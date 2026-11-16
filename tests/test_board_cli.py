@@ -299,7 +299,7 @@ def test_a_failure_board_prints_the_whole_reader_key(world, tmp_path, capsys):
                      str(extra_file(tmp_path)), "--repo", str(clone), "--since", "2026-11-12T00:00:00Z", "--now", NOW)
     reader = json.loads(out)["reader"]
     assert rc == 3 and set(reader) == {"repo", "since", "main_ref", "main_commits", "main_records", "chain_refs", "chain_commits",
-                                       "branches", "refs", "merged", "unattributed", "diverged", "matched_by_key"}
+                                       "branches", "refs", "merged", "unattributed", "diverged", "matched_by_key", "other_repos"}
     assert reader["main_commits"] == 0 and reader["diverged"] == [] and reader["matched_by_key"] == 0
 
 
@@ -328,3 +328,59 @@ def test_the_keys_flow_supplies_are_still_accepted(world, tmp_path, capsys):
     rc, doc, err = board(capsys, world, write_items(tmp_path, item(3)), extra)
     assert rc == 3 and err == "" and states(doc) == {"levain#3": "unknown"}
     assert any("seats unreadable: the roster could not be read" in p for p in doc["problems"])
+
+
+# ------------------------------------------------------------------------------------------------ a dependency in another repo (levain#72)
+def _row(n: int, repo: str, *, depends: list | None = None) -> str:
+    return json.dumps({"v": 1, "op": "add", "id": f"{repo}#{n}", "at": AT, "by": "t", "repo": repo, "title": f"{repo} item {n}",
+                       "words": "", "origin": "desk 1", "done": "the work lands", "done_kind": "merged", "tier": "sonnet",
+                       "depends_on": depends or []})
+
+
+def _two_repos(tmp_path: Path, *, land: bool = True):
+    """levain#1 (closed on levain's main when ``land``) and flow#5, which depends on it; flow is the repo read."""
+    other, home = World(tmp_path), World(tmp_path, "flow")        # tmp/levain and tmp/flow: checkouts beside each other
+    for w in (other, home):
+        w.commit("root", date=OLD)
+        w.push_main()
+    if land:
+        other.commit("the work", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+        other.push_main()
+    items = write_items(tmp_path, _row(1, "levain"), _row(5, "flow", depends=[{"kind": "item", "ref": "levain#1", "label": "x"}]))
+    return home, items
+
+
+def test_a_landed_dependency_in_the_other_repo_releases_its_dependent_in_the_cli_output(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert states(doc) == {"levain#1": "done", "flow#5": "ready"}, doc["items"]
+    assert doc["reader"]["other_repos"] == ["levain"]
+
+
+def test_a_dependency_not_yet_landed_in_the_other_repo_still_holds_its_dependent(tmp_path, capsys):
+    home, items = _two_repos(tmp_path, land=False)
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert states(doc)["flow#5"] == "blocked", doc["items"]
+
+
+def test_a_foreign_checkout_that_is_missing_reads_unknown_never_ready(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    import shutil
+    shutil.rmtree(tmp_path / "levain")
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert states(doc)["levain#1"] == "unknown" and states(doc)["flow#5"] != "ready", doc["items"]
+    assert doc["reader"]["other_repos"] == []
+
+
+def test_other_repo_names_a_checkout_that_is_not_beside_the_repo(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    (tmp_path / "levain").rename(tmp_path / "elsewhere")
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow", "--other-repo", f"levain={tmp_path / 'elsewhere'}")
+    assert states(doc) == {"levain#1": "done", "flow#5": "ready"}, doc["items"]
+
+
+def test_a_repo_no_item_of_this_repo_depends_on_is_never_read(tmp_path, capsys):
+    home, _ = _two_repos(tmp_path)
+    items = write_items(tmp_path, _row(1, "levain"), _row(5, "flow"))
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert doc["reader"]["other_repos"] == []

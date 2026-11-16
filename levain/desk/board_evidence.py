@@ -167,6 +167,20 @@ def repo_name_of(repo: Path) -> str | None:
     return name or None
 
 
+def sibling_checkout(repo: Path, name: str) -> Path | None:
+    """Where the checkout of the repo called ``name`` lives, beside this one: the directory next to the one that holds
+    this repository's ``.git`` (a linked worktree resolves to the main checkout), when it is a directory. None when git
+    cannot place ``repo`` or nothing of that name is beside it. Reads one ``git rev-parse``; it never walks history."""
+    try:
+        common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
+    except GitFailed:
+        return None
+    if common.name != ".git" or not name or "/" in name or name in (".", ".."):
+        return None
+    cand = common.parent.parent / name
+    return cand if cand.is_dir() else None
+
+
 # ------------------------------------------------------------------------------------------------ commits
 @dataclass(frozen=True)
 class _Commit:

@@ -27,9 +27,9 @@ def git(repo: Path, *args: str, date: str | None = None, stdin: str | None = Non
 class World:
     """``origin`` (bare) and ``w`` (a clone with ``main`` pushed). Commits are made in ``w``."""
 
-    def __init__(self, tmp: Path) -> None:
-        self.origin = tmp / "origin.git"
-        self.w = tmp / "levain"                                   # the name item ids use
+    def __init__(self, tmp: Path, name: str = "levain") -> None:
+        self.origin = tmp / ("origin.git" if name == "levain" else f"{name}-origin.git")
+        self.w = tmp / name                                       # the name item ids use
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True, env={**os.environ, **_ENV})
         subprocess.run(["git", "clone", "-q", str(self.origin), str(self.w)], check=True, capture_output=True, env={**os.environ, **_ENV})
         git(self.w, "checkout", "-q", "-b", "main")

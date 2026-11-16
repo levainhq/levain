@@ -16,6 +16,7 @@ checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -55,6 +56,9 @@ def register(subparsers: Any) -> None:
                    help="A JSON object with the evidence flow supplies (seats, band, waiters, documents, unreadable). "
                         f"It may not name a source this command reads itself: {', '.join(READ_BY_CLI)}.")
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
+    p.add_argument("--other-repo", dest="other_repo", action="append", default=[], metavar="NAME=PATH",
+                   help="Where another repo's checkout is, for a dependency that lives there (repeatable). Default: a directory "
+                        "called NAME beside this repository's. With neither, an item of that repo reads unknown.")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids, <name>#<n> (default: the directory that holds the repository's .git).")
     p.add_argument("--since", default=be.BOARD_EPOCH, metavar="ISO",
@@ -102,6 +106,38 @@ def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
     return None
 
 
+def _foreign_repos(items: Any, home: str) -> list[str]:
+    """The repos, other than ``home``, that an item of ``home`` depends on (through item links, followed to any depth):
+    the only foreign git a ``home`` item's state can need. A repo nothing here reaches is never read."""
+    seen: set[str] = set()
+    todo = [i.id for i in items.values() if i.repo == home]
+    while todo:
+        iid = todo.pop()
+        if iid in seen or iid not in items:
+            continue
+        seen.add(iid)
+        todo.extend(l.ref for l in items[iid].depends_on if l.kind == "item" and l.ref)
+    return sorted({items[i].repo for i in seen} - {home})
+
+
+def _read_others(args: argparse.Namespace, folded: Any, repo: Path, home: str, extra: Any) -> dict[str, Evidence]:
+    """Each foreign repo's evidence, read the way the home repo's is (one bounded ``read_git_evidence`` under its own
+    deadline, its documents stat'd, flow's extra merged). A repo whose checkout is not found is left out: its items read
+    unknown in :func:`derive_all`, never ready."""
+    named = dict(o.split("=", 1) for o in args.other_repo if "=" in o)
+    out: dict[str, Evidence] = {}
+    for name in _foreign_repos(folded.items, home):
+        path = Path(named[name]).expanduser() if name in named else be.sibling_checkout(repo, name)
+        if path is None or not path.is_dir():
+            continue
+        ev, _ = be.read_git_evidence(path, repo_name=name, since=args.since)
+        ev["documents"] = be.read_documents({k: v for k, v in folded.items.items() if v.repo == name}, path)
+        if extra is not None:
+            _merge_extra(ev, copy.deepcopy(extra))              # the same object was accepted for the home repo
+        out[name] = Evidence.from_dict(ev)
+    return out
+
+
 def run_state(args: argparse.Namespace) -> int:
     items_path = args.items or (Path(os.environ[ITEMS_ENV]) if os.environ.get(ITEMS_ENV) else None)
     if items_path is None:
@@ -117,6 +153,7 @@ def run_state(args: argparse.Namespace) -> int:
     repo = Path(args.repo).expanduser()
     evidence, summary = be.read_git_evidence(repo, repo_name=args.repo_name, since=args.since)
     evidence["documents"] = be.read_documents(folded.items, repo)
+    extra = None
     if args.evidence_extra is not None:
         try:
             extra = json.loads(Path(args.evidence_extra).expanduser().read_text("utf-8"))
@@ -125,9 +162,11 @@ def run_state(args: argparse.Namespace) -> int:
         bad = _merge_extra(evidence, extra)
         if bad is not None:
             return _fail(f"--evidence-extra {args.evidence_extra}: {bad}")
-    board = derive_all(folded, Evidence.from_dict(evidence), now=now)
+    home = summary.get("repo")
+    others = _read_others(args, folded, repo, home, extra) if home else {}
+    board = derive_all(folded, Evidence.from_dict(evidence), now=now, repo=home, other_evidence=others)
     doc = board.to_dict()
-    doc["reader"] = summary
+    doc["reader"] = {**summary, "other_repos": sorted(others)}
     if args.json:
         print(json.dumps(doc, indent=2, sort_keys=False))
     else:
