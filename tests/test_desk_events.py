@@ -1492,9 +1492,10 @@ def test_a_pass_still_moves_the_open_events_among_settled_ones(store, clock, tmp
     assert [e.event_id for e in got] == [posted.event.event_id]
 
 
-def test_the_done_desk_check_costs_the_same_at_any_count_of_settled_events(store, clock, tmp_path):
+def test_the_done_desk_check_issues_the_same_statements_at_any_count_of_settled_events(store, clock, tmp_path):
     """levain#69 finding 2, `unseen_event` (read by the watcher's replace-a-done-desk pass, in the coord write
-    transaction): the statements it costs do not grow with the settled events ever stored."""
+    transaction): the STATEMENTS it issues do not grow with the settled events ever stored (the single query still
+    walks the stored events inside SQLite, so this pins the round trips, not the work)."""
     cred = sensor(store, tmp_path)
     down(store, cred, 1)
     ln = store.pending_desk()
@@ -1511,7 +1512,6 @@ def test_the_done_desk_check_costs_the_same_at_any_count_of_settled_events(store
     _settled_beats(store, clock, cred, 40, first=15)
     clock.advance(hours=3)
     many = _statements(store, check)
-    print("MEASURE launch_replace_done statements, 5 vs 45 settled events:", few, many)
     assert many == few, (few, many)
 
 
