@@ -118,7 +118,7 @@ def refused(reply, *, text):
 def test_tools_list_is_exactly_the_one_tool_and_it_has_no_words_field():
     reply = room_mcp.handle(NOLAUNCH, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     tools = reply["result"]["tools"]
-    assert [t["name"] for t in tools] == ["propose_drop"]
+    assert [t["name"] for t in tools] == ["propose_drop", "propose_envelope"]
     schema = tools[0]["inputSchema"]
     assert set(schema["properties"]) == {"quote_ids", "summary", "about"}
     assert schema["additionalProperties"] is False
@@ -312,7 +312,7 @@ def test_the_real_process_proposes_for_its_bound_launch_only(store, qdir, world,
     out, err = p.communicate("".join(json.dumps(m) + "\n" for m in msgs), timeout=30)
     replies = [json.loads(l) for l in out.splitlines()]
     assert err == "" and p.returncode == 0
-    assert [t["name"] for t in replies[1]["result"]["tools"]] == ["propose_drop"]
+    assert [t["name"] for t in replies[1]["result"]["tools"]] == ["propose_drop", "propose_envelope"]
     assert replies[2]["result"]["isError"] is False and "A card is waiting" in replies[2]["result"]["content"][0]["text"]
     assert replies[3]["error"]["code"] == -32602
     assert len(proposals(qdir)) == 1

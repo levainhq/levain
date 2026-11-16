@@ -128,7 +128,7 @@ from levain.desk import lease
 from levain.desk.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStore, Verdict, _launch_state, _open_room,
                                      liveness)
 from levain.desk.chat_tripwires import TripwireContext
-from levain.desk.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
+from levain.desk.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_TOOLS,
                                                ClaudeSession, PipeTransport, _leads_own_group, canary_denied, default_deny_paths,
                                                host_probe, open_probe, room_argv, room_door_tools, room_hook_command,
                                                room_host_argv, room_settings_json)
@@ -615,10 +615,9 @@ def containment_digest(settings_json: str, readguard_sha256: str, host: Optional
                              host_commands=json.loads(host.to_json()) if host is not None else None)
         return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
-              "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL,
-              "readguard_sha256": readguard_sha256}
-    if host is not None:        # D2: the door's tool set and the argvs it runs are part of the containment a spawn ran under
-        policy["door"] = list(host_door_tools(host))
+              "setting_sources": "user", "settings": json.loads(settings_json), "door": list(host_door_tools(host)),
+              "readguard_sha256": readguard_sha256}      # the door's tool list the spawn really had (None: the default door)
+    if host is not None:        # D2: the argvs the door runs are part of the containment a spawn ran under
         policy["host_commands"] = json.loads(host.to_json())
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

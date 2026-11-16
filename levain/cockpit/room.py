@@ -21,6 +21,11 @@ Writes act through a :class:`RoomHost` the mount was given, for an authenticated
 * ``proposal/<id>/commit`` and ``/dismiss``: his tap on a card. The drop's words are the bytes the card's field held
   (his adopted quote or his edit), the room's summary only ever rides as the labelled note
   (:func:`levain.desk.room.commit`).
+* an ENVELOPE card (a proposal of a second kind, read from the SERVER's row, never from the request): ``proposal/<id>/preview
+  {words}`` reads the posted bytes back as plain words and the hash the tap must echo (writes nothing); a ``commit`` on it
+  goes to :func:`levain.desk.spec_card.tap` and carries ``{words, outbox_id, thread_id, input_sha256}``, the thread and
+  the hash of the reading he was shown. A commit without them is ``update_page`` (an old cached page that cannot read
+  this card), and nothing is written.
 
 **Live text (492 R3, ruling R-C).** Every read carries ``live``: ``{turn, text, seq}`` while the room's child is mid-reply
 (from :func:`levain.desk.room_live.snapshot` of ``launch_id``, an in-memory buffer), else ``null``. It is NEVER
@@ -55,15 +60,19 @@ from levain.cockpit.consent import utc_stamp
 from levain.desk import chat
 from levain.desk import room as coordroom
 from levain.desk import room_live
+from levain.desk import spec_card
+from levain.desk.envelopes import EnvelopeStore
 from levain.desk.chat_lease import check_owner
 from levain.desk.room_launch import RoomLaunchError
 from levain.desk.room_serve import RoomServeError
+from levain.desk.envelope_drafts import SpecRefused
+from levain.desk.spec_card import TapRefused
 from levain.desk.store import SURFACES, WORDS_MAX, CoordError, DropConflict
 
 ROOM_PATH = "/cockpit/room.json"
 ROOM_PREFIX = "/cockpit/room/"
 ROOM_ACTIONS = ("send", "stop", "mark", "drop", "rotate", "open")
-PROPOSAL_ACTIONS = ("commit", "dismiss")
+PROPOSAL_ACTIONS = ("commit", "dismiss", "preview")
 READ_OWNER = "cockpit:room-read"        # a room composer ignores its owner (no lease); the read still needs a well-formed one
 PROPOSALS_MAX = 50
 WAIT_MAX_S = 25                         # the longest a cursor read may wait for a newer item (``wait=<seconds>``)
@@ -114,7 +123,7 @@ def is_room_path(path: str) -> bool:
 
 
 def post_route(path: str) -> tuple[str, str | None] | None:
-    """``(action, proposal_id)`` for ``POST /cockpit/room/<action>`` or ``/cockpit/room/proposal/<pr-id>/<commit|dismiss>``,
+    """``(action, proposal_id)`` for ``POST /cockpit/room/<action>`` or ``/cockpit/room/proposal/<pr-id>/<commit|dismiss|preview>``,
     else None."""
     if not path.startswith(ROOM_PREFIX):
         return None
@@ -172,10 +181,14 @@ def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any
     if not (threads._has(conn, "drop_proposals") and threads._has(conn, "proposal_events")):
         return []
     has_drops = threads._has(conn, "drops")
+    has_specs = threads._has(conn, "spec_proposals")
+    now = utc_stamp(datetime.now(timezone.utc))
     out = []
     rows = conn.execute("SELECT proposal_id, quoted, words, summary, about, at FROM drop_proposals WHERE room_thread = ? "
                         "ORDER BY gseq DESC LIMIT ?", (room_thread, PROPOSALS_MAX)).fetchall()
     for pid, quoted, words, summary, about, at in reversed(rows):
+        spec = conn.execute("SELECT thread_id, spec_text FROM spec_proposals WHERE proposal_id = ?", (pid,)).fetchone() \
+            if has_specs else None
         event = conn.execute("SELECT kind, drop_id FROM proposal_events WHERE proposal_id = ? ORDER BY seq LIMIT 1",
                              (pid,)).fetchone()
         state, drop_id = (event[0], event[1] if event[0] == "committed" else None) if event else ("open", None)
@@ -183,8 +196,38 @@ def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any
             made = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
             if made is not None:
                 words = made[0]
-        out.append({"proposal_id": pid, "state": state, "quoted": json.loads(quoted), "words": words,
-                    "summary": summary, "about": about, "at": at, "drop_id": drop_id})
+        card = {"proposal_id": pid, "state": state, "quoted": json.loads(quoted), "words": words,
+                "summary": summary, "about": about, "at": at, "drop_id": drop_id, "kind": "drop",
+                "thread_id": None, "replaced_by": None}
+        if spec is not None:
+            card.update(_envelope_facts(conn, pid, state, drop_id, spec[0], spec[1], json.loads(quoted), now))
+        out.append(card)
+    return out
+
+
+def _envelope_facts(conn: sqlite3.Connection, pid: str, state: str, drop_id: str | None, thread_id: str, spec_text: str,
+                    quoted: list, now: str) -> dict[str, Any]:
+    """What an ENVELOPE card adds to its row, from read-only SQL: the card's kind, its thread and the desk's title for it,
+    his quoted words (the stored bodies, joined as the room reads them), the room's spec as the field's prefill (a
+    committed card shows the bytes he posted, which the drop holds), the newer card that replaced it (derived), whether a
+    signed grant is running on the thread, and the draft his tap made."""
+    title = conn.execute("SELECT value FROM thread_events WHERE thread_id = ? AND field = 'title' ORDER BY seq DESC LIMIT 1",
+                         (thread_id,)).fetchone() if threads._has(conn, "thread_events") else None
+    bodies = []
+    for mid in quoted:
+        found = conn.execute("SELECT body FROM chat_messages WHERE message_id = ?", (mid,)).fetchone() \
+            if threads._has(conn, "chat_messages") else None
+        if found is not None:
+            bodies.append(found[0])
+    newer = coordroom.newer_card(conn, pid)          # the store's own derivation, so the read and the tap agree
+    tap = conn.execute("SELECT draft_id, revision FROM spec_card_taps WHERE proposal_id = ?", (pid,)).fetchone() \
+        if threads._has(conn, "spec_card_taps") else None
+    out = {"kind": "envelope", "thread_id": thread_id, "title": title[0] if title else "",
+           "quoted_words": "\n\n".join(bodies), "replaced_by": newer,
+           "signed_head": state == "open" and spec_card.standing(conn, thread_id, now) is not None,
+           "draft_id": None if tap is None else tap[0], "revision": None if tap is None else tap[1]}
+    if drop_id is None:
+        out["words"] = spec_text
     return out
 
 
@@ -712,9 +755,20 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
     words, outbox = req.get("words"), req.get("outbox_id")
     if not isinstance(words, str) or not words.strip() or len(words) > WORDS_MAX:
         return _refusal("bad_request", f"a drop is a non-empty string of at most {WORDS_MAX} characters", 400)
+    thread = _envelope_thread(host, proposal_id)          # the card's kind is the SERVER's row, never the request's
+    if action == "preview":
+        if thread is None:
+            return _refusal("no_proposal", f"proposal {proposal_id} is not an envelope card", 404)
+        try:
+            got = spec_card.preview(_envelope_store(host), thread, words)
+        except CoordError as exc:
+            return _spec_refusal(exc)
+        return 200, {"proposal_id": proposal_id, "thread_id": thread, **got}
     if not isinstance(outbox, str) or chat._OUTBOX_ID.fullmatch(outbox) is None:
         return _refusal("bad_request", "a commit carries the client's own outbox_id: 8 to 128 of A-Z a-z 0-9 . _ - "
                         "(starting with a letter or digit)", 400)
+    if thread is not None:
+        return _tap_envelope(host, proposal_id, words, outbox, surface, req)
     try:
         drop, created = coordroom.commit(host.store, proposal_id, words, outbox, surface)
     except DropConflict as exc:
@@ -722,6 +776,64 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
     except CoordError as exc:
         return _proposal_refusal(exc)
     return 200, {"proposal_id": proposal_id, "drop_id": drop.drop_id, "created": created}
+
+
+def _envelope_store(host: RoomHost) -> EnvelopeStore:
+    """The room's store as the envelope writer needs it: the host's own when it already is one (the tests' clock rides
+    with it), else one over the same directory."""
+    store = host.store
+    return store if isinstance(store, EnvelopeStore) else EnvelopeStore(store.directory)
+
+
+def _envelope_thread(host: RoomHost, proposal_id: str) -> str | None:
+    """The thread an ENVELOPE card is for, read from the server's own row; None for a plain drop card or no card."""
+    conn = host.store._connect()
+    try:
+        spec = coordroom.spec_of(conn, proposal_id)
+    finally:
+        conn.close()
+    return None if spec is None else spec.thread_id
+
+
+def _tap_envelope(host: RoomHost, proposal_id: str, words: str, outbox: str, surface: str, req: dict[str, Any]
+                  ) -> tuple[int, dict[str, Any]]:
+    """His tap on an envelope card: the bytes his field held, the thread the page showed and the hash of the reading he
+    was shown for those bytes. A request without the thread or the hash is an old page that cannot read this card:
+    ``update_page``, nothing written, never a plain drop of spec text."""
+    echo, sha = req.get("thread_id"), req.get("input_sha256")
+    if not isinstance(echo, str) or not isinstance(sha, str):
+        return _refusal("update_page", "this card needs a newer page than the one you have open; reload it, nothing was "
+                        "sent", 409)
+    try:
+        got = spec_card.tap(_envelope_store(host), proposal_id, words, outbox, surface, thread_echo=echo,
+                            input_sha256=sha)
+    except TapRefused as exc:
+        return _refusal(_TAP_NAMES.get(exc.code, "proposal_refused"), str(exc), 409)
+    except DropConflict as exc:
+        return _refusal("outbox_conflict", str(exc), 409)
+    except CoordError as exc:
+        return _spec_refusal(exc)
+    return 200, {"proposal_id": proposal_id, "drop_id": got.drop.drop_id, "created": got.created,
+                 "draft_id": got.draft_id, "revision": got.revision, "thread_id": got.thread_id}
+
+
+_TAP_NAMES = {"stale_preview": "stale_preview", "thread_mismatch": "thread_mismatch", "settled": "proposal_settled",
+              "expired": "proposal_expired", "replaced": "proposal_replaced", "thread_closed": "thread_closed",
+              "not_a_spec_card": "no_proposal"}
+
+
+def _spec_refusal(exc: CoordError) -> tuple[int, dict[str, Any]]:
+    """A refusal of the posted bytes by the grammar (or a store check inside the tap): the grammar's is named by its TYPE
+    (:class:`~levain.desk.envelope_drafts.SpecRefused`), never by its sentence, which may echo the spec's own text (L3 r1
+    complement); of the rest, the proposal cases keep their names, a drop-words refusal is ``bad_words``, anything else
+    is ``spec_refused`` with the sentence it came with."""
+    text = str(exc)
+    if isinstance(exc, SpecRefused):
+        return _refusal("spec_refused", text, 409)
+    if text.startswith("no proposal") or text.startswith("a drop ") or text.startswith("outbox_id ") \
+            or " is expired" in text or " is already " in text or " is committed" in text or " is dismissed" in text:
+        return _proposal_refusal(exc)
+    return _refusal("spec_refused", text, 409)
 
 
 def _proposal_refusal(exc: CoordError) -> tuple[int, dict[str, Any]]:

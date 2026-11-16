@@ -912,10 +912,13 @@ class CoordStore:
 
     def _insert_drop(self, conn: sqlite3.Connection, now: str, *, words: str, sha: str, surface: str,
                      outbox_id: str, sent_at: str, source: Source, drop_id: str | None = None,
-                     envelope_id: str | None = None, receipt: dict[str, Any] | None = None) -> Drop:
+                     envelope_id: str | None = None, receipt: dict[str, Any] | None = None,
+                     wake: bool = True) -> Drop:
         """Insert a checked drop and its ``delivered`` drop receipt inside the caller's write transaction.
         ``drop_id`` and ``envelope_id`` are given only by a drop that carries a structured envelope (C2), whose body
-        names the drop id it was signed for; ``envelope_id`` is written in the insert, never set later."""
+        names the drop id it was signed for; ``envelope_id`` is written in the insert, never set later. ``wake`` False
+        is for a caller that settles the drop (:meth:`note_in`) in this same transaction: nothing is left for a desk
+        to file, so none is asked for."""
         if drop_id is None:
             drop_id = "dr-" + secrets.token_hex(16)
         elif not isinstance(drop_id, str) or _DROP_ID.fullmatch(drop_id) is None:
@@ -933,14 +936,14 @@ class CoordStore:
              source.how, envelope_id, next_gseq(conn, now)))
         self._reply(conn, None, "drop_receipt", "drops", drop_id,
                     {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
-        from levain.desk.lease import wake
+        from levain.desk.lease import wake as ask_for_a_desk
 
         # a drop with no desk asks for one, in its own transaction (C0 §6). A wake that fails rolls back to
         # here and the drop is kept: your words are never lost to the desk's bookkeeping
         conn.execute("SAVEPOINT coord_wake")
         woke = None
         try:
-            woke = wake(conn, now)
+            woke = ask_for_a_desk(conn, now) if wake else None
         except Exception:  # noqa: BLE001 - any wake failure, never the drop: the words are kept
             conn.execute("ROLLBACK TO coord_wake")
         conn.execute("RELEASE coord_wake")
@@ -1018,6 +1021,22 @@ class CoordStore:
                 raise CoordError(f"drop {drop_id} is already noted")
             self._reply(conn, None, "drop_receipt", "drops", drop_id,
                         {"stage": "noted", "drop_id": drop_id, "why": why, "threads": []}, now)
+        return why
+
+    def note_in(self, conn: sqlite3.Connection, now: str, drop_id: str, why: str, *, by: str = "operator") -> str:
+        """:meth:`note`'s ``noted`` receipt for a path that is not the desk's, inside the caller's write transaction
+        (``with store._write() as (conn, now)``, as :meth:`bare_thread`): the room card's tap, whose drop is a spec the
+        operator tapped and the desk has nothing to file. No lease, no wake; the caller's transaction is the receipt's,
+        so a caller that raises afterwards leaves nothing behind. A drop already split or noted is refused."""
+        self._actor(by, ("operator",))
+        why = _one_line("a drop's why", why, _TITLE_MAX)
+        self._must_drop(conn, drop_id)
+        if self._receipts(conn, drop_id, "split"):
+            raise CoordError(f"drop {drop_id} is already split; a split drop is not noted")
+        if self._receipts(conn, drop_id, "noted"):
+            raise CoordError(f"drop {drop_id} is already noted")
+        self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                    {"stage": "noted", "drop_id": drop_id, "why": why, "threads": []}, now)
         return why
 
     def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:

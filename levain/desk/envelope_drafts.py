@@ -19,7 +19,7 @@ import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from levain.authority import AuthoritySnapshot
@@ -35,7 +35,8 @@ from levain.desk.legacy import ROLE_DESK
 __all__ = [
     "AgainstHead", "AuthorityFacet", "Card", "Draft", "DraftStale", "DraftState", "HeadState", "RULES",
     "admit_check", "authority_facet", "cards", "cite_label", "create", "draft_sign_bytes", "drop_rule", "head_state",
-    "label", "latest", "lapse_reason", "rederive_check", "renew_rule", "replace_rule", "revise", "spec_rule",
+    "label", "latest", "lapse_reason", "parse_spec", "rederive_check", "render_spec", "SpecRefused", "renew_rule",
+    "replace_rule", "revise", "spec_rule",
     "state_of", "unclosed_series", "withdraw",
 ]
 
@@ -236,6 +237,17 @@ def _check_cites_against(conn: sqlite3.Connection, d_thread: str, proposal: Mapp
     return None
 
 
+_ROOM_CARD_LINE = "from a room card you tapped (drafted by the room)"
+
+
+def _from_room_card(conn: sqlite3.Connection, drop_id: str) -> bool:
+    """Whether ``drop_id`` is the drop an envelope card's tap wrote (the link table is the room's, absent from a store that
+    never held a room; this reads through read-only doors, so it never creates it)."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spec_card_taps'").fetchone() is None:
+        return False
+    return conn.execute("SELECT 1 FROM spec_card_taps WHERE drop_id = ?", (drop_id,)).fetchone() is not None
+
+
 def cite_label(conn: sqlite3.Connection, d: Draft, cite: Mapping[str, str]) -> dict[str, Any]:
     """What a card may say about a cited record: only what the store holds, derived from append-only rows, so a label
     cannot move under a revision. A drop: its words, whether it is in this thread, its stored surface and time labelled
@@ -245,8 +257,11 @@ def cite_label(conn: sqlite3.Connection, d: Draft, cite: Mapping[str, str]) -> d
         if row is None:
             return {"kind": "drop", "ref": cite["ref"], "line": "a drop this store does not hold"}
         inside = cite["ref"] in _members_at(conn, d.thread_id, d.proposal["binds"][0]["rev"])
-        return {"kind": "drop", "ref": cite["ref"], "words": row[0], "in_thread": inside,
-                "line": "in this thread" if inside else "not in this thread, sent after this draft began",
+        line = "in this thread" if inside else "not in this thread, sent after this draft began"
+        if _from_room_card(conn, cite["ref"]):
+            # the bytes are his (he posted them), the draft of them is the room's: said, never "your words" (H1-4)
+            line = f"{_ROOM_CARD_LINE}; {line}"
+        return {"kind": "drop", "ref": cite["ref"], "words": row[0], "in_thread": inside, "line": line,
                 "surface": f"{row[1]} at {row[2]}, {_UNAUTH}"}
     row = conn.execute("SELECT signer_fp FROM envelopes WHERE envelope_id = ?", (cite["ref"],)).fetchone()
     return {"kind": "envelope", "ref": cite["ref"],
@@ -505,32 +520,190 @@ def drop_rule(store: EnvelopeStore, thread_id: str, *, by: str, token: object = 
                        observed=observed, blanks=("where",))
 
 
-def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, token: object = None) -> Draft:
-    """``spec/1``: a drop whose words are the CLI's envelope spec (a member of the thread, or newer than the series;
-    the cite check holds the bound) sets every field the spec names, read through the CLI's own grammar with the
-    drop's own source; every other value and its cites carry over from the parent revision. Free words are not a spec
-    and are refused (they wait for a translator that writes through :func:`revise`)."""
+def _no_repeats(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads``'s ``object_pairs_hook``: a repeated key is refused, never "the last one wins", so the field a
+    reader sees first is the field that is parsed."""
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _Repeat(key)
+        out[key] = value
+    return out
+
+
+class _Repeat(Exception):
+    """A repeated JSON key (carried out of the hook, since a ValueError there would read as "not JSON")."""
+
+
+def _first_unshowable(value: Any) -> str | None:
+    """The first unshowable character in any string of a parsed JSON value, keys included, or None. The check is on the
+    PARSED strings: an escaped form (``\\u202e``) is plain ASCII in the text and passes a check made on the text. A walk
+    with its own stack, never recursion, so no nesting depth the decoder accepts can overflow it (L3 r1 codex LOW)."""
+    from levain import unshowable
+
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, str):
+            found = unshowable.describe(v, allow="")
+            if found is not None:
+                return found
+        elif isinstance(v, dict):
+            for k, item in reversed(list(v.items())):       # reversed onto a stack: read in document order
+                stack.extend((item, k))
+        elif isinstance(v, list):
+            stack.extend(reversed(v))
+    return None
+
+
+class SpecRefused(CoordError):
+    """The grammar's refusal of a spec's words (:func:`parse_spec`): a type a surface names its refusal by, never by
+    matching the sentence, which may echo the spec's own text (L3 r1 complement LOW)."""
+
+
+class _NoStore:
+    """What :func:`parse_spec` hands the CLI's body builder for its ``store_id``: the body's store id is never one of the
+    values a spec sets, so the reader never opens the store (opening one that is not there makes it: L3 r1 codex MED)."""
+
+    @staticmethod
+    def store_id() -> str:
+        return "0" * 32
+
+
+def _value_check(fields: Mapping[str, Any], stop_span: timedelta | None) -> None:
+    """The draft writer's own value checks (:func:`ed.check_proposal`, the body's parse with every unnamed value
+    filled by a placeholder) over the values a spec names, at the clock now: a value a revision could only refuse is
+    refused here, by the reader the door, the preview and the tap share (L3 r1 codex MED). Raises DraftError."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    named = dict(fields)
+    if stop_span is not None:
+        named["stop_at"] = utc_stamp(now + stop_span)
+    values = ed.check_fields(named)
+    ed.check_proposal({"format": env.BODY_FORMAT, "store_id": "0" * 32, "envelope_id": "ev-" + "0" * 32,
+                       "origin": "worded", "drop_id": "dr-" + "0" * 32, "words_sha256": "sha256:" + "0" * 64,
+                       "binds": [{"thread_id": "th-" + "0" * 32, "rev": 1, "members_sha256": "sha256:" + "0" * 64}],
+                       "supersedes": None, "issued_at": utc_stamp(now), **values})
+
+
+def parse_spec(words: str, source: Any, store: EnvelopeStore, *, subject: str = "these words"
+               ) -> tuple[dict[str, Any], list[str], timedelta | None]:
+    """The ONE reader of an envelope spec's words, shared by the ``spec/1`` rule, the room card's door, its preview and
+    its tap: ``(fields, named, stop_span)``, the editable values the spec names (read through the CLI's own grammar with
+    ``source``), the field names it sets (``stop_at`` when a stop is given) and the stop as a span (None: none given).
+    Refused, naming ``subject``: words that are not JSON, a repeated key, an unshowable character in any key or value
+    (escaped forms included), a launch grant (a draft never carries one), keys outside the draft's, a stop that is not a
+    duration, whatever the CLI grammar refuses, and any value the draft writer's own checks refuse (a revision could
+    only refuse it later). Every refusal is :class:`SpecRefused`. Writes nothing and reads nothing from ``store`` (kept
+    in the signature for its callers; the values a spec sets never depend on it)."""
+    try:
+        return _parse_spec(words, source, subject)
+    except SpecRefused:
+        raise
+    except CoordError as exc:              # the CLI grammar's own sentences (a stop, a land, a list)
+        raise SpecRefused(str(exc)) from None
+    except ed.DraftError as exc:
+        raise SpecRefused(f"{subject} is not a draft the store can hold: {exc}") from None
+    except RecursionError:                 # nested deeper than a reader recurses: a grammar refusal, never a fault
+        raise SpecRefused(f"{subject} is not an envelope spec: it is nested too deeply") from None
+
+
+def _parse_spec(words: str, source: Any, subject: str) -> tuple[dict[str, Any], list[str], timedelta | None]:
     from levain.desk import cli
 
+    try:
+        spec = json.loads(words, object_pairs_hook=_no_repeats)
+    except _Repeat as exc:
+        raise SpecRefused(f"{subject} is not an envelope spec: it repeats the key {str(exc.args[0])[:40]!r}") from None
+    except ValueError:
+        raise SpecRefused(f"{subject} is not an envelope spec: its words are not JSON") from None
+    found = _first_unshowable(spec)
+    if found is not None:
+        raise SpecRefused(f"{subject} holds an unshowable character {found}; nothing reads past it")
+    if isinstance(spec, dict) and env.LAUNCH_LIST in spec:
+        # the CLI's spec takes the grant; a draft never carries one (ed.check_proposal), so it is refused, never dropped
+        raise SpecRefused(f"{subject} names launches: {ed._NO_LAUNCH_DRAFT}")
+    if not isinstance(spec, dict) or not spec or not set(spec) <= _DRAFT_SPEC_KEYS:
+        raise SpecRefused(f"{subject} is not an envelope spec: a JSON object with keys among "
+                          f"{sorted(_DRAFT_SPEC_KEYS)}")
+    stop_span = cli._parse_stop(spec["stop"]) if "stop" in spec and isinstance(spec["stop"], str) else None
+    if "stop" in spec and stop_span is None:
+        raise SpecRefused('stop is a duration text like "2h"')
+    body = cli._spec_body({k: v for k, v in spec.items() if k != "stop"}, words, source, _NoStore())
+    fields = {k: body[k] for k in _EDIT_SPEC if k in spec}
+    _value_check(fields, stop_span)
+    named = [*fields, *(["stop_at"] if stop_span is not None else [])]
+    return fields, named, stop_span
+
+
+def _span_text(span: timedelta) -> str:
+    minutes = int(span.total_seconds() // 60)
+    hours, minutes = divmod(minutes, 60)
+    return "".join([f"{hours}h" if hours else "", f"{minutes}m" if minutes else ""])
+
+
+def render_spec(fields: Mapping[str, Any], stop_span: timedelta | None, base: Mapping[str, Any] | None
+                ) -> list[dict[str, Any]]:
+    """The one plain-words reader of a parsed spec, one line per value it names, in the grammar's order:
+    ``{"field", "text", "wider"}``. ``wider`` marks a value that grants more than ``base`` (the head as narrowed, a
+    body-shaped mapping; None is a head that grants nothing, so everything is new): a path the base lacks, a land the
+    base does not hold exactly as named (the same branch with other limits is wider, as :func:`env.widens` reads it:
+    L3 r1 codex MED), a push or publish at all, a budget key above the base's. A land's limits are shown. The stop is
+    shown and never marked (its base is the clock). Pure: it reads nothing and writes nothing."""
+    base = base if base is not None else {"where": [], "lands": [], "pushes": [], "publishes": [],
+                                          "budget": {k: 0 for k in env.BUDGET_KEYS}}
+    lines: list[dict[str, Any]] = []
+    if "where" in fields:
+        have = {w["repo"]: tuple(w["paths"]) for w in base.get("where", [])}
+        parts, wider = [], False
+        for w in fields["where"]:
+            parts.append(f"{w['repo']}: {', '.join(w['paths'])}")
+            wider = wider or any(not env.path_within(p, have.get(w["repo"], ())) for p in w["paths"])
+        lines.append({"field": "where", "text": "work in " + ("; ".join(parts) or "nowhere"), "wider": wider})
+    for kind, verb in (("lands", "land onto"), ("pushes", "push to"), ("publishes", "publish")):
+        if kind not in fields:
+            continue
+        held = {env.effect_key(kind, e): e for e in base.get(kind, [])}
+        items = [_effect_text(kind, e) for e in fields[kind]]
+        wider = bool(fields[kind]) if kind != "lands" else any(held.get(env.effect_key(kind, e)) != e
+                                                                for e in fields[kind])
+        lines.append({"field": kind, "text": f"{verb} " + ("; ".join(items) if items else "nothing"), "wider": wider})
+    if "budget" in fields:
+        held = base.get("budget", {})
+        names = [f"{k} {fields['budget'][k]}" for k in env.BUDGET_KEYS if k in fields["budget"]]
+        wider = any(fields["budget"][k] > held.get(k, 0) for k in env.BUDGET_KEYS if k in fields["budget"])
+        lines.append({"field": "budget", "text": "up to " + ", ".join(names), "wider": wider})
+    if stop_span is not None:
+        lines.append({"field": "stop", "text": f"stop {_span_text(stop_span)} after it is signed", "wider": False})
+    return lines
+
+
+def _criterion_text(c: Mapping[str, Any]) -> str:
+    """One land criterion (one key, checked by the body's parse) as words: ``max_files 3``, ``paths src/, docs/``,
+    ``no_new_files``."""
+    (key, value), = c.items()
+    if value is True:
+        return key
+    return f"{key} {', '.join(value) if isinstance(value, list) else value}"
+
+
+def _effect_text(kind: str, e: Mapping[str, Any]) -> str:
+    if kind == "lands":
+        limits = [_criterion_text(c) for c in e.get("criteria", [])]
+        return f"{e['onto']} in {e['repo']} ({'limits: ' + ', '.join(limits) if limits else 'no limits'})"
+    if kind == "pushes":
+        return f"{e['branch']} on {e['remote']} ({e['url']}) from {e['repo']}"
+    return " ".join(str(e.get(k)) for k in ("package", "version", "index") if e.get(k) is not None) or "a package"
+
+
+def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, token: object = None) -> Draft:
+    """``spec/1``: a drop whose words are the CLI's envelope spec (a member of the thread, or newer than the series;
+    the cite check holds the bound) sets every field the spec names, read through :func:`parse_spec` with the drop's own
+    source; every other value and its cites carry over from the parent revision. Free words are not a spec and are
+    refused (they wait for a translator that writes through :func:`revise`)."""
     with read_transaction(store._connect) as conn:
         drop = store._must_drop(conn, drop_id)
         observed = _observed(store, conn, thread_id)
-    try:
-        spec = json.loads(drop.words)
-    except ValueError:
-        raise CoordError(f"drop {drop_id} is not an envelope spec: its words are not JSON") from None
-    if isinstance(spec, dict) and env.LAUNCH_LIST in spec:
-        # the CLI's spec takes the grant; a draft never carries one (ed.check_proposal), so it is refused, never dropped
-        raise CoordError(f"drop {drop_id} names launches: {ed._NO_LAUNCH_DRAFT}")
-    if not isinstance(spec, dict) or not spec or not set(spec) <= _DRAFT_SPEC_KEYS:
-        raise CoordError(f"drop {drop_id} is not an envelope spec: a JSON object with keys among "
-                         f"{sorted(_DRAFT_SPEC_KEYS)}")
-    stop_span = cli._parse_stop(spec["stop"]) if "stop" in spec and isinstance(spec["stop"], str) else None
-    if "stop" in spec and stop_span is None:
-        raise CoordError('stop is a duration text like "2h"')
-    body = cli._spec_body({k: v for k, v in spec.items() if k != "stop"}, drop.words, drop.source, store)
-    fields = {k: body[k] for k in _EDIT_SPEC if k in spec}
-    named = [*fields, *(["stop_at"] if stop_span is not None else [])]
+    fields, named, stop_span = parse_spec(drop.words, drop.source, store, subject=f"drop {drop_id}")
     cites = [{"field": k, "kind": "drop", "ref": drop.drop_id, "digest": drop.words_sha256} for k in named]
     return _rule_write(store, thread_id, fields, cites, by=by, token=token, stop_span=stop_span,
                        expect=(drop.drop_id, drop.words_sha256), observed=observed)

@@ -289,8 +289,11 @@ def test_ensure_is_idempotent_and_adds_only_its_own_objects(store, qdir):
     room.ensure(c)
     room.ensure(c)
     after = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
-    assert before < after and {"room_events", "drop_proposals", "proposal_events", "drop_notes"} <= after - before
-    assert all(n.split("_")[0] in ("room", "drop", "proposal", "sqlite") for n in after - before if not n.startswith("sqlite_"))
+    assert before < after and {"room_events", "drop_proposals", "proposal_events", "drop_notes", "spec_proposals",
+                               "spec_card_taps"} <= after - before
+    # "spec": the envelope card's two tables (H1-4 shape A), the one prefix this module's objects gained
+    assert all(n.split("_")[0] in ("room", "drop", "proposal", "spec", "sqlite") for n in after - before
+               if not n.startswith("sqlite_"))
 
 
 # --- L3 r1 fixes ---------------------------------------------------------------------------------------------------

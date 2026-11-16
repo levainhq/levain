@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from levain.desk import chat, room, room_launch, room_readguard
+from levain.desk import chat, room, room_host, room_launch, room_readguard
 from levain.desk.chat import ChatService, ChatStore, liveness
 from levain.desk.claude_session import ROOM_MCP_TOOL, room_host_argv
 from levain.desk.driver import LivenessEvidence
@@ -65,7 +65,8 @@ def out(f):
     f.setdefault("session_id", sid); f.setdefault("uuid", str(uuid.uuid4()))
     sys.stdout.write(json.dumps(f) + "\n"); sys.stdout.flush()
 def init():
-    tools = ["Task", "Bash", "Edit", "Read", "Skill", "WebSearch", "Write", "mcp__levain_room__propose_drop"]
+    tools = ["Task", "Bash", "Edit", "Read", "Skill", "WebSearch", "Write", "mcp__levain_room__propose_drop",
+             "mcp__levain_room__propose_envelope"]
     if mode == "no_bash": tools.remove("Bash")
     servers = [{{"name": "levain_room", "status": "connected"}}]
     if mode == "two_servers": servers.append({{"name": "iterm-mcp", "status": "connected"}})
@@ -153,7 +154,7 @@ def build(tmp_path, profile="default"):
     cwd.mkdir()
     home.mkdir()
     prof = make_profile(tmp_path) if profile == "default" else profile
-    svc = ChatService(cs, probe=make_probe(cs, profile=prof), tripwires=make_tripwires(cs, profile=prof),
+    svc = ChatService(cs, probe=make_probe(cs, door_names=room_host.door_tools(None), profile=prof), tripwires=make_tripwires(cs, profile=prof),
                       sleep=lambda _s: None,
                       **({"room_permission_mode": prof.permission_mode} if prof is not None else {}))
     return {"store": store, "cs": cs, "thread": thread, "svc": svc, "fake": fake, "cwd": cwd, "home": home,
@@ -404,7 +405,7 @@ def test_the_digest_is_the_host_policy_and_equal_across_two_launches(world):
     sha = hashlib.sha256((world["tmp"] / "host_guard.py").read_bytes()).hexdigest()
     a = containment_digest(settings, "", None, profile=world["profile"], hook_sha256=[sha])
     assert digests(world) == [a, a]                                         # one policy, both launches
-    policy = host_policy(world["profile"], settings_json=settings, hook_sha256=[sha], door=["propose_drop"])
+    policy = host_policy(world["profile"], settings_json=settings, hook_sha256=[sha], door=list(room_host.door_tools(None)))
     assert a == hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -462,7 +463,8 @@ def test_a_host_digest_needs_one_hook_sha_per_hook(world):
 
 # --- the probe, the tripwire context, the mode ------------------------------------------------------------------------
 BYPASS_INIT = {"permissionMode": BYPASS, "cwd": "/w", "tools": ["Bash", "Read", "Edit", "Write", "Glob", "TodoWrite",
-                                                               "mcp__levain_room__propose_drop"],
+                                                               "mcp__levain_room__propose_drop",
+                                                               "mcp__levain_room__propose_envelope"],
                "mcp_servers": [{"name": "levain_room", "status": "connected"}], "claude_code_version": "2.1.323"}
 
 
@@ -522,7 +524,7 @@ def test_a_service_expecting_dontask_latches_a_host_room(tmp_path):
     w = build(tmp_path)
     try:
         w["svc"].close()
-        w["svc"] = ChatService(w["cs"], probe=make_probe(w["cs"], profile=w["profile"]),
+        w["svc"] = ChatService(w["cs"], probe=make_probe(w["cs"], door_names=room_host.door_tools(None), profile=w["profile"]),
                                tripwires=make_tripwires(w["cs"], profile=w["profile"]), sleep=lambda _s: None)
         with pytest.raises(RoomLaunchError, match="turned off by its own open check"):
             launcher(w).ensure()                                              # the mode line latches the open itself
