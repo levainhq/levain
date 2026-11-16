@@ -34,7 +34,7 @@ def test_the_document_lists_the_rule_order_of_the_table():
 
 def test_the_document_names_every_audit_kind_and_only_those():
     text = _section("7. The board and the audit")
-    named = set(re.findall(r"`(unknown|landed_not_closed|gate_expired|unattributed_work|unknown_id_in_trailer)`", text))
+    named = set(re.findall(r"`(unknown|landed_not_closed|gate_expired|unattributed_work|unknown_id_in_trailer|prose_done)`", text))
     assert named == set(bs.AUDIT_KINDS)
 
 

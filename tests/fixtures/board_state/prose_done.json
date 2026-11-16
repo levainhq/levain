@@ -1,0 +1,152 @@
+{
+ "about": "A document/run item whose `done` is prose, not a path (docs/ready-schema-v2.md section 7, `prose_done`).",
+ "cases": [
+  {
+   "audit": [
+    [
+     "prose_done",
+     "flow#7"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "the reader can run it and sees a green board": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-16T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "flow#7"
+      ],
+      "date": "2026-11-16T12:00:00Z",
+      "items": [],
+      "sha": "0000000000000000000000000000000000000007"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "flow#7": {
+     "column": "backlog",
+     "reason_contains": "commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-16T10:00:00Z\", \"by\": \"t\", \"depends_on\": [], \"done\": \"the reader can run it and sees a green board\", \"done_kind\": \"document\", \"id\": \"flow#7\", \"op\": \"add\", \"origin\": \"o\", \"repo\": \"flow\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "prose_done: a document item whose done is a sentence, with a closing trailer on main, is named",
+   "now": "2026-11-16T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "prose_done",
+     "flow#7"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "the reader can run it and sees a green board": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-16T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "flow#7"
+      ],
+      "date": "2026-11-16T12:00:00Z",
+      "items": [],
+      "sha": "0000000000000000000000000000000000000007"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "flow#7": {
+     "column": "backlog",
+     "reason_contains": "commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-16T10:00:00Z\", \"by\": \"t\", \"depends_on\": [], \"done\": \"the reader can run it and sees a green board\", \"done_kind\": \"run\", \"id\": \"flow#7\", \"op\": \"add\", \"origin\": \"o\", \"repo\": \"flow\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "prose_done: a run item whose done is a sentence is named the same way",
+   "now": "2026-11-16T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "flow#7"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "docs/x.md": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-16T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "flow#7"
+      ],
+      "date": "2026-11-16T12:00:00Z",
+      "items": [],
+      "sha": "0000000000000000000000000000000000000007"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "flow#7": {
+     "column": "backlog",
+     "reason_contains": "commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-16T10:00:00Z\", \"by\": \"t\", \"depends_on\": [], \"done\": \"docs/x.md\", \"done_kind\": \"document\", \"id\": \"flow#7\", \"op\": \"add\", \"origin\": \"o\", \"repo\": \"flow\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "prose_done: a document item whose done is a real path stays landed_not_closed",
+   "now": "2026-11-16T20:00:00Z"
+  }
+ ]
+}

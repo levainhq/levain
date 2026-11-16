@@ -154,7 +154,7 @@ def test_state_column_audit_sets_are_the_declared_ones():
     assert len(bs.STATES) == 13 and bs.STATES[-1] == "unknown"
     assert set(bs.STATE_COLUMN.values()) == set(bs.COLUMNS)
     assert bs.COLUMNS == ("off", "done", "needs_you", "waiting", "running", "backlog", "ready", "unknown")
-    assert bs.AUDIT_KINDS == ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer")
+    assert bs.AUDIT_KINDS == ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer", "prose_done")
     assert bs.MAX_EVIDENCE_AGE_S == 21600 and bs.FUTURE_SKEW_S == 300
 
 

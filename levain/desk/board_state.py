@@ -70,7 +70,7 @@ STATE_COLUMN: dict[str, str] = {
 }
 STATES = tuple(STATE_COLUMN)
 COLUMNS = tuple(dict.fromkeys(STATE_COLUMN.values()))
-AUDIT_KINDS = ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer")
+AUDIT_KINDS = ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer", "prose_done")
 _DECISION_STATE = {"cut": "cut", "parked": "parked", "out-of-1.0": "out_of_1_0"}
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+")
@@ -962,6 +962,26 @@ def _landed(ctx: _Ctx, item: Item) -> tuple[int, MainCommit] | None:
     return (len(touched), max(touched, key=_commit_key)) if touched else None
 
 
+#: The ONE definition of "looks like a path" for a ``document``/``run`` item's ``done``: no whitespace, and either a "/" or
+#: a file extension (a dot, then 1-8 letters or digits, at the very end, after at least one other character).
+_PATH_LIKE = re.compile(r"(?=\S+\Z)(?:\S*/\S*|\S*[^\s.]\.[A-Za-z0-9]{1,8})\Z")
+
+
+def looks_like_path(text: str) -> bool:
+    return bool(_PATH_LIKE.fullmatch((text or "").strip()))
+
+
+def _prose_done_why(item: Item, state: str) -> str | None:
+    """Why a ``document``/``run`` item's closing evidence can never be met (its ``done`` is a sentence, not a path), or
+    None. A closed or decided item is never named (it has its own evidence or ruling)."""
+    done = (item.done or "").strip()
+    if item.done_kind not in ("document", "run") or not done or looks_like_path(done):
+        return None
+    if state in ("done", "cut", "parked", "out_of_1_0"):
+        return None
+    return f"{item.done_kind} item whose done is prose, not a path: nothing can close it; amend done to the path, or the kind to merged or band"
+
+
 def _landed_why(count: int, last: MainCommit) -> str:
     return f"{count} commits on main, last {_short(last.sha)}; close it or name what remains"
 
@@ -1132,6 +1152,8 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
         landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
         if old:                         # a live state beside an expired gate keeps its state; the gate is the one entry
             audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
+        elif prose := _prose_done_why(folded.items[s.id], s.state):    # prose_done: in place of landed_not_closed, which it explains
+            audit.append(AuditEntry("prose_done", s.id, prose))
         elif s.state == "landed_not_closed":
             audit.append(AuditEntry("landed_not_closed", s.id, s.reason))
         elif landed:                    # rule 6 was ruled out only by an orphan branch: the state follows rules 7-8, the audit still says it
