@@ -4452,7 +4452,10 @@ class _Handler(GuardedHandler):
             if speak:
                 return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=self._room_directory(directory),
                                            question_store=getattr(srv, "question_store", None),
-                                           desk_port=srv.desk_port, **common)
+                                           # levain#80: a desk reply is re-read through the Desk port under the Desk
+                                           # view's own read gate (desk_gate), the slot desk.json takes
+                                           desk_port=getattr(srv, "desk_port", None),
+                                           desk_gate=getattr(srv, "desk_gate", None), **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:

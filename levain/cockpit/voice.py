@@ -94,9 +94,13 @@ SAMPLE_KEYS = frozenset({"sample", "provider", "voice", "speed"})
 # V1-7: a Needs-you card read aloud. The page names the card (``question:<n>``); the words are card_script's, built from the
 # filed question, never from the body.
 CARD_KEYS = frozenset({"card_id", "chunk", "provider", "voice", "speed"})
-# levain#80: a Desk reply read aloud. The page names the desk thread and the event's time; the words are the desk host's own
-# event for that pair (re-read through the Desk port), never the body's.
-DESK_KEYS = frozenset({"desk_thread_id", "desk_at", "chunk", "provider", "voice", "speed"})
+# levain#80: a Desk reply read aloud. The page names the desk thread, the event's time and the cursor its batch was read after
+# (null: the thread's first read); the words are the desk host's own reply event, re-read through the Desk port in ONE read
+# from that cursor, never the body's. The Desk port's events carry no id of their own, so (thread, after, at) is the key.
+DESK_KEYS = frozenset({"desk_thread_id", "desk_at", "desk_after", "chunk", "provider", "voice", "speed"})
+# the Desk port's own bounds on a time string and a cursor (levain.desk.desk_port: _AT_MAX, _CURSOR); the port checks the shapes
+_DESK_FIELD_MAX = 64
+_DESK_THREAD_MAX = 200
 SAMPLE_WORDS = "This is how your room will sound."
 LAST_READ_STATES = frozenset({"keychain_unreadable", "unusable", "refused", "authority_unreadable"})
 
@@ -197,9 +201,14 @@ WORDS = {
     "bad_room": "The request names the room thread the page shows (room_thread_id).",
     "no_room": "No conversation is recorded.",
     "room_rotated": "This conversation was replaced; nothing more is read from it.",
-    "bad_desk": "desk_thread_id and desk_at name the desk reply by its thread and its time.",
+    "bad_desk": ("desk_thread_id, desk_at and desk_after name the desk reply: its thread, its time and the cursor the page "
+                 "read it after (null for a thread's first read)."),
     "no_desk": "No desk is wired here.",
-    "desk_unreadable": "The desk record could not be read.",
+    "desk_busy": "The desk is answering other reads; try again in a moment.",
+    "desk_unreadable": "The desk could not be read just now. Reading uses the on-device voice.",
+    "desk_moved": "The desk no longer returns that reply where this page read it. Reading uses the on-device voice.",
+    "desk_ambiguous": ("Two desk replies with different words share that time, and the server does not pick one. Reading "
+                       "uses the on-device voice."),
     "card_unreadable": "The card record could not be read.",
     "room_unreadable": "The room record could not be read.",
     "not_a_reply": "That reply is not finished, or is not in this conversation.",
@@ -668,9 +677,11 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
             if not isinstance(req["card_id"], str) or not card_script.CARD_ID.fullmatch(req["card_id"]):
                 return None, refusal(400, "bad_request", "bad_card")
         elif desk:
-            for k in ("desk_thread_id", "desk_at"):
-                if not isinstance(req[k], str) or not req[k] or len(req[k]) > 200:
-                    return None, refusal(400, "bad_request", "bad_desk")
+            thread, at, after = req["desk_thread_id"], req["desk_at"], req["desk_after"]
+            if (not isinstance(thread, str) or not thread or len(thread) > _DESK_THREAD_MAX
+                    or not isinstance(at, str) or not at or len(at) > _DESK_FIELD_MAX
+                    or (after is not None and (not isinstance(after, str) or not after or len(after) > _DESK_FIELD_MAX))):
+                return None, refusal(400, "bad_request", "bad_desk")
         elif isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
             return None, refusal(400, "bad_request", "bad_reply")
         chunk = req["chunk"]
@@ -687,10 +698,11 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
 def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | str,
           revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
           read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
-          question_store: Any = None, desk_port: Any = None) -> Answer:
+          question_store: Any = None, desk_port: Any = None, desk_gate: Any = None) -> Answer:
     """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. A body naming
     ``card_id`` (``question:<n>``) instead reads that filed question as the card script (V1-7, ``question_store``: the words
-    are :mod:`card_script`'s over the filed question). The words
+    are :mod:`card_script`'s over the filed question). A body naming ``desk_thread_id`` reads the Desk port's own reply event
+    (levain#80, :func:`_desk_chunks`), holding a slot of ``desk_gate`` (the Desk view's read gate) for its one read. The words
     are only the record's (``reply_text`` over the open room's stream, then ``speakable``); a body naming any other key
     is refused. ``directory`` is the store directory the room is read from; ``revoke_queue`` the grant routes' queue
     (:func:`revoke_refusal`). Both keyword-only, like :func:`transcribe`'s: two paths never swap by position."""
@@ -702,7 +714,7 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
         chunks = [SAMPLE_WORDS]
     else:
         chunks, refused = (_card_chunks(question_store, req) if "card_id" in req
-                           else _desk_chunks(desk_port, req) if "desk_thread_id" in req
+                           else _desk_chunks(desk_port, desk_gate, req) if "desk_thread_id" in req
                            else _reply_chunks(directory, service, req))
         if refused is not None or chunks is None:
             return refused or internal_answer()
@@ -745,21 +757,36 @@ def _reply_chunks(directory: Path | str, service: Any, req: dict[str, Any]) -> t
     return chunks, None
 
 
-def _desk_chunks(port: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
-    """The speakable chunks of the desk's reply the request names (its thread and the event's time), or the refusal. The words
-    are the desk host's event, re-read here: only an event the desk itself wrote as a reply is ever read."""
+def _desk_chunks(port: Any, gate: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
+    """The speakable chunks of the desk's reply the request names, or the refusal. The words are the desk host's event,
+    re-read here: only an event the Desk port returns as ``by == "desk"``, ``kind == "reply"`` is ever read.
+
+    ONE port read per request, from the cursor the page read the reply after (``desk_after``; None for a thread's first
+    read). The host's events are paged by size, oldest first (flow's desk_events.py), so the first page after that cursor is
+    the batch the page drew the reply from; a read from the thread's start would miss every reply past its first page. The
+    read holds a ``gate`` slot, the one the Desk view's own reads take (503 at once when none is free), so a speak can never
+    run more host commands at once than the Desk view can. The events carry no id; ``at`` is to the second, so two replies
+    may share it: the same words are read, different words are refused (``desk_ambiguous``), never one picked. Every
+    refusal the page can do nothing about (moved, ambiguous, unreadable) carries the on-device fallback: the page reads the
+    words it drew on this device, and nothing is sent."""
     if port is None:
         return None, refusal(404, "not_found", "no_desk")
+    if gate is None or not gate.acquire(blocking=False):
+        return None, refusal(503, "desk_busy", "desk_busy")
     try:
-        batch = port.events(req["desk_thread_id"], None)
+        batch = port.events(req["desk_thread_id"], req["desk_after"])
         if not batch.readable:
-            return None, refusal(404, "not_a_reply", "not_a_reply")
-        texts = [e.text for e in batch.events if e.by == "desk" and e.kind == "reply" and e.at == req["desk_at"] and e.text]
+            return None, refusal(503, "desk_unreadable", "desk_unreadable", fallback=True)
+        texts = {e.text for e in batch.events if e.by == "desk" and e.kind == "reply" and e.at == req["desk_at"] and e.text}
     except Exception:            # noqa: BLE001 - a desk that cannot be read is fixed words, never its detail
-        return None, refusal(500, "internal", "desk_unreadable")
-    if len(texts) != 1:          # none, or the time names two events: nothing is guessed
-        return None, refusal(404, "not_a_reply", "not_a_reply")
-    chunks = speakable(texts[0])
+        return None, refusal(503, "desk_unreadable", "desk_unreadable", fallback=True)
+    finally:
+        gate.release()
+    if not texts:
+        return None, refusal(404, "desk_moved", "desk_moved", fallback=True)
+    if len(texts) > 1:           # one time names replies with different words: nothing is guessed
+        return None, refusal(409, "desk_ambiguous", "desk_ambiguous", fallback=True)
+    chunks = speakable(next(iter(texts)))
     if not chunks:
         return None, refusal(404, "nothing_to_read", "nothing_to_read")
     if not req["chunk"] < len(chunks):
