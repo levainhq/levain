@@ -583,6 +583,7 @@ def test_a_receipt_poll_on_an_idle_stale_reading_says_not_read_yet_never_the_old
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline and port._ctx_busy:
         time.sleep(0.05)
+    assert not port._ctx_busy, "the background context refresh did not finish"
     assert port.context(block=False).tokens == 1_012
 
 
