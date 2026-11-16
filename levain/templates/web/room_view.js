@@ -261,8 +261,6 @@
   var LONG_LINE = 20000;
   // the bounds on a whole reply drawn by the markdown renderer: total characters and line count (a longer one is drawn plain)
   var MAX_TOTAL = 200000, MAX_LINES = 4000;
-  // the words the Start desk control hands the signing sheet (the relay reads the first word and an optional shape)
-  var DESK_WORDS = "/fanin broad";
   function closeBold(s, from) {
     var eol = s.indexOf("\n", from);
     if (eol < 0) eol = s.length;
@@ -604,17 +602,6 @@
     note.setAttribute("role", "status");
     actions.className = "rv-actions rv-slot";           // Send and Stop share this one slot (Stop while a reply runs and the draft is empty)
     actions.appendChild(stopB); actions.appendChild(sendB);
-    // Start the desk: the room cannot sign, and a room-committed card is unsigned by construction, so a desk is started only from the
-    // cockpit's own signing sheet. This control opens that sheet (the page's LevainSignSheet.openDrop) with the start words filled in;
-    // the passkey tap there is the signature, and the words stay his to edit (the other shape is one word away). Drawn only where the
-    // page carries the sheet.
-    var deskB = null;
-    if (opts.desk !== false && root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function") {
-      deskB = el(doc, "button", "rv-desk", "Start desk");
-      deskB.setAttribute("type", "button"); deskB.setAttribute("title", "Open the signing sheet to start a desk: " + DESK_WORDS);
-      deskB.setAttribute("aria-label", "Start a desk (opens the signing sheet)");
-      top.appendChild(deskB);
-    }
     var rotB = null;
     if (opts.rotate !== false) {
       rotB = el(doc, "button", "rv-rotate", "New");
@@ -762,12 +749,6 @@
         last = ""; return pull();
       }).catch(function () { note.textContent = "The stop could not be sent: the server could not be reached."; })
         .then(function () { flight.stop = false; paintDock(); });
-    });
-    if (deskB) deskB.addEventListener("click", function () {
-      var S = root.LevainSignSheet, got = null;
-      try { got = S && S.openDrop(DESK_WORDS); } catch (e) { got = null; }
-      note.textContent = got ? "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk inside limits; its Send words only button starts it with no limits; nothing starts until you press one of them."
-                             : "The signing sheet did not open, so no desk was started.";
     });
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
