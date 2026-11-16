@@ -18,7 +18,7 @@ from typing import Any
 from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.desk import lease as _leases
-from levain.desk import seam_arrival, seam_handoffs, seam_open
+from levain.desk import dream_status, seam_arrival, seam_handoffs, seam_open
 from levain.desk.seam import _trim, open_brief, verbose_lines
 from levain.desk.seam_build import build
 from levain.desk.store import CoordError, StoreAbsent
@@ -172,6 +172,21 @@ def _readonly_text(store: Any, args: argparse.Namespace, kind: str | None = None
     return brief.text, brief
 
 
+def _dream_notes(store: Any, launch: Any) -> list[str]:
+    """A running desk's one dream-seam line (:func:`levain.desk.dream_status.seam_note`): a dream saved memory after
+    this launch started. A READ: it tells, it never rotates. A read that fails is named, never read as nothing to say."""
+    started = getattr(launch, "at", None)
+    if not started:
+        return []  # no start stamp to compare a save against: nothing to say, and no standing line each open
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            recs = dream_status.records(conn)
+        note = dream_status.seam_note(recs, started, _lv(launch), _tail(store))
+    except Exception as exc:  # noqa: BLE001 - named, and the open itself stands
+        return [f"Dream seam: cannot-derive ({type(exc).__name__}: {_trim(unshowable.mark(str(exc), allow=''), 160)})"]
+    return [] if note is None else [note]
+
+
 def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     light = bool(getattr(args, "light", False))
     gap_hours = getattr(args, "gap_hours", None)
@@ -198,6 +213,7 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
         built = _own_launch_build(store, launch)
         # a verified leave is consumed whenever an open runs; its open comes before a stale one already acknowledged
         arrivals, arrival_notes = seam_arrival.ingest_leaves(store, args.queue_dir, args.token)
+        arrival_notes = [*arrival_notes, *_dream_notes(store, launch)]
         waiting = [b for b in arrivals if not seam_arrival.is_acked(store, b.open_id)]
         if waiting and (built is None or seam_arrival.is_acked(store, built.open_id)):
             built = waiting[0]
@@ -233,9 +249,9 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
                 and handoff.writer == launch.session_key):
             note = (f"a desk cannot acknowledge its own handoff (this launch wrote handoff {handoff.handoff_id}): "
                     "printed read-only; the desk after you opens it")
-        elif built is None and handoff is not None and handoff.seam_kind == "rotation":
-            built = build(store, kind="rotation", signal_kind="rotation", signal_key=str(handoff.handoff_id),
-                          queue_dir=args.queue_dir, token=args.token)
+        elif built is None and handoff is not None and handoff.seam_kind in ("rotation", "dream"):
+            built = build(store, kind=handoff.seam_kind, signal_kind=handoff.seam_kind,
+                          signal_key=str(handoff.handoff_id), queue_dir=args.queue_dir, token=args.token)
         if built is None and not note:
             note = ("no open is built for this launch and the latest handoff is "
                     f"{'absent' if handoff is None else handoff.seam_kind + ' (its builder is a later slice)'}: "

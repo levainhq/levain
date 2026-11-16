@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from levain.consent.questions import QuestionStore
-from levain.desk import seam, seam_build, seam_handoffs, seam_open
+from levain.desk import dream_status, seam, seam_build, seam_handoffs, seam_open
 from levain.desk.lease import LeaseRefused
 from levain.desk.store import CoordError, CoordStore
 from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
@@ -107,7 +107,7 @@ def test_an_empty_store(tmp_path):
     assert {"unsequenced rows", "unacknowledged opens", "board items", "undecided", "review queue items"} <= _empty(b.text)
     assert b.text.splitlines()[-1].endswith("; away: off")
     # what is not derived or built, and the scope, are coord open --verbose's: never in the body
-    assert f"Not built: {seam.NOT_BUILT}" in seam.verbose_lines() and "Not built" not in b.text
+    assert dream_status.DREAM_NOTE in seam.verbose_lines() and "Dream" not in b.text
     assert "Scope:" not in b.text and "Missing close" not in b.text
 
 

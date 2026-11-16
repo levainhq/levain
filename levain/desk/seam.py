@@ -23,7 +23,7 @@ that shows every row keeps nothing back. The unsequenced class is one line per t
 **A detail row names its row**: ``gseq N  table[:kind]  row id  who  label`` for the tables in :data:`DETAIL_FIELDS`
 (the label is the first line of its stored text, at most 60 characters), read in the same transaction as the counts.
 A section that is exactly its own "nothing here" line is folded into one ``Empty (0 each)`` line; a section that could
-not be read is never folded. What is not derived, what is not built and the read scope are :func:`verbose_lines`,
+not be read is never folded. What is not derived, how the Dream line is read and the read scope are :func:`verbose_lines`,
 printed by ``coord open --verbose`` and never part of the stored body.
 
 **One stored field is one line**: :func:`_clean` marks every C0, C1 and Unicode line separator, so no stored text can
@@ -59,21 +59,17 @@ from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
-from levain.desk import morning, ready, review, seam_classes
+from levain.desk import dream_status, morning, ready, review, seam_classes
 from levain.desk.seam_handoffs import _COLUMNS as _HANDOFF_COLUMNS, _counted_head, _row as _handoff_row
 from levain.desk.seam_open import BODY_CAP, SEAM_KINDS, acked_cursor, acked_cuts, open_tables_present
 from levain.desk.store import GSEQ_TABLES, CoordError, CoordStore, StoreAbsent
 from levain import unshowable
 from levain.dispatch import DispatchError
 
-__all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief", "verbose_lines"]
+__all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "open_brief", "verbose_lines"]
 
 #: the most Since detail rows one brief reads, whatever the byte cap leaves
 DETAIL_ROWS_MAX = 1000
-#: what this brief cannot tell a desk. An enabled dream writes the always-loaded memory text under live seats (D1-L1);
-#: what is not built is the part that gets a desk onto that text, so a running desk keeps the memory it loaded.
-NOT_BUILT = ("the dream seam (rotating a desk onto the memory a dream wrote) and memory freshness are not built: a "
-             "running desk keeps the memory it loaded")
 _LIST_LINES = 30           # a board, a band, a card: never the whole of a long one
 _LINE = 240
 
@@ -185,7 +181,7 @@ def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: 
         reason = _clean(_cap(exc, 200))
     why = "absent: there is no desk store here" if absent else f"cannot-derive: {reason}"
     text = "\n".join([f"SEAM OPEN {kind}, read {read_at}", f"store: {why}", "cursor: none (no cut was read)",
-                      _scope_line(read_at), f"Not built: {NOT_BUILT}"])
+                      _scope_line(read_at), dream_status.DREAM_UNREAD])
     return Brief(kind, text, read_at, 0, 0, None, degraded=f"store: {why}")
 
 
@@ -196,10 +192,10 @@ def _scope_line(read_at: str | None = None) -> str:
 
 
 def verbose_lines() -> list[str]:
-    """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived or not built, and the read
-    scope. Constant text, so a stored open needs nothing more to print them."""
+    """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived, how the Dream line is read,
+    and the read scope. Constant text, so a stored open needs nothing more to print them."""
     return ["Missing close: shown in the brief only when an away mark began an operator seam with no operator close "
-            "after it", f"Not built: {NOT_BUILT}", _scope_line()]
+            "after it", dream_status.DREAM_NOTE, _scope_line()]
 
 
 _UNSEQ_HEAD = "Unsequenced (rows written by an older release)"
@@ -282,6 +278,8 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     missing = _guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)
     if not (band_unread and missing[:1] and missing[0].startswith("Missing close: cannot-derive")):
         rest = [*rest, *missing]
+    # the dream's status is read in the same transaction; its failure is named and never degrades the brief
+    rest = [*rest, *_guard("Dream", lambda: dream_status.status_lines(dream_status.records(conn), now), failed)]
     head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
                                                     (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]
