@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from levain.desk import chat
+from levain.desk import chat, desk_context
 from levain.desk.chat_lease import check_owner
 from levain.desk.desk_port import (DESKCMD_ENV, DeskCommands, DeskPort, DeskPortError, HostCommandDeskPort, OutboxConflict,
                                    check_words)
@@ -122,7 +122,9 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
     events: list[dict[str, str]] = []
     cursor: str | None = None
     readable = True
-    context = _context_view(port, lease_view["state"])
+    # a poll that names a thread is the receipt path: its receipts never wait on the context command (it answers the reading held
+    # and refreshes it behind the request); the desk-alone poll is the one that runs it, at most once per the port's TTL
+    context = None if caps is None else _context_view(port, lease_view, block=thread is None)
     if thread is not None:
         try:
             batch = port.events(thread, after)
@@ -136,24 +138,34 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
     else:
         body = {"wired": True, "caps": caps, "lease": lease_view, "thread_id": thread, "events": events, "cursor": cursor,
                 "readable": readable}
-    if context is not None:
-        body["context"] = context
+        if context is not None:
+            body["context"] = context
     return 200, body
 
 
-def _context_view(port: DeskPort, lease_state: str) -> dict[str, Any] | None:
+def _context_view(port: DeskPort, lease_view: dict[str, Any], *, block: bool = True) -> dict[str, Any] | None:
     """The live desk's context for the read (levain#79): None when the port has no context command or no desk holds the lease (the
-    page draws no line); else ``{"state": "ok", tokens, soft, hard, model}`` or ``{"state": "unreadable"}``, never a zero for a
-    reading that could not be made. The tokens come from the desk session's transcript usage block (``levain.desk.desk_context``)."""
-    if lease_state != "held" or getattr(port, "has_context", False) is not True:
+    page draws no line); else ``{"state": "ok", tokens, soft, hard, model, holder}``, ``{"state": "none"}`` (a desk with no reading
+    yet) or ``{"state": "unreadable"}``, never a zero for a reading that could not be made. The tokens come from the desk session's
+    transcript usage block (``levain.desk.desk_context``). The lease and the context come from two host commands: when the context
+    says which desk its transcript belongs to (``holder``) and the lease names another, the context is not this desk's: unreadable."""
+    if lease_view["state"] != "held" or getattr(port, "has_context", False) is not True:
         return None
     try:
-        got = port.context()        # type: ignore[attr-defined]
+        try:
+            got = port.context(block=block)        # type: ignore[attr-defined]
+        except TypeError:       # a port whose context takes no ``block`` (a host's own): it is asked as it was
+            got = port.context()                   # type: ignore[attr-defined]
     except Exception:       # noqa: BLE001 - a context that cannot be read is not known: say so, never a 500 on a poll
         got = None
     if got is None:
         return {"state": "unreadable"}
-    return {"state": "ok", "tokens": got.tokens, "soft": got.soft, "hard": got.hard, "model": got.model}
+    who = getattr(got, "holder", None)
+    if who is not None and lease_view.get("holder") is not None and who != lease_view["holder"]:
+        return {"state": "unreadable", "holder": who}
+    if isinstance(got, desk_context.NoReading):
+        return {"state": "none", "why": got.why, "holder": who}
+    return {"state": "ok", "tokens": got.tokens, "soft": got.soft, "hard": got.hard, "model": got.model, "holder": who}
 
 
 # --- the write ----------------------------------------------------------------------------------------------------------

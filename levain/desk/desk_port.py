@@ -43,6 +43,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,7 @@ __all__ = ["ARMED_STATES", "Armed", "DELIVERY_OUTCOMES", "DESKCMD_ENV", "DeskCap
 DESKCMD_ENV = "LEVAIN_DESK_PORT_COMMANDS"
 # [seat] characters of words one post may carry by default; a host sets its own with ``words_max``
 WORDS_MAX = 2000
+CONTEXT_TTL = 3.0        # seconds a context reading (the host command's answer and the tail read) is shared between polls
 POST_OUTCOMES = ("accepted", "ambiguous", "not_delivered")
 LEASE_STATES = ("held", "none", "unknown")
 EVENT_BY = ("script", "desk")
@@ -393,6 +395,12 @@ class HostCommandDeskPort:
         self._wake = wake
         self._timeout = timeout
         self._lock = threading.Lock()
+        # the context reading: what is held and when, the last tail read by its transcript's stat, and the one-run-at-a-time locks
+        self._ctx_state = threading.Lock()
+        self._ctx_run = threading.Lock()
+        self._ctx_held: Optional[tuple[float, Any]] = None
+        self._ctx_key_view: Optional[tuple[Any, Any]] = None
+        self._ctx_busy = False
         self.capabilities()      # the adapter and wake are checked once, here
         self._ensure()
 
@@ -435,18 +443,70 @@ class HostCommandDeskPort:
         not be read); with none it draws no such line."""
         return self._cmds.context is not None
 
-    def context(self) -> Optional[desk_context.ContextView]:
-        """The live desk's context against its rotation lines, or None when it cannot be read (no command, the command failed or
-        named nothing usable, the transcript is gone or holds no usage record). Unreadable is never zero."""
+    def context(self, *, block: bool = True) -> Optional[desk_context.ContextView | desk_context.NoReading]:
+        """The live desk's context against its rotation lines: a ``ContextView``; a ``NoReading`` (the desk has made no turn yet, or
+        just compacted, or ``block`` is False and nothing has been read yet); None when it cannot be read (the command failed or named
+        nothing usable, the path is not a regular file, the transcript is gone). Unreadable is never zero.
+
+        The host command runs at most once per :data:`CONTEXT_TTL` seconds, whoever asks, and a poll never waits on it once a reading is
+        held: an aged reading is answered as it is while ONE background refresh runs for the next poll (so a reading is at most about
+        TTL plus one poll old). Only the very first ask with ``block`` True runs the command in the caller (concurrent first asks share
+        that one run); ``block`` False is the receipt path's, which never does: with nothing held it says ``NoReading("not read yet")``."""
         if self._cmds.context is None:
             return None
-        ran = room_host.run(self._cmds.context, "", (), timeout=self._timeout)
-        if not ran.started or ran.code != 0:
-            return None
-        named = desk_context.parse_command(ran.out)
-        if named is None:
-            return None
-        return desk_context.read_context(named[0], deep=named[1])
+        with self._ctx_state:
+            held = self._ctx_held
+            if held is not None and time.monotonic() - held[0] < CONTEXT_TTL:
+                return held[1]
+            if held is not None or not block:       # an aged reading is answered as it is and refreshed behind the request
+                if not self._ctx_busy:
+                    self._ctx_busy = True
+                    threading.Thread(target=self._refresh_context, daemon=True, name="desk-context").start()
+                return held[1] if held is not None else desk_context.NoReading("not read yet")
+        with self._ctx_run:                 # one run at a time: a waiter takes the reading the run it waited for left
+            with self._ctx_state:
+                held = self._ctx_held
+                if held is not None and time.monotonic() - held[0] < CONTEXT_TTL:
+                    return held[1]
+            return self._read_context_now()
+
+    def _refresh_context(self) -> None:
+        try:
+            with self._ctx_run:
+                self._read_context_now()
+        except Exception:       # noqa: BLE001 - a background refresh that failed leaves the held reading to age out
+            pass
+        finally:
+            with self._ctx_state:
+                self._ctx_busy = False
+
+    def _read_context_now(self) -> Optional[desk_context.ContextView | desk_context.NoReading]:
+        """Run the host's context command and read the transcript it names; keep the answer (a failure included) for the TTL. The
+        tail read is skipped when the transcript's path, mtime and size are those of the last read. Stderr on a command that exited
+        0 is ignored (:func:`levain.desk.room_host.run` keeps stdout when there is any), as the lease and events commands do."""
+        view: Optional[desk_context.ContextView | desk_context.NoReading] = None
+        try:
+            assert self._cmds.context is not None
+            ran = room_host.run(self._cmds.context, "", (), timeout=self._timeout)
+            named = desk_context.parse_command(ran.out) if ran.started and ran.code == 0 else None
+            if named is not None:
+                try:
+                    st = os.stat(named.path)
+                    key: Optional[tuple[Any, ...]] = (str(named.path), named.deep, named.holder, st.st_mtime_ns, st.st_size)
+                except OSError:
+                    key = None
+                with self._ctx_state:
+                    prev = self._ctx_key_view
+                if key is not None and prev is not None and prev[0] == key:
+                    view = prev[1]
+                else:
+                    view = desk_context.read_context(named.path, deep=named.deep, holder=named.holder)
+                    with self._ctx_state:
+                        self._ctx_key_view = (key, view) if key is not None else None
+        finally:
+            with self._ctx_state:
+                self._ctx_held = (time.monotonic(), view)
+        return view
 
     def events(self, thread_id: str, after: Optional[str] = None) -> EventBatch:
         if self._cmds.events is None:
@@ -593,15 +653,15 @@ class ScriptedDeskPort:
     def script_unreadable(self, flag: bool = True) -> None:
         self._unreadable = bool(flag)
 
-    def script_context(self, view: Optional[desk_context.ContextView]) -> None:
-        """Give the double a context command; ``view`` None is a context that cannot be read."""
+    def script_context(self, view: Optional[desk_context.ContextView | desk_context.NoReading]) -> None:
+        """Give the double a context command; ``view`` None is a context that cannot be read, a ``NoReading`` is a desk with none yet."""
         self._context_on, self._context = True, view
 
     @property
     def has_context(self) -> bool:
         return self._context_on
 
-    def context(self) -> Optional[desk_context.ContextView]:
+    def context(self, *, block: bool = True) -> Optional[desk_context.ContextView | desk_context.NoReading]:
         return self._context
 
     def capabilities(self) -> DeskCaps:
