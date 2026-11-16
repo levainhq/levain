@@ -10,7 +10,7 @@ and calls no ``open``.
 The flow, as events and commands:
 
   - events: :class:`Tick`, :class:`Cockpit`, :class:`Polled`, :class:`Listed`, :class:`Scanned`, :class:`Filed`,
-    :class:`Answer`, :class:`Delivered`, :class:`RunFailed`.
+    :class:`Pushed`, :class:`Answer`, :class:`Delivered`, :class:`RunFailed`.
   - commands: :class:`Poll`, :class:`ListGrants`, :class:`Scan`, :class:`File`, :class:`Push`, :class:`ReadAnswer`,
     :class:`Deliver`. ``Poll``, ``ListGrants`` and ``Deliver`` are root helper runs (``egress-refusals``,
     ``egress-grants-list``, ``egress-grant``); the flow has at most one in flight and a ``Deliver`` preempts a read
@@ -29,9 +29,15 @@ S4 adds no root admission authority. It adds a trusted proposer and delivery imp
 surface. Refusal provenance, card authorship, title, requester and the message's ``rp`` are not root-attested. The one
 open-card rule below protects the operator's attention; it grants no containment.
 
-THE ONE RULE (it replaces every cap): a card is filed only when no host card is open anywhere in the signing queue,
-:func:`open_card_scan`. A denied, removed-early or lapsed-twice host is never carded again this session; a host
-is carded again only after its own grant ran out.
+THE ONE RULE (it replaces every cap on cards): a card is filed only when no host card is open anywhere in the signing
+queue, :func:`open_card_scan`; the supervisor runs the scan and the filing under the queue's lock, so two sessions on
+one queue cannot both file. A denied, removed-early or lapsed-twice host is never carded again this session, nor is a
+host whose tapped card root refused or that could not be delivered in time or read; a host is carded again only after
+its own grant ran out, or after a filing the queue could not write.
+
+THE ONE BOUND ON WHAT THE AGENT DRIVES: it chooses which hosts are refused, so the flow keeps at most
+:data:`HOSTS_MAX` of them (a host past that is counted, never kept, and the end says how many) and repeats a full poll
+at once at most :data:`FULL_POLLS_MAX` times in a row. An event copies only the hosts it changes.
 
 THREE FRESHNESS BOUNDS (root's ``FRESH_S`` is measured from the message's ``issued``, not from the tap):
 
@@ -72,6 +78,8 @@ EMPTY_POLLS_SLOW = 3
 LIST_S = 30.0                       # the grants list
 SCAN_RETRY_S = 10.0                 # a scan that found an open card is not repeated sooner
 REFUSALS_HOSTS_MAX = 8              # egress_verbs.REFUSALS_HOSTS_MAX: a poll that returned this many polls again at once
+FULL_POLLS_MAX = 8                  # ...this many times in a row at most; then the next poll waits POLL_S
+HOSTS_MAX = 256                     # hosts the flow keeps; a refused host past this is counted, not kept
 LAPSES_MAX = 2                      # a card that lapsed twice is not raised a third time
 TITLE_HOST_MAX = 48                 # a longer host shows its last 48 characters, tail first (the part that owns the name)
 NOTES_MAX = 32                      # hosts named in the end-notes; the rest as a count
@@ -313,6 +321,14 @@ class Filed:
 
 
 @dataclass(frozen=True)
+class Pushed:
+    """The card's :class:`Push` was carried out: ``started`` is ``sender.spawn``'s answer (False: no ping child ran, so
+    neither a phone nor the notification center was told)."""
+    phone_live: bool
+    started: bool
+
+
+@dataclass(frozen=True)
 class Answer:
     """What the queue says of card ``rid`` now: ``open``, ``denied`` or ``signed`` (``payload`` is
     :func:`read_signed`'s result, None if the signed record is not usable)."""
@@ -331,8 +347,9 @@ class Delivered:
 
 @dataclass(frozen=True)
 class RunFailed:
-    """A run or a local action ended without an answer. ``verb`` is the helper verb or ``file``; ``name`` is the root
-    refusal name when root refused, None when the run crashed, timed out or was ended."""
+    """A run or a local action ended without an answer. ``verb`` is the helper verb, ``scan`` or ``file``; ``name`` is
+    the root refusal name when root refused, None when the run crashed, timed out or was ended. For ``file``, ``name``
+    :data:`RETRY` is a queue that could not be written (it may be writable later) and None a card that cannot be filed."""
     verb: str
     name: Optional[str] = None
 
@@ -441,17 +458,26 @@ class CardFlow:
     next_poll: float = 0.0
     next_scan: float = 0.0
     empty_polls: int = 0
+    full_polls: int = 0                # full polls repeated at once in a row
     seq: int = 0
-    pushed: Optional[bool] = None      # whether any card reached a live phone (None: none was filed)
+    pushed: Optional[bool] = None      # whether any started ping went to a live phone (None: no ping started)
+    push_failed: int = 0               # pings sender.spawn could not start
     poll_errors: Dict[str, int] = field(default_factory=dict)
-    cards_filed: int = 0
+    untracked: int = 0                 # refusals that named a host past HOSTS_MAX
 
     # -- the reducer ---------------------------------------------------------------------------------------------
     def advance(self, event: object, wall: float, mono: float) -> Tuple["CardFlow", list[Command]]:
         """``(flow, commands)`` after ``event`` at wall time ``wall`` (epoch seconds, UTC: root's measure) and
         monotonic time ``mono``. Never mutates ``self``, never raises for an event it does not know, and returns no
-        command once the flow is off."""
-        new = copy.deepcopy(self)
+        command once the flow is off.
+
+        Copy-on-write: the new flow shares every host with ``self`` until it changes one (:meth:`_w` copies it
+        first), and copies the card and the error counts, which are small. ``live`` and ``prior`` are only ever
+        replaced, never changed in place."""
+        new = copy.copy(self)
+        new.hosts = dict(self.hosts)
+        new.poll_errors = dict(self.poll_errors)
+        new.card = copy.copy(self.card)
         cmds: list[Command] = []
         if isinstance(event, Cockpit):
             new.rp = event.rp
@@ -463,6 +489,8 @@ class CardFlow:
             new._scanned(event, wall, mono, cmds)
         elif isinstance(event, Filed):
             new._filed(event, mono, cmds)
+        elif isinstance(event, Pushed):
+            new._pushed(event)
         elif isinstance(event, Answer):
             new._answer(event, wall, mono, cmds)
         elif isinstance(event, Delivered):
@@ -482,6 +510,11 @@ class CardFlow:
         if self.off is None:
             self.off = why
 
+    def _w(self, host: str) -> _Host:
+        """Host ``host`` to change: a copy of the shared one, put in this flow's table first (copy-on-write)."""
+        h = self.hosts[host] = copy.copy(self.hosts[host])
+        return h
+
     def _polled(self, ev: Polled, wall: float, mono: float) -> None:
         if self.inflight == REFUSALS:
             self.inflight = None
@@ -493,16 +526,21 @@ class CardFlow:
             seen.append(host)
             self._saw(host, wall)
         self.empty_polls = 0 if ev.hosts else self.empty_polls + 1
-        if len(ev.hosts) >= REFUSALS_HOSTS_MAX:
+        if len(ev.hosts) >= REFUSALS_HOSTS_MAX and self.full_polls < FULL_POLLS_MAX - 1:
+            self.full_polls += 1
             self.next_poll = mono                           # a full poll: the rest is waiting, go again at once
         elif self.empty_polls >= EMPTY_POLLS_SLOW and self.card is None:
-            self.next_poll = mono + POLL_SLOW_S
+            self.full_polls, self.next_poll = 0, mono + POLL_SLOW_S
         else:
-            self.next_poll = mono + POLL_S
+            self.full_polls, self.next_poll = 0, mono + POLL_S
 
     def _saw(self, host: str, wall: float) -> None:
-        h = self.hosts.get(host)
-        if h is None:
+        if host in self.hosts:
+            h = self._w(host)
+        elif len(self.hosts) >= HOSTS_MAX:
+            self.untracked += 1
+            return
+        else:
             self.seq += 1
             h = self.hosts[host] = _Host(polls=0, seq=self.seq)
             if eg.never_grant(host):
@@ -518,22 +556,24 @@ class CardFlow:
             self.inflight = None
         self.listed_mono = mono
         now = datetime.fromtimestamp(wall, tz=timezone.utc)
-        if self.store is None:
-            self.store = ev.store
-        same = ev.store == self.store
         live = {host: expires for _g, host, expires, _c in ev.entries if expires > now}
-        if same:
-            # removed EARLY: the list answered ok, with the card's own store, a non-empty prior set held the host, and
-            # it is gone before its expiry (revoked or repaired: root's list cannot tell which)
-            for host, expires in self.prior.items():
-                h = self.hosts.get(host)
-                if self.prior and host not in live and expires > now and h is not None and h.state == GRANTED:
-                    h.state, h.outcome = REMOVED, "removed-early"
-            self.prior = dict(live)
+        if ev.store != self.store:
+            # root's store is new (the first list, or a repair made another): the next card names it, and the old
+            # store's prior set says nothing about this list, so nothing is read as removed from it
+            self.store, self.prior = ev.store, {}
+        # removed EARLY: the list answered ok, with the card's own store, a non-empty prior set held the host, and
+        # it is gone before its expiry (revoked or repaired: root's list cannot tell which)
+        for host, expires in self.prior.items():
+            h = self.hosts.get(host)
+            if host not in live and expires > now and h is not None and h.state == GRANTED:
+                h = self._w(host)
+                h.state, h.outcome = REMOVED, "removed-early"
+        self.prior = dict(live)
         self.live = live
         for host, expires in live.items():
             h = self.hosts.get(host)
             if h is not None and h.state in (WAITING, GRANTED):      # allowed already (another way, or by this card)
+                h = self._w(host)
                 h.state, h.expires = GRANTED, expires
 
     def _scanned(self, ev: Scanned, wall: float, mono: float, cmds: list[Command]) -> None:
@@ -552,13 +592,13 @@ class CardFlow:
             message = eg.build_message(self.store, grant, self.session, self.slot, c.host, issued,
                                        issued + timedelta(seconds=SESSION_DEADLINE_S), self.rp)
         except eg.GrantRefused:
-            h = self.hosts[c.host]
+            h = self._w(c.host)
             h.state, h.outcome = DEAD, "never"
             self.card = None
             return
         c.grant, c.message, c.issued, c.stage = grant, message, issued, "file"
         c.filed_mono = mono
-        self.hosts[c.host].state = CARDED
+        self._w(c.host).state = CARDED
         cmds.append(File(message, title(c.host, self.slot), CARD_TTL_S))
 
     def _filed(self, ev: Filed, mono: float, cmds: list[Command]) -> None:
@@ -567,16 +607,20 @@ class CardFlow:
             return
         c.rid, c.stage, c.phone_live, c.filed_mono = ev.rid, "open", ev.phone_live, mono
         c.next_answer = mono + ANSWER_POLL_S
-        self.cards_filed += 1
-        self.pushed = bool(ev.phone_live) if self.pushed is None else (self.pushed or bool(ev.phone_live))
         expires = c.issued + timedelta(seconds=CARD_TTL_S)
         cmds.append(Push(ev.rid, title(c.host, self.slot), push_body(c.host, self.slot, expires), bool(ev.phone_live)))
+
+    def _pushed(self, ev: Pushed) -> None:
+        if not ev.started:
+            self.push_failed += 1
+            return
+        self.pushed = bool(ev.phone_live) or bool(self.pushed)
 
     def _answer(self, ev: Answer, wall: float, mono: float, cmds: list[Command]) -> None:
         c = self.card
         if c is None or c.stage != "open" or ev.rid != c.rid:
             return
-        h = self.hosts[c.host]
+        h = self._w(c.host)
         c.read_since = None
         if ev.state == "open":
             if wall >= c.issued_ts + CARD_TTL_S:
@@ -608,7 +652,7 @@ class CardFlow:
         cmds.append(Deliver(dict(c.payload or {}), c.issued_ts + START_CUTOFF_S))
 
     def _dead(self, c: _Card, outcome: str, detail: str = "") -> None:
-        h = self.hosts[c.host]
+        h = self._w(c.host)
         h.state, h.outcome, h.detail = DEAD, outcome, detail
         self.card = None
         if self.inflight == GRANT:
@@ -620,7 +664,7 @@ class CardFlow:
             self.inflight = None
         if c is None or c.stage != "delivering":
             return
-        h = self.hosts[c.host]
+        h = self._w(c.host)
         if ev.name is None:
             r = ev.result or {}
             if r.get("grant") == c.grant and r.get("host") == c.host and r.get("choice") == (c.payload or {}).get("choice"):
@@ -642,7 +686,7 @@ class CardFlow:
             self._turn_off(words)
             self._dead(c, "skew", words)
         elif cls == FRESH:
-            self._dead(c, "clock", "the clock moved while the card was open (the laptop slept or was corrected)")
+            self._dead(c, *self._late(c, wall, mono))       # root's measure ran out: a moved clock, or a late start
         elif cls == UNENROLLED:
             self._dead(c, "unenrolled", words)
         elif ev.name == "egress-grant-used" and c.unknown:
@@ -675,7 +719,10 @@ class CardFlow:
         cls = refusal_class(name) if name is not None else None
         if verb == "file":
             c = self.card
-            if c is not None and c.stage == "file":
+            if c is not None and c.stage == "file" and name == RETRY:
+                self._w(c.host).state = WAITING             # the queue could not be written: nothing was asked of him
+                self.card, self.next_scan = None, mono + SCAN_RETRY_S
+            elif c is not None and c.stage == "file":
                 self._dead(c, "not-filed", "the card could not be filed")
             return
         if verb == "scan":
@@ -723,7 +770,7 @@ class CardFlow:
 
     def _lapsed(self, c: _Card) -> None:
         """Nobody tapped in time: the host goes to the back of the queue once, then is not carded again."""
-        h = self.hosts[c.host]
+        h = self._w(c.host)
         h.lapses += 1
         if h.lapses >= LAPSES_MAX:
             h.state, h.outcome = LAPSED, "lapsed"
@@ -750,10 +797,10 @@ class CardFlow:
             elif mono >= self.next_poll:
                 self.inflight = REFUSALS
                 cmds.append(Poll(self.cursor))
-        if (self.card is None and self.rp is not None and self.store is not None and mono >= self.next_scan
-                and self._next_host() is not None):
-            host = self._next_host()
-            self.card = _Card(host=str(host), grant="", message="", issued=datetime.fromtimestamp(wall, tz=timezone.utc),
+        host = (self._next_host() if self.card is None and self.rp is not None and self.store is not None
+                and mono >= self.next_scan else None)
+        if host is not None:
+            self.card = _Card(host=host, grant="", message="", issued=datetime.fromtimestamp(wall, tz=timezone.utc),
                               stage="scan")
             cmds.append(Scan())
 
@@ -790,12 +837,24 @@ class CardFlow:
             names = ", ".join(suppressed[:NOTES_MAX])
             more = f" and {len(suppressed) - NOTES_MAX} more" if len(suppressed) > NOTES_MAX else ""
             notes.append("no more cards for these hosts this session: " + names + more)
+        if self.untracked:
+            notes.append(f"{self.untracked} refusal(s) named a host past this session's limit of {HOSTS_MAX} hosts: "
+                         "those hosts were not kept and no card was filed for them")
         c = self.card
         if c is not None and c.stage in ("open", "file"):
             notes.append(f"host card for {c.host} was left open; it expires on its own and tapping it now does nothing")
-        if self.cards_filed:
+        elif c is not None and c.stage == "delivering" and (self.inflight == GRANT or c.unknown):
+            notes.append(f"host card for {c.host} was tapped and the session ended while root was being asked: the "
+                         "host may be allowed, check the host grants list")
+        elif c is not None and c.stage == "delivering":
+            notes.append(f"host card for {c.host} was tapped and the session ended before its delivery was tried "
+                         "again; no grant was made")
+        if self.pushed is not None:
             notes.append("host cards were pushed to your phone" if self.pushed else
                          "no phone was subscribed: the host cards waited in the cockpit's notification center")
+        if self.push_failed:
+            notes.append(f"the ping for {self.push_failed} host card(s) could not be started, so neither your phone "
+                         "nor the notification center was told; the card was filed in the signing queue")
         for name, n in sorted(self.poll_errors.items()):
             notes.append(f"reading root's host-grant state failed {n} time(s): {name}")
         return notes

@@ -1359,7 +1359,7 @@ class _CardLane:
         self._last = float("-inf")
         self._rp_at = float("-inf")
         self._rp_seen: object = object()
-        self._phone_failed = 0
+        self._qlock = -1                   # the sign queue's lock, held from a scan that found no open card to its filing
 
     # -- what the relay asks ---------------------------------------------------------------------------------------
     @property
@@ -1407,7 +1407,8 @@ class _CardLane:
             self._die(e)
 
     def end(self) -> None:
-        """The run in flight is ended (TERM, then KILL, reaped); never raises."""
+        """The run in flight is ended (TERM, then KILL, reaped) and the queue lock let go; never raises."""
+        self._unlock()
         run, self.run, self.pending = self.run, None, None
         if run is not None:
             try:
@@ -1421,9 +1422,6 @@ class _CardLane:
             out += self.flow.end_notes()
         except Exception as e:  # noqa: BLE001
             out.append(f"host cards: the end-of-session notes could not be written ({type(e).__name__})")
-        if self._phone_failed:
-            out.append(f"the push for {self._phone_failed} host card(s) could not be started: the card is in the "
-                       "cockpit's notification center")
         return out + self.extra
 
     # -- inside ----------------------------------------------------------------------------------------------------
@@ -1470,6 +1468,7 @@ class _CardLane:
                     self._do(cmd)
         finally:
             self._busy = False
+            self._unlock()                 # a scan's lock never outlives the feed it was taken in
 
     def _do(self, cmd: object) -> None:
         EC = self._events()
@@ -1487,7 +1486,7 @@ class _CardLane:
         elif isinstance(cmd, EC.File):
             self._todo.append(self._file(cmd))
         elif isinstance(cmd, EC.Push):
-            self._push(cmd)
+            self._todo.append(self._push(cmd))
         elif isinstance(cmd, EC.ReadAnswer):
             self._todo.append(self._read(cmd.rid))
 
@@ -1532,16 +1531,53 @@ class _CardLane:
         self._feed(ev)
 
     # -- local queue work ------------------------------------------------------------------------------------------
+    def _unlock(self) -> None:
+        fd, self._qlock = self._qlock, -1
+        if fd >= 0:
+            try:
+                os.close(fd)               # closing the descriptor lets the flock go
+            except OSError:
+                pass
+
+    def _lock(self) -> bool:
+        """The sign queue's own lock (``sign._queue_lock``'s file, ``<queue>/sign/.lock``), TRIED once, never waited
+        on: the relay does not block. False when another holder has it (a Signer answering, another session's scan
+        and filing): the scan then reads as "a card may be open" and is tried again later. OSError when the lock
+        cannot be taken at all."""
+        from levain.consent import sign
+
+        self._unlock()
+        d = sign.sign_dir(self.queue)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except BaseException:
+            os.close(fd)
+            raise
+        self._qlock = fd
+        return True
+
     def _scan(self) -> object:
         """:func:`egress_cards.open_card_scan` over the sign dir: only the ``lv-*.json`` files whose mtime is within the
         card ttl are read. More than ``sign._SCAN_MAX`` such names (nothing prunes the dir) is "a card may be open":
-        the rule fails toward no card, and the host is said at the end."""
+        the rule fails toward no card, and the host is said at the end.
+
+        The ONE RULE is check-then-act, and two sessions can share one queue, so the scan runs under the queue's lock
+        and a scan that found no card keeps it until the filing that follows in the same feed (:meth:`_feed` lets it
+        go at the end whatever happened): a second session's scan meanwhile finds the lock held and waits, and its
+        next scan sees the card. A held lock reads as "a card may be open": it fails toward no card."""
         from levain.consent import sign
 
         EC = self._events()
         wall = self.sup.s.wall()
         entries = []
         try:
+            if not self._lock():
+                return EC.Scanned(True)
             with os.scandir(sign.sign_dir(self.queue)) as it:
                 for de in it:
                     if _CARD_SCAN_NAME.fullmatch(de.name) is None:
@@ -1553,6 +1589,7 @@ class _CardLane:
                     if wall - mtime > EC.CARD_TTL_S:
                         continue
                     if len(entries) >= sign._SCAN_MAX:
+                        self._unlock()
                         return EC.Scanned(True)
                     rid = de.name[:-5]
                     try:
@@ -1560,11 +1597,13 @@ class _CardLane:
                     except (sign.SignRefused, OSError):
                         request = None
                     entries.append((de.name, mtime, request, sign.state_of(self.queue, rid)))
-        except FileNotFoundError:
-            return EC.Scanned(False)           # no sign dir yet: nothing is open
         except OSError:
+            self._unlock()
             return EC.RunFailed("scan")
-        return EC.Scanned(EC.open_card_scan(entries, wall))
+        found = EC.open_card_scan(entries, wall)
+        if found:
+            self._unlock()
+        return EC.Scanned(found)
 
     def _file(self, cmd: Any) -> object:
         from levain import webpush
@@ -1573,17 +1612,22 @@ class _CardLane:
         EC = self._events()
         try:
             rid = sign.file_levain_request(self.queue, EC.NAMESPACE, cmd.message, title=cmd.title, ttl_s=cmd.ttl_s)
-        except (ValueError, OSError, sign.SignRefused):
-            return EC.RunFailed("file")
+        except ValueError:
+            return EC.RunFailed("file")                  # this card can never be filed
+        except (OSError, sign.SignRefused):
+            return EC.RunFailed("file", EC.RETRY)        # the queue could not be written now: the host waits
+        finally:
+            self._unlock()
         try:
             live = bool(webpush.live(self.queue))
         except Exception:  # noqa: BLE001 - not knowing a phone is live only means the center carries the card
             live = False
         return EC.Filed(rid, live)
 
-    def _push(self, cmd: Any) -> None:
+    def _push(self, cmd: Any) -> object:
         """The ping is ALWAYS recorded (``sender.spawn``: the notification center's row, which is the fallback with no
-        phone), and pushed to phones only when one is live. Not ``spawn_sign_request``: that hard-codes ``push=True``."""
+        phone), and pushed to phones only when one is live. Not ``spawn_sign_request``: that hard-codes ``push=True``.
+        Whether its child started goes back to the flow, so the end never says a ping went where none was sent."""
         from levain.consent.cockpit_origin import read_origin
         from levain.consent.sign import deep_link
         from levain.webpush import sender
@@ -1597,8 +1641,7 @@ class _CardLane:
                                          "what": cmd.body.strip() or cmd.title, "sign_id": cmd.rid})
         except (ValueError, OSError):
             started = False
-        if not started:
-            self._phone_failed += 1
+        return self._events().Pushed(bool(cmd.phone_live), bool(started))
 
     def _read(self, rid: str) -> object:
         from levain.consent import sign

@@ -67,6 +67,8 @@ class World:
         self.poll_cap: int | None = None                   # stop executing after this many polls
         self.rid_n = 0
         self.polls = 0
+        self.file_fail: object = None                      # C.RETRY: the queue could not be written; "permanent"
+        self.push_starts = True                            # sender.spawn's answer
 
     # -- driving ---------------------------------------------------------------------------------------------------
     def step(self, event) -> None:
@@ -114,6 +116,9 @@ class World:
             self.step(C.Scanned(self.open_elsewhere or any(c["state"] == "open" and c["expires"] > self.wall
                                                            for c in self.queue.values())))
         elif isinstance(cmd, C.File):
+            if self.file_fail is not None:
+                self.step(C.RunFailed("file", None if self.file_fail == "permanent" else str(self.file_fail)))
+                return
             self.rid_n += 1
             rid = f"lv-{self.rid_n:032x}"
             self.files.append(cmd)
@@ -122,12 +127,15 @@ class World:
             self.step(C.Filed(rid, self.phone_live))
         elif isinstance(cmd, C.Push):
             self.pushes.append(cmd)
+            self.step(C.Pushed(cmd.phone_live, self.push_starts))
         elif isinstance(cmd, C.ReadAnswer):
             q = self.queue[cmd.rid]
             self.step(C.Answer(cmd.rid, q["state"], q["payload"]))
         elif isinstance(cmd, C.Deliver):
             self.calls.append(("grant", cmd.payload, cmd.start_by, self.wall))
             ans = self.grant_answers.pop(0) if self.grant_answers else None
+            if ans == "hang":
+                return                                     # still running when the session ends
             if ans == "timeout":
                 self.step(C.RunFailed(C.GRANT, None))
             elif ans is not None:
@@ -895,3 +903,128 @@ def test_the_push_is_one_per_card_and_never_for_a_retry():
     for _ in range(10):
         w.tick(10.0)
     assert len(w.pushes) == 1
+
+
+# --- L3 round 1 (levain#66 S4): what the agent can drive, and what the end says ---------------------------------------
+def _hosts(n: int, tag: str = "h") -> list[str]:
+    return [f"{tag}{i:05d}.example.org" for i in range(n)]
+
+
+def test_l3_the_host_table_is_bounded_and_the_hosts_past_it_are_counted_not_kept():
+    """codex HIGH 176 / complement MED 18: the agent chooses its hosts, so a distinct-host flood must not grow the
+    flow without bound. Past :data:`HOSTS_MAX` a refused host is counted, never kept, and the end says how many."""
+    flow = C.CardFlow(session=SESSION, slot=3, rp=RP)
+    flow, _ = flow.advance(C.Listed(STORE, ()), T0, 1000.0)
+    hosts = _hosts(C.HOSTS_MAX + 40)
+    for i in range(0, len(hosts), 8):
+        flow, _ = flow.advance(C.Polled(tuple(hosts[i:i + 8]), i), T0, 1000.0)
+    assert len(flow.hosts) == C.HOSTS_MAX
+    assert hosts[-1] not in flow.hosts and hosts[0] in flow.hosts
+    [line] = [n for n in flow.end_notes() if "were not kept" in n]
+    assert "40 refusal(s)" in line and str(C.HOSTS_MAX) in line
+    # a host already kept still counts its polls when the table is full
+    flow, _ = flow.advance(C.Polled((hosts[1],), 0), T0, 1000.0)
+    assert flow.hosts[hosts[1]].polls == 2
+
+
+def test_l3_an_event_copies_what_it_changes_and_shares_the_rest():
+    """codex HIGH 176: no whole-flow deep copy per tick. A Tick shares every host with the flow it was given; a poll
+    copies only the hosts it saw; the given flow is never changed (T23 still holds)."""
+    w = World(_hosts(64))
+    w.open_elsewhere = True
+    w.poll_cap = 8
+    w.tick(0.0)
+    before = w.flow
+    snap = repr(before)
+    after, _ = before.advance(C.Tick(), w.wall + 1, w.mono + 1)
+    assert all(after.hosts[h] is before.hosts[h] for h in before.hosts)
+    seen = _hosts(64)[0]
+    after, _ = before.advance(C.Polled((seen,), 0), w.wall + 1, w.mono + 1)
+    assert after.hosts[seen] is not before.hosts[seen] and after.hosts[seen].polls == before.hosts[seen].polls + 1
+    assert sum(after.hosts[h] is before.hosts[h] for h in before.hosts) == len(before.hosts) - 1
+    assert repr(before) == snap
+
+
+def test_l3_full_polls_go_again_at_once_only_up_to_a_burst_then_wait():
+    """complement MED 18: a full poll goes again at once (T11), but the agent cannot hold the root helper in a
+    back-to-back loop: after :data:`FULL_POLLS_MAX` full polls in a row the next waits :data:`POLL_S`."""
+    w = World([h for h in _hosts(400) for _ in range(2)])
+    w.open_elsewhere = True
+    w.tick(0.0)
+    assert w.polls == C.FULL_POLLS_MAX
+    w.tick(C.POLL_S - 0.5)
+    assert w.polls == C.FULL_POLLS_MAX
+    w.tick(0.5)
+    assert w.polls == 2 * C.FULL_POLLS_MAX
+
+
+def test_l3_a_store_root_lists_anew_is_the_one_the_next_card_names():
+    """complement LOW 46 / deepseek MED 104: root's store id changed mid-session (a repair). The flow adopts it, so the
+    next card is not one root must refuse ``egress-grant-store``, and no host is promoted from a list of a store the
+    flow does not use."""
+    w = booted(("first.example.org",))
+    w.deny()
+    w.tick(2.0)
+    w.store = "store-new12345"
+    w.tick(C.LIST_S)
+    w.log.append("second.example.org")
+    for _ in range(4):
+        w.tick(C.POLL_S)
+    assert w.filed_hosts()[-1] == "second.example.org"
+    assert eg.parse_signed(eg.signed_bytes(w.files[-1].message, "s")).store == "store-new12345"
+
+
+def test_l3_a_transient_filing_failure_leaves_the_host_waiting_and_a_permanent_one_does_not():
+    """codex MED 184: one OSError at filing (ENOSPC, an interrupted write) is not a verdict on the host."""
+    w = World(["files.example.org"])
+    w.file_fail = C.RETRY
+    w.settle(2)
+    assert w.files == [] and w.flow.hosts["files.example.org"].state == C.WAITING and w.flow.card is None
+    w.file_fail = None
+    w.tick(C.SCAN_RETRY_S)
+    assert w.filed_hosts() == ["files.example.org"]
+    w = World(["files.example.org"])
+    w.file_fail = "permanent"
+    w.settle(2)
+    assert w.flow.hosts["files.example.org"].state == C.DEAD
+    assert w.flow.hosts["files.example.org"].outcome == "not-filed"
+
+
+def test_l3_a_delivery_cut_off_by_the_end_of_the_session_is_said():
+    """complement LOW 33 / codex MED 180: he tapped and the session ended while the delivery ran or waited."""
+    w = booted()
+    w.tap()
+    w.grant_answers = ["hang"]
+    w.tick(2.0)
+    assert w.flow.card is not None and w.flow.card.stage == "delivering"
+    [line] = [n for n in w.flow.end_notes() if "files.example.org" in n]
+    assert "may be allowed" in line and "check the host grants list" in line
+    w = booted()
+    w.tap()
+    w.grant_answers = ["egress-grant-not-active"]                  # retryable: it waits for its second attempt
+    w.tick(2.0)
+    assert w.flow.card is not None and w.flow.card.stage == "delivering" and w.flow.card.retry_at is not None
+    [line] = [n for n in w.flow.end_notes() if "files.example.org" in n]
+    assert "no grant was made" in line and "may be allowed" not in line
+
+
+def test_l3_a_push_that_never_started_is_not_said_to_have_reached_the_phone_or_the_center():
+    """codex MED 186: a phone was live but ``sender.spawn`` could not start the ping."""
+    w = World(["files.example.org"], phone_live=True)
+    w.push_starts = False
+    w.settle(2)
+    notes = w.flow.end_notes()
+    assert not any("pushed to your phone" in n or "waited in the cockpit's notification center" in n for n in notes)
+    [line] = [n for n in notes if "could not be started" in n]
+    assert "1 host card" in line and "signing queue" in line
+
+
+def test_l3_a_root_fresh_answer_with_no_clock_drift_says_late_not_that_the_clock_moved():
+    """deepseek LOW 142: a delivery that waited past its start bound (the probe held the lock) is told ``fresh``; with
+    the two clocks agreeing that is lateness, not a moved clock."""
+    w = booted()
+    w.tap()
+    w.grant_answers = ["fresh"]
+    w.tick(2.0)
+    h = w.flow.hosts["files.example.org"]
+    assert h.outcome == "late" and not any("clock moved" in n for n in w.flow.end_notes())

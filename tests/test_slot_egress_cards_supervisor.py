@@ -444,6 +444,109 @@ def test_a_helper_name_that_is_not_root_is_not_taken_for_a_refusal(lane_env: Any
     assert "helper-timeout" not in " ".join(lane.notes())
 
 
+def _lock_free(queue: Path) -> bool:
+    import fcntl
+
+    fd = os.open(queue / "sign" / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_l3_two_sessions_on_one_queue_cannot_both_file_a_card(lane_env: Any) -> None:
+    """codex HIGH 178 / complement LOW 42: the ONE RULE is check-then-act. Session A's scan found nothing and is about
+    to file; session B scans in that window. B must not read "nothing open"; once A has filed, B sees A's card."""
+    sup, lane, queue = lane_env
+    sup.wallv = datetime.now(timezone.utc).timestamp()
+    other = SV._CardLane(FakeSup(session="s-" + "cd" * 8, slot=1), EC.CardFlow(session="s-" + "cd" * 8, slot=1), queue)
+    other.sup.wallv = sup.wallv
+    assert lane._scan() == EC.Scanned(False)                       # A: nothing open; A holds the queue until it files
+    assert other._scan() == EC.Scanned(True)                       # B in the window: a card may be open, it waits
+    now = datetime.now(timezone.utc)
+    msg = eg.build_message(STORE, eg.new_grant_id(), SESSION, 0, HOST, now, now.replace(year=now.year + 1), "x.example")
+    assert isinstance(lane._file(EC.File(msg, "t", 480.0)), EC.Filed)
+    assert _lock_free(queue)                                       # the filing let the lock go
+    assert other._scan() == EC.Scanned(True)                       # and B now sees A's card
+    assert _lock_free(queue)
+
+
+def test_l3_the_queue_lock_never_outlives_a_feed(lane_env: Any) -> None:
+    sup, lane, queue = lane_env
+    sup.wallv = datetime.now(timezone.utc).timestamp()
+    answer_script([[HOST]])
+    drive(sup, lane, 6, each=lambda: None if _lock_free(queue) else pytest.fail("the queue lock was left held"))
+    [card] = card_files(queue)
+    (queue / "sign" / f"{card.stem}.denied").write_text("")      # nothing open: a scan now holds the lock
+    lane.flow = EC.CardFlow(session=SESSION, slot=0)                # rp unknown: a feed that files nothing
+    assert lane._scan() == EC.Scanned(False) and not _lock_free(queue)
+    lane._feed(EC.Tick())
+    assert _lock_free(queue)
+    assert lane._scan() == EC.Scanned(False) and not _lock_free(queue)
+    lane.end()
+    assert _lock_free(queue)
+
+
+def test_l3_a_damaged_queue_file_does_not_end_the_lane(lane_env: Any) -> None:
+    """deepseek MED 63 / 81: a malformed ``lv-*.json`` in the scan, and a damaged answer to the lane's own card. Neither
+    ``read_request`` nor ``state_of`` raises for a file's contents (the first returns a refused request, the second
+    only asks whether the answer files exist), so the lane goes on: the scan counts nothing for the junk, the card is
+    filed, and a damaged answer is the host's 'unreadable' note."""
+    sup, lane, queue = lane_env
+    sup.wallv = datetime.now(timezone.utc).timestamp()
+    d = queue / "sign"
+    d.mkdir()
+    (d / ("lv-" + "1" * 32 + ".json")).write_text("{not json")
+    (d / ("lv-" + "2" * 32 + ".json")).mkdir()
+    (d / ("lv-" + "3" * 32 + ".json")).write_bytes(b"\xff\xfe" * 10)
+    (d / ("lv-" + "1" * 32 + ".signed.json")).write_text("junk")
+    answer_script([[HOST]])
+    drive(sup, lane, 6)
+    assert not lane.dead and lane.flow.card is not None and lane.flow.card.stage == "open"
+    rid = lane.flow.card.rid
+    (d / f"{rid}.sig").mkdir()                                      # not a regular file
+    (d / f"{rid}.signed.json").write_text("{damaged")
+    drive(sup, lane, 3)
+    assert not lane.dead and lane.flow.hosts[HOST].outcome == "unreadable"
+
+
+def test_l3_a_transient_filing_failure_files_the_card_once_the_queue_recovers(lane_env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex MED 184: one OSError at filing (ENOSPC) is not a verdict on the host."""
+    sup, lane, queue = lane_env
+    sup.wallv = datetime.now(timezone.utc).timestamp()
+    real = sign.file_levain_request
+    fails = [OSError(28, "No space left on device")]
+
+    def flaky(*a: Any, **k: Any) -> str:
+        if fails:
+            raise fails.pop()
+        return real(*a, **k)
+    monkeypatch.setattr(sign, "file_levain_request", flaky)
+    answer_script([[HOST]])
+    drive(sup, lane, 3)
+    assert not fails and card_files(queue) == [] and lane.flow.hosts[HOST].state == EC.WAITING
+    drive(sup, lane, EC.SCAN_RETRY_S + 2)
+    assert len(card_files(queue)) == 1 and lane.flow.hosts[HOST].state == EC.CARDED
+
+
+def test_l3_a_ping_that_could_not_start_is_not_said_to_have_reached_anyone(lane_env: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex MED 186: the phone was live, ``sender.spawn`` answered False."""
+    sup, lane, queue = lane_env
+    sup.wallv = datetime.now(timezone.utc).timestamp()
+    monkeypatch.setattr("levain.webpush.live", lambda q: True)
+    monkeypatch.setattr("levain.webpush.sender.spawn", lambda *a, **k: False)
+    answer_script([[HOST]])
+    drive(sup, lane, 6)
+    assert len(card_files(queue)) == 1
+    notes = lane.notes()
+    [failed] = [n for n in notes if "could not be started" in n]
+    assert "signing queue" in failed
+    assert not any("pushed to your phone" in n or "waited in the cockpit's notification center" in n for n in notes)
+
+
 # --- the real relay against the fake helper ---------------------------------------------------------------------------
 
 @bounded(90)
