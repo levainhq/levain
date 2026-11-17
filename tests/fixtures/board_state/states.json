@@ -278,7 +278,7 @@
    "expect": {
     "levain#4": {
      "column": "ready",
-     "reason_contains": "residue cleared without a signature: file a signing row for np-aaaaaaaa",
+     "reason_contains": "sends the flat form: no grade for band row np-aaaaaaaa",
      "state": "landed_not_closed"
     }
    },

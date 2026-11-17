@@ -745,7 +745,7 @@ def test_a_signed_row_that_names_another_item_does_not_close_this_one(monkeypatc
     """P5-b: an amend re-pointing done at an unrelated signed row closes nothing."""
     state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "signed"}, naming="levain#2", item_id=1)
     assert grade == "signed-terminal" and state.state == "landed_not_closed"
-    assert state.reason.startswith("band row q-") and state.reason.endswith("does not name levain#1: file a signing row that names it")
+    assert state.reason.startswith("band row q-") and "does not name levain#1" in state.reason and state.reason.endswith("file a signing row that names it")
 
 
 def test_a_native_row_names_its_items_from_the_question_text_or_blocks_only(tmp_path):
@@ -781,3 +781,110 @@ def test_only_band_kind_items_change_a_merged_item_and_an_open_row_keep_their_la
     got, _ = board_of(ev2(**merged(whole("levain", band=[open_row, unsigned]), whole("flow"))), *items)
     assert got["levain#2"].state == "needs_you"                       # an open row keeps today's reading
     assert got["levain#3"].state == "ready"                           # a merged item is untouched by a band row's grade
+
+
+# ------------------------------------------------------------------------------------------------ P5 L3 round 1 fixes (levain#98)
+def _row(rid, items, grade, by="cli"):
+    return {"id": rid, "state": "resolved", "items": items, "by": by, "grade": grade}
+
+
+@pytest.mark.parametrize("text", ["levain#1-backup", "levain#1/archive", "levain#1\\archive", "levain#1#2", "levain#1-", "levain#1_x"])
+def test_q1_an_item_id_followed_by_an_identifier_or_path_continuation_is_not_that_item(text):
+    assert bp._items_in(text) == []
+
+
+def test_q1_a_trailing_hyphen_row_does_not_close_the_item(monkeypatch, tmp_path):
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "signed"}, naming="levain#1-backup", item_id=1)
+    assert grade == "signed-terminal" and state.state == "landed_not_closed"
+
+
+def test_q2_an_unsigned_band_row_reads_ready_close_while_seats_is_unreadable():
+    row = _row("np-1", ["levain#1"], "unsigned-terminal")
+    seats_down = {"seats": [blk("levain", [], complete=False, why="x")], "band": [blk("levain", [row])], "waiters": [blk("levain", [])]}
+    got, _ = board_of(ev2(**seats_down, producers=("levain",)), _item(1, done="np-1", done_kind="band"))
+    assert got["levain#1"].state == "landed_not_closed"
+    got, _ = board_of(ev2(**seats_down, producers=("levain",)), _item(2, done="it lands"))      # the later rule still needs every source
+    assert got["levain#2"].state == "unknown"
+
+
+def test_q2_a_band_gap_still_reads_unknown():
+    row = _row("np-1", ["levain#1"], "unsigned-terminal")
+    parts = {"seats": [blk("levain", [])], "band": [blk("levain", [row], complete=False, why="x")], "waiters": [blk("levain", [])]}
+    got, _ = board_of(ev2(**parts, producers=("levain",)), _item(1, done="np-1", done_kind="band"))
+    assert got["levain#1"].state == "unknown"
+
+
+def _countersign_board(monkeypatch, tmp_path, verdict, *, sign=None, environ=None, seen=None):
+    from levain import band_view
+    from levain.consent import answer_countersign as ac
+
+    store, qs, now = _numbered_store(tmp_path, "confirm residue of levain#1 is cleared")
+    store.answer(qs[0].id, option="y", channel="cli")
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: sign or {"sign_state": "unsigned", "sign_reason": "remote"})
+
+    def fake(st, qid, *, sign_queue, **k):
+        if seen is not None:
+            seen.append(sign_queue)
+        return ac.Verdict(verdict)
+    monkeypatch.setattr(ac, "verdict", fake)
+    monkeypatch.setattr(band_view, "_remote_badge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("env-bound display helper used")))
+    return bp.native_blocks(now=now, store_id=None, consent_dir=tmp_path, environ=environ or {})["band"]["rows"][0]["grade"]
+
+
+def test_q3_the_countersign_reads_the_producers_own_queue_and_not_the_display_helper(monkeypatch, tmp_path):
+    seen: list = []
+    assert _countersign_board(monkeypatch, tmp_path, "countersigned", seen=seen) == "countersigned"
+    assert seen == [tmp_path]                                         # the explicit consent dir, not the live install's queue
+    seen.clear()
+    assert _countersign_board(monkeypatch, tmp_path / "x", "countersigned", environ={"LEVAIN_SIGN_QUEUE_DIR": "/q"}, seen=seen) == "countersigned"
+    assert seen == [Path("/q")]                                       # a queue the environment names is honoured
+
+
+@pytest.mark.parametrize("verdict", ["countersigned-by-nobody", "Countersigned", "countersigned ", "open"])
+def test_q4_only_the_exact_countersigned_verdict_counts(monkeypatch, tmp_path, verdict):
+    assert _countersign_board(monkeypatch, tmp_path, verdict) == "unsigned-terminal"
+
+
+def test_q4_a_non_remote_unsigned_answer_is_never_countersigned(monkeypatch, tmp_path):
+    assert _countersign_board(monkeypatch, tmp_path, "countersigned", sign={"sign_state": "unsigned", "sign_reason": "x"}) == "unsigned-terminal"
+
+
+def test_q5_a_second_producer_naming_other_items_never_widens_what_a_signed_row_closes():
+    mine = _row("np-1", ["levain#1"], "signed-terminal")
+    theirs = _row("np-1", ["levain#1", "levain#2"], "signed-terminal")
+    parts = merged(whole("levain", band=[mine]), whole("flow", band=[theirs]))
+    got, _ = board_of(ev2(**parts), _item(1, done="np-1", done_kind="band"), _item(2, done="np-1", done_kind="band"))
+    assert got["levain#1"].state == "done"
+    assert got["levain#2"].state == "landed_not_closed" and "does not name levain#2" in got["levain#2"].reason
+
+
+def test_q6_a_row_whose_items_are_a_list_in_the_file_still_folds():
+    row = _row("np-1", ["levain#1"], "signed-terminal")
+    got, _ = board_of(ev2(**merged(whole("levain", band=[row, dict(row)]), whole("flow"))), _item(1, done="np-1", done_kind="band"))
+    assert got["levain#1"].state == "done"
+
+
+def test_q7_a_band_item_fed_only_by_a_flat_producer_names_the_producer_limit():
+    flat = {"evidence_v": 1, "fetched_at": FETCHED, "unreadable": {}, "main": [], "chain": [], "refs": [], "merged": [], "branches": [],
+            "documents": {}, "unattributed": [], "seats": [], "waiters": [], "band": {"open": {}, "resolved": {"np-1": "cli"}}}
+    got, _ = board_of(flat, _item(1, done="np-1", done_kind="band"))
+    assert got["levain#1"].state == "landed_not_closed"
+    assert "sends the flat form: no grade" in got["levain#1"].reason and "file a signing row" not in got["levain#1"].reason
+
+
+def test_q8_the_does_not_name_reason_says_the_match_is_exact_and_case_sensitive():
+    row = _row("np-1", ["levain#2"], "signed-terminal")
+    got, _ = board_of(ev2(**merged(whole("levain", band=[row]), whole("flow"))), _item(1, done="np-1", done_kind="band"))
+    assert "exact, case-sensitive" in got["levain#1"].reason
+
+
+def test_q9_a_countersign_wiring_error_is_not_swallowed(monkeypatch, tmp_path):
+    from levain.consent import answer_countersign as ac
+
+    def boom(*a, **k):
+        raise TypeError("wiring")
+    monkeypatch.setattr(ac, "verdict", boom)
+    with pytest.raises(TypeError):
+        bp._countersigned(object(), "q", {"sign_state": "unsigned", "sign_reason": "remote"}, tmp_path)
+    monkeypatch.setattr(ac, "verdict", lambda *a, **k: (_ for _ in ()).throw(OSError("read")))
+    assert bp._countersigned(object(), "q", {"sign_state": "unsigned", "sign_reason": "remote"}, tmp_path) is False

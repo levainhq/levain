@@ -23,12 +23,18 @@ An external file is ``{"evidence_v": 2, "blocks": {"seats": <block>, "band": <bl
 ONE read of its whole bytes. The producer must write it by temp file, fsync and rename: the file is not under the store's
 lock, so a reader that opened a half-written file would see a torn one (which reads as that producer unreadable). A block in
 it must be an object naming that producer and carrying no ``form`` key; any other makes the whole file unreadable.
+
+Known edges. A signing row whose question does not contain the literal item id never closes that item (by design, P5-b: a
+backing row names ``repo#N`` and is filed ``--authorises``). ``_grade`` runs the countersign read once per resolved unsigned row
+(one store read each; boards are small).
 """
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Sequence
+import sqlite3
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,7 +49,7 @@ BAND_ROWS_MAX = 10_000
 _PRODUCER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 #: An item id as a whole token: not the tail of a longer word, path or id, and not followed by more of one (``app#2.txt`` is a
 #: file name, not item app#2; a full stop that ends a sentence still ends the id).
-_ITEM_ID = re.compile(r"(?<![\w.#/-])[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+(?![\w]|\.\w)")
+_ITEM_ID = re.compile(r"(?<![\w.#/-])[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+(?![\w#/\\-]|\.\w)")
 _MISSING = object()
 
 
@@ -93,10 +99,12 @@ def read_external(store_dir: Path, producers: Sequence[str]) -> tuple[dict[str, 
 
 
 def native_blocks(*, now: datetime, store_id: str | None, no_land_waiter: bool = False,
-                  consent_dir: Path | None = None) -> dict[str, dict[str, Any]]:
-    """The native producer's block for each of seats, band and waiters, captured at ``now`` (aware)."""
+                  consent_dir: Path | None = None, environ: Mapping[str, str] | None = None) -> dict[str, dict[str, Any]]:
+    """The native producer's block for each of seats, band and waiters, captured at ``now`` (aware). ``environ`` (default the
+    process's) names the sign queue a countersign is read from."""
     out: dict[str, dict[str, Any]] = {}
-    for source, read in (("seats", lambda: _seats(consent_dir)), ("band", lambda: _band(consent_dir, now))):
+    env = os.environ if environ is None else environ
+    for source, read in (("seats", lambda: _seats(consent_dir)), ("band", lambda: _band(consent_dir, now, env))):
         try:
             rows, why = read()
         except Exception as exc:                    # noqa: BLE001 - a read that blew up is an incomplete block, never a crash
@@ -171,43 +179,64 @@ def _seats(consent_dir: Path | None) -> tuple[list[dict[str, Any]], str | None]:
     return seats, "; ".join(whys) or None
 
 
-def _grade(store: Any, question: Any) -> str:
+def _grade(store: Any, question: Any, queue: Path | None = None) -> str:
     """How a resolved row was answered: signed or not, by phone or at a terminal; ``unknown`` when the store cannot say.
-    A native answer carries no signing flag, so the answer's signing sidecar (:func:`levain.band_view.answer_sign_of`) says."""
+    A native answer carries no signing flag, so the answer's signing sidecar (:func:`levain.band_view.answer_sign_of`) says;
+    it is read once, for the grade and for the countersign check. ``queue`` is the sign queue the countersign reads."""
     from levain import band_view
 
     answer = question.answer
     signed = answer.signed
-    if signed is None:
+    sign: Any = None
+    if signed is not True:
         try:
-            state = (band_view.answer_sign_of(store, question.id) or {}).get("sign_state")
+            sign = band_view.answer_sign_of(store, question.id) or {}
         except Exception:                           # noqa: BLE001 - a sidecar that cannot be read is a grade the store cannot say
-            state = None
+            sign = None
+    if signed is None:
+        state = (sign or {}).get("sign_state")
         signed = True if state == "signed" else False if state == "unsigned" else None
     where = "phone" if answer.channel == "phone" else "terminal"
     if signed is True:
         return f"signed-{where}"
-    if _countersigned(store, question.id):
+    if _countersigned(store, question.id, sign, queue):
         return "countersigned"
     return f"unsigned-{where}" if signed is False else "unknown"
 
 
-def _countersigned(store: Any, question_id: str) -> bool:
-    """A remote answer recorded unsigned whose sign card the phone's passkey signed over exactly that answer
-    (levain.consent.answer_countersign: fail closed, only a verified signature reads so)."""
-    try:
-        from levain import band_view
-
-        return band_view._remote_badge(store, question_id).startswith("countersigned")
-    except Exception:                               # noqa: BLE001 - a countersign that cannot be judged is not one
+def _countersigned(store: Any, question_id: str, sign: Any, queue: Path | None) -> bool:
+    """A remote answer recorded unsigned (``sign``: its sidecar) whose sign card the phone's passkey signed over exactly that
+    answer: :func:`levain.consent.answer_countersign.verdict` says exactly ``countersigned`` (fail closed: only a verified
+    signature reads so). Only the read failures the verdict could let through are caught, and read as not countersigned."""
+    if not isinstance(sign, Mapping) or sign.get("sign_state") != "unsigned" or sign.get("sign_reason") != "remote":
         return False
+    from levain.consent import answer_countersign as ac
+
+    try:
+        return ac.verdict(store, question_id, sign_queue=queue).state == "countersigned"
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
+def _sign_queue(consent_dir: Path | None, environ: Mapping[str, str]) -> Path | None:
+    """The sign queue the countersign reads: the live install's (a named ``$LEVAIN_SIGN_QUEUE_DIR``, or the live store's hook
+    queue) for the live store; for an explicit ``consent_dir`` (the hook queue is the consent dir) that directory, never the
+    live one, unless the environment names a queue."""
+    from levain.consent import answer_countersign as ac
+
+    try:
+        if consent_dir is None or environ.get(ac.ENV_QUEUE):
+            return ac.sign_queue_dir(environ)
+        return Path(consent_dir)
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def _items_in(*texts: Any) -> list[str]:
     return list(dict.fromkeys(i for t in texts if isinstance(t, str) for i in _ITEM_ID.findall(t)))
 
 
-def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]], str | None]:
+def _band(consent_dir: Path | None, now: datetime, environ: Mapping[str, str]) -> tuple[list[dict[str, Any]], str | None]:
     from levain import band_sources, band_view
     from levain.consent.questions import QuestionStore
 
@@ -219,6 +248,7 @@ def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]]
     if seen.pending:
         whys.append("an open band item has no number yet")
     rows: list[dict[str, Any]] = []
+    queue = _sign_queue(consent_dir, environ)
     questions = store.recent(BAND_ROWS_MAX)
     if len(questions) >= BAND_ROWS_MAX:
         whys.append(f"more than {BAND_ROWS_MAX} band rows: older rows not read")
@@ -229,7 +259,7 @@ def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]]
         elif not isinstance(q.answer.channel, str) or not q.answer.channel:
             whys.append(f"the answer to {q.id} names no channel")
         else:
-            rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(store, q)})
+            rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(store, q, queue)})
     if not band_view._foreign(store):          # the open authority rows (consent, sign, extend) the band shows; read even when a source failed
         try:
             extras = band_sources.read_extras(store.directory, store._clock, now=now)

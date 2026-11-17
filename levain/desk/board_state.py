@@ -515,6 +515,8 @@ class BandRow:
     items: tuple[str, ...]
     by: str
     grade: str
+    producer: str = ""          # who wrote it (set by the block reader); ``flat``: it came in flow's flat form, which has no grade
+    flat: bool = False
 
 
 def _seq(raw: Any, what: str) -> Sequence[Any]:
@@ -683,6 +685,8 @@ def _read_block(source: str, raw: Any, *, now: datetime | None, store_id: str | 
         rows = tuple(parse(raw.get("rows")))
     except _Bad as e:
         return bad(f"malformed row: {e}")
+    if source == "band":
+        rows = tuple(replace(r, producer=producer, flat=flat) for r in rows)
     if not isinstance(raw.get("complete"), bool):
         return bad("complete is not true or false")
     if not raw["complete"]:
@@ -752,7 +756,8 @@ class Evidence:
     documents: Mapping[str, bool]
     unattributed: tuple[Unattributed, ...]
     band_grade: Mapping[str, str] = field(default_factory=dict)       # resolved band row -> how it was answered
-    band_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)   # resolved band row -> the items it names
+    band_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)   # resolved band row -> the items EVERY resolver names
+    band_flat: Mapping[str, tuple[str, ...]] = field(default_factory=dict)    # resolved band row -> its flat-form resolvers, when ALL are
 
     @classmethod
     def from_dict(cls, obj: Any, *, now: datetime | None, store_id: str | None = None) -> "Evidence":
@@ -823,10 +828,18 @@ class Evidence:
                 resolutions.setdefault(r.id, set()).add((r.by, r.grade))
         band_resolved: dict[str, str] = {}
         band_grade: dict[str, str] = {}
-        band_items: dict[str, tuple[str, ...]] = {}
+        by_producer: dict[str, dict[str, tuple[str, ...]]] = {}     # row -> producer -> the items that producer's rows name
+        flat_only: dict[str, list[str]] = {}
         for r in composed["band"][0]:
             if r.state == "resolved":
-                band_items[r.id] = tuple(dict.fromkeys(band_items.get(r.id, ()) + r.items))
+                mine = by_producer.setdefault(r.id, {})
+                mine[r.producer] = tuple(dict.fromkeys(mine.get(r.producer, ()) + tuple(r.items)))
+                flat_only.setdefault(r.id, []).append(r.producer if r.flat else "")
+        # what a signed row closes is what EVERY producer that resolved it names (fail closed: a second producer reporting the
+        # same row with other items never widens it)
+        band_items = {rid: tuple(i for i in next(iter(per.values())) if all(i in o for o in per.values()))
+                      for rid, per in by_producer.items()}
+        band_flat = {rid: tuple(dict.fromkeys(ps)) for rid, ps in flat_only.items() if all(ps)}
         for rid, pairs in resolutions.items():              # two producers that disagree: both are named, the weaker grade stands
             ordered = sorted(pairs)
             band_resolved[rid] = ordered[0][0] if len(ordered) == 1 else "; ".join(f"{by} ({grade})" for by, grade in ordered)
@@ -836,7 +849,7 @@ class Evidence:
         raw_fetched = obj.get("fetched_at")
         fetched_at = raw_fetched if isinstance(raw_fetched, str) and raw_fetched.strip() else None
         return cls(fetched_at, parse_timestamp(fetched_at), unreadable, main, chain, branches, refs_merged[0],
-                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade, band_items)
+                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade, band_items, band_flat)
 
     def unreadable_reason(self, source: str) -> str | None:
         """Why ``source`` cannot be trusted, or None. ``git`` stands for the four git-derived sources and ``notes`` for
@@ -1252,9 +1265,12 @@ def _rule_done(ctx: _Ctx, item: Item) -> State | None:
         return ctx.make(item, "done", f"{kind} {path} exists", (path,)) if ev.documents.get(path) is True else None
     if path in ev.band_resolved and path not in ev.band_open:
         if ev.band_grade.get(path, "unknown") not in SIGNED_GRADES:
+            if flat := ev.band_flat.get(path):              # a flat producer sends no grade: filing a signing row cannot satisfy it
+                return ctx.make(item, "landed_not_closed", f"producer {', '.join(flat)} sends the flat form: no grade for band row {path}", (path,))
             return ctx.make(item, "landed_not_closed", f"residue cleared without a signature: file a signing row for {path}", (path,))
         if item.id not in ev.band_items.get(path, ()):      # P5-b: a signed row that names some other item closes nothing here
-            return ctx.make(item, "landed_not_closed", f"band row {path} does not name {item.id}: file a signing row that names it", (path,))
+            return ctx.make(item, "landed_not_closed", f"band row {path} does not name {item.id} (an exact, case-sensitive match "
+                                                       f"on every producer that resolved it): file a signing row that names it", (path,))
         return ctx.make(item, "done", f"band {path} resolved by {ev.band_resolved[path]}", (path,))
     return None
 
@@ -1403,7 +1419,9 @@ _ABSENCE_OF: dict[str, tuple[str, ...]] = {
 
 def _absence_reason(ev: Evidence, item: Item, state: str) -> str | None:
     """Why ``state`` cannot be concluded, or None: the absence it rests on needs every expected producer readable and complete."""
-    if state == "done" and item.done_kind == "band":      # "its np row is not still open" is an absence too
+    path = (item.done or "").strip()
+    band_close = item.done_kind == "band" and path in ev.band_resolved and path not in ev.band_open     # _rule_done's band branch
+    if band_close and state in ("done", "landed_not_closed"):      # "its np row is not still open" is an absence too, and all it needs
         sources: tuple[str, ...] = ("band",)
     else:
         sources = _ABSENCE_OF.get(state, ())
