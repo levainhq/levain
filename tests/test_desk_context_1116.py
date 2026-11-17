@@ -6,11 +6,8 @@ it (levain.cockpit.desk_tab), the page draws it (desk_tab_view.js, the lease bar
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
-import pwd
-import shutil
 import sys
 from pathlib import Path
 
@@ -23,9 +20,6 @@ from levain.desk.desk_port import DeskCommands, HostCommandDeskPort, ScriptedDes
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_desk_pane_page import _OPEN, _TAP_DESK, _TOKENED, desk_page, put, until, wired
 
-# the account's real home, not $HOME (the test rigs repoint HOME)
-REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
-SEAT_CONTEXT = Path(os.environ.get("FLOW_SEAT_CONTEXT") or REAL_HOME / "Briefcase" / "flow" / "scripts" / "seat_context.py")
 PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}}
 
 
@@ -39,19 +33,6 @@ def transcript(tmp_path: Path, lines: list[str], name="s.jsonl") -> Path:
     p = tmp_path / name
     p.write_text("\n".join(lines) + "\n")
     return p
-
-
-def flow_scan():
-    if not SEAT_CONTEXT.is_file():
-        pytest.skip("flow's scripts/seat_context.py is not on this machine")
-    spec = importlib.util.spec_from_file_location("seat_context_ref", SEAT_CONTEXT)
-    mod = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, str(SEAT_CONTEXT.parent))
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path.remove(str(SEAT_CONTEXT.parent))
-    return mod
 
 
 # --- the reading ------------------------------------------------------------------------------------------------------------------
@@ -137,32 +118,8 @@ def test_a_seek_that_lands_inside_a_record_drops_its_partial_head_and_one_on_a_r
         assert desk_context._tail(f, size, last + 5) == [lines[-1].encode()]        # inside the one before: its partial head is dropped
 
 
-def test_the_desk_lines_are_flows_rotation_lines():
-    sc = flow_scan()
-    assert sc.LIMITS["desk"] == (SOFT, HARD) and sc.DEEP_HARD == DEEP_HARD and sc.limits_for("desk", None)[:2] == (SOFT, HARD)
-    assert sc.limits_for("desk", {"granted": "x"})[:2] == (None, DEEP_HARD)
-
-
-def test_the_reading_matches_seat_contexts_for_the_same_transcript(tmp_path):
-    sc = flow_scan()
-    p = transcript(tmp_path, [rec(5, 100_000, 2_000), '{"type":"user"}', rec(0, 0, 0), rec(3, 212_000, 400, model="claude-opus-5-5"), "garbage", '{"type":"user"}'])
-    ctx, _samples, model = sc.scan(str(p))
-    got = read_context(p)
-    assert got.tokens == ctx == 212_403 and got.model == model
-
-
-def test_the_reading_matches_seat_contexts_on_a_real_session_transcript(tmp_path):
-    sc = flow_scan()
-    root = REAL_HOME / ".claude" / "projects"
-    live = sorted((x for x in root.glob("*/*.jsonl") if 50_000 < x.stat().st_size < 60_000_000), key=lambda x: x.stat().st_mtime) if root.is_dir() else []
-    if not live:
-        pytest.skip("no real session transcript here")
-    copy = tmp_path / "real.jsonl"
-    shutil.copyfile(live[-1], copy)          # a copy: a live file grows between the two reads
-    ctx, _samples, _model = sc.scan(str(copy))
-    got = read_context(copy)
-    assert (got.tokens if got else 0) == ctx, (got, ctx)
-
+# (the three parity tests against flow's scripts/seat_context.py are in tests/test_desk_context_1116_flow_parity.py: they skip off the
+# operator's machine, and a skip in this file fails the CI browser job)
 
 # --- the host's command and the port ----------------------------------------------------------------------------------------------
 
