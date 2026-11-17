@@ -253,6 +253,11 @@ def test_f5_the_desk_brief_says_a_running_desk_keeps_the_memory_it_loaded():
 def test_f5_the_signing_card_and_the_changelog_say_it_too():
     card = da.signing_card_text("America/New_York", per_run_usd=20.0, night_usd=40.0, expires="x", store_dir="/s")
     assert "keeps the memory it loaded" in card
+    # levain#84: the card says what the rotation is (a desk's own choice at a seam) and what is not yet true
+    flat = " ".join(card.split())
+    assert "a live desk can hand itself over onto the new text at a seam it chooses" in flat
+    assert "nothing rotates a desk by itself and no real desk has yet been run through this" in flat
+    assert "is not built" not in flat
     changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
     bullet = next(ln for ln in changelog.splitlines() if ln.startswith("- **The dream runs with seats live"))
     assert "keeps the memory it loaded" in bullet
