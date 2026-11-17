@@ -102,3 +102,89 @@ def test_a_desk_that_started_after_the_rollback_loaded_the_restored_text_and_is_
     assert why is None
     desk.token = later.coord_status()["lease"]["token"]
     assert _notes(_open(desk, capsys)) == []
+
+
+def _activated_at(desk, got, when):
+    """The rotation's successor activated at a store clock of ``when`` (its request was earlier): returns its token."""
+    later = CoordStore(desk.directory, clock=lambda: when)
+    return _activate_successor(later, got.successor)
+
+
+def test_a_successor_requested_before_the_rollback_but_activated_after_it_is_told_nothing(desk, capsys):
+    # launches.at is the REQUEST stamp (base+10); the desk loaded memory at activation (base+20), after the rollback (+15)
+    base = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", base + timedelta(minutes=1), occurrence="occ-1")
+    got = dream_rotation.rotate(CoordStore(desk.directory, clock=lambda: base + timedelta(minutes=10)), token=desk.token, body=BODY)
+    _file(desk.directory, "rolled-back", base + timedelta(minutes=12), occurrence="occ-1")
+    desk.token = _activated_at(desk, got, base + timedelta(minutes=14))
+    assert _notes(_open(desk, capsys)) == []
+
+
+def test_a_successor_requested_and_activated_before_the_rollback_is_told(desk, capsys):
+    base = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", base + timedelta(minutes=1), occurrence="occ-1")
+    got = dream_rotation.rotate(CoordStore(desk.directory, clock=lambda: base + timedelta(minutes=10)), token=desk.token, body=BODY)
+    desk.token = _activated_at(desk, got, base + timedelta(minutes=11))
+    _file(desk.directory, "rolled-back", base + timedelta(minutes=15), occurrence="occ-1")
+    assert len(_notes(_open(desk, capsys))) == 1
+
+
+def test_a_failing_rollback_read_does_not_drop_the_seam_note(desk, capsys, monkeypatch):
+    from levain.desk import dream_status
+
+    base = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", base + timedelta(hours=1), occurrence="occ-9")  # a save after the desk started
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("no such column: close_key")
+
+    monkeypatch.setattr(dream_status, "rollback_notes", boom)
+    out = _open(desk, capsys, "--light")
+    assert "Dream seam: the" in out and "dream saved new memory" in out
+    assert "Dream rolled back: cannot-derive (OperationalError" in out
+
+
+def test_a_failing_seam_note_does_not_drop_the_rollback_line(desk, capsys, monkeypatch):
+    from levain.desk import dream_status
+
+    got, token, base = _rotated(desk)
+    desk.token = token
+    _file(desk.directory, "rolled-back", base + timedelta(minutes=30), occurrence="occ-1")
+
+    def boom(*a, **k):
+        raise RuntimeError("tail unreadable")
+
+    monkeypatch.setattr(dream_status, "seam_note", boom)
+    out = _open(desk, capsys)
+    assert len(_notes(out)) == 1 and "occurrence occ-1" in _notes(out)[0]
+    assert "Dream seam: cannot-derive (RuntimeError" in out
+
+
+def test_two_rollbacks_of_distinct_occurrences_are_told_newest_first(desk, capsys):
+    base = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", base + timedelta(minutes=1), occurrence="occ-1", day="2026-11-14")
+    first = dream_rotation.rotate(CoordStore(desk.directory, clock=lambda: base + timedelta(minutes=10)), token=desk.token, body=BODY)
+    token = _activated_at(desk, first, base + timedelta(minutes=11))
+    _file(desk.directory, "consolidated", base + timedelta(minutes=12), occurrence="occ-2", day="2026-11-15")
+    second = dream_rotation.rotate(CoordStore(desk.directory, clock=lambda: base + timedelta(minutes=13)), token=token, body=BODY)
+    desk.token = _activated_at(desk, second, base + timedelta(minutes=14))
+    # the desk running now loaded both saves; both are then rolled back, occ-1 first
+    _file(desk.directory, "rolled-back", base + timedelta(minutes=20), occurrence="occ-1")
+    _file(desk.directory, "rolled-back", base + timedelta(minutes=25), occurrence="occ-2")
+    lines = _notes(_open(desk, capsys))
+    assert len(lines) == 2 and "occ-2" in lines[0] and "occ-1" in lines[1]
+
+
+def test_the_newest_save_of_an_occurrence_at_or_before_the_load_decides(desk, capsys):
+    from levain.desk import dream_status
+
+    # two saves of occ-1: an early one and a later one; the desk loaded between them is judged by the later one at or
+    # before its load, never the oldest
+    recs = [dream_status.DreamRecord("rolled-back", "2026-11-15T09:00:00Z", "o"),
+            dream_status.DreamRecord("consolidated", "2026-11-15T07:00:00Z", "o"),
+            dream_status.DreamRecord("consolidated", "2026-11-15T05:00:00Z", "o")]
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE seam_handoffs (close_key TEXT)")
+    conn.execute("INSERT INTO seam_handoffs VALUES ('dream-rotation:o')")
+    (line,) = dream_status.rollback_notes(conn, recs, "2026-11-15T08:00:00Z")
+    assert "saved 2026-11-15T07:00:00Z" in line

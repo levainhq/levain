@@ -181,18 +181,30 @@ def _readonly_text(store: Any, args: argparse.Namespace, kind: str | None = None
 def _dream_notes(store: Any, launch: Any) -> list[str]:
     """A running desk's one dream-seam line (:func:`levain.desk.dream_status.seam_note`): a dream saved memory after
     this launch started, and a line for each dream a rotation handed over onto that was rolled back after this launch
-    loaded it (:func:`levain.desk.dream_status.rollback_notes`). A READ: it tells, it never rotates. A read that fails is named, never read as nothing to say."""
+    loaded it (:func:`levain.desk.dream_status.rollback_notes`, judged against when the launch loaded memory, not when it was requested). A READ: it tells, it never rotates.
+    A read that fails is named, each line on its own, never read as nothing to say."""
     started = getattr(launch, "at", None)
     if not started:
         return []  # no start stamp to compare a save against: nothing to say, and no standing line each open
     try:
         with read_transaction(store.open_readonly) as conn:
             recs = dream_status.records(conn)
-            undone = dream_status.rollback_notes(conn, recs, started)
-        note = dream_status.seam_note(recs, started, _lv(launch), _tail(store))
+            try:  # its own failure (an older seam_handoffs, a lock) names itself and never drops the seam note
+                loaded = dream_status.loaded_at(conn, launch.launch_id, started)
+                undone = dream_status.rollback_notes(conn, recs, loaded)
+            except Exception as exc:  # noqa: BLE001
+                undone = [_cannot("Dream rolled back", exc)]
     except Exception as exc:  # noqa: BLE001 - named, and the open itself stands
-        return [f"Dream seam: cannot-derive ({type(exc).__name__}: {_trim(unshowable.mark(str(exc), allow=''), 160)})"]
+        return [_cannot("Dream seam", exc)]
+    try:  # and a seam-note failure never drops an already derived rollback line
+        note = dream_status.seam_note(recs, started, _lv(launch), _tail(store))
+    except Exception as exc:  # noqa: BLE001
+        return [*undone, _cannot("Dream seam", exc)]
     return [*undone, *([] if note is None else [note])]
+
+
+def _cannot(label: str, exc: Exception) -> str:
+    return f"{label}: cannot-derive ({type(exc).__name__}: {_trim(unshowable.mark(str(exc), allow=''), 160)})"
 
 
 def _rotated_handoff(store: Any, token: Any) -> Any:
