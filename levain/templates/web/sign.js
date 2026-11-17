@@ -103,6 +103,15 @@
   // the thread whose head card the drop sheet draws (the thread view's link): read here, the next line takes the fragment out of the bar
   const tm = /(?:^#|&)thread=([A-Za-z0-9._:-]{1,160})(?:&|$)/.exec(location.hash);
   const headThread = location.pathname === "/sign/drop" && tm ? tm[1] : "";
+  // `#words=<percent-encoded>` (an NFC tag's link, e.g. #words=%2Ffanin%20broad): PRE-FILLS the drop's words box and does nothing
+  // else. The words are shown in the box, nothing is sent or signed on load, and the passkey signature binds whatever the box holds
+  // when the tap is made. The fragment never reaches a server and is taken out of the bar below, like the others.
+  const wdm = /(?:^#|&)words=([^&]*)(?:&|$)/.exec(location.hash);
+  let hashWords = "";
+  if (location.pathname === "/sign/drop" && wdm) {
+    try { hashWords = decodeURIComponent(wdm[1]); } catch (e) { hashWords = ""; }
+    hashWords = hashWords.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").slice(0, 500);
+  }
   let pick = "";
   const pickV = vm ? vm[1] : "";
   if (pm) { try { pick = decodeURIComponent(pm[1]); } catch (e) { pick = pm[1]; } }
@@ -1066,6 +1075,7 @@
       const pre = window.sessionStorage.getItem("levain-drop-prefill");
       if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
     } catch (e) { /* the sheet opens empty */ }
+    if (hashWords) { words.value = hashWords; grow(words); }     // a tag's link: pre-filled for the person to read, never sent or signed by itself
     const keyBox = el("div", "env-keybox");
     keyBox.hidden = true;
     const acts = $("sheet-actions");

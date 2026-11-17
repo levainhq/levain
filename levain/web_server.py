@@ -3205,6 +3205,7 @@ class _Handler(GuardedHandler):
                 return {"error": "rate_limited", "message": "too many taps; try again in a minute"}, 429
         via = tap["name"] if tap is not None else str(self._credential()["name"])
         precheck = after = None
+        tap_state: "list[str]" = []        # the token's fixed state text (0 or 1 items), filled by its precheck under the lock
         if tap is not None:
             # The token is asked again, fresh, under the presence lock that revoke also takes: a revoke or a narrowed
             # list either lands before this check (refused here) or after the word is written, never in between.
@@ -3217,6 +3218,7 @@ class _Handler(GuardedHandler):
                 rec = presence_tokens.verify(queue, supplied)
                 if rec is None or rec["name"] != name:
                     raise presence_tokens.TokenRefused("forbidden", "this tap token is not valid")
+                tap_state[:] = [rec["state"]] if rec.get("state") else []     # the text on the record verified under the lock, never the request's
                 if word in presence.WORDS + route_mod.ROUTE_WORDS and word not in rec["words"]:
                     raise presence_tokens.TokenRefused(
                         "word_not_allowed", f"this tap token may set only: {', '.join(rec['words'])}")
@@ -3253,6 +3255,9 @@ class _Handler(GuardedHandler):
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
+        state_line = None
+        if tap_state:      # the token's one fixed text, after its word landed: the operator's own governed state edit, tagged phone
+            state_line = self._tap_state_write(tap_state[0])
         try:     # a write can make held pings due (a widened mute, devices on, back): start their push now, outside the lock
             from levain.webpush import held
 
@@ -3260,7 +3265,27 @@ class _Handler(GuardedHandler):
             held.flush_if_due(queue, throttle=False)
         except Exception:  # noqa: BLE001 - a failed flush never fails the set; the next gate call flushes
             pass
-        return self._presence_view(queue), 200
+        view = self._presence_view(queue)
+        if state_line is not None:
+            view["state_line"] = state_line
+        return view, 200
+
+    def _tap_state_write(self, text: str) -> "dict[str, Any]":
+        """The state text a tap token carries, set through the governed ``operator_state`` edit (source ``phone``: it is a
+        phone's tap). Fail-soft by design: the presence word has already landed, so a state line that cannot be written
+        is reported in the reply (``{"text", "set": False, "error"}``), never a failed tap."""
+        from levain import writes
+
+        scope = self.server.levain_source.write_scope
+        if scope is None:
+            return {"text": text, "set": False, "error": "this cockpit has no writable state line"}
+        try:
+            writes.apply_edit(scope, {"kind": "operator_state", "text": text, "source": "phone"})
+        except writes.EditError as exc:
+            return {"text": text, "set": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - a state write never fails the tap that already set the word
+            return {"text": text, "set": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"text": text, "set": True}
 
     def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/presence/token/new {name, words?}`` / ``/revoke {name}``: full credential only (the push gate
@@ -3272,15 +3297,18 @@ class _Handler(GuardedHandler):
         except (ValueError, UnicodeDecodeError):
             return {"error": "bad_json", "message": "body is not valid JSON"}, 400
         new = route == _PRESENCE_TOKEN_NEW
-        keys = {"name", "words"} if new else {"name"}
+        keys = {"name", "words", "state"} if new else {"name"}
         if (not isinstance(req, dict) or not {"name"} <= set(req) <= keys or not isinstance(req["name"], str)
                 or ("words" in req and (not isinstance(req["words"], list)
-                                        or not all(isinstance(w, str) for w in req["words"])))):
-            return {"error": "bad_request", "message": "send name as text" + (", and words as a list of words" if new else "")}, 400
+                                        or not all(isinstance(w, str) for w in req["words"])))
+                or ("state" in req and not isinstance(req["state"], str))):
+            return {"error": "bad_request", "message": "send name as text" + (", words as a list of words and state as text" if new else "")}, 400
         queue = self.server.signer.queue_dir
         try:
             if new:
-                rec, token = presence_tokens.create(queue, req["name"], req.get("words"))
+                if req.get("state") is not None and self.server.levain_source.write_scope is None:
+                    return {"error": "presence_refused", "message": "this cockpit has no writable state line, so a token cannot set one"}, 422
+                rec, token = presence_tokens.create(queue, req["name"], req.get("words"), state=req.get("state"))
                 return {"token": token, "record": rec, "tokens": presence_tokens.list_public(queue)}, 200
             if not presence_tokens.revoke(queue, req["name"]):
                 return {"error": "not_found", "message": "no live tap token has that name"}, 404

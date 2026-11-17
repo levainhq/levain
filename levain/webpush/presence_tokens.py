@@ -5,6 +5,10 @@ The file (``<queue>/webpush/presence_tokens.json``, 0600) holds only the sha256 
 secret is shown once, at creation. The web layer resolves a supplied token here, asks again under the presence lock at
 the write, and owns the rate limit (:class:`RateLimit`); this module decides nothing about what a word does (the record, :mod:`levain.webpush.intent`, does). A token may set only the words on its allow-list, and
 ``sleep`` and ``loud`` (the two that silence or force the phone for a long stretch) only when the operator listed them.
+
+A token may also carry ONE fixed state-line text, set when it is created and never from a call: a tap of a token that
+names exactly one word then sets that word AND that text (the bed tag: ``sleep`` and ``Bed``). The text is part of the
+token's named allowed set and the cockpit shows it beside the words; no body or header of a tap can change it.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the pr
 FILE_NAME = "presence_tokens.json"
 DEFAULT_WORDS = ("away", "back", "quiet", "desk", "devices")
 NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
+STATE_MAX = 120     # a tag's state text is a word or two, far under the state line's own bound
 MAX_TOKENS = 50
 _MAX_BYTES = 64 * 1024
 RATE_PER_MIN = 10
@@ -136,20 +141,32 @@ def _write(queue_dir: Path | str, recs: list[dict]) -> None:
 
 def _public(r: dict) -> dict:
     return {"name": r["name"], "words": [w for w in r["words"] if w in WORDS], "created": r.get("created"),
-            "last_used": r.get("last_used"), "revoked": bool(r.get("revoked"))}
+            "last_used": r.get("last_used"), "revoked": bool(r.get("revoked")),
+            "state": r["state"] if isinstance(r.get("state"), str) else None}
 
 
 def create(queue_dir: Path | str, name: str, words: "list[str] | tuple[str, ...] | None" = None, *,
-           now: float | None = None) -> tuple[dict, str]:
+           state: "str | None" = None, now: float | None = None) -> tuple[dict, str]:
     """Mint a token named ``name`` allowed to set ``words`` (default :data:`DEFAULT_WORDS`). Returns the public record
     and the token itself, which is not kept anywhere and cannot be shown again. A live token of the same name is a
-    refusal (a name says which tap did what, so it stays unique among the live ones)."""
+    refusal (a name says which tap did what, so it stays unique among the live ones). ``state`` is the one fixed
+    state-line text a tap of this token also sets: it needs exactly one word on the token (so a tap does one thing),
+    is whitespace-collapsed, has no control characters and is at most :data:`STATE_MAX` characters."""
     if not isinstance(name, str) or not NAME_RE.match(name) or name != name.strip():
         raise PresenceError("a token's name is 1 to 40 letters, digits, spaces, dots, dashes or underscores")
     use = list(DEFAULT_WORDS if words is None else words)
     if not use or any(not isinstance(w, str) or w not in WORDS for w in use):
         raise PresenceError(f"a token's words are some of: {', '.join(WORDS)}")
     use = [w for w in WORDS if w in use]
+    text = None
+    if state is not None:
+        if not isinstance(state, str) or any(ord(c) < 32 or ord(c) == 127 for c in state):
+            raise PresenceError("a token's state text is plain text on one line")
+        text = " ".join(state.split())
+        if not text or len(text) > STATE_MAX:
+            raise PresenceError(f"a token's state text is 1 to {STATE_MAX} characters")
+        if len(use) != 1:
+            raise PresenceError("a token that sets a state text names exactly one word")
     token = secrets.token_urlsafe(32)
     with _locked(queue_dir, strict=True, wait=3.0):
         recs = [r for r in _read(queue_dir) if not r.get("revoked")]   # a revoked record is dropped here: the file stays small
@@ -159,6 +176,8 @@ def create(queue_dir: Path | str, name: str, words: "list[str] | tuple[str, ...]
             raise PresenceError("too many tap tokens: revoke one first")
         rec = {"name": name, "sha256": _hash(token), "created": time.time() if now is None else now,
                "last_used": None, "words": use, "revoked": False}
+        if text is not None:
+            rec["state"] = text
         _write(queue_dir, recs + [rec])
     return _public(rec), token
 

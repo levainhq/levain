@@ -831,7 +831,7 @@
   const PR_MIN = 1, PR_MAX = 1440;                        // custom minutes, as the server allows (1 minute to 24 hours)
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {},
       prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, prTapList = null, prNote = null,
-      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
+      prNew = null, prName = null, prState = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
       prDevBtns = {}, prAfterBtns = {}, prAfterCustom = null, prAfterRow = null, prLetsBtns = {}, prUntilBtns = {}, prForRow = null,
       prForBtns = {}, prForCustom = null, prAfterOpen = false, prForOpen = false,
       prCustomLine = null, prCustomText = null, prResetBtn = null, prUntilLab = null, prFreeNote = null;
@@ -1053,7 +1053,7 @@
     ph.appendChild(el("h2", null, "Tap tokens"));
     prPanel.appendChild(ph);
     const body = el("div", "pbody dev-body");
-    body.appendChild(el("p", "dev-note pr-intro", "A tap token lets one Shortcut or NFC tag set your presence, and nothing else."));
+    body.appendChild(el("p", "dev-note pr-intro", "A tap token lets one Shortcut or NFC tag set your presence (and, if you give it one, a fixed state line), and nothing else."));
     prTapList = el("div", "dev-list pr-tap-list");
     body.appendChild(prTapList);
     const form = el("form", "pr-new-form");
@@ -1069,6 +1069,11 @@
       prChecks[w] = c; boxes.appendChild(l);
     }
     form.appendChild(boxes);
+    // optional: ONE fixed state line a tap also sets (a bed tag: Sleep + "Bed"); fixed here, never changed by a tap
+    prState = el("input", "dev-label pr-state");
+    prState.type = "text"; prState.maxLength = 120; prState.placeholder = "Optional: also set your state line to… (needs exactly one word above)";
+    prState.setAttribute("aria-label", "State line this tap token also sets");
+    form.appendChild(prState);
     const go = el("button", "dev-btn", "Create tap token");
     go.type = "submit";
     form.appendChild(go);
@@ -1194,7 +1199,8 @@
       row.dataset.name = t.name;
       const main = el("div", "dev-main");
       main.appendChild(el("div", "dev-name", t.name));
-      main.appendChild(el("div", "dev-meta", "May set: " + (t.words || []).join(", ") + " · last used " + when(t.last_used)));
+      main.appendChild(el("div", "dev-meta", "May set: " + (t.words || []).join(", ")
+        + (t.state ? " + your state line to “" + t.state + "”" : "") + " · last used " + when(t.last_used)));
       row.appendChild(main);
       const rv = el("button", "dev-btn pr-revoke", "Revoke");
       rv.type = "button";
@@ -1305,12 +1311,16 @@
     const words = PR_TAP_WORDS.map((x) => x[0]).filter((w) => prChecks[w].checked);
     if (!name) { prSay("Give the tap token a name."); return; }
     if (!words.length) { prSay("Pick at least one word it may set."); return; }
+    const state = prState.value.trim();
+    if (state && words.length !== 1) { prSay("A token that sets a state line names exactly one word."); return; }
     if (tapBusy) return;
     tapBusy = true;
     try {
-      const got = await tapCall("/webpush/presence/token/new", { name: name, words: words });
+      const body = { name: name, words: words };
+      if (state) body.state = state;
+      const got = await tapCall("/webpush/presence/token/new", body);
       if (!got || !got.token) return;
-      prName.value = "";
+      prName.value = ""; prState.value = "";
       showNewTap(got.token, got.record || {});
     } finally { tapBusy = false; }
   }
