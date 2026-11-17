@@ -191,10 +191,12 @@ def rollback_notes(conn: sqlite3.Connection, recs: list[DreamRecord], started_at
         if r.kind == "consolidated" and r.at <= started_at:
             saves.setdefault(r.occurrence, r)
     out: list[str] = []
+    told: set[str] = set()  # newest first: only the newest rollback of an occurrence is told
     for back in (r for r in recs if r.kind == "rolled-back"):
         save = saves.get(back.occurrence)
-        if save is None or back.at <= started_at:
+        if save is None or back.at <= started_at or back.occurrence in told:
             continue
+        told.add(back.occurrence)
         if conn.execute("SELECT 1 FROM seam_handoffs WHERE close_key = ?", (KEY_PREFIX + back.occurrence,)).fetchone() is None:
             continue
         out.append(f"Dream rolled back: the dream of occurrence {back.occurrence} (saved {save.at}) was rolled back at "

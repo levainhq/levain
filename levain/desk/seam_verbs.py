@@ -189,6 +189,7 @@ def _dream_notes(store: Any, launch: Any) -> list[str]:
     try:
         with read_transaction(store.open_readonly) as conn:
             recs = dream_status.records(conn)
+            loaded = started
             try:  # its own failure (an older seam_handoffs, a lock) names itself and never drops the seam note
                 loaded = dream_status.loaded_at(conn, launch.launch_id, started)
                 undone = dream_status.rollback_notes(conn, recs, loaded)
@@ -197,7 +198,7 @@ def _dream_notes(store: Any, launch: Any) -> list[str]:
     except Exception as exc:  # noqa: BLE001 - named, and the open itself stands
         return [_cannot("Dream seam", exc)]
     try:  # and a seam-note failure never drops an already derived rollback line
-        note = dream_status.seam_note(recs, started, _lv(launch), _tail(store))
+        note = dream_status.seam_note(recs, loaded, _lv(launch), _tail(store))
     except Exception as exc:  # noqa: BLE001
         return [*undone, _cannot("Dream seam", exc)]
     return [*undone, *([] if note is None else [note])]

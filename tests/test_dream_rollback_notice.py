@@ -188,3 +188,27 @@ def test_the_newest_save_of_an_occurrence_at_or_before_the_load_decides(desk, ca
     conn.execute("INSERT INTO seam_handoffs VALUES ('dream-rotation:o')")
     (line,) = dream_status.rollback_notes(conn, recs, "2026-11-15T08:00:00Z")
     assert "saved 2026-11-15T07:00:00Z" in line
+
+
+def test_a_dream_saved_between_the_successors_request_and_activation_is_not_told_as_saved_after_it_started(desk, capsys):
+    # launches.at is the REQUEST stamp (base+10); the successor loaded memory at activation (base+14), after the
+    # occ-2 save (+12): that dream WAS loaded, so no "Dream seam:" line may say it saved after the desk started
+    base = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", base + timedelta(minutes=1), occurrence="occ-1")
+    got = dream_rotation.rotate(CoordStore(desk.directory, clock=lambda: base + timedelta(minutes=10)), token=desk.token, body=BODY)
+    _file(desk.directory, "consolidated", base + timedelta(minutes=12), occurrence="occ-2", day="2026-11-15")
+    desk.token = _activated_at(desk, got, base + timedelta(minutes=14))
+    assert "Dream seam:" not in _open(desk, capsys)
+
+
+def test_two_rolled_back_cards_of_one_occurrence_after_the_load_tell_one_line_the_newest(desk, capsys):
+    from levain.desk import dream_status
+
+    recs = [dream_status.DreamRecord("rolled-back", "2026-11-15T10:00:00Z", "o"),
+            dream_status.DreamRecord("rolled-back", "2026-11-15T09:00:00Z", "o"),
+            dream_status.DreamRecord("consolidated", "2026-11-15T07:00:00Z", "o")]
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE seam_handoffs (close_key TEXT)")
+    conn.execute("INSERT INTO seam_handoffs VALUES ('dream-rotation:o')")
+    (line,) = dream_status.rollback_notes(conn, recs, "2026-11-15T08:00:00Z")
+    assert "rolled back at 2026-11-15T10:00:00Z" in line
