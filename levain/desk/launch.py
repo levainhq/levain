@@ -1137,9 +1137,8 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
         except (OSError, ValueError) as exc:     # ValueError: sys.executable empty or relative (nothing spawned yet)
             return fail(f"the read budget could not be installed ({type(exc).__name__}: {str(exc)[:200]})")
         # a nested user_scope launch must not inherit the parent seat's budget variables (_harness keeps LEVAIN_*)
-        if budget is None:
-            env = {k: v for k, v in env.items() if not k.startswith("LEVAIN_READ_BUDGET_")}
-        else:
+        env = {k: v for k, v in env.items() if not k.startswith("LEVAIN_READ_BUDGET_")}
+        if budget is not None:
             env = {**env, **budget["env"]}
         brief = _write_brief(store, got)
         name = session_name(got)

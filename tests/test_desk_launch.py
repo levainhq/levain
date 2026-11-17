@@ -34,7 +34,8 @@ mode = (here / "mode").read_text().strip()
 state = here / "state.json"
 with open(here / "log.jsonl", "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(),
-                         "budget_dir": os.environ.get("LEVAIN_READ_BUDGET_DIR")}}) + "\n")
+                         "budget_dir": os.environ.get("LEVAIN_READ_BUDGET_DIR"),
+                         "budget_call": os.environ.get("LEVAIN_READ_BUDGET_CALL")}}) + "\n")
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
     print("2.1.305 (Claude Code)"); sys.exit(0)
@@ -1486,6 +1487,28 @@ def test_install_tightens_looser_existing_directories(tmp_path):
     os.chmod(base / "state", 0o755)
     read_budget_install.install(tmp_path)
     assert (base.stat().st_mode & 0o777) == 0o700 and ((base / "state").stat().st_mode & 0o777) == 0o700
+
+
+def test_install_refuses_a_symlinked_budget_directory_and_leaves_the_target_alone(tmp_path):
+    from levain.desk import read_budget_install
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    os.chmod(target, 0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "read_budget").symlink_to(target)
+    with pytest.raises(OSError, match="symlink"):
+        read_budget_install.install(home)
+    assert (target.stat().st_mode & 0o777) == 0o755
+
+
+def test_budgeted_launch_strips_a_stale_parent_budget_env_then_sets_its_own(qdir, workdir, fake, live_hook, monkeypatch):
+    monkeypatch.setenv("LEVAIN_READ_BUDGET_CALL", "5")
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()))
+    _argv, call = _budget_launch(s, fake, qdir)
+    assert call["budget_dir"] == str(qdir / "read_budget" / "state")
+    assert call["budget_call"] is None
 
 
 def test_the_installed_budget_script_is_the_package_file_byte_for_byte_and_stdlib_only(tmp_path):

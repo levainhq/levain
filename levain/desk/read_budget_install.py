@@ -38,7 +38,9 @@ def install(home: str | os.PathLike[str]) -> tuple[str, str]:
     state = base / "state"
     for d in (base, state):
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(d, 0o700)      # a directory that was already there keeps its old mode otherwise
+        if d.is_symlink():
+            raise OSError(f"{d} is a symlink; the read budget needs a plain directory")
+        os.chmod(d, 0o700)    # a directory that was already there keeps its old mode otherwise
     data = _source()
     path = base / f"read_budget-{hashlib.sha256(data).hexdigest()[:16]}.py"
     try:
