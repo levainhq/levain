@@ -219,15 +219,14 @@ def _countersigned(store: Any, question_id: str, sign: Any, queue: Path | None) 
 
 
 def _sign_queue(consent_dir: Path | None, environ: Mapping[str, str]) -> Path | None:
-    """The sign queue the countersign reads: the live install's (a named ``$LEVAIN_SIGN_QUEUE_DIR``, or the live store's hook
-    queue) for the live store; for an explicit ``consent_dir`` (the hook queue is the consent dir) that directory, never the
-    live one, unless the environment names a queue."""
+    """The sign queue the countersign reads, resolved by the one resolver the filing path uses
+    (:func:`levain.consent.answer_countersign.sign_queue_dir`): the live install's for the live store (``environ``: a named
+    ``$LEVAIN_SIGN_QUEUE_DIR``, else its hook queue's ``claude_code.json``); for an explicit ``consent_dir`` (the hook queue is
+    the consent dir) that directory's own ``claude_code.json``, the environment never naming its queue."""
     from levain.consent import answer_countersign as ac
 
     try:
-        if consent_dir is None or environ.get(ac.ENV_QUEUE):
-            return ac.sign_queue_dir(environ)
-        return Path(consent_dir)
+        return ac.sign_queue_dir(environ, None if consent_dir is None else Path(consent_dir))
     except (OSError, ValueError, KeyError):
         return None
 

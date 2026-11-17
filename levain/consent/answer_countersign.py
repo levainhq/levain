@@ -83,7 +83,7 @@ def _absolute(value: Any) -> Path | None:
     return None
 
 
-def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
+def resolve_sign_queue(environ: Mapping[str, str], hook_queue: Path | str | None = None) -> SignQueue:
     """The cockpit Signer's queue dir, and why there is none. In order: ``$LEVAIN_SIGN_QUEUE_DIR`` when set and
     non-empty (an absolute path, else no queue and ``why`` names it); else
     the hook queue's ``claude_code.json``. When that file is present it must be readable, a JSON object, and any
@@ -93,8 +93,10 @@ def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
     queue itself, when it is a directory that a cockpit serves or has served, i.e. it holds a published cockpit
     origin or its sign-request directory exists (so a request filed there is still found after that cockpit stops).
     A stale origin after a crash still counts: a request filed then waits for the next serve on that queue.
-    Relative paths are never resolved, since the hook runs in a project's directory."""
-    raw_env = environ.get(ENV_QUEUE)
+    Relative paths are never resolved, since the hook runs in a project's directory.
+    ``hook_queue`` names one explicit store's hook queue (a reader of a store that is not the live install's): then the
+    environment names neither the queue nor the hook queue, and that directory's ``claude_code.json`` is read exactly as above."""
+    raw_env = None if hook_queue is not None else environ.get(ENV_QUEUE)
     if raw_env:   # an empty value counts as unset; a named one that is not absolute is refused, never passed over
         got = _absolute(raw_env)
         if got is None:
@@ -103,7 +105,7 @@ def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
     try:
         from levain.consent.queue import queue_dir_for
 
-        qdir = queue_dir_for(environ)
+        qdir = Path(hook_queue) if hook_queue is not None else queue_dir_for(environ)
     except Exception:  # noqa: BLE001 - no hook queue to read settings from: no card
         return SignQueue(None)
     try:
@@ -137,9 +139,9 @@ def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
         return SignQueue(None, qdir)
 
 
-def sign_queue_dir(environ: Mapping[str, str]) -> Path | None:
+def sign_queue_dir(environ: Mapping[str, str], hook_queue: Path | str | None = None) -> Path | None:
     """:func:`resolve_sign_queue`'s ``path``: the cockpit Signer's queue dir, or None (no card)."""
-    return resolve_sign_queue(environ).path
+    return resolve_sign_queue(environ, hook_queue).path
 
 
 def sign_queue_hint(found: SignQueue) -> str:

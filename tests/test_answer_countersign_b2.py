@@ -304,3 +304,36 @@ def test_s1_a_blank_body_still_names_the_request_so_the_button_stays(monkeypatch
     [p] = pushes
     assert p["data"]["what"] == ac.CARD_TITLE
     assert center.needs_data(__import__("json").dumps(p["data"]), rid) is not None
+
+
+# --- P5 (levain#98): the board's countersigned grade rests on the REAL verdict, through the one queue resolver ----------
+
+def _board_grade(store, qdir: Path, environ: dict) -> str:
+    from datetime import datetime, timezone
+
+    from levain.desk import board_producers as bp
+
+    rows = bp.native_blocks(now=datetime.now(timezone.utc), store_id=None, consent_dir=qdir, environ=environ)["band"]["rows"]
+    return {r["id"]: r["grade"] for r in rows}[store.recent(1)[0].id]
+
+
+def test_p5_the_board_reads_countersigned_from_the_real_verdict_and_the_configured_sign_queue(monkeypatch, store, env, keydir,
+                                                                                               qdir, signq, tmp_path, pushes):
+    """Q3 + the unstubbed verdict: a countersign filed through the real filing path (the queue named by ``sign_queue_dir`` in the
+    store's claude_code.json, not by the environment) is graded ``countersigned`` by native_blocks, whatever queue the
+    process environment names; before the fix the producer read ``qdir`` itself (or the ambient queue) and graded it unsigned."""
+    from levain.consent import sign as sign_mod
+
+    qs = seen(store, env, 1)
+    (qdir / "claude_code.json").write_text(json.dumps({"sign_queue_dir": str(signq)}))
+    remote_line(monkeypatch, store, env, keydir, "1a", None)           # filed via the resolver: no env queue, the settings key
+    [path] = cards(signq)
+    pk = _Passkey()
+    monkeypatch.setattr(sign_mod, "passkey_key_source", lambda q, rp, **k: (lambda: {pk.key.fingerprint: pk.key}))
+    ambient = {"LEVAIN_SIGN_QUEUE_DIR": str(tmp_path / "some-live-queue")}
+    assert ac.resolve_sign_queue(ambient, qdir).path == signq           # the producer's resolution is the filing path's
+    assert _board_grade(store, qdir, ambient).startswith("unsigned")    # filed, not yet signed on the phone
+    sign_card(signq, pk, path.stem)
+    assert ac.verdict(store, qs[0].id, sign_queue=signq, keys=lambda: {pk.key.fingerprint: pk.key}).state == "countersigned"
+    assert _board_grade(store, qdir, ambient) == "countersigned"
+    assert _board_grade(store, qdir, {}) == "countersigned"

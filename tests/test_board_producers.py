@@ -831,13 +831,18 @@ def _countersign_board(monkeypatch, tmp_path, verdict, *, sign=None, environ=Non
     return bp.native_blocks(now=now, store_id=None, consent_dir=tmp_path, environ=environ or {})["band"]["rows"][0]["grade"]
 
 
-def test_q3_the_countersign_reads_the_producers_own_queue_and_not_the_display_helper(monkeypatch, tmp_path):
+def test_q3_the_countersign_reads_the_queue_the_filing_resolver_names_for_the_producers_store(monkeypatch, tmp_path):
+    import json
+
     seen: list = []
-    assert _countersign_board(monkeypatch, tmp_path, "countersigned", seen=seen) == "countersigned"
-    assert seen == [tmp_path]                                         # the explicit consent dir, not the live install's queue
-    seen.clear()
-    assert _countersign_board(monkeypatch, tmp_path / "x", "countersigned", environ={"LEVAIN_SIGN_QUEUE_DIR": "/q"}, seen=seen) == "countersigned"
-    assert seen == [Path("/q")]                                       # a queue the environment names is honoured
+    named = tmp_path / "elsewhere"
+    named.mkdir()
+    (tmp_path / "claude_code.json").write_text(json.dumps({"sign_queue_dir": str(named)}))
+    # a configured sign_queue_dir is honoured for an explicit store, and the ambient environment's queue is not
+    assert _countersign_board(monkeypatch, tmp_path, "countersigned", environ={"LEVAIN_SIGN_QUEUE_DIR": "/q"}, seen=seen) == "countersigned"
+    assert seen == [named]
+    # the live store (no consent_dir) takes the environment's named queue, as the filing path does
+    assert bp._sign_queue(None, {"LEVAIN_SIGN_QUEUE_DIR": "/q"}) == Path("/q")
 
 
 @pytest.mark.parametrize("verdict", ["countersigned-by-nobody", "Countersigned", "countersigned ", "open"])
