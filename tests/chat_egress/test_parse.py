@@ -306,11 +306,12 @@ def test_l3_a_hex_looking_label_that_is_no_number_stays_dns(raw):
     assert canonical_host(raw) == raw
 
 
-def _time_parse_keys(n, clock):
-    """Best of 9 wall time of one parse of an n-key query (the best of 9 drops scheduler noise)."""
+def _time_parse_keys(n, clock, reps=9):
+    """Best of `reps` clock readings of one parse of an n-key query (best of 9 drops wall-clock scheduler noise; a
+    deterministic step clock needs one)."""
     query = "&".join(f"k{i}=v" for i in range(n))
     best = float("inf")
-    for _ in range(9):
+    for _ in range(reps):
         t0 = clock()
         p = parse.parse(frame(query=query))
         best = min(best, clock() - t0)
@@ -318,13 +319,13 @@ def _time_parse_keys(n, clock):
     return best
 
 
-def test_m1_names_dedupe_is_linear(clock=None, n=10_000):
+def test_m1_names_dedupe_is_linear(clock=None, n=10_000, reps=9):
     """Linearity, not seconds: 4x the keys must cost well under the 16x a quadratic dedupe would. A linear parse
     sits near 4x; the bound is 10x, so a loaded runner's constant slowdown (which scales both sizes) cannot trip it."""
     import time
     clock = clock or time.perf_counter
-    small = _time_parse_keys(n, clock)
-    large = _time_parse_keys(4 * n, clock)
+    small = _time_parse_keys(n, clock, reps)
+    large = _time_parse_keys(4 * n, clock, reps)
     assert large < 10 * small, (small, large, large / small)
 
 
@@ -346,8 +347,10 @@ def test_m1_linearity_bound_rejects_a_quadratic_dedupe(monkeypatch):
             self._set = frozenset(seen)
 
     monkeypatch.setattr(parse, "Names", QuadNames)
-    with pytest.raises(AssertionError):
-        test_m1_names_dedupe_is_linear(clock=lambda: steps[0], n=3_000)
+    with pytest.raises(AssertionError) as ei:
+        test_m1_names_dedupe_is_linear(clock=lambda: steps[0], n=3_000, reps=1)   # a step count is exact: one run
+    assert steps[0] > 0, "the stand-in was never exercised"
+    assert str(ei.value).startswith("("), ei.value      # the bound's own (small, large, ratio) message, not the parse-shape assert
 
 
 def test_m1_linearity_holds_under_a_constant_slowdown():
