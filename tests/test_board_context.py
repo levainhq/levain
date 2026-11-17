@@ -67,13 +67,43 @@ def make_repo(root: Path, name: str) -> Path:
     return d
 
 
+FLOW_SCHEMA = """
+CREATE TABLE episodes (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    metadata TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX idx_episodes_timestamp ON episodes(timestamp);
+CREATE TABLE episode_tags (
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (episode_id, tag)
+);
+CREATE INDEX idx_tags_tag ON episode_tags(tag);
+"""  # copied from flow's real episodic.db (.schema episodes, .schema episode_tags), read-only
+
+
+def flow_add(c, eid, ts, typ, content, tags=()):
+    c.execute("INSERT INTO episodes (id, timestamp, agent, type, source, content, metadata) VALUES (?, ?, 'flow', ?, 'flow-seat', ?, NULL)",
+              (eid, ts, typ, content))
+    for t in tags:
+        c.execute("INSERT INTO episode_tags VALUES (?, ?)", (eid, t))
+
+
 def make_flow_db(path: Path, tags_for: str = "alpha#1") -> None:
     c = sqlite3.connect(path)
-    c.execute("CREATE TABLE episodes (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, agent TEXT NOT NULL, type TEXT NOT NULL,"
-              " source TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, metadata TEXT, created_at TEXT NOT NULL DEFAULT '')")
-    c.execute("INSERT INTO episodes VALUES ('e1', ?, 'flow', 'observation', 'flow-seat', ?, ?, '')",
-              (now_stamp(), f"flow side note for {tags_for}", json.dumps({"tags": [f"item:{tags_for}", "repo:alpha"]})))
-    c.execute("INSERT INTO episodes VALUES ('e2', ?, 'flow', 'observation', 'flow-seat', 'not tagged', NULL, '')", (now_stamp(),))
+    c.executescript(FLOW_SCHEMA)
+    flow_add(c, "e1", now_stamp(), "observation", f"flow side note for {tags_for}", (f"item:{tags_for}", "repo:alpha"))
+    flow_add(c, "e2", now_stamp(), "observation", "not tagged")
+    flow_add(c, "e3", now_stamp(), "decision", "flow repo decision", ("repo:alpha",))
+    flow_add(c, "e4", now_stamp(), "observation", "other item note", ("item:beta#9",))
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=400)).strftime("%Y-%m-%dT%H:%M:%S-05:00")
+    flow_add(c, "e5", old, "observation", "ancient tagged note", (f"item:{tags_for}",))
     c.commit()
     c.close()
 
@@ -135,6 +165,7 @@ def test_the_five_parts_in_order(world, capsys):
     assert "state: landed_not_closed" in out and "commits on main: 1" in out
     assert "worked alpha#1 step" in out and "chose approach X" in out and "elsewhere" not in out
     assert "flow side note for alpha#1" in out and "not tagged" not in out
+    assert "flow repo decision" in out and "other item note" not in out and "ancient tagged note" not in out
     assert "record[artifacts]: unavailable (no record directory)" in out
     assert "conventions: AGENTS.md" in out
     assert "untracked" not in out

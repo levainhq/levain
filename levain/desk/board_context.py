@@ -12,8 +12,8 @@ costs the others:
 4. ``record``: three named sources, each reporting for itself. ``record[anneal]``: the anneal store's episodes tagged
    ``item:NAME#N`` then the newest ``decision`` episodes tagged ``repo:NAME``, read the way :mod:`levain.agents.recall` reads
    (the window by TIME, then filter, then cap, ``truncated`` when the scan bound is hit with the cap unmet).
-   ``record[flow]``: the same read of flow's own ``episodic.db`` through a READ-ONLY open (T9-a: flow's capture drops tags
-   until T12 (ii), so a flow seat's tags are read at the source); optional, never required.
+   ``record[flow]``: the same read of flow's own ``episodic.db`` through a READ-ONLY open, its tags read from flow's
+   ``episode_tags`` table (T9-a; fix 1); optional, never required.
    ``record[artifacts]``: the record directory's ``pre-track-*`` directories and dated artifact names that carry the item, by name only.
 5. ``conventions``: which of AGENTS.md, CLAUDE.md, CONTRIBUTING(.md) exist on origin/main, by name only.
 
@@ -303,17 +303,29 @@ def _read_anneal(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
 
 def _read_flow(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
     """Flow's episodic.db opened READ-ONLY. ``mode=ro`` first (a live WAL store reads consistently); ``immutable=1`` only when
-    that open cannot be made (a read-only directory); neither ever writes the file."""
+    that open cannot be made (a read-only directory); neither ever writes the file.
+
+    Flow keeps tags in its own table, ``episode_tags(episode_id, tag)`` (``scripts/episodic.py`` writes them there; no flow
+    writer puts tags in ``episodes.metadata``, so that path is not read). The window is an index-friendly lower bound on
+    ``episodes.timestamp`` (flow stamps carry a local offset, so the bound is widened by the largest UTC offset, 14 hours,
+    to never drop an episode at the edge); the newest MAX_SCAN rows are read, then only their tags."""
     base = "file:" + quote(str(path))
     last: Exception | None = None
     for q in ("?mode=ro", "?mode=ro&immutable=1"):
         try:
             conn = sqlite3.connect(base + q, uri=True, timeout=5)
             try:
-                since = _window(now)
+                since = (now - timedelta(days=WINDOW_DAYS, hours=14)).strftime(_STAMP)
                 total = conn.execute("SELECT COUNT(*) FROM episodes WHERE timestamp >= ?", (since,)).fetchone()[0]
-                got = conn.execute("SELECT timestamp, type, source, content, metadata FROM episodes WHERE timestamp >= ?"
+                got = conn.execute("SELECT id, timestamp, type, source, content FROM episodes WHERE timestamp >= ?"
                                    " ORDER BY timestamp DESC LIMIT ?", (since, MAX_SCAN)).fetchall()
+                tags: dict[str, list[str]] = {}
+                ids = [r[0] for r in got]
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    for eid, tag in conn.execute("SELECT episode_id, tag FROM episode_tags WHERE episode_id IN (%s)"
+                                                 % ",".join("?" * len(chunk)), chunk):
+                        tags.setdefault(eid, []).append(tag)
             finally:
                 conn.close()
             break
@@ -321,13 +333,8 @@ def _read_flow(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
             last = exc
     else:
         raise last or sqlite3.Error("cannot open")
-    rows, bad = [], 0
-    for ts, typ, src, content, meta in got:
-        try:
-            rows.append(_Ep(str(ts), str(typ), str(src or ""), str(content), _tags_of(meta)))
-        except ValueError:
-            bad += 1
-    return rows, total, bad
+    rows = [_Ep(str(ts), str(typ), str(src or ""), str(content), tuple(tags.get(eid, ()))) for eid, ts, typ, src, content in got]
+    return rows, total, 0
 
 
 def _source_lines(label: str, given: str | None, env: str, reader: Any, status: str, item_id: str, repo: str, now: datetime
