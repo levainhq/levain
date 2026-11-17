@@ -74,6 +74,7 @@ HASH_RE = re.compile(r"[0-9a-f]{64}")
 AUTHOR_KINDS = ("operator", "agent")
 GRADE_ASSERTED = "asserted"
 SIGNED_CHAIN_MOVED = "the board changed while you signed: sign again"
+GRADE_RELAYED = "relayed"
 
 
 class BoardError(RuntimeError):
@@ -484,17 +485,35 @@ def _author_for(author: Mapping[str, object] | None, by: str) -> dict:
 
 
 def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now: str | None = None, *,
-                 author: Mapping[str, object]) -> dict:
+                 author: Mapping[str, object], source: Mapping[str, object] | None = None) -> dict:
     """THE one place a record is built: every verb's record comes out of here, in the key order flow's writer uses, then
     ``author`` and ``grade``. The grade is the writer's, never a caller's: ``asserted`` until a later grade is earned.
     ``prev`` is not here: :func:`_append` stamps it, under the lock, right after ``at``. A body carrying ``author``,
-    ``grade``, ``prev`` or ``sig`` is refused: those keys are the writer's, never a caller's."""
-    taken = sorted(k for k in ("author", "grade", "prev", "sig") if k in body)
+    ``grade``, ``prev``, ``sig`` or ``source`` is refused: those keys are the writer's, never a caller's. ``source`` here
+    is the writer's own, from :func:`levain.desk.board_relay.relay_source`: it makes the grade ``relayed`` and is refused on
+    an operator (a relay is the desk's act)."""
+    taken = sorted(k for k in ("author", "grade", "prev", "sig", "source") if k in body)
     if taken:
         raise BoardError(f"a record body may not carry {', '.join(taken)}: the writer sets those")
     checked = _author_for(author, by)
-    return {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body,
-            "author": checked, "grade": GRADE_ASSERTED}
+    rec = {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body,
+           "author": checked, "grade": GRADE_ASSERTED}
+    if source is not None:
+        if checked["kind"] != "agent":
+            raise BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
+        rec["grade"] = GRADE_RELAYED
+        rec["source"] = dict(source)
+    return rec
+
+
+def _read_relay(relay, words) -> dict | None:
+    """The ``source`` for a record relaying ``relay`` = ``(np id, band source)``, read NOW (at write time), or None for no
+    relay. Refuses an unknown or unanswered row and words that are not a verbatim excerpt of the answer."""
+    if relay is None:
+        return None
+    from levain.desk import board_relay
+    np_id, band = relay
+    return board_relay.relay_source(np_id, words, band)
 
 
 def canonical_bytes(rec: Mapping[str, object]) -> bytes:
@@ -882,7 +901,7 @@ def _preflight(seal, author: Mapping[str, object] | None = None) -> None:
 
 
 def add(target: Target, repo, title, origin, by, words="", done=None, done_kind="merged", tier=None, depends=(),
-        key=None, payload_hash=None, now=None, *, author, seal=None) -> tuple[str, bool]:
+        key=None, payload_hash=None, now=None, *, author, seal=None, relay=None) -> tuple[str, bool]:
     """Append an ``add``; returns ``(id, created)``. With ``key`` and ``payload_hash``: the same key with the same hash
     returns the existing id and writes nothing; the same key with another hash refuses. A key never expires."""
     repo = _one_line(repo, "repo")
@@ -917,7 +936,8 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")
-        return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author), seal), True
+        source = _read_relay(relay, fields["words"])
+        return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author, source=source), seal), True
 
     _preflight(seal, author)
     rec, written = _append(target, build, seal=seal)
@@ -946,7 +966,7 @@ def _current_done(recs: list[dict], item_id: str) -> tuple:
     return kind, done
 
 
-def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, seal=None) -> str:
+def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, seal=None, relay=None) -> str:
     """``fields`` replaces those fields: title, words, done, done_kind, tier, depends_on (a list of link specs; None clears
     done/tier). Any other key is refused, so there is no way to store a status."""
     allowed = {"title", "words", "done", "done_kind", "tier", "depends_on"}
@@ -974,20 +994,23 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
             out[k] = [parse_link(d) for d in v]
     why, by = _one_line(why, "why"), _one_line(by, "by")
     author = _author_for(author, by)
+    if relay is not None and "words" not in out:
+        raise BoardError("a relayed amend must carry --words: the verbatim excerpt of the answer it relays")
 
     def build(recs):
         _require_known(recs, item_id)
         if "done" in out or "done_kind" in out:         # judge the RESULTING row, only when this amend touches the pair
             now_kind, now_done = _current_done(recs, item_id)
             _require_path_done(out.get("done_kind", now_kind), out["done"] if "done" in out else now_done)
-        return _graded(target, build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author), seal), True
+        source = _read_relay(relay, out.get("words"))
+        return _graded(target, build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author, source=source), seal), True
 
     _preflight(seal, author)
     return _append(target, build, seal=seal)[0]["id"]
 
 
 def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None,
-           authority=None) -> str:
+           authority=None, relay=None) -> str:
     """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
     ``abandon-track``'s cuts carry it); it is written after ``date`` only when given. A cut's cause (P2-d) is checked against
     ``authority``, an authority SOURCE read under the lock (``board_sign.resolve_authority``); a sealed decide checks it
@@ -1005,7 +1028,8 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
 
     def build(recs):
         _require_known(recs, item_id)
-        return _graded(target, build_record("decide", item_id, by, body, now, author=author), seal, authority), True
+        source = _read_relay(relay, words)
+        return _graded(target, build_record("decide", item_id, by, body, now, author=author, source=source), seal, authority), True
 
     _preflight(seal, author)
     return _append(target, build, seal=seal)[0]["id"]
