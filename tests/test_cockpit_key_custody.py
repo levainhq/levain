@@ -616,29 +616,71 @@ def _signs_with(monkeypatch, other: RealKey) -> None:
     monkeypatch.setattr(keys_mod.subprocess, "run", run)
 
 
-def test_a_touch_id_signature_the_key_did_not_make_reads_as_no_presence_not_a_bad_signature(tmp_path, monkeypatch):
-    import levain.cockpit.keys as keys_mod
-    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
-    (tmp_path / "k.levain-key.json").write_text(json.dumps({
+def _touch_id_sidecar(tmp_path, name="k"):
+    (tmp_path / f"{name}.levain-key.json").write_text(json.dumps({
         "format": "levain-key/1", "custody": "touch-id", "provider": "/usr/lib/ssh-keychain.dylib",
         "ctk_hash": "A" * 40}))
+
+
+def _signs_nothing(monkeypatch) -> None:
+    """ssh-keygen exits 0 and writes nothing: the cancelled prompt."""
+    import levain.cockpit.keys as keys_mod
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if "-Y" in list(argv) and list(argv)[list(argv).index("-Y") + 1] == "sign":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"")
+        return real_run(argv, **kw)
+    monkeypatch.setattr(keys_mod.subprocess, "run", run)
+
+
+def test_a_touch_id_sign_that_returns_no_signature_is_the_cancelled_one(tmp_path, monkeypatch):
+    import levain.cockpit.keys as keys_mod
+    k = RealKey(tmp_path, "k")
+    _touch_id_sidecar(tmp_path)
+    _, sign = keys_mod.ssh_signer(k.path)
+    _signs_nothing(monkeypatch)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    assert "Touch ID was cancelled" in str(err.value) and k.fingerprint in str(err.value)
+
+
+def test_a_touch_id_signature_that_is_there_but_does_not_verify_is_never_called_cancelled(tmp_path, monkeypatch):
+    # 11-17: a touched Touch ID sign of a long statement read "Touch ID was cancelled" whatever had actually failed;
+    # a signature that exists and fails the check is named for that, with what it carried
+    import levain.cockpit.keys as keys_mod
+    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    _touch_id_sidecar(tmp_path)
     _, sign = keys_mod.ssh_signer(k.path)
     _signs_with(monkeypatch, other)
     with pytest.raises(KeyError_) as err:
         sign(b"m")
     msg = str(err.value)
-    assert "Touch ID" in msg and "cancelled" in msg and k.fingerprint in msg
-    assert "does not verify" not in msg
+    assert "cancelled" not in msg and "does not verify" in msg and k.fingerprint in msg
+    assert "ssh-ed25519" in msg and "chars" in msg and "ssh-keygen ran" in msg
+
+
+def test_a_signature_without_the_presence_flag_is_named_for_it_not_called_cancelled(tmp_path, monkeypatch):
+    import levain.cockpit.keys as keys_mod
+    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    _touch_id_sidecar(tmp_path)
+    _, sign = keys_mod.ssh_signer(k.path)
+    _signs_with(monkeypatch, other)
+    monkeypatch.setattr(keys_mod._authority_sig, "_sshsig_type_and_flags", lambda sig: ("sk-ecdsa-sha2-nistp256@openssh.com", 0))
+    monkeypatch.setattr(keys_mod._authority, "presence_missing", lambda sig, pub: True)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    assert "user-presence flag" in str(err.value) and "cancelled" not in str(err.value) and "flags 0x00" in str(err.value)
 
 
 def test_a_hand_made_touch_id_key_with_no_sidecar_is_named_by_its_provider(tmp_path, monkeypatch):
     # L3 r1 (codex MED): a hand-made Secure Enclave key signs through SSH_SK_PROVIDER with no sidecar
     import levain.cockpit.keys as keys_mod
     from levain.cockpit.custody import APPLE_PROVIDER
-    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    k = RealKey(tmp_path, "k")
     monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)
     _, sign = keys_mod.ssh_signer(k.path)
-    _signs_with(monkeypatch, other)
+    _signs_nothing(monkeypatch)
     with pytest.raises(KeyError_) as err:
         sign(b"m")
     assert "Touch ID" in str(err.value) and "cancelled" in str(err.value)
@@ -651,7 +693,7 @@ def test_any_key_whose_signature_is_not_its_own_is_refused_at_signing(tmp_path, 
     _signs_with(monkeypatch, other)
     with pytest.raises(KeyError_) as err:
         sign(b"m")
-    assert "no valid signature" in str(err.value) and "Touch ID" not in str(err.value)
+    assert "does not verify" in str(err.value) and "Touch ID" not in str(err.value)
 
 
 def test_a_good_signature_still_passes_the_signing_time_check(tmp_path):

@@ -292,6 +292,11 @@ def test_sign_no_key(tmp_path):
     ("ssh-keygen could not sign with /k (exit 1)", "unavailable"),
     ("ssh-keygen could not sign (FileNotFoundError)", "signer-error"),
     ("ssh-keygen returned no valid signature by SHA256:x (/k), so nothing was signed", "signer-error"),
+    # 11-17: a signature that is there but fails the check is never the cancelled reason
+    ("ssh-keygen returned a signature that does not verify as SHA256:x (sk-ecdsa-sha2-nistp256@openssh.com, flags 0x01, "
+     "250 chars, ssh-keygen ran 1.2s), so nothing was signed", "signer-error"),
+    ("ssh-keygen returned a signature for SHA256:x without the user-presence flag (sk-ecdsa-sha2-nistp256@openssh.com, "
+     "flags 0x00, 250 chars, ssh-keygen ran 1.2s), so nothing was signed", "signer-error"),
 ])
 def test_sign_reasons(tmp_path, message, reason):
     d = tmp_path / "keys"

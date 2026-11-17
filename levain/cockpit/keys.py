@@ -29,6 +29,7 @@ import re
 import sqlite3
 import struct
 import subprocess
+import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, overload
 
 from levain import authority as _authority
+from levain import authority_sig as _authority_sig
 from levain.authority import (LAPTOP, NAMESPACE, UNSTATED, AnchorError, AuthorityError, AuthorityKey,
                               AuthoritySnapshot, VerifierUnavailable, _pipe_reading, anchor_path, sign_and_append)
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
@@ -891,6 +893,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             env["SSH_SK_PROVIDER"] = sidecar.provider
         if no_agent:
             env.pop("SSH_AUTH_SOCK", None)
+        started = time.monotonic()
         try:
             cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", namespace],
                                 input=message, stdout=subprocess.PIPE,
@@ -904,16 +907,34 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         except UnicodeDecodeError:
             raise KeyError_("ssh-keygen's signature is not ASCII") from None
         # Checked here, at the moment of signing, so a signature the key did not make is named for what it
-        # is: a cancelled Touch ID prompt lets ssh-keygen exit 0 without one (measured 2026-10-12). Left to
-        # the log's replay it would read as a bad signature, which is a different failure.
+        # is. Only "no signature came back" is called a cancelled Touch ID prompt (it lets ssh-keygen exit 0
+        # without one, measured 2026-10-12); a signature that IS there and fails the check is named as that,
+        # with what it carried, because calling a touched sign "cancelled" is a false record (11-17).
         if not _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
                                           namespace=namespace, ssh_keygen=ssh_keygen):
             # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
             # (a hand-made key enrolled with --custody touch-id has no sidecar)
-            if touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER:
-                raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp}, "
+            is_touch = touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER
+            elapsed = time.monotonic() - started
+            try:
+                sig_type, flags = _authority_sig._sshsig_type_and_flags(signature)     # raises when no signature is there
+            except (ValueError, UnicodeError):
+                sig_type = flags = None
+                present = False
+            else:
+                present = True
+            if not present:
+                if is_touch:
+                    raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp}, "
+                                    "so nothing was signed")
+                raise KeyError_(f"ssh-keygen returned no valid signature by {fp} ({key_path}), so nothing was signed")
+            carried = (f"{sig_type}, flags {'none' if flags is None else format(flags, '#04x')}, "
+                       f"{len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s")
+            if _authority.presence_missing(signature, public_key):
+                raise KeyError_(f"ssh-keygen returned a signature for {fp} without the user-presence flag ({carried}), "
                                 "so nothing was signed")
-            raise KeyError_(f"ssh-keygen returned no valid signature by {fp} ({key_path}), so nothing was signed")
+            raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}), "
+                            "so nothing was signed")
         return signature
 
     return fp, sign
