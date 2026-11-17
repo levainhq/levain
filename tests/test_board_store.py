@@ -269,3 +269,248 @@ def test_explicit_items_with_no_pointer_still_reads(home, tmp_path, capsys):
         assert rc in (0, 3), err
         assert len(json.loads(out)["items"]) == 2
     assert not (tmp_path / bs.LOCK_NAME).exists()          # a store nobody set up is not given a lock file
+
+
+# --------------------------------------------------------------------------------------------------- fix round 1
+
+
+ADD = ("add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b")
+
+
+def _replace_with_copy(path: Path) -> None:
+    """What a git checkout does: the same bytes under a new inode."""
+    copy = path.with_name("items.copy")
+    copy.write_bytes(path.read_bytes())
+    os.replace(copy, path)
+
+
+def test_a_write_that_landed_in_a_replaced_inode_is_redone_against_the_new_file(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    real, calls = bs._write_all, {"n": 0}
+
+    def swap_then_write(fd, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _replace_with_copy(items)           # the replacement arrives between the open and the write
+        real(fd, payload)
+
+    monkeypatch.setattr(bs, "_write_all", swap_then_write)
+    rc, out, err = run(capsys, *ADD)
+    assert rc == 0 and out == "levain#2", err
+    assert calls["n"] == 2
+    ids = [json.loads(x)["id"] for x in lines(store)]
+    assert ids == ["levain#1", "levain#2"]          # the record is in the file at the path, once, with the id the NEW contents allow
+
+
+def test_a_write_in_a_store_replaced_every_time_refuses_naming_the_replacement(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    real = bs._write_all
+
+    def always(fd, payload):
+        _replace_with_copy(store / "items.jsonl")
+        real(fd, payload)
+
+    monkeypatch.setattr(bs, "_write_all", always)
+    rc, out, err = run(capsys, *ADD)
+    assert rc == 2 and "was replaced while a write was in flight" in err
+    assert lines(store) == []
+
+
+def test_a_read_of_a_replaced_file_is_retried_once_then_refused(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    run(capsys, *ADD)
+    target = bs.resolve_store()
+    real, calls = bs._read_fd, {"n": 0}
+
+    def swap_once(fd):
+        raw = real(fd)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _replace_with_copy(store / "items.jsonl")
+        return raw
+
+    monkeypatch.setattr(bs, "_read_fd", swap_once)
+    assert len(bs.read_item_lines(target)) == 1 and calls["n"] == 2
+    calls["n"] = -100                           # now every read is followed by a replacement
+    monkeypatch.setattr(bs, "_read_fd", lambda fd: (_replace_with_copy(store / "items.jsonl"), real(fd))[1])
+    with pytest.raises(bs.BoardError, match="was replaced while it was read"):
+        bs.read_item_lines(target)
+
+
+@pytest.mark.parametrize("damage", ["gone", "no-store-id"])
+def test_a_dangling_pointer_refuses_every_reader_and_writer_and_recreates_nothing(home, tmp_path, capsys, damage):
+    import shutil
+    store = use(capsys, tmp_path / "s")
+    if damage == "gone":
+        shutil.rmtree(store)
+    else:
+        (store / "store.id").unlink()
+    want = f"pointer names {store}, which holds no store (store.id missing); run levain board use"
+    for verb in (("state", "--json"), ADD, ("decide", "--id", "levain#1", "--decision", "cut", "--words", "w", "--by", "b"),
+                 ("amend", "--id", "levain#1", "--why", "w", "--by", "b", "--title", "x")):
+        rc, out, err = run(capsys, *verb)
+        assert rc == 2 and want in err, (verb, err)
+    assert not store.exists() or not (store / "items.jsonl").exists()
+    assert not (store / "store.id").exists()
+    assert run(capsys, "use", str(store))[0] == 0                       # only `use` makes a store
+    assert run(capsys, *ADD)[1] == "levain#1"
+
+
+def test_an_explicit_file_must_be_called_items_jsonl(home, tmp_path, capsys):
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("")
+    want = "--items must name a store directory or its items.jsonl"
+    rc, _, err = run(capsys, "state", "--json", "--items", str(shadow))
+    assert rc == 2 and want in err
+    store = use(capsys, tmp_path / "s")
+    for verb in (("state", "--json"), ADD):
+        rc, _, err = run(capsys, verb[0], "--items", str(shadow), *verb[1:])
+        assert rc == 2 and want in err
+    assert lines(store) == []
+
+
+def test_a_symlinked_items_file_is_the_store_its_parent_is(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "real.jsonl").write_text("")
+    (store / "items.jsonl").symlink_to(elsewhere / "real.jsonl")
+    link_dir = tmp_path / "alias"
+    link_dir.symlink_to(store)
+    rc, out, err = run(capsys, "add", "--items", str(link_dir / "items.jsonl"), *ADD[1:])
+    assert rc == 0 and out == "levain#1", err
+    assert len((elsewhere / "real.jsonl").read_text("utf-8").splitlines()) == 1
+
+
+@pytest.mark.parametrize("bad", ["", "relative/path\n", "/a\n/b\n", "DIR"])
+def test_use_repairs_a_pointer_that_cannot_be_read(home, tmp_path, capsys, bad):
+    (home / "board").mkdir(parents=True)
+    pointer = home / "board" / "STORE"
+    if bad == "DIR":
+        pointer.mkdir()
+    else:
+        pointer.write_text(bad)
+    rc, out, err = run(capsys, "state", "--json")
+    assert rc == 2
+    d = tmp_path / "s"
+    store = use(capsys, d)
+    assert pointer.read_text("utf-8") == f"{store}\n"
+    assert run(capsys, *ADD)[1] == "levain#1"
+
+
+def test_a_reader_does_not_create_store_lock(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    (store / "store.lock").unlink()
+    assert run(capsys, "state", "--json")[0] in (0, 3)
+    assert bs.read_store_id(bs.resolve_store()) is not None
+    assert bs.known_ids(bs.resolve_store()) == set()
+    assert not (store / "store.lock").exists()
+    assert run(capsys, *ADD)[1] == "levain#1"           # a writer takes it
+    assert (store / "store.lock").exists()
+
+
+def test_short_writes_are_looped_to_the_end(home, tmp_path, capsys, monkeypatch):
+    real = os.write
+    monkeypatch.setattr(bs.os, "write", lambda fd, data: real(fd, bytes(data)[:1]))
+    store = use(capsys, tmp_path / "s")
+    assert len((store / "store.id").read_text("utf-8")) == 33
+    assert (home / "board" / "STORE").read_text("utf-8") == f"{store}\n"
+
+
+def test_a_failed_store_id_write_is_undone_and_no_pointer_is_written(home, tmp_path, capsys, monkeypatch):
+    def boom(fd, data):
+        raise OSError(28, "no space")
+
+    monkeypatch.setattr(bs.os, "write", boom)
+    with pytest.raises(bs.BoardError, match="cannot set up the store"):
+        bs.use(tmp_path / "s")
+    assert not (tmp_path / "s" / "store.id").exists() and not (home / "board" / "STORE").exists()
+
+
+def test_a_failed_pointer_write_leaves_no_temp_file(home, tmp_path, capsys, monkeypatch):
+    real = os.write
+    store = tmp_path / "s"
+    use(capsys, store)
+    (home / "board" / "STORE").unlink()
+
+    def boom(fd, data):
+        if bytes(data).startswith(str(store).encode()):
+            raise OSError(28, "no space")
+        return real(fd, data)
+
+    monkeypatch.setattr(bs.os, "write", boom)
+    with pytest.raises(bs.BoardError, match="cannot write the store pointer"):
+        bs.use(store)
+    assert [p.name for p in (home / "board").iterdir() if p.name.startswith(".STORE")] == []
+    assert not (home / "board" / "STORE").exists()
+
+
+def test_the_pointer_round_trips_a_path_with_edge_spaces_and_refuses_a_newline(home, tmp_path, capsys):
+    odd = tmp_path / " spaced "
+    store = use(capsys, odd)
+    assert bs.read_pointer() == store and str(store).endswith(" spaced ")
+    assert run(capsys, *ADD)[1] == "levain#1"
+    rc, _, err = run(capsys, "use", str(tmp_path / "a\nb"))
+    assert rc == 2 and "newline" in err and bs.read_pointer() == store
+
+
+def test_the_directory_is_fsynced_after_a_created_entry(home, tmp_path, capsys, monkeypatch):
+    import stat
+    real, dirs = os.fsync, []
+
+    def spy(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            dirs.append(os.fstat(fd).st_ino)
+        return real(fd)
+
+    monkeypatch.setattr(bs.os, "fsync", spy)
+    store = use(capsys, tmp_path / "s")
+    assert os.stat(store).st_ino in dirs and os.stat(home / "board").st_ino in dirs       # store.id, then the pointer
+    dirs.clear()
+    assert run(capsys, *ADD)[0] == 0
+    assert dirs == [os.stat(store).st_ino]                                                 # items.jsonl was created
+    dirs.clear()
+    run(capsys, *ADD)
+    assert dirs == []                                                                      # nothing new was created
+
+
+def test_an_empty_items_argument_is_not_given(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, "add", "--items", "", *ADD[1:])[1] == "levain#1"
+    assert run(capsys, "state", "--json", "--items", "")[0] in (0, 3)
+    assert len(lines(store)) == 1
+
+
+def test_a_key_used_by_another_repo_refuses_naming_both(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    base = ("--title", "t", "--origin", "o", "--by", "b", "--key", "k1", "--payload-hash", HASH_A)
+    assert run(capsys, "add", "--repo", "levain", *base)[1] == "levain#1"
+    assert run(capsys, "add", "--repo", "levain", *base)[1] == "levain#1"
+    rc, out, err = run(capsys, "add", "--repo", "flow", *base)
+    assert rc == 2 and "levain#1" in err and "'levain'" in err and "'flow'" in err
+    assert len(lines(store)) == 1
+
+
+def test_an_unreadable_store_does_not_abort_an_add_through_the_depends_warning(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    real = bs.known_ids
+
+    def boom(target):
+        raise bs.BoardError("listing failed")
+
+    monkeypatch.setattr(bs, "known_ids", boom)
+    rc, out, err = run(capsys, *ADD, "--depends", "item:levain#9")
+    assert rc == 0 and out == "levain#1" and "could not check depends_on" in err and "listing failed" in err
+    monkeypatch.setattr(bs, "known_ids", real)
+
+
+def test_charter_check_prints_the_stores_own_refusal(home, tmp_path, capsys):
+    from levain.desk import charter
+    use(capsys, tmp_path / "mine")
+    other = tmp_path / "theirs"
+    other.mkdir()
+    (other / "items.jsonl").write_text("")
+    items, why = charter._store(other / "items.jsonl")
+    assert items is None and "two stores" in why and "BoardError" not in why

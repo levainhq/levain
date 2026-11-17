@@ -280,10 +280,12 @@ def _read_path(path: Path) -> tuple[str | None, str]:
 def _store(path: Path) -> tuple[dict[str, tuple[str, str | None]] | None, str]:
     """``(items, why)``: the store folded, or None and why the store checks are skipped. A torn store or one with
     problems is not complete, so it is skipped like an unreadable one, never trusted."""
+    from levain.desk import board_store
     from levain.desk.board_state import fold
     try:
-        from levain.desk import board_store
         folded = fold(board_store.read_item_lines(board_store.resolve_store(path)))
+    except board_store.BoardError as exc:
+        return None, f"was refused: {exc}"
     except (OSError, ValueError, RuntimeError, RecursionError) as exc:
         return None, f"cannot be read ({type(exc).__name__})"
     if folded.torn or folded.problems:

@@ -50,7 +50,7 @@ def register(subparsers: Any) -> None:
         description=("Fold the item store, read git, and print the derived state of every item. Reads only. Exit 0 when the "
                      "audit is empty, 3 when it is not, 2 when the items file or an explicit option is unusable."))
     p.add_argument("--json", action="store_true", help="Print the Board as JSON (the contract flow's readers consume).")
-    p.add_argument("--items", type=Path, metavar="PATH",
+    p.add_argument("--items", type=str, metavar="PATH",
                    help=f"The items store (items.jsonl). Default: ${ITEMS_ENV}; one of the two is required.")
     p.add_argument("--evidence-extra", dest="evidence_extra", type=Path, metavar="PATH",
                    help="A JSON object with the evidence flow supplies (seats, band, waiters, documents, unreadable). "
@@ -82,7 +82,7 @@ def register(subparsers: Any) -> None:
     a.add_argument("--by", required=True)
     a.add_argument("--key", default=None, help="An idempotency key: the same key and --payload-hash returns the existing id.")
     a.add_argument("--payload-hash", dest="payload_hash", default=None, metavar="SHA256")
-    a.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    a.add_argument("--items", type=str, metavar="PATH", help=items_help)
     a.set_defaults(func=run_add)
     m = sub.add_parser("amend", description="Replace fields of an item.")
     m.add_argument("--id", required=True)
@@ -95,7 +95,7 @@ def register(subparsers: Any) -> None:
     m.add_argument("--tier", choices=bs.TIERS)
     m.add_argument("--depends", action="append", default=None, metavar="TYPED", help="replaces the item's depends_on")
     m.add_argument("--clear", action="append", default=[], choices=bs.CLEARABLE)
-    m.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    m.add_argument("--items", type=str, metavar="PATH", help=items_help)
     m.set_defaults(func=run_amend)
     d = sub.add_parser("decide", description="Record a ruling on an item.")
     d.add_argument("--id", required=True)
@@ -103,7 +103,7 @@ def register(subparsers: Any) -> None:
     d.add_argument("--words", required=True)
     d.add_argument("--by", required=True)
     d.add_argument("--date", default=None)
-    d.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    d.add_argument("--items", type=str, metavar="PATH", help=items_help)
     d.set_defaults(func=run_decide)
     u = sub.add_parser("use", description="Make DIR this install's item store (created if needed); writes the pointer last.")
     u.add_argument("dir", type=Path, metavar="DIR")
@@ -165,13 +165,17 @@ def _refused(exc: Exception) -> int:
 
 
 def _warn_unknown_deps(target: bs.Target, depends: Any) -> None:
-    refs = [d["ref"] for d in (bs.parse_link(x) for x in depends) if d["kind"] == "item"]
-    if refs:
-        held = bs.known_ids(target)
-        unknown = [r for r in refs if r not in held]
-        if unknown:
-            print(f"board: depends_on names {', '.join(unknown)}, which the store does not hold yet; the board will read it unknown until it does.",
-                  file=sys.stderr)
+    """Advisory only: a failure to check says so in one line and the write goes on (the write judges its own inputs)."""
+    try:
+        refs = [d["ref"] for d in (bs.parse_link(x) for x in depends) if d["kind"] == "item"]
+        if refs:
+            held = bs.known_ids(target)
+            unknown = [r for r in refs if r not in held]
+            if unknown:
+                print(f"board: depends_on names {', '.join(unknown)}, which the store does not hold yet; the board will read it unknown until it does.",
+                      file=sys.stderr)
+    except (bs.BoardError, OSError) as exc:
+        print(f"board: could not check depends_on against the store ({exc}); writing anyway.", file=sys.stderr)
 
 
 def run_add(args: argparse.Namespace) -> int:

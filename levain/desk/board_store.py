@@ -9,8 +9,9 @@ Where the store is (one pointer, one identity):
 
 * ``<levain home>/board`` is :func:`levain.desk.work_attach.board_store_dir`. Its ``STORE`` file is the pointer: one
   line, an absolute path, written LAST by ``levain board use <dir>`` (atomic replace).
-* With a pointer, the store directory is the one it names. With none, readers use an explicit ``--items`` /
-  ``$LEVAIN_BOARD_ITEMS`` (a file, or a directory that holds ``items.jsonl``); writers refuse until ``board use`` has run.
+* With a pointer, the store directory is the one it names, and it must hold ``store.id`` (a dangling pointer refuses every
+  reader and writer; only ``board use`` creates a store). With none, readers use an explicit ``--items`` /
+  ``$LEVAIN_BOARD_ITEMS`` (a directory, or a file named exactly ``items.jsonl``); writers refuse until ``board use`` has run.
 * ``store.id`` is a random id written once, when a store directory is first set up, and never rewritten.
 * An explicit path that resolves to a different directory than the pointer's refuses every reader and writer
   (:data:`TWO_STORES`).
@@ -100,18 +101,29 @@ def read_pointer(environ: Mapping[str, str] | None = None) -> Path | None:
         return None
     except (OSError, UnicodeDecodeError) as exc:
         raise BoardError(f"the store pointer {home / POINTER_NAME} cannot be read ({type(exc).__name__}: {exc})") from None
-    line = raw.strip()
+    line = raw[:-1] if raw.endswith("\n") else raw          # exactly one terminator: a path's own edges are the path
     if not line or "\n" in line or not os.path.isabs(line):
         raise BoardError(f"the store pointer {home / POINTER_NAME} must hold one absolute path; run `levain board use <dir>`")
     return Path(os.path.realpath(line))
 
 
 def _explicit_dir_and_file(given: Path) -> tuple[Path, Path]:
-    """``--items`` names the items FILE or the store DIRECTORY: a directory compares as itself, anything else by its parent."""
-    p = Path(os.path.realpath(Path(given).expanduser()))
+    """``--items`` names the store DIRECTORY or its ``items.jsonl``. A directory compares as itself; a file must be called
+    exactly ``items.jsonl`` and compares by the real path of its parent (so a symlinked items file is the store its parent is)."""
+    expanded = Path(given).expanduser()
+    p = Path(os.path.realpath(expanded))
     if p.is_dir():
         return p, p / ITEMS_NAME
-    return p.parent, p
+    if expanded.name != ITEMS_NAME:
+        raise BoardError(f"--items must name a store directory or its {ITEMS_NAME}, not {str(given)!r}")
+    parent = Path(os.path.realpath(expanded.parent))
+    return parent, parent / ITEMS_NAME
+
+
+def _require_store_exists(pointed: Path) -> None:
+    """A pointer is only good while the directory it names holds a store: never recreate one implicitly."""
+    if not pointed.is_dir() or not (pointed / STORE_ID_NAME).exists():
+        raise BoardError(f"pointer names {pointed}, which holds no store ({STORE_ID_NAME} missing); run levain board use")
 
 
 def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | None = None) -> Target:
@@ -119,9 +131,10 @@ def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | 
     -> the explicit path must agree with it, or this raises the two-stores refusal. With no pointer, an explicit path is
     the store as given; with neither, the store is the levain home's board directory."""
     env = os.environ if environ is None else environ
-    given = items if items else (env.get(ITEMS_ENV) or None)
+    given = items if items is not None and str(items) != "" else (env.get(ITEMS_ENV) or None)
     pointed = read_pointer(environ)
     if pointed is not None:
+        _require_store_exists(pointed)
         if given:
             edir, efile = _explicit_dir_and_file(Path(given))
             if edir != pointed:
@@ -164,6 +177,22 @@ def _open_checked(path: Path, flags: int, flock_op: int | None = None) -> int:
     raise BoardError(f"{path} keeps being replaced under the lock (a git operation?); retry")
 
 
+def _same_file(fd: int, path: Path) -> bool:
+    try:
+        return os.fstat(fd).st_ino == os.stat(path).st_ino
+    except OSError:
+        return False
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make a created or renamed entry durable: fsync the directory that holds it."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class StoreHandle:
     """What :func:`store_lock` yields: opens the store's files while the lock is held."""
 
@@ -186,6 +215,9 @@ def store_lock(store_dir: Path, *, exclusive: bool) -> Iterator[StoreHandle]:
             store_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise BoardError(f"cannot create the board store directory {store_dir}: {exc}") from None
+    elif not (store_dir / LOCK_NAME).exists():
+        yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock): a read must not create it
+        return
     fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
     try:
         yield StoreHandle(store_dir, exclusive)
@@ -210,42 +242,46 @@ def _read_fd(fd: int) -> bytes:
     return raw
 
 
-def read_item_lines(target: Target) -> list[str]:
-    """The items file's lines, read under the shared lock. The fold decides what they mean (a torn line is a torn board).
-    A pointered store with no items file yet reads as empty; an explicit file that is missing raises OSError."""
-    if not target.pointered:
-        fd = _open_checked(target.items_path, os.O_RDONLY, fcntl.LOCK_SH)          # no store.lock in a store nobody set up
+def _read_stable(path: Path, flock_op: int | None = None) -> bytes:
+    """The bytes of ``path``, read from a file that is still the one at ``path`` afterwards; one retry if it was replaced."""
+    for _ in range(2):
+        fd = _open_checked(path, os.O_RDONLY, flock_op)
         try:
             raw = _read_fd(fd)
+            if _same_file(fd, path):
+                return raw
         finally:
             os.close(fd)
+    raise BoardError(f"{path} was replaced while it was read (a git operation?); retry")
+
+
+def read_item_lines(target: Target) -> list[str]:
+    """The items file's lines, read under the shared lock. The fold decides what they mean (a torn line is a torn board).
+    A pointered store with no items file yet reads as empty; an explicit file that is missing raises BoardError."""
+    if not target.pointered:
+        raw = _read_stable(target.items_path, fcntl.LOCK_SH)          # no store.lock in a store nobody set up
     else:
-        with store_lock(target.store_dir, exclusive=False) as held:
+        with store_lock(target.store_dir, exclusive=False):
             if not target.items_path.exists():
                 return []
-            fd = held.open(target.items_path.name, os.O_RDONLY, fcntl.LOCK_SH)
-            try:
-                raw = _read_fd(fd)
-            finally:
-                os.close(fd)
+            raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
     return raw.decode("utf-8").splitlines()
 
 
 def read_store_id(target: Target) -> str | None:
     """The store's identity, or None when it has none yet."""
-    with store_lock(target.store_dir, exclusive=False) as held:
+    with store_lock(target.store_dir, exclusive=False):
         if not (target.store_dir / STORE_ID_NAME).exists():
             return None
-        fd = held.open(STORE_ID_NAME, os.O_RDONLY)
-        try:
-            return _read_fd(fd).decode("utf-8", "replace").strip() or None
-        finally:
-            os.close(fd)
+        return _read_stable(target.store_dir / STORE_ID_NAME).decode("utf-8", "replace").strip() or None
 
 
 def _read_records(fd: int) -> list[dict]:
     """Every record of the store, or BoardError on a torn one. Reads the id and op only."""
-    raw = _read_fd(fd)
+    return _records_from(_read_fd(fd))
+
+
+def _records_from(raw: bytes) -> list[dict]:
     if raw and not raw.endswith(b"\n"):
         raise BoardError("the store does not end in a newline (a torn append); repair it before writing")
     try:
@@ -357,6 +393,17 @@ def _write_all(fd: int, payload: bytes) -> None:
         raise BoardError(f"the board store write failed ({exc}); the store was cut back to its last whole record") from None
 
 
+def _write_bytes(fd: int, payload: bytes) -> None:
+    """Write every byte (a short write is legal), then fsync. Raises OSError."""
+    done = 0
+    while done < len(payload):
+        n = os.write(fd, payload[done:])
+        if n <= 0:
+            raise OSError("write returned 0")
+        done += n
+    os.fsync(fd)
+
+
 def _require_pointered(target: Target) -> None:
     if not target.pointered:
         raise BoardError(NO_STORE)
@@ -366,17 +413,29 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]]) ->
     """Under the exclusive lock, hand ``build(records)`` the store's records; it returns ``(record, write)`` and may raise
     BoardError. When ``write`` is true the record is appended as one line and fsynced. Returns what ``build`` returned."""
     _require_pointered(target)
+    path = target.store_dir / target.items_path.name
     with store_lock(target.store_dir, exclusive=True) as held:
-        fd = held.open(target.items_path.name, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
-        try:
-            recs = _read_records(fd)
-            rec, write = build(recs)
-            if write:
-                # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                _write_all(fd, (json.dumps(rec, separators=(",", ":")) + "\n").encode("ascii"))
-            return rec, write
-        finally:
-            os.close(fd)
+        for _ in range(OPEN_RETRIES):
+            created = not path.exists()
+            fd = held.open(target.items_path.name, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
+            try:
+                recs = _read_records(fd)
+                rec, write = build(recs)
+                if write:
+                    # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
+                    _write_all(fd, (json.dumps(rec, separators=(",", ":")) + "\n").encode("ascii"))
+                if _same_file(fd, path):
+                    if write and created:
+                        try:
+                            _fsync_dir(target.store_dir)
+                        except OSError as exc:
+                            raise BoardError(f"{rec['id']} was written but the store directory could not be fsynced ({exc})") from None
+                    return rec, write
+            finally:
+                os.close(fd)
+            # the file was replaced under the lock (a git operation): the record, if any, is in the unlinked inode.
+            # Open the current file, read it again, build again (id and idempotency key judged against the new contents).
+        raise BoardError(f"{path} was replaced while a write was in flight (a git operation?) {OPEN_RETRIES} times; nothing was kept, retry")
 
 
 def _check_repo_mode(repo: str) -> None:
@@ -412,6 +471,8 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         if key is not None:
             for r in recs:
                 if r.get("op") == "add" and r.get("key") == key:
+                    if r.get("repo") != repo:
+                        raise BoardError(f"key {key!r} was already used for {r['id']} in repo {r.get('repo')!r}; this add is for repo {repo!r}")
                     if r.get("payload_hash") == payload_hash:
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
@@ -499,61 +560,76 @@ def known_ids(target: Target) -> set[str]:
     """The ids the store has added. Raises BoardError on a torn store."""
     if not target.items_path.exists():
         return set()
-    with store_lock(target.store_dir, exclusive=False) as held:
-        fd = held.open(target.items_path.name, os.O_RDONLY, fcntl.LOCK_SH)
-        try:
-            return {r["id"] for r in _read_records(fd) if r.get("op") == "add"}
-        finally:
-            os.close(fd)
+    with store_lock(target.store_dir, exclusive=False):
+        raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
+    return {r["id"] for r in _records_from(raw) if r.get("op") == "add"}
 
 
 # ------------------------------------------------------------------------------------------------------------- use
 
 
 def _write_store_id_once(held: StoreHandle) -> None:
+    path = held.dir / STORE_ID_NAME
     fd = held.open(STORE_ID_NAME, os.O_RDWR | os.O_CREAT)
     try:
         if _read_fd(fd).strip():
             return
-        os.write(fd, (secrets.token_hex(16) + "\n").encode("ascii"))
-        os.fsync(fd)
+        try:
+            _write_bytes(fd, (secrets.token_hex(16) + "\n").encode("ascii"))
+        except OSError:
+            try:
+                os.unlink(path)                 # a store with a half-written identity is no store: undo the creation
+            except OSError:
+                pass
+            raise
     finally:
         os.close(fd)
+    _fsync_dir(held.dir)
 
 
 def _write_pointer(home: Path, store_dir: Path) -> None:
-    """Atomic replace: a temp file in the same directory, fsynced, then renamed over the pointer."""
+    """Atomic replace: a temp file in the same directory, fully written and fsynced, renamed over the pointer, directory fsynced."""
     home.mkdir(parents=True, exist_ok=True)
     tmp = home / f".{POINTER_NAME}.{os.getpid()}.{secrets.token_hex(4)}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         try:
-            os.write(fd, (str(store_dir) + "\n").encode("utf-8"))
-            os.fsync(fd)
+            _write_bytes(fd, (str(store_dir) + "\n").encode("utf-8"))
         finally:
             os.close(fd)
-        os.replace(tmp, home / POINTER_NAME)
+        target = home / POINTER_NAME
+        if target.is_dir() and not target.is_symlink():
+            target.rmdir()                      # a directory where the pointer belongs: only an empty one is repaired
+        os.replace(tmp, target)
     except OSError:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    _fsync_dir(home)
 
 
 def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tuple[Path, bool]:
     """``levain board use <dir>``: make ``<dir>`` this install's store. Creates it, writes ``store.id`` if absent, and writes
-    the pointer LAST. Returns ``(resolved dir, changed)``; the same dir again changes nothing."""
+    the pointer LAST. Returns ``(resolved dir, changed)``; the same dir again changes nothing. A pointer that cannot be
+    read counts as a different one and is replaced."""
     home = _home_dir(environ)
     if home is None:
         raise BoardError("cannot place the store pointer: no levain home (set LEVAIN_HOME)")
     store_dir = Path(os.path.realpath(Path(directory).expanduser()))
+    if "\n" in str(store_dir):
+        raise BoardError(f"the store path {str(store_dir)!r} holds a newline; the one-line pointer cannot name it")
     try:
         with store_lock(store_dir, exclusive=True) as held:
             _write_store_id_once(held)
     except OSError as exc:
         raise BoardError(f"cannot set up the store at {store_dir}: {exc}") from None
-    if read_pointer(environ) == store_dir:
+    try:
+        current = read_pointer(environ)
+    except BoardError:
+        current = None
+    if current == store_dir:
         return store_dir, False
     try:
         _write_pointer(home, store_dir)
