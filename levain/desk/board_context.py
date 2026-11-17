@@ -28,6 +28,12 @@ and headers included) against :data:`TOTAL_CHARS`, re-cutting the largest part u
 Where the stores are: ``--anneal PATH`` (else ``$LEVAIN_ANNEAL_DB``) and ``--flow-episodes PATH`` (else
 ``$LEVAIN_FLOW_EPISODES``). No existing producer or install config names a read-only episodic.db path, so these are explicit.
 A source with no path named says ``unavailable``; a path that was named and cannot be read says ``unreadable`` with the first error.
+
+Known edges (judged, not bugs): the flow prefilter's 14-hour widening is at least every real offset's distance and flow writes
+``T``-separated ISO stamps only, so no boundary row is dropped. ``total_chars`` is the rendered page's size; the ``--json`` form adds
+escaping. ``--repo`` reads git state only (it names a path the registry lacks, so there is nothing to check it against; the state
+part says so); charter and conventions come from the registry. The record directory is the operator's own, so its filenames are
+not sanitised. Dedupe is conservative by design, and the ``-wal``/``-shm`` side files are named above.
 """
 from __future__ import annotations
 
@@ -69,7 +75,8 @@ DECISION_EPISODES = 5
 EPISODE_CHARS = 300
 COMMITS_SHOWN = 15
 CONVENTIONS = ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING", "CONTRIBUTING.md")
-_ID = re.compile(r"([a-z][a-z0-9_-]*)#([0-9]+)")
+_ID = bs.ID_RE                                       # the store's own id grammar, not a third regex
+_TRUNC_TAIL = re.compile(r"\[truncated: (\d+) more lines?\]")
 _DATED = re.compile(r"^(?:\d{4}-\d{2}-\d{2}|\d{8})")
 _STAMP = "%Y-%m-%dT%H:%M:%S.%fZ"
 EXIT_REFUSED = 2
@@ -100,14 +107,25 @@ def _clip_marked(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     marker = f"… [clipped {len(text)} chars]"          # the widest the count can be, so the result never exceeds n
-    keep = max(0, n - len(marker))
+    if n < len(marker):                                 # no room for the marker: a bare cut, still within n
+        return (text[:max(0, n - 1)] + "…")[:max(0, n)]
+    keep = n - len(marker)
     return text[:keep] + f"… [clipped {len(text) - keep} chars]"
+
+
+def _s(value: Any) -> str:
+    """A value for display: ``—`` for None, never the literal ``None``."""
+    return "—" if value is None else str(value)
 
 
 def _cap(lines: list[str], budget: int) -> tuple[list[str], bool]:
     """``lines`` cut at ``budget`` characters. A line longer than a third of the budget is clipped (marker), so one
     over-long line never evicts the lines after it; when later lines do not fit, the cut ends in a ``[truncated ...]`` line
     that is itself inside the budget."""
+    carried = 0
+    if lines and (m := _TRUNC_TAIL.fullmatch(lines[-1])):      # a re-cap: drop the earlier marker, keep its count
+        carried = int(m.group(1))
+        lines = lines[:-1]
     out, used, clipped = [], 0, False
     line_max = max(200, budget // 3)
     for i, raw in enumerate(lines):
@@ -119,10 +137,13 @@ def _cap(lines: list[str], budget: int) -> tuple[list[str], bool]:
                 out.append(_clip_marked(ln, room))      # the very first line is never lost entirely
                 used += len(out[-1]) + 1
                 i += 1
-            rest = len(lines) - i
-            return out + [f"[truncated: {rest} more line{'s' if rest != 1 else ''}]"], True
+            rest = len(lines) - i + carried
+            return (out + [f"[truncated: {rest} more line{'s' if rest != 1 else ''}]"] if rest > 0 else out), True
         out.append(ln)
         used += len(ln) + 1
+    if carried:
+        out.append(f"[truncated: {carried} more line{'s' if carried != 1 else ''}]")
+        clipped = True
     return out, clipped
 
 
@@ -217,19 +238,19 @@ def _charter_part(repo: Any, name: str, item_id: str, folded: Any, derived: Deri
     for pid in sorted(ids, key=lambda p: (abs(ids.index(p) - pos), ids.index(p))):
         it = folded.items.get(pid)
         st = derived.states.get(pid) if derived is not None else None
-        lines.append(f"- {pid}  {st.state if st else 'state unreadable'}  {_clip(it.title, 100) if it else '(not in the store)'}")
+        lines.append(f"- {pid}  {st.state if st else 'state unreadable'}  {_clip(_s(it.title), 100) if it else '(not in the store)'}")
     out, cut = _cap(lines, PART_CHARS["charter"])
     return Part("charter", out, truncated=cut)
 
 
 def _item_part(item: Any, derived: Derived | None) -> Part:
     # his words verbatim, on their own sub-budget, so the done line and the dependencies always survive
-    lines = [f"item {item.id}: {_clip_marked(item.title, MARK_CHARS)}",
-             f"words: {_clip_marked(item.words, WORDS_CHARS) if item.words else '(none given)'}",
-             f"origin: {_clip_marked(str(item.origin), MARK_CHARS)}",
-             f"done: {_clip_marked(item.done, MARK_CHARS) if item.done else '(none)'}  done_kind: {item.done_kind}"]
+    lines = [f"item {item.id}: {_clip_marked(_s(item.title), MARK_CHARS)}",
+             f"words: {_clip_marked(str(item.words), WORDS_CHARS) if item.words else '(none given)'}",
+             f"origin: {_clip_marked(_s(item.origin), MARK_CHARS)}",
+             f"done: {_clip_marked(str(item.done), MARK_CHARS) if item.done else '(none)'}  done_kind: {_s(item.done_kind)}"]
     if item.decision is not None:
-        lines.append(f"decision: {item.decision.decision} ({item.decision.date}): {_clip_marked(item.decision.words or '', MARK_CHARS)}")
+        lines.append(f"decision: {_s(item.decision.decision)} ({_s(item.decision.date)}): {_clip_marked(item.decision.words or '', MARK_CHARS)}")
     if not item.depends_on:
         lines.append("depends on: nothing")
     for link in item.depends_on:
@@ -242,14 +263,16 @@ def _item_part(item: Any, derived: Derived | None) -> Part:
     return Part("item", out, truncated=cut)
 
 
-def _state_part(item_id: str, derived: Derived) -> Part:
+def _state_part(item_id: str, derived: Derived, repo_note: str = "") -> Part:
     if derived.why:
         return _unreadable("state", derived.why)
     st = derived.states.get(item_id)
     if st is None:
         return _unreadable("state", "the derive did not return the item")
     ev = derived.evidence
-    lines = [f"state: {st.state} ({st.column}): {st.reason}"]
+    lines = [f"state: {_s(st.state)} ({_s(st.column)}): {_s(st.reason)}"]
+    if repo_note:
+        lines.append(repo_note)
     if ev is None:
         lines.append("commits: unreadable (no evidence)")
     else:
@@ -430,12 +453,12 @@ def _artifact_lines(repo: Any, item_id: str) -> list[str]:
     except OSError as exc:
         return [f"record[artifacts]: unreadable ({base} cannot be listed: {type(exc).__name__})"]
     name, _, n = item_id.partition("#")
-    forms = (item_id, f"{name}-{n}", f"{name}_{n}")
+    forms = [re.compile(re.escape(f) + r"(?!\d)") for f in (item_id, f"{name}-{n}", f"{name}_{n}")]   # not a prefix of a longer number
     hits: list[str] = []
     for e in names:
         if e.startswith("pre-track-"):
             hits.append(e)
-        elif _DATED.match(e) and any(f in e for f in forms):
+        elif _DATED.match(e) and any(f.search(e) for f in forms):
             hits.append(e)
     return [f"record[artifacts]: {base}"] + [f"  {h}" for h in hits] if hits else \
         [f"record[artifacts]: nothing in {base} names {item_id} (pre-track-* and dated artifacts)"]
@@ -454,8 +477,8 @@ def _record_part(repo: Any, name: str, item_id: str, args: argparse.Namespace, n
     out, c3 = _cap(lines, PART_CHARS["record"])
     part = Part("record", out, truncated=cut or c3)
     if not (ok_a or ok_f):
-        part.status = "unreadable"
-        part.why = "no episode source could be read"
+        named = any(g is not None or os.environ.get(env) for g, env in ((args.anneal, ANNEAL_ENV), (args.flow_episodes, FLOW_ENV)))
+        part.status, part.why = ("unreadable", "no episode source could be read") if named else ("unavailable", "no episode source was named")
     return part
 
 
@@ -491,7 +514,8 @@ def _enforce_total(mode_line: str, parts: list[Part]) -> str:
         big.lines, _cut = _cap(big.lines, max(200, big.chars() - (len(text) - TOTAL_CHARS)))
         big.truncated = True
         text = _render(mode_line, parts)
-    return text[:TOTAL_CHARS]                   # unreachable with sane caps; the bound holds regardless
+    tail = "\n[truncated: page bound]"            # unreachable with sane caps; the bound holds regardless, visibly
+    return (text[:max(0, TOTAL_CHARS - len(tail))] + tail)[:TOTAL_CHARS]
 
 
 def _refuse(msg: str) -> int:
@@ -499,11 +523,18 @@ def _refuse(msg: str) -> int:
     return EXIT_REFUSED
 
 
+def _guarded(name: str, build: Any) -> Part:
+    """One part's builder under its own guard: an exception is that part's ``unreadable``; the other parts still print."""
+    try:
+        return build()
+    except Exception as exc:  # noqa: BLE001
+        return _unreadable(name, f"{type(exc).__name__}: {_clip(str(exc), 120)}")
+
+
 def run_context(args: argparse.Namespace) -> int:
-    m = _ID.fullmatch(args.item)
-    if not m:
+    if not isinstance(args.item, str) or _ID.fullmatch(args.item) is None:
         return _refuse(f"{args.item!r} is not an item id (NAME#N)")
-    name, item_id = m.group(1), args.item
+    name, item_id = args.item.partition("#")[0], args.item
     try:
         target = bs.resolve_store(args.items)
         lines = bs.read_item_lines(target)
@@ -514,6 +545,7 @@ def run_context(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
         return _refuse(f"--now {args.now!r} is not an ISO-8601 timestamp")
+    now = now.astimezone(timezone.utc)          # the stamps below end in a literal Z, so the instant must be UTC
     folded = fold(lines)
     item = folded.items.get(item_id)
     if item is None:
@@ -543,11 +575,14 @@ def run_context(args: argparse.Namespace) -> int:
             derived = Derived({}, None, f"git evidence cannot be read ({type(exc).__name__}: {_clip(str(exc), 120)})")
     dv = derived if not derived.why else None
 
-    parts = [_charter_part(repo, name, item_id, folded, dv, repo_why),
-             _item_part(item, dv),
-             _state_part(item_id, derived),
-             _record_part(repo, name, item_id, args, now),
-             _conventions_part(repo)]
+    repo_note = ""
+    if repo is None and repo_path is not None:
+        repo_note = f"git evidence was read from {repo_path}, given by --repo; the path's identity is not checked"
+    parts = [_guarded("charter", lambda: _charter_part(repo, name, item_id, folded, dv, repo_why)),
+             _guarded("item", lambda: _item_part(item, dv)),
+             _guarded("state", lambda: _state_part(item_id, derived, repo_note)),
+             _guarded("record", lambda: _record_part(repo, name, item_id, args, now)),
+             _guarded("conventions", lambda: _conventions_part(repo))]
     mode_line = _clip(mode_line, MARK_CHARS) if mode_line else ""
     text = _enforce_total(mode_line, parts)
     if args.json:

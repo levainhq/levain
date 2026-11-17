@@ -442,3 +442,108 @@ def test_an_empty_flag_is_honoured_and_unconfigured_is_unavailable(world, capsys
     monkeypatch.delenv("LEVAIN_FLOW_EPISODES")
     rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal))
     assert "record[flow]: unavailable (no path named" in out
+
+
+# ------------------------------------------------------------------------------------------------------------- fix 3 (L3 r1)
+
+
+def test_f3_1_item_id_grammar_is_the_stores(world, capsys):
+    from levain.desk import board_store as bs
+    assert bc._ID is bs.ID_RE
+    rc, out, err = board(capsys, "context", "alpha#01", *world.args)
+    assert rc == 2 and "not an item id" in err
+    rc, out, err = board(capsys, "context", "3d.x#1", "--no-land-waiter")       # valid grammar (digit lead, dot): reaches the store lookup
+    assert rc == 2 and "no item 3d.x#1 in the store" in err
+
+
+def test_f3_2_non_utc_now_is_normalised(world, capsys):
+    rc, out, err = board(capsys, "context", "alpha#1", "--now", "2026-11-17T12:00:00-05:00", *world.args)
+    assert rc == 0, err
+    assert bc._window(datetime.datetime(2026, 11, 17, 17, 0, tzinfo=datetime.timezone.utc)).startswith("2026-08-19T17:00:00")
+    # the run itself: an episode at 16:30Z (11:30-05:00) is inside, one at 18:00Z is after the instant 17:00Z
+    c = sqlite3.connect(world.flow)
+    flow_add(c, "n1", "2026-11-17T16:30:00Z", "observation", "inside nonutc", ("item:alpha#1",))
+    flow_add(c, "n2", "2026-11-17T18:00:00Z", "observation", "after nonutc", ("item:alpha#1",))
+    c.commit()
+    c.close()
+    rc, out, err = board(capsys, "context", "alpha#1", "--now", "2026-11-17T12:00:00-05:00", *world.args)
+    assert "inside nonutc" in out and "after nonutc" not in out
+
+
+def test_f3_3_an_item_form_does_not_match_a_longer_number(tmp_path):
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    for n in ("2026-11-17_alpha-10_x.md", "2026-11-17_alpha_12.md", "2026-11-17_alpha#100.md", "2026-11-17_alpha-1.md", "2026-11-17_alpha-1_x.md"):
+        (rec / n).write_text("x")
+    out = bc._artifact_lines(SimpleNamespace(record_dir=str(rec)), "alpha#1")
+    assert out[1:] == ["  2026-11-17_alpha-1.md", "  2026-11-17_alpha-1_x.md"]
+
+
+def test_f3_4_one_part_failing_costs_only_that_part(world, capsys, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("kaput")
+    monkeypatch.setattr(bc, "_item_part", boom)
+    rc, out, err = board(capsys, "context", "alpha#1", *world.args)
+    assert rc == 0 and "item: unreadable (RuntimeError: kaput)" in out
+    assert "- C1: it works" in out and "state: landed_not_closed" in out and "conventions: AGENTS.md" in out
+
+
+def test_f3_4_a_bad_record_dir_and_a_none_title_do_not_crash(world, capsys, tmp_path):
+    item = SimpleNamespace(id="alpha#1", title=None, words=None, origin=None, done=None, done_kind=None, decision=None, depends_on=[])
+    p = bc._item_part(item, None)
+    assert "None" not in "\n".join(p.lines) and "item alpha#1: —" in p.lines[0]
+    part = bc._guarded("record", lambda: bc._record_part(SimpleNamespace(record_dir="bad\x00dir"), "alpha", "alpha#1",
+                                                          SimpleNamespace(anneal=None, flow_episodes=None), datetime.datetime.now(datetime.timezone.utc)))
+    assert part.status in ("unreadable", "unavailable")
+
+
+def test_f3_5_no_source_named_is_unavailable_a_failed_named_one_is_unreadable(world, capsys, tmp_path):
+    rc, out, _ = board(capsys, "context", "alpha#1", "--json", "--no-land-waiter")
+    rec = [p for p in json.loads(out)["parts"] if p["part"] == "record"][0]
+    assert rec["status"] == "unavailable"
+    rc, out, _ = board(capsys, "context", "alpha#1", "--json", "--no-land-waiter", "--anneal", str(tmp_path / "nope.db"))
+    rec = [p for p in json.loads(out)["parts"] if p["part"] == "record"][0]
+    assert rec["status"] == "unreadable"
+
+
+def test_f3_6_repo_flag_is_labelled(world, capsys):
+    store = world.store
+    (store / "repos.jsonl").rename(store / "repos.jsonl.off")
+    (store / "repos.jsonl").touch()
+    rc, out, err = board(capsys, "context", "alpha#1", "--repo", str(world.repo), "--no-land-waiter")
+    assert rc == 0, err
+    assert f"git evidence was read from {world.repo}, given by --repo; the path's identity is not checked" in out
+
+
+def test_f3_7_render_fixes():
+    out, cut = bc._cap(["x" * 20000], 150)
+    assert not any("0 more line" in ln for ln in out)
+    lines = [f"line {i} " + "z" * 80 for i in range(40)]
+    once, _ = bc._cap(lines, 1500)
+    twice, _ = bc._cap(once, 700)
+    assert sum(1 for ln in twice if ln.startswith("[truncated: ")) == 1
+    first = [ln for ln in once if ln.startswith("[truncated: ")][0]
+    kept_once = len(once) - 1
+    n_twice = int(twice[-1].split()[1])
+    assert n_twice == (len(lines) - kept_once) + (kept_once - (len(twice) - 1))
+    for n in (0, 1, 5, 20):
+        assert len(bc._clip_marked("y" * 100, n)) <= n
+    assert bc._s(None) == "—"
+
+
+def test_f3_7_last_resort_slice_ends_in_a_marker_inside_the_bound(monkeypatch):
+    monkeypatch.setattr(bc, "TOTAL_CHARS", 120)
+    parts = [bc.Part("a", ["a"]), bc.Part("b", ["b"])]
+    monkeypatch.setattr(bc, "_cap", lambda lines, budget: (lines, False))      # cannot shrink: the fallback must hold the bound
+    text = bc._enforce_total("m" * 300, parts)
+    assert len(text) <= 120 and text.endswith("[truncated: page bound]")
+
+
+def test_f3_8_anneal_total_matching_is_pre_limit(tmp_path):
+    from anneal_memory import Store
+    s = Store(tmp_path / "a.db")
+    for i in range(12):
+        s.record(f"ep {i}", "observation", source="x", metadata={"tags": ["a"]})
+    r = s.recall(limit=5)
+    s.close()
+    assert len(r.episodes) == 5 and r.total_matching == 12
