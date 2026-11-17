@@ -916,7 +916,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
             # (a hand-made key enrolled with --custody touch-id has no sidecar)
             is_touch = touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER
-            if not signature.strip():
+            if not signature:        # empty only: whitespace is output, not a cancel
                 if is_touch:
                     raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
                                     f"(ssh-keygen ran {elapsed:.1f}s), so nothing was signed")
