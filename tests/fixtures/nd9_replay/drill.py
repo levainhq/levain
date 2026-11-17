@@ -23,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from levain.desk import effects as fx                              # noqa: E402

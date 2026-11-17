@@ -1,4 +1,4 @@
-"""ND-9 (board levain#18): the replay drill's harness, not its verdict. The drill (project_memory/1116-26_nd9_replay/)
+"""ND-9 (board levain#18): the replay drill's harness, not its verdict. The drill (tests/fixtures/nd9_replay/)
 replays 21 synthetic events against the draft orders and writes a disagreement table for him to read. What is pinned here
 is only that the harness runs offline, covers the oracle's events and the five classes, gives the same observation under
 a fresh and a resident desk, and has a written reason for each disagreement it reports. Whether the code and the oracle
@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("cryptography")
 
 ROOT = Path(__file__).resolve().parent.parent
-DRILL = ROOT / "project_memory" / "1116-26_nd9_replay"
+DRILL = ROOT / "tests" / "fixtures" / "nd9_replay"
 pytestmark = [pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen"),
               pytest.mark.skipif(not (DRILL / "drill.py").exists(), reason="the drill is not in this checkout")]
 
