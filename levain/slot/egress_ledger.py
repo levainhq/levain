@@ -13,9 +13,12 @@ verb), with its two locks and the install's own ``store_id``.
     is pruned by wall time only, so a clock set back past a prune would make a pruned id's bytes fresh again with no
     row to refuse them; a tap whose commit time is more than :data:`CLOCK_SLACK_S` before the mark is
     ``egress-grant-clock`` (fail closed) until the clock is back past it. Absent is no prune yet.
-  - ``ledger.lock`` (a bounded wait) serializes every read-modify-write of both files across ALL sessions;
-    ``verify.lock`` (a TRY) lets one ssh-keygen run at a time install-wide. Lock order: verify lock (taken and released
-    before any other), then the session lock, then the ledger lock. Nothing takes the ledger lock and then another.
+  - ``ledger.lock`` (a bounded wait) serializes every read-modify-write of both files across ALL sessions. The verify
+    lock (a TRY) lets one ssh-keygen run at a time install-wide; it is an flock on the grants DIRECTORY itself (a fresh
+    open of ``.`` below the directory fd), not on a file in it, so taking it creates nothing and a request whose
+    signature fails leaves no file behind. Every contender locks the same directory inode. Lock order: verify lock
+    (taken and released before any other), then the session lock, then the ledger lock. Nothing takes the ledger lock
+    and then another.
 
 A ledger that does not parse is ``egress-grant-ledger`` and is never read as empty or rewritten. Every write replaces
 the file whole by a unique temp and a rename (never an append: a torn tail would brick the ledger), synced as
@@ -41,7 +44,7 @@ from levain.slot import egress_grants as eg
 from levain.slot.egress_store import NOT_READY, fsync_of
 
 USED_NAME, REVOKED_NAME, HIGH_WATER_NAME = "used.jsonl", "revoked.jsonl", "high_water"
-LEDGER_LOCK, VERIFY_LOCK, STORE_ID_NAME = "ledger.lock", "verify.lock", "store_id"
+LEDGER_LOCK, STORE_ID_NAME = "ledger.lock", "store_id"
 USED_MAX = 4096
 REVOKED_MAX = 256
 FILE_MAX = 2 * 1024 * 1024
@@ -61,6 +64,7 @@ _GRANT = re.compile(r"eh-[0-9a-f]{24}")
 _SESSION = re.compile(r"s-[0-9a-f]{16}")
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_LOCK = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_O_DIR_LOCK = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _USED_KEYS = frozenset({"grant", "session", "host", "issued", "keep_until"})
 _REVOKED_KEYS = frozenset({"grant", "keep_until"})
 
@@ -133,16 +137,24 @@ def read_store_id(ctx: object, dirfd: int) -> str:
 
 
 @contextmanager
-def _flock(ctx: object, dirfd: int, name: str, wait_s: Optional[float]) -> Iterator[None]:
+def _flock(ctx: object, dirfd: int, name: Optional[str], wait_s: Optional[float]) -> Iterator[None]:
+    """flock ``name`` below ``dirfd`` (created 0600 if absent), or, for ``name`` None, the directory ``dirfd`` names
+    (opened afresh, so the lock belongs to its own open file description and creates nothing). ``wait_s`` None is a
+    TRY: held is ``egress-grant-busy``."""
     seams = ctx.seams  # type: ignore[attr-defined]
+    label = "the grants directory" if name is None else name
     try:
-        fd = os.open(name, _O_LOCK, 0o600, dir_fd=dirfd)
+        if name is None:
+            fd = os.open(".", _O_DIR_LOCK, dir_fd=dirfd)
+        else:
+            fd = os.open(name, _O_LOCK, 0o600, dir_fd=dirfd)
     except OSError:
-        raise Refused(NOT_READY, "%s cannot be opened" % name) from None
+        raise Refused(NOT_READY, "%s cannot be opened" % label) from None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != seams.chowned_uid(0):
-            raise Refused(NOT_READY, "%s is not a regular root file" % name)
+        if (not (stat.S_ISDIR(st.st_mode) if name is None else stat.S_ISREG(st.st_mode))
+                or st.st_uid != seams.chowned_uid(0)):
+            raise Refused(NOT_READY, "%s is not root's" % label)
         deadline = None  # type: Optional[float]
         delay = 0.01
         while True:
@@ -153,11 +165,11 @@ def _flock(ctx: object, dirfd: int, name: str, wait_s: Optional[float]) -> Itera
                 if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
                     raise
                 if wait_s is None:
-                    raise Refused(ERR_BUSY, "%s is held" % name) from None
+                    raise Refused(ERR_BUSY, "%s is held" % label) from None
                 now = seams.monotonic()
                 deadline = now + wait_s if deadline is None else deadline
                 if now >= deadline:
-                    raise Refused(ERR_BUSY, "%s held past %gs" % (name, wait_s)) from None
+                    raise Refused(ERR_BUSY, "%s held past %gs" % (label, wait_s)) from None
                 seams.sleep(delay)
                 delay = min(delay * 2, 0.25)
         yield
@@ -166,8 +178,9 @@ def _flock(ctx: object, dirfd: int, name: str, wait_s: Optional[float]) -> Itera
 
 
 def verify_lock(ctx: object, dirfd: int):
-    """The install-wide TRY lock around one signature verification: held is ``egress-grant-busy``."""
-    return _flock(ctx, dirfd, VERIFY_LOCK, None)
+    """The install-wide TRY lock around one signature verification: an flock on the grants directory (see the module
+    docstring), so it exists before any request and no request creates it. Held is ``egress-grant-busy``."""
+    return _flock(ctx, dirfd, None, None)
 
 
 def ledger_lock(ctx: object, dirfd: int):

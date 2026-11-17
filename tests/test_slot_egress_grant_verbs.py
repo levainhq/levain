@@ -354,7 +354,7 @@ def test_a_missing_signers_file_is_unenrolled(world, verifier):
 def test_a_held_verify_lock_answers_busy_and_no_verifier_runs(world, verifier):
     """T30"""
     import fcntl
-    fd = os.open(world.L / "routes" / "grants" / "verify.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(world.L / "routes" / "grants", os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         refused(tap(world), "egress-grant-busy")
@@ -372,7 +372,7 @@ def test_the_verify_lock_is_released_before_the_session_lock_is_taken(world, ver
         refused(tap(world), "session-busy")
     finally:
         os.close(fd)
-    again = os.open(world.L / "routes" / "grants" / "verify.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    again = os.open(world.L / "routes" / "grants", os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(again, fcntl.LOCK_EX | fcntl.LOCK_NB)     # not held by the refused call
     finally:

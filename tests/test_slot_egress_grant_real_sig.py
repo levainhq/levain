@@ -93,3 +93,75 @@ def test_a_tampered_signature_is_refused_and_does_not_burn_the_tap(real):
     assert used_ids(w) == []
     ok = tap(w, "files.example.org", "s", msg=msg, sig=sig, fp=IH.blob_fingerprint(good.public))
     assert ok[0] == RH.EXIT_OK                                   # the same tap, intact, still admitted
+
+
+# --- levain#109: the enrolled line's principal travels with the key; no request creates a verify lock file -------------
+
+def _grants(w):
+    return sorted(p.name for p in (w.L / "routes" / "grants").iterdir())
+
+
+def _enrol(w, principal, key, options=f'namespaces="{NS}"'):
+    signers = w.L / "policy" / "authority_signers"
+    signers.write_text(f"{principal} {options} {key.public}\n")
+    signers.chmod(0o644)
+
+
+def test_a_bad_signature_leaves_no_verify_lock_file_and_a_good_one_none_either(real):
+    w, good, _o, _a = real
+    before = _grants(w)
+    refused(deliver(w, good, namespace="levain-authority"), "egress-grant-sig")      # reaches the real ssh-keygen
+    assert _grants(w) == before and "verify.lock" not in _grants(w)
+    assert deliver(w, good)[0] == RH.EXIT_OK                                        # a good one verifies
+    assert "verify.lock" not in _grants(w)
+
+
+def test_the_verify_lock_is_one_at_a_time_install_wide_while_a_real_verify_would_run(real):
+    import fcntl
+    import os
+    w, good, _o, _a = real
+    fd = os.open(w.L / "routes" / "grants", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        refused(deliver(w, good), "egress-grant-busy")
+    finally:
+        os.close(fd)
+    assert deliver(w, good)[0] == RH.EXIT_OK
+
+
+@pytest.mark.parametrize("principal", ["phill", "alice@example.org", "a.b_c-d+e"])
+def test_the_enrolled_lines_own_principal_is_the_identity_verified_under(real, principal):
+    w, good, _o, _a = real
+    _enrol(w, principal, good)
+    assert IH._signer_fields(f'{principal} namespaces="{NS}" {good.public}'.encode())[0] == principal
+    from levain.slot import egress_verify as EVY
+    assert EVY.enrolled_key(w_ctx(w), IH.blob_fingerprint(good.public)) == (principal, good.public.split()[0] + " "
+                                                                           + good.public.split()[1])
+    assert deliver(w, good)[0] == RH.EXIT_OK
+
+
+def w_ctx(w):
+    class _Ctx:
+        seams = w.seams
+    return _Ctx()
+
+
+@pytest.mark.parametrize("principals", ["*", "a,b", "!x", "*@example.org", '"two words"'])
+def test_a_line_whose_principals_are_not_one_literal_word_is_no_enrolment(real, principals):
+    w, good, _o, _a = real
+    _enrol(w, principals, good)
+    refused(deliver(w, good), "egress-grant-unenrolled")
+    assert entries(w) is None and used_ids(w) == []
+
+
+def test_the_principal_is_passed_to_the_verifier_and_a_signature_is_not_valid_under_another_identity(real):
+    from levain.authority_sig import verify_link_sig
+    w, good, _o, _a = real
+    _enrol(w, "phill", good)
+    msg = eg.signed_bytes(raw_message("files.example.org"), "s")
+    sig = good.sign(msg, NS)
+    kw = dict(public_key=good.public, fingerprint=IH.blob_fingerprint(good.public), namespace=NS)
+    assert verify_link_sig(msg, sig, principal="phill", **kw) is True
+    assert verify_link_sig(msg, sig, principal="authority-signer", **kw) is True      # the identity is the caller's pick
+    assert verify_link_sig(msg, sig, principal="*", **kw) is False                     # never a pattern
+    assert verify_link_sig(msg, sig, principal="a b", **kw) is False
