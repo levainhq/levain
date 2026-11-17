@@ -129,6 +129,11 @@
    "owner": "levain/consent/terminal_sign.py"
   },
   {
+   "namespace": "levain-board",
+   "status": "shipped",
+   "owner": "levain/desk/board_sign.py"
+  },
+  {
    "namespace": "levain-desk-answer",
    "status": "shipped",
    "owner": "levain/consent/terminal_sign.py"

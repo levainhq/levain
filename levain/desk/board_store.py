@@ -585,7 +585,8 @@ def _require_pointered(target: Target) -> None:
 
 
 def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filename: str = ITEMS_NAME,
-            parse: Callable[[bytes], Any] = _records_from) -> tuple[dict, bool]:
+            parse: Callable[[bytes], Any] = _records_from,
+            seal: Callable[[dict], dict] | None = None) -> tuple[dict, bool]:
     """Under the exclusive lock, hand ``build(parse(raw))`` the parsed bytes of ``<store dir>/<filename>`` (``parse`` is the
     per-file record reader: ``_records_from`` for the items file, the registry's reader for ``repos.jsonl``; it may raise
     BoardError); ``build`` returns ``(record, write)`` and may raise BoardError. A file that ends in an unterminated line (only
@@ -594,7 +595,11 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
     before the write the held fd's size is compared with the size of the bytes the record was built from: a lock-free writer
     that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
-    break, which the verifier reports."""
+    break, which the verifier reports.
+
+    ``seal`` (see :mod:`levain.desk.board_sign`) is called on the chained record, under the lock, before the size check and the
+    write: it returns the record to write (with its ``sig``) or raises BoardError, and then nothing is written. A signer that is
+    slow holds the lock for that long; a re-read after a lock-free writer's append signs again."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
@@ -611,6 +616,8 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                 if not write:
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
+                if seal is not None:
+                    rec = seal(rec)                         # signs the bytes that include prev; raises, writing nothing, on any failure
                 if os.fstat(fd).st_size != len(raw):
                     continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
@@ -633,8 +640,40 @@ def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
     board_registry.check_add(store_dir, repo, key)
 
 
+def _store_lines(target: Target) -> list[bytes]:
+    """Every line of both store files as written, for the cause check. Called from a ``build`` that runs under the exclusive
+    lock, so it takes none of its own."""
+    out: list[bytes] = []
+    for name in APPEND_FILES:
+        try:
+            out.extend(ln for ln in _read_stable(target.store_dir / name).split(b"\n") if ln)
+        except BoardError:
+            if (target.store_dir / name).exists():
+                raise
+    return out
+
+
+def _graded(target: Target, rec: dict, seal) -> dict:
+    """The writer's last word on a built record, before ``prev`` and before any prompt: the grade from the seal's ``via``
+    (``asserted`` with none), a signed record's author must be the operator, and the fixed policy
+    (:func:`levain.desk.board_sign.require_policy`) must accept it."""
+    from levain.desk import board_sign
+    if seal is not None:
+        board_sign.check_signable(rec)
+        rec = {**rec, "grade": seal.grade}
+    grade = rec["grade"]
+    needs_lines = rec["op"] == "decide" and "cause" in rec and grade not in board_sign.SIGNED_GRADES
+    board_sign.require_policy(rec["op"], grade, rec, lines=_store_lines(target) if needs_lines else ())
+    return rec
+
+
+def _preflight(seal) -> None:
+    if seal is not None:
+        seal.preflight()
+
+
 def add(target: Target, repo, title, origin, by, words="", done=None, done_kind="merged", tier=None, depends=(),
-        key=None, payload_hash=None, now=None, *, author) -> tuple[str, bool]:
+        key=None, payload_hash=None, now=None, *, author, seal=None) -> tuple[str, bool]:
     """Append an ``add``; returns ``(id, created)``. With ``key`` and ``payload_hash``: the same key with the same hash
     returns the existing id and writes nothing; the same key with another hash refuses. A key never expires."""
     repo = _one_line(repo, "repo")
@@ -669,9 +708,10 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")
-        return build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author), True
+        return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author), seal), True
 
-    rec, written = _append(target, build)
+    _preflight(seal)
+    rec, written = _append(target, build, seal=seal)
     return rec["id"], written
 
 
@@ -697,7 +737,7 @@ def _current_done(recs: list[dict], item_id: str) -> tuple:
     return kind, done
 
 
-def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author) -> str:
+def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, seal=None) -> str:
     """``fields`` replaces those fields: title, words, done, done_kind, tier, depends_on (a list of link specs; None clears
     done/tier). Any other key is refused, so there is no way to store a status."""
     allowed = {"title", "words", "done", "done_kind", "tier", "depends_on"}
@@ -731,12 +771,13 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author) -
         if "done" in out or "done_kind" in out:         # judge the RESULTING row, only when this amend touches the pair
             now_kind, now_done = _current_done(recs, item_id)
             _require_path_done(out.get("done_kind", now_kind), out["done"] if "done" in out else now_done)
-        return build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author), True
+        return _graded(target, build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author), seal), True
 
-    return _append(target, build)[0]["id"]
+    _preflight(seal)
+    return _append(target, build, seal=seal)[0]["id"]
 
 
-def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None) -> str:
+def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None) -> str:
     """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
     ``abandon-track``'s cuts carry it); it is written after ``date`` only when given."""
     if decision not in DECISIONS:
@@ -744,17 +785,18 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
     author = _author_for(author, by)
     when = _real_date(when or (now or _utc_now())[:10], "date")
+    body = {"decision": decision, "words": words, "date": when}
+    if cause is not None:
+        if not isinstance(cause, str) or not HASH_RE.fullmatch(cause):
+            raise BoardError(f"cause {cause!r} is not a lowercase sha256 hex digest")
+        body["cause"] = cause
 
     def build(recs):
         _require_known(recs, item_id)
-        body = {"decision": decision, "words": words, "date": when}
-        if cause is not None:
-            if not HASH_RE.fullmatch(cause):
-                raise BoardError(f"cause {cause!r} is not a lowercase sha256 hex digest")
-            body["cause"] = cause
-        return build_record("decide", item_id, by, body, now, author=author), True
+        return _graded(target, build_record("decide", item_id, by, body, now, author=author), seal), True
 
-    return _append(target, build)[0]["id"]
+    _preflight(seal)
+    return _append(target, build, seal=seal)[0]["id"]
 
 
 def known_ids(target: Target) -> set[str]:
