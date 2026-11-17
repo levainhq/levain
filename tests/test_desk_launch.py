@@ -33,7 +33,8 @@ here = Path(__file__).resolve().parent
 mode = (here / "mode").read_text().strip()
 state = here / "state.json"
 with open(here / "log.jsonl", "a") as fh:
-    fh.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\n")
+    fh.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(),
+                         "budget_dir": os.environ.get("LEVAIN_READ_BUDGET_DIR")}}) + "\n")
 args = sys.argv[1:]
 if args[:1] == ["--version"]:
     print("2.1.305 (Claude Code)"); sys.exit(0)
@@ -221,7 +222,8 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
     assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
     # the default: the user layer stays out (project + local settings only, auto-memory off), flags before the prompt
-    assert argv[7:11] == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert argv[7:9] == ["--setting-sources", "project,local"] and argv[9] == "--settings"
+    assert json.loads(argv[10])["autoMemoryEnabled"] is False                     # row 800 adds hooks and env to it
     assert len(argv) == 12 and str(brief) in argv[11]
     assert not any(a in ("--session-id", "--bare", "--dangerously-skip-permissions") or "bypass" in a for a in argv)
     spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
@@ -1417,7 +1419,8 @@ def test_user_scope_off_is_the_default_and_on_restores_the_old_argv(store, fake,
     off_argv, off_sha = _spawn_argv_and_sha(store, fake, qdir)
     assert off_argv.index("--setting-sources") < off_argv.index("--settings") < len(off_argv) - 1
     assert off_argv[off_argv.index("--setting-sources") + 1] == "project,local"
-    assert off_argv[off_argv.index("--settings") + 1] == '{"autoMemoryEnabled":false}'
+    doc = json.loads(off_argv[off_argv.index("--settings") + 1])         # row 800: the read budget rides with it
+    assert doc["autoMemoryEnabled"] is False and set(doc) == {"autoMemoryEnabled", "hooks", "env"}
     assert len(off_argv) == 12 and off_sha.startswith("sha256:")
 
 
@@ -1427,6 +1430,54 @@ def test_user_scope_on_spawns_with_neither_flag(qdir, workdir, fake, live_hook):
     argv, _sha = _spawn_argv_and_sha(s, fake, qdir)
     assert argv[:7] == ["--bg", "-n", argv[2], "--permission-mode", "default", "--model", "haiku"]
     assert len(argv) == 8 and "--setting-sources" not in argv and "--settings" not in argv
+
+
+# --- row 800: a seat Levain launches carries the read budget ---------------------------------------------------
+def _budget_launch(store, fake, qdir):
+    _argv, _sha = _spawn_argv_and_sha(store, fake, qdir)
+    (call,) = [c for c in fake.calls() if c["argv"][:1] == ["--bg"]][-1:]
+    return _argv, call
+
+
+def test_a_launched_seat_settings_carry_the_read_budget_hooks_with_absolute_paths(store, fake, qdir, live_hook, workdir):
+    argv, _call = _budget_launch(store, fake, qdir)
+    hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]
+    assert set(hooks) == {"PreToolUse", "PostToolUse"}
+    for ev, arg in (("PreToolUse", "pre"), ("PostToolUse", "post")):
+        (entry,) = hooks[ev]
+        assert entry["matcher"] == "Read"
+        cmd = shlex.split(entry["hooks"][0]["command"])
+        assert os.path.isabs(cmd[0]) and cmd[1] == "-I" and os.path.isabs(cmd[2]) and cmd[3] == arg
+        assert Path(cmd[2]).name.startswith("read_budget-") and Path(cmd[2]).is_file()
+
+
+def test_a_launched_seat_env_and_settings_name_the_budget_state_dir(store, fake, qdir, live_hook, workdir):
+    argv, call = _budget_launch(store, fake, qdir)
+    want = str(qdir / "read_budget" / "state")
+    assert call["budget_dir"] == want and Path(want).is_dir()
+    assert json.loads(argv[argv.index("--settings") + 1])["env"] == {"LEVAIN_READ_BUDGET_DIR": want}
+
+
+def test_user_scope_on_gets_no_read_budget_hook_and_no_env(qdir, workdir, fake, live_hook):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    argv, call = _budget_launch(s, fake, qdir)
+    assert "--settings" not in argv and call["budget_dir"] is None and not (qdir / "read_budget").exists()
+
+
+def test_the_installed_budget_script_is_the_package_file_byte_for_byte_and_stdlib_only(tmp_path):
+    import ast
+    import hashlib
+    from levain.desk import read_budget, read_budget_install
+    script, state = read_budget_install.install(tmp_path)
+    src = Path(read_budget.__file__)
+    assert Path(script).read_bytes() == src.read_bytes()
+    assert Path(script).name == f"read_budget-{hashlib.sha256(src.read_bytes()).hexdigest()[:16]}.py"
+    assert Path(state).is_dir() and read_budget_install.install(tmp_path) == (script, state)   # idempotent
+    tree = ast.parse(src.read_text())
+    mods = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    mods |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+    assert "levain" not in mods and mods <= set(sys.stdlib_module_names), mods
 
 
 def test_the_recorded_argv_sha_differs_between_on_and_off(qdir, workdir, fake, live_hook, tmp_path):

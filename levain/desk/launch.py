@@ -262,11 +262,19 @@ def drops_path(launch: Any) -> Path:
 _PROJECT_LAYERS = "project,local"
 
 
-def _layer_args(user_scope: bool) -> list[str]:
+def _layer_args(user_scope: bool, budget: dict[str, Any] | None = None) -> list[str]:
     """The Claude Code flags that keep your user layer (user settings, hooks, CLAUDE.md) out of a session
-    Levain starts: none when ``user_scope`` is on. The one home of the rule, for the desk and later a worker."""
+    Levain starts: none when ``user_scope`` is on. The one home of the rule, for the desk and later a worker.
+    ``budget`` (:func:`levain.desk.read_budget_install.seat_budget`) adds the read budget's hooks (row 800) to the
+    same ``--settings`` document, and the state directory as the settings' ``env`` too (the hook is inert without it,
+    and a background session's own environment is not assumed to be this process's); a seat the operator starts
+    himself (``user_scope`` on) gets neither."""
     if user_scope:
         return []
+    if budget is not None:
+        doc = {"autoMemoryEnabled": False, "hooks": budget["hooks"], "env": budget["env"]}
+        return ["--setting-sources", _PROJECT_LAYERS,
+                "--settings", json.dumps(doc, sort_keys=True, separators=(",", ":"))]
     # both forms (one comma-joined argument, inline JSON) were accepted by four real `claude --bg` runs on Claude Code
     # 2.1.314 (1030-42 dietrun). Measured 10-30 on 2.1.314: with `--setting-sources project,local` those four runs
     # answered NOT IN CONTEXT for a fact only in the user's ~/.claude/CLAUDE.md and for a canary string, so the user
@@ -1122,10 +1130,15 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
         if found is None:
             return fail("claude is not on PATH")
         exe = found
+        # row 800: a seat Levain launches carries the read budget unless the operator's own layer is on (user_scope)
+        from levain.desk import read_budget_install
+        budget = None if user_scope else read_budget_install.seat_budget(store.directory)
+        if budget is not None:
+            env = {**env, **budget["env"]}
         brief = _write_brief(store, got)
         name = session_name(got)
         argv = [exe, "--bg", "-n", name, "--permission-mode", "default",
-                *(["--model", got.model] if got.model else []), *_layer_args(user_scope), _prompt(got, brief)]
+                *(["--model", got.model] if got.model else []), *_layer_args(user_scope, budget), _prompt(got, brief)]
         argv_sha = "sha256:" + hashlib.sha256(canonical_bytes(argv)).hexdigest()
         try:
             cp = _run(argv, cwd=cwd, env=env, timeout=_SPAWN_TIMEOUT)
