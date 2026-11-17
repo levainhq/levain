@@ -80,6 +80,7 @@ def test_the_state_text_is_fixed_at_creation_and_no_call_can_inject_one(rig):
     {"words": ["sleep"], "state": "bell\x07"},
     {"words": ["sleep"], "state": "a‮b"},          # bidi override
     {"words": ["sleep"], "state": "a b"},          # line separator
+    {"words": ["sleep"], "state": "a\ud800b"},          # a lone surrogate
 ])
 def test_a_state_text_that_is_not_one_short_line_on_one_word_is_not_minted(rig, body):
     src, q = rig
@@ -135,12 +136,13 @@ def test_an_edit_refusal_detail_never_reaches_the_taps_caller(rig, monkeypatch):
 def test_a_cockpit_with_no_state_file_mints_no_state_token(rig, monkeypatch):
     src, q = rig
     with _signed(src, q) as (port, _):
-        keep = src.context_json
-        object.__setattr__(src, "context_json", None)       # the source is a frozen dataclass: this test alone unsets it
+        scope = src.write_scope
+        keep = scope.context_json
+        object.__setattr__(scope, "context_json", None)       # the scope a tap writes through (frozen): this test alone unsets it
         try:
             st, got, _ = _mint_bed(port)
         finally:
-            object.__setattr__(src, "context_json", keep)
+            object.__setattr__(scope, "context_json", keep)
         assert st == 422 and presence_tokens.list_public(q) == [], got
 
 

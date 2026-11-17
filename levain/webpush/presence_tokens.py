@@ -161,7 +161,7 @@ def create(queue_dir: Path | str, name: str, words: "list[str] | tuple[str, ...]
     use = [w for w in WORDS if w in use]
     text = None
     if state is not None:
-        if not isinstance(state, str) or any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in state):
+        if not isinstance(state, str) or any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in state):
             raise PresenceError("a token's state text is plain text on one line")
         text = " ".join(state.split())
         if not text or len(text) > STATE_MAX:

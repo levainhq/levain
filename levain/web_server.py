@@ -3307,8 +3307,8 @@ class _Handler(GuardedHandler):
         queue = self.server.signer.queue_dir
         try:
             if new:
-                if (req.get("state") is not None and (self.server.levain_source.write_scope is None
-                                                      or self.server.levain_source.context_json is None)):
+                scope = self.server.levain_source.write_scope       # the target a tap writes is the WRITE scope's, not the source's
+                if req.get("state") is not None and (scope is None or getattr(scope, "context_json", None) is None):
                     return {"error": "presence_refused", "message": "this cockpit has no writable state line, so a token cannot set one"}, 422
                 rec, token = presence_tokens.create(queue, req["name"], req.get("words"), state=req.get("state"))
                 return {"token": token, "record": rec, "tokens": presence_tokens.list_public(queue)}, 200

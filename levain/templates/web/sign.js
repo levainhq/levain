@@ -110,7 +110,7 @@
   let hashWords = "";
   if (location.pathname === "/sign/drop" && wdm) {
     try { hashWords = decodeURIComponent(wdm[1]); } catch (e) { hashWords = ""; }
-    hashWords = hashWords.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "").slice(0, 500);
+    hashWords = hashWords.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g, "").slice(0, 500);
   }
   let pick = "";
   const pickV = vm ? vm[1] : "";
