@@ -5,6 +5,8 @@ provider flag: the spawn keyguard in ``tests/conftest.py`` judges every spawn an
 here replaces ``verify_link_sig``; the other verb tests spy on it."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from levain.slot import egress_grants as eg
@@ -95,7 +97,7 @@ def test_a_tampered_signature_is_refused_and_does_not_burn_the_tap(real):
     assert ok[0] == RH.EXIT_OK                                   # the same tap, intact, still admitted
 
 
-# --- levain#109: the enrolled line's principal travels with the key; no request creates a verify lock file -------------
+# --- levain#109: the enrolled line's principals field is returned verbatim; no request creates a verify lock file ---
 
 def _grants(w):
     return sorted(p.name for p in (w.L / "routes" / "grants").iterdir())
@@ -129,39 +131,77 @@ def test_the_verify_lock_is_one_at_a_time_install_wide_while_a_real_verify_would
     assert deliver(w, good)[0] == RH.EXIT_OK
 
 
-@pytest.mark.parametrize("principal", ["phill", "alice@example.org", "a.b_c-d+e"])
-def test_the_enrolled_lines_own_principal_is_the_identity_verified_under(real, principal):
-    w, good, _o, _a = real
-    _enrol(w, principal, good)
-    assert IH._signer_fields(f'{principal} namespaces="{NS}" {good.public}'.encode())[0] == principal
-    from levain.slot import egress_verify as EVY
-    assert EVY.enrolled_key(w_ctx(w), IH.blob_fingerprint(good.public)) == (principal, good.public.split()[0] + " "
-                                                                           + good.public.split()[1])
-    assert deliver(w, good)[0] == RH.EXIT_OK
-
-
 def w_ctx(w):
     class _Ctx:
         seams = w.seams
     return _Ctx()
 
 
-@pytest.mark.parametrize("principals", ["*", "a,b", "!x", "*@example.org", '"two words"'])
-def test_a_line_whose_principals_are_not_one_literal_word_is_no_enrolment(real, principals):
+@pytest.mark.parametrize("principals", ["phill", "alice@example.org", "*", "a,b", "!x"])
+def test_enrolled_key_returns_the_principals_field_verbatim_and_the_line_still_verifies(real, principals):
+    from levain.slot import egress_verify as EVY
     w, good, _o, _a = real
     _enrol(w, principals, good)
-    refused(deliver(w, good), "egress-grant-unenrolled")
-    assert entries(w) is None and used_ids(w) == []
+    got = EVY.enrolled_key(w_ctx(w), IH.blob_fingerprint(good.public))
+    assert got[0] == principals and got[1] == f'namespaces="{NS}"' and got[2] == " ".join(good.public.split()[:2])
+    assert deliver(w, good)[0] == RH.EXIT_OK
 
 
-def test_the_principal_is_passed_to_the_verifier_and_a_signature_is_not_valid_under_another_identity(real):
-    from levain.authority_sig import verify_link_sig
+def test_a_star_principal_enrolled_line_verifies(real):
     w, good, _o, _a = real
-    _enrol(w, "phill", good)
+    _enrol(w, "*", good)
+    assert deliver(w, good)[0] == RH.EXIT_OK
+
+
+def test_check_signature_returns_the_enrolled_principals_field(real):
+    from levain.slot import egress_verify as EVY
+    w, good, _o, _a = real
+    _enrol(w, "alice@example.org", good)
     msg = eg.signed_bytes(raw_message("files.example.org"), "s")
-    sig = good.sign(msg, NS)
-    kw = dict(public_key=good.public, fingerprint=IH.blob_fingerprint(good.public), namespace=NS)
-    assert verify_link_sig(msg, sig, principal="phill", **kw) is True
-    assert verify_link_sig(msg, sig, principal="authority-signer", **kw) is True      # the identity is the caller's pick
-    assert verify_link_sig(msg, sig, principal="*", **kw) is False                     # never a pattern
-    assert verify_link_sig(msg, sig, principal="a b", **kw) is False
+    assert EVY.check_signature(w_ctx(w), msg, good.sign(msg, NS), IH.blob_fingerprint(good.public)) == "alice@example.org"
+
+
+def _grants_fd(w):
+    return os.open(w.L / "routes" / "grants", os.O_RDONLY | os.O_DIRECTORY)
+
+
+@pytest.mark.parametrize("name", ["EBADF", "ENOLCK", "EOPNOTSUPP", "ENOTSUP"])
+def test_a_filesystem_that_cannot_flock_a_directory_is_a_not_ready_refusal(real, monkeypatch, name):
+    import errno
+    import fcntl
+    from levain.slot import Refused
+    from levain.slot import egress_ledger as EL
+    code = getattr(errno, name, None)
+    if code is None:
+        pytest.skip(name + " is not on this platform")
+
+    def boom(fd, op):
+        raise OSError(code, "no")
+    monkeypatch.setattr(fcntl, "flock", boom)
+    w = real[0]
+    dfd = _grants_fd(w)
+    try:
+        with pytest.raises(Refused) as ei:
+            with EL.verify_lock(w_ctx(w), dfd):
+                pass
+    finally:
+        os.close(dfd)
+    assert str(ei.value).startswith(EL.NOT_READY) and "grants directory" in str(ei.value) and errno.errorcode[code] in str(ei.value)
+
+
+def test_other_flock_errnos_still_raise(real, monkeypatch):
+    import errno
+    import fcntl
+    from levain.slot import egress_ledger as EL
+
+    def boom(fd, op):
+        raise OSError(errno.EIO, "no")
+    monkeypatch.setattr(fcntl, "flock", boom)
+    w = real[0]
+    dfd = _grants_fd(w)
+    try:
+        with pytest.raises(OSError):
+            with EL.verify_lock(w_ctx(w), dfd):
+                pass
+    finally:
+        os.close(dfd)

@@ -18,7 +18,10 @@ verb), with its two locks and the install's own ``store_id``.
     open of ``.`` below the directory fd), not on a file in it, so taking it creates nothing and a request whose
     signature fails leaves no file behind. Every contender locks the same directory inode. Lock order: verify lock
     (taken and released before any other), then the session lock, then the ledger lock. Nothing takes the ledger lock
-    and then another.
+    and then another. A filesystem that cannot flock a directory fd (EBADF, ENOLCK, EOPNOTSUPP, ENOTSUP) is ``not-ready``.
+    Known edges: a stale empty ``verify.lock`` from an earlier release stays as an orphan (nothing reads it); the lock's
+    exclusivity holds while no other code flocks the grants directory; revocation latency is bounded by one in-flight
+    verify.
 
 A ledger that does not parse is ``egress-grant-ledger`` and is never read as empty or rewritten. Every write replaces
 the file whole by a unique temp and a rename (never an append: a torn tail would brick the ledger), synced as
@@ -65,6 +68,8 @@ _SESSION = re.compile(r"s-[0-9a-f]{16}")
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_LOCK = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _O_DIR_LOCK = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+#: what a filesystem that cannot flock a directory fd answers: a refusal, not a crash
+_NO_DIR_LOCK = frozenset(getattr(errno, n) for n in ("EBADF", "ENOLCK", "EOPNOTSUPP", "ENOTSUP") if hasattr(errno, n))
 _USED_KEYS = frozenset({"grant", "session", "host", "issued", "keep_until"})
 _REVOKED_KEYS = frozenset({"grant", "keep_until"})
 
@@ -162,6 +167,9 @@ def _flock(ctx: object, dirfd: int, name: Optional[str], wait_s: Optional[float]
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except OSError as e:
+                if e.errno in _NO_DIR_LOCK:
+                    raise Refused(NOT_READY, "%s cannot be locked (%s)"
+                                  % (label, errno.errorcode.get(e.errno, e.errno))) from None
                 if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
                     raise
                 if wait_s is None:

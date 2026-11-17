@@ -217,24 +217,15 @@ def public_key_fingerprint(public_key: Any, *, ssh_keygen: Path | str = DEFAULT_
     return m.group(1) if m else None
 
 
-#: A signers-line principal :func:`verify_link_sig` will name as the identity: one literal word, no list, wildcard,
-#: negation, quote or space (the shape ``enrol-authority-signer --principal`` admits).
-LITERAL_PRINCIPAL = re.compile(r"[A-Za-z0-9._@+][A-Za-z0-9._@+-]{0,127}")
-DEFAULT_PRINCIPAL = "authority-signer"
-
-
 def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerprint: str,
                     namespace: str = NAMESPACE, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                    timeout: float = 10.0, principal: str = DEFAULT_PRINCIPAL) -> bool:
+                    timeout: float = 10.0) -> bool:
     """True only if ``signature`` is an SSHSIG over ``message`` in ``namespace`` by ``public_key``, the
     verifier reports exactly ``fingerprint`` for the key it verified with, and, for a FIDO (sk-*) key or
     signature, the signature carries the user-presence flag. The signers line and the signature reach
     ssh-keygen through pipes (``/dev/fd/N``), never a file, so no same-uid process can swap either one
     (say, for a signers line with ``no-touch-required``) between write and use; the presence flag is
-    checked here as well, so a no-touch signature is refused whatever the verifier would say. ``principal`` is the
-    identity written into the one-line signers file and named with ``-I``; a caller that holds a signers line's own
-    principal passes it, so the verdict is bound to that line. Anything but one literal word
-    (:data:`LITERAL_PRINCIPAL`) is False.
+    checked here as well, so a no-touch signature is refused whatever the verifier would say.
     Raises :class:`VerifierUnavailable` when the verifier cannot run (that is never a verdict)."""
     if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE:
         return False
@@ -247,8 +238,7 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
     problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
     if problem is not None:
         raise VerifierUnavailable(f"cannot verify an authority signature: {problem}")
-    if not isinstance(principal, str) or LITERAL_PRINCIPAL.fullmatch(principal) is None:
-        return False
+    principal = "authority-signer"
     try:
         signers = _signers_line(principal, namespace, public_key).encode("ascii")
     except UnicodeError:
