@@ -45,6 +45,8 @@ READ_DEFAULT_LINES = 2000       # what an unscoped Read returns at most
 SCAN_CAP = 8_000_000            # bytes read to count lines; past it the size is stat's and lines are estimated
 OUTLINE_MAX = 60
 LABEL_MAX = 100                 # a heading or key shown in the outline is cut to this many characters
+LINE_PREFIX_BYTES = 8           # ESTIMATE: Read renders each line as a right-aligned 6-wide number plus a separator ("     1" then
+#                                 a tab, as seen in a local Read result; an arrow separator is 3 UTF-8 bytes), so 7 to 9 bytes a line
 FLOOR_BYTES = 4096              # a Read priced at or under this many bytes ALWAYS passes (a seat is never wedged)
 NONTEXT_EXT = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".heic", ".pdf"))
 HOOK_MATCHER = "Read"
@@ -95,8 +97,8 @@ def _lines(path: str):
 
 
 def slice_bytes(path: str, offset: int | None, limit: int | None, whole: bool = False) -> tuple[int, int, int]:
-    """(file bytes of the lines the Read returns, first line (1-based), lines returned). The ``cat -n`` prefixes Read
-    adds are not counted. Unscoped = the first READ_DEFAULT_LINES, or the whole file when ``whole`` (allow_large).
+    """(file bytes of the lines the Read returns, first line (1-based), lines returned). The line-number prefixes Read
+    adds are NOT in these bytes; the callers add LINE_PREFIX_BYTES per line. Unscoped = the first READ_DEFAULT_LINES, or the whole file when ``whole`` (allow_large).
     Streams, so a file over SCAN_CAP prices by its range; past the cap the rest is estimated from the average line."""
     size = os.stat(path).st_size
     start = max(1, offset or 1)
@@ -128,10 +130,10 @@ def _fit(path: str, start: int, max_bytes: int) -> tuple[int, int | None]:
         if seen < start:
             continue
         if first is None:
-            first = len(ln)
-        if used + len(ln) > max_bytes:
+            first = len(ln) + LINE_PREFIX_BYTES
+        if used + len(ln) + LINE_PREFIX_BYTES > max_bytes:
             break
-        used += len(ln)
+        used += len(ln) + LINE_PREFIX_BYTES
         n += 1
     return n, first
 
@@ -242,6 +244,8 @@ def _deny_text(path: str, nbytes: int, cost: int, max_bytes: int, why: str, rema
     nlines = f"about {o['lines']}" if o["est"] else str(o["lines"])
     head = (f"{DENY_PREFIX}this read would cost ~{cost} token-turns ({nbytes} bytes x {remaining} turns left), "
             f"{why}. {path}: {o['bytes']} bytes, {nlines} lines; outline by {o['kind']}{note}:\n{body}{more}\n")
+    if first is None:                                    # nothing to read at all: an empty file or a range past its end
+        return head + "The file has no lines to return (it is empty), so there is no range to retry."
     if limit < 1:
         return (head + f"Line {start} alone is {first} bytes, over the {max_bytes} one read may carry now, and Read cannot "
                 f"return part of a line: no offset/limit can pass. The desk must grant this path to read it whole.")
@@ -257,10 +261,19 @@ def _ledger_path(state: str, session_id: str) -> str:
 
 def _rows(state: str, session_id: str) -> list[dict[str, Any]]:
     try:
-        with open(_ledger_path(state, session_id), encoding="utf-8") as fh:
-            return [r for r in (json.loads(x) for x in fh if x.strip()) if isinstance(r, dict)]
-    except (OSError, ValueError):
+        with open(_ledger_path(state, session_id), encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
         return []
+    rows: list[dict[str, Any]] = []
+    for x in lines:                                      # a torn or garbled line is skipped alone, every good row stays
+        try:
+            r = json.loads(x) if x.strip() else None
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            rows.append(r)
+    return rows
 
 
 def charge(state: str, session_id: str, *, tool: str, path: str, nbytes: int, remaining: int) -> int:
@@ -319,6 +332,7 @@ def decide_pre(event: Any, environ: Mapping[str, str], now: float | None = None)
             return None
         offset, limit = _int(ti.get("offset")), _int(ti.get("limit"))
         nbytes, _start, _n = slice_bytes(real, offset, limit, whole=ti.get("allow_large") is True)
+        nbytes += _n * LINE_PREFIX_BYTES                 # the prefixes Read adds enter context too
         if nbytes <= FLOOR_BYTES:                        # a read this small always passes: no ledger can wedge a seat
             return None
         rows = _rows(state, sid)
@@ -360,7 +374,11 @@ def decide_post(event: Any, environ: Mapping[str, str]) -> str | None:
             return None
         real, _ti, sid, _ = t
         remaining = _remaining(environ, _rows(state, sid))
-        nbytes = FLOOR_BYTES if is_nontext(real) else _response_bytes(event.get("tool_response"))
+        try:
+            nontext = is_nontext(real)
+        except Exception:  # noqa: BLE001  (the target vanished or is unreadable since the pre hook: treat as text)
+            nontext = False
+        nbytes = FLOOR_BYTES if nontext else _response_bytes(event.get("tool_response"))
         cost = charge(state, sid, tool="Read", path=real, nbytes=nbytes, remaining=remaining)
         if cost > _env_int(environ, "LEVAIN_READ_BUDGET_CALL", DEFAULT_CALL):
             return f"{DENY_PREFIX}that read cost ~{cost} token-turns ({nbytes} bytes x {remaining} turns left)."

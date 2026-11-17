@@ -162,7 +162,7 @@ def test_spent_ledger_never_wedges_a_tiny_read_and_the_retry_passes(tmp_path, en
     tiny.write_text("one line\n")
     assert rb.decide_pre(_ev(tiny), env) is None                  # under the floor: always passes
     assert rb.decide_pre(_ev(p, offset=1, limit=1), env) is None
-    out = rb.decide_pre(_ev(p, offset=1, limit=600), env)         # over the floor, ledger spent: denied...
+    out = rb.decide_pre(_ev(p, offset=1, limit=300), env)         # over the floor, ledger spent: denied...
     assert out
     off, lim = _retry(out)
     assert rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None  # ...and the named retry can pass
@@ -211,7 +211,7 @@ def test_one_huge_line_is_named_plainly(tmp_path, env):
 
 
 def test_allow_large_unscoped_is_priced_as_the_whole_file(tmp_path, env):
-    env["LEVAIN_READ_BUDGET_CALL"] = "60000"
+    env["LEVAIN_READ_BUDGET_CALL"] = "100000"
     p = tmp_path / "three.txt"
     p.write_text("123456789\n" * 3000)                            # first 2000 lines pass, the whole file does not
     assert rb.decide_pre(_ev(p), env) is None
@@ -228,3 +228,42 @@ def test_outline_counts_lines_like_read_and_caps_text(tmp_path):
     js = tmp_path / "k.json"
     js.write_text(json.dumps({"k" * 500: 1}))
     assert all(len(e[2]) <= 120 for e in rb.outline(str(js))["entries"])
+
+
+# ---- L3 round fixes (b1686fix2): each test was run failing before its fix ---------------------------------------------
+def test_a_torn_or_non_utf8_ledger_line_keeps_the_good_rows(tmp_path, env):
+    state = env[rb.STATE_ENV]
+    rb.charge(state, "s1", tool="Read", path="/a", nbytes=100, remaining=5)
+    with open(rb._ledger_path(state, "s1"), "ab") as fh:
+        fh.write(b'{"t": 1, "pri\n\xff\xfe\xfd\n')
+    rb.charge(state, "s1", tool="Read", path="/b", nbytes=200, remaining=5)
+    rows = rb._rows(state, "s1")
+    assert [r["path"] for r in rows] == ["/a", "/b"]
+
+
+def test_post_charges_the_response_when_the_target_vanished(tmp_path, env):
+    p = tmp_path / "gone.txt"
+    p.write_text("x\n")
+    post = {"tool_name": "Read", "session_id": "s1", "cwd": "/", "tool_input": {"file_path": str(p)},
+            "tool_response": "z" * 3000}
+    p.unlink()
+    rb.decide_post(post, env)
+    rows = rb._rows(env[rb.STATE_ENV], "s1")
+    assert len(rows) == 1 and rows[0]["bytes"] == 3000
+
+
+def test_empty_file_gets_a_plain_message_not_none_bytes(tmp_path, env):
+    p = tmp_path / "empty.txt"
+    p.write_text("")
+    assert rb.decide_pre(_ev(p), env) is None                     # an empty file is free
+    out = rb._deny_text(str(p), 0, 0, rb.FLOOR_BYTES, "x", 5, 7)
+    assert "None" not in out and "empty" in out
+
+
+def test_line_number_prefixes_are_priced(tmp_path, env):
+    p = tmp_path / "blank.txt"
+    p.write_text("\n" * 2000)                                     # 2000 raw bytes: under the floor without the prefixes
+    assert rb.decide_pre(_ev(p), env)
+    out = rb.decide_pre(_ev(p), env)
+    off, lim = _retry(out)
+    assert lim < 2000 and rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
