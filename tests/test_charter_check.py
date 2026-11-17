@@ -288,3 +288,97 @@ def test_a_file_past_the_byte_cap_is_refused_before_it_is_decoded(tmp_path, caps
     big.write_bytes(b"a" * (charter.MAX_BYTES + 1))
     rc, out = _run(["--file", str(big), "--repo-name", "levain"], capsys)
     assert rc == 0 and "unreadable (larger than" in out
+
+
+# ---- levain charter init NAME and the placeholder refusal (levain#89) ----
+def _git_repo(path):
+    import subprocess
+    path.mkdir()
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    return path
+
+
+def _store_file(path, rows):
+    import json
+    lines = []
+    for iid, decision in rows:
+        repo, _, n = iid.partition("#")
+        lines.append(json.dumps({"v": 1, "op": "add", "id": iid, "at": "2026-11-13T12:05:09Z", "by": "desk 21", "repo": repo,
+                                 "title": "t", "words": "w", "origin": "np-4f29d079", "done": "d", "done_kind": "document",
+                                 "tier": "sonnet", "depends_on": []}))
+        if decision:
+            lines.append(json.dumps({"v": 1, "op": "decide", "id": iid, "at": "2026-11-13T12:06:09Z", "by": "desk 21",
+                                     "decision": decision, "words": "w", "date": "2026-11-13"}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _fill(text):
+    import re
+    return re.sub(r"<[^\s<>][^<>]*>", "filled", text)
+
+
+def test_a_placeholder_token_is_a_problem_on_any_line_and_the_real_charter_has_none():
+    assert [p for p in charter.check_text(REAL, repo_name="levain")[0] if p.rule == "placeholder"] == []
+    probs, _ = charter.check_text(REAL.replace("Python 3.12 or later", "<version> or later"), repo_name="levain")
+    hit = [p for p in probs if p.rule == "placeholder"]
+    assert len(hit) == 1 and hit[0].text == f"placeholder: <version> on line {hit[0].line} is not filled"
+
+
+def test_init_writes_the_skeleton_with_the_plan_prefilled_in_id_order(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    store = _store_file(tmp_path / "items.jsonl", [("levain#10", None), ("levain#2", None), ("levain#3", "cut"),
+                                                   ("levain#4", "parked"), ("levain#5", "out-of-1.0"), ("flow#1", None)])
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(store)]) == 0
+    text = (repo / "CHARTER.md").read_text(encoding="utf-8")
+    assert text.startswith("# Charter: levain\nCharter-Version: 1\nExport: memory\n\n## Purpose\n<")
+    assert [ln for ln in text.splitlines() if ln.startswith("## ")] == [f"## {s}" for s in charter.SECTIONS]
+    assert text.split("## Plan\n")[1].split() == ["-", "levain#2", "-", "levain#10"]
+
+
+def test_init_round_trip_fails_only_on_placeholders_then_passes_once_filled(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    store = _store_file(tmp_path / "items.jsonl", [("levain#1", None), ("levain#2", None)])
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(store), "--export", "repo"]) == 0
+    text = (repo / "CHARTER.md").read_text(encoding="utf-8")
+    items = {"levain#1": ("levain", None), "levain#2": ("levain", None)}
+    probs, warns = charter.check_text(text, repo_name="levain", items=items)
+    assert probs and {p.rule for p in probs} == {"placeholder"} and warns == []
+    filled, _ = charter.check_text(_fill(text), repo_name="levain", items=items)
+    assert filled == []
+
+
+def test_init_without_a_store_says_so_and_holds_one_placeholder_plan_line(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    assert main(["charter", "init", "levain", "--repo", str(repo)]) == 0
+    assert "no --items store was read" in capsys.readouterr().err
+    text = (repo / "CHARTER.md").read_text(encoding="utf-8")
+    assert text.endswith("## Plan\n- <repo>#<n>\n")
+    assert charter.check_text(_fill(text), repo_name="levain")[0][0].rule == "plan"   # `- filled` is not an item id: not a charter either
+
+
+def test_init_never_overwrites_and_refuses_a_bad_name_and_a_non_repo(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    (repo / "CHARTER.md").write_text("mine\n", encoding="utf-8")
+    assert main(["charter", "init", "levain", "--repo", str(repo)]) == 1
+    assert str(repo / "CHARTER.md") in capsys.readouterr().err
+    assert (repo / "CHARTER.md").read_text(encoding="utf-8") == "mine\n"
+    for bad in ("Levain", "1x", "a b", "", "a#1"):
+        assert main(["charter", "init", bad, "--repo", str(repo), "--stdout"]) == 1
+        assert "must be lowercase" in capsys.readouterr().err
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert main(["charter", "init", "levain", "--repo", str(plain)]) == 1
+    assert "not inside a git work tree" in capsys.readouterr().err
+    assert not (plain / "CHARTER.md").exists()
+
+
+def test_init_stdout_prints_and_writes_nothing_and_a_torn_store_writes_nothing(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--stdout"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("# Charter: levain\n") and not (repo / "CHARTER.md").exists()
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("not json\n", encoding="utf-8")
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(bad)]) == 1
+    assert not (repo / "CHARTER.md").exists()

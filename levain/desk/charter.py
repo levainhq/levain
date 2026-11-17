@@ -1,4 +1,5 @@
-"""levain.desk.charter -- ``levain charter check``: does a repository's CHARTER.md hold the prescribed shape?
+"""levain.desk.charter -- ``levain charter check`` (does a repository's CHARTER.md hold the prescribed shape?) and
+``levain charter init`` (write the skeleton).
 
 The charter is one human-written ``CHARTER.md`` at a repository's root: ``# Charter: <name>``, ``Charter-Version: 1``,
 ``Export: repo | memory | off``, then exactly four ``##`` sections in order (Purpose, Criteria, Constraints, Plan). It
@@ -44,6 +45,8 @@ _JUDGED = re.compile(r"\[judged: [^\]]*\]")
 _SHA = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _GLYPH = re.compile(r"[✅☑✔]|\[[xX ]\]")
+_PLACEHOLDER = re.compile(r"<[^\s<>][^<>]*>")
+_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,10 @@ def check_text(text: str, *, repo_name: str | None = None,
             bad(n, "status", "a check-mark glyph or task box (status does not live in the charter)")
         if _DATE.search(_JUDGED.sub("", ln)):
             bad(n, "status", "a date outside a [judged: ...] tag (a dated line is a status line)")
+    # A skeleton's `<...>` token is a blank not yet filled; a charter holding one is not a charter.
+    for i, ln in enumerate(lines):
+        for m in _PLACEHOLDER.finditer(ln):
+            bad(i + 1, "placeholder", f"placeholder: {m.group(0)} on line {i + 1} is not filled")
     problems.sort(key=lambda p: (p.line, p.rule))
     return problems, warnings
 
@@ -341,6 +348,84 @@ def run_check(args: Any) -> int:
     return 0     # warn mode: the check never refuses in 1.0
 
 
+_SKELETON_BODIES = {
+    "Purpose": ["<one paragraph: what this repo is for and for whom>"],
+    "Criteria": ["- C1: <a checkable statement of done-for-the-product> [judged: <who>]"],
+    "Constraints": ["- K1: <an opinion or limit the work must hold>"],
+}
+
+
+def skeleton_text(name: str, export: str, plan_ids: list[str] | None) -> str:
+    """The charter skeleton: every body a ``<...>`` placeholder, except a Plan prefilled with ``plan_ids`` (None or
+    empty: the Plan holds one placeholder line)."""
+    out = [f"# Charter: {name}", "Charter-Version: 1", f"Export: {export}", ""]
+    for sec in SECTIONS:
+        out.append(f"## {sec}")
+        if sec == "Plan":
+            out.extend([f"- {i}" for i in plan_ids] if plan_ids else ["- <repo>#<n>"])
+        else:
+            out.extend(_SKELETON_BODIES[sec])
+        out.append("")
+    return "\n".join(out)
+
+
+def _plan_ids(items: Mapping[str, tuple[str, str | None]], name: str) -> list[str]:
+    """NAME's items not decided out of the plan, in id order."""
+    return sorted((i for i, (repo, dec) in items.items() if repo == name and dec not in OUT_OF_PLAN),
+                  key=lambda iid: int(iid.rpartition("#")[2]))
+
+
+def _toplevel(path: Path) -> Path | None:
+    from levain.desk.board_evidence import _env
+    try:
+        cp = subprocess.run(["git", "-C", str(path.expanduser()), "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True, timeout=30, env=_env())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return None
+    out = cp.stdout.strip()
+    return Path(out) if cp.returncode == 0 and out else None
+
+
+def run_init(args: Any) -> int:
+    def refuse(msg: str) -> int:
+        print(f"levain charter init: {msg}", file=sys.stderr)
+        return 1
+
+    name = args.name
+    if not _NAME.match(name):
+        return refuse(f"the name {name!r} must be lowercase letters, digits, '_' or '-', starting with a letter (it is the "
+                      "prefix of the repo's item ids).")
+    root: Path | None = None
+    if not args.stdout or args.repo is not None:     # --stdout alone needs no repository
+        where = args.repo if args.repo is not None else Path(".")
+        root = _toplevel(where)
+        if root is None:
+            return refuse(f"{where} is not inside a git work tree.")
+    plan_ids: list[str] | None = None
+    if args.items is None:
+        print("levain charter init: no --items store was read; the Plan holds one placeholder line.", file=sys.stderr)
+    else:
+        items, why = _store(args.items)
+        if items is None:
+            return refuse(f"the items file {args.items} {why}; nothing was written.")
+        plan_ids = _plan_ids(items, name)
+    text = skeleton_text(name, args.export, plan_ids)
+    if args.stdout:
+        sys.stdout.write(text)
+        return 0
+    assert root is not None
+    target = root / "CHARTER.md"
+    try:
+        with target.open("x", encoding="utf-8") as fh:      # "x" never overwrites, even against a race
+            fh.write(text)
+    except FileExistsError:
+        return refuse(f"{target} already exists; it is never overwritten.")
+    except OSError as exc:
+        return refuse(f"cannot write {target}: {type(exc).__name__}.")
+    print(f"levain charter init: wrote {target}; replace every <...> placeholder, then run `levain charter check --worktree`.")
+    return 0
+
+
 def register(subparsers: Any) -> None:
     # Hidden, as ``levain board`` is (no ``help=``: ``levain --help`` and the README's "All commands" table leave it out).
     charter = subparsers.add_parser("charter", description="The repository charter: purpose, criteria, constraints, plan.")
@@ -359,3 +444,14 @@ def register(subparsers: Any) -> None:
     p.add_argument("--items", type=Path, metavar="PATH", help="The board items store; when given, plan and criterion ids are checked against it.")
     p.add_argument("--json", action="store_true", help="Print the result as JSON.")
     p.set_defaults(func=run_check)
+    q = sub.add_parser(
+        "init", help="Write a CHARTER.md skeleton for a repository.",
+        description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
+                     "<...> placeholder that `check` refuses until it is replaced. Never overwrites."))
+    q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
+    q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
+    q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
+    q.add_argument("--items", type=Path, metavar="PATH",
+                   help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out-of-1.0.")
+    q.add_argument("--stdout", action="store_true", help="Print the skeleton instead of writing it.")
+    q.set_defaults(func=run_init)
