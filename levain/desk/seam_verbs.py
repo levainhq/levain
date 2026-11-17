@@ -206,8 +206,8 @@ def _rotated_handoff(store: Any, token: Any) -> Any:
             if ln is None or ln.state != "ended" or ln.cause != _leases.DREAM_ROTATED:
                 return None
             found = conn.execute(f"SELECT {seam_handoffs._COLUMNS} FROM seam_handoffs WHERE writer = ? AND "
-                                 "seam_kind = 'dream' AND close_key LIKE 'dream-rotation:%' ORDER BY handoff_id DESC LIMIT 1",
-                                 (ln.session_key,)).fetchone()
+                                 "seam_kind = 'dream' AND close_key LIKE ? ORDER BY handoff_id DESC LIMIT 1",
+                                 (ln.session_key, dream_rotation.KEY_PREFIX + "%")).fetchone()
             return None if found is None else seam_handoffs._row(found)
     except Exception:  # noqa: BLE001 - the refusal below still stands without the handoff's name
         return None
@@ -240,7 +240,7 @@ def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
     if isinstance(got, dream_rotation.AlreadyStored):
         raise CoordError(f"this is not a rotation: the dream occurrence {got.occurrence} already has handoff "
                          f"{got.handoff.handoff_id} ({got.handoff.close_key}); nothing was written and this desk "
-                         "stays live; to end it, run `coord close --kind rotation` with its own request id")
+                         "stays live")
     h = got.handoff
     _emit(out, args.json, {"rotated": True, "handoff_id": h.handoff_id, "occurrence": got.occurrence,
                            "successor_launch_id": got.successor.launch_id},

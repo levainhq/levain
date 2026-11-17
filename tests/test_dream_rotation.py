@@ -305,6 +305,7 @@ def test_a_rotation_without_its_own_key_is_not_named_as_the_rotation_handoff(des
     monkeypatch.setattr(dream_rotation, "KEY_PREFIX", "not-a-rotation:")      # an ended desk whose dream handoff is not keyed as one
     assert isinstance(_rotate(desk), dream_rotation.Rotation)
     assert [h[1] for h in _handoffs(desk)] == ["by-hand-1", "not-a-rotation:occ-1"]
+    monkeypatch.setattr(dream_rotation, "KEY_PREFIX", "dream-rotation:")      # the real prefix, as the live code reads it
     assert seam_verbs._rotated_handoff(desk, desk.token) is None
 
 
