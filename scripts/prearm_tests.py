@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SUMMARY = re.compile(r"^=*\s*(\d+ (passed|failed|skipped|errors?|warnings?|deselected|xfailed|xpassed|rerun)(, )?)+.* in [\d.]+s")
 TAIL = "PREARM ONLY: this is a filter, the full suite still runs on the landing SHA."
 
 
@@ -176,6 +177,7 @@ def main():
     # serial: -n0 overrides an `-n` in addopts (disabling the xdist plugin instead would abort pytest on the unknown option)
     xdist = ["-n0"] if addopts and re.search(r"(^|\s)(-n|--numprocesses|--dist)", addopts.group(1)) else []
     if a.basetemp:
+        a.basetemp = os.path.abspath(a.basetemp)
         os.makedirs(a.basetemp, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="prearm-", dir=a.basetemp)
     runs = [sorted(chosen)] + ([["-m", "invariant", "tests"]] if a.invariant else [])
@@ -188,23 +190,25 @@ def main():
             last = ""
             for line in p.stdout:
                 print(line, end="")
-                if re.search(r"\d+ (passed|failed|skipped|errors?).* in \d", line):  # pytest's final summary line
+                if SUMMARY.match(line):  # pytest's final summary line, anchored
                     last = line
             p.wait()
             if not last:
                 print(f"pytest exited {p.returncode} with no summary line: NOT a pass")
                 rc = rc or p.returncode or 3
             rc = rc or p.returncode
+            run_passed = 0
             for n, w in re.findall(r"(\d+) (passed|failed|skipped|errors?)", last):
                 counts[w.rstrip("s") if w.startswith("error") else w] += int(n)
+                run_passed += int(n) if w == "passed" else 0
+            if p.returncode == 0 and last and not run_passed:  # each run alone: an all-skipped selection is not covered by a passing invariant run
+                print(f"run {i} passed nothing (all skipped): NOT a pass")
+                rc = rc or 3
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     c = counts
     skip = f" (skipped tests did not run, e.g. needs_browser without Chrome: not a pass)" if c["skipped"] else ""
     print(f"{TAIL} passed={c['passed']} failed={c['failed']} errors={c['error']} skipped={c['skipped']}{skip}")
-    if not rc and not c["passed"]:
-        print("no selected test passed (all skipped or none ran): exit 3, the link is NOT covered by this filter")
-        return 3
     return rc
 
 
