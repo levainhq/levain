@@ -244,7 +244,10 @@ class Night:
             raise RuntimeError(f"the drill could not activate the scratch desk: {why}")
         self.token, self.launch_id = self.store.coord_claim(ln.launch_id, ln.session_key), ln.launch_id
         now = next(e for e in events.listing(self.store, limit=events.LIST_MAX) if e.event_id == ev.event_id)
-        return now.state in ("claimed", "delivered") and now.launch_id == ln.launch_id
+        taken = now.state in ("claimed", "delivered") and now.launch_id == ln.launch_id
+        if not taken:
+            self._end_desk()                  # a launch that did not take THIS event must not keep the lease for the next one
+        return taken
 
     def _ack(self, ev: events.Event, why: str) -> str | None:
         """The scripted desk writes its decision against an event its brief took; a refusal is returned, not hidden."""
