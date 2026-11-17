@@ -2934,6 +2934,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                           "--gap-hours or more before this; otherwise say none is needed.")
     cop.add_argument("--gap-hours", dest="gap_hours", type=float, default=None, metavar="H",
                      help="With --light: the gap under which no light open is needed (default 4).")
+    cop.add_argument("--dream-body-file", dest="dream_body_file", type=Path, default=None, metavar="PATH",
+                     help="Hand this desk over onto the memory a dream saved: PATH is the handoff body (JSON, every "
+                          "key). Your statement that you are at a seam (not while he is typing, not mid-work); it "
+                          "writes the dream handoff and asks for the next desk, only when a dream saved after you "
+                          "started and nothing of yours is claimed or unacknowledged. Refused with --light or --ack.")
     cop.add_argument("--verbose", action="store_true",
                      help="Also print what the open does not derive or build, and its read scope.")
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")

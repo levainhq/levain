@@ -153,9 +153,11 @@ def seam_note(recs: list[DreamRecord], started_at: str, lv: str, tail: str) -> s
         return None
     return (f"Dream seam: the {_hm(saved.at)} dream saved new memory at {saved.at}, after this desk started "
             f"({started_at}); this desk holds the memory from before it. Hand over onto it only at a seam you are "
-            "not in: never while he is typing, never in the middle of work. At that seam run "
-            f"`{lv} coord close --kind dream --body-file PATH --request-id ID --prev-handoff-id H --token N{tail}`; "
-            "the next desk loads the new memory. Nothing rotates you on its own.")
+            "not in: never while he is typing, never in the middle of work. At that seam write the handoff body "
+            f"(JSON) to PATH and run `{lv} coord open --dream-body-file PATH --token N{tail}` (no --light, no --ack): "
+            "it writes the dream handoff and asks for the next desk, which loads the new memory; "
+            f"`{lv} coord close --kind dream --body-file PATH --request-id ID --prev-handoff-id H --token N{tail}` "
+            "writes the handoff alone. Nothing rotates you on its own.")
 
 
 def _claimed_events(conn: sqlite3.Connection, launch_id: str) -> list[str]:
