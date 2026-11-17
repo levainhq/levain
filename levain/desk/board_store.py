@@ -28,6 +28,7 @@ was replaced under it.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -43,7 +44,7 @@ from levain.desk import work_attach
 
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
-    "TWO_STORES", "add", "amend", "build_record", "decide", "next_id", "read_item_lines", "read_pointer",
+    "TWO_STORES", "add", "amend", "build_record", "canonical_bytes", "chain_prev", "decide", "next_id", "read_item_lines", "read_pointer",
     "resolve_store", "store_lock", "use",
 ]
 
@@ -65,6 +66,8 @@ REPO_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")                # lowercase only: `
 NP_RE = re.compile(r"np-[0-9a-f]{8}")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
+AUTHOR_KINDS = ("operator", "agent")
+GRADE_ASSERTED = "asserted"
 
 
 class BoardError(RuntimeError):
@@ -384,9 +387,69 @@ def next_id(recs: list[dict], repo: str) -> str:
     return f"{repo}#{top + 1}"
 
 
-def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now: str | None = None) -> dict:
-    """THE one place a record is built: every verb's record comes out of here, in the key order flow's writer uses."""
-    return {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body}
+def _author(author: Mapping[str, object] | None) -> dict:
+    """The record's ``author``: ``{"kind": "operator"|"agent", "name": str[, "launch_key": str]}``. A launch key belongs to an
+    agent only. Refuses a missing author, an empty name, another kind, or a launch key on an operator."""
+    if not isinstance(author, Mapping):
+        raise BoardError("a record needs an author: {kind: operator|agent, name, launch_key?}")
+    extra = sorted(str(k) for k in author if k not in ("kind", "name", "launch_key"))
+    if extra:
+        raise BoardError(f"author carries {', '.join(extra)}, which is not one of kind, name, launch_key")
+    kind = author.get("kind")
+    if kind not in AUTHOR_KINDS:
+        raise BoardError(f"author kind {kind!r} is not one of {AUTHOR_KINDS}")
+    out = {"kind": kind, "name": _one_line(author.get("name"), "author name")}
+    key = author.get("launch_key")
+    if key is not None:
+        if kind != "agent":
+            raise BoardError("a launch key belongs to an agent; an operator carries none")
+        out["launch_key"] = _one_line(key, "launch key")
+    return out
+
+
+def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now: str | None = None, *,
+                 author: Mapping[str, object]) -> dict:
+    """THE one place a record is built: every verb's record comes out of here, in the key order flow's writer uses, then
+    ``author`` and ``grade``. The grade is the writer's, never a caller's: ``asserted`` until a later grade is earned.
+    ``prev`` is not here: :func:`_append` stamps it, under the lock, right after ``at``."""
+    return {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body,
+            "author": _author(author), "grade": GRADE_ASSERTED}
+
+
+def canonical_bytes(rec: Mapping[str, object]) -> bytes:
+    """The one serialisation a record is written (and later signed) in: compact separators, ASCII only, the dict's key order.
+    No trailing newline."""
+    return json.dumps(rec, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def chain_prev(raw: bytes) -> str:
+    """The ``prev`` the NEXT record of a file whose bytes are ``raw`` carries: the lowercase hex sha256 of the last line's
+    bytes as written (its trailing newline excluded; a torn line's bytes included). A file in which no line carries ``prev``
+    yet (empty, or a legacy prefix) gives the sha256 of ALL its bytes: for an empty file that is the sha256 of nothing, and
+    for a legacy prefix it is the cutover hash, so the first chained record vouches for every byte before it."""
+    lines = raw.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and "prev" in rec:
+            return hashlib.sha256(lines[-1]).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _with_prev(rec: dict, prev: str) -> dict:
+    """``rec`` with ``prev`` placed right after ``at``."""
+    out: dict = {}
+    for k, v in rec.items():
+        if k == "prev":
+            continue
+        out[k] = v
+        if k == "at":
+            out["prev"] = prev
+    return out
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -428,14 +491,15 @@ def _require_pointered(target: Target) -> None:
         raise BoardError(NO_STORE)
 
 
-def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]]) -> tuple[dict, bool]:
-    """Under the exclusive lock, hand ``build(records)`` the store's records; it returns ``(record, write)`` and may raise
-    BoardError. When ``write`` is true the record is appended as one line and fsynced. Returns what ``build`` returned."""
+def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *, filename: str = ITEMS_NAME) -> tuple[dict, bool]:
+    """Under the exclusive lock, hand ``build(records)`` the records of ``<store dir>/<filename>``; it returns ``(record,
+    write)`` and may raise BoardError. When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read
+    in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it."""
     _require_pointered(target)
-    path = target.store_dir / target.items_path.name
+    path = target.store_dir / filename
     with store_lock(target.store_dir, exclusive=True) as held:
         for _ in range(OPEN_RETRIES):
-            fd = held.open(target.items_path.name, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
+            fd = held.open(filename, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
             try:
                 empty = os.fstat(fd).st_size == 0           # a write into a zero-length file may have just created it
                 raw = _read_fd(fd)
@@ -445,8 +509,9 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]]) ->
                 rec, write = build(recs)
                 if not write:
                     return rec, False
+                rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                line = (json.dumps(rec, separators=(",", ":"))).encode("ascii")
+                line = canonical_bytes(rec)
                 _write_all(fd, line + b"\n")
                 if not _same_file(fd, path):
                     raise BoardError(f"{path} was replaced while {rec['id']} was being written (a git operation?): the record may or may not be "
@@ -464,7 +529,7 @@ def _check_repo_mode(repo: str) -> None:
 
 
 def add(target: Target, repo, title, origin, by, words="", done=None, done_kind="merged", tier=None, depends=(),
-        key=None, payload_hash=None, now=None) -> tuple[str, bool]:
+        key=None, payload_hash=None, now=None, *, author) -> tuple[str, bool]:
     """Append an ``add``; returns ``(id, created)``. With ``key`` and ``payload_hash``: the same key with the same hash
     returns the existing id and writes nothing; the same key with another hash refuses. A key never expires."""
     repo = _one_line(repo, "repo")
@@ -498,7 +563,7 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")
-        return build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now), True
+        return build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author), True
 
     rec, written = _append(target, build)
     return rec["id"], written
@@ -526,7 +591,7 @@ def _current_done(recs: list[dict], item_id: str) -> tuple:
     return kind, done
 
 
-def amend(target: Target, item_id, why, by, fields: dict, now=None) -> str:
+def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author) -> str:
     """``fields`` replaces those fields: title, words, done, done_kind, tier, depends_on (a list of link specs; None clears
     done/tier). Any other key is refused, so there is no way to store a status."""
     allowed = {"title", "words", "done", "done_kind", "tier", "depends_on"}
@@ -559,12 +624,12 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None) -> str:
         if "done" in out or "done_kind" in out:         # judge the RESULTING row, only when this amend touches the pair
             now_kind, now_done = _current_done(recs, item_id)
             _require_path_done(out.get("done_kind", now_kind), out["done"] if "done" in out else now_done)
-        return build_record("amend", item_id, by, {"fields": out, "why": why}, now), True
+        return build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author), True
 
     return _append(target, build)[0]["id"]
 
 
-def decide(target: Target, item_id, decision, words, by, when=None, now=None) -> str:
+def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author) -> str:
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
@@ -572,7 +637,7 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None) ->
 
     def build(recs):
         _require_known(recs, item_id)
-        return build_record("decide", item_id, by, {"decision": decision, "words": words, "date": when}, now), True
+        return build_record("decide", item_id, by, {"decision": decision, "words": words, "date": when}, now, author=author), True
 
     return _append(target, build)[0]["id"]
 

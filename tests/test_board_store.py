@@ -2,6 +2,8 @@
 one pointer, one identity and one lock, and every record it writes folds cleanly through board_state.fold."""
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -45,8 +47,10 @@ def lines(d: Path) -> list[str]:
 
 
 def sans_at(line: str) -> dict:
+    """The record without what P1a adds (the stamp, ``prev``, ``author``, ``grade``): what flow's writer also wrote."""
     rec = json.loads(line)
-    rec.pop("at")
+    for k in ("at", "prev", "author", "grade"):
+        rec.pop(k, None)
     return rec
 
 
@@ -72,7 +76,7 @@ def test_port_writes_the_records_flow_wrote_byte_for_byte_but_the_stamp(home, tm
         assert sans_at(a) == sans_at(b)
         # the text after the stamp is identical too: same key order, same separators, same escapes
         assert a.split('"at":"', 1)[0] == b.split('"at":"', 1)[0]
-        assert a.split('"by":', 1)[1] == b.split('"by":', 1)[1]
+        assert a.split('"by":', 1)[1].rsplit(',"author":', 1)[0] + "}" == b.split('"by":', 1)[1]
         assert a.isascii()
 
 
@@ -209,7 +213,7 @@ def test_a_torn_store_refuses_writes(home, tmp_path, capsys):
 def _worker(store: str, tag: str, n: int) -> None:
     target = bs.Target(Path(store), Path(store) / "items.jsonl", True)
     for i in range(n):
-        bs.add(target, "levain", f"{tag} {i}", "o", tag)
+        bs.add(target, "levain", f"{tag} {i}", "o", tag, author={"kind": "agent", "name": tag})
 
 
 def test_two_processes_appending_lose_no_line_and_take_no_id_twice(home, tmp_path, capsys):
@@ -716,3 +720,172 @@ def test_same_file_needs_device_and_inode_to_match(tmp_path, monkeypatch):
         assert not bs._same_file(fd, p)
     finally:
         os.close(fd)
+
+
+# ------------------------------------------------------------------------------------------------ P1a: author, grade, chain
+
+AGENT = {"kind": "agent", "name": "levain 22"}
+
+
+def _target(store: Path) -> bs.Target:
+    return bs.Target(store, store / "items.jsonl", True)
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+@pytest.mark.parametrize("author, why", [
+    (None, "needs an author"),
+    ({"kind": "agent", "name": ""}, "must not be empty"),
+    ({"kind": "agent"}, "must not be empty"),
+    ({"kind": "robot", "name": "x"}, "is not one of"),
+    ({"kind": "operator", "name": "x", "launch_key": "k"}, "belongs to an agent"),
+    ({"kind": "agent", "name": "x", "extra": 1}, "is not one of kind"),
+])
+def test_build_record_refuses_a_bad_author(author, why):
+    with pytest.raises(bs.BoardError, match=why):
+        bs.build_record("add", "levain#1", "b", {}, "2026-11-17T00:00:00Z", author=author)
+
+
+def test_build_record_writes_author_and_an_asserted_grade_and_no_grade_argument():
+    rec = bs.build_record("add", "levain#1", "b", {"title": "t"}, "2026-11-17T00:00:00Z",
+                          author={"kind": "agent", "name": "n", "launch_key": "k"})
+    assert rec["author"] == {"kind": "agent", "name": "n", "launch_key": "k"} and rec["grade"] == "asserted"
+    assert list(rec)[:5] == ["v", "op", "id", "at", "by"]
+    with pytest.raises(TypeError):
+        bs.build_record("add", "levain#1", "b", {}, grade="signed-x", author=AGENT)     # the writer's grade, never a caller's
+    assert "grade" not in inspect.signature(bs.build_record).parameters
+
+
+def test_every_verb_needs_an_author(home, tmp_path):
+    t = _target(Path(os.path.realpath(tmp_path / "s")))
+    bs.use(t.store_dir)
+    with pytest.raises(TypeError):
+        bs.add(t, "levain", "t", "o", "b")
+    bs.add(t, "levain", "t", "o", "b", author=AGENT)
+    with pytest.raises(TypeError):
+        bs.amend(t, "levain#1", "w", "b", {"title": "x"})
+    with pytest.raises(TypeError):
+        bs.decide(t, "levain#1", "cut", "w", "b")
+
+
+def test_cli_author_flags_and_the_environment(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    monkeypatch.delenv("LEVAIN_LAUNCH_KEY", raising=False)
+    assert run(capsys, *ADD)[0] == 0
+    monkeypatch.setenv("LEVAIN_LAUNCH_KEY", "envkey")
+    assert run(capsys, *ADD)[0] == 0
+    assert run(capsys, *ADD, "--launch-key", "flagkey")[0] == 0
+    assert run(capsys, *ADD, "--author-kind", "operator")[0] == 0               # the ambient key does not refuse an operator
+    rc, _, err = run(capsys, *ADD, "--author-kind", "operator", "--launch-key", "k")
+    assert rc == 2 and "belongs to an agent" in err
+    got = [json.loads(x)["author"] for x in lines(store)]
+    by = ADD[ADD.index("--by") + 1]
+    assert got == [{"kind": "agent", "name": by}, {"kind": "agent", "name": by, "launch_key": "envkey"},
+                   {"kind": "agent", "name": by, "launch_key": "flagkey"}, {"kind": "operator", "name": by}]
+    assert {json.loads(x)["grade"] for x in lines(store)} == {"asserted"}
+    with pytest.raises(SystemExit):                                         # no --by: argparse refuses, no default author
+        run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o")
+
+
+def test_canonical_bytes_is_the_pinned_serialisation():
+    rec = {"v": 1, "at": "x", "words": "é \u2028 \"q\"", "n": [1, {"a": None}]}
+    assert bs.canonical_bytes(rec) == b'{"v":1,"at":"x","words":"\\u00e9 \\u2028 \\"q\\"","n":[1,{"a":null}]}'
+
+
+def test_prev_of_the_first_record_in_an_empty_file_is_the_hash_of_nothing(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    (line,) = lines(store)
+    assert json.loads(line)["prev"] == _sha(b"")
+    assert list(json.loads(line))[:5] == ["v", "op", "id", "at", "prev"]
+
+
+def test_prev_chains_across_three_appends_over_the_bytes_as_written(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    for _ in range(3):
+        assert run(capsys, *ADD)[0] == 0
+    raw = (store / "items.jsonl").read_bytes().split(b"\n")[:-1]
+    recs = [json.loads(x) for x in raw]
+    assert recs[0]["prev"] == _sha(b"")
+    assert recs[1]["prev"] == _sha(raw[0]) and recs[2]["prev"] == _sha(raw[1])
+    assert len({r["prev"] for r in recs}) == 3
+    assert all(raw[i] == bs.canonical_bytes(recs[i]) for i in range(3))             # what is on disk is the canonical form
+
+
+def test_chain_prev_over_a_torn_last_line_hashes_its_bytes_as_written():
+    a = bs.canonical_bytes({"v": 1, "id": "levain#1", "prev": _sha(b"")})
+    torn = b'{"v":1,"op":"add","id":"levain#2"'
+    assert bs.chain_prev(a + b"\n" + torn) == _sha(torn)                  # no trailing newline: the whole fragment
+    assert bs.chain_prev(a + b"\n" + torn + b"\n") == _sha(torn)         # a torn line that did get its newline
+    assert bs.chain_prev(a + b"\n") == _sha(a)
+    garbled = b"\xff\xfe not json"
+    assert bs.chain_prev(a + b"\n" + garbled) == _sha(garbled)
+    # the writer still refuses a torn store (P1b's ack-torn re-anchors it): nothing is appended over the tear
+    assert bs.chain_prev(b"") == _sha(b"")
+
+
+def test_the_first_chained_record_after_a_legacy_prefix_carries_the_hash_of_the_whole_prefix(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    legacy = (b'{"v":1,"op":"add","id":"levain#1","at":"2026-11-01T00:00:00Z","by":"old","repo":"levain","title":"t","words":"",'
+              b'"origin":"o","done":null,"done_kind":"merged","tier":null,"depends_on":[]}\n'
+              b'{"v":1,"op":"add","id":"levain#2","at":"2026-11-01T00:00:01Z","by":"old","repo":"levain","title":"u","words":"",'
+              b'"origin":"o","done":null,"done_kind":"merged","tier":null,"depends_on":[]}\n')
+    (store / "items.jsonl").write_bytes(legacy)
+    assert run(capsys, *ADD)[0] == 0 and run(capsys, *ADD)[0] == 0
+    raw = (store / "items.jsonl").read_bytes()
+    assert raw.startswith(legacy)
+    first, second = [json.loads(x) for x in raw[len(legacy):].split(b"\n")[:-1]]
+    assert first["prev"] == _sha(legacy)                                   # every byte before it, not the last line only
+    assert second["prev"] == _sha(raw[len(legacy):].split(b"\n")[0])      # then line to line
+    assert first["id"] == "levain#3"
+
+
+def test_append_to_another_file_name_chains_that_file(home, tmp_path):
+    store = Path(os.path.realpath(tmp_path / "s"))
+    bs.use(store)
+    t = _target(store)
+    for n in (1, 2):
+        bs._append(t, lambda recs, n=n: (bs.build_record("add", f"levain#{n}", "b", {}, author=AGENT), True), filename="repos.jsonl")
+    raw = (store / "repos.jsonl").read_bytes().split(b"\n")[:-1]
+    assert json.loads(raw[0])["prev"] == _sha(b"") and json.loads(raw[1])["prev"] == _sha(raw[0])
+    assert not (store / "items.jsonl").exists()
+
+
+def test_a_file_replaced_before_the_write_rebuilds_prev_from_the_new_files_last_line(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "git", {}, "2026-11-17T00:00:00Z", author=AGENT))
+    real_read, real_write, calls, seen = bs._read_fd, bs._write_all, {"n": 0}, []
+
+    def swap_after_first_read(fd):
+        raw = real_read(fd)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            copy = items.with_name("items.copy")                 # git checkout: another seat's line arrived under a new inode
+            copy.write_bytes(items.read_bytes() + foreign + b"\n")
+            os.replace(copy, items)
+        return raw
+
+    def spy_write(fd, payload):
+        seen.append(json.loads(payload)["prev"])
+        real_write(fd, payload)
+
+    monkeypatch.setattr(bs, "_read_fd", swap_after_first_read)
+    monkeypatch.setattr(bs, "_write_all", spy_write)
+    assert run(capsys, *ADD)[0] == 0
+    assert calls["n"] == 2 and seen == [_sha(foreign)]               # one write, chained to the NEW file's last line
+    last = json.loads(lines(store)[-1])
+    assert last["prev"] == _sha(foreign) and last["id"] == "levain#2" and len(lines(store)) == 3
+
+
+def test_a_torn_store_still_refuses_a_chained_write(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    with open(store / "items.jsonl", "ab") as fh:
+        fh.write(b'{"v":1,"op":"add","id":"levain#2"')
+    before = (store / "items.jsonl").read_bytes()
+    rc, _, err = run(capsys, *ADD)
+    assert rc == 2 and "torn" in err and (store / "items.jsonl").read_bytes() == before

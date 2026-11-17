@@ -36,6 +36,8 @@ from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER,
 __all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
 
 ITEMS_ENV = bs.ITEMS_ENV
+#: Read when ``--launch-key`` is not given. Nothing in Levain's launch path exports it yet; the flag is the sure way.
+LAUNCH_KEY_ENV = "LEVAIN_LAUNCH_KEY"
 #: Sources this CLI reads from git (or by stat). An extra object may not name them: two writers for one source is how
 #: a stale hand-made file would silently outvote git.
 READ_BY_CLI = ("fetched_at", "main", "chain", "refs", "merged", "branches", "unattributed")
@@ -82,6 +84,12 @@ def register(subparsers: Any) -> None:
     p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
     p.set_defaults(func=run_state)
 
+    def author_args(parser: Any) -> None:
+        parser.add_argument("--author-kind", dest="author_kind", choices=bs.AUTHOR_KINDS, default="agent",
+                            help="Who writes: an operator or an agent (default agent). The name is --by.")
+        parser.add_argument("--launch-key", dest="launch_key", default=None, metavar="KEY",
+                            help=f"An agent's launch key (default: ${LAUNCH_KEY_ENV} when set). Refused for an operator.")
+
     items_help = f"An explicit store (its items file or its directory); it must be this install's store. Default: ${ITEMS_ENV}."
     a = sub.add_parser("add", description="Capture an item; prints its id.")
     a.add_argument("--repo", required=True)
@@ -93,6 +101,7 @@ def register(subparsers: Any) -> None:
     a.add_argument("--tier", default=None, choices=bs.TIERS)
     a.add_argument("--depends", action="append", default=[], metavar="TYPED")
     a.add_argument("--by", required=True)
+    author_args(a)
     a.add_argument("--key", default=None, help="An idempotency key: the same key and --payload-hash returns the existing id.")
     a.add_argument("--payload-hash", dest="payload_hash", default=None, metavar="SHA256")
     a.add_argument("--items", type=str, metavar="PATH", help=items_help)
@@ -101,6 +110,7 @@ def register(subparsers: Any) -> None:
     m.add_argument("--id", required=True)
     m.add_argument("--why", required=True)
     m.add_argument("--by", required=True)
+    author_args(m)
     m.add_argument("--title")
     m.add_argument("--words")
     m.add_argument("--done")
@@ -115,6 +125,7 @@ def register(subparsers: Any) -> None:
     d.add_argument("--decision", required=True, choices=bs.DECISIONS)
     d.add_argument("--words", required=True)
     d.add_argument("--by", required=True)
+    author_args(d)
     d.add_argument("--date", default=None)
     d.add_argument("--items", type=str, metavar="PATH", help=items_help)
     d.set_defaults(func=run_decide)
@@ -259,6 +270,16 @@ def _warn_unknown_deps(target: bs.Target, depends: Any) -> None:
         print(f"board: could not check depends_on against the store ({exc}); writing anyway.", file=sys.stderr)
 
 
+def _author(args: argparse.Namespace) -> dict[str, str]:
+    """The author a verb writes under: the kind, the name from ``--by`` (a missing ``--by`` is argparse's refusal; no default
+    is invented) and the launch key, from the flag else the environment. An operator with a launch key is refused by the store."""
+    author = {"kind": args.author_kind, "name": args.by}
+    key = args.launch_key if args.launch_key is not None else (os.environ.get(LAUNCH_KEY_ENV) or None)
+    if key is not None and not (args.launch_key is None and args.author_kind == "operator"):
+        author["launch_key"] = key             # an ambient key never turns an operator write into a refusal
+    return author
+
+
 def run_add(args: argparse.Namespace) -> int:
     try:
         target = bs.resolve_store(args.items)
@@ -268,7 +289,7 @@ def run_add(args: argparse.Namespace) -> int:
             _warn_unknown_deps(target, args.depends)
         item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
                             done_kind=args.done_kind, tier=args.tier, depends=args.depends, key=args.key,
-                            payload_hash=args.payload_hash)
+                            payload_hash=args.payload_hash, author=_author(args))
         print(item_id)
     except bs.BoardError as exc:
         return _refused(exc)
@@ -291,7 +312,7 @@ def run_amend(args: argparse.Namespace) -> int:
             if key in fields:
                 raise bs.BoardError(f"--{c.replace('_', '-')} and --clear {c} name the same field; give one")
             fields[key] = [] if c == "depends" else None
-        print("amended", bs.amend(target, args.id, args.why, args.by, fields))
+        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=_author(args)))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
@@ -300,7 +321,7 @@ def run_amend(args: argparse.Namespace) -> int:
 def run_decide(args: argparse.Namespace) -> int:
     try:
         target = bs.resolve_store(args.items)
-        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date))
+        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=_author(args)))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
