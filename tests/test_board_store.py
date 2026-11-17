@@ -724,7 +724,7 @@ def test_same_file_needs_device_and_inode_to_match(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------------------------------------ P1a: author, grade, chain
 
-AGENT = {"kind": "agent", "name": "levain 22"}
+AGENT = {"kind": "agent", "name": "b"}
 
 
 def _target(store: Path) -> bs.Target:
@@ -750,8 +750,8 @@ def test_build_record_refuses_a_bad_author(author, why):
 
 def test_build_record_writes_author_and_an_asserted_grade_and_no_grade_argument():
     rec = bs.build_record("add", "levain#1", "b", {"title": "t"}, "2026-11-17T00:00:00Z",
-                          author={"kind": "agent", "name": "n", "launch_key": "k"})
-    assert rec["author"] == {"kind": "agent", "name": "n", "launch_key": "k"} and rec["grade"] == "asserted"
+                          author={"kind": "agent", "name": "b", "launch_key": "k"})
+    assert rec["author"] == {"kind": "agent", "name": "b", "launch_key": "k"} and rec["grade"] == "asserted"
     assert list(rec)[:5] == ["v", "op", "id", "at", "by"]
     with pytest.raises(TypeError):
         bs.build_record("add", "levain#1", "b", {}, grade="signed-x", author=AGENT)     # the writer's grade, never a caller's
@@ -857,7 +857,7 @@ def test_a_file_replaced_before_the_write_rebuilds_prev_from_the_new_files_last_
     store = use(capsys, tmp_path / "s")
     assert run(capsys, *ADD)[0] == 0
     items = store / "items.jsonl"
-    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "git", {}, "2026-11-17T00:00:00Z", author=AGENT))
+    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "b", {}, "2026-11-17T00:00:00Z", author=AGENT))
     real_read, real_write, calls, seen = bs._read_fd, bs._write_all, {"n": 0}, []
 
     def swap_after_first_read(fd):
@@ -909,3 +909,134 @@ def test_chain_prev_hashes_every_line_as_written_blank_and_crlf_included():
     line = b'{"v":1,"prev":"x"}'
     assert bs.chain_prev(line + b"\n\n") == _sha(b"")                # a blank tail line hashes as empty bytes
     assert bs.chain_prev(line + b"\r\n") == _sha(line + b"\r")       # a CRLF line hashes its \r
+
+
+# ------------------------------------------------------------------------------------------------ P1a fix round 2
+
+
+def test_a_lock_free_append_between_the_read_and_the_write_is_read_again_and_chained(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "b", {}, "2026-11-17T00:00:00Z", author=AGENT))
+    real, calls = bs.chain_prev, {"n": 0}
+
+    def append_lock_free(raw):
+        calls["n"] += 1
+        out = real(raw)
+        if calls["n"] == 1:
+            fd = os.open(items, os.O_WRONLY | os.O_APPEND)               # flow's board.py: no lock, no read of ours
+            os.write(fd, foreign + b"\n")
+            os.close(fd)
+        return out
+
+    monkeypatch.setattr(bs, "chain_prev", append_lock_free)
+    assert run(capsys, *ADD)[0] == 0
+    assert calls["n"] == 2
+    got = lines(store)
+    assert len(got) == 3 and json.loads(got[-1])["prev"] == _sha(foreign) and json.loads(got[-1])["id"] == "levain#2"
+
+
+def test_a_writer_that_keeps_racing_is_refused_after_a_bounded_number_of_rounds(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    real, calls = bs.chain_prev, {"n": 0}
+
+    def always(raw):
+        calls["n"] += 1
+        out = real(raw)
+        fd = os.open(store / "items.jsonl", os.O_WRONLY | os.O_APPEND)
+        os.write(fd, b'{"v":1,"op":"add","id":"flow#1","at":"x"}\n')
+        os.close(fd)
+        return out
+
+    monkeypatch.setattr(bs, "chain_prev", always)
+    rc, _, err = run(capsys, *ADD)
+    assert rc == 2 and calls["n"] == bs.OPEN_RETRIES and "nothing was written" in err
+
+
+def test_a_bad_author_is_refused_before_any_lock_or_file_and_even_on_an_idempotent_add(home, tmp_path):
+    store = Path(os.path.realpath(tmp_path / "gone"))
+    t = _target(store)
+    with pytest.raises(bs.BoardError, match="needs an author"):
+        bs.add(t, "levain", "t", "o", "b", author=None)                  # the store does not exist: the author is judged first
+    assert not store.exists()
+    real = Path(os.path.realpath(tmp_path / "s"))
+    bs.use(real)
+    t = _target(real)
+    h = "a" * 64
+    assert bs.add(t, "levain", "t", "o", "b", key="k", payload_hash=h, author=AGENT) == ("levain#1", True)
+    size = (real / "items.jsonl").stat().st_size
+    with pytest.raises(bs.BoardError, match="is not one of"):
+        bs.add(t, "levain", "t", "o", "b", key="k", payload_hash=h, author={"kind": "robot", "name": "b"})
+    with pytest.raises(bs.BoardError, match="needs an author"):
+        bs.amend(t, "levain#1", "w", "b", {"title": "x"}, author=None)
+    with pytest.raises(bs.BoardError, match="needs an author"):
+        bs.decide(t, "levain#1", "cut", "w", "b", author=None)
+    assert (real / "items.jsonl").stat().st_size == size
+
+
+def test_chain_prev_reads_the_last_line_first(monkeypatch):
+    legacy = b'{"v":1,"op":"add","id":"levain#1","at":"x"}\n' * 50
+    last = b'{"v":1,"op":"add","id":"levain#2","at":"x","prev":"' + b"0" * 64 + b'"}'
+    calls = {"n": 0}
+    real = bs.json.loads
+
+    def counting(line):
+        calls["n"] += 1
+        return real(line)
+
+    monkeypatch.setattr(bs.json, "loads", counting)
+    assert bs.chain_prev(legacy + last + b"\n") == _sha(last) and calls["n"] == 1
+    calls["n"] = 0
+    assert bs.chain_prev(legacy) == _sha(legacy) and calls["n"] == 50            # only a last line without prev scans the prefix
+
+
+def test_chain_prev_survives_a_line_nested_too_deep_to_parse():
+    deep = b"[" * 200000
+    assert bs.chain_prev(deep + b"\n") == _sha(deep + b"\n")
+    last = b'{"id":"levain#1","at":"x","prev":"' + b"0" * 64 + b'"}'
+    assert bs.chain_prev(deep + b"\n" + last + b"\n") == _sha(last)
+    assert bs.chain_prev(last + b"\n" + deep + b"\n") == _sha(deep)              # a line that cannot be parsed carries no prev
+
+
+def test_build_record_refuses_an_author_name_that_is_not_by():
+    with pytest.raises(bs.BoardError, match="must equal by"):
+        bs.build_record("add", "levain#1", "someone", {}, "2026-11-17T00:00:00Z", author=AGENT)
+
+
+def test_append_refuses_a_file_outside_the_store_files(home, tmp_path):
+    store = Path(os.path.realpath(tmp_path / "s"))
+    bs.use(store)
+    for name in ("other.jsonl", "../items.jsonl", "store.id"):
+        with pytest.raises(bs.BoardError, match="not a store file"):
+            bs._append(_target(store), lambda recs: ({"at": "x"}, True), filename=name)
+    assert not (store / "other.jsonl").exists()
+
+
+@pytest.mark.parametrize("author", [
+    {"kind": "agent", "name": 5},
+    {"kind": "agent", "name": ["b"]},
+    {"kind": "agent", "name": "b", "launch_key": 7},
+    {"kind": 1, "name": "b"},
+])
+def test_author_fields_are_never_coerced(author):
+    with pytest.raises(bs.BoardError, match="must be a string"):
+        bs.build_record("add", "levain#1", "b", {}, "2026-11-17T00:00:00Z", author=author)
+
+
+def test_cli_refuses_an_empty_or_blank_by(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    for blank in ("", "  "):
+        rc, _, err = run(capsys, *ADD, "--by", blank)
+        assert rc == 2 and "--by must name who writes" in err
+    assert lines(store) == []
+
+
+def test_an_empty_launch_key_means_no_launch_key_whatever_the_environment_says(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    monkeypatch.setenv("LEVAIN_LAUNCH_KEY", "envkey")
+    assert run(capsys, *ADD, "--launch-key", "")[0] == 0
+    assert "launch_key" not in json.loads(lines(store)[0])["author"]
+    assert run(capsys, *ADD)[0] == 0
+    assert json.loads(lines(store)[1])["author"]["launch_key"] == "envkey"

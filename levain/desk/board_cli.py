@@ -271,17 +271,21 @@ def _warn_unknown_deps(target: bs.Target, depends: Any) -> None:
 
 
 def _author(args: argparse.Namespace) -> dict[str, str]:
-    """The author a verb writes under: the kind, the name from ``--by`` (a missing ``--by`` is argparse's refusal; no default
-    is invented) and the launch key, from the flag else the environment. An operator with a launch key is refused by the store."""
+    """The author a verb writes under: the kind, the name from ``--by`` (a missing or blank ``--by`` is refused here; no
+    default is invented) and the launch key, from the flag else the environment. An empty ``--launch-key`` means no launch
+    key, whatever the environment holds. An operator with a launch key is refused by the store."""
+    if not args.by or not args.by.strip():
+        raise bs.BoardError("--by must name who writes (not empty)")
     author = {"kind": args.author_kind, "name": args.by}
     key = args.launch_key if args.launch_key is not None else (os.environ.get(LAUNCH_KEY_ENV) or None)
-    if key is not None and not (args.launch_key is None and args.author_kind == "operator"):
+    if key and not (args.launch_key is None and args.author_kind == "operator"):
         author["launch_key"] = key             # an ambient key never turns an operator write into a refusal
     return author
 
 
 def run_add(args: argparse.Namespace) -> int:
     try:
+        author = _author(args)
         target = bs.resolve_store(args.items)
         for spec in args.depends:               # a malformed link is a refusal, not an advisory
             bs.parse_link(spec)
@@ -289,7 +293,7 @@ def run_add(args: argparse.Namespace) -> int:
             _warn_unknown_deps(target, args.depends)
         item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
                             done_kind=args.done_kind, tier=args.tier, depends=args.depends, key=args.key,
-                            payload_hash=args.payload_hash, author=_author(args))
+                            payload_hash=args.payload_hash, author=author)
         print(item_id)
     except bs.BoardError as exc:
         return _refused(exc)
@@ -298,6 +302,7 @@ def run_add(args: argparse.Namespace) -> int:
 
 def run_amend(args: argparse.Namespace) -> int:
     try:
+        author = _author(args)
         target = bs.resolve_store(args.items)
         fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
                                     ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
@@ -312,7 +317,7 @@ def run_amend(args: argparse.Namespace) -> int:
             if key in fields:
                 raise bs.BoardError(f"--{c.replace('_', '-')} and --clear {c} name the same field; give one")
             fields[key] = [] if c == "depends" else None
-        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=_author(args)))
+        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=author))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
@@ -320,8 +325,9 @@ def run_amend(args: argparse.Namespace) -> int:
 
 def run_decide(args: argparse.Namespace) -> int:
     try:
+        author = _author(args)
         target = bs.resolve_store(args.items)
-        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=_author(args)))
+        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0

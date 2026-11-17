@@ -51,6 +51,7 @@ __all__ = [
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
 ITEMS_NAME = "items.jsonl"
+APPEND_FILES = ("items.jsonl", "repos.jsonl")
 LOCK_NAME = "store.lock"
 POINTER_NAME = "STORE"
 STORE_ID_NAME = "store.id"
@@ -396,6 +397,9 @@ def _author(author: Mapping[str, object] | None) -> dict:
     extra = sorted(str(k) for k in author if k not in ("kind", "name", "launch_key"))
     if extra:
         raise BoardError(f"author carries {', '.join(extra)}, which is not one of kind, name, launch_key")
+    for field in ("kind", "name", "launch_key"):
+        if field in author and not isinstance(author[field], str):          # never coerced: a number is not a name
+            raise BoardError(f"author {field} must be a string, not {type(author[field]).__name__}")
     kind = author.get("kind")
     if kind not in AUTHOR_KINDS:
         raise BoardError(f"author kind {kind!r} is not one of {AUTHOR_KINDS}")
@@ -408,6 +412,14 @@ def _author(author: Mapping[str, object] | None) -> dict:
     return out
 
 
+def _author_for(author: Mapping[str, object] | None, by: str) -> dict:
+    """The validated author, checked BEFORE any lock or file is touched, and agreeing with ``by`` (the two never differ)."""
+    out = _author(author)
+    if out["name"] != by:
+        raise BoardError(f"author name {out['name']!r} must equal by {by!r}")
+    return out
+
+
 def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now: str | None = None, *,
                  author: Mapping[str, object]) -> dict:
     """THE one place a record is built: every verb's record comes out of here, in the key order flow's writer uses, then
@@ -417,8 +429,9 @@ def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now
     taken = sorted(k for k in ("author", "grade", "prev", "sig") if k in body)
     if taken:
         raise BoardError(f"a record body may not carry {', '.join(taken)}: the writer sets those")
+    checked = _author_for(author, by)
     return {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body,
-            "author": _author(author), "grade": GRADE_ASSERTED}
+            "author": checked, "grade": GRADE_ASSERTED}
 
 
 def canonical_bytes(rec: Mapping[str, object]) -> bytes:
@@ -438,14 +451,23 @@ def chain_prev(raw: bytes) -> str:
     lines = raw.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
-    for line in lines:
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and "prev" in rec:
-            return hashlib.sha256(lines[-1]).hexdigest()
+    if not lines:
+        return hashlib.sha256(raw).hexdigest()
+    if _carries_prev(lines[-1]):                # the normal case: one parse, however long the file
+        return hashlib.sha256(lines[-1]).hexdigest()
+    if any(_carries_prev(line) for line in lines[:-1]):
+        return hashlib.sha256(lines[-1]).hexdigest()
     return hashlib.sha256(raw).hexdigest()
+
+
+def _carries_prev(line: bytes) -> bool:
+    """True when ``line`` is a JSON object with a ``prev`` key. A line that cannot be parsed (not JSON, or nested too deep for
+    the parser) carries none."""
+    try:
+        rec = json.loads(line)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(rec, dict) and "prev" in rec
 
 
 def _with_prev(rec: dict, prev: str) -> dict:
@@ -505,7 +527,12 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *,
     """Under the exclusive lock, hand ``build(records)`` the records of ``<store dir>/<filename>``; it returns ``(record,
     write)`` and may raise BoardError. When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read
     in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it
-    was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none)."""
+    was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
+    before the write the held fd's size is compared with the size of the bytes the record was built from: a lock-free writer
+    that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
+    break, which the verifier reports."""
+    if filename not in APPEND_FILES:
+        raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
     path = target.store_dir / filename
     with store_lock(target.store_dir, exclusive=True) as held:
@@ -521,6 +548,8 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *,
                 if not write:
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
+                if os.fstat(fd).st_size != len(raw):
+                    continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
                 _write_all(fd, canonical_bytes(rec) + b"\n")
                 if not _same_file(fd, path):
@@ -554,6 +583,7 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
               "depends_on": [parse_link(d) for d in depends]}
     _require_path_done(done_kind, fields["done"])
     by = _one_line(by, "by")
+    author = _author_for(author, by)
     if (key is None) != (payload_hash is None):
         raise BoardError("--key and --payload-hash go together")
     if key is not None:
@@ -628,6 +658,7 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author) -
                 raise BoardError("depends_on takes a list of typed link specs (item:<id>, band:np-xxxxxxxx, link:<ref>, gate:<date>:<words>); [] clears it")
             out[k] = [parse_link(d) for d in v]
     why, by = _one_line(why, "why"), _one_line(by, "by")
+    author = _author_for(author, by)
 
     def build(recs):
         _require_known(recs, item_id)
@@ -643,6 +674,7 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
+    author = _author_for(author, by)
     when = _real_date(when or (now or _utc_now())[:10], "date")
 
     def build(recs):
