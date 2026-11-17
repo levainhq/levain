@@ -574,6 +574,9 @@ def test_spend_overrun_recorded_session_not_revoked(py):
             s1, f1 = await w.session(S1)
             q1 = await f1.q()
             await R3.aio_until(lambda: w.control.spend_overruns(S1), what="SPEND-OVERRUN recorded")
+            # the record (CONTROL) and the `settled` line (keys' ledger writer) land from different processes: wait for the line
+            await R3.aio_until(lambda: any(o["kind"] == "settled" for o in B2.ledger_lines(w.keys.ledger_path)),
+                               what="the settled ledger line")
             settled = [o for o in B2.ledger_lines(w.keys.ledger_path) if o["kind"] == "settled"]
             return {"q1": q1, "recs": w.control.spend_overruns(S1), "settled": settled, "state": s1.state(),
                     "handles": w.control.handles(S1) is not None, "no_k": await no_k(f1), "q2": await f1.q(),
