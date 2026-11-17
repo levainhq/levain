@@ -647,3 +647,12 @@ def test_l5_recorded_and_ledger_full_name_a_replaced_grant_too() -> None:
     body, status = _surface(root).revoke(S1, G1, "browser", _far())
     assert status == 200 and body["result"] == "gone"
     assert "replaced by a newer grant for the same host" in body["message"] and "ledger is full" in body["message"]
+
+
+def test_a_revoke_spawns_two_listings_and_one_revoke_not_one_listing():
+    """Diogenes 11-17 candidate B: the module docstring once said one listing spawn; the real sequence is the listing
+    that decides the id is in force, the revoke, and the fresh listing the answer carries."""
+    root = FakeRoot()
+    body, status = _surface(root).revoke(S1, G1, "cred", _far())
+    assert status == 200 and body["result"] == "revoked"
+    assert root.verbs() == ["egress-grants-all", "egress-grant-revoke", "egress-grants-all"]

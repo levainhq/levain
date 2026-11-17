@@ -17,7 +17,9 @@ a root verb, and the allowlist is :meth:`HostGrantSurface.call`, in this module,
 Revoke only narrows: the root helper never adds a grant here (that takes a passkey-signed message root verifies). A
 per-id revoke is sent only for a ``(session, id)`` the cockpit's own listing holds; any other is answered ``gone`` with
 no revoke spawn, so a credential holder cannot fill root's install-wide revoked-id ledger (``egress-grant-ledger-full``)
-through this route. One request is at most one listing spawn and one revoke spawn, never an automatic retry.
+through this route. A revoke spawns the revoke verb at most once, never an automatic retry; the listings it takes
+(the one that decides whether the id is in force, and the fresh one an answer carries) are each a spawn unless the cache
+serves them: :meth:`HostGrantSurface.revoke` is the count.
 
 Every wait is bounded by one absolute monotonic ``deadline`` the route gives (the route takes it from the request's
 start); no spawn starts with under :data:`MIN_SPAWN_S` left. The root helper child is never signalled
