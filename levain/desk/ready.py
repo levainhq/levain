@@ -59,7 +59,7 @@ from levain.intention_legacy import READY_SOURCE_KEY
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
     "JournalAhead", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
-    "FACT_COLS", "item_facts", "migrate_item_facts", "ready_counts", "record_landed", "replay", "slug",
+    "FACT_COLS", "item_facts", "live_seat_launches", "migrate_item_facts", "ready_counts", "record_landed", "replay", "slug",
 ]
 
 SCHEMA_VERSION = 1
@@ -600,6 +600,20 @@ SEATS_SOURCE = "seats"
 JOURNAL_SOURCE = "journal"
 
 
+def live_seat_launches(conn: sqlite3.Connection, now: str) -> builtins.list:
+    """The roster projection's launches, as ``(launch, waiting)`` pairs: every launch whose latest event is ``active``,
+    oldest first. ``waiting`` is True for a desk launch with no liveness evidence (see :func:`_seat_rows`: the lease's
+    own reading, not a second rule). The one place the roster's liveness is read; :func:`_seat_rows` draws it and
+    :mod:`levain.desk.nightclose` records it. A store before the launch tables reads as no seats."""
+    from levain.desk import lease
+
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'launch_events'").fetchone() is None:
+        return []
+    held = lease.lease(conn, now)
+    return [(ln, ln.role == ROLE_DESK and not (held is not None and held.live and held.holder == ln.session_key))
+            for ln in lease._in_state(conn, "active")]
+
+
 def _seat_rows(conn: sqlite3.Connection, now: str) -> builtins.list:
     """The live seats (SCHEMA section 5's roster projection) from the launch rows the desk already keeps: every launch
     whose latest event is ``active``. ``token`` is the launch id, ``name`` says harness, role and thread.
@@ -613,15 +627,10 @@ def _seat_rows(conn: sqlite3.Connection, now: str) -> builtins.list:
     ``repo`` is ``""``: a launch records no repository (``cwd`` is an arbitrary execution directory, its basename wrong for a
     nested directory or a worktree), and no wrong repo is better than a guessed one. A store before the launch tables reads as
     no seats."""
-    from levain.desk import lease
-
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'launch_events'").fetchone() is None:
-        return []
-    held = lease.lease(conn, now)
     out = []
-    for ln in lease._in_state(conn, "active"):
+    for ln, waiting in live_seat_launches(conn, now):
         seat = {"token": ln.launch_id, "repo": "", "name": " ".join([str(ln.harness), str(ln.role), *map(str, ln.threads)])}
-        if ln.role == ROLE_DESK and not (held is not None and held.live and held.holder == ln.session_key):
+        if waiting:
             seat["declared"] = "waiting"
             seat["name"] += " (no live lease)"
         out.append(seat)

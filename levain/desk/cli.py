@@ -2211,9 +2211,10 @@ def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) 
                if journal is not None else f"no effect journal exists yet ({JOURNAL_FILE} is not in {store.directory}): "
                                            "effects not read")
     _emit(out, args.json, {"owner": got.owner, "stopped": got.stopped, "handed": list(got.handed),
-                           "effects": list(got.effects), "journal": journal is not None},
+                           "effects": list(got.effects), "seats": list(got.seats), "journal": journal is not None},
           f"nightclose: owner {got.owner}; stop {'written' if got.stopped else 'already covers every launch'}; "
-          f"events handed {len(got.handed)}" + (f" ({', '.join(got.handed)})" if got.handed else "") + f"; {effects}")
+          f"events handed {len(got.handed)}" + (f" ({', '.join(got.handed)})" if got.handed else "") + f"; {effects}"
+          + f"; seats recorded {len(got.seats)}" + (f" ({', '.join(got.seats)})" if got.seats else ""))
     return 0
 
 
