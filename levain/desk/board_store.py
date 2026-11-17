@@ -1,7 +1,8 @@
 """levain.desk.board_store — the board's item store: where it lives, the one lock over it, and the writer.
 
-The writer is a port of flow's ``scripts/board.py``: the same records (``json.dumps(rec, separators=(",", ":"))``,
-ASCII only), the same refusals, the same id allocation under the lock. Item STATE is never stored; this module writes
+The writer is a port of flow's ``scripts/board.py``: flow's records (compact separators, ASCII only) plus three keys of
+its own, ``author``, ``grade`` and ``prev`` (see :func:`build_record`, :func:`chain_prev`), the same refusals, the same id
+allocation under the lock. Item STATE is never stored; this module writes
 records and reads ids only. The fold and every state rule live in :mod:`levain.desk.board_state`, which this module does
 not import.
 
@@ -411,7 +412,11 @@ def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now
                  author: Mapping[str, object]) -> dict:
     """THE one place a record is built: every verb's record comes out of here, in the key order flow's writer uses, then
     ``author`` and ``grade``. The grade is the writer's, never a caller's: ``asserted`` until a later grade is earned.
-    ``prev`` is not here: :func:`_append` stamps it, under the lock, right after ``at``."""
+    ``prev`` is not here: :func:`_append` stamps it, under the lock, right after ``at``. A body carrying ``author``,
+    ``grade``, ``prev`` or ``sig`` is refused: those keys are the writer's, never a caller's."""
+    taken = sorted(k for k in ("author", "grade", "prev", "sig") if k in body)
+    if taken:
+        raise BoardError(f"a record body may not carry {', '.join(taken)}: the writer sets those")
     return {"v": 1, "op": op, "id": item_id, "at": now or _utc_now(), "by": by, **body,
             "author": _author(author), "grade": GRADE_ASSERTED}
 
@@ -426,7 +431,10 @@ def chain_prev(raw: bytes) -> str:
     """The ``prev`` the NEXT record of a file whose bytes are ``raw`` carries: the lowercase hex sha256 of the last line's
     bytes as written (its trailing newline excluded; a torn line's bytes included). A file in which no line carries ``prev``
     yet (empty, or a legacy prefix) gives the sha256 of ALL its bytes: for an empty file that is the sha256 of nothing, and
-    for a legacy prefix it is the cutover hash, so the first chained record vouches for every byte before it."""
+    for a legacy prefix it is the cutover hash, so the first chained record vouches for every byte before it.
+
+    Every line between newlines is hashed AS WRITTEN: a blank line hashes as empty bytes, a CRLF line hashes its ``\\r``.
+    Lines split on ``\\n`` only. A verifier must do the same (not ``splitlines()``, not text mode, no skipping blanks)."""
     lines = raw.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
@@ -441,7 +449,9 @@ def chain_prev(raw: bytes) -> str:
 
 
 def _with_prev(rec: dict, prev: str) -> dict:
-    """``rec`` with ``prev`` placed right after ``at``."""
+    """``rec`` with ``prev`` placed right after ``at``. A record without ``at`` is refused: it is never written unchained."""
+    if "at" not in rec:
+        raise BoardError("a record needs an at key: it cannot be chained without one")
     out: dict = {}
     for k, v in rec.items():
         if k == "prev":
@@ -494,7 +504,8 @@ def _require_pointered(target: Target) -> None:
 def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *, filename: str = ITEMS_NAME) -> tuple[dict, bool]:
     """Under the exclusive lock, hand ``build(records)`` the records of ``<store dir>/<filename>``; it returns ``(record,
     write)`` and may raise BoardError. When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read
-    in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it."""
+    in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it
+    was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none)."""
     _require_pointered(target)
     path = target.store_dir / filename
     with store_lock(target.store_dir, exclusive=True) as held:

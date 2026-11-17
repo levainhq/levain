@@ -595,7 +595,7 @@ def test_a_write_never_recreates_a_store_that_vanished_before_the_lock(home, tmp
     else:
         (store / "store.id").unlink()
     with pytest.raises(bs.BoardError, match="holds no store"):
-        bs.add(target, "levain", "t", "o", "b")
+        bs.add(target, "levain", "t", "o", "b", author=AGENT)
     assert not store.exists() or sorted(p.name for p in store.iterdir()) in ([], ["store.lock"])
     assert not (store / "items.jsonl").exists() and not (store / "store.id").exists()
 
@@ -889,3 +889,42 @@ def test_a_torn_store_still_refuses_a_chained_write(home, tmp_path, capsys):
     before = (store / "items.jsonl").read_bytes()
     rc, _, err = run(capsys, *ADD)
     assert rc == 2 and "torn" in err and (store / "items.jsonl").read_bytes() == before
+
+
+def test_a_replacement_that_copies_the_written_line_is_found_by_its_exact_bytes_and_keeps_its_prev(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    first = items.read_bytes().split(b"\n")[0]
+    real, calls = bs._write_all, {"n": 0}
+
+    def write_then_swap(fd, payload):
+        calls["n"] += 1
+        real(fd, payload)
+        if calls["n"] == 1:
+            _replace_with_copy(items)                                # the copy already holds the written line
+
+    monkeypatch.setattr(bs, "_write_all", write_then_swap)
+    assert run(capsys, *ADD)[0] == 0
+    assert calls["n"] == 1 and len(lines(store)) == 2                # found, not rebuilt: one record in all
+    assert json.loads(lines(store)[1])["prev"] == _sha(first)        # the prev computed in attempt 1
+
+
+def test_a_record_without_at_is_refused_not_written_unchained(home, tmp_path):
+    t = _target(Path(os.path.realpath(tmp_path / "s")))
+    bs.use(t.store_dir)
+    with pytest.raises(bs.BoardError, match="needs an at"):
+        bs._append(t, lambda recs: ({"v": 1, "op": "add", "id": "levain#1"}, True), filename="repos.jsonl")
+    assert not (t.store_dir / "repos.jsonl").read_bytes()
+
+
+@pytest.mark.parametrize("key", ["author", "grade", "prev", "sig"])
+def test_build_record_refuses_a_body_that_carries_a_writer_key(key):
+    with pytest.raises(bs.BoardError, match=key):
+        bs.build_record("add", "levain#1", "b", {key: "x"}, "2026-11-17T00:00:00Z", author=AGENT)
+
+
+def test_chain_prev_hashes_every_line_as_written_blank_and_crlf_included():
+    line = b'{"v":1,"prev":"x"}'
+    assert bs.chain_prev(line + b"\n\n") == _sha(b"")                # a blank tail line hashes as empty bytes
+    assert bs.chain_prev(line + b"\r\n") == _sha(line + b"\r")       # a CRLF line hashes its \r
