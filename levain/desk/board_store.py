@@ -32,6 +32,7 @@ import json
 import os
 import re
 import secrets
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -115,6 +116,8 @@ def _explicit_dir_and_file(given: Path) -> tuple[Path, Path]:
     if p.is_dir():
         return p, p / ITEMS_NAME
     if expanded.name != ITEMS_NAME:
+        if not os.path.lexists(expanded) and not expanded.name.endswith(".jsonl"):     # a missing directory; a missing *.jsonl is a shadow file
+            raise BoardError(f"--items {given}: no such directory")
         raise BoardError(f"--items must name a store directory or its {ITEMS_NAME}, not {str(given)!r}")
     parent = Path(os.path.realpath(expanded.parent))
     return parent, parent / ITEMS_NAME
@@ -153,12 +156,17 @@ def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | 
 # --------------------------------------------------------------------------------------------------------------- lock
 
 
-def _open_checked(path: Path, flags: int, flock_op: int | None = None) -> int:
+def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_ok: bool = False) -> int:
     """Open ``path`` (taking ``flock_op`` when given), then check it is still the file at ``path``: a git operation replaces a
-    tracked file by a new inode, and a lock on the unlinked one excludes nobody. Retried a bounded number of times."""
+    tracked file by a new inode, and a lock on the unlinked one excludes nobody. Retried a bounded number of times.
+    ``missing_ok``: a file that is not there returns -1 instead of refusing."""
     for _ in range(OPEN_RETRIES):
         try:
             fd = os.open(path, flags, 0o644)
+        except FileNotFoundError:
+            if missing_ok:
+                return -1
+            raise BoardError(f"cannot open {path}: no such file") from None
         except OSError as exc:
             raise BoardError(f"cannot open {path}: {exc}") from None
         if flock_op is not None:
@@ -193,6 +201,14 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _fsync_dir_or_warn(path: Path, what: str) -> None:
+    """The bytes are already durable: a directory fsync that fails is a warning, never a failure of the write."""
+    try:
+        _fsync_dir(path)
+    except OSError as exc:
+        print(f"board: {what} was written, but the directory {path} could not be fsynced ({exc})", file=sys.stderr)
+
+
 class StoreHandle:
     """What :func:`store_lock` yields: opens the store's files while the lock is held."""
 
@@ -206,23 +222,36 @@ class StoreHandle:
 
 
 @contextmanager
-def store_lock(store_dir: Path, *, exclusive: bool) -> Iterator[StoreHandle]:
+def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False) -> Iterator[StoreHandle]:
     """Hold ``<store dir>/store.lock``: LOCK_EX when ``exclusive``, else LOCK_SH. Every store file's reader and writer
-    uses it. Not held across git evidence reads."""
+    uses it. Not held across git evidence reads. A writer never creates the store: under the exclusive lock the directory
+    and ``store.id`` must exist, or it refuses (only ``use``, with ``setup``, makes a store). A reader never creates the
+    lock: a missing lock means no writer, and it reads without one."""
     store_dir = Path(store_dir)
     if exclusive:
+        if not setup:
+            _require_store_exists(store_dir)
         try:
-            store_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise BoardError(f"cannot create the board store directory {store_dir}: {exc}") from None
-    elif not (store_dir / LOCK_NAME).exists():
-        yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock): a read must not create it
+            fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX)
+        except BoardError:
+            if not setup:
+                _require_store_exists(store_dir)            # the store vanished while we opened: say so, not "cannot open"
+            raise
+        try:
+            if not setup:
+                _require_store_exists(store_dir)            # re-checked under the lock
+            yield StoreHandle(store_dir, True)
+        finally:
+            os.close(fd)                # closing releases the flock
         return
-    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True)
+    if fd < 0:
+        yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock)
+        return
     try:
-        yield StoreHandle(store_dir, exclusive)
+        yield StoreHandle(store_dir, False)
     finally:
-        os.close(fd)                    # closing releases the flock
+        os.close(fd)
 
 
 # ------------------------------------------------------------------------------------------------------------- reading
@@ -415,26 +444,28 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]]) ->
     _require_pointered(target)
     path = target.store_dir / target.items_path.name
     with store_lock(target.store_dir, exclusive=True) as held:
+        line = None                     # the serialised record, once one has been written
         for _ in range(OPEN_RETRIES):
-            created = not path.exists()
             fd = held.open(target.items_path.name, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
             try:
-                recs = _read_records(fd)
+                empty = os.fstat(fd).st_size == 0           # a write into a zero-length file may have just created it
+                raw = _read_fd(fd)
+                if line is not None and line in raw.split(b"\n"):
+                    return rec, True            # the replacement kept our record (a copy made after the write): done
+                recs = _records_from(raw)
                 rec, write = build(recs)
                 if write:
                     # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                    _write_all(fd, (json.dumps(rec, separators=(",", ":")) + "\n").encode("ascii"))
+                    line = (json.dumps(rec, separators=(",", ":"))).encode("ascii")
+                    _write_all(fd, line + b"\n")
                 if _same_file(fd, path):
-                    if write and created:
-                        try:
-                            _fsync_dir(target.store_dir)
-                        except OSError as exc:
-                            raise BoardError(f"{rec['id']} was written but the store directory could not be fsynced ({exc})") from None
+                    if write and empty:
+                        _fsync_dir_or_warn(target.store_dir, rec["id"])
                     return rec, write
             finally:
                 os.close(fd)
             # the file was replaced under the lock (a git operation): the record, if any, is in the unlinked inode.
-            # Open the current file, read it again, build again (id and idempotency key judged against the new contents).
+            # Open the current file, read it again; if it already holds the record, that is the write; else build again.
         raise BoardError(f"{path} was replaced while a write was in flight (a git operation?) {OPEN_RETRIES} times; nothing was kept, retry")
 
 
@@ -607,7 +638,7 @@ def _write_pointer(home: Path, store_dir: Path) -> None:
         except OSError:
             pass
         raise
-    _fsync_dir(home)
+    _fsync_dir_or_warn(home, "the store pointer")
 
 
 def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tuple[Path, bool]:
@@ -621,7 +652,8 @@ def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tupl
     if "\n" in str(store_dir):
         raise BoardError(f"the store path {str(store_dir)!r} holds a newline; the one-line pointer cannot name it")
     try:
-        with store_lock(store_dir, exclusive=True) as held:
+        store_dir.mkdir(parents=True, exist_ok=True)
+        with store_lock(store_dir, exclusive=True, setup=True) as held:
             _write_store_id_once(held)
     except OSError as exc:
         raise BoardError(f"cannot set up the store at {store_dir}: {exc}") from None

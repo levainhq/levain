@@ -181,6 +181,8 @@ def _warn_unknown_deps(target: bs.Target, depends: Any) -> None:
 def run_add(args: argparse.Namespace) -> int:
     try:
         target = bs.resolve_store(args.items)
+        for spec in args.depends:               # a malformed link is a refusal, not an advisory
+            bs.parse_link(spec)
         if target.pointered:
             _warn_unknown_deps(target, args.depends)
         item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
@@ -198,6 +200,8 @@ def run_amend(args: argparse.Namespace) -> int:
         fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
                                     ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
         if args.depends is not None:
+            for spec in args.depends:
+                bs.parse_link(spec)
             if target.pointered:
                 _warn_unknown_deps(target, args.depends)
             fields["depends_on"] = list(args.depends)

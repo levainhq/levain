@@ -247,6 +247,8 @@ def test_the_inode_recheck_retries_then_refuses(tmp_path, monkeypatch):
 def test_store_lock_is_exclusive_against_a_shared_holder(tmp_path):
     import fcntl
     d = tmp_path / "s"
+    d.mkdir()
+    (d / bs.STORE_ID_NAME).write_text("x\n")
     with bs.store_lock(d, exclusive=True):
         fd = os.open(d / bs.LOCK_NAME, os.O_RDWR)
         try:
@@ -514,3 +516,123 @@ def test_charter_check_prints_the_stores_own_refusal(home, tmp_path, capsys):
     (other / "items.jsonl").write_text("")
     items, why = charter._store(other / "items.jsonl")
     assert items is None and "two stores" in why and "BoardError" not in why
+
+
+# --------------------------------------------------------------------------------------------------- fix round 2
+
+
+def test_a_retry_after_a_replacement_that_kept_the_record_appends_nothing(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    real, calls = bs._write_all, {"n": 0}
+
+    def write_then_swap(fd, payload):
+        calls["n"] += 1
+        real(fd, payload)
+        if calls["n"] == 1:
+            _replace_with_copy(store / "items.jsonl")       # a copy that already holds the written line
+
+    monkeypatch.setattr(bs, "_write_all", write_then_swap)
+    rc, out, err = run(capsys, *ADD)
+    assert rc == 0 and out == "levain#2", err
+    assert calls["n"] == 1
+    assert [json.loads(x)["id"] for x in lines(store)] == ["levain#1", "levain#2"]
+
+
+def _dir_fsync_fails(monkeypatch, only):
+    real = bs._fsync_dir
+
+    def flaky(path):
+        if Path(path) == only:
+            raise OSError(5, "io error")
+        return real(path)
+
+    monkeypatch.setattr(bs, "_fsync_dir", flaky)
+
+
+def test_a_failed_directory_fsync_after_a_durable_write_is_a_warning(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    _dir_fsync_fails(monkeypatch, store)
+    rc, out, err = run(capsys, *ADD)                       # items.jsonl is created here: the directory fsync runs and fails
+    assert rc == 0 and out == "levain#1"
+    assert str(store) in err and "io error" in err and err.count("\n") == 0
+    assert [json.loads(x)["id"] for x in lines(store)] == ["levain#1"]
+
+
+def test_a_failed_directory_fsync_after_the_pointer_is_replaced_is_a_warning(home, tmp_path, capsys, monkeypatch):
+    store = tmp_path / "s"
+    _dir_fsync_fails(monkeypatch, home / "board")
+    rc, out, err = run(capsys, "use", str(store))
+    assert rc == 0 and str(home / "board") in err and "io error" in err
+    assert bs.read_pointer() == Path(os.path.realpath(store))
+
+
+@pytest.mark.parametrize("damage", ["gone", "no-store-id"])
+def test_a_write_never_recreates_a_store_that_vanished_before_the_lock(home, tmp_path, capsys, damage):
+    import shutil
+    store = use(capsys, tmp_path / "s")
+    target = bs.resolve_store()
+    if damage == "gone":
+        shutil.rmtree(store)
+    else:
+        (store / "store.id").unlink()
+    with pytest.raises(bs.BoardError, match="holds no store"):
+        bs.add(target, "levain", "t", "o", "b")
+    assert not store.exists() or sorted(p.name for p in store.iterdir()) in ([], ["store.lock"])
+    assert not (store / "items.jsonl").exists() and not (store / "store.id").exists()
+
+
+def test_a_shared_reader_opens_the_lock_without_creating_it(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    real, seen = os.open, []
+
+    def spy(path, flags, *a, **k):
+        if str(path).endswith(bs.LOCK_NAME):
+            seen.append(flags)
+        return real(path, flags, *a, **k)
+
+    monkeypatch.setattr(bs.os, "open", spy)
+    with bs.store_lock(store, exclusive=False):
+        pass
+    assert seen and all(not f & os.O_CREAT for f in seen)
+    (store / bs.LOCK_NAME).unlink()
+    seen.clear()
+    with bs.store_lock(store, exclusive=False):
+        pass
+    assert not (store / bs.LOCK_NAME).exists()
+
+
+def test_a_write_into_a_zero_length_existing_file_fsyncs_the_directory(home, tmp_path, capsys, monkeypatch):
+    import stat
+    store = use(capsys, tmp_path / "s")
+    (store / "items.jsonl").write_text("")
+    real, dirs = os.fsync, []
+
+    def spy(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            dirs.append(os.fstat(fd).st_ino)
+        return real(fd)
+
+    monkeypatch.setattr(bs.os, "fsync", spy)
+    assert run(capsys, *ADD)[0] == 0
+    assert dirs == [os.stat(store).st_ino]
+    dirs.clear()
+    run(capsys, *ADD)
+    assert dirs == []
+
+
+def test_an_invalid_depends_is_a_refusal_printed_once_and_nothing_is_written(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "s")
+    rc, out, err = run(capsys, *ADD, "--depends", "bogus:x")
+    assert rc == 2 and err.count("refused") == 1 and "could not check" not in err and out == ""
+    assert lines(store) == []
+    assert run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b", "--depends", "item:levain#9")[0] == 0
+    rc, out, err = run(capsys, "amend", "--id", "levain#1", "--why", "w", "--by", "b", "--depends", "bogus:x")
+    assert rc == 2 and err.count("refused") == 1 and "could not check" not in err
+
+
+def test_a_missing_items_directory_is_worded_for_what_happened(home, tmp_path, capsys):
+    missing = tmp_path / "nope"
+    for verb in (("state", "--json"), ADD):
+        rc, _, err = run(capsys, verb[0], "--items", str(missing), *verb[1:])
+        assert rc == 2 and f"--items {missing}: no such directory" in err and "must name a store" not in err
