@@ -17,7 +17,7 @@ from levain.desk import effects_mcp as mcp
 
 pytest.importorskip("cryptography")
 from tests.test_effect_verbs import ACK_LINE, D, EVR, EVT, Rig, call, signed, world  # noqa: E402,F401
-from tests.test_standing_order_signing import LINE, make, sign  # noqa: E402
+from tests.test_standing_order_signing import make, sign  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -147,3 +147,40 @@ def test_the_shipped_facts_are_the_closed_ones():
     assert len(values) == 1 and ast.unparse(values[0]) == "arming_gate.CLOSED_FACTS" and dict(ag.CLOSED_FACTS) == {}
     writes = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "NIGHT_ARMING_FACTS" for t in n.targets)]
     assert not writes                                                          # nothing in the module rebinds it
+
+
+def test_the_two_fact_lists_cannot_differ():
+    assert tuple(fx._FACT_NAMES) == tuple(ag.FACTS) == tuple(FULL)
+    assert set(fx.R_ARMING) == set(SUBSETS)                                    # one sentence per non-empty subset, in gate order
+
+
+def test_every_fact_present_and_still_refused_is_the_twin_sentence(world, monkeypatch):
+    monkeypatch.setattr(fx, "NIGHT_ARMING_FACTS", dict(FULL))
+    monkeypatch.setattr(ag, "arming_refusal", lambda order, facts=None: "refused")
+    g = signed(world)
+    rig = Rig(world)
+    with pytest.raises(fx.EffectRefused) as err:
+        restart(world, rig, g)
+    assert fx.refusal_text(err.value) == fx.R_ARMING_TWIN and rig.untouched()
+
+
+def test_an_open_set_the_table_does_not_hold_fails_closed(world, monkeypatch):
+    monkeypatch.setattr(fx, "NIGHT_ARMING_FACTS", ag.CLOSED_FACTS)
+    monkeypatch.setattr(ag, "missing_facts", lambda facts=None: ("nd7_ruled", "a_fourth_fact"))
+    g = signed(world)
+    rig = Rig(world)
+    with pytest.raises(fx.EffectRefused) as err:
+        restart(world, rig, g)
+    assert fx.refusal_text(err.value) == fx.R_ARMING[tuple(FULL)] and rig.untouched()
+
+
+def test_a_closed_gate_refusal_writes_no_would_have_acted_row_and_no_ping(world, monkeypatch):
+    from tests.test_would_have_acted import make_wha
+    monkeypatch.setattr(fx, "NIGHT_ARMING_FACTS", ag.CLOSED_FACTS)
+    g = signed(world)
+    rig = Rig(world)
+    w, pings = make_wha(rig)
+    with pytest.raises(fx.EffectRefused) as err:
+        rig.effects(would_have_acted=w).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
+    assert fx.refusal_text(err.value) == fx.R_ARMING[tuple(FULL)]
+    assert w.open_pings() == [] and w.morning_list() == [] and pings.sent == []

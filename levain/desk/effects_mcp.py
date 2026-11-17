@@ -18,7 +18,7 @@ argument outside its shape or enum, a missing or an extra one, is refused by :mo
 is even read. ``main`` wires NO executor and no effect journal yet (the night
 key is ND-8, the mail credential O8; the sealed drafter's argv and output parser exist
 (:mod:`levain.desk.sealed`) but the launcher that runs it is not built, so no drafter is wired here either): every call
-that passes the order gate then answers "not wired". Wiring is done by constructing :class:`~levain.desk.effects.Effects` in the process that owns the
+that passes the order gate and the arming gate (ND-11) then answers "not wired". Wiring is done by constructing :class:`~levain.desk.effects.Effects` in the process that owns the
 credentials, not by anything a seat says."""
 from __future__ import annotations
 

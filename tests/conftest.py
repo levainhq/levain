@@ -479,8 +479,7 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture(autouse=True)
 def _night_armed_for_the_verb_tests(monkeypatch):
     """The effect verbs' arming gate (levain#20) is closed as shipped. The tests of the verbs themselves run with it
-    OPEN so they reach what they test; tests/test_night_arming_gate.py sets it closed, or reads the shipped value in a
-    fresh interpreter, for the gate's own tests."""
+    OPEN so they reach what they test; tests/test_night_arming_gate.py sets it closed for the gate's own tests."""
     try:
         import levain.desk.effects as _fx
     except ImportError:

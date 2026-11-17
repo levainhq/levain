@@ -140,6 +140,8 @@ R_VERSION = "the order in force is not the version asked for: nothing was done"
 #: writes the three np ids here. :meth:`Effects.gate` reads it by name at every call.
 NIGHT_ARMING_FACTS: Mapping[str, str] = arming_gate.CLOSED_FACTS
 _FACT_NAMES = {"nd7_ruled": "the ND-7 ruling", "nd8_done": "ND-8 done", "nd9_read": "the ND-9 read"}
+if tuple(_FACT_NAMES) != tuple(arming_gate.FACTS):      # one list of facts: a fourth fact added to one and not the other cannot import
+    raise ImportError("effects._FACT_NAMES and arming_gate.FACTS name different facts")
 
 
 def _armed_sentence(open_keys: tuple[str, ...]) -> str:
@@ -147,8 +149,11 @@ def _armed_sentence(open_keys: tuple[str, ...]) -> str:
             + ": nothing was done")
 
 
-#: one fixed sentence per set of open items (a refusal never carries computed text); the keys are tuples in gate order
-R_ARMING = {keys: _armed_sentence(keys) for n in (1, 2, 3) for keys in itertools.combinations(_FACT_NAMES, n)}
+#: one fixed sentence per set of open items (a refusal never carries computed text); the keys are tuples in gate order,
+#: built from the gate's own fact keys. A closed-gate refusal writes NO would-have-acted row and no ping (it is not a
+#: coverage reason, :func:`_coverage_reason`): the head ruled that intended for 1.0; ND-3c is a later row.
+R_ARMING = {keys: _armed_sentence(keys) for n in range(1, len(arming_gate.FACTS) + 1)
+            for keys in itertools.combinations(arming_gate.FACTS, n)}
 R_ARMING_TWIN = "the night is not armed for effect lines; one np id is given for more than one item: nothing was done"
 R_NOT_WIRED = "this effect is not wired in this process: nothing was done"
 R_EVENT = "the event is not an authenticated mail from a known sender with its message: nothing was done"
@@ -520,6 +525,7 @@ class Effects:
         order answers at this instant: in the verified replay, signers active, unexpired, not revoked, not stopped,
         its widening's base too (:func:`levain.desk.standing_orders.orders_in_force`), and its whole-record digest is
         ``expect_sha256`` (the version the desk read in its brief; a different record under the same id is refused).
+        An order with effect lines is also refused while an arming fact is open (:data:`NIGHT_ARMING_FACTS`).
         Every fault refuses."""
         try:
             now = self.clock()
@@ -533,10 +539,14 @@ class Effects:
             if type(expect_sha256) is not str or not hmac.compare_digest(standing_orders.order_sha256(order),
                                                                          expect_sha256):
                 raise _OwnRefusal(R_VERSION)
-            if arming_gate.arming_refusal(order, NIGHT_ARMING_FACTS) is not None:
+            facts = NIGHT_ARMING_FACTS
+            if arming_gate.arming_refusal(order, facts) is not None:
                 # the order is in force and is the version asked for, but the night is not armed for its effect lines
-                open_keys = arming_gate.missing_facts(NIGHT_ARMING_FACTS)
-                raise _OwnRefusal(R_ARMING.get(open_keys, R_ARMING_TWIN))
+                open_keys = arming_gate.missing_facts(facts)
+                if not open_keys:                           # every fact present: the refusal can only be one np id twice
+                    raise _OwnRefusal(R_ARMING_TWIN)
+                # an open set the table does not hold is an unexpected state: refuse as if every item were open
+                raise _OwnRefusal(R_ARMING.get(open_keys) or R_ARMING[tuple(arming_gate.FACTS)])
             lines = [ln for ln in order["effect_lines"] if ln["verb"] == verb]
         except Exception as exc:                            # noqa: BLE001 - any fault reading the log is "no order"
             if _trusted(exc):                               # ours; a clock's EffectRefused, any reason, is a fault
