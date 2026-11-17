@@ -59,7 +59,6 @@ HEAVY_TABLE = [
 ]
 
 
-STAGE0_RESULTS = ("success", "failure", "cancelled", "skipped")
 
 
 def test_there_are_heavy_jobs():
@@ -143,6 +142,9 @@ def test_stage0_cannot_fail_quietly():
     job = JOBS["stage0"]
     assert "continue-on-error" not in job
     assert [s.get("name") for s in job["steps"] if "continue-on-error" in s] == []
+    # nor can a run line swallow a pytest exit
+    swallowed = [s.get("name") for s in job["steps"] if re.search(r"\|\|\s*true|set \+e", s.get("run", ""))]
+    assert swallowed == []
 
 
 def test_the_stage0_checks_can_fail():
@@ -510,6 +512,8 @@ def test_the_stage1_golden_journeys_are_run_by_the_browser_job():
     spec = importlib.util.spec_from_file_location("ci_shard_browser", Path(__file__).resolve().parent / "ci" / "shard.py")
     shard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(shard)
+    # strategy.job-total counts every matrix combination, so the shard axis must be the matrix's only axis
+    assert list(JOBS["browser"]["strategy"]["matrix"]) == ["shard"]
     n = len(JOBS["browser"]["strategy"]["matrix"]["shard"])
     dealt = [f for k in range(n) for f in shard.browser_shard(n, k)]
     assert "tests/test_journeys_stage1.py" in dealt

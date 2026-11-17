@@ -170,7 +170,8 @@ def main():
         return 3
 
     addopts = re.search(r'addopts\s*=\s*"([^"]*)"', (ROOT / "pyproject.toml").read_text())
-    xdist = ["-p", "no:xdist"] if addopts and re.search(r"(^|\s)(-n|--numprocesses|--dist)", addopts.group(1)) else []
+    # serial: -n0 overrides an `-n` in addopts (disabling the xdist plugin instead would abort pytest on the unknown option)
+    xdist = ["-n0"] if addopts and re.search(r"(^|\s)(-n|--numprocesses|--dist)", addopts.group(1)) else []
     tmp = tempfile.mkdtemp(prefix="prearm-", dir=a.basetemp)
     runs = [sorted(chosen)] + ([["-m", "invariant", "tests"]] if a.invariant else [])
     rc, counts = 0, {"passed": 0, "failed": 0, "skipped": 0, "error": 0}

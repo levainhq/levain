@@ -120,7 +120,7 @@ jobs:
         run: pytest -q -m invariant --basetemp=/tmp/levain-pt
 
       - name: Check the invariant list against the tests
-        # a listed test renamed or dropped fails here, in stage 0, not later in a shard
+        # a listed test renamed or dropped fails here, in stage 0, with the invariant tests, not only in a shard
         run: pytest -q tests/test_ci_invariant_marker.py --basetemp=/tmp/levain-pt-marker
 
   plan:
