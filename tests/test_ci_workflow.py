@@ -11,8 +11,8 @@ JOBS = WF["jobs"]
 GATE_CLAUSE = "!(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true')"
 # stage0 (the invariant tests) skips only where the gate skips everything.
 STAGE0_IF = "${{ always() && !cancelled() && " + GATE_CLAUSE + " }}"
-# The jobs that need both the gate and stage0 run only on a stage0 that SUCCEEDED, besides the gate clause.
-HEAVY_IF = "${{ always() && !cancelled() && needs.stage0.result == 'success' && " + GATE_CLAUSE + " }}"
+# The heavy jobs wait on the gate alone: stage0 runs beside them (landing throughput, 11-17), not in front of them.
+HEAVY_IF = "${{ always() && !cancelled() && " + GATE_CLAUSE + " }}"
 
 
 def evaluate(cond, gate_result, skip, cancelled=False, stage0="success"):
@@ -44,8 +44,8 @@ def _needs(name, jobs=None):
 
 
 def _heavy():
-    """The jobs fed directly by the gate and stage0: every one must carry the stage0 dependency and guard."""
-    return [n for n, j in JOBS.items() if set(_needs(n)) == {"gate", "stage0"}]
+    """The jobs fed by the gate alone, bar the verified marker and stage0 itself: the suite's heavy jobs."""
+    return [n for n, j in JOBS.items() if n not in ("verified", "stage0") and set(_needs(n)) == {"gate"}]
 
 
 # (gate result, skip output, heavy job runs?). The skip output is "" when the gate did not run or failed before writing.
@@ -64,7 +64,7 @@ STAGE0_RESULTS = ("success", "failure", "cancelled", "skipped")
 
 def test_there_are_heavy_jobs():
     assert len(_heavy()) >= 6
-    # the jobs the move names; a heavy job that dropped its stage0 dependency falls out of _heavy(), so name them
+    # the jobs the move names; a heavy job that grew a dependency beyond the gate falls out of _heavy(), so name them
     for n in ("plan", "test", "root-py39", "linux-live", "browser", "isolation", "chat-egress-srt"):
         assert n in _heavy(), n
 
@@ -117,44 +117,45 @@ def test_every_heavy_job_skips_only_when_the_gate_succeeded_and_said_skip(name):
     assert evaluate(cond, "cancelled", "", cancelled=False) is True, name
 
 
-@pytest.mark.parametrize("name", _heavy())
-def test_a_heavy_job_runs_only_after_a_successful_stage0(name):
-    assert "stage0" in _needs(name), name
-    cond = JOBS[name]["if"]
-    assert "needs.stage0.result == 'success'" in cond, name
-    for stage0 in STAGE0_RESULTS:
-        for result, skip, _ in HEAVY_TABLE:
-            assert evaluate(cond, result, skip, stage0=stage0) is (stage0 == "success" and evaluate(cond, result, skip)), \
-                (name, stage0, result, skip)
+def _run_is_red(results):
+    """A run's conclusion is failure when any job of it failed (a skipped job is neither)."""
+    return any(r == "failure" for r in results.values())
 
 
-@pytest.mark.parametrize("stage0", ["failure", "cancelled", "skipped"])
-@pytest.mark.parametrize("event,ref", [("push", "refs/heads/seat/x"), ("push", "refs/heads/main")])
-def test_a_stage0_that_did_not_succeed_stops_every_heavy_job(stage0, event, ref):
-    results = simulate(event, ref, "success", "false", stage0_outcome=stage0)
-    suite = [n for n in JOBS if n not in NO_TESTS and n != "stage0"]
-    assert [n for n in suite if results[n] != "skipped"] == [], (stage0, event, ref)
+def test_no_job_waits_on_stage0():
+    # stage0 sat ~332 s median ahead of every heavy job (landing throughput, 11-17): it runs beside them now.
+    assert [n for n in JOBS if "stage0" in _ancestors(n)] == []
+    assert not any("stage0" in (j.get("if") or "") for j in JOBS.values())
+
+
+@pytest.mark.parametrize("event,ref", [("push", "refs/heads/seat/x"), ("push", "refs/heads/land/x"),
+                                       ("push", "refs/heads/main")])
+def test_a_red_stage0_makes_the_run_red_and_the_heavy_jobs_still_run(event, ref):
+    # the heavy jobs are not stopped by stage0, so the run is red only because stage0 is a failed job of it
+    results = simulate(event, ref, "success", "false", stage0_outcome="failure")
+    assert results["stage0"] == "failure" and _run_is_red(results), (event, ref)
+    assert [n for n in _heavy() if results[n] != "success"] == [], (event, ref)
+    assert not _run_is_red(simulate(event, ref, "success", "false")), (event, ref)
+
+
+def test_stage0_cannot_fail_quietly():
+    # continue-on-error on the job or any step would turn a red invariant into a green run
+    job = JOBS["stage0"]
+    assert "continue-on-error" not in job
+    assert [s.get("name") for s in job["steps"] if "continue-on-error" in s] == []
 
 
 def test_the_stage0_checks_can_fail():
-    # Controls: drop the stage0 guard from one job, or its dependency from another, and the checks above must go red.
-    saved = {n: (JOBS[n]["if"], JOBS[n]["needs"]) for n in ("root-py39", "isolation")}
+    # Controls: a stage0 that is hidden behind continue-on-error, and a heavy job that waits on stage0 again, must both be seen.
+    saved = JOBS["isolation"]["needs"]
     try:
-        JOBS["root-py39"]["if"] = HEAVY_IF.replace("needs.stage0.result == 'success' && ", "")
-        assert simulate("push", "refs/heads/seat/x", stage0_outcome="failure")["root-py39"] == "success"
-        assert "needs.stage0.result == 'success'" not in JOBS["root-py39"]["if"]
-        JOBS["isolation"]["needs"] = "gate"
-        assert "isolation" not in _heavy() and "stage0" not in _needs("isolation")
+        JOBS["isolation"]["needs"] = ["gate", "stage0"]
+        assert [n for n in JOBS if "stage0" in _ancestors(n)] == ["isolation"]
+        assert "isolation" not in _heavy()
     finally:
-        for n, (i, nd) in saved.items():
-            JOBS[n]["if"], JOBS[n]["needs"] = i, nd
-
-
-def test_every_job_but_the_gate_the_verified_marker_and_stage0_itself_needs_stage0():
-    # Fail fast means no fan-out: a job added later that names only the gate would start beside stage 0 and not behind it.
-    # `gate` decides, `verified` only prints the verdict the gate found, `stage0` is the front.
-    front = {"gate", "verified", "stage0"}
-    assert [n for n in JOBS if n not in front and "stage0" not in _needs(n)] == []
+        JOBS["isolation"]["needs"] = saved
+    assert not _run_is_red({"stage0": "success", "test": "success"})
+    assert _run_is_red({"stage0": "failure", "test": "success"})
 
 
 def test_the_shard_pytest_runs_under_xdist_and_reports_failures_for_the_rerun():
@@ -366,8 +367,8 @@ def test_no_run_line_expands_a_branch_name_or_an_api_string():
 # ---- CI speed (levain 78 ciB): static shard list, one Python off the landing refs, the check names ----------------
 
 def test_the_pytest_matrix_no_longer_waits_on_the_plan_job():
-    # it waits on the gate and on stage0 and on nothing else: the shard list is static, so no planning job sits in front
-    assert sorted(_needs("test")) == ["gate", "stage0"]
+    # it waits on the gate and on nothing else: the shard list is static, so no planning job sits in front
+    assert sorted(_needs("test")) == ["gate"]
     assert JOBS["plan"]["name"] == "plan test shards"
     assert not any("plan" in _needs(n) for n in JOBS)
 
@@ -500,10 +501,19 @@ def test_the_dead_link_cleanup_check_can_fail():
 
 
 def test_the_stage1_golden_journeys_are_run_by_the_browser_job():
-    """The journeys file has no step of its own: the browser job selects every tests/*.py that names `needs_browser`, and the
-    journeys file does (it imports the mark). This fails if the selector stops being that grep or the file stops naming it."""
+    """The journeys file has no step of its own: the browser job selects every tests/*.py that names `needs_browser` (through
+    `shard.py browser`, which deals them by measured weight), and the journeys file does (it imports the mark). This fails if
+    the selector stops being that or the file stops being in some shard."""
+    import importlib.util
     run = next(st["run"] for st in JOBS["browser"]["steps"] if st.get("name") == "Run the browser tests")
-    assert "grep -l needs_browser tests/*.py" in run
+    assert "tests/ci/shard.py browser --shards ${{ strategy.job-total }}" in run
+    spec = importlib.util.spec_from_file_location("ci_shard_browser", Path(__file__).resolve().parent / "ci" / "shard.py")
+    shard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shard)
+    n = len(JOBS["browser"]["strategy"]["matrix"]["shard"])
+    dealt = [f for k in range(n) for f in shard.browser_shard(n, k)]
+    assert "tests/test_journeys_stage1.py" in dealt
+    assert sorted(dealt) == shard.browser_files()
     journeys = Path(__file__).resolve().parent / "test_journeys_stage1.py"
     assert "needs_browser" in journeys.read_text()
     # a skip fails the job, so the journeys cannot pass by skipping there

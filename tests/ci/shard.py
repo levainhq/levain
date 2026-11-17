@@ -4,6 +4,8 @@
     pytest --collect-only -q > nodes.txt
     python tests/ci/shard.py pick --shards N --shard K < nodes.txt > files.txt
 
+    python tests/ci/shard.py browser --shards N --shard K      (the cockpit browser job's files, by tests/ci/browser_weights.json)
+
 `check-static --workflow FILE` compares the static shard list the workflow's `test` matrix holds (the one line carrying
 the marker `# static shard list`) with what `shards` would write for the workflow's own TEST_SHARDS, and exits non-zero
 on a difference, so the matrix cannot go stale against the planner. (A new test file never needs the list: each shard
@@ -281,6 +283,30 @@ _STATIC_LIST = re.compile(r"^\s*shard:\s*(\[[0-9,\s]*\])\s*# static shard list\s
 _TEST_SHARDS = re.compile(r'^\s*TEST_SHARDS:\s*"?(\d+)"?\s*(?:#.*)?$', re.MULTILINE)
 
 
+BROWSER_WEIGHTS = Path(__file__).resolve().parent / "browser_weights.json"
+
+
+def browser_files(root=ROOT):
+    """The test files the cockpit browser job runs: every top-level tests/*.py that names `needs_browser` (the mark is a
+    skipif, so no `-m` selection can pick them; this is what the job's old `grep -l needs_browser tests/*.py` listed)."""
+    found = []
+    for path in sorted((root / "tests").glob("*.py")):
+        if "needs_browser" in path.read_text(encoding="utf-8", errors="replace"):
+            found.append(path.relative_to(root).as_posix())
+    return found
+
+
+def browser_shard(n, k, root=ROOT, weights_path=BROWSER_WEIGHTS):
+    """Shard k of n of the browser files, balanced by measured seconds (browser_weights.json, same format and the same
+    greedy split as the pytest shards; an unmeasured file costs its test count times per_test)."""
+    files = browser_files(root)
+    assert files, "no test file names needs_browser: refusing to plan"
+    weights = load_weights(weights_path)
+    shards, _ = partition(files, n, lambda f: weight(f, root, weights))
+    check(shards, files)
+    return shards[k]
+
+
 def check_static(workflow_text):
     """Raise ValueError unless the workflow's one static shard list equals the planner's list for its TEST_SHARDS."""
     lists, counts = _STATIC_LIST.findall(workflow_text), _TEST_SHARDS.findall(workflow_text)
@@ -311,6 +337,17 @@ def main(argv, stdin=None, environ=None):
             print(f"shard.py pick: {e}", file=sys.stderr)
             return 1
         print("\n".join(shards[k]))
+        return 0
+    if len(argv) == 6 and argv[1] == "browser" and argv[2] == "--shards" and argv[4] == "--shard":
+        try:
+            n, k = _count(argv[3]), int(argv[5])
+            if not 0 <= k < n:
+                raise ValueError(f"shard {k} is not in 0..{n - 1}")
+            files = browser_shard(n, k)
+        except (AssertionError, ValueError) as e:
+            print(f"shard.py browser: {e}", file=sys.stderr)
+            return 1
+        print("\n".join(files))
         return 0
     if len(argv) == 4 and argv[1] == "check-static" and argv[2] == "--workflow":
         try:

@@ -85,10 +85,10 @@ jobs:
         run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
 
   stage0:
-    # Fail fast (CI move 2): the whole-tree invariant tests (tests/ci/invariant_tests.txt, marker `invariant`) run alone
-    # first, and every heavy job `needs:` this one, so a rule broken by a change in a file the author never opened stops
-    # the run before the fan-out. Only a stage0 that SUCCEEDED lets the others run (a failed, cancelled or skipped
-    # stage0 runs none of them); it skips only where the gate skips everything, a main sha already verified elsewhere.
+    # The whole-tree invariant tests (tests/ci/invariant_tests.txt, marker `invariant`), so a rule broken by a change in a
+    # file the author never opened still turns the run red. It runs BESIDE the heavy jobs, not in front of them (11-17,
+    # landing throughput: it sat ~332 s median ahead of every shard): no job `needs:` it, and a red stage0 is a failed
+    # job of the run, which is a red run. It skips only where the gate skips everything, a main sha already verified elsewhere.
     name: stage 0 (invariant tests)
     needs: gate
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -129,10 +129,10 @@ jobs:
     # would emit for TEST_SHARDS. It keeps its name because the check name is read elsewhere. A new test file needs no list
     # change: each shard job's `pick` fails on a collected file that no shard holds.
     name: plan test shards
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -154,13 +154,12 @@ jobs:
 
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; without always() the
     # implicit success() sees the skipped gate and skips this matrix (a land/** run once went green without
     # the unit suite). A failed, errored or cancelled gate runs the shards too (fail closed); only a gate that
-    # succeeded and said skip skips them. The shard list is static (below), so no planning job sits in front of them;
-    # `stage0` is the one job in front of them, and only a stage0 that SUCCEEDED lets a shard run.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # succeeded and said skip skips them. The shard list is static (below), so no planning job sits in front of them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
@@ -237,6 +236,17 @@ jobs:
           set -e
           test "$rc" -eq 0 || python scripts/ci_flake_rerun.py "$rc" "$RUNNER_TEMP/pytest.log" "$RUNNER_TEMP/flake-rerun" "shard ${{ matrix.shard }} py${{ matrix.python-version }}"
 
+      - name: Keep the collected node ids
+        # The shard-weights refresh (tests/ci/shard.py `weights`) needs the node ids of the CI platform: a macOS collection
+        # holds a different count, so the refresh refuses. One shard keeps them, and one Python (a refresh is one Python).
+        if: always() && matrix.python-version == '3.13' && matrix.shard == 0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pytest-nodes-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/nodes.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Keep the flake rerun record
         # Intent, from the ruling of 11-10: a rerun is recorded in the job summary and in this artifact only, and CI commits
         # nothing; a human or the desk folds the artifact's rows into the ledger.
@@ -279,10 +289,10 @@ jobs:
     # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
@@ -332,10 +342,10 @@ jobs:
     # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
     # skip). It runs the floor test files only.
     name: bwrap floor live (Python 3.12)
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -384,21 +394,23 @@ jobs:
     # `needs_browser`), because the mark is a skipif and not a registered marker, so `-m` cannot pick it.
     # The job fails if that selection is empty, if nothing was collected, or if ANY test skips.
     # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
-    # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
-    # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
+    # over it once the sign-attempt tests joined), so the files are split into shards, and `shard.py browser` balances
+    # them by measured seconds (tests/ci/browser_weights.json; it was a round-robin over three, 960-990 s a shard, which
+    # made this job the slowest of the run, so the matrix holds four): each shard keeps the same rules (selection by
+    # file, nothing collected fails, any skip fails). The shard count is the matrix's own length (strategy.job-total).
     # Python 3.13 everywhere but a workflow_dispatch on a ref that is neither main nor land/**; that runs 3.12 only.
     name: cockpit browser tests (Python ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
 
@@ -441,10 +453,8 @@ jobs:
           echo "Chrome: $CHROME"
           "$CHROME" --version
           node --version
-          all=$(grep -l needs_browser tests/*.py | sort)
-          test -n "$all" || { echo "no test file names needs_browser"; exit 1; }
-          files=$(echo "$all" | awk -v k=${{ matrix.shard }} '(NR-1)%3==k')
-          echo "shard ${{ matrix.shard }} of 3:"
+          files=$(python tests/ci/shard.py browser --shards ${{ strategy.job-total }} --shard ${{ matrix.shard }})
+          echo "shard ${{ matrix.shard }} of ${{ strategy.job-total }}:"
           echo "$files"
           test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
@@ -484,10 +494,10 @@ jobs:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
     # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
     name: setup-isolation e2e (${{ matrix.os }})
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 20
@@ -524,10 +534,10 @@ jobs:
     # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
     # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
     name: chat egress srt (${{ matrix.os }})
-    needs: [gate, stage0]
+    needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
-    if: ${{ always() && !cancelled() && needs.stage0.result == 'success' && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 40
