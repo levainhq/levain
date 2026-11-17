@@ -32,13 +32,15 @@ Stdlib only.
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 
-__all__ = ["Attempt", "BudgetSpent", "JOURNAL_FILE", "Journal", "STATUSES", "idem_key", "night_key"]
+__all__ = ["Attempt", "BudgetSpent", "JOURNAL_FILE", "Journal", "ReadOnlyJournal", "STATUSES", "idem_key", "night_key"]
 
 JOURNAL_FILE = "effect_attempts.db"     # the one name of the journal file inside a store directory
 
@@ -124,6 +126,28 @@ def night_key(stamp: object, cut_hour_utc: int) -> str:
     if not isinstance(stamp, datetime) or stamp.tzinfo is None:
         raise ValueError("a night key needs an aware datetime")
     return (stamp.astimezone(timezone.utc) - timedelta(hours=cut_hour_utc)).date().isoformat()
+
+
+class ReadOnlyJournal:
+    """The attempts file at ``path`` read and nothing else: opened ``mode=ro`` (never created, no schema step, no
+    migration, no write lock, no journal-mode change), so a caller that must not touch a live night journal can read
+    it. Reads through the same column list and row mapping as :class:`Journal`. Nothing is opened until :meth:`rows`,
+    and any fault (a missing or wrong-type file, a corrupt file, a table without a selected column) is raised there."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+
+    def rows(self) -> list[Attempt]:
+        # An idle WAL file (no ``-wal`` and no ``-shm`` beside it: a live writer keeps both) is opened ``mode=ro`` plus ``immutable`` (``immutable`` alone would create a missing file), so
+        # reading it makes no sidecar; one with a sidecar, a night runner's, is read ``mode=ro`` through the existing ones.
+        idle = not any(os.path.lexists(f"{self.path}{s}") for s in ("-wal", "-shm"))
+        conn = sqlite3.connect(f"file:{quote(str(self.path))}?mode=ro{'&immutable=1' if idle else ''}", uri=True,
+                               timeout=5.0)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            return [_attempt(r) for r in conn.execute(f"SELECT {_COLUMNS} FROM effect_attempts ORDER BY attempt_id")]
+        finally:
+            conn.close()
 
 
 class Journal:

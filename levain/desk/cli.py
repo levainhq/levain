@@ -2197,23 +2197,26 @@ def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
 
 
 def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain desk nightclose --token N``: the morning quiescence (:func:`levain.desk.nightclose.nightclose`), run by
+    """``levain coord nightclose --token N``: the morning quiescence (:func:`levain.desk.nightclose.nightclose`), run by
     the day desk under its own lease. The effects half runs only when the store directory already holds the effect
     journal (:data:`levain.desk.effect_attempts.JOURNAL_FILE`): the verb never creates it, so a desk with no night
     writes no empty file and the effects half stays a no-op until the night path makes one."""
-    from levain.desk.effect_attempts import JOURNAL_FILE, Journal
+    from levain.desk.effect_attempts import JOURNAL_FILE, ReadOnlyJournal
     from levain.desk.nightclose import nightclose
 
+    # ABSENT only when the name does not exist at all; anything there (a directory, a dangling symlink, a corrupt file)
+    # is read, and unreadable it refuses before any write. The reader is read-only: it never creates, migrates or locks
     path = Path(store.directory) / JOURNAL_FILE
-    journal = Journal(path) if path.is_file() else None
+    journal = ReadOnlyJournal(path) if os.path.lexists(path) else None
     got = nightclose(store, datetime.now(timezone.utc), token=args.token, journal=journal)
-    effects = (f"effects recorded {len(got.effects)}" + (f" ({', '.join(str(a) for a in got.effects)})" if got.effects else "")
+    handed = list(got.handed)
+    effects =(f"effects recorded {len(got.effects)}" + (f" ({', '.join(str(a) for a in got.effects)})" if got.effects else "")
                if journal is not None else f"no effect journal exists yet ({JOURNAL_FILE} is not in {store.directory}): "
                                            "effects not read")
-    _emit(out, args.json, {"owner": got.owner, "stopped": got.stopped, "handed": list(got.handed),
+    _emit(out, args.json, {"owner": got.owner, "stopped": got.stopped, "handed": handed,
                            "effects": list(got.effects), "seats": list(got.seats), "journal": journal is not None},
           f"nightclose: owner {got.owner}; stop {'written' if got.stopped else 'already covers every launch'}; "
-          f"events handed {len(got.handed)}" + (f" ({', '.join(got.handed)})" if got.handed else "") + f"; {effects}"
+          f"events handed {len(handed)}" + (f" ({', '.join(str(a) for a in handed)})" if handed else "") + f"; {effects}"
           + f"; seats recorded {len(got.seats)}" + (f" ({', '.join(got.seats)})" if got.seats else ""))
     return 0
 

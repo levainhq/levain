@@ -5,12 +5,13 @@ reserve exists yet)."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from levain.cli import main
-from levain.desk.effect_attempts import JOURNAL_FILE, Journal
+from levain.desk.effect_attempts import JOURNAL_FILE, Journal, ReadOnlyJournal
 from levain.desk.nightclose import EFFECT_PREFIX, STOP_PREFIX
 from tests.test_desk_events import Clock, Pinger, pinger, rows, sensor, store, down, qdir  # noqa: F401
 from tests.test_desk_nightclose import latest, morning, night
@@ -81,3 +82,105 @@ def test_no_lease_refuses_clearly_and_writes_nothing(store, tmp_path, qdir, cloc
     assert out != 0 and "lease" in (err.err + err.out)
     assert rows(qdir, "SELECT COUNT(*) FROM event_states UNION ALL SELECT COUNT(*) FROM meta") == before
     assert not (qdir / JOURNAL_FILE).exists()
+
+
+# ---- ND-10f: the journal is read READ-ONLY and refused before any write (L3 round 1) ----------------------------------
+
+def _snapshot(qdir):
+    return {p.name: p.read_bytes() for p in sorted(qdir.iterdir()) if p.is_file() and p.name.startswith(JOURNAL_FILE)}, \
+        sorted(p.name for p in qdir.iterdir())
+
+
+def _refuses_writing_nothing(qdir, capsys, token):
+    before = rows(qdir, "SELECT COUNT(*) FROM event_states UNION ALL SELECT COUNT(*) FROM meta")
+    got = main(["coord", "nightclose", "--token", str(token), "--queue-dir", str(qdir)])
+    err = capsys.readouterr()
+    assert got != 0 and (err.err + err.out).strip(), (got, err)
+    assert rows(qdir, f"SELECT key FROM meta WHERE key GLOB '{STOP_PREFIX}*' OR key GLOB '{EFFECT_PREFIX}*'") == []
+    assert rows(qdir, "SELECT COUNT(*) FROM event_states UNION ALL SELECT COUNT(*) FROM meta") == before
+    return err
+
+
+def _old_schema_journal(path, *, with_recipient=True, with_limits=False):
+    cols = ("attempt_id INTEGER PRIMARY KEY AUTOINCREMENT, idem_key TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, "
+            "order_sha256 TEXT NOT NULL, incarnation INTEGER NOT NULL, verb TEXT NOT NULL, event_id TEXT NOT NULL, "
+            "args_digest TEXT NOT NULL, " + ("recipient TEXT, " if with_recipient else "") +
+            "incident_scope TEXT NOT NULL, night_scope TEXT NOT NULL, status TEXT NOT NULL, reserved_at TEXT NOT NULL, "
+            "settled_at TEXT" + (", per_incident INTEGER, per_night INTEGER" if with_limits else ""))
+    c = sqlite3.connect(path)
+    try:
+        c.execute(f"CREATE TABLE effect_attempts ({cols})")
+        c.commit()
+    finally:
+        c.close()
+
+
+def test_wrong_token_leaves_a_healthy_journal_byte_identical_and_makes_no_sidecar(store, tmp_path, qdir, clock, pinger,
+                                                                                  capsys):
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    reserve(Journal(qdir / JOURNAL_FILE), evs[0])
+    b, token = morning(store, a)
+    before = _snapshot(qdir)
+    _refuses_writing_nothing(qdir, capsys, token + 100)
+    assert _snapshot(qdir) == before                                        # bytes and directory listing (no -wal/-shm)
+
+
+def test_wrong_token_does_not_migrate_an_old_schema_journal(store, tmp_path, qdir, clock, pinger, capsys):
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    _old_schema_journal(qdir / JOURNAL_FILE)                                # no per_incident / per_night columns
+    b, token = morning(store, a)
+    before = _snapshot(qdir)
+    _refuses_writing_nothing(qdir, capsys, token + 100)
+    assert _snapshot(qdir) == before
+    c = sqlite3.connect(qdir / JOURNAL_FILE)
+    try:
+        assert "per_incident" not in {r[1] for r in c.execute("PRAGMA table_info(effect_attempts)")}
+    finally:
+        c.close()
+
+
+def test_right_token_still_records_the_unknown_attempt_of_an_old_schema_journal(store, tmp_path, qdir, clock, pinger,
+                                                                                capsys):
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    _old_schema_journal(qdir / JOURNAL_FILE)
+    c = sqlite3.connect(qdir / JOURNAL_FILE)
+    c.execute("INSERT INTO effect_attempts (idem_key, order_id, order_sha256, incarnation, verb, event_id, args_digest, "
+              "recipient, incident_scope, night_scope, status, reserved_at) VALUES "
+              "('k', 'so-1', 'a', 1, 'restart_service', ?, 'd', NULL, 'i', 'n', 'unknown', 't')", (evs[0],))
+    c.commit()
+    c.close()
+    b, token = morning(store, a)
+    out = run(qdir, capsys, "--token", str(token))
+    assert "effects recorded 1 (1)" in out.out
+
+
+@pytest.mark.parametrize("kind", ["directory", "dangling_symlink"])
+def test_a_wrong_type_object_named_as_the_journal_refuses_before_any_write(store, tmp_path, qdir, clock, pinger, capsys,
+                                                                           kind):
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    if kind == "directory":
+        (qdir / JOURNAL_FILE).mkdir()
+    else:
+        (qdir / JOURNAL_FILE).symlink_to(tmp_path / "nowhere.db")
+    b, token = morning(store, a)
+    _refuses_writing_nothing(qdir, capsys, token)                           # the RIGHT token: refused for the journal
+    assert not (tmp_path / "nowhere.db").exists()
+
+
+def test_a_journal_table_lacking_a_selected_column_refuses_before_any_write(store, tmp_path, qdir, clock, pinger,
+                                                                            capsys):
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    _old_schema_journal(qdir / JOURNAL_FILE, with_recipient=False)
+    b, token = morning(store, a)
+    before = _snapshot(qdir)
+    _refuses_writing_nothing(qdir, capsys, token)
+    assert _snapshot(qdir) == before
+
+
+def test_read_only_journal_reads_what_journal_reads_and_never_creates_a_missing_file(tmp_path):
+    full = Journal(tmp_path / "a.db")
+    reserve(full, "ev-1")
+    assert ReadOnlyJournal(tmp_path / "a.db").rows() == full.rows() != []
+    with pytest.raises(sqlite3.Error):
+        ReadOnlyJournal(tmp_path / "missing.db").rows()
+    assert not (tmp_path / "missing.db").exists() and sorted(p.name for p in tmp_path.glob("missing*")) == []

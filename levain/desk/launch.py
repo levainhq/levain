@@ -537,7 +537,9 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
         "for you with its exact acknowledge line (run it); when nothing waits it says \"no light open needed\".",
         f"- In the morning, after a night with a night desk, run `{lv} coord nightclose --token N {tail}`: it stops the "
         "night's claims and hands its open events (and any started effect) to you, and records every working seat "
-        "(`nightclose_seat:` rows, named in its `seats recorded` line): ADOPT those seats, never stop them.",
+        "(`nightclose_seat:` rows, named in its `seats recorded` line): ADOPT those seats, never stop them. An effect "
+        "the night reserved after the read is recorded only by the next close: run it again until it reports "
+        "`effects recorded 0`.",
         f"- {DAY_PARAGRAPH}",
         f"- When his words say he is leaving: `{lv} coord away DROP_ID --token N {tail}`, then `{lv} coord close "
         f"--plan {tail}` prints the walk checklist (it writes nothing); walk it with him, then write the handoff.",
