@@ -455,7 +455,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -762,7 +762,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -813,7 +813,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -862,7 +862,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -913,7 +913,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -962,7 +962,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }
@@ -1794,7 +1794,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "2 commits on main, last 111111111;",
      "state": "landed_not_closed"
     }
@@ -1849,7 +1849,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "2 commits on main, last 111111111;",
      "state": "landed_not_closed"
     }
@@ -1918,7 +1918,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "",
      "state": "landed_not_closed"
     },

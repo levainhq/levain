@@ -45,7 +45,7 @@
    },
    "expect": {
     "levain#166": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "2 commits on main, last 000000000",
      "state": "landed_not_closed"
     }

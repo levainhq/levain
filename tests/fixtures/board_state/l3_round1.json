@@ -895,7 +895,7 @@
    },
    "expect": {
     "levain#1": {
-     "column": "backlog",
+     "column": "ready",
      "reason_contains": "1 commits on main",
      "state": "landed_not_closed"
     }

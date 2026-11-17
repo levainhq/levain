@@ -164,8 +164,8 @@ def test_the_board_serialises_with_the_schema_word():
     folded = bs.fold(case["items_lines"])
     board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"]), now=NOW)
     d = json.loads(json.dumps(board.to_dict()))
-    assert d["schema"] == "ready-v2" and set(d) == {"schema", "as_of", "items", "audit", "unattributed", "problems"}
-    assert set(d["items"][0]) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of"}
+    assert d["schema"] == "ready-v3" and set(d) == {"schema", "as_of", "items", "audit", "unattributed", "problems"}
+    assert set(d["items"][0]) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"}
 
 
 def _chain_world(n: int, low_waits_on_high: bool):

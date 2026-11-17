@@ -73,10 +73,10 @@ def test_a_clean_board_prints_the_contract_and_exits_zero(world, tmp_path, capsy
     rc, doc, err = board(capsys, world, write_items(tmp_path, item(1), item(2), item(3)), extra_file(tmp_path, seats=seats))
     assert rc == 0 and err == "", (doc["audit"], doc["problems"])
     assert set(doc) == {"schema", "as_of", "items", "audit", "unattributed", "problems", "reader"}
-    assert doc["schema"] == "ready-v2" and doc["audit"] == [] and doc["problems"] == []
+    assert doc["schema"] == "ready-v3" and doc["audit"] == [] and doc["problems"] == []
     assert states(doc) == {"levain#1": "done", "levain#2": "in_flight", "levain#3": "ready"}
     for s in doc["items"]:
-        assert set(s) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of"}
+        assert set(s) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"}
         assert s["state"] in STATES and s["column"] in COLUMNS and s["reason"]
     assert doc["reader"]["repo"] == "levain" and doc["reader"]["main_ref"] == "origin/main"
     assert doc["reader"]["branches"] == 1 and doc["reader"]["main_records"] == 1
@@ -106,6 +106,7 @@ def test_landed_on_main_without_a_closing_trailer_reads_landed_not_closed(world,
     rc, doc, _ = board(capsys, world, write_items(tmp_path, item(4)), extra_file(tmp_path))
     assert states(doc) == {"levain#4": "landed_not_closed"} and rc == 3
     assert [(a["kind"], a["id"]) for a in doc["audit"]] == [("landed_not_closed", "levain#4")]
+    assert [(s["column"], s["kind"]) for s in doc["items"]] == [("ready", "close")]
 
 
 def test_an_item_in_the_chain_reads_landing(world, tmp_path, capsys):

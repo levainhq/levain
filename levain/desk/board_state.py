@@ -1,4 +1,4 @@
-"""levain.desk.board_state — the board stores ITEMS and DERIVES their state (READY_SCHEMA v2).
+"""levain.desk.board_state — the board stores ITEMS and DERIVES their state (READY_SCHEMA v3).
 
 An item is stored (what was asked, in whose words, what closes it, what it waits on, where it came from) and its
 state never is. State is computed on every read by one pure function from evidence the machine already keeps:
@@ -35,11 +35,11 @@ from typing import Any, Callable
 
 __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
-    "FUTURE_SKEW_S", "Folded", "Item", "Link", "MAX_EVIDENCE_AGE_S", "SCHEMA", "STATES", "STATE_COLUMN", "State", "TIERS",
+    "FUTURE_SKEW_S", "Folded", "Item", "Link", "MAX_EVIDENCE_AGE_S", "SCHEMA", "STATES", "STATE_COLUMN", "STATE_KIND", "State", "TIERS",
     "derive_all", "derive_state", "fold", "parse_timestamp",
 ]
 
-SCHEMA = "ready-v2"
+SCHEMA = "ready-v3"
 #: Evidence older than this reads unknown (6 h: judged in the design page, to be set by the land waiter's own fetch
 #: cadence; one named constant so the line moves in one place).
 MAX_EVIDENCE_AGE_S = 21600
@@ -61,15 +61,20 @@ STATE_COLUMN: dict[str, str] = {
     "needs_you": "needs_you",
     "landing": "waiting",
     "in_flight": "running",
-    "landed_not_closed": "backlog",
+    "landed_not_closed": "ready",
     "blocked": "backlog",
     "ready_with_start": "ready",
     "needs_grooming": "backlog",
     "ready": "ready",
     "unknown": "unknown",
 }
+#: The kind of work a ``ready`` column state is, and ``None`` for every other state: a ``landed_not_closed`` item is ready
+#: CLOSE work (Phill np-2f5f3a6c), a ``ready_with_start`` item has a branch to start from, a plain ``ready`` item is new work.
+STATE_KIND: dict[str, str | None] = {s: None for s in STATE_COLUMN}
+STATE_KIND.update(landed_not_closed="close", ready_with_start="start", ready="work")
 STATES = tuple(STATE_COLUMN)
-COLUMNS = tuple(dict.fromkeys(STATE_COLUMN.values()))
+#: The columns in board order (the order readers draw them); a test holds this set to the values of :data:`STATE_COLUMN`.
+COLUMNS = ("off", "done", "needs_you", "waiting", "running", "backlog", "ready", "unknown")
 AUDIT_KINDS = ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer")
 _DECISION_STATE = {"cut": "cut", "parked": "parked", "out-of-1.0": "out_of_1_0"}
 
@@ -645,10 +650,12 @@ class State:
     reason: str
     refs: tuple[str, ...]
     as_of: str | None
+    kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "repo": self.repo, "title": self.title, "tier": self.tier, "state": self.state,
-                "column": self.column, "reason": self.reason, "refs": list(self.refs), "as_of": self.as_of}
+                "column": self.column, "reason": self.reason, "refs": list(self.refs), "as_of": self.as_of,
+                "kind": self.kind}
 
 
 @dataclass(frozen=True)
@@ -705,7 +712,7 @@ class _Ctx:
 
     def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
         return State(item.id, item.repo, item.title, item.tier if item.tier in TIERS else None, state,
-                     STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at)
+                     STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at, STATE_KIND[state])
 
     def state_of(self, iid: str) -> State:
         if iid not in self.memo:

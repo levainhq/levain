@@ -71,3 +71,18 @@ def test_every_emitted_state_and_column_comes_from_the_declared_set():
 def test_v1_stays_untouched_beside_v2():
     v1 = json.loads(V1.read_text(encoding="utf-8"))
     assert v1["schema"] == 1 and v1["cases"]
+
+
+def test_kind_is_close_start_work_for_the_ready_states_and_none_for_the_rest():
+    assert V2["kinds"] == {k: v for k, v in bs.STATE_KIND.items() if v is not None}
+    assert V2["kinds"] == {"landed_not_closed": "close", "ready_with_start": "start", "ready": "work"}
+    assert set(bs.STATE_KIND) == set(bs.STATES)
+    assert bs.STATE_COLUMN["landed_not_closed"] == "ready"
+    assert "| `landed_not_closed` | `ready` |" in DOC
+
+
+def test_a_state_serialises_its_kind():
+    case = next(c for c in load_cases() if c["expect"])
+    _folded, board = run_case(bs, case)
+    for s in board.items:
+        assert s.to_dict()["kind"] == bs.STATE_KIND[s.state]
