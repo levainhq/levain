@@ -12,8 +12,8 @@ may carry effects and needs the facts: a missing or misspelt key, ``None``, a tu
 order that is not a mapping (a bare list of lines, an unparsed string, ``None`` from a failed lookup), or a mapping
 that raises when read.
 
-Not here: wiring this into the effect verb's execution check (the NIGHT_ARMING_CLEARED read, levain#20, after
-levain#12), which must also resolve each np id to a band row of the right kind. Nothing in this module reads a store, a
+Not here: resolving each np id to a band row of the right kind. The effect verb's execution check reads the facts
+from ``levain.desk.effects.NIGHT_ARMING_FACTS`` (levain#20). Nothing in this module reads a store, a
 clock or the environment.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
-__all__ = ["CLOSED_FACTS", "FACTS", "arming_refusal"]
+__all__ = ["CLOSED_FACTS", "FACTS", "arming_refusal", "missing_facts"]
 
 # the three facts, in the order he does them, each with what it records; the gate reads only this tuple
 _FACT_WORDS: tuple[tuple[str, str], ...] = (
@@ -61,6 +61,11 @@ def _np_id(facts: Any, key: str) -> str | None:
     except Exception:
         return None
     return value if type(value) is str and _NP_ID.fullmatch(value) else None
+
+
+def missing_facts(facts: Any = None) -> tuple[str, ...]:
+    """The fact keys (in :data:`FACTS` order) that ``facts`` does not carry as an np id; every key for a non-mapping."""
+    return tuple(key for key, _ in _FACT_WORDS if _np_id(facts, key) is None)
 
 
 def arming_refusal(order: Any, facts: Any = None) -> str | None:

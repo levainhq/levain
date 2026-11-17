@@ -45,7 +45,7 @@ call (no order in force, no covering line, a spent budget, a sender on no line) 
 row with an open ping when an :class:`Effects` is given one and the event the call names is found and passes the
 verb's own event checks (a made-up or stale event id writes nothing); nothing runs and the refusal is unchanged.
 
-NOT HERE (the next rows): the arm record (O1) and ``NIGHT_ARMING_CLEARED`` (ND-11); the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
+NOT HERE (the next rows): the arm record (O1); the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
 the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8). Until
 those land the executors are injected: an :class:`Effects` with no runner, transport, event lookup, raw source or
 drafter refuses with :data:`R_NOT_WIRED`. This module imports no mail library and holds no credential.
@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import itertools
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -67,13 +68,13 @@ from typing import Any, Protocol
 
 from levain.authority import _SO_VERBS, STANDING_ORDER_VOICES, _require_aware
 from levain.cockpit.consent import parse_stamp, utc_stamp
-from levain.desk import standing_orders
+from levain.desk import arming_gate, standing_orders
 from levain.desk.effect_attempts import BudgetSpent, Journal, idem_key, night_key
 from levain.desk.events import Event
 from levain.desk.would_have_acted import WouldHaveActed
 
 __all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS", "DISCLOSURES",
-           "Draft", "EVENT_FUTURE_SKEW", "EVENT_MAX_AGE", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_CUT_HOUR_UTC", "NIGHT_SSH", "REFUSALS",
+           "Draft", "EVENT_FUTURE_SKEW", "EVENT_MAX_AGE", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_ARMING_FACTS", "NIGHT_CUT_HOUR_UTC", "NIGHT_SSH", "REFUSALS",
            "SERVICES", "VOICES", "ack_text_refusal", "diagnosis_argv", "inbound_from", "refusal_text", "restart_argv",
            "subprocess_runner"]
 
@@ -133,6 +134,22 @@ R_ARGS = "an argument is not one of the verb's allowed values, or one is missing
 R_ORDER = "no standing order in force covers this: nothing was done"
 R_LINE = "the order has no effect line whose allowed values cover this call: nothing was done"
 R_VERSION = "the order in force is not the version asked for: nothing was done"
+#: the arming gate's facts (ND-11, board levain#20; ND_BUILD_PLAN O12): the np ids of his ND-7 ruling, ND-8 done and ND-9
+#: read, by the keys of :data:`levain.desk.arming_gate.FACTS`. Closed as shipped. It is a source constant on purpose: no
+#: argument, environment variable, file, store row or verb sets it, so the only way to open it is a reviewed commit that
+#: writes the three np ids here. :meth:`Effects.gate` reads it by name at every call.
+NIGHT_ARMING_FACTS: Mapping[str, str] = arming_gate.CLOSED_FACTS
+_FACT_NAMES = {"nd7_ruled": "the ND-7 ruling", "nd8_done": "ND-8 done", "nd9_read": "the ND-9 read"}
+
+
+def _armed_sentence(open_keys: tuple[str, ...]) -> str:
+    return ("the night is not armed for effect lines; still open: " + ", ".join(_FACT_NAMES[k] for k in open_keys)
+            + ": nothing was done")
+
+
+#: one fixed sentence per set of open items (a refusal never carries computed text); the keys are tuples in gate order
+R_ARMING = {keys: _armed_sentence(keys) for n in (1, 2, 3) for keys in itertools.combinations(_FACT_NAMES, n)}
+R_ARMING_TWIN = "the night is not armed for effect lines; one np id is given for more than one item: nothing was done"
 R_NOT_WIRED = "this effect is not wired in this process: nothing was done"
 R_EVENT = "the event is not an authenticated mail from a known sender with its message: nothing was done"
 R_FROM = "the message's sender cannot be derived, is not on the order's list, or the message is an auto-reply, a list " \
@@ -157,7 +174,7 @@ R_TEXT_DOTTED = "the draft holds a dotted name (a link or address)"
 R_TEXT_WORD = "the draft holds a date, time, price, commitment, attachment or link word"
 R_TEXT_PHRASE = "the draft holds a commitment phrase"
 #: every sentence this module refuses with, and the only text a refusal may carry out (:func:`refusal_text`)
-REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_VOICE, R_DISCLOSURE, R_FAILED,
+REFUSALS = frozenset({*R_ARMING.values(), R_ARMING_TWIN, R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_VOICE, R_DISCLOSURE, R_FAILED,
                       R_UNKNOWN, R_BUDGET_INCIDENT, R_BUDGET_NIGHT, R_EVENT_AGE, R_SENDER,
                       R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_LINES, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
                       R_TEXT_WORD, R_TEXT_PHRASE})
@@ -516,6 +533,10 @@ class Effects:
             if type(expect_sha256) is not str or not hmac.compare_digest(standing_orders.order_sha256(order),
                                                                          expect_sha256):
                 raise _OwnRefusal(R_VERSION)
+            if arming_gate.arming_refusal(order, NIGHT_ARMING_FACTS) is not None:
+                # the order is in force and is the version asked for, but the night is not armed for its effect lines
+                open_keys = arming_gate.missing_facts(NIGHT_ARMING_FACTS)
+                raise _OwnRefusal(R_ARMING.get(open_keys, R_ARMING_TWIN))
             lines = [ln for ln in order["effect_lines"] if ln["verb"] == verb]
         except Exception as exc:                            # noqa: BLE001 - any fault reading the log is "no order"
             if _trusted(exc):                               # ours; a clock's EffectRefused, any reason, is a fault

@@ -13,6 +13,8 @@ sys.path.insert(0, worktree)
 from pathlib import Path  # noqa: E402
 
 from levain.desk import effects as fx  # noqa: E402
+
+fx.NIGHT_ARMING_FACTS = {"nd7_ruled": "np-00000007", "nd8_done": "np-00000008", "nd9_read": "np-00000009"}  # this child tests the crash, not the gate
 from levain.desk.effect_attempts import Journal  # noqa: E402
 from tests import test_effect_verbs as tv  # noqa: E402
 

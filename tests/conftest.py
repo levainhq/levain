@@ -474,3 +474,16 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.nodeid.split("[", 1)[0] in ids:
             item.add_marker(pytest.mark.invariant)
+
+
+@pytest.fixture(autouse=True)
+def _night_armed_for_the_verb_tests(monkeypatch):
+    """The effect verbs' arming gate (levain#20) is closed as shipped. The tests of the verbs themselves run with it
+    OPEN so they reach what they test; tests/test_night_arming_gate.py sets it closed, or reads the shipped value in a
+    fresh interpreter, for the gate's own tests."""
+    try:
+        import levain.desk.effects as _fx
+    except ImportError:
+        return
+    monkeypatch.setattr(_fx, "NIGHT_ARMING_FACTS",
+                        {"nd7_ruled": "np-00000007", "nd8_done": "np-00000008", "nd9_read": "np-00000009"})
