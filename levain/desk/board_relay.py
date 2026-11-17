@@ -128,6 +128,13 @@ class NativeBandSource:
         except Exception as exc:                            # noqa: BLE001 - any read failure is a refusal, never a crash
             raise BandRefusal(f"the band store could not be read ({type(exc).__name__})") from None
         if q is None:
+            path = getattr(self._store, "path", None)
+            try:
+                missing = path is not None and (not path.exists() or path.stat().st_size == 0)
+            except OSError:
+                missing = False
+            if missing:
+                raise BandRefusal(f"no band store at {getattr(self._store, 'directory', path)}")
             raise BandRefusal(f"{np_id} is not a row this band holds")
         if q.answer is None:
             raise BandRefusal(f"{np_id} is unanswered")
@@ -177,13 +184,19 @@ def _row_of(source: BandSource, np_id: str) -> BandRow:
     return row
 
 
-def relay_source(np_id: str, words: str, source: BandSource) -> dict:
-    """The WRITE side: read the row now, and refuse unless it is answered and ``words`` is a verbatim, non-blank substring
-    of the answer. Returns the record's ``source`` object. Raises BoardError."""
+def check_source_id(np_id: str) -> None:
+    """The one validator of a ``--source`` id: a native q-<24 hex> passes; anything else, an np- id included, is refused.
+    Called by :func:`relay_source` and by the store's ``add`` BEFORE an idempotent key hit can return. Raises BoardError."""
     if not isinstance(np_id, str) or not (NP_RE.fullmatch(np_id) or Q_RE.fullmatch(np_id)):
         raise BoardError(f"--source {np_id!r} is not a native q-<24 hex> question id")
     if NP_RE.fullmatch(np_id):                              # no production source reads one yet: refuse up front, never advertise it
         raise BoardError(f"--source {np_id}: {NP_UNREADABLE}")
+
+
+def relay_source(np_id: str, words: str, source: BandSource) -> dict:
+    """The WRITE side: read the row now, and refuse unless it is answered and ``words`` is a verbatim, non-blank substring
+    of the answer. Returns the record's ``source`` object. Raises BoardError."""
+    check_source_id(np_id)
     if not isinstance(words, str) or not words.strip():
         raise BoardError("a relayed record must carry the words it relays: they must be a verbatim excerpt of the answer")
     if re.search(r"[\x00-\x1f\x7f\x85\u2028\u2029]", words):    # the one-line rule decide already holds (board_store._one_line), on every verb
