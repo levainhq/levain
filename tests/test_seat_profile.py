@@ -305,6 +305,41 @@ def test_a_read_budget_install_error_refuses_naming_it(rig, monkeypatch, exc):
         build(rig)
 
 
+def _allow_write_overlaps(profile_settings: dict, budget_dir: Path) -> list[str]:
+    """Every sandbox ``allowWrite`` entry that overlaps the read budget directory, in EITHER direction: the budget dir
+    inside the entry (an entry that covers it) or the entry inside the budget dir (a child of it). ``hg.is_within`` is
+    one-directional and resolves symlinks, so both calls are needed."""
+    return [e for e in profile_settings["sandbox"]["filesystem"]["allowWrite"]
+            if hg.is_within(budget_dir, e) or hg.is_within(e, budget_dir)]
+
+
+@pytest.mark.parametrize("own_home", [False, True])
+def test_no_allow_write_entry_overlaps_the_read_budget_directory(rig, tmp_path, own_home):
+    """Desk ruling (L2 wire2): the seat's Bash must not be able to write the hook script or the ledger an unsandboxed
+    hook execs and reads. For the profile ``build_seat_profile`` produces, no ``allowWrite`` entry covers the budget
+    directory and none lies inside it."""
+    if own_home:
+        home = Path(os.path.realpath(tmp_path)) / "levain-home"
+        p = build(rig, levain_home=home)
+    else:
+        home = Path(os.environ["TMPDIR"]) / sp.CANARY_DIRNAME / "levain-home"
+        p = build(rig)
+    budget_dir = Path(os.path.realpath(home)) / "read_budget"
+    assert budget_dir.is_dir() and Path(p.env["LEVAIN_READ_BUDGET_DIR"]).parent == budget_dir
+    assert p.settings["sandbox"]["filesystem"]["allowWrite"]                  # not vacuous
+    assert _allow_write_overlaps(p.settings, budget_dir) == []
+
+
+def test_the_overlap_check_flags_a_covering_or_child_allow_write_entry(rig):
+    """The check above can fail: a profile whose ``allowWrite`` names the budget dir, its parent, or a child of it."""
+    p = build(rig)
+    budget_dir = Path(p.env["LEVAIN_READ_BUDGET_DIR"]).parent
+    for bad in (budget_dir, budget_dir.parent, budget_dir / "state"):
+        fake = json.loads(json.dumps(p.settings))
+        fake["sandbox"]["filesystem"]["allowWrite"].append(str(bad))
+        assert _allow_write_overlaps(fake, budget_dir) == [str(bad)], bad
+
+
 def test_a_dry_run_builds_the_same_hooks_and_env_and_writes_nothing(rig):
     base, _, _ = rig
     home = Path(os.environ["TMPDIR"]) / sp.CANARY_DIRNAME / "levain-home"

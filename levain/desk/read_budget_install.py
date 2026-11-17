@@ -31,19 +31,64 @@ def _source() -> bytes:
     return Path(read_budget.__file__).read_bytes()
 
 
-def planned(home: str | os.PathLike[str]) -> tuple[str, str]:
-    """``(script, state_dir)`` exactly as :func:`install` would name them, WITHOUT writing anything (a dry run mints nothing)."""
+def _paths(home: str | os.PathLike[str]) -> tuple[Path, Path]:
     base = Path(os.path.abspath(home)) / SUBDIR
-    return str(base / f"read_budget-{hashlib.sha256(_source()).hexdigest()[:16]}.py"), str(base / "state")
+    return base, base / "state"
+
+
+def _nearest_existing(p: Path) -> Path:
+    while not os.path.lexists(p) and p != p.parent:
+        p = p.parent
+    return p
+
+
+def _prewrite_check(base: Path, state: Path) -> None:
+    """The refusals :func:`install` makes BEFORE it writes, read-only, so :func:`planned` (the dry run) refuses
+    exactly where the real install would (L1 wire2 F2): an existing ``read_budget`` or ``state`` that is a symlink
+    (or not a directory), and a missing one whose nearest existing ancestor this process cannot write and enter."""
+    for d in (base, state):
+        if os.path.lexists(d):
+            if d.is_symlink():
+                raise OSError(f"{d} is a symlink; the read budget needs a plain directory")
+            if not d.is_dir():
+                raise NotADirectoryError(f"{d} is not a directory; the read budget needs a plain directory")
+            continue
+        anc = _nearest_existing(d)
+        if not os.access(anc, os.W_OK | os.X_OK):
+            raise PermissionError(f"{anc} is not writable; the read budget cannot make {d}")
+
+
+def _make_dirs(d: Path) -> None:
+    """``d`` and every missing parent, EACH made 0700 (``mkdir(parents=True)`` leaves the parents at the umask's mode)."""
+    missing: list[Path] = []
+    p = d
+    while not os.path.lexists(p) and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    for m in reversed(missing):
+        try:
+            m.mkdir(mode=0o700)
+        except FileExistsError:
+            continue            # made meanwhile: the symlink check below still judges the budget's own directories
+        os.chmod(m, 0o700)      # a umask can only narrow the mode; this pins it exactly
+
+
+def planned(home: str | os.PathLike[str]) -> tuple[str, str]:
+    """``(script, state_dir)`` exactly as :func:`install` would name them, WITHOUT writing anything (a dry run mints
+    nothing), after the same pre-write refusals :func:`install` makes (:func:`_prewrite_check`)."""
+    base, state = _paths(home)
+    _prewrite_check(base, state)
+    return str(base / f"read_budget-{hashlib.sha256(_source()).hexdigest()[:16]}.py"), str(state)
 
 
 def install(home: str | os.PathLike[str]) -> tuple[str, str]:
     """``(script, state_dir)``, absolute: the script written to ``<home>/read_budget/read_budget-<sha[:16]>.py`` (0600,
-    replaced whole when missing, holding other bytes, or not mode 0600) and the state directory made (0700). OSError is the caller's."""
-    base = Path(os.path.abspath(home)) / SUBDIR
-    state = base / "state"
+    replaced whole when missing, holding other bytes, or not mode 0600) and the state directory made (0700, as is every
+    directory it has to create on the way). OSError is the caller's."""
+    base, state = _paths(home)
+    _prewrite_check(base, state)
     for d in (base, state):
-        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _make_dirs(d)
         if d.is_symlink():
             raise OSError(f"{d} is a symlink; the read budget needs a plain directory")
         os.chmod(d, 0o700)    # a directory that was already there keeps its old mode otherwise

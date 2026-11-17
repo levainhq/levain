@@ -1502,6 +1502,58 @@ def test_install_refuses_a_symlinked_budget_directory_and_leaves_the_target_alon
     assert (target.stat().st_mode & 0o777) == 0o755
 
 
+@pytest.mark.parametrize("which", ["read_budget", "state"])
+def test_planned_refuses_a_symlinked_budget_directory_with_installs_message(tmp_path, which):
+    """L1 wire2 F2: the dry run makes install()'s pre-write refusals. Revert: ``planned`` not calling
+    ``_prewrite_check`` (a ``--dry-run`` then passes where the real launch refuses)."""
+    from levain.desk import read_budget_install
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    home = tmp_path / "home"
+    link = home / "read_budget" / "state" if which == "state" else home / "read_budget"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    with pytest.raises(OSError) as dry:
+        read_budget_install.planned(home)
+    with pytest.raises(OSError) as real:
+        read_budget_install.install(home)
+    assert "symlink" in str(dry.value) and str(dry.value) == str(real.value) and type(dry.value) is type(real.value)
+    assert not list(target.iterdir())
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory modes")
+def test_planned_refuses_an_unwritable_home_as_install_does(tmp_path):
+    """L1 wire2 F2: a home this process cannot write refuses the dry run too, with install()'s message."""
+    from levain.desk import read_budget_install
+    home = tmp_path / "home"
+    home.mkdir()
+    os.chmod(home, 0o500)
+    try:
+        with pytest.raises(PermissionError, match="not writable") as dry:
+            read_budget_install.planned(home)
+        with pytest.raises(PermissionError) as real:
+            read_budget_install.install(home)
+        assert str(dry.value) == str(real.value)
+        assert not (home / "read_budget").exists()
+    finally:
+        os.chmod(home, 0o700)
+
+
+def test_install_makes_every_missing_directory_0700_whatever_the_umask(tmp_path):
+    """L1 wire2 F3: ``mkdir(parents=True)`` left the parents at the umask's mode. Revert: install's ``parents=True``."""
+    from levain.desk import read_budget_install
+    home = tmp_path / "a" / "b" / "home"
+    old = os.umask(0o022)
+    try:
+        script, state = read_budget_install.install(home)
+    finally:
+        os.umask(old)
+    made = [tmp_path / "a", tmp_path / "a" / "b", home, home / "read_budget", home / "read_budget" / "state"]
+    assert Path(state) == made[-1]
+    assert {str(d): oct(d.stat().st_mode & 0o777) for d in made} == {str(d): "0o700" for d in made}
+    assert (Path(script).stat().st_mode & 0o777) == 0o600
+
+
 def test_budgeted_launch_strips_a_stale_parent_budget_env_then_sets_its_own(qdir, workdir, fake, live_hook, monkeypatch):
     monkeypatch.setenv("LEVAIN_READ_BUDGET_CALL", "5")
     s = CoordStore(qdir)

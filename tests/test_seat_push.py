@@ -348,6 +348,42 @@ def test_a_canary_profile_never_takes_a_grant(eg):
                            canary_root=Path("/nonexistent"), egress=grant)
 
 
+def _budget_commands(profile, python: str) -> dict[str, set[str]]:
+    """Per event, the exact hook commands ``read_budget.settings_hooks(<python>, <planned script>)`` builds for this
+    profile's read budget home (named by the profile's ``LEVAIN_READ_BUDGET_DIR``: ``<home>/read_budget/state``)."""
+    from levain.desk import read_budget, read_budget_install
+    home = Path(profile.env[read_budget.STATE_ENV]).parent.parent
+    script, _state = read_budget_install.planned(home)
+    return {ev: {h["command"] for g in groups for h in g["hooks"]}
+            for ev, groups in read_budget.settings_hooks(python, script).items()}
+
+
+_HOOK_EVENTS = ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest")
+
+
+def _checked_commands(hooks: dict, budget: dict[str, set[str]]) -> list[str]:
+    """Every hook command the user-site test checks: all of them but the read budget's own, skipped by EXACT match."""
+    return [h["command"] for event in _HOOK_EVENTS for g in hooks.get(event, ()) for h in g["hooks"]
+            if h["command"] not in budget.get(event, ())]
+
+
+def test_the_budget_skip_is_an_exact_match_not_a_substring(eg):
+    """L1 wire2 F4. Revert: the user-site test skipping any command that merely CONTAINS ``read_budget-``."""
+    eg.rig.sign_lease()
+    eg.sign()
+    plan = eg.rig.launch("lane-a")
+    budget = _budget_commands(plan.profile, sys.executable)
+    assert set(budget) == {"PreToolUse", "PostToolUse"} and all(len(c) == 1 for c in budget.values())
+    hooks = plan.profile.settings["hooks"]
+    every = [h["command"] for ev in _HOOK_EVENTS for g in hooks.get(ev, ()) for h in g["hooks"]]
+    checked = _checked_commands(hooks, budget)
+    assert len(every) - len(checked) == 2 and not set().union(*budget.values()) & set(checked)   # exactly the two skipped
+    decoy = f"{shlex.quote(sys.executable)} -m evil read_budget-x"
+    with_decoy = {**hooks, "PreToolUse": [*hooks["PreToolUse"],
+                                          {"matcher": "", "hooks": [{"type": "command", "command": decoy}]}]}
+    assert decoy in _checked_commands(with_decoy, budget)          # a substring is NOT a match: it stays checked
+
+
 def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
     """Reproduced 11-07: a levain installed with ``pip install --user`` was invisible to the seat hooks, because ``-I``
     also turns the user site off, and the seat's Stop push, its tool-call records and its observe hook then failed with
@@ -358,9 +394,8 @@ def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
     eg.sign()
     plan = eg.rig.launch("lane-a")
     hooks = plan.profile.settings["hooks"]
-    cmds = [h["command"] for event in ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PostToolUseFailure",
-                                       "PermissionRequest") for g in hooks[event] for h in g["hooks"]
-            if "read_budget-" not in h["command"]]    # the read budget's `/bin/sh -c` hook is not a `-m` Python hook
+    # the read budget's `/bin/sh -c` hook is not a `-m` Python hook: skipped by EXACT match only (L1 wire2 F4)
+    cmds = _checked_commands(hooks, _budget_commands(plan.profile, sys.executable))
     assert len(cmds) == 6
     base = getattr(sys, "_base_executable", sys.executable)
     ub = tmp_path / "userbase"

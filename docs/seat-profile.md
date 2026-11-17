@@ -125,8 +125,9 @@ The canary and `levain seat launch --dry-run` pass no commit, so they exempt not
 Every tool call is recorded to the launcher key directory by `levain.seat_record` (`PreToolUse`, `PostToolUse` and
 `PostToolUseFailure` hooks), and permission requests are observed. With a seat-egress grant, a `Stop` and a `SessionEnd`
 hook run the push described under seat egress. Every seat also carries the read budget (row 800): a `PreToolUse` and a
-`PostToolUse` hook on `Read`, appended after the recording hooks, with `LEVAIN_READ_BUDGET_DIR` in the seat's environment
-(the one variable outside the env allowlist above).
+`PostToolUse` hook on `Read`, appended after the recording hooks, with `LEVAIN_READ_BUDGET_DIR` in the seat's environment.
+That variable and `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` are the two the profile adds after the environment allowlist
+(listed under seat egress below); neither is a credential.
 
 ### Where it stops
 
@@ -235,7 +236,8 @@ run before it is used. If P10 does not pass, Glob and Grep are dropped from the 
 ## Seat egress: `levain seat egress`
 
 A seat has no push tool, and the profile passes it only a short list of environment variables (`PATH`, `HOME`, `USER`,
-`LOGNAME`, `SHELL`, `LANG`, `TERM`, `TMPDIR` and `LC_*`), so no credential is handed to it. A seat-egress grant lets Levain itself push a seat's
+`LOGNAME`, `SHELL`, `LANG`, `TERM`, `TMPDIR` and `LC_*`), plus two it sets itself (`CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS`
+and the read budget's `LEVAIN_READ_BUDGET_DIR`, a path), so no credential is handed to it. A seat-egress grant lets Levain itself push a seat's
 commits, and only to the branch `seat/<lane key>` of one remote. It cannot name another branch, so a seat has no
 path to your main branch through it.
 

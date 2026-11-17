@@ -5548,8 +5548,9 @@ def _check_cc_sandbox(install: Path) -> list[CheckResult]:
 def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = None,
                         managed: Any = None) -> list[CheckResult]:
     """The ``seat profile`` row: the terminal seat profile builds for a throwaway canary root with the claude binary and
-    interpreter found here, and names its tool set. Builds only; nothing is launched. No claude binary is a fact said
-    in words, a refusal is a failure."""
+    interpreter found here, and names its tool set. Builds only; nothing is launched, and it builds DRY (the read
+    budget's paths are named and pre-checked, never written: L1 wire2 F3). No claude binary is a fact said in words, a
+    refusal is a failure."""
     import tempfile
 
     from levain import seat_profile as sp
@@ -5565,7 +5566,8 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
         (base / "ret").mkdir()
         (base / "keys").mkdir()
         prof = sp.build_seat_profile(base / "lane", base / "ret", claude_bin=claude, python=python or sys.executable,
-                                     lease=None, key_dir=base / "keys", canary_root=base, managed=managed)
+                                     lease=None, key_dir=base / "keys", canary_root=base, managed=managed,
+                                     dry_run=True)
         return [CheckResult("seat profile", True, f"builds (tools {','.join(prof.tools)}; digest {prof.digest()[:12]})")]
     except sp.SeatRefusal as exc:
         return [CheckResult("seat profile", False, f"refused: {exc}"[:400],

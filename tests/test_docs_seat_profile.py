@@ -288,7 +288,27 @@ def test_the_github_door_the_page_describes_is_the_codes():
     assert f"push/{seat_gh.LOG_NAME}" in TEXT
 
 
-def test_the_one_env_variable_outside_the_allowlist_is_named():
-    """Row 800: ``LEVAIN_READ_BUDGET_DIR`` is added to the profile's env after ``host_env``, not allowlisted."""
+_ENV_ADDED = ("LEVAIN_READ_BUDGET_DIR", "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS")
+
+
+def _paragraph(anchor: str) -> str:
+    """The one blank-line-delimited paragraph of the page holding ``anchor``."""
+    hits = [p for p in TEXT.split("\n\n") if anchor in p]
+    assert len(hits) == 1, (anchor, len(hits))
+    return hits[0]
+
+
+def test_the_variables_added_after_the_allowlist_are_both_named():
+    """Row 800 + L1 wire2 F1: the profile adds TWO variables after ``host_env`` (the read budget's and the git
+    instructions switch), and the allowlist is described BELOW the hooks paragraph, at seat egress. The hooks paragraph
+    must name both and point down; the allowlist sentence must state the exception, naming both."""
     from levain import host_guard
-    assert "LEVAIN_READ_BUDGET_DIR" in TEXT and "LEVAIN_READ_BUDGET_DIR" not in host_guard._ENV_ALLOW
+    for name in _ENV_ADDED:
+        assert name not in host_guard._ENV_ALLOW and not name.startswith(host_guard._ENV_ALLOW_PREFIXES)
+    hooks = _paragraph("Every seat also carries the read budget")
+    assert all(f"`{n}`" in hooks for n in _ENV_ADDED), hooks
+    assert "the one variable" not in hooks and "allowlist above" not in hooks and "below" in hooks
+    allow = _paragraph("only a short list of environment variables")
+    assert all(f"`{n}`" in allow for n in _ENV_ADDED), allow
+    assert all(f"`{n}`" in allow for n in sorted(host_guard._ENV_ALLOW)), allow
+
