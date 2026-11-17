@@ -178,7 +178,7 @@ def test_a_whole_ceremony_folds_through_every_mode():
     r = f.repos["x"]
     assert (r.mode, r.attention, r.migration, r.owner, r.charter_blob, r.charter_before) == ("tracked", "paused", "m1", "desk 3", "b1", "none")
     assert r.retire == ({"repo": "x", "path": "next.md"},) and r.since == "2026-11-17T10:00:03Z" and not f.torn and not f.problems
-    f = rf.fold_repos([rec("register", n=1), rec("begin-track", n=2), rec("abandon-track", n=3), rec("abandon-done", n=4)], store_id=SID)
+    f = rf.fold_repos([rec("register", n=1), rec("begin-track", n=2), rec("abandon-track", n=3), rec("abandon-done", n=4, migration="m1")], store_id=SID)
     assert f.repos["x"].mode == "untracked"
     f = rf.fold_repos(lines + [rec("untrack", n=5)], store_id=SID)
     assert f.repos["x"].mode == "untracked"
@@ -632,15 +632,6 @@ def test_abandon_done_needs_every_item_cut_and_the_charter_compensation(store, t
     assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].mode == "untracked"
 
 
-def test_abandon_done_checks_nothing_when_the_repo_had_a_charter_before(store, tmp_path, mkrepo, capsys):
-    a = mkrepo("alpha")
-    land(a, "CHARTER.md", "# kept\n")
-    m, ids = abandon_ready(capsys, tmp_path, store, a)
-    ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
-    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan="- alpha#1"))         # his edit stays
-    assert ok(capsys, "abandon-done", "alpha", *A) == "untracked alpha"
-
-
 # --------------------------------------------------------------------------------------------------------------------
 # untrack
 
@@ -794,19 +785,6 @@ def test_a_torn_tail_with_no_newline_is_unreadable_and_ack_terminates_it_first(s
     raw = (store / "repos.jsonl").read_bytes()
     assert raw.endswith(b"\n") and b'{"v":1,"op":"paus\n{' in raw
     assert run(capsys, "repos")[0] == 0
-
-
-def test_ack_torn_works_on_the_items_file_too(store, tmp_path, mkrepo, capsys):
-    a = mkrepo("alpha")
-    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
-    with open(store / "items.jsonl", "a") as fh:
-        fh.write("garbage\n")
-    rc, _, err = run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "1", "--why", "w", *A)
-    assert rc == 2 and "clean record" in err
-    assert ok(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "test", *A) == "acknowledged items.jsonl line 2"
-    last = json.loads((store / "items.jsonl").read_text().splitlines()[-1])
-    assert last["op"] == "ack-torn" and last["line"] == 2 and last["sha256"] == hashlib.sha256(b"garbage").hexdigest()
-    assert ok(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "test", *A).endswith("already acknowledged")
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1197,3 +1175,211 @@ def test_n10_a_retire_path_must_be_relative_to_its_repo(store, tmp_path, mkrepo,
         rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, retire=[{"repo": "alpha", "path": bad}])),
                          "--words", "y", *A)
         assert rc == 2 and "relative to its repo's root" in err, bad
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# round 2 fixes (levain#93): F1..F11
+
+
+def tear_item_adds(store):
+    """Make every add line of the items file unreadable (a torn line the item fold cannot trust)."""
+    p = store / "items.jsonl"
+    p.write_text("".join("#" + ln + "\n" if json.loads(ln)["op"] == "add" else ln + "\n" for ln in p.read_text().splitlines()))
+
+
+def test_f1_ack_torn_on_the_items_file_is_refused_naming_p1b_and_appends_nothing(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    track_ready(capsys, tmp_path, store, a, "alpha")
+    with open(store / "items.jsonl", "a") as fh:
+        fh.write("garbage\n")
+    before = (store / "items.jsonl").read_bytes()
+    rc, _, err = run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "w", *A)
+    assert rc == 2 and "P1b" in err and "items.jsonl" in err
+    assert (store / "items.jsonl").read_bytes() == before
+
+
+def test_f2_abandon_done_on_a_torn_item_store_refuses_instead_of_reading_no_items(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    m, ids = abandon_ready(capsys, tmp_path, store, a)
+    real = bs.decide
+    monkeypatch.setattr(bs, "decide", lambda *x, **k: (_ for _ in ()).throw(bs.BoardError("down")))
+    run(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    monkeypatch.setattr(bs, "decide", real)
+    tear_item_adds(store)
+    n = len(reg_lines(store))
+    rc, _, err = run(capsys, "abandon-done", "alpha", *A)
+    assert rc == 2 and "items" in err and "torn" in err
+    assert len(reg_lines(store)) == n and br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].mode == "aborting"
+
+
+def test_f3_untrack_refuses_a_torn_item_store_even_when_no_item_reads_as_the_repos(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    tear_item_adds(store)
+    n = len(reg_lines(store))
+    rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
+    assert rc == 2 and "torn" in err and len(reg_lines(store)) == n
+
+
+def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_missed(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    ok(capsys, "decide", "--id", iid, "--decision", "out-of-1.0", "--words", "later", *A)
+    real = br._unsettled_items
+
+    def derive_then_a_concurrent_add(*args, **kw):
+        out = real(*args, **kw)                                  # the check saw nothing open ...
+        ok(capsys, "add", "--repo", "alpha", "--title", "late", "--origin", "desk 1", *A)   # ... then an add lands
+        return out
+
+    monkeypatch.setattr(br, "_unsettled_items", derive_then_a_concurrent_add)
+    n = len(reg_lines(store))
+    rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
+    assert rc == 2 and "changed under the check" in err and len(reg_lines(store)) == n
+    monkeypatch.setattr(br, "_unsettled_items", real)
+    rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
+    assert rc == 2 and "items not done, cut or parked" in err                  # run again: now it sees the add
+
+
+def test_f4_abandon_done_rechecks_every_item_reads_cut_under_the_lock(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    m, ids = abandon_ready(capsys, tmp_path, store, a)
+    ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    real = br._compensation_missing
+
+    def check_then_a_reopen(*args, **kw):
+        out = real(*args, **kw)
+        ok(capsys, "decide", "--id", ids[0], "--decision", "reopen", "--words", "wait", *A)
+        return out
+
+    monkeypatch.setattr(br, "_compensation_missing", check_then_a_reopen)
+    n = len(reg_lines(store))
+    rc, _, err = run(capsys, "abandon-done", "alpha", *A)
+    assert rc == 2 and "items not cut" in err and ids[0] in err and len(reg_lines(store)) == n
+
+
+def test_f5_two_repos_with_the_same_directory_name_both_launch(store, home, tmp_path, mkrepo):
+    a = mkrepo("alpha")
+    other = tmp_path / "elsewhere" / "alpha"
+    other.parent.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    (other / "f").write_text("x")
+    git(other, "add", ".")
+    git(other, "commit", "-qm", "other root")
+    env = {"LEVAIN_HOME": str(home)}
+    assert br.register_for_launch(a, env) is True
+    assert br.register_for_launch(other, env) is True
+    names = [r["repo"] for r in reg_lines(store)]
+    assert names[0] == "alpha" and names[1].startswith("alpha-") and len(set(names)) == 2
+    assert br.register_for_launch(other, env) is False                        # the second is known now
+
+
+def test_f5_a_repo_with_no_commit_registers_nothing_and_the_launch_proceeds(store, home, tmp_path):
+    d = tmp_path / "fresh"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True)
+    assert br.register_for_launch(d, {"LEVAIN_HOME": str(home)}) is False
+    assert (store / "repos.jsonl").read_bytes() == b""
+    cs = CoordStore(tmp_path / "board")
+    token = cs.coord_take()
+    assert cs.launch_request(token, harness="claude", role=ROLE_DESK, cwd=str(d)).launch_id
+
+
+def test_f5_a_concurrent_register_of_the_same_identity_is_a_no_op_not_a_refusal(store, home, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    real = br.read_registry
+
+    def read_then_someone_registers(*args, **kw):
+        view = real(*args, **kw)
+        monkeypatch.setattr(br, "read_registry", real)
+        ok(capsys, "register", "other-name", "--path", str(a), "--words", "w", *A)    # lands between the read and the write
+        return view
+
+    monkeypatch.setattr(br, "read_registry", read_then_someone_registers)
+    assert br.register_for_launch(a, {"LEVAIN_HOME": str(home)}) is False
+    assert [r["repo"] for r in reg_lines(store)] == ["other-name"]
+
+
+def test_f5_a_worker_asking_for_several_threads_is_refused_before_anything_is_registered(store, home, tmp_path, mkrepo):
+    a = mkrepo("alpha")
+    cs = CoordStore(tmp_path / "board")
+    token = cs.coord_take()
+    with pytest.raises(CoordError):
+        cs.launch_request(token, harness="claude", role="worker", threads=["t1", "t2"], cwd=str(a))
+    assert (store / "repos.jsonl").read_bytes() == b""
+
+
+def test_f6_an_abandon_done_without_a_migration_or_for_another_one_is_a_problem_and_changes_nothing():
+    base = [rec("register", n=1), rec("begin-track", n=2), rec("abandon-track", n=3)]
+    for bad in (rec("abandon-done", n=4), rec("abandon-done", n=4, migration="m2")):
+        f = rf.fold_repos(base + [bad], store_id=SID)
+        assert f.repos["x"].mode == "aborting" and any("abandon-done" in p and "migration" in p for p in f.problems), f.problems
+    f = rf.fold_repos(base + [rec("abandon-done", n=4, migration="m1")], store_id=SID)
+    assert f.repos["x"].mode == "untracked" and not f.problems
+
+
+def test_f7_a_corrected_re_ack_repairs_a_line_whose_first_ack_named_the_wrong_hash():
+    bad = "{not json"
+    mk = lambda sha, n: json.dumps({"v": 1, "store": SID, "op": "ack-torn", "line": 2, "sha256": sha, "why": "w", "at": f"2026-11-17T10:00:0{n}Z", "by": "d"})
+    f = rf.fold_repos([rec("register"), bad, mk("f" * 64, 5), mk(hashlib.sha256(bad.encode()).hexdigest(), 6)], store_id=SID)
+    assert not f.torn and f.acked == (2,)
+
+
+def test_f8_an_import_rerun_does_not_re_pause_a_repo_the_operator_resumed(home, tmp_path, mkrepo, capsys, monkeypatch):
+    mkrepo("alpha")
+    mkrepo("beta")
+    mkrepo("gamma")
+    focus = focus_file(tmp_path, {"alpha": ("active", "wa"), "beta": ("paused", "wb"), "gamma": ("paused", "wg")})
+    store = tmp_path / "store"
+    argv = ("use", str(store), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "desk 1")
+    real_pause = br.pause
+    calls = []
+
+    def pause_beta_then_crash(*a, **k):
+        if calls:
+            raise bs.BoardError("crash mid-import")
+        calls.append(1)
+        return real_pause(*a, **k)
+
+    monkeypatch.setattr(br, "pause", pause_beta_then_crash)
+    rc, _, err = run(capsys, *argv)
+    assert rc == 2 and "crash mid-import" in err
+    sd = Path(os.path.realpath(store))
+    monkeypatch.setattr(br, "pause", real_pause)
+    tgt = bs.Target(sd, sd / "items.jsonl", True)
+    br.resume(tgt, "beta", "back", "desk 1", author={"kind": "operator", "name": "desk 1"})          # he resumed beta after the partial import
+    ok(capsys, *argv)
+    ops = [(r["op"], r["repo"]) for r in reg_lines(sd)]
+    assert ops == [("register", "alpha"), ("register", "beta"), ("pause", "beta"), ("register", "gamma"), ("resume", "beta"), ("pause", "gamma")]
+    assert br.read_registry(tgt).fold.repos["beta"].attention == "active"
+
+
+def test_f9_withdrawn_abandon_done_checks_nothing_when_the_repo_had_a_charter_before(store, tmp_path, mkrepo, capsys):
+    """design.md 4.2, the abandon-done bullet: "where X had a charter before, nothing is checked, because section 5 keeps it
+    (revision 6, complement r5: revision 5 required the old blob back, which a kept edit never passes)". F9 (require the old blob
+    back) was withdrawn by the head: charter_before is a blob sha, origin/main's CHARTER.md differs, abandon-done still succeeds."""
+    a = mkrepo("alpha")
+    land(a, "CHARTER.md", "# kept\n")
+    m, ids = abandon_ready(capsys, tmp_path, store, a)
+    before = [r for r in reg_lines(store) if r["op"] == "begin-track"][-1]["charter_before"]
+    ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan="- alpha#1"))             # his edit stays
+    assert before != "none" and br._blob(str(a)) != before
+    assert ok(capsys, "abandon-done", "alpha", *A) == "untracked alpha"
+
+
+def test_f10_load_has_no_flock_parameter():
+    import inspect
+    assert "flock" not in inspect.signature(br._load).parameters
+
+
+def test_f11_untrack_evidence_that_cannot_be_read_is_a_refusal_not_a_traceback(store, tmp_path, mkrepo, capsys, monkeypatch):
+    from levain.desk import board_evidence as be
+    a = mkrepo("alpha")
+    track_ready(capsys, tmp_path, store, a, "alpha")
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    for exc in (OSError("disk"), subprocess.SubprocessError("git")):
+        monkeypatch.setattr(be, "read_git_evidence", lambda *x, _e=exc, **k: (_ for _ in ()).throw(_e))
+        rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
+        assert rc == 2 and "refused" in err and "Traceback" not in err

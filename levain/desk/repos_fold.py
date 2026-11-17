@@ -237,6 +237,8 @@ def _apply(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
             return
         if cur.mode != "aborting":
             raise _Soft(f"abandon-done {name}: the repo is {cur.mode}, not aborting")
+        if rec.get("migration") != cur.migration:
+            raise _Soft(f"abandon-done {name}: it names migration {rec.get('migration')!r}, the aborting ceremony is {cur.migration!r}")
         repos[name] = replace(cur, mode="untracked", since=at, words=rec["words"])
     elif op == "untrack":
         if cur.mode != "tracked":
@@ -252,7 +254,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     """The registry from its record lines. ``store_id`` (the store's ``store.id``) makes a record that names another store
     torn; ``unterminated_tail`` says the last line has no newline (an append in flight, or a crash), and it is torn."""
     lines = list(lines)
-    acks: dict[int, str] = {}
+    acks: dict[int, set[str]] = {}               # ANY ack of a line whose hash matches accepts it: a corrected re-ack repairs
     parsed: list[Any] = []
     texts: list[str | None] = []                 # None: the line is not text (bytes that are not UTF-8, or not a str at all)
     shas: list[str] = []                         # of the line's RAW bytes: a bytes line is hashed as given, never as decoded text
@@ -279,7 +281,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 _validate(rec, store_id)
             except _Bad:
                 continue
-            acks.setdefault(rec["line"], rec["sha256"])
+            acks.setdefault(rec["line"], set()).add(rec["sha256"])
     repos: dict[str, Repo] = {}
     problems: list[str] = []
     torn_why = ""
@@ -309,7 +311,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
         except _Bad as e:
             sha = shas[n - 1]
             torn_lines.append((n, sha))
-            if n in acks and acks[n] == sha:
+            if sha in acks.get(n, ()):
                 acked.append(n)                 # skipped exactly; listed in ``acked``, not a problem
             else:
                 if n in acks:
