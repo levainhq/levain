@@ -115,7 +115,7 @@
   },
   {
    "namespace": "levain-egress-host",
-   "status": "reserved",
+   "status": "shipped",
    "owner": "levain/slot/egress_grants.py"
   },
   {

@@ -121,3 +121,35 @@ def test_the_egress_host_namespace_is_registered_with_one_grammar_and_one_pair_o
 def test_every_levain_sign_request_grammar_is_a_registered_namespace():
     assert set(NS.LEVAIN_SIGN_REQUESTS) <= set(NS.REGISTRY)
     assert all(ns.startswith("levain") for ns in NS.LEVAIN_SIGN_REQUESTS)
+
+
+def test_t19_the_egress_host_namespace_is_shipped_by_the_slice_that_files_its_first_card():
+    ns = NS.EGRESS_HOST_NAMESPACE
+    assert NS.REGISTRY[ns][0] == "shipped"
+    [row] = [n for n in GOLDEN["namespaces"] if n["namespace"] == ns]
+    assert row == {"namespace": ns, "status": "shipped", "owner": "levain/slot/egress_grants.py"}
+
+
+def test_the_host_grant_words_are_pinned_exactly_and_are_the_only_test_that_names_them():
+    """THE one place the exact words of ``LEVAIN_SIGN_CHOICES`` are written out. They are the button AND the signed
+    line, root reads the same table from its own installed copy, and nothing is signed in this namespace until it
+    ships, so a change here is a reviewed diff (after a release it needs a message-format bump, never an edit in
+    place). Phill's ruling on the wording (band row np-386737ea, options a/b/c) may change exactly this constant and
+    this test; every other test reaches the words through the constant."""
+    assert NS.LEVAIN_SIGN_CHOICES[NS.EGRESS_HOST_NAMESPACE] == (
+        ("s", "Allow this host for this session (at most 8 hours). The agent can then send anything it can read to "
+              "any account on this host; Levain cannot see or limit what is sent."),
+        ("d", "Allow this host for 24 hours or until this session ends. The agent can then send anything it can read "
+              "to any account on this host; Levain cannot see or limit what is sent."),
+    )
+
+
+def test_every_option_text_states_the_bound_it_signs_and_is_within_the_sheets_limit():
+    """The 8-hour accuracy fix is part of every option (a, b and c): ``s`` must not say a bare "this session"."""
+    from levain.consent import sign
+    from levain.slot import egress_grants as eg
+
+    texts = dict(NS.LEVAIN_SIGN_CHOICES[NS.EGRESS_HOST_NAMESPACE])
+    assert "8" in texts["s"] and str(eg.SESSION_TTL_MAX_S // 3600) in texts["s"]
+    assert "24" in texts["d"] and str(eg.DAY_TTL_S // 3600) in texts["d"]
+    assert all(0 < len(t) <= sign.OPTION_TEXT_MAX for t in texts.values())
