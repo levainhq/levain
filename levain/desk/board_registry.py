@@ -676,8 +676,9 @@ def _unsettled_items(target: bs.Target, cur: rf.Repo) -> tuple[list[str], str]:
     try:
         ev, summary = be.read_git_evidence(Path(cur.path), repo_name=cur.name)
         ev["documents"] = be.read_documents(mine, Path(cur.path))
-        board = derive_all(folded, Evidence.from_dict(ev), now=datetime.now(timezone.utc),
-                           repo_evidence={cur.name: Evidence.from_dict(ev)}, primary_repo=cur.name)
+        now = datetime.now(timezone.utc)
+        board = derive_all(folded, Evidence.from_dict(ev, now=now), now=now,
+                           repo_evidence={cur.name: Evidence.from_dict(ev, now=now)}, primary_repo=cur.name)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise BoardError(f"untrack {cur.name} refused: the repo's evidence cannot be read ({type(exc).__name__}: {exc})") from None
     return sorted(s.id for s in board.items if s.repo == cur.name and s.state not in ("done", "cut", "parked", "out_of_1_0")), digest
