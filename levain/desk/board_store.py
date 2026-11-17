@@ -933,10 +933,15 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                     if r.get("repo") != repo:
                         raise BoardError(f"key {key!r} was already used for {r['id']} in repo {r.get('repo')!r}; this add is for repo {repo!r}")
                     if r.get("payload_hash") == payload_hash:
+                        if relay is not None:           # a key hit under --source is only the same relay: relayed, citing this id
+                            src = r.get("source")
+                            if r.get("grade") != GRADE_RELAYED or not isinstance(src, Mapping) or src.get("np") != relay[0]:
+                                raise BoardError(f"key {key!r} was already used for {r['id']}, which is not a relayed record citing "
+                                                 f"{relay[0]}; this add relays it")
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")
-        source = _read_relay(relay, fields["words"])
+        source = _read_relay(relay, fields.get("words"))
         return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author, source=source), seal), True
 
     _preflight(seal, author)
