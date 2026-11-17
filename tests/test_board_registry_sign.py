@@ -9,9 +9,11 @@ This module does NOT use test_board_registry.py's autouse seam (which seals the 
 tests): here the policy itself is the subject."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -182,6 +184,11 @@ def test_the_launch_hook_and_import_focus_register_and_pause_as_asserted(home, t
     assert rc == 0, err
     recs = reg_lines(Path(os.path.realpath(store)))
     assert [r["op"] for r in recs] == ["register", "register", "pause"] and {r["grade"] for r in recs} == {"asserted"}
+    gamma = mkrepo("gamma")                                              # the launch hook itself (L1 6a): its register is asserted
+    assert br.register_for_launch(gamma, os.environ) is True
+    last = reg_lines(Path(os.path.realpath(store)))[-1]
+    assert last["op"] == "register" and last["repo"] == "gamma" and last["grade"] == "asserted" and "sig" not in last
+    assert last["author"]["kind"] == "agent"
 
 
 def test_use_import_focus_refuses_sign_there_is_nothing_to_sign(home, tmp_path, mkrepo, capsys):
@@ -190,6 +197,12 @@ def test_use_import_focus_refuses_sign_there_is_nothing_to_sign(home, tmp_path, 
     rc, out, err = run(capsys, "use", str(tmp_path / "store"), "--import-focus", str(focus), "--author-kind", "operator", "--sign")
     assert rc == 2 and "--sign does not apply" in err and focus.read_text().count("moved_to") == 0
     assert not (tmp_path / "store" / "repos.jsonl").exists()
+
+
+def test_a_plain_use_with_sign_has_its_own_refusal_nothing_to_sign(home, tmp_path, capsys):
+    rc, out, err = run(capsys, "use", str(tmp_path / "store"), "--sign")
+    assert rc == 2 and "use writes no record" in err and "--import-focus" not in err
+    assert not (tmp_path / "store").exists()
 
 
 # ---------------------------------------------------------------------------------------------- the CLI and --sign
@@ -344,3 +357,192 @@ def test_the_cli_abandon_track_sign_cuts_with_the_cause(store, tmp_path, mkrepo,
     assert rc == 0 and out == f"aborting alpha; cut 1 items: {iid}", err
     cut = [json.loads(x) for x in items_raw(store).decode().splitlines()][-1]
     assert cut["cause"] == hashlib.sha256(abandon_line(store).encode()).hexdigest() and cut["grade"] == "asserted"
+
+
+# ------------------------------------------------- fix 1 (levain 26 rulings): each case run once by hand on a scratch store first
+
+
+def test_the_abandon_names_the_items_files_last_line_l2_m2(tgt, store, tmp_path, mkrepo, rig):
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    keyed(tgt, "alpha", f"{m}:a")
+    last_item = [ln for ln in items_raw(store).split(b"\n") if ln][-1]
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    abandon = json.loads(abandon_line(store))
+    assert abandon["items_last"] == hashlib.sha256(last_item).hexdigest()
+    assert sg.verify_record(abandon, rig.snapshot()).state == "valid"            # items_last is inside the signed bytes
+
+
+def test_a_cut_of_another_repos_item_keyed_to_the_abandons_migration_is_refused_l2_m2(tgt, store, tmp_path, mkrepo, rig):
+    """Ruling 1: alpha's ceremony M abandoned signed; beta is tracked, so an add for beta takes ANY key, M:x included; an
+    unsigned cut of that item citing alpha's abandon is refused (the item is not of the abandon's repo)."""
+    tracking(tgt, tmp_path, mkrepo, rig, name="alpha", plan=("a",))
+    m = br.read_registry(tgt).fold.repos["alpha"].migration
+    keyed(tgt, "alpha", f"{m}:a")
+    tracked(tgt, tmp_path, mkrepo, rig, name="beta")
+    br.track(tgt, "beta", "go", "desk 1", author=OP, seal=rig.seal())
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    stray = keyed(tgt, "beta", f"{m}:x")
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="decision-class write.*was added for 'beta'"):
+        bs.decide(tgt, stray, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=cause, authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_a_cut_of_the_abandoned_repos_item_added_after_the_abandon_is_refused_l2_m2(tgt, store, tmp_path, mkrepo, rig):
+    """Ruling 1: alpha abandoned (M), done, re-tracked (M2) and tracked, so an add for alpha takes any key again; an item keyed
+    M:y added now, after the abandon, cannot be cut unsigned by citing the old abandon."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    keyed(tgt, "alpha", f"{m}:a")
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    br.begin_track(tgt, "alpha", manifest(tmp_path), "again", "desk 1", author=OP, seal=rig.seal())
+    m2 = br.read_registry(tgt).fold.repos["alpha"].migration
+    iid = keyed(tgt, "alpha", f"{m2}:a")
+    land(repo, "CHARTER.md", f"# Charter: alpha\nCharter-Version: 1\nExport: repo\n\n## Purpose\nT.\n\n## Criteria\n- C1: ok [judged: phill]\n\n"
+                              f"## Constraints\n- K1: none\n\n## Plan\n- {iid}\n")
+    br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())
+    late = keyed(tgt, "alpha", f"{m}:y")
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="decision-class write.*was added after the cited abandon-track"):
+        bs.decide(tgt, late, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=cause, authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_a_move_that_changes_a_tracking_or_tracked_repos_origin_is_decision_class_l2_m1(tgt, store, tmp_path, mkrepo, rig):
+    """Ruling 2: a clone shares the root commits and has ANOTHER origin (the path it was cloned from)."""
+    repo, m, iid = tracked(tgt, tmp_path, mkrepo, rig)                   # alpha: tracking
+    fork = tmp_path / "fork"
+    git(tmp_path, "clone", "-q", str(repo), str(fork))
+    before = raw(store)
+    with pytest.raises(bs.BoardError, match="move of a tracking or tracked repo that changes its origin or root set is a decision-class"):
+        br.move(tgt, "alpha", str(fork), "m", "seat-1", author=AGENT)
+    assert raw(store) == before
+    br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())  # alpha: tracked
+    with pytest.raises(bs.BoardError, match="decision-class"):
+        br.move(tgt, "alpha", str(fork), "m", "desk 1", author=OP)
+    br.move(tgt, "alpha", str(fork), "m", "desk 1", author=OP, seal=rig.seal())
+    r = reg_lines(store)[-1]
+    assert r["op"] == "move" and r["grade"] == "signed-terminal" and sg.verify_record(r, rig.snapshot()).state == "valid"
+    assert br.read_registry(tgt).fold.repos["alpha"].origin == r["origin"] != ""
+
+
+def test_a_relocation_that_keeps_origin_and_roots_and_any_untracked_move_stay_asserted_l2_m1(tgt, store, tmp_path, mkrepo, rig):
+    repo, m, iid = tracked(tgt, tmp_path, mkrepo, rig)                   # alpha: tracking
+    reloc = tmp_path / "reloc"
+    shutil.copytree(repo, reloc)                                         # the same repository, origin kept, another path
+    br.move(tgt, "alpha", str(reloc), "relocated", "seat-1", author=AGENT)
+    r = reg_lines(store)[-1]
+    assert r["op"] == "move" and r["grade"] == "asserted" and r["path"] == os.path.realpath(reloc)
+    beta = registered(tgt, mkrepo, "beta")                               # untracked
+    fork = tmp_path / "bfork"
+    git(tmp_path, "clone", "-q", str(beta), str(fork))                   # another origin
+    br.move(tgt, "beta", str(fork), "moved", "seat-1", author=AGENT)
+    r = reg_lines(store)[-1]
+    assert r["op"] == "move" and r["repo"] == "beta" and r["grade"] == "asserted"
+
+
+def test_signed_asserted_ok_registry_records_are_written_and_verify_l1_6b(tgt, store, tmp_path, mkrepo, rig):
+    repo = mkrepo("alpha")
+    br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=rig.seal())
+    reloc = tmp_path / "reloc"
+    shutil.copytree(repo, reloc)
+    br.move(tgt, "alpha", str(reloc), "moved", "desk 1", author=OP, seal=rig.seal())
+    br.pause(tgt, "alpha", "later", "desk 1", author=OP, seal=rig.seal())
+    br.resume(tgt, "alpha", "now", "desk 1", author=OP, seal=rig.seal())
+    tracking(tgt, tmp_path, mkrepo, rig, name="gamma", plan=())
+    br.abandon_track(tgt, "gamma", "no", "desk 1", author=OP, seal=rig.seal())
+    br.abandon_done(tgt, "gamma", "", "desk 1", author=OP, seal=rig.seal())
+    with open(store / "repos.jsonl", "ab") as f:
+        f.write(b"garbage")                                              # an unterminated torn tail: the ack gets a newline first
+    n = len(reg_lines_tolerant(store))
+    assert br.ack_torn(tgt, "repos.jsonl", n, "test", "desk 1", author=OP, seal=rig.seal())
+    recs = [json.loads(x) for x in raw(store).decode().splitlines() if x != "garbage"]
+    want = ("register", "move", "pause", "resume", "abandon-done", "ack-torn")
+    signed = [r for r in recs if r["op"] in want and r.get("repo") in ("alpha", "gamma", None)]
+    assert sorted({r["op"] for r in signed}) == sorted(want)
+    for r in signed:
+        if r["op"] == "register" and r["repo"] == "gamma":
+            continue                                                     # the helper registered gamma unsigned
+        assert r["grade"] == "signed-terminal" and sg.verify_record(r, rig.snapshot()).state == "valid", r["op"]
+    assert not br.read_registry(tgt).fold.torn
+
+
+def test_the_cli_rerun_of_an_unsigned_abandon_track_refuses_without_a_log_and_finishes_with_one_l1_6c(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    tgt = bs.resolve_store(None)
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a", "b"))
+    ids = [keyed(tgt, "alpha", f"{m}:a"), keyed(tgt, "alpha", f"{m}:b")]
+    real = bs.decide
+    calls = []
+
+    def crash_after_one(*args, **kw):
+        if calls:
+            raise bs.BoardError("simulated crash")
+        calls.append(args[1])
+        return real(*args, **kw)
+
+    monkeypatch.setattr(bs, "decide", crash_after_one)
+    with pytest.raises(bs.BoardError, match="simulated crash"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(bs, "decide", real)
+    before, items_before = raw(store), items_raw(store)
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)     # this install has no authority log
+    assert rc == 2 and "decision-class write" in err and "no authority log" in err, err
+    assert raw(store) == before and items_raw(store) == items_before
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    assert rc == 0 and out == f"aborting alpha; cut 1 items: {ids[1]}", err
+    assert raw(store) == before                                          # no new abandon: the cut cites the signed one
+
+
+def test_an_aborting_repo_with_an_asserted_abandon_recovers_by_a_signed_rerun_ruling_5(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    tgt = bs.resolve_store(None)
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    sid = br.read_registry(tgt).store_id
+    forged = {"v": 1, "store": sid, "op": "abandon-track", "repo": "alpha", "at": NOW, "by": "x", "words": "w",
+              "migration": m, "author": OP, "grade": "asserted", "prev": "0" * 64}
+    with open(store / "repos.jsonl", "ab") as f:
+        f.write(bs.canonical_bytes(forged) + b"\n")
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "aborting"
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    before, items_before = raw(store), items_raw(store)
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)    # unsigned: stuck, and says how to recover
+    assert rc == 2 and "graded 'asserted': it must be signed (re-run `abandon-track` with --sign)" in err, err
+    assert raw(store) == before and items_raw(store) == items_before
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert cut == [iid]
+    fresh = json.loads(abandon_line(store))
+    assert fresh["grade"] == "signed-terminal" and fresh["migration"] == m and fresh["words"] == "w"   # re-signs the recorded words
+    assert json.loads([x for x in items_raw(store).decode().splitlines()][-1])["cause"] == hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    n = len(reg_lines(store))
+    assert br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())[1] == []
+    assert len(reg_lines(store)) == n                                    # it holds now: a signed re-run writes nothing
+
+
+def test_a_signed_abandon_with_another_authority_source_is_refused_l1_5(tgt, store, tmp_path, mkrepo, rig):
+    tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    other = Rig(tmp_path / "other")
+    before, items_before = raw(store), items_raw(store)
+    with pytest.raises(bs.BoardError, match="the seal's own authority source"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal(), authority=other.source())
+    assert raw(store) == before and items_raw(store) == items_before
+
+
+def test_register_cli_with_no_signer_refuses_sign_instead_of_ignoring_it_l1_4(store, mkrepo, capsys):
+    tgt = bs.resolve_store(None)
+    registered(tgt, mkrepo)
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers()
+
+    def author_args(q):
+        q.add_argument("--sign", action="store_true")
+        q.add_argument("--author-kind", default="agent")
+    br.register_cli(sub, author_args, lambda a: {"kind": a.author_kind, "name": a.by}, "items")
+    before = raw(store)
+    args = p.parse_args(["pause", "alpha", "--words", "w", "--by", "desk 1", "--author-kind", "operator", "--sign"])
+    assert args.func(args) == 2 and "no signer is wired" in capsys.readouterr().err
+    assert raw(store) == before
+    args = p.parse_args(["pause", "alpha", "--words", "w", "--by", "desk 1"])
+    assert args.func(args) == 0 and reg_lines(store)[-1]["op"] == "pause"

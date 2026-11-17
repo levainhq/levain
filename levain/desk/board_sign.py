@@ -28,7 +28,8 @@ The cause (P2-d). A ``decide`` of ``cut`` may carry ``cause``: the lowercase hex
 bytes exactly as written in the store file, without its trailing newline (the same byte range the chain's ``prev`` hashes).
 :func:`verify_cause` holds it: the cited record is an ``abandon-track`` whose signature verifies ``valid`` against the
 authority log (a ``relayed`` one is refused until P3's verifier lands), of a migration ``M`` the item is keyed to (its ``add``
-carries key ``M`` or ``M:...``). A present cause is checked on every decide, signed or not.
+carries key ``M`` or ``M:...``), of the item's own repo, and the item's ``add`` predates the abandon (it is at or before the
+items line the abandon names in ``items_last``). A present cause is checked on every decide, signed or not.
 
 :func:`verify_record` is pure over ``(record, authority snapshot)``. :func:`require_policy` is the one table of the fixed 1.0
 policy; the writer calls it before it signs or writes.
@@ -53,9 +54,9 @@ from typing import Any, Callable, Mapping, Sequence
 from levain.desk import board_store as bs
 
 __all__ = [
-    "ASSERTED_OK", "DECISION_CLASS", "NAMESPACE", "POLICY", "SIGNED_GRADES", "Prepared", "Seal", "Verdict", "admit",
-    "commit_phone", "prepare", "require_policy", "resolve_authority", "signing_bytes", "terminal_seal", "verify_cause",
-    "verify_record",
+    "ASSERTED_OK", "DECISION_CLASS", "ITEMS_NONE", "NAMESPACE", "POLICY", "SIGNED_GRADES", "Prepared", "Seal", "Verdict",
+    "abandon_problem", "admit", "commit_phone", "move_is_decision", "prepare", "require_policy", "resolve_authority",
+    "signing_bytes", "terminal_seal", "verify_cause", "verify_record",
 ]
 
 NAMESPACE = "levain-board"
@@ -114,9 +115,9 @@ def read_authority(source: AuthoritySource | None) -> Any:
 
 DECISION_CLASS = "decision"
 ASSERTED_OK = "asserted-ok"
-#: THE fixed 1.0 policy, keyed by op. Decision-class ops need a signed or relayed record; every other op accepts ``asserted``.
-#: The registry ops are listed though their verbs are not built on every base: a verb that writes one calls
-#: :func:`require_policy`. The operator setting this per verb is 1.1 and is not here.
+#: THE fixed 1.0 policy, keyed by op. Decision-class ops need a signed or relayed record; every other op accepts ``asserted``,
+#: save one case keyed on the repo's state too: a ``move`` that :func:`move_is_decision` names (L2 M1, levain 26). The
+#: operator setting this per verb is 1.1 and is not here.
 POLICY: dict[str, str] = {
     "decide": DECISION_CLASS, "begin-track": DECISION_CLASS, "track": DECISION_CLASS, "abandon-track": DECISION_CLASS,
     "untrack": DECISION_CLASS,
@@ -125,9 +126,20 @@ POLICY: dict[str, str] = {
 }
 
 
-def _refusal(op: str) -> str:
-    return (f"{op} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <np-id> relaying his "
-            f"answer; an asserted record is refused")
+def _refusal(op: str, why: str = "") -> str:
+    return (f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <np-id> relaying "
+            f"his answer; an asserted record is refused")
+
+
+MOVE_DECISION = " of a tracking or tracked repo that changes its origin or root set"
+
+
+def move_is_decision(mode: str, old_origin: str, old_root: Sequence[str], new_origin: str, new_root: Sequence[str]) -> bool:
+    """A ``move`` is decision-class (head ruling, levain 26, 11-17; L2 M1) when the repo is ``tracking`` or ``tracked`` and the
+    move CHANGES the recorded origin or root set: the tracked repo's evidence (its items done on origin/main, its charter
+    blob) would then be read from another repository. The same repository relocated on disk (origin and root set kept), and
+    any move of an ``untracked`` repo, stay asserted-ok."""
+    return mode in ("tracking", "tracked") and (old_origin != new_origin or sorted(old_root) != sorted(new_root))
 
 
 def _record_hash(line: bytes | str) -> str:
@@ -146,12 +158,45 @@ def _keyed_to(item_key: Any, migration: str) -> bool:
     return isinstance(item_key, str) and (item_key == migration or item_key.startswith(migration + ":"))
 
 
+ITEMS_NONE = "none"                       # ``items_last`` of an abandon written when the items file had no line
+
+
+def abandon_problem(held: Mapping[str, Any], snapshot: Any) -> str | None:
+    """Why the ``abandon-track`` record ``held`` cannot be the cause of a cut, or None when it can: it must be signed (a
+    ``relayed`` one is P3's verifier's to check and is refused), :func:`verify_record` must find it ``valid`` against
+    ``snapshot``, and it must name its migration and ``items_last`` (the items file's last line when it was written; an
+    abandon from before that field cannot order the items, so it holds no cut). Raises ``VerifierUnavailable`` when
+    ssh-keygen cannot run. The recovery for any of these is to re-run ``abandon-track`` signed: on an ``aborting`` repo
+    whose abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``)."""
+    grade = held.get("grade")
+    if grade == GRADE_RELAYED:
+        return ("cause names a relayed abandon-track: a relayed citation is checked by P3's verifier, which this build "
+                "does not have, so it is refused, never trusted")
+    if grade not in SIGNED_GRADES:
+        return f"cause names an abandon-track graded {grade!r}: it must be signed (re-run `abandon-track` with --sign)"
+    if snapshot is None:
+        return "cause names a signed abandon-track and there is no authority log to verify it against"
+    verdict = verify_record(held, snapshot)
+    if verdict.state != "valid":
+        return f"the cited abandon-track's signature is not valid: {verdict.text} (re-run `abandon-track` with --sign)"
+    migration = held.get("migration")
+    if not isinstance(migration, str) or not migration:
+        return "the cited abandon-track names no migration"
+    last = held.get("items_last")
+    if not (last == ITEMS_NONE or (isinstance(last, str) and bs.HASH_RE.fullmatch(last))):
+        return ("the cited abandon-track does not name the items file's last line (items_last), so no item can be shown to "
+                "predate it (re-run `abandon-track` with --sign)")
+    return None
+
+
 def verify_cause(record: Mapping[str, Any], lines: Sequence[bytes | str], snapshot: Any) -> str | None:
-    """Why ``record``'s ``cause`` does not hold, or None when it does. It holds when ``cause`` is the sha256 of one of
-    ``lines`` (every store line as written, no trailing newline), that line is an ``abandon-track`` whose signature
-    :func:`verify_record` finds ``valid`` against ``snapshot``, and the item ``record`` decides was added with key ``M`` or
-    ``M:...``, where ``M`` is the abandon's ``migration``. A ``relayed`` abandon is refused: its citation is P3's verifier's
-    to check and that verifier is not on this base. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
+    """Why ``record``'s ``cause`` does not hold, or None when it does. ``lines`` is every line of BOTH store files as written
+    (no trailing newline; each file's lines in file order). It holds when ``cause`` is the sha256 of one of ``lines``, that
+    line is an ``abandon-track`` that :func:`abandon_problem` accepts, and the item ``record`` decides (L2 M2, levain 26):
+    was added for the abandon's ``repo``, with key ``M`` or ``M:...`` where ``M`` is the abandon's ``migration``, and BEFORE
+    the abandon: its ``add`` line is at or before the line whose sha256 is the abandon's ``items_last`` (``none``: the items
+    file was empty then, so no item predates it). Both are item lines, so their order in ``lines`` is their order in the
+    items file. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
     cause = record.get("cause")
     if not isinstance(cause, str) or not bs.HASH_RE.fullmatch(cause):
         return "cause must be the lowercase sha256 of an abandon-track record"
@@ -166,37 +211,38 @@ def verify_cause(record: Mapping[str, Any], lines: Sequence[bytes | str], snapsh
         return "cause names no abandon-track record in the store"
     if held.get("op") != "abandon-track":
         return "cause names a record that is not an abandon-track"
-    grade = held.get("grade")
-    if grade == GRADE_RELAYED:
-        return ("cause names a relayed abandon-track: a relayed citation is checked by P3's verifier, which this build "
-                "does not have, so it is refused, never trusted")
-    if grade not in SIGNED_GRADES:
-        return f"cause names an abandon-track graded {grade!r}: it must be signed"
-    if snapshot is None:
-        return "cause names a signed abandon-track and there is no authority log to verify it against"
-    verdict = verify_record(held, snapshot)
-    if verdict.state != "valid":
-        return f"the cited abandon-track's signature is not valid: {verdict.text}"
-    migration = held.get("migration")
-    if not isinstance(migration, str) or not migration:
-        return "the cited abandon-track names no migration"
+    problem = abandon_problem(held, snapshot)
+    if problem is not None:
+        return problem
+    migration = held["migration"]
     item_id = record.get("id")
-    added = next((r for r in map(_parse, lines) if isinstance(r, dict) and r.get("op") == "add" and r.get("id") == item_id),
-                 None)
+    added_at, added = next(((i, r) for i, r in enumerate(map(_parse, lines))
+                            if isinstance(r, dict) and r.get("op") == "add" and r.get("id") == item_id), (None, None))
     if added is None:
         return f"{item_id} has no add record in the store"
     if not _keyed_to(added.get("key"), migration):
         return f"cause names an abandon-track of migration {migration!r}, and {item_id} is not keyed to it"
+    if added.get("repo") != held.get("repo"):
+        return (f"cause names the abandon-track of repo {held.get('repo')!r}, and {item_id} was added for "
+                f"{added.get('repo')!r}")
+    last = held["items_last"]
+    anchor = None if last == ITEMS_NONE else next((i for i, ln in enumerate(lines) if _record_hash(ln) == last), None)
+    if last != ITEMS_NONE and anchor is None:
+        return "the items line the cited abandon-track names (items_last) is not in the store"
+    if anchor is None or added_at > anchor:
+        return f"{item_id} was added after the cited abandon-track: an abandon cuts only the items that predate it"
     return None
 
 
 def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None, *,
-                   lines: Sequence[bytes | str] = (), snapshot: Any = None) -> None:
+                   lines: Sequence[bytes | str] = (), snapshot: Any = None, decision: str = "") -> None:
     """Refuse (:class:`~levain.desk.board_store.BoardError`) a record the fixed 1.0 policy does not accept at ``grade``. An op
     not in :data:`POLICY` is refused (fail closed). ``grade`` is the WRITER's (a signed grade is then earned by :func:`admit`;
     ``relayed`` is P3's). A decision-class op needs ``signed-*`` or ``relayed``; the one exception (P2-d) is a ``decide`` of
     ``cut`` whose ``cause`` holds (:func:`verify_cause` over ``lines``, every store line as written, and ``snapshot``). A
-    present ``cause`` is checked whatever the grade, and refused on anything but a cut."""
+    present ``cause`` is checked whatever the grade, and refused on anything but a cut. ``decision`` (non-empty: the words
+    naming why) makes an asserted-ok op decision-class for THIS record: the writer passes it for a ``move`` that
+    :func:`move_is_decision` names."""
     from levain.authority_sig import VerifierUnavailable
     record = record or {}
     if op not in POLICY:
@@ -213,9 +259,9 @@ def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None,
             raise bs.BoardError((f"{_refusal(op)}; the cause exception does not hold: " if not signed
                                  else "the cause does not hold: ") + problem)
         return
-    if POLICY[op] == ASSERTED_OK or signed:
+    if (POLICY[op] == ASSERTED_OK and not decision) or signed:
         return
-    raise bs.BoardError(_refusal(op))
+    raise bs.BoardError(_refusal(op, decision))
 
 
 def check_signable(record: Mapping[str, Any]) -> None:
