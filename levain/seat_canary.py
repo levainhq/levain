@@ -34,8 +34,8 @@ from typing import Any, Callable, Mapping, Sequence
 from levain import canary_probe, seat_record
 from levain.host_canary import Check, _Listener, _Turn, _drive, check_init_event
 from levain.host_guard import CC_SEAT_TOOLS
-from levain.seat_profile import (CANARY_DIRNAME, GH_SERVER_NAME, GH_TOOL_ALLOW, SeatProfile,  # noqa: F401
-                                 build_seat_profile, ensure_canary_prefix)
+from levain.seat_profile import (CANARY_BUDGET_DIRNAME, CANARY_DIRNAME, GH_SERVER_NAME, GH_TOOL_ALLOW,  # noqa: F401
+                                 SeatProfile, build_seat_profile, ensure_canary_prefix, real_levain_home)
 
 __all__ = ["SWAP_FALLBACK_TOOLS", "SEAT_PROBE_IDS", "SEAT_PROBES", "TOOL_PROBES", "READY_TOOL_PROBES", "SeatProbe",
            "SeatCanaryVerdict", "check_seat_init", "run_seat_canary", "collect_evidence", "main"]
@@ -710,6 +710,10 @@ def run_seat_canary(*, claude_bin: str, python: str, swap_attempts: int, timeout
     environ = os.environ if environ is None else environ
     nonce = secrets.token_hex(8)
     root = _canary_root(environ, nonce)
+    # the read budget's per-run home: OUTSIDE the canary root (under $TMPDIR, which the seat's sandbox lets it write;
+    # L3 wire2 r1 codex HIGH) and removed below with the root, so no run leaves a ledger behind (codex LOW)
+    budget_parent = Path(os.path.abspath(real_levain_home(environ))) / CANARY_BUDGET_DIRNAME
+    budget_home = budget_parent / nonce
     try:
         lane_a, lane_b, ret, decoy, keys, host = (root / d for d in ("laneA", "laneB", "returnA", "decoy", "keys", "host"))
         for d in (lane_a, lane_b, ret, decoy / ".claude", keys, host):
@@ -722,7 +726,7 @@ def run_seat_canary(*, claude_bin: str, python: str, swap_attempts: int, timeout
         key_file.write_text(f"{key_secret}\n{_key_sentinel(nonce)}\n", encoding="utf-8")
         factory = profile_factory or build_seat_profile
         profile = factory(lane_a, ret, claude_bin=claude_bin, python=python, lease=None, key_dir=keys,
-                          canary_root=root, environ=environ)
+                          canary_root=root, environ=environ, budget_home=budget_home)
         if isinstance(profile, SeatProfile) and profile.tools != tools:
             profile = dataclasses.replace(profile, tools=tools)
 
@@ -802,6 +806,11 @@ def run_seat_canary(*, claude_bin: str, python: str, swap_attempts: int, timeout
             shutil.rmtree(socks, ignore_errors=True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(budget_home, ignore_errors=True)
+        try:
+            budget_parent.rmdir()       # only when empty: another run's home stays
+        except OSError:
+            pass
         # a HOMEWRITE that escaped was already recorded by _observe; the exact nonce-named file is removed after
         escaped = Path.home() / f".levain-canary-probe-{nonce}"
         if os.path.lexists(escaped) and not os.path.isdir(escaped):

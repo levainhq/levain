@@ -44,16 +44,23 @@ def _nearest_existing(p: Path) -> Path:
 
 def _prewrite_check(base: Path, state: Path) -> None:
     """The refusals :func:`install` makes BEFORE it writes, read-only, so :func:`planned` (the dry run) refuses
-    exactly where the real install would (L1 wire2 F2): an existing ``read_budget`` or ``state`` that is a symlink
-    (or not a directory), and a missing one whose nearest existing ancestor this process cannot write and enter."""
+    exactly where the real install would (L1 wire2 F2): an existing ``read_budget`` or ``state`` that is a symlink, not
+    a directory, not this user's (``install`` chmods it) or not writable and enterable (L3 wire2 r1 M1), and a missing
+    one whose nearest existing ancestor is not a directory this process can write and enter."""
     for d in (base, state):
         if os.path.lexists(d):
             if d.is_symlink():
                 raise OSError(f"{d} is a symlink; the read budget needs a plain directory")
             if not d.is_dir():
                 raise NotADirectoryError(f"{d} is not a directory; the read budget needs a plain directory")
+            if hasattr(os, "geteuid") and os.stat(d).st_uid != os.geteuid():
+                raise PermissionError(f"{d} is not owned by this user; the read budget cannot set its mode")
+            if not os.access(d, os.W_OK | os.X_OK):
+                raise PermissionError(f"{d} is not writable; the read budget cannot write into it")
             continue
         anc = _nearest_existing(d)
+        if not anc.is_dir():
+            raise NotADirectoryError(f"{anc} is not a directory; the read budget cannot make {d}")
         if not os.access(anc, os.W_OK | os.X_OK):
             raise PermissionError(f"{anc} is not writable; the read budget cannot make {d}")
 

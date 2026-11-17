@@ -1539,6 +1539,57 @@ def test_planned_refuses_an_unwritable_home_as_install_does(tmp_path):
         os.chmod(home, 0o700)
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory modes")
+@pytest.mark.parametrize("which", ["read_budget", "state"])
+def test_planned_refuses_an_existing_unwritable_budget_directory_as_install_does(tmp_path, which):
+    """L3 wire2 r1 M1 (complement 1, deepseek 1): an EXISTING ``read_budget`` or ``state`` this process cannot write
+    refuses the dry run, with install()'s message. Revert: the existing-dir ``os.access`` clause of ``_prewrite_check``
+    (the dry run then passes and the real install refuses)."""
+    from levain.desk import read_budget_install
+    home = tmp_path / "home"
+    d = home / "read_budget" / "state" if which == "state" else home / "read_budget"
+    (home / "read_budget" / "state").mkdir(parents=True)
+    os.chmod(d, 0o500)
+    try:
+        with pytest.raises(PermissionError, match="not writable") as dry:
+            read_budget_install.planned(home)
+        with pytest.raises(PermissionError) as real:
+            read_budget_install.install(home)
+        assert str(dry.value) == str(real.value) and str(d) in str(dry.value)
+    finally:
+        os.chmod(d, 0o700)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX ownership")
+def test_planned_refuses_a_budget_directory_another_user_owns_as_install_does(tmp_path, monkeypatch):
+    """L3 wire2 r1 M1: install() chmods an existing budget directory, which only its owner can. Ownership is faked by
+    the effective uid (making a directory another user owns needs root). Revert: the ``st_uid`` clause."""
+    from levain.desk import read_budget_install
+    home = tmp_path / "home"
+    (home / "read_budget" / "state").mkdir(parents=True)
+    me = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: me + 1)
+    with pytest.raises(PermissionError, match="not owned") as dry:
+        read_budget_install.planned(home)
+    with pytest.raises(PermissionError) as real:
+        read_budget_install.install(home)
+    assert str(dry.value) == str(real.value)
+
+
+def test_planned_refuses_a_home_that_is_a_file_as_install_does(tmp_path):
+    """L3 wire2 r1 complement 2: the nearest existing ancestor is a file a W_OK|X_OK check passes (mode 0755). Revert:
+    the ``anc.is_dir()`` clause (the dry run passes, install fails with NotADirectoryError)."""
+    from levain.desk import read_budget_install
+    home = tmp_path / "home"
+    home.write_text("x")
+    os.chmod(home, 0o755)
+    with pytest.raises(NotADirectoryError) as dry:
+        read_budget_install.planned(home)
+    with pytest.raises(NotADirectoryError) as real:
+        read_budget_install.install(home)
+    assert str(dry.value) == str(real.value) and home.read_text() == "x"
+
+
 def test_install_makes_every_missing_directory_0700_whatever_the_umask(tmp_path):
     """L1 wire2 F3: ``mkdir(parents=True)`` left the parents at the umask's mode. Revert: install's ``parents=True``."""
     from levain.desk import read_budget_install

@@ -33,6 +33,11 @@ def rig(tmp_path, monkeypatch):
     from levain.cockpit.firejournal import CockpitDB
     world = World(tmp_path)
     CockpitDB(world.root).set_install_class("reported")
+    # the seat's $TMPDIR (an implicit sandbox write root) apart from the levain home: a lease launch refuses a read
+    # budget under it (L3 wire2 r1 codex HIGH), and pytest's homes all live under the real $TMPDIR
+    seat_tmp = tmp_path / "seat-tmp"
+    seat_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(seat_tmp))
     src = tmp_path / "source"
     src.mkdir()
     _git(src, "init", "-q")
@@ -330,11 +335,15 @@ def test_a_lease_profile_without_the_levain_home_refuses(rig):
                               key_dir=rig.key_dir, managed=())
 
 
-def test_a_dry_run_writes_no_read_budget_and_a_launch_carries_it(rig):
+def test_a_dry_run_writes_no_read_budget_and_a_launch_carries_it(rig, monkeypatch):
     """Row 800. ``--dry-run`` mints nothing: the levain home has no read_budget directory after it; the real launch
-    installs the script and carries the hook and the state dir in the profile's own env."""
+    installs the script and carries the hook and the state dir in the profile's own env. The home is this test's own,
+    under tmp_path (L3 wire2 r1 deepseek 4: the launch writes there, never into a real levain home)."""
     import io
+    from levain import host_guard as hg
+    monkeypatch.setenv("LEVAIN_HOME", str(rig.tmp / "levain-home"))
     home = sl._levain_home()
+    assert hg.is_within(home, rig.tmp) and not hg.is_within(home, os.environ["TMPDIR"])
     rig.sign_lease()
     out, err = io.StringIO(), io.StringIO()
     rc = sl.validate_launch("lane-p", str(rig.src), rig.sha, claude_bin=rig.claude, python=sys.executable,

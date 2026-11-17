@@ -176,11 +176,74 @@ def test_lease_none_only_under_canary_prefix(rig, tmp_path):
                               lease=None, key_dir=keys, canary_root=other, managed=[])
 
 
+def _lease_home() -> Path:
+    """A levain home OUTSIDE the rig's $TMPDIR (the rig sets it to tmp_path): the conftest's per-test ``$LEVAIN_HOME``,
+    a sibling of tmp_path under pytest's base temp, which no implicit root of the rig's environ covers."""
+    home = Path(os.path.realpath(os.environ["LEVAIN_HOME"])) / "lhome"
+    assert not any(hg.is_within(home, t) for t in sp.implicit_write_roots(os.environ))
+    return home
+
+
+def _lease(base):
+    return {"kind": sp.SEAT_LEASE_KIND, "agent": "claude_code", "lanes_parent": str(base), "returns_parent": str(base)}
+
+
+@pytest.mark.parametrize("root", [*sp.IMPLICIT_TMP_ROOTS, "$TMPDIR"])
+def test_a_lease_launch_refuses_a_read_budget_home_under_an_implicit_temp_root(rig, root):
+    """L3 wire2 r1 codex HIGH. The sandbox lets the seat's Bash write /tmp, /private/tmp, /var/tmp, /dev/shm and its
+    $TMPDIR without an allowWrite entry: a read budget under one is a hook script the seat could rewrite and an
+    unsandboxed hook would exec. Refused before anything is written, naming the read budget and LEVAIN_HOME. Revert:
+    the ``implicit_write_roots`` clause of ``build_seat_profile`` (the build then passes and installs the script)."""
+    import secrets
+    base = rig[0]
+    parent = Path(os.environ["TMPDIR"]) if root == "$TMPDIR" else Path(root)
+    home = parent / f"levain-h1-{secrets.token_hex(6)}" / "home"
+    for dry in (True, False):
+        with pytest.raises(sp.SeatRefusal, match=r"read budget directory .* temp directory .*LEVAIN_HOME"):
+            build(rig, lease=_lease(base), canary_root=None, levain_home=home, dry_run=dry)
+    assert not os.path.lexists(home.parent)
+    # the same home under a non-temp parent builds (the refusal is narrow)
+    assert build(rig, lease=_lease(base), canary_root=None, levain_home=_lease_home()).env["LEVAIN_READ_BUDGET_DIR"]
+
+
+def test_an_explicit_budget_home_is_held_to_the_temp_roots_too(rig):
+    """The canary's per-run home is checked as a lease's is: a ``budget_home`` under $TMPDIR refuses."""
+    with pytest.raises(sp.SeatRefusal, match="temp directory"):
+        build(rig, budget_home=Path(os.environ["TMPDIR"]) / "bh")
+
+
+def test_implicit_write_roots_are_resolved_and_carry_the_seats_tmpdir(tmp_path):
+    roots = sp.implicit_write_roots({"TMPDIR": str(tmp_path)})
+    assert Path(os.path.realpath(tmp_path)) in roots and Path(os.path.realpath("/tmp")) in roots
+    assert all(r == Path(os.path.realpath(r)) for r in roots) and len(set(roots)) == len(roots)
+    assert Path(os.path.realpath(tmp_path)) not in sp.implicit_write_roots({})
+
+
+def test_a_refused_build_installs_no_read_budget(rig, monkeypatch):
+    """L3 wire2 r1 deepseek 2. A build refused by the managed-settings check (the LAST refusal) leaves no
+    ``read_budget`` behind. Revert: the install above that ``if problems: raise``."""
+    home = _lease_home()
+    monkeypatch.setattr(sp.hg, "check_managed_settings", lambda *a, **k: ["a managed setting refuses"])
+    with pytest.raises(sp.SeatRefusal, match="a managed setting refuses"):
+        build(rig, lease=_lease(rig[0]), canary_root=None, levain_home=home)
+    assert not (home / "read_budget").exists()
+
+
+def test_a_budget_hook_event_seat_record_does_not_register_is_added_not_a_crash(rig, monkeypatch):
+    """L3 wire2 r1 deepseek 3. Revert: ``hooks[ev]`` for ``hooks.get(ev, [])`` (a KeyError out of the builder)."""
+    from levain.desk import read_budget
+    real = read_budget.settings_hooks
+    group = {"matcher": "Read", "hooks": [{"type": "command", "command": "x read_budget-extra"}]}
+    monkeypatch.setattr(read_budget, "settings_hooks", lambda py, s: {**real(py, s), "SessionStart": [group]})
+    p = build(rig)
+    assert p.settings["hooks"]["SessionStart"] == [group]
+
+
 def test_lease_paths_checked(rig, tmp_path):
     base, keys, _ = rig
     lease = {"kind": sp.SEAT_LEASE_KIND, "agent": "claude_code", "lanes_parent": str(base),
              "returns_parent": str(base)}
-    home = tmp_path / "lhome"
+    home = _lease_home()           # a lease launch refuses a home under the rig's $TMPDIR (tmp_path): L3 wire2 r1 H1
     assert build(rig, lease=lease, canary_root=None, levain_home=home).clone == base / "lane"
     bad = {**lease, "lanes_parent": str(tmp_path / "nope")}
     with pytest.raises(sp.SeatRefusal, match="lanes_parent"):

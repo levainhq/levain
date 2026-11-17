@@ -386,7 +386,7 @@ def test_run_builds_through_the_one_builder_and_removes_its_root(tmp_path):
         t.timed_out = True
         return t
 
-    env = {"TMPDIR": str(tmp_path)}
+    env = {**os.environ, "TMPDIR": str(tmp_path)}
     v = sc.run_seat_canary(claude_bin="/bin/claude", python="/usr/bin/python3", swap_attempts=3, environ=env,
                            drive=drive, profile_factory=factory)
     assert seen["lease"] is None and Path(seen["canary_root"]).parts[-2] == sc.CANARY_DIRNAME
@@ -398,7 +398,7 @@ def test_run_builds_through_the_one_builder_and_removes_its_root(tmp_path):
 
 def test_run_refuses_zero_swap_attempts(tmp_path):
     with pytest.raises(ValueError):
-        sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=0, environ={"TMPDIR": str(tmp_path)})
+        sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=0, environ={**os.environ, "TMPDIR": str(tmp_path)})
 
 
 # --- L3 z1 r1 -----------------------------------------------------------------------------------------------------
@@ -525,7 +525,7 @@ def test_the_run_plants_the_notebooks_and_control_files_before_the_turn(tmp_path
         return t
 
     sc.run_seat_canary(claude_bin="/bin/claude", python="/usr/bin/python3", swap_attempts=2,
-                       environ={"TMPDIR": str(tmp_path)}, drive=drive, profile_factory=factory)
+                       environ={**os.environ, "TMPDIR": str(tmp_path)}, drive=drive, profile_factory=factory)
     names = seen["files"]
     assert sum(n.startswith("nb-") for n in names) == 2 and "nb.ipynb" in names
     assert any(n.startswith("grep-ctl-") for n in names) and any(n.startswith("outside-") for n in names)
@@ -575,7 +575,7 @@ def _run(tmp_path, monkeypatch, *, tools=CC_SEAT_TOOLS, edit_turn=None, swap_att
         return t
 
     v = sc.run_seat_canary(claude_bin="/bin/claude", python="/usr/bin/python3", swap_attempts=swap_attempts,
-                           environ={"TMPDIR": str(tmp_path)}, drive=drive, profile_factory=factory, tools=tools)
+                           environ={**os.environ, "TMPDIR": str(tmp_path)}, drive=drive, profile_factory=factory, tools=tools)
     return v, seen
 
 
@@ -742,7 +742,7 @@ def test_a_canary_set_that_names_a_tool_not_admitted_or_half_a_probe_is_refused(
     with pytest.raises(ValueError):
         sc.check_canary_tools(tools)
     with pytest.raises(ValueError):
-        sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=2, environ={"TMPDIR": str(tmp_path)}, tools=tools)
+        sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=2, environ={**os.environ, "TMPDIR": str(tmp_path)}, tools=tools)
     with pytest.raises(SystemExit):
         sc.main(["--claude-bin", "c", "--tools", ",".join(tools) or ","])
 
@@ -779,7 +779,7 @@ def _spy_run(tmp_path, **kw):
         t.timed_out = True
         return t
     sc.run_seat_canary(claude_bin="/bin/claude", python="/usr/bin/python3", swap_attempts=2,
-                       environ={"TMPDIR": str(tmp_path)}, drive=drive, profile_factory=lambda clone, ret, **k: _ModelSpy(seen), **kw)
+                       environ={**os.environ, "TMPDIR": str(tmp_path)}, drive=drive, profile_factory=lambda clone, ret, **k: _ModelSpy(seen), **kw)
     return seen["model"]
 
 
@@ -800,7 +800,7 @@ def test_the_cli_reaches_the_real_run_with_its_model(tmp_path, monkeypatch):
 
     def wrapped(**kw):
         return real(**kw, drive=lambda argv, **d: _timed_out_turn(),
-                    profile_factory=lambda clone, ret, **k: _ModelSpy(seen), environ={"TMPDIR": str(tmp_path)})
+                    profile_factory=lambda clone, ret, **k: _ModelSpy(seen), environ={**os.environ, "TMPDIR": str(tmp_path)})
     monkeypatch.setattr(sc, "run_seat_canary", wrapped)
     sc.main(["--claude-bin", "/bin/claude", "--swap-attempts", "2", "--model", "opus"])
     assert seen["model"] == "opus"
@@ -823,22 +823,43 @@ def test_init_event_compares_the_levain_gh_tools_exactly():
     assert status(ev(**{"P0.init": init(tools=[*CC_SEAT_TOOLS])}), "P0") == "fail"
 
 
-def test_the_canary_profile_carries_the_read_budget_under_its_own_prefix(tmp_path):
-    """Row 800. The canary has no levain home: its budget lives under the canary prefix, never the real home."""
+def _canary_budget_run(tmp_path, *, stop: bool):
+    """Run the canary through the REAL builder; ``stop`` raises after the build (a failed run), else the turn times out."""
     import sys
-    from levain.seat_profile import real_levain_home
     seen = {}
 
     def factory(clone, ret, **kw):
         prof = sc.build_seat_profile(clone, ret, **{**kw, "managed": []})
         seen["state"] = prof.env["LEVAIN_READ_BUDGET_DIR"]
         seen["hooks"] = prof.settings["hooks"]
-        raise RuntimeError("stop after the build")
+        seen["allow"] = prof.settings["sandbox"]["filesystem"]["allowWrite"]
+        Path(seen["state"], "session-x.jsonl").write_text("{}\n")      # what a PostToolUse ledger write leaves
+        if stop:
+            raise RuntimeError("stop after the build")
+        return prof
     try:
         sc.run_seat_canary(claude_bin="/bin/echo", python=sys.executable, swap_attempts=1,
-                           drive=lambda argv, **d: _timed_out_turn(), profile_factory=factory, environ={**os.environ, "TMPDIR": str(tmp_path)})
+                           drive=lambda argv, **d: _timed_out_turn(), profile_factory=factory,
+                           environ={**os.environ, "TMPDIR": str(tmp_path)})
     except Exception:  # noqa: BLE001 - the verdict path is not under test
         pass
-    assert "levain-seat-canary" in seen["state"] and "/levain-home/read_budget/state" in seen["state"]
-    assert not seen["state"].startswith(str(real_levain_home(os.environ)))
+    return seen
+
+
+@pytest.mark.parametrize("stop", [True, False])
+def test_the_canary_budget_home_is_per_run_outside_every_temp_root_and_removed(tmp_path, stop):
+    """Row 800, L3 wire2 r1 codex HIGH + LOW. The canary's root is under $TMPDIR, which its seat's sandbox can write, so
+    its read budget lives in a per-run home under ``<real levain home>/seat_canary/<nonce>`` (never the home's own
+    ``read_budget``), and the run removes it, ledger and all. Revert: ``budget_home=`` in ``run_seat_canary`` (the state
+    is then under the canary prefix in $TMPDIR) or its ``rmtree`` (the home and its ledger stay)."""
+    from levain import seat_profile as sp
+    home = Path(os.path.realpath(sp.real_levain_home(os.environ)))
+    seen = _canary_budget_run(tmp_path, stop=stop)
+    state = Path(seen["state"])
+    assert state.parent.parent.parent == home / sp.CANARY_BUDGET_DIRNAME and state.parts[-2:] == ("read_budget", "state")
+    assert not any(sp.hg.is_within(state, t) for t in sp.implicit_write_roots({"TMPDIR": str(tmp_path)}))
+    assert not any(sp.hg.is_within(state, r) for r in seen["allow"])
     assert any("read_budget-" in h["command"] for g in seen["hooks"]["PreToolUse"] for h in g["hooks"])
+    assert not os.path.lexists(state.parent.parent) and not os.path.lexists(home / sp.CANARY_BUDGET_DIRNAME)
+    assert not (home / "read_budget").exists()                       # the home's own budget is never touched
+    assert not (tmp_path / sc.CANARY_DIRNAME / "levain-home" / "read_budget").exists()   # nor the shared prefix one

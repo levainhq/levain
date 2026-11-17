@@ -65,6 +65,23 @@ def real_levain_home(environ: Mapping[str, str]) -> Path:
     return queue_dir_for(environ).parent
 
 
+#: The temp roots Claude Code's sandbox lets sandboxed Bash write WITHOUT an ``allowWrite`` entry (L3 wire2 r1 codex
+#: HIGH), plus the seat's own ``$TMPDIR`` (:func:`implicit_write_roots`): a host-owned file under one is the seat's.
+IMPLICIT_TMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/dev/shm")
+
+#: The canary's per-run read-budget home, ``<real levain home>/seat_canary/<nonce>``: outside every temp root (the
+#: canary's own root is under ``$TMPDIR``, which its seat can write) and apart from the home's own ``read_budget``.
+CANARY_BUDGET_DIRNAME = "seat_canary"
+
+
+def implicit_write_roots(environ: Mapping[str, str]) -> tuple[Path, ...]:
+    """:data:`IMPLICIT_TMP_ROOTS` and ``environ``'s ``TMPDIR`` (the one :func:`levain.host_guard.host_env` hands the
+    seat), each resolved, without repeats. Over-inclusive on purpose: a root the sandbox does not grant only makes the
+    read-budget check stricter."""
+    tmpdir = environ.get("TMPDIR")
+    return tuple(dict.fromkeys(_real(c) for c in (*IMPLICIT_TMP_ROOTS, *([tmpdir] if tmpdir else []))))
+
+
 class SeatRefusal(HostRefusal):
     """A seat profile is refused. ``str()`` is the reason shown to the operator."""
 
@@ -538,7 +555,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
                        home: Path | None = None, egress: Mapping[str, Any] | None = None,
                        cockpit_root: Path | str | None = None, levain_home: Path | str | None = None,
                        tools: Sequence[str] = CC_SEAT_TOOLS, base_sha: str | None = None,
-                       dry_run: bool = False) -> SeatProfile:
+                       dry_run: bool = False, budget_home: Path | str | None = None) -> SeatProfile:
     """Build the terminal seat profile, or raise :class:`SeatRefusal` naming every problem found. ``lease=None`` is
     accepted only with ``canary_root`` under the fixed test prefix. Refuses a root that already holds an agent-config
     target, and an executable (python, claude) a seat could write.
@@ -562,9 +579,13 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     refuses, as does every other protected name.
 
     Every seat carries the read budget (levain row 800): its PreToolUse/PostToolUse ``Read`` hook groups are APPENDED to
-    the event lists (``seat_record`` stays first, no new event name) and ``LEVAIN_READ_BUDGET_DIR`` rides ``env``. Its
-    home is the levain home (the canary's own home under its prefix). ``dry_run`` names the same paths and writes
-    nothing (``levain seat launch --dry-run`` mints nothing)."""
+    the event lists (``seat_record`` stays first) and ``LEVAIN_READ_BUDGET_DIR`` rides ``env``. Its home is
+    ``budget_home`` when given (:func:`levain.seat_canary.run_seat_canary` passes a per-run one under
+    :data:`CANARY_BUDGET_DIRNAME` and removes it), else the levain home (a canary built without one: its own home under
+    its prefix). A lease launch, and any ``budget_home`` given, refuses when the budget directory lies inside a seat root
+    or an :func:`implicit_write_roots` temp root: the seat could rewrite the script an unsandboxed hook execs (L3 wire2
+    r1 codex HIGH). The install runs only once every refusal is in (a refused build writes nothing). ``dry_run`` names
+    the same paths and writes nothing (``levain seat launch --dry-run`` mints nothing)."""
     environ = os.environ if environ is None else environ
     tools = tuple(tools)
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
@@ -598,9 +619,17 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     pkg = Path(__file__).resolve().parent
     problems += [f"the levain package ({pkg}) is inside a seat root" for r in roots if hg.is_within(pkg, r)]
     # the read budget's script is exec'd by an unsandboxed hook: a seat that could write it would run code outside its bound
-    budget_dir = gh_home / "read_budget"
+    b_home = _real(budget_home) if budget_home is not None else gh_home
+    budget_dir = b_home / "read_budget"
     problems += [f"the read budget directory ({budget_dir}) is inside a seat root" for r in roots
                  if hg.is_within(budget_dir, r)]
+    if lease is not None or budget_home is not None:
+        # the sandbox's IMPLICIT writable roots too, not only allowWrite (L3 wire2 r1 codex HIGH)
+        tmp_hit = next((t for t in implicit_write_roots(environ) if hg.is_within(budget_dir, t)), None)
+        if tmp_hit is not None:
+            problems.append(f"the read budget directory ({budget_dir}) is inside {tmp_hit}, a temp directory the seat's "
+                            "sandbox lets it write, so the seat could rewrite the hook script: set LEVAIN_HOME to a "
+                            "directory outside every temp root (the default ~/.levain is)")
     if problems:
         raise SeatRefusal("; ".join(problems))
 
@@ -638,14 +667,21 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         from levain import seat_push
         hooks = {**hooks, **seat_push.hook_entries(python, clone=clone, key_dir=key_dir, cockpit_root=cockpit_root,
                                                    home=Path(levain_home))}
+    problems += hg.check_sandbox_types(sandbox)
+    problems += hg.check_managed_settings(
+        hg.load_managed_settings(platform) if managed is None else managed, roots,
+        trusted_hooks=hg.load_managed_trust(platform, environ, home))
+    if problems:
+        raise SeatRefusal("; ".join(problems))
+    # the install only now, after every refusal (L3 wire2 r1 deepseek 2: a refused build left read_budget/ behind)
     from levain.desk import read_budget, read_budget_install
     try:
-        script, state = (read_budget_install.planned if dry_run else read_budget_install.install)(gh_home)
+        script, state = (read_budget_install.planned if dry_run else read_budget_install.install)(b_home)
         budget_hooks = read_budget.settings_hooks(python, script)
     except (OSError, ValueError) as exc:
         raise SeatRefusal(f"the read budget could not be installed ({type(exc).__name__}: {str(exc)[:200]})") from None
-    # APPEND, never replace: seat_record stays first in each event, and no event name is added
-    hooks = {**hooks, **{ev: [*hooks[ev], *groups] for ev, groups in budget_hooks.items()}}
+    # APPEND, never replace: seat_record stays first in each event (an event it does not register starts empty)
+    hooks = {**hooks, **{ev: [*hooks.get(ev, []), *groups] for ev, groups in budget_hooks.items()}}
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],
@@ -655,12 +691,6 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         "autoMemoryEnabled": False,
         "hooks": hooks,
     }
-    problems += hg.check_sandbox_types(sandbox)
-    problems += hg.check_managed_settings(
-        hg.load_managed_settings(platform) if managed is None else managed, roots,
-        trusted_hooks=hg.load_managed_trust(platform, environ, home))
-    if problems:
-        raise SeatRefusal("; ".join(problems))
     # LEVAIN_READ_BUDGET_DIR is a DELIBERATE addition outside host_env's allowlist (the hook is inert without it). It is
     # delivered through the profile's own env, which launch_seat hands the process and digest() binds, not through the
     # settings ``env`` key (unmeasured under ``--setting-sources ""``). A path only, host-owned.
