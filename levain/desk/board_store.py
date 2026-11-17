@@ -73,6 +73,7 @@ DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 AUTHOR_KINDS = ("operator", "agent")
 GRADE_ASSERTED = "asserted"
+SIGNED_CHAIN_MOVED = "the board changed while you signed: sign again"
 
 
 class BoardError(RuntimeError):
@@ -597,9 +598,11 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
     break, which the verifier reports.
 
-    ``seal`` (see :mod:`levain.desk.board_sign`) is called on the chained record, under the lock, before the size check and the
-    write: it returns the record to write (with its ``sig``) or raises BoardError, and then nothing is written. A signer that is
-    slow holds the lock for that long; a re-read after a lock-free writer's append signs again."""
+    ``seal`` (see :mod:`levain.desk.board_sign`) is run on the chained record by ``board_sign.admit``, under the lock, before
+    the size check and the write: the signature is made, the authority log is replayed and the signed record must verify, or
+    BoardError is raised and nothing is written. A signer that is slow holds the lock for that long. After a seal, a store
+    file that was replaced or grew is a refusal (:data:`SIGNED_CHAIN_MOVED`), never a re-read: a second prompt is never
+    shown for one write."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
@@ -617,7 +620,10 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
                 if seal is not None:
-                    rec = seal(rec)                         # signs the bytes that include prev; raises, writing nothing, on any failure
+                    from levain.desk import board_sign
+                    rec = board_sign.admit(target, seal, rec)       # signs the bytes that include prev, then verifies; raises on any failure
+                    if not _same_file(fd, path) or os.fstat(fd).st_size != len(raw):
+                        raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
                 if os.fstat(fd).st_size != len(raw):
                     continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
@@ -653,17 +659,24 @@ def _store_lines(target: Target) -> list[bytes]:
     return out
 
 
-def _graded(target: Target, rec: dict, seal) -> dict:
-    """The writer's last word on a built record, before ``prev`` and before any prompt: the grade from the seal's ``via``
-    (``asserted`` with none), a signed record's author must be the operator, and the fixed policy
-    (:func:`levain.desk.board_sign.require_policy`) must accept it."""
+def _graded(target: Target, rec: dict, seal, authority=None) -> dict:
+    """The writer's word on a built record, before ``prev`` and before any prompt: the grade the seal's ``via`` claims
+    (``asserted`` with none; a claimed grade is earned only by ``board_sign.admit`` after the ceremony), a signed record's
+    author must be the operator, and the fixed policy (:func:`levain.desk.board_sign.require_policy`) must accept it. A
+    record carrying ``cause`` has it checked here against the authority log read now (the seal's source, else
+    ``authority``): for an unsigned record no blocking step follows this check; a sealed one is checked again by ``admit``
+    against the log replayed after the ceremony."""
     from levain.desk import board_sign
     if seal is not None:
         board_sign.check_signable(rec)
         rec = {**rec, "grade": seal.grade}
     grade = rec["grade"]
-    needs_lines = rec["op"] == "decide" and "cause" in rec and grade not in board_sign.SIGNED_GRADES
-    board_sign.require_policy(rec["op"], grade, rec, lines=_store_lines(target) if needs_lines else ())
+    lines, snapshot = (), None
+    if "cause" in rec and rec["op"] == "decide" and rec.get("decision") == "cut":
+        lines = _store_lines(target)
+        source = seal.authority if seal is not None else authority
+        snapshot = board_sign.read_authority(source) if source is not None else None
+    board_sign.require_policy(rec["op"], grade, rec, lines=lines, snapshot=snapshot)
     return rec
 
 
@@ -777,9 +790,12 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
     return _append(target, build, seal=seal)[0]["id"]
 
 
-def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None) -> str:
+def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None,
+           authority=None) -> str:
     """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
-    ``abandon-track``'s cuts carry it); it is written after ``date`` only when given."""
+    ``abandon-track``'s cuts carry it); it is written after ``date`` only when given. A cut's cause (P2-d) is checked against
+    ``authority``, an authority SOURCE read under the lock (``board_sign.resolve_authority``); a sealed decide checks it
+    against the seal's source instead."""
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
@@ -793,7 +809,7 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
 
     def build(recs):
         _require_known(recs, item_id)
-        return _graded(target, build_record("decide", item_id, by, body, now, author=author), seal), True
+        return _graded(target, build_record("decide", item_id, by, body, now, author=author), seal, authority), True
 
     _preflight(seal)
     return _append(target, build, seal=seal)[0]["id"]
