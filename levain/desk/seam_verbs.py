@@ -228,17 +228,15 @@ def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
         _emit(out, args.json, {"rotated": False, "why": got.why},
               f"not rotated: {got.why}\nnothing was written; this desk keeps its lease and keeps working")
         return 0
+    if isinstance(got, dream_rotation.AlreadyStored):
+        raise CoordError(f"this is not a rotation: the dream occurrence {got.occurrence} already has handoff "
+                         f"{got.handoff.handoff_id} ({got.handoff.close_key}); nothing was written and this desk "
+                         "stays live")
     h = got.handoff
-    if got.successor is None:
-        _emit(out, args.json, {"rotated": False, "already_rotated": True, "handoff_id": h.handoff_id,
-                               "occurrence": got.occurrence},
-              f"not rotated again: the dream occurrence {got.occurrence} already has handoff {h.handoff_id} "
-              f"({h.close_key}); nothing was written and this desk keeps its lease")
-        return 0
     _emit(out, args.json, {"rotated": True, "handoff_id": h.handoff_id, "occurrence": got.occurrence,
                            "successor_launch_id": got.successor.launch_id},
           f"rotated: handoff {h.handoff_id} (dream, occurrence {got.occurrence}) "
-          f"{'was already written by this desk and is adopted' if got.adopted else 'written'}; this desk's lease is "
+          f"written; this desk's lease is "
           f"released and the next desk (launch {got.successor.launch_id}) is asked for; it opens from the handoff. "
           "Stop here: your writes are fenced now.")
     return 0
