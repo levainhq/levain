@@ -187,7 +187,20 @@ def _grade(store: Any, question: Any) -> str:
     where = "phone" if answer.channel == "phone" else "terminal"
     if signed is True:
         return f"signed-{where}"
+    if _countersigned(store, question.id):
+        return "countersigned"
     return f"unsigned-{where}" if signed is False else "unknown"
+
+
+def _countersigned(store: Any, question_id: str) -> bool:
+    """A remote answer recorded unsigned whose sign card the phone's passkey signed over exactly that answer
+    (levain.consent.answer_countersign: fail closed, only a verified signature reads so)."""
+    try:
+        from levain import band_view
+
+        return band_view._remote_badge(store, question_id).startswith("countersigned")
+    except Exception:                               # noqa: BLE001 - a countersign that cannot be judged is not one
+        return False
 
 
 def _items_in(*texts: Any) -> list[str]:

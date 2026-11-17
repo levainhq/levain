@@ -57,7 +57,10 @@ PRODUCER_FUTURE_SKEW_S = 60
 PRODUCER_SOURCES = ("seats", "band", "waiters")
 #: How a resolved band row was answered, weakest first. Two producers that resolved one row differently are read at the
 #: weaker grade; a grade this list does not hold is weaker than every one it does.
-GRADE_ORDER = ("unknown", "unsigned-terminal", "unsigned-phone", "signed-terminal", "signed-phone")
+GRADE_ORDER = ("unknown", "unsigned-terminal", "unsigned-phone", "signed-terminal", "countersigned", "signed-phone")
+#: The grades at which a ``done_kind: band`` item's resolved row closes it (P5): a signature, or a phone passkey's
+#: countersignature over exactly the recorded answer (levain.consent.answer_countersign).
+SIGNED_GRADES = ("signed-phone", "signed-terminal", "countersigned")
 #: Evidence older than this reads unknown (6 h: judged in the design page, to be set by the land waiter's own fetch
 #: cadence; one named constant so the line moves in one place).
 MAX_EVIDENCE_AGE_S = 21600
@@ -749,6 +752,7 @@ class Evidence:
     documents: Mapping[str, bool]
     unattributed: tuple[Unattributed, ...]
     band_grade: Mapping[str, str] = field(default_factory=dict)       # resolved band row -> how it was answered
+    band_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)   # resolved band row -> the items it names
 
     @classmethod
     def from_dict(cls, obj: Any, *, now: datetime | None, store_id: str | None = None) -> "Evidence":
@@ -819,6 +823,10 @@ class Evidence:
                 resolutions.setdefault(r.id, set()).add((r.by, r.grade))
         band_resolved: dict[str, str] = {}
         band_grade: dict[str, str] = {}
+        band_items: dict[str, tuple[str, ...]] = {}
+        for r in composed["band"][0]:
+            if r.state == "resolved":
+                band_items[r.id] = tuple(dict.fromkeys(band_items.get(r.id, ()) + r.items))
         for rid, pairs in resolutions.items():              # two producers that disagree: both are named, the weaker grade stands
             ordered = sorted(pairs)
             band_resolved[rid] = ordered[0][0] if len(ordered) == 1 else "; ".join(f"{by} ({grade})" for by, grade in ordered)
@@ -828,7 +836,7 @@ class Evidence:
         raw_fetched = obj.get("fetched_at")
         fetched_at = raw_fetched if isinstance(raw_fetched, str) and raw_fetched.strip() else None
         return cls(fetched_at, parse_timestamp(fetched_at), unreadable, main, chain, branches, refs_merged[0],
-                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade)
+                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade, band_items)
 
     def unreadable_reason(self, source: str) -> str | None:
         """Why ``source`` cannot be trusted, or None. ``git`` stands for the four git-derived sources and ``notes`` for
@@ -1243,6 +1251,10 @@ def _rule_done(ctx: _Ctx, item: Item) -> State | None:
     if kind in ("document", "run"):
         return ctx.make(item, "done", f"{kind} {path} exists", (path,)) if ev.documents.get(path) is True else None
     if path in ev.band_resolved and path not in ev.band_open:
+        if ev.band_grade.get(path, "unknown") not in SIGNED_GRADES:
+            return ctx.make(item, "landed_not_closed", f"residue cleared without a signature: file a signing row for {path}", (path,))
+        if item.id not in ev.band_items.get(path, ()):      # P5-b: a signed row that names some other item closes nothing here
+            return ctx.make(item, "landed_not_closed", f"band row {path} does not name {item.id}: file a signing row that names it", (path,))
         return ctx.make(item, "done", f"band {path} resolved by {ev.band_resolved[path]}", (path,))
     return None
 

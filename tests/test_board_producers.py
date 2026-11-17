@@ -227,8 +227,8 @@ def test_a_band_row_that_is_not_whole_makes_that_producer_incomplete_and_closes_
 
 
 def test_two_producers_that_resolve_one_row_differently_name_both_and_take_the_weaker_grade_in_either_order():
-    a = {"id": "np-1", "state": "resolved", "items": [], "by": "phone", "grade": "signed-phone"}
-    b = {"id": "np-1", "state": "resolved", "items": [], "by": "cli", "grade": "unsigned-terminal"}
+    a = {"id": "np-1", "state": "resolved", "items": ["levain#1"], "by": "phone", "grade": "signed-phone"}
+    b = {"id": "np-1", "state": "resolved", "items": ["levain#1"], "by": "cli", "grade": "unsigned-terminal"}
     item = _item(1, done="np-1", done_kind="band")
     outs = []
     for first, second in ((a, b), (b, a)):
@@ -236,12 +236,14 @@ def test_two_producers_that_resolve_one_row_differently_name_both_and_take_the_w
         got, _ = board_of(ev2(**parts), item)
         ev = bs.Evidence.from_dict(ev2(**parts), now=NOW, store_id="s1")
         assert ev.band_grade == {"np-1": "unsigned-terminal"}
-        outs.append(got["levain#1"].reason)
-    assert outs[0] == outs[1] == "band np-1 resolved by cli (unsigned-terminal); phone (signed-phone)"
+        assert ev.band_resolved == {"np-1": "cli (unsigned-terminal); phone (signed-phone)"}
+        outs.append(got["levain#1"])
+    assert outs[0].state == outs[1].state == "landed_not_closed"      # P5: the weaker grade stands, so a signed native + an unsigned flow row is not a signature
+    assert outs[0].reason == outs[1].reason == "residue cleared without a signature: file a signing row for np-1"
 
 
 def test_a_band_done_item_rests_on_the_band_absence():
-    parts = merged(whole("levain", band=[{"id": "np-9", "state": "resolved", "items": [], "by": "phone", "grade": "signed-phone"}]),
+    parts = merged(whole("levain", band=[{"id": "np-9", "state": "resolved", "items": ["levain#1"], "by": "phone", "grade": "signed-phone"}]),
                    whole("flow"))
     item = _item(1, done="np-9", done_kind="band")
     got, _ = board_of(ev2(**parts), item)
@@ -685,3 +687,97 @@ def test_native_band_keeps_its_open_question_rows_when_the_authority_reread_rais
     got = {**got, "captured_at": _stamp(1.0)}                       # the test store's clock is not the board's NOW
     board, _ = board_of(ev2(seats=[blk("levain", [])], waiters=[blk("levain", [])], band=[got], producers=("levain",)), _item(9))
     assert board["levain#9"].state == "needs_you"
+
+
+# ------------------------------------------------------------------------------------------------ P5: a band-kind close is signed (levain#98)
+def _native_band_board(monkeypatch, tmp_path, *, sign, naming="levain#1", item_id=1, verdict=None, other=None):
+    """One native band question answered at a terminal, its signing sidecar and countersign verdict stubbed; the native
+    producer's rows folded for a ``done_kind: band`` item pointing at that row. Returns (state, the row's grade)."""
+    from levain import band_view
+    from levain.consent import answer_countersign as ac
+
+    store, qs, now = _numbered_store(tmp_path, f"confirm residue of {naming} is cleared")
+    store.answer(qs[0].id, option="y", channel="cli")
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: sign)
+    if verdict is not None:
+        monkeypatch.setattr(ac, "verdict", lambda *a, **k: ac.Verdict(verdict))
+    rows = bp.native_blocks(now=now, store_id=None, consent_dir=tmp_path)["band"]["rows"]
+    parts = merged(whole("levain", band=rows), whole("flow", band=other or []))
+    got, _ = board_of(ev2(**parts), _item(item_id, done=qs[0].id, done_kind="band"))
+    return got[f"levain#{item_id}"], {r["id"]: r["grade"] for r in rows}[qs[0].id]
+
+
+def test_a_signed_native_row_naming_the_item_closes_a_band_item(monkeypatch, tmp_path):
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "signed"})
+    assert (state.state, grade) == ("done", "signed-terminal")
+
+
+def test_an_unsigned_native_row_reads_ready_close_with_the_signing_reason(monkeypatch, tmp_path):
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "unsigned", "sign_reason": "x"})
+    assert grade == "unsigned-terminal" and state.state == "landed_not_closed" and state.column == "ready" and state.kind == "close"
+    assert state.reason.startswith("residue cleared without a signature: file a signing row for q-")
+
+
+def test_a_row_the_store_cannot_grade_reads_ready_close(monkeypatch, tmp_path):
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign=None)
+    assert grade == "unknown" and state.state == "landed_not_closed" and "without a signature" in state.reason
+
+
+def test_a_countersigned_remote_answer_closes_like_a_signed_one(monkeypatch, tmp_path):
+    """A countersign is a phone passkey's verified signature over exactly the recorded answer: signed strength, so it closes."""
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "unsigned", "sign_reason": "remote"}, verdict="countersigned")
+    assert (state.state, grade) == ("done", "countersigned")
+
+
+@pytest.mark.parametrize("verdict", ["open", "expired", "no-card", "disowned", "failed"])
+def test_a_remote_answer_whose_card_is_not_countersigned_does_not_close(monkeypatch, tmp_path, verdict):
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "unsigned", "sign_reason": "remote"}, verdict=verdict)
+    assert grade == "unsigned-terminal" and state.state == "landed_not_closed"
+
+
+def test_countersigned_sits_at_signed_strength_between_terminal_and_phone():
+    order = bs.GRADE_ORDER
+    assert order.index("signed-terminal") < order.index("countersigned") < order.index("signed-phone")
+    assert set(bs.SIGNED_GRADES) == {"signed-phone", "signed-terminal", "countersigned"}
+
+
+def test_a_signed_row_that_names_another_item_does_not_close_this_one(monkeypatch, tmp_path):
+    """P5-b: an amend re-pointing done at an unrelated signed row closes nothing."""
+    state, grade = _native_band_board(monkeypatch, tmp_path, sign={"sign_state": "signed"}, naming="levain#2", item_id=1)
+    assert grade == "signed-terminal" and state.state == "landed_not_closed"
+    assert state.reason.startswith("band row q-") and state.reason.endswith("does not name levain#1: file a signing row that names it")
+
+
+def test_a_native_row_names_its_items_from_the_question_text_or_blocks_only(tmp_path):
+    """What a desk row must carry for P5-b: the literal item id (repo#N) in the question's ``what`` or its ``blocks``."""
+    from levain.consent.questions import QuestionStore
+
+    store = QuestionStore(tmp_path)
+    kw = dict(agent="claude_code", agent_session_id="s", options=[("y", "yes"), ("n", "no")], rec="y", cwd=str(tmp_path))
+    in_what = store.file(what="confirm residue of levain#1", blocks="b", **kw)
+    in_blocks = store.file(what="confirm residue", blocks="the item is levain#1", **kw)
+    nowhere = store.file(what="confirm residue of the thing", blocks="b", **kw)
+    assert [bp._items_in(q.what, q.blocks) for q in (in_what, in_blocks, nowhere)] == [["levain#1"], ["levain#1"], []]
+
+
+def test_a_signed_native_row_and_an_unsigned_flow_row_for_one_id_read_ready_close(monkeypatch, tmp_path):
+    flow = [{"id": "PLACEHOLDER", "state": "resolved", "items": ["levain#1"], "by": "cli", "grade": "unsigned-terminal"}]
+    from levain import band_view
+
+    store, qs, now = _numbered_store(tmp_path, "confirm residue of levain#1 is cleared")
+    store.answer(qs[0].id, option="y", channel="phone")
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: {"sign_state": "signed"})
+    native = bp.native_blocks(now=now, store_id=None, consent_dir=tmp_path)["band"]["rows"]
+    assert native[0]["grade"] == "signed-phone"
+    flow[0]["id"] = qs[0].id
+    got, _ = board_of(ev2(**merged(whole("levain", band=native), whole("flow", band=flow))), _item(1, done=qs[0].id, done_kind="band"))
+    assert got["levain#1"].state == "landed_not_closed" and "without a signature" in got["levain#1"].reason
+
+
+def test_only_band_kind_items_change_a_merged_item_and_an_open_row_keep_their_labels():
+    open_row = {"id": "np-2", "state": "open", "items": ["levain#2"], "by": "", "grade": "unknown"}
+    unsigned = {"id": "np-1", "state": "resolved", "items": ["levain#3"], "by": "cli", "grade": "unsigned-terminal"}
+    items = [_item(2, done="np-2", done_kind="band"), _item(3), _item(4, done="np-1", done_kind="band")]
+    got, _ = board_of(ev2(**merged(whole("levain", band=[open_row, unsigned]), whole("flow"))), *items)
+    assert got["levain#2"].state == "needs_you"                       # an open row keeps today's reading
+    assert got["levain#3"].state == "ready"                           # a merged item is untouched by a band row's grade

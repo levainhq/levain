@@ -277,9 +277,9 @@
    },
    "expect": {
     "levain#4": {
-     "column": "done",
-     "reason_contains": "np-aaaaaaaa resolved by phill",
-     "state": "done"
+     "column": "ready",
+     "reason_contains": "residue cleared without a signature: file a signing row for np-aaaaaaaa",
+     "state": "landed_not_closed"
     }
    },
    "items_lines": [
