@@ -536,7 +536,9 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
         "(`coord open` prints the H to use; the body is JSON with state_line, in_flight, next, contingencies, "
         "notes, attested_operator_present, attested_walked; `coord handoff show` reads one back). In it, name rows "
         "by id (dr-..., item keys), never by ordinal: the next desk sees ids, not your order. For the "
-        "operator leaving, `next` and `contingencies` are the night plan.",
+        "operator leaving, `next` and `contingencies` are the night plan. For the dream, at a seam you chose, "
+        f"`{lv} coord open --dream-body-file PATH --token N {tail}` (the same body; no --light, no --ack) writes the "
+        "dream handoff and asks for the next desk in one step; it does nothing unless a dream saved after you started.",
         "",
     ]
 

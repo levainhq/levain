@@ -18,7 +18,7 @@ from typing import Any
 from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.desk import lease as _leases
-from levain.desk import dream_status, seam_arrival, seam_handoffs, seam_open
+from levain.desk import dream_rotation, dream_status, seam_arrival, seam_handoffs, seam_open
 from levain.desk.seam import _trim, open_brief, verbose_lines
 from levain.desk.seam_build import build
 from levain.desk.store import CoordError, StoreAbsent
@@ -101,9 +101,23 @@ def _run_plan(args: argparse.Namespace, out: Any, store: Any) -> int:
     return 0
 
 
-def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
+def _load_body(path: Path) -> dict[str, Any]:
+    """The handoff body file as one JSON object with each key once; a refusal otherwise (nothing was written)."""
     from levain.desk.cli import _read_file
 
+    text = _read_file(path, _BODY_FILE_MAX, "the handoff body")
+    try:
+        body = json.loads(text, object_pairs_hook=_once)
+    except (ValueError, RecursionError) as exc:
+        raise CoordError(f"the handoff body {path} is not one JSON object with each key once "
+                         f"({type(exc).__name__ if isinstance(exc, RecursionError) else str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
+    if not isinstance(body, dict):
+        raise CoordError(f"the handoff body {path} is not one JSON object with each key once (it is "
+                         f"JSON {type(body).__name__}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}")
+    return body
+
+
+def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
     if getattr(args, "plan", False):
         return _run_plan(args, out, store)
     missing = [flag for flag, v in (("--kind", args.kind), ("--body-file", args.body_file),
@@ -111,15 +125,7 @@ def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
     if missing:
         raise CoordError(f"coord close needs {', '.join(missing)} (or --plan to read the walk's checklist); nothing "
                          "was written")
-    text = _read_file(args.body_file, _BODY_FILE_MAX, "the handoff body")
-    try:
-        body = json.loads(text, object_pairs_hook=_once)
-    except (ValueError, RecursionError) as exc:
-        raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once "
-                         f"({type(exc).__name__ if isinstance(exc, RecursionError) else str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
-    if not isinstance(body, dict):
-        raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once (it is "
-                         f"JSON {type(body).__name__}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}")
+    body = _load_body(args.body_file)
     h = seam_handoffs.close(store, kind=args.kind, body=body, request_id=args.request_id,
                             prev_handoff_id=args.prev_handoff_id, token=args.token)
     try:
@@ -187,9 +193,67 @@ def _dream_notes(store: Any, launch: Any) -> list[str]:
     return [] if note is None else [note]
 
 
+def _rotated_handoff(store: Any, token: Any) -> Any:
+    """The dream handoff the desk that held lease ``token`` wrote when it rotated onto a dream, or None: a read.
+    The released lease's own release row names the holder, and only a launch ended with the rotation's cause counts."""
+    if token is None:
+        return None
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            row = conn.execute("SELECT holder FROM lease_events WHERE kind = 'release' AND token = ? "
+                               "ORDER BY seq DESC LIMIT 1", (token,)).fetchone()
+            ln = None if row is None else _leases._launch_by_key(conn, row[0])
+            if ln is None or ln.state != "ended" or ln.cause != _leases.DREAM_ROTATED:
+                return None
+            found = conn.execute(f"SELECT {seam_handoffs._COLUMNS} FROM seam_handoffs WHERE writer = ? AND "
+                                 "seam_kind = 'dream' ORDER BY handoff_id DESC LIMIT 1", (ln.session_key,)).fetchone()
+            return None if found is None else seam_handoffs._row(found)
+    except Exception:  # noqa: BLE001 - the refusal below still stands without the handoff's name
+        return None
+
+
+def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
+    """``coord open --dream-body-file PATH``: the live desk, at a seam it chose, hands itself over onto the memory a
+    dream saved (:func:`levain.desk.dream_rotation.rotate`). The ONE caller of the write; it runs before the open
+    builds, ingests or delivers anything, so the open's own unacknowledged delivery cannot read as mid-work."""
+    launch, why = _active(store, args.token)
+    if launch is None:
+        done = _rotated_handoff(store, args.token)
+        if done is not None:
+            raise CoordError(f"this desk already handed over onto the dream at handoff {done.handoff_id} "
+                             f"({done.close_key}); the next desk opens it; nothing was written")
+        raise CoordError(f"a dream rotation is the live desk's: {why}; nothing was written")
+    got = dream_rotation.rotate(store, token=args.token, body=_load_body(args.dream_body_file))
+    if isinstance(got, dream_rotation.NotDue):
+        _emit(out, args.json, {"rotated": False, "why": got.why},
+              f"not rotated: {got.why}\nnothing was written; this desk keeps its lease and keeps working")
+        return 0
+    h = got.handoff
+    if got.successor is None:
+        _emit(out, args.json, {"rotated": False, "already_rotated": True, "handoff_id": h.handoff_id,
+                               "occurrence": got.occurrence},
+              f"not rotated again: the dream occurrence {got.occurrence} already has handoff {h.handoff_id} "
+              f"({h.close_key}); nothing was written and this desk keeps its lease")
+        return 0
+    _emit(out, args.json, {"rotated": True, "handoff_id": h.handoff_id, "occurrence": got.occurrence,
+                           "successor_launch_id": got.successor.launch_id},
+          f"rotated: handoff {h.handoff_id} (dream, occurrence {got.occurrence}) "
+          f"{'was already written by this desk and is adopted' if got.adopted else 'written'}; this desk's lease is "
+          f"released and the next desk (launch {got.successor.launch_id}) is asked for; it opens from the handoff. "
+          "Stop here: your writes are fenced now.")
+    return 0
+
+
 def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     light = bool(getattr(args, "light", False))
     gap_hours = getattr(args, "gap_hours", None)
+    if getattr(args, "dream_body_file", None) is not None:
+        # the flag is the desk's own statement that it is at a seam (the store records no desk turn): never with the
+        # attended-turn verb, never with an acknowledgement
+        if light or gap_hours is not None or args.ack is not None or args.read_back_file is not None:
+            raise CoordError("--dream-body-file hands this desk over onto a dream and takes no --light, --gap-hours, "
+                             "--ack or --read-back-file; run them as separate commands; nothing was written")
+        return _run_dream_rotation(args, out, store)
     if args.ack is not None:
         # refused, not dropped: a caller that asked for a light open must not read an acknowledgement as one
         if light or gap_hours is not None:
