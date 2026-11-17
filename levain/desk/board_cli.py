@@ -115,8 +115,9 @@ def register(subparsers: Any) -> None:
 
     def author_args(parser: Any) -> None:
         parser.add_argument("--sign", action="store_true",
-                            help="Sign this record with the operator's Touch ID key (needs --author-kind operator, a fresh terminal "
-                                 "and an enrolled terminal key). The lock is held while the prompt is up; a refused prompt writes nothing.")
+                            help="Sign this record with the operator's Touch ID key (needs --author-kind operator, a fresh terminal, "
+                                 "a terminal key and the authority log that enrols it; the record is verified against that log before it is "
+                                 "written). The lock is held while the prompt is up; a refused prompt writes nothing.")
         parser.add_argument("--author-kind", dest="author_kind", choices=bs.AUTHOR_KINDS, default="agent",
                             help="Who writes: an operator or an agent (default agent). The name is --by.")
         parser.add_argument("--launch-key", dest="launch_key", default=None, metavar="KEY",
@@ -160,7 +161,8 @@ def register(subparsers: Any) -> None:
     author_args(d)
     d.add_argument("--date", default=None)
     d.add_argument("--cause", default=None, metavar="SHA256",
-                   help="For a cut: the sha256 of the signed or relayed abandon-track record this cut derives from.")
+                   help="For a cut: the lowercase hex sha256 of the signed abandon-track record this cut derives from, over that line's "
+                        "bytes exactly as written in the store file, without its trailing newline. Checked against the authority log.")
     d.add_argument("--items", type=str, metavar="PATH", help=items_help)
     d.set_defaults(func=run_decide)
     u = sub.add_parser("use", description="Make DIR this install's item store (created if needed); writes the pointer last.")
@@ -377,13 +379,14 @@ def _author(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _seal(args: argparse.Namespace, author: dict[str, str]):
-    """The seal for ``--sign`` (None without it). An agent author with ``--sign`` is refused here, before any prompt."""
+    """The seal for ``--sign`` (None without it). An agent author with ``--sign`` is refused here, before any prompt, and so
+    is an install with no authority log to verify the signature against (``board_sign.resolve_authority``)."""
     if not args.sign:
         return None
     if author["kind"] != "operator":
         raise bs.BoardError("--sign signs as the operator: add --author-kind operator")
     from levain.desk import board_sign
-    return board_sign.terminal_seal()
+    return board_sign.terminal_seal(authority=board_sign.resolve_authority())
 
 
 def run_add(args: argparse.Namespace) -> int:
@@ -428,13 +431,21 @@ def run_amend(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cause_authority(args: argparse.Namespace, seal: Any):
+    """The authority source an unsigned ``--cause`` is checked against (None when there is no cause, or a seal carries one)."""
+    if args.cause is None or seal is not None:
+        return None
+    from levain.desk import board_sign
+    return board_sign.resolve_authority()
+
+
 def run_decide(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
         seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
-                                   cause=args.cause, seal=seal))
+                                   cause=args.cause, seal=seal, authority=_cause_authority(args, seal)))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0

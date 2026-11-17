@@ -37,17 +37,25 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def stand_in_signer(monkeypatch):
-    """``decide`` is decision-class (P2): these tests are about the store's shape, so ``--sign`` here gets a seal that stamps a
-    placeholder signature, never Touch ID. Real signing and its verification are tests/test_board_sign.py's."""
+def stand_in_signer(monkeypatch, tmp_path_factory):
+    """``decide`` is decision-class (P2): these tests are about the store's shape, so ``--sign`` here gets a throwaway test key
+    and an authority source that enrols it (made on first use), never Touch ID. A stand-in signature would be refused: the
+    writer verifies every signed record before it writes. Signing itself is tests/test_board_sign.py's."""
     from levain.desk import board_sign
+    from levain.cockpit import keys as ckeys
+    from tests.test_board_sign import Rig
 
-    class Stamp(board_sign.Seal):
-        via = "terminal"
+    made: list = []
+    real = board_sign.terminal_seal
 
-        def __call__(self, record):
-            return {**record, "sig": {"sshsig": "stand-in", "fingerprint": "SHA256:x", "via": "terminal"}}
-    monkeypatch.setattr(board_sign, "terminal_seal", lambda: Stamp())
+    def seal(**kw):
+        if not made:
+            made.append(Rig(tmp_path_factory.mktemp("signer")))
+        rig = made[0]
+        return real(authority=rig.source(), key_dir=rig.dir, remote=lambda: None, in_agent_session=lambda: False,
+                    signer_factory=lambda path, bound: ckeys.ssh_signer(path, namespace=board_sign.NAMESPACE, timeout=bound))
+    monkeypatch.setattr(board_sign, "terminal_seal", seal)
+    monkeypatch.setattr(board_sign, "resolve_authority", lambda **kw: None)
 
 
 SIGNED = ("--author-kind", "operator", "--sign")

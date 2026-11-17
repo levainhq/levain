@@ -70,9 +70,14 @@ class Rig:
     def sign(self, message: bytes) -> str:
         return ckeys.ssh_signer(self.path, namespace=sg.NAMESPACE)[1](message)
 
+    def source(self, revoked_seq: int | None = None):
+        """An authority SOURCE (what the writer replays after the ceremony) whose log enrols this key."""
+        return lambda: self.snapshot(revoked_seq)
+
     def seal(self, **kw) -> sg.Seal:
         def factory(path, bound):
             return ckeys.ssh_signer(path, namespace=sg.NAMESPACE, timeout=bound)
+        kw.setdefault("authority", self.source())
         return sg.terminal_seal(key_dir=self.dir, signer_factory=factory, remote=lambda: None,
                                 in_agent_session=lambda: False, **kw)
 
@@ -186,7 +191,8 @@ def test_a_failed_refused_or_cancelled_signature_writes_nothing(target, rig):
         def sign(message):
             raise ckeys.KeyError_("Touch ID was cancelled or did not complete: no signature was made")
         return rig.fp, sign
-    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=cancelled, remote=lambda: None, in_agent_session=lambda: False)
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=cancelled, remote=lambda: None, in_agent_session=lambda: False,
+                            authority=rig.source())
     with pytest.raises(bs.BoardError, match="cancelled"):
         bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
     assert (target.store_dir / "items.jsonl").read_bytes() == before
@@ -199,13 +205,15 @@ def test_no_key_a_remote_session_and_an_agent_session_each_refuse_with_nothing_w
     empty.mkdir(mode=0o700)
     with pytest.raises(bs.BoardError, match="no terminal key"):
         bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW,
-                  seal=sg.terminal_seal(key_dir=empty, in_agent_session=lambda: False))
+                  seal=sg.terminal_seal(key_dir=empty, in_agent_session=lambda: False, authority=rig.source()))
     with pytest.raises(bs.BoardError, match="remote"):
         bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW,
-                  seal=sg.terminal_seal(key_dir=rig.dir, remote=lambda: "ssh", in_agent_session=lambda: False))
+                  seal=sg.terminal_seal(key_dir=rig.dir, remote=lambda: "ssh", in_agent_session=lambda: False,
+                                        authority=rig.source()))
     with pytest.raises(bs.BoardError, match="not inside an agent session"):
         bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW,
-                  seal=sg.terminal_seal(key_dir=rig.dir, remote=lambda: None, in_agent_session=lambda: True))
+                  seal=sg.terminal_seal(key_dir=rig.dir, remote=lambda: None, in_agent_session=lambda: True,
+                                        authority=rig.source()))
     assert (target.store_dir / "items.jsonl").read_bytes() == before
 
 
@@ -256,7 +264,8 @@ def test_the_cli_refuses_an_unsigned_decide_and_sign_needs_an_operator(target, c
 def test_the_cli_sign_writes_a_signed_record_through_the_seal(target, rig, monkeypatch, capsys):
     item = add_item(target)
     made = rig.seal()
-    monkeypatch.setattr(sg, "terminal_seal", lambda: made)
+    monkeypatch.setattr(sg, "terminal_seal", lambda **kw: made)
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     rc = main(["board", "decide", "--id", item, "--decision", "cut", "--words", "w", "--by", "phill",
                "--author-kind", "operator", "--sign"])
     assert rc == 0, capsys.readouterr().err
@@ -276,7 +285,7 @@ def test_a_phone_signature_over_the_prepared_bytes_is_appended_as_signed_phone(t
     kw = dict(item_id=item, decision="cut", words="no", by="phill", author=OPERATOR)
     prepared = sg.prepare(target, "decide", **kw)
     assert len(items(target)) == 1                         # preparing writes nothing
-    sg.commit_phone(target, prepared, phone.sign(prepared.message), phone.snapshot())
+    sg.commit_phone(target, prepared, phone.sign(prepared.message), phone.source())
     rec = items(target)[-1]
     assert rec["grade"] == "signed-phone" and rec["sig"]["via"] == "phone" and rec["prev"] == prepared.prev
     v = sg.verify_record(rec, phone.snapshot())
@@ -290,7 +299,7 @@ def test_the_phone_path_refuses_when_the_chain_head_moved(target, tmp_path):
     sig = phone.sign(prepared.message)
     bs.amend(target, item, "why", "phill", {"title": "moved"}, now=NOW, author=OPERATOR)         # the head moves
     with pytest.raises(bs.BoardError, match="the board changed while you signed: sign again"):
-        sg.commit_phone(target, prepared, sig, phone.snapshot())
+        sg.commit_phone(target, prepared, sig, phone.source())
     assert len(items(target)) == 2
 
 
@@ -307,7 +316,7 @@ def test_the_phone_path_refuses_a_bad_wrong_namespace_unenrolled_or_laptop_class
                       (laptop_listed.sign(prepared.message), laptop_listed.snapshot()), ("not a signature", phone.snapshot()),
                       (good, phone.snapshot(revoked_seq=3))):
         with pytest.raises(bs.BoardError):
-            sg.commit_phone(target, prepared, sig, snap)
+            sg.commit_phone(target, prepared, sig, lambda: snap)
     assert len(items(target)) == 1
 
 
@@ -317,64 +326,329 @@ def test_a_phone_signed_decide_for_an_agent_author_is_refused(target, tmp_path):
         sg.prepare(target, "decide", item_id=item, decision="cut", words="no", by="seat-1", author=AGENT)
 
 
-# ------------------------------------------------------------------------------------------------------- P2-d the cause
 
 
-def abandon_line(target: bs.Target, *, repo="levain", grade="signed-terminal", op="abandon-track") -> str:
-    line = json.dumps({"v": 1, "op": op, "repo": repo, "at": NOW, "grade": grade}, separators=(",", ":"))
-    with open(target.store_dir / "repos.jsonl", "ab") as f:
-        f.write(line.encode() + b"\n")
-    return hashlib.sha256(line.encode()).hexdigest()
+# ------------------------------------------------------------------------- the grade is earned by a check (G1, G5, G8)
 
 
-def cut(target, item, cause):
-    return bs.decide(target, item, "cut", "abandoned", "seat-1", author=AGENT, now=NOW, cause=cause)
+def snap(*rigs: Rig, revoked: tuple[Rig, ...] = ()) -> AuthoritySnapshot:
+    keys = {r.fp: AuthorityKey(fingerprint=r.fp, public_key=r.public, key_class=r.key_class, enrolled_seq=1,
+                               revoked_seq=5 if r in revoked else None) for r in rigs}
+    return AuthoritySnapshot(store_id="s", seq=6, head_hash="h", keys=keys, policy=StandingPolicy())
 
 
-def test_a_cut_caused_by_a_signed_abandon_of_the_same_repo_is_accepted_asserted(target):
+def revoking_factory(state: dict, key: str = "revoked"):
+    """A signer factory whose signing also revokes (the operator revoking a key while the prompt is up)."""
+    def factory(path, bound):
+        fp, sign = ckeys.ssh_signer(path, namespace=sg.NAMESPACE, timeout=bound)
+
+        def signing(message):
+            state["calls"] = state.get("calls", 0) + 1
+            state[key] = True
+            return sign(message)
+        return fp, signing
+    return factory
+
+
+def test_a_terminal_signature_by_an_unenrolled_revoked_or_wrong_class_key_writes_nothing(target, rig, tmp_path):
     item = add_item(target)
-    cause = abandon_line(target)
-    cut(target, item, cause)
-    rec = items(target)[-1]
-    assert rec["grade"] == "asserted" and rec["cause"] == cause
-    abandon_line(target, grade="relayed")
-    cut(target, item, hashlib.sha256(
-        (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[1]).hexdigest())
+    before = (target.store_dir / "items.jsonl").read_bytes()
+    stranger = Rig(tmp_path / "x", label="other")
+    as_phone = Rig(tmp_path / "p", authority.DISPLAY_PHONE, label="ph")
+    wrong_class = AuthoritySnapshot(store_id="s", seq=2, head_hash="h", policy=StandingPolicy(), keys={
+        rig.fp: AuthorityKey(fingerprint=rig.fp, public_key=rig.public, key_class=authority.DISPLAY_PHONE, enrolled_seq=1)})
+    for source, why in ((stranger.source(), "not a key in the authority log"), (rig.source(revoked_seq=4), "revoked at seq 4"),
+                        (lambda: wrong_class, "is not a terminal key"), (as_phone.source(), "not a key in the authority log")):
+        with pytest.raises(bs.BoardError, match=why):
+            bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=rig.seal(authority=source))
+    assert (target.store_dir / "items.jsonl").read_bytes() == before
 
 
-def test_a_cut_whose_cause_does_not_hold_is_refused(target):
+def test_a_key_revoked_while_the_prompt_is_up_writes_nothing(target, rig):
     item = add_item(target)
-    cases = {
-        "unsigned abandon": abandon_line(target, grade="asserted"),
-        "another repo": abandon_line(target, repo="flow"),
-        "not an abandon": abandon_line(target, op="register"),
-        "no such record": "f" * 64,
-    }
-    for why, cause in cases.items():
-        with pytest.raises(bs.BoardError, match="--sign"):
-            cut(target, item, cause)
-    with pytest.raises(bs.BoardError, match="sha256"):
-        cut(target, item, "nope")
+    state: dict = {}
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=revoking_factory(state), remote=lambda: None,
+                            in_agent_session=lambda: False,
+                            authority=lambda: rig.snapshot(revoked_seq=9 if state.get("revoked") else None))
+    with pytest.raises(bs.BoardError, match="revoked at seq 9"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
+    assert state["calls"] == 1 and len(items(target)) == 1
+
+
+def test_no_authority_log_refuses_a_signed_write_before_any_prompt(target, rig, tmp_path, capsys):
+    item = add_item(target)
+    state: dict = {}
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=revoking_factory(state), remote=lambda: None,
+                            in_agent_session=lambda: False)
+    with pytest.raises(bs.BoardError, match="a signature nobody can verify is not a signed grade"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
+    assert "calls" not in state and len(items(target)) == 1
+    with pytest.raises(bs.BoardError, match="holds no cockpit.db"):
+        sg.resolve_authority(data_root=tmp_path / "nowhere")
+    with pytest.raises(bs.BoardError, match="name none cockpits"):
+        sg.resolve_authority(queue_dir=tmp_path / "noqueue")
+    rc = main(["board", "decide", "--id", item, "--decision", "cut", "--words", "w", "--by", "phill",
+               "--author-kind", "operator", "--sign"])
+    assert rc == 2 and "nobody can verify" in capsys.readouterr().err
+
+
+def test_a_seal_that_only_claims_a_grade_is_refused(target, rig):
+    item = add_item(target)
+
+    class Stamp(sg.Seal):
+        via = "terminal"
+        authority = staticmethod(rig.source())
+
+        def __call__(self, record):
+            return {**record, "sig": {"sshsig": "stand-in", "fingerprint": rig.fp, "via": "terminal"}}
+
+    class Rewrites(Stamp):
+        def __call__(self, record):
+            return rig.seal()({**record, "words": "other"})
+    for seal, why in ((Stamp(), "signature does not verify"), (Rewrites(), "other than the one built")):
+        with pytest.raises(bs.BoardError, match=why):
+            bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
     assert len(items(target)) == 1
 
 
-def test_a_cause_is_refused_on_anything_but_a_cut(target, rig):
+def test_a_phone_key_revoked_during_the_ceremony_is_not_appended_and_a_snapshot_is_refused(target, tmp_path):
+    phone = phone_rig(tmp_path)
     item = add_item(target)
-    cause = abandon_line(target)
+    state: dict = {}
+    prepared = sg.prepare(target, "decide", item_id=item, decision="cut", words="no", by="phill", author=OPERATOR)
+    sig = phone.sign(prepared.message)
+    state["revoked"] = True                                          # revoked while the phone was signing
+    with pytest.raises(bs.BoardError, match="revoked at seq 3"):
+        sg.commit_phone(target, prepared, sig, lambda: phone.snapshot(revoked_seq=3 if state.get("revoked") else None))
+    with pytest.raises(bs.BoardError, match="not a snapshot"):
+        sg.commit_phone(target, prepared, sig, phone.snapshot())
+    assert len(items(target)) == 1
+
+
+def test_a_store_that_moved_during_the_prompt_is_refused_without_a_second_prompt(target, rig):
+    item = add_item(target)
+    path = target.store_dir / "items.jsonl"
+    first = path.read_bytes().split(b"\n")[0] + b"\n"
+    for move in ("append", "replace"):
+        state: dict = {}
+        base = revoking_factory(state, key="x")
+
+        def factory(p, bound, move=move, base=base):
+            fp, sign = base(p, bound)
+
+            def signing(message):
+                out = sign(message)
+                if move == "append":                    # a lock-free writer appends while the prompt is up
+                    with open(path, "ab") as f:
+                        f.write(first)
+                else:                                   # the file is replaced (a git operation)
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_bytes(path.read_bytes())
+                    tmp.replace(path)
+                return out
+            return fp, signing
+        seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=factory, remote=lambda: None, in_agent_session=lambda: False,
+                                authority=rig.source())
+        with pytest.raises(bs.BoardError, match="the board changed while you signed: sign again"):
+            bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
+        assert state["calls"] == 1
+    assert not any(r.get("op") == "decide" for r in items(target))
+
+
+# ------------------------------------------------------------------------------------------------------ prepare (G6)
+
+
+def test_prepare_freezes_one_timestamp_and_refuses_a_seal(target, tmp_path):
+    phone = phone_rig(tmp_path)
+    item = add_item(target)
+    prepared = sg.prepare(target, "decide", item_id=item, decision="cut", words="no", by="phill", author=OPERATOR, now=None)
+    assert prepared.kwargs["now"] and prepared.record["at"] == prepared.kwargs["now"]
+    sg.commit_phone(target, prepared, phone.sign(prepared.message), phone.source())
+    assert items(target)[-1]["grade"] == "signed-phone"
+    with pytest.raises(bs.BoardError, match="a seal argument is refused"):
+        sg.prepare(target, "decide", item_id=item, decision="cut", words="no", by="phill", author=OPERATOR, seal=None)
+
+
+# -------------------------------------------------------------------------------------------- exact grades only (G7)
+
+
+def test_only_exact_known_grades_get_a_verdict_and_a_sig_off_a_signed_grade_is_bad():
+    empty = AuthoritySnapshot(store_id="s", seq=1, head_hash="h", keys={}, policy=StandingPolicy())
+    base = {"v": 1, "op": "add", "id": "levain#1", "at": NOW, "by": "phill", "author": OPERATOR}
+    chained = {**base, "prev": "0" * 64}
+    sig = {"sshsig": "x", "fingerprint": "SHA256:x", "via": "terminal"}
+    assert sg.verify_record({**chained, "grade": "operator"}, empty).state == "bad"
+    assert sg.verify_record({**chained, "grade": "Asserted"}, empty).state == "bad"
+    assert sg.verify_record(chained, empty).state == "bad"                              # chained, no grade
+    assert sg.verify_record({**base, "sig": sig}, empty).state == "bad"                 # legacy-shaped, signed
+    assert sg.verify_record({**base, "grade": "legacy", "sig": sig}, empty).state == "bad"
+    assert sg.verify_record({**chained, "grade": "relayed", "sig": sig}, empty).state == "bad"
+    assert sg.verify_record({**chained, "grade": "asserted", "sig": sig}, empty).state == "bad"
+    assert sg.verify_record(base, empty).state == "legacy"
+    assert sg.verify_record({**chained, "grade": "asserted"}, empty).state == "asserted"
+    assert sg.verify_record({**chained, "grade": "relayed"}, empty).state == "relayed"
+
+
+# ---------------------------------------------------------------------------------------- P2-d the cause (G2, G3, G4)
+
+
+def signed_abandon(target: bs.Target, signer: Rig, *, migration="M1", grade="signed-terminal", op="abandon-track",
+                   sign=True, junk=False) -> str:
+    """An abandon-track line written raw into repos.jsonl (the verb is T2's), signed by ``signer``; returns its cause."""
+    rec = {"v": 1, "op": op, "repo": "levain", "at": NOW, "prev": "0" * 64, "by": "phill", "migration": migration,
+           "words": "abandon", "author": OPERATOR, "grade": grade}
+    if sign:
+        armored = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n" if junk else signer.sign(sg.signing_bytes(rec))
+        rec = {**rec, "sig": {"sshsig": armored, "fingerprint": signer.fp, "via": "terminal"}}
+    line = bs.canonical_bytes(rec)
+    with open(target.store_dir / "repos.jsonl", "ab") as f:
+        f.write(line + b"\n")
+    return hashlib.sha256(line).hexdigest()
+
+
+def keyed_item(target: bs.Target, key: str) -> str:
+    return bs.add(target, "levain", "an item", "desk 1", "phill", author=OPERATOR, now=NOW, key=key,
+                  payload_hash=hashlib.sha256(key.encode()).hexdigest())[0]
+
+
+def cut(target, item, cause, source):
+    return bs.decide(target, item, "cut", "abandoned", "seat-1", author=AGENT, now=NOW, cause=cause, authority=source)
+
+
+def test_a_cut_caused_by_a_valid_signed_abandon_of_the_items_migration_is_accepted_asserted(target, rig):
+    plan, exact = keyed_item(target, "M1:plan-1"), keyed_item(target, "M1")
+    cause = signed_abandon(target, rig)
+    for item in (plan, exact):
+        cut(target, item, cause, rig.source())
+        rec = items(target)[-1]
+        assert rec["grade"] == "asserted" and rec["cause"] == cause and rec["id"] == item
+    lines = [*(target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[:1],
+             *(target.store_dir / "items.jsonl").read_bytes().split(b"\n")[:1]]
+    assert sg.verify_cause(items(target)[-2], lines, rig.snapshot()) is None            # P6's entry point
+
+
+def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
+    item = keyed_item(target, "M1:plan-1")
+    other_m = keyed_item(target, "M10:plan-1")                    # M10 is not M1
+    unkeyed = add_item(target)
+    good = signed_abandon(target, rig)
+    cases = [
+        (item, signed_abandon(target, rig, grade="asserted", sign=False), rig.source(), "graded 'asserted'"),
+        (item, signed_abandon(target, rig, sign=False), rig.source(), "claims a signature it does not carry"),
+        (item, signed_abandon(target, rig, junk=True), rig.source(), "signature does not verify"),
+        (item, signed_abandon(target, rig, migration="M2"), rig.source(), "is not keyed to it"),
+        (other_m, good, rig.source(), "is not keyed to it"),
+        (unkeyed, good, rig.source(), "is not keyed to it"),
+        (item, signed_abandon(target, rig, op="register"), rig.source(), "not an abandon-track"),
+        (item, "f" * 64, rig.source(), "no abandon-track record"),
+        (item, good, rig.source(revoked_seq=2), "revoked at seq 2"),
+        (item, good, Rig(tmp_path / "s", label="s").source(), "not a key in the authority log"),
+        (item, good, None, "no authority log"),
+        (item, signed_abandon(target, rig, grade="relayed", sign=False), rig.source(), "P3's verifier"),
+    ]
+    for it, cause, source, why in cases:
+        with pytest.raises(bs.BoardError, match="--sign") as exc:
+            cut(target, it, cause, source)
+        assert why in str(exc.value), (why, str(exc.value))
+    with pytest.raises(bs.BoardError, match="sha256"):
+        cut(target, item, "nope", rig.source())
+    assert not any(r["op"] == "decide" for r in items(target))
+
+
+def test_a_signed_cut_has_its_cause_checked_too(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    junk = signed_abandon(target, rig, junk=True)
+    with pytest.raises(bs.BoardError, match="the cause does not hold"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, cause=junk, seal=rig.seal())
+    assert not any(r["op"] == "decide" for r in items(target))
+
+
+def test_a_signed_cut_rechecks_its_cause_after_the_prompt(target, rig, tmp_path):
+    abandoner = Rig(tmp_path / "ab", label="abandoner")
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, abandoner)
+    state: dict = {}
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=revoking_factory(state), remote=lambda: None,
+                            in_agent_session=lambda: False,
+                            authority=lambda: snap(rig, abandoner, revoked=(abandoner,) if state.get("revoked") else ()))
+    with pytest.raises(bs.BoardError, match="not written: the cause does not hold: .*revoked"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, cause=cause, seal=seal)
+    assert state["calls"] == 1 and not any(r["op"] == "decide" for r in items(target))
+
+
+def test_a_cause_is_refused_on_anything_but_a_cut(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, rig)
     with pytest.raises(bs.BoardError, match="cut only"):
         bs.decide(target, item, "parked", "w", "phill", author=OPERATOR, now=NOW, cause=cause, seal=rig.seal())
 
 
-def test_the_cause_check_reads_the_hash_of_the_line_as_written(target):
-    item = add_item(target)
-    abandon_line(target)
+def test_the_cause_check_reads_the_hash_of_the_line_as_written(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    signed_abandon(target, rig)
     line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
-    cut(target, item, hashlib.sha256(line).hexdigest())
     with pytest.raises(bs.BoardError):
-        cut(target, item, hashlib.sha256(line + b" ").hexdigest())
+        cut(target, item, hashlib.sha256(line + b"\n").hexdigest(), rig.source())     # the newline is not in the range
+    cut(target, item, hashlib.sha256(line).hexdigest(), rig.source())
+
+
+def test_the_cli_checks_an_unsigned_cause_against_the_authority_log(target, rig, monkeypatch, capsys):
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, rig)
+    argv = ["board", "decide", "--id", item, "--decision", "cut", "--words", "w", "--by", "seat-1", "--cause", cause]
+    assert main(argv) == 2 and "nobody can verify" in capsys.readouterr().err          # this install has no authority log
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    assert main(argv) == 0, capsys.readouterr().err
+    assert items(target)[-1]["cause"] == cause
+
+
+# ------------------------------------------------------------------------------ a real authority log's keys (G10)
+
+
+def test_signatures_resolve_in_a_real_replayed_authority_log(target, rig, tmp_path):
+    """The fingerprint the terminal signer reports and the one ``sshsig_public_key`` reads off a phone signature are the
+    keys of a REAL authority log, replayed by the same source the envelope store's accept path reads."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from levain.authority import ReplayCache, anchor_path, sign_and_append
+    from levain.authority_sig import sshsig_public_key
+    from levain.cockpit.firejournal import CockpitDB
+
+    phone = phone_rig(tmp_path)
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    CockpitDB(root).set_install_class("reported")
+    conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+    try:
+        for r, cls, custody in ((rig, authority.LAPTOP, "passphrase"), (phone, authority.DISPLAY_PHONE, "unstated")):
+            sign_and_append(conn, {"op": "enrol", "fingerprint": r.fp, "public_key": r.public, "class": cls, "custody": custody},
+                            signer_fp=rig.fp,
+                            sign=lambda m: ckeys.ssh_signer(rig.path, namespace=authority.NAMESPACE)[1](m),
+                            clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(), anchor=anchor_path(root))
+    finally:
+        conn.close()
+    source = sg.resolve_authority(data_root=root)
+    keys = source().keys
+    assert set(keys) == {rig.fp, phone.fp}
+    item = add_item(target)
+    bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=rig.seal(authority=source))
+    prepared = sg.prepare(target, "decide", item_id=item, decision="reopen", words="back", by="phill", author=OPERATOR)
+    sig = phone.sign(prepared.message)
+    assert sshsig_public_key(sig)[1] in keys
+    sg.commit_phone(target, prepared, sig, source)
+    assert [sg.verify_record(r, source()).state for r in items(target)[1:]] == ["valid", "valid"]
 
 
 def test_the_namespace_is_registered():
     from levain.contracts.namespaces import REGISTRY
     assert REGISTRY["levain-board"][:2] == ("shipped", "levain/desk/board_sign.py") and sg.NAMESPACE == "levain-board"
 
+
+def test_a_deeply_nested_cited_line_is_refused_not_a_crash(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    line = b"[" * 100000 + b"]" * 100000
+    with open(target.store_dir / "repos.jsonl", "ab") as f:
+        f.write(line + b"\n")
+    with pytest.raises(bs.BoardError, match="not a record"):
+        cut(target, item, hashlib.sha256(line).hexdigest(), rig.source())
