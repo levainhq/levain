@@ -294,3 +294,32 @@ def test_a_manual_dream_close_is_never_taken_for_the_rotation_handoff(desk):
     got = _rotate(desk)
     assert got.handoff.close_key == "dream-rotation:occ-1" and got.handoff.prev_handoff_id == manual.handoff_id
     assert [h[1] for h in _handoffs(desk)] == ["by-hand-1", "dream-rotation:occ-1"]
+
+
+def test_a_rotation_without_its_own_key_is_not_named_as_the_rotation_handoff(desk, monkeypatch):
+    from levain.desk import seam_verbs
+
+    _saved_after(desk, hours=0.001)
+    desk._clock = lambda: parse_stamp(_requested(desk)) + timedelta(minutes=1)
+    seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-1", prev_handoff_id=None, token=desk.token)
+    monkeypatch.setattr(dream_rotation, "KEY_PREFIX", "not-a-rotation:")      # an ended desk whose dream handoff is not keyed as one
+    assert isinstance(_rotate(desk), dream_rotation.Rotation)
+    assert [h[1] for h in _handoffs(desk)] == ["by-hand-1", "not-a-rotation:occ-1"]
+    assert seam_verbs._rotated_handoff(desk, desk.token) is None
+
+
+def test_a_rotation_key_refusal_names_a_dream_rotation(desk, monkeypatch):
+    _saved_after(desk)
+    monkeypatch.setattr(dream_rotation, "KEY_PREFIX", "two\nlines:")
+    with pytest.raises(CoordError, match="a dream rotation needs a request id"):
+        _rotate(desk)
+
+
+def test_a_raising_advisory_read_does_not_stop_the_write_path(desk, monkeypatch):
+    _saved_after(desk)
+
+    def boom(*a, **k):
+        raise RuntimeError("advisory read failed")
+
+    monkeypatch.setattr(dream_status, "rotation_due", boom)
+    assert isinstance(_rotate(desk), dream_rotation.Rotation)

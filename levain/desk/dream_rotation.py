@@ -68,11 +68,11 @@ def _advisory(store, token: int) -> tuple[bool, str]:
         with read_transaction(store.open_readonly) as conn:
             held = _leases.lease(conn, store._stamp())
             ln = None if held is None or held.token != token else _leases._launch_by_key(conn, held.holder)
-    except Exception:  # noqa: BLE001 - an unreadable store is the fenced write's refusal to make
+        if ln is None:
+            return True, ""
+        return dream_status.rotation_due(store, ln, at_turn_boundary=True)
+    except Exception:  # noqa: BLE001 - best-effort: the in-transaction seam_check is the one authority
         return True, ""
-    if ln is None:
-        return True, ""
-    return dream_status.rotation_due(store, ln, at_turn_boundary=True)
 
 
 def rotate(store, *, token: object, body: object) -> Rotation | NotDue | AlreadyStored:
@@ -101,9 +101,9 @@ def rotate(store, *, token: object, body: object) -> Rotation | NotDue | Already
                 raise _NotDue(why)
             # re-derived, not taken from seam_check: one transaction, so it names the save seam_check just judged
             saved, _ = dream_status._current(dream_status.records(conn, strict=True))
-            occurrence = saved.occurrence
+            occurrence = saved.occurrence    # a non-empty str: dream_status's parser builds it with str() and refuses ""
             key = KEY_PREFIX + occurrence
-            seam_handoffs._check_request_id(key)
+            seam_handoffs._check_request_id(key, "a dream rotation")
             stored = seam_handoffs._row(conn.execute(
                 f"SELECT {seam_handoffs._COLUMNS} FROM seam_handoffs WHERE close_key = ?", (key,)).fetchone())
             if stored is not None:

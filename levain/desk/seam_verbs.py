@@ -206,10 +206,18 @@ def _rotated_handoff(store: Any, token: Any) -> Any:
             if ln is None or ln.state != "ended" or ln.cause != _leases.DREAM_ROTATED:
                 return None
             found = conn.execute(f"SELECT {seam_handoffs._COLUMNS} FROM seam_handoffs WHERE writer = ? AND "
-                                 "seam_kind = 'dream' ORDER BY handoff_id DESC LIMIT 1", (ln.session_key,)).fetchone()
+                                 "seam_kind = 'dream' AND close_key LIKE 'dream-rotation:%' ORDER BY handoff_id DESC LIMIT 1",
+                                 (ln.session_key,)).fetchone()
             return None if found is None else seam_handoffs._row(found)
     except Exception:  # noqa: BLE001 - the refusal below still stands without the handoff's name
         return None
+
+
+def _refuse_if_rotated(store: Any, token: Any) -> None:
+    done = _rotated_handoff(store, token)
+    if done is not None:
+        raise CoordError(f"this desk already handed over onto the dream at handoff {done.handoff_id} "
+                         f"({done.close_key}); the next desk it asks for opens it; nothing was written")
 
 
 def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
@@ -218,12 +226,13 @@ def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
     builds, ingests or delivers anything, so the open's own unacknowledged delivery cannot read as mid-work."""
     launch, why = _active(store, args.token)
     if launch is None:
-        done = _rotated_handoff(store, args.token)
-        if done is not None:
-            raise CoordError(f"this desk already handed over onto the dream at handoff {done.handoff_id} "
-                             f"({done.close_key}); the next desk opens it; nothing was written")
+        _refuse_if_rotated(store, args.token)
         raise CoordError(f"a dream rotation is the live desk's: {why}; nothing was written")
-    got = dream_rotation.rotate(store, token=args.token, body=_load_body(args.dream_body_file))
+    try:
+        got = dream_rotation.rotate(store, token=args.token, body=_load_body(args.dream_body_file))
+    except _leases.LeaseRefused:
+        _refuse_if_rotated(store, args.token)      # the loser of a retry race: the winner's handoff is the answer
+        raise
     if isinstance(got, dream_rotation.NotDue):
         _emit(out, args.json, {"rotated": False, "why": got.why},
               f"not rotated: {got.why}\nnothing was written; this desk keeps its lease and keeps working")
@@ -231,7 +240,7 @@ def _run_dream_rotation(args: argparse.Namespace, out: Any, store: Any) -> int:
     if isinstance(got, dream_rotation.AlreadyStored):
         raise CoordError(f"this is not a rotation: the dream occurrence {got.occurrence} already has handoff "
                          f"{got.handoff.handoff_id} ({got.handoff.close_key}); nothing was written and this desk "
-                         "stays live")
+                         "stays live; to end it, run `coord close --kind rotation` with its own request id")
     h = got.handoff
     _emit(out, args.json, {"rotated": True, "handoff_id": h.handoff_id, "occurrence": got.occurrence,
                            "successor_launch_id": got.successor.launch_id},
