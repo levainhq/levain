@@ -38,8 +38,10 @@ import argparse
 import contextlib
 import copy
 import dataclasses
+import errno
 import json
 import os
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -278,10 +280,18 @@ def _store_id(store_dir: Path) -> str | None:
     """The store's id (``<store dir>/store.id``), or None when the file is missing. A file that exists but is empty or blank
     raises :class:`ValueError`, and any other failure to read it :class:`OSError` or :class:`UnicodeDecodeError`: a store whose
     id cannot be read is not one to judge blocks against."""
+    path = store_dir / bs.STORE_ID_NAME
     try:
-        text = (store_dir / "store.id").read_text("utf-8").strip()
+        st = os.lstat(path)                             # never open before knowing what it is: a FIFO would block the read
+        if stat.S_ISLNK(st.st_mode):
+            st = os.stat(path)                          # a link to a regular file is fine; a broken one raises OSError
     except FileNotFoundError:
+        if os.path.lexists(path):                       # a dangling link is a store.id that cannot be read, not a missing one
+            raise OSError(errno.ENOENT, "store.id is a broken symlink") from None
         return None
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(errno.EINVAL, "store.id is not a regular file")
+    text = path.read_text("utf-8").strip()
     if not text:
         raise ValueError("store.id is empty: the store is damaged")
     return text
@@ -422,7 +432,7 @@ def run_state(args: argparse.Namespace) -> int:
             return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}")
         return _refused(exc)
     given = args.items or os.environ.get(ITEMS_ENV)
-    if not target.pointered and (target.store_dir / bs.STORE_ID_NAME).is_file():
+    if not target.pointered and os.path.lexists(target.store_dir / bs.STORE_ID_NAME):
         target = dataclasses.replace(target, pointered=True)    # an explicit store that holds a store.id is a store: its lock, its registry
     if not given and not target.pointered and not target.items_path.is_file():
         return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
@@ -454,6 +464,10 @@ def run_state(args: argparse.Namespace) -> int:
         return EXIT_LOCKED
     except (OSError, UnicodeDecodeError, bs.BoardError) as exc:
         return _fail(f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
+    if store_id_exc is not None:                        # first: a store.id that cannot be read is said as that, not as a registry that cannot load
+        if isinstance(store_id_exc, ValueError) and not isinstance(store_id_exc, UnicodeDecodeError):
+            return _fail(str(store_id_exc))
+        return _fail(f"store.id could not be read: {type(store_id_exc).__name__}: {store_id_exc}")
     # No --repo (and no --also-repo) on a store that has a registry file: every tracked repo is read (T3). Otherwise one repo, as
     # before (a store with no registry file reads the repository here, whatever its registry audit says).
     whole = args.repo is None and not args.also_repo and registry_file
@@ -499,10 +513,6 @@ def run_state(args: argparse.Namespace) -> int:
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
-    if store_id_exc is not None:
-        if isinstance(store_id_exc, ValueError) and not isinstance(store_id_exc, UnicodeDecodeError):
-            return _fail(str(store_id_exc))
-        return _fail(f"store.id could not be read: {type(store_id_exc).__name__}: {store_id_exc}")
     producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
     if bp.NATIVE_PRODUCER in producers:
         return _fail(f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
@@ -549,7 +559,11 @@ def run_state(args: argparse.Namespace) -> int:
                        primary_repo=summary["repo"] if cross else None, label_primary=whole, unread_repos=unread_why)
     doc = board.to_dict()
     # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read under the one hold)
-    registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc)
+    try:
+        registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)
+    except bs.LockWaiting as exc:
+        print(f"levain board state: refused: {exc}", file=sys.stderr)
+        return EXIT_LOCKED
     doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit]
     doc["reader"] = summary
     if whole:                                           # no repo is privileged: freshness, counts and labels span every repo read

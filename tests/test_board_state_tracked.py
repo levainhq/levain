@@ -407,7 +407,8 @@ def test_an_explicit_dir_with_no_store_id_stays_a_plain_items_file(tmp_path, mkr
     a = mkrepo("alpha")
     monkeypatch.chdir(a)
     rc, doc, err = _state(capsys, "--items", str(d))
-    assert rc in (0, 3), err and doc["reader"]["repo"] == "alpha"
+    assert rc in (0, 3), err
+    assert doc["reader"]["repo"] == "alpha"
 
 
 def test_a_repo_holding_items_but_absent_from_the_registry_reads_unknown_and_says_so(store, tmp_path, mkrepo, capsys):
@@ -460,16 +461,84 @@ def test_a_stale_non_primary_repo_fails_closed_like_a_stale_primary(store, tmp_p
     assert beta["state"] == "unknown" and "older than" in beta["reason"]
 
 
-def test_the_registry_audit_fallback_is_bounded_and_says_so_when_it_cannot_lock(store, tmp_path, mkrepo, capsys):
+def test_the_registry_audit_fallback_is_bounded_and_a_busy_lock_is_not_an_audit_line(store, tmp_path, mkrepo, capsys, monkeypatch):
+    import pytest
     from datetime import datetime, timezone
     _two_tracked(capsys, tmp_path, store, mkrepo)
     target = bs.resolve_store(None)
     now = datetime.now(timezone.utc)
     with bs.store_lock(store, exclusive=True):
         t0 = time.monotonic()
-        lines = bc.br.audit_for_state(target, now, deadline=bs._deadline_of(0.3))
+        with pytest.raises(bs.LockWaiting):                                                   # never an "unreadable" line: the caller exits 4
+            bc.br.audit_for_state(target, now, deadline=bs._deadline_of(0.3))
         waited = time.monotonic() - t0
     assert 0.25 <= waited < 3
-    assert len(lines) == 1 and lines[0].startswith("registry: unreadable: ") and bs.LOCK_WAITING in lines[0]
     assert bc.br.audit_for_state(target, now, deadline=bs._deadline_of(2)) == []                # the writer gone: nothing to say
     assert bc.br.audit_for_state(target, now) == []                                            # no deadline: as before
+
+    def torn(*a, **k):
+        raise bs.BoardError("torn beyond reading")
+
+    monkeypatch.setattr(bc.br, "_load", torn)
+    assert bc.br.audit_for_state(target, now) == ["registry: unreadable: torn beyond reading"]  # every other BoardError keeps its line
+
+
+def test_run_state_hands_the_state_deadline_to_the_audit_and_a_busy_lock_there_is_exit_4(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    real = bc.br.audit_for_state
+    seen: list = []
+
+    def spy(*args, **kw):
+        seen.append(kw.get("deadline"))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(bc.br, "audit_for_state", spy)
+    assert _state(capsys)[0] in (0, 3)
+    assert len(seen) == 1 and isinstance(seen[0], float)                                       # the one state deadline, never None
+
+    def busy(*args, **kw):
+        raise bs.LockWaiting(bs.LOCK_WAITING)
+
+    monkeypatch.setattr(bc.br, "audit_for_state", busy)
+    rc, out, err = run(capsys, "state", "--json")
+    assert rc == bc.EXIT_LOCKED and out == "" and "locked" in err
+
+
+def test_an_explicit_store_dir_with_a_mistyped_items_file_name_is_refused_never_an_empty_board(store, tmp_path, mkrepo, capsys):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    _unpoint(store)
+    (store / "itemz.jsonl").write_text("")
+    rc, out, err = run(capsys, "state", "--json", "--items", str(store / "itemz.jsonl"))
+    assert rc == 2 and out == "" and "refused" in err
+    rc, out, err = run(capsys, "state", "--json", "--items", str(store / "nope.jsonl"))
+    assert rc == 2 and out == ""
+
+
+def _store_id_replaced_by(store, kind):
+    sid = store / "store.id"
+    sid.unlink()
+    if kind == "dir":
+        sid.mkdir()
+    elif kind == "dangling":
+        os.symlink(str(store / "nowhere"), sid)
+    elif kind == "fifo":
+        os.mkfifo(sid)
+
+
+def test_a_store_id_that_is_not_a_regular_file_is_refused_never_a_plain_items_read(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    _unpoint(store)
+    monkeypatch.chdir(tmp_path / "alpha" if (tmp_path / "alpha").exists() else tmp_path)
+    for kind in ("dir", "dangling", "fifo"):
+        _store_id_replaced_by(store, kind)
+        for given in (store, store / bs.ITEMS_NAME):
+            rc, out, err = run(capsys, "state", "--json", "--items", str(given))              # a FIFO must not hang the read
+            assert rc == 2 and out == "" and "store.id" in err, (kind, rc, err)
+        if kind == "dir":
+            (store / "store.id").rmdir()
+        else:
+            (store / "store.id").unlink()
+        (store / "store.id").write_text("store-" + "a" * 32 + "\n")
+
+
+                                            # no deadline: as before

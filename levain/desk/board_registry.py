@@ -50,6 +50,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -143,6 +144,12 @@ def _store_id(store_dir: Path) -> str:
     p = store_dir / bs.STORE_ID_NAME
     if not p.exists():
         raise BoardError(f"{store_dir} holds no {bs.STORE_ID_NAME}; run `levain board use`")
+    try:
+        regular = stat.S_ISREG(os.stat(p).st_mode)      # never open a FIFO (it would block); a broken link is no store.id either
+    except OSError:
+        regular = False
+    if not regular:
+        raise BoardError(f"{p} is not a regular file; run `levain board use`")
     sid = bs._read_stable(p).decode("utf-8", "replace").strip()
     if not sid:
         raise BoardError(f"{p} is empty; run `levain board use`")
@@ -974,14 +981,16 @@ def audit_for_state(target: bs.Target, now: datetime, *, view: View | None = Non
     all: one ``registry: unreadable: <why>`` line). A store with no pointer, or no ``repos.jsonl`` yet, adds nothing.
     Given the registry the caller already read under its own hold (``view``, or ``view_exc`` for the BoardError it raised)
     this takes no lock: one snapshot, one lock. Without either it reads the registry under a shared lock of its own, bounded by ``deadline`` (a ``time.monotonic()``
-    instant; None waits as long as it takes); a lock it could not get in time is an ``unreadable`` line like any other."""
+    instant; None waits as long as it takes); a lock it could not get in time raises :class:`LockWaiting` (a busy store is exit 4, never an audit line)."""
     if not target.pointered:
         return []
     if view is None and view_exc is None:
         try:
             with bs.store_lock(target.store_dir, exclusive=False, deadline=deadline):
                 view = _load(target.store_dir, deadline)
-        except BoardError as exc:                    # LockWaiting is one; never swallowed (W8): a registry that cannot be judged is an audit entry
+        except bs.LockWaiting:                       # a busy lock is not an unreadable registry: the caller answers exit 4, never a board
+            raise
+        except BoardError as exc:                    # every other refusal (W8): a registry that cannot be judged is an audit entry
             return [f"registry: unreadable: {exc}"]
     if view is None:
         return [f"registry: unreadable: {view_exc}"]
