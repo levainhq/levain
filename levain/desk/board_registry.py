@@ -35,8 +35,9 @@ Known edges, left open under the reachability line (nobody reaches them):
   failure there lets the launch go on unregistered (the next launch in that repo registers it);
 * ``use --import-focus`` judges each name's identity on a registry snapshot taken before its writes: a ``move`` that lands
   between that check and the import's write is not seen by the import;
-* likewise a repo registered BY HAND between that snapshot and the import's ``register`` makes the import's register an
-  unwritten no-op for that name: the hand record stands, and a ``paused`` focus state for that name still pauses it.
+* likewise a repo registered BY HAND at the same path between that snapshot and the import's ``register`` makes the
+  import's register an unwritten no-op for that name: the hand record stands, and a ``paused`` focus state for that name
+  still pauses it (a hand registration at ANOTHER path makes ``register`` refuse, which stops the import there).
 """
 from __future__ import annotations
 
