@@ -2204,15 +2204,18 @@ def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) 
     from levain.desk.effect_attempts import JOURNAL_FILE, ReadOnlyJournal
     from levain.desk.nightclose import nightclose
 
-    # ABSENT only when the name does not exist at all; anything there (a directory, a dangling symlink, a corrupt file)
-    # is read, and unreadable it refuses before any write. The reader is read-only: it never creates, migrates or locks
+    # ABSENT only when the name does not exist at all; anything there (a directory, a dangling symlink, a corrupt
+    # file) is read, and unreadable it refuses before any write. The reader is read-only: it never creates,
+    # migrates or locks
     path = Path(store.directory) / JOURNAL_FILE
     journal = ReadOnlyJournal(path) if os.path.lexists(path) else None
     got = nightclose(store, datetime.now(timezone.utc), token=args.token, journal=journal)
     handed = list(got.handed)
-    effects =(f"effects recorded {len(got.effects)}" + (f" ({', '.join(str(a) for a in got.effects)})" if got.effects else "")
-               if journal is not None else f"no effect journal exists yet ({JOURNAL_FILE} is not in {store.directory}): "
-                                           "effects not read")
+    if journal is not None:
+        effects = f"effects recorded {len(got.effects)}" + (f" ({', '.join(str(a) for a in got.effects)})" if got.effects else "")
+    else:       # the zero is printed so the brief's "until effects recorded 0" stop holds on this path too
+        effects = (f"effects recorded 0 (no effect journal exists yet: {JOURNAL_FILE} is not in {store.directory}; "
+                   "effects not read)")
     _emit(out, args.json, {"owner": got.owner, "stopped": got.stopped, "handed": handed,
                            "effects": list(got.effects), "seats": list(got.seats),
                            "on_record": list(got.on_record), "journal": journal is not None},

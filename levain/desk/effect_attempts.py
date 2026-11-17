@@ -137,12 +137,15 @@ class ReadOnlyJournal:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
 
+    def _uri(self) -> str:
+        # An idle file (no ``-wal``, ``-shm`` or ``-journal`` beside it: a live WAL writer keeps the first two, a rollback-mode
+        # writer's hot journal is the third) is opened ``mode=ro`` plus ``immutable`` (``immutable`` alone would create a
+        # missing file), so reading it makes no sidecar; one with a sidecar is read ``mode=ro`` through the existing ones.
+        idle = not any(os.path.lexists(f"{self.path}{s}") for s in ("-wal", "-shm", "-journal"))
+        return f"file:{quote(str(self.path))}?mode=ro{'&immutable=1' if idle else ''}"
+
     def rows(self) -> list[Attempt]:
-        # An idle WAL file (no ``-wal`` and no ``-shm`` beside it: a live writer keeps both) is opened ``mode=ro`` plus ``immutable`` (``immutable`` alone would create a missing file), so
-        # reading it makes no sidecar; one with a sidecar, a night runner's, is read ``mode=ro`` through the existing ones.
-        idle = not any(os.path.lexists(f"{self.path}{s}") for s in ("-wal", "-shm"))
-        conn = sqlite3.connect(f"file:{quote(str(self.path))}?mode=ro{'&immutable=1' if idle else ''}", uri=True,
-                               timeout=5.0)
+        conn = sqlite3.connect(self._uri(), uri=True, timeout=5.0)
         try:
             conn.execute("PRAGMA query_only = ON")
             return [_attempt(r) for r in conn.execute(f"SELECT {_COLUMNS} FROM effect_attempts ORDER BY attempt_id")]

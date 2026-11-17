@@ -65,7 +65,7 @@ def test_journal_absent_says_so_writes_the_events_half_and_creates_no_file(store
     b, token = morning(store, a)
     before = sorted(p.name for p in qdir.iterdir())
     out = run(qdir, capsys, "--token", str(token))
-    assert "no effect journal exists yet" in out.out and "events handed 2" in out.out
+    assert "effects recorded 0 (no effect journal exists yet" in out.out and "events handed 2" in out.out
     assert latest(qdir, evs[0]) == ("claimed", b.launch_id)
     assert not (qdir / JOURNAL_FILE).exists()
     assert sorted(p.name for p in qdir.iterdir()) == before                 # no new file of any name
@@ -184,3 +184,12 @@ def test_read_only_journal_reads_what_journal_reads_and_never_creates_a_missing_
     with pytest.raises(sqlite3.Error):
         ReadOnlyJournal(tmp_path / "missing.db").rows()
     assert not (tmp_path / "missing.db").exists() and sorted(p.name for p in tmp_path.glob("missing*")) == []
+
+
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm", "-journal"])
+def test_read_only_journal_never_takes_the_immutable_path_with_any_sidecar(tmp_path, sidecar):
+    db = tmp_path / "a.db"
+    db.write_bytes(b"")
+    assert "immutable=1" in ReadOnlyJournal(db)._uri()
+    (tmp_path / f"a.db{sidecar}").write_bytes(b"")
+    assert "immutable" not in ReadOnlyJournal(db)._uri() and "mode=ro" in ReadOnlyJournal(db)._uri()
