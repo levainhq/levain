@@ -1,15 +1,17 @@
 """levain.desk.repos_fold — the registry's pure fold: the lines of ``repos.jsonl`` -> each repo's mode and attention.
 
-Stdlib only and no levain import, like :mod:`levain.desk.board_state`: it reads nothing, writes nothing, and judges only
-the lines it is handed. The writer, the verbs and the locking are :mod:`levain.desk.board_registry`.
+Stdlib only and no levain import beyond :mod:`levain.desk.board_chain` (also stdlib only), like :mod:`levain.desk.board_state`:
+it reads nothing, writes nothing, and judges only the lines it is handed. The writer, the verbs and the locking are
+:mod:`levain.desk.board_registry`.
 
 A record is ``{"v": 1, "store": <store.id>, "op": ..., "repo": <name>, "at": ..., "by": ..., "words": ..., ...}`` (design
-4.2); ``author``, ``grade`` and ``prev`` ride on it and this fold ignores them (the chain's verifier is not here).
+4.2); ``author`` and ``grade`` ride on it and this fold ignores them. ``prev`` is the chain's: a break in it is a torn line.
 
 Two kinds of trouble, as in the item store's fold:
 
 * a TORN line (not JSON, not an object, an unknown version or op, a missing or ill-shaped required field, another store's
-  id, or an unterminated tail) makes the whole registry torn: nothing can be trusted past it. ``torn`` and ``torn_why``
+  id, an unterminated tail, or a line where the hash chain breaks: :func:`levain.desk.board_chain.check_chain`) makes the
+  whole registry torn: nothing can be trusted past it. ``torn`` and ``torn_why``
   say so, and every reader refuses until an ``ack-torn`` record names exactly that line and the sha256 of its bytes.
 * a well-formed record that no state allows (a ``track`` on an untracked repo, a ``register`` over another path) is a
   PROBLEM line: skipped, listed, never fatal.
@@ -25,6 +27,8 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
+
+from levain.desk import board_chain
 
 __all__ = ["ACK", "MODES", "OPS", "Repo", "RepoFold", "check_manifest", "fold_repos", "line_sha256"]
 
@@ -268,7 +272,8 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     """The registry from its record lines. ``store_id`` (the store's ``store.id``) makes a record that names another store
     torn; ``unterminated_tail`` says the last line has no newline (an append in flight, or a crash), and it is torn."""
     lines = list(lines)
-    acks: dict[int, set[str]] = {}               # ANY ack of a line whose hash matches accepts it: a corrected re-ack repairs
+    breaks = board_chain.check_chain(lines).by_line()
+    acks: dict[int, set[str]] = {}              # ANY ack of a line whose hash matches accepts it: a corrected re-ack repairs
     parsed: list[Any] = []
     texts: list[str | None] = []                 # None: the line is not text (bytes that are not UTF-8, or not a str at all)
     shas: list[str] = []                         # of the line's RAW bytes: a bytes line is hashed as given, never as decoded text
@@ -315,6 +320,8 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 raise _Bad("not JSON")
             if not isinstance(rec, dict):
                 raise _Bad("a record must be a JSON object")
+            if n in breaks:
+                raise _Bad(breaks[n])
             _validate(rec, store_id)
             if n in acks:
                 problems.append(f"line {n}: ack-torn names this line, which is not torn")

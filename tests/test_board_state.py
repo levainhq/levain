@@ -225,6 +225,8 @@ def _impurities(source: str) -> list[str]:
         if isinstance(node, ast.Import):
             bad += [f"import {a.name}" for a in node.names if a.name.split(".")[0] not in ALLOWED_IMPORTS]
         elif isinstance(node, ast.ImportFrom):
+            if node.module == "levain.desk" and not node.level and [a.name for a in node.names] == ["board_chain"]:
+                continue                    # the one sibling: the stdlib-only chain checker both folds share (P1b)
             if node.level or (node.module or "").split(".")[0] not in ALLOWED_IMPORTS:
                 bad.append(f"from {'.' * node.level}{node.module or ''} import")
         elif isinstance(node, ast.Call):

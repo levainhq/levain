@@ -19,8 +19,8 @@ Three entry points, all pure (no file, no clock, no environment: ``now`` is a pa
 
 The state, column and audit-kind sets each have ONE definition here (:data:`STATE_COLUMN`, :data:`AUDIT_KINDS`):
 the emit sites and the schema document test read those, so the documented set cannot drift from the emitted one.
-Stdlib only, and no ``levain`` import, so the module can be copied or installed anywhere and a conformance run needs
-nothing else.
+Stdlib only, and no ``levain`` import beyond its stdlib-only sibling :mod:`levain.desk.board_chain` (the one chain checker
+both stores' folds share), so the module can be copied with that one file and a conformance run needs nothing else.
 """
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ from dataclasses import dataclass, field, replace
 from datetime import date as _date, datetime, timezone
 from functools import cached_property
 from typing import Any, Callable
+
+from levain.desk import board_chain
 
 __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
@@ -188,6 +190,8 @@ class Folded:
     problems: tuple[str, ...] = ()
     torn: bool = False
     torn_why: str = ""
+    acked: tuple[int, ...] = ()                                     # lines an ``ack-torn`` skipped
+    torn_lines: tuple[tuple[int, str], ...] = ()                    # (line, sha256 of its bytes) of every torn line, acked or not
 
 
 def _req_str(obj: Mapping[str, Any], key: str, what: str | None = None) -> str:
@@ -319,10 +323,30 @@ def _apply(rec: Mapping[str, Any], items: dict[str, Item]) -> None:
 
 def fold(lines: Iterable[str]) -> Folded:
     """The current items from the record lines, in file order. Blank lines are skipped; every other line must be a
-    well-formed record of a known version and op, or the file is torn (a crash mid-append looks exactly like this)."""
+    well-formed record of a known version and op, or the file is torn (a crash mid-append looks exactly like this).
+    ``lines`` are the file's lines split on ``\\n`` only, so the numbers and the hashes are the file's own.
+
+    A broken CHAIN (:func:`levain.desk.board_chain.check_chain`: an unchained record after the cutover, a ``prev`` that does
+    not match the line before, a cutover that does not commit the legacy prefix) is one more way a line is torn, named in
+    ``torn_why``. An ``ack-torn`` record ``{op, line, sha256, why}`` whose ``sha256`` is the hash of that line's bytes makes
+    the fold skip exactly that line, torn or chain-broken; an ack of a line that is not torn is a problem and skips nothing.
+    Acknowledged lines are in ``acked``; every torn line, acknowledged or not, is in ``torn_lines``."""
+    lines = list(lines)
     items: dict[str, Item] = {}
     problems: list[str] = []
     torn_why = ""
+    breaks = board_chain.check_chain(lines).by_line()
+    acks: dict[int, set[str]] = {}                      # ANY ack of a line whose hash matches accepts it
+    for raw in lines:
+        if isinstance(raw, str) and board_chain.ACK_OP in raw:
+            try:
+                rec = json.loads(raw)
+                target, sha = _ack_target(rec)
+            except (ValueError, RecursionError, _Bad):
+                continue
+            acks.setdefault(target, set()).add(sha)
+    acked: list[int] = []
+    torn_lines: list[tuple[int, str]] = []
     for n, raw in enumerate(lines, 1):
         if not isinstance(raw, str):                    # a file read in binary mode must not look like an empty store
             problems.append(f"line {n}: torn: not text ({type(raw).__name__})")
@@ -340,13 +364,44 @@ def fold(lines: Iterable[str]) -> Folded:
                 raise _Bad(f"not JSON ({e})") from None
             if not isinstance(rec, Mapping):
                 raise _Bad("a record must be a JSON object")
+            if n in breaks:
+                raise _Bad(breaks[n])
+            if rec.get("op") == board_chain.ACK_OP:
+                _ack_target(rec)                        # shape only; an ack changes no item
+                if n in acks:
+                    problems.append(f"line {n}: ack-torn names this line, which is not torn")
+                continue
+            if n in acks:
+                problems.append(f"line {n}: ack-torn names this line, which is not torn")
             _apply(rec, items)
         except _Soft as e:
             problems.append(f"line {n}: {e}")
         except _Bad as e:
-            problems.append(f"line {n}: torn: {e}")
-            torn_why = torn_why or f"line {n}: {e}"
-    return Folded(items, tuple(problems), bool(torn_why), torn_why)
+            sha = board_chain.line_hash(raw)
+            torn_lines.append((n, sha))
+            if sha in acks.get(n, ()):
+                acked.append(n)                         # skipped exactly; listed in ``acked``, not a problem
+            else:
+                problems.append(f"line {n}: torn: {e}" + ("; an ack-torn names it with a different sha256" if n in acks else ""))
+                torn_why = torn_why or f"line {n}: {e}"
+    return Folded(items, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines))
+
+
+def _ack_target(rec: Any) -> tuple[int, str]:
+    """``(line, sha256)`` of an ``ack-torn`` record, or :class:`_Bad` when it is not one or is ill-shaped."""
+    if not isinstance(rec, Mapping) or rec.get("op") != board_chain.ACK_OP:
+        raise _Bad("not an ack-torn record")
+    if type(rec.get("v")) is not int or rec["v"] != 1:
+        raise _Bad(f"unknown record version {rec.get('v')!r}")
+    _req_str(rec, "at")
+    _req_str(rec, "by")
+    _req_str(rec, "why")
+    n, sha = rec.get("line"), rec.get("sha256")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise _Bad("ack-torn line must be a positive integer")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise _Bad("ack-torn sha256 must be 64 lowercase hex")
+    return n, sha
 
 
 # ------------------------------------------------------------------------------------------------ the evidence

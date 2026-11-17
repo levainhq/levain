@@ -201,11 +201,12 @@ def _items_facts(store_dir: Path) -> tuple[dict[str, dict], dict[str, str | None
     raw = _items_raw(store_dir)
     folded = _fold_items(raw)
     adds: dict[str, dict] = {}
-    for line in raw.decode("utf-8").splitlines():
-        if not line.strip():
-            continue
-        rec = json.loads(line)                          # the fold accepted every line, so each is an object with a str id
-        if rec.get("op") == "add" and rec["id"] in folded.items:
+    for line in raw.decode("utf-8").split("\n"):
+        try:
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            continue                                    # blank, or a torn line the fold skipped because an ack-torn names it
+        if isinstance(rec, dict) and rec.get("op") == "add" and rec["id"] in folded.items:
             adds.setdefault(rec["id"], rec)
     decision = {i: (it.decision.decision if it.decision else None) for i, it in folded.items.items()}
     return adds, decision
@@ -224,7 +225,10 @@ def _fold_items(raw: bytes) -> Any:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise BoardError("the items store is torn: it is not UTF-8 text; repair it first") from None
-    folded = fold(text.splitlines())
+    lines = text.split("\n")                            # \n only: the line numbers and the chain's hashes are the file's own
+    if lines and lines[-1] == "":
+        lines.pop()
+    folded = fold(lines)
     if folded.torn:
         raise BoardError(f"the items store is torn ({folded.torn_why}); repair it first")
     return folded
@@ -725,18 +729,17 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
 
 def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, author: Mapping[str, Any],
              now: str | None = None) -> bool:
-    """Append ``{"op": "ack-torn", "line": N, "sha256": <of that line's bytes>, "why": ...}`` to ``repos.jsonl``: a reader then
-    skips exactly that line. The hash is computed here from the bytes on disk, and the line must be torn by the fold's rules.
-    ``items.jsonl`` is refused: the item fold (``board_state``, P1b's) does not know the record, so an ack appended there would
-    leave the store torn. Returns False when the line is already acknowledged."""
-    if file == bs.ITEMS_NAME:
-        raise BoardError(f"ack-torn for {bs.ITEMS_NAME} is not available yet: the item fold has to learn the record first "
-                         f"(P1b); until then repair the line by hand")
-    if file != REPOS_NAME:
-        raise BoardError(f"--file must be {REPOS_NAME}")
-    if not isinstance(line, int) or line < 1:
+    """Append ``{"op": "ack-torn", "line": N, "sha256": <of that line's bytes>, "why": ...}`` to ``repos.jsonl`` or ``items.jsonl``:
+    a reader then skips exactly that line. The hash is computed here from the bytes on disk, and the line must be torn by that
+    file's fold, a broken chain (:mod:`levain.desk.board_chain`) included. Like every record the ack is chained onto the line
+    before it, so after a tear at the tail its ``prev`` is the hash it names. Returns False when the line is already acknowledged."""
+    if file not in (REPOS_NAME, bs.ITEMS_NAME):
+        raise BoardError(f"--file must be {REPOS_NAME} or {bs.ITEMS_NAME}")
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
         raise BoardError("--line must be a positive line number")
     why, by = bs._one_line(why, "why"), bs._one_line(by, "by")
+    if file == bs.ITEMS_NAME:
+        return _ack_torn_items(target, line, why, by, author, now)
 
     def build(fold, sid, raw):
         parts = raw.split(b"\n")
@@ -752,6 +755,37 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
         return _record(rf.ACK, None, by, sid, {"line": line, "sha256": sha, "why": why}, author, now), True
 
     _, written = _reg_write(target, build, allow_torn=True)
+    return written
+
+
+def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Mapping[str, Any], now: str | None) -> bool:
+    """``ack_torn`` for ``items.jsonl``: judged by the item fold, written by the one writer with no parse (a torn store is the
+    case). The ack has no id; the fold and the writer's id reader both know it."""
+    from levain.desk.board_state import fold
+
+    def build(raw):
+        parts = raw.split(b"\n")
+        if parts and parts[-1] == b"":
+            parts.pop()
+        if line > len(parts):
+            raise BoardError(f"{bs.ITEMS_NAME} has {len(parts)} lines; there is no line {line}")
+        try:
+            folded = fold([p.decode("utf-8") for p in parts])
+        except UnicodeDecodeError:
+            raise BoardError(f"{bs.ITEMS_NAME} is not UTF-8 text; repair it by hand") from None
+        if line in folded.acked:
+            return None, False
+        if line not in {n for n, _ in folded.torn_lines}:
+            raise BoardError(f"line {line} of {bs.ITEMS_NAME} is not torn")
+        rec = bs.build_record(rf.ACK, "-", by, {"line": line, "sha256": hashlib.sha256(parts[line - 1]).hexdigest(), "why": why},
+                              now, author=author)
+        rec.pop("id")
+        return rec, True
+
+    bs._require_pointered(target)
+    if not (target.store_dir / bs.ITEMS_NAME).exists():
+        raise BoardError(f"{bs.ITEMS_NAME} does not exist; there is no line {line}")
+    _, written = bs._append(target, build, filename=bs.ITEMS_NAME, parse=lambda raw: raw)
     return written
 
 
@@ -1201,7 +1235,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
         common(p)
         p.set_defaults(func=run((lambda fn, verb: lambda a, t: said(a, *fn(t, a.name, a.words, a.by, author=author_of(a)), verb + "d", "already " + verb + "d"))(fn, verb)))
 
-    p = sub.add_parser("ack-torn", description="Acknowledge one torn line of repos.jsonl: readers then skip exactly that line. (items.jsonl is refused until the item fold learns the record.)")
+    p = sub.add_parser("ack-torn", description="Acknowledge one torn line of repos.jsonl or items.jsonl (a malformed line, or a break in the hash chain): readers then skip exactly that line.")
     p.add_argument("--file", required=True, choices=(REPOS_NAME, bs.ITEMS_NAME))
     p.add_argument("--line", required=True, type=int)
     p.add_argument("--why", required=True)

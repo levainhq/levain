@@ -860,11 +860,18 @@ def test_append_to_another_file_name_chains_that_file(home, tmp_path):
     assert not (store / "items.jsonl").exists()
 
 
+def _chained_foreign(items: Path, rec_id: str = "flow#1", prev_fn=None) -> bytes:
+    """A record another CHAINED writer appends (P1b: an unchained line after the cutover is a break, not a race): its prev is
+    the hash of the file's last line as it is now."""
+    rec = bs._with_prev(bs.build_record("add", rec_id, "b", {}, "2026-11-17T00:00:00Z", author=AGENT), (prev_fn or bs.chain_prev)(items.read_bytes()))
+    return bs.canonical_bytes(rec)
+
+
 def test_a_file_replaced_before_the_write_rebuilds_prev_from_the_new_files_last_line(home, tmp_path, capsys, monkeypatch):
     store = use(capsys, tmp_path / "s")
     assert run(capsys, *ADD)[0] == 0
     items = store / "items.jsonl"
-    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "b", {}, "2026-11-17T00:00:00Z", author=AGENT))
+    foreign = _chained_foreign(items)
     real_read, real_write, calls, seen = bs._read_fd, bs._write_all, {"n": 0}, []
 
     def swap_after_first_read(fd):
@@ -925,7 +932,7 @@ def test_a_lock_free_append_between_the_read_and_the_write_is_read_again_and_cha
     store = use(capsys, tmp_path / "s")
     assert run(capsys, *ADD)[0] == 0
     items = store / "items.jsonl"
-    foreign = bs.canonical_bytes(bs.build_record("add", "flow#1", "b", {}, "2026-11-17T00:00:00Z", author=AGENT))
+    foreign = _chained_foreign(items)
     real, calls = bs.chain_prev, {"n": 0}
 
     def append_lock_free(raw):
@@ -953,7 +960,7 @@ def test_a_writer_that_keeps_racing_is_refused_after_a_bounded_number_of_rounds(
         calls["n"] += 1
         out = real(raw)
         fd = os.open(store / "items.jsonl", os.O_WRONLY | os.O_APPEND)
-        os.write(fd, b'{"v":1,"op":"add","id":"flow#1","at":"x"}\n')
+        os.write(fd, _chained_foreign(store / "items.jsonl", f"flow#{calls['n']}", real) + b"\n")
         os.close(fd)
         return out
 

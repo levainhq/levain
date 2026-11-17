@@ -169,6 +169,8 @@ def test_the_fold_is_pure_and_imports_nothing_from_levain():
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            if isinstance(node, ast.ImportFrom) and node.module == "levain.desk" and [a.name for a in node.names] == ["board_chain"]:
+                continue                    # the one sibling: the stdlib-only chain checker both folds share (P1b)
             assert not any(n == "levain" or n.startswith("levain.") for n in names), names
 
 
@@ -233,7 +235,7 @@ def test_ack_torn_skips_exactly_that_line_by_its_hash():
 
 
 def test_fields_the_fold_does_not_know_are_ignored():
-    f = rf.fold_repos([rec("register", prev="0" * 64, author={"kind": "agent", "name": "a"}, grade="asserted", future="x")], store_id=SID)
+    f = rf.fold_repos([rec("register", prev=hashlib.sha256(b"").hexdigest(), author={"kind": "agent", "name": "a"}, grade="asserted", future="x")], store_id=SID)
     assert not f.torn and not f.problems and "x" in f.repos
 
 
@@ -764,6 +766,58 @@ def test_a_torn_registry_refuses_every_reader_and_writer_until_acked(store, mkre
     assert ok(capsys, "pause", "alpha", "--words", "w", *A) == "paused alpha"
 
 
+OLD_REG = b'{"v":1,"store":"%s","op":"pause","repo":"alpha","at":"2026-11-17T00:00:00Z","by":"old","words":"w"}'
+
+
+def _registry_with_old_writer_line(store, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    line = OLD_REG % (store / "store.id").read_bytes().strip()
+    with open(store / "repos.jsonl", "ab") as fh:
+        fh.write(line + b"\n")                                      # an old writer appends a record with no prev
+    return line
+
+
+def test_p1b_an_unchained_registry_line_after_the_cutover_is_torn_and_every_reader_and_writer_refuses_naming_it(store, mkrepo, capsys):
+    _registry_with_old_writer_line(store, mkrepo, capsys)
+    fold = rf.fold_repos((store / "repos.jsonl").read_bytes().split(b"\n")[:-1], store_id=(store / "store.id").read_text().strip())
+    assert fold.torn and fold.torn_why == "line 3: unchained record after the cutover (an old writer?)"
+    before = (store / "repos.jsonl").read_bytes()
+    for argv in (("repos",), ("resume", "alpha", "--words", "w", *A)):
+        rc, _, err = run(capsys, *argv)
+        assert rc == 2 and "an old writer?" in err and "ack-torn --file repos.jsonl --line 3" in err, argv
+    assert (store / "repos.jsonl").read_bytes() == before
+
+
+def test_p1b_ack_torn_on_the_registry_re_anchors_and_a_second_break_after_it_refuses_again(store, mkrepo, capsys):
+    line = _registry_with_old_writer_line(store, mkrepo, capsys)
+    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "3", "--why", "stale checkout", *A) == "acknowledged repos.jsonl line 3"
+    ack = reg_lines(store)[-1]
+    assert ack["op"] == "ack-torn" and ack["sha256"] == hashlib.sha256(line).hexdigest() and ack["prev"] == ack["sha256"]
+    assert run(capsys, "repos")[0] == 0                            # derives again; the old writer's record is skipped, not applied
+    assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].attention == "paused"
+    assert ok(capsys, "resume", "alpha", "--words", "w", *A) == "resumed alpha"
+    with open(store / "repos.jsonl", "ab") as fh:
+        fh.write(line + b"\n")
+    rc, _, err = run(capsys, "repos")
+    assert rc == 2 and "line 6: unchained record after the cutover (an old writer?)" in err
+    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "6", "--why", "again", *A) == "acknowledged repos.jsonl line 6"
+    assert run(capsys, "repos")[0] == 0
+
+
+def test_p1b_a_registry_prev_that_does_not_match_is_named(store, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    ok(capsys, "resume", "alpha", "--words", "w", *A)
+    lines = (store / "repos.jsonl").read_bytes().split(b"\n")[:-1]
+    del lines[1]
+    (store / "repos.jsonl").write_bytes(b"\n".join(lines) + b"\n")
+    rc, _, err = run(capsys, "repos")
+    assert rc == 2 and "line 2: prev does not match line 1" in err
+
+
 def reg_lines_tolerant(store):
     out = []
     for ln in (store / "repos.jsonl").read_text("utf-8").splitlines():
@@ -1187,15 +1241,13 @@ def tear_item_adds(store):
     p.write_text("".join("#" + ln + "\n" if json.loads(ln)["op"] == "add" else ln + "\n" for ln in p.read_text().splitlines()))
 
 
-def test_f1_ack_torn_on_the_items_file_is_refused_naming_p1b_and_appends_nothing(store, tmp_path, mkrepo, capsys):
+def test_f1_ack_torn_on_the_items_file_is_taken_since_p1b_and_the_item_store_reads_again(store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, store, a, "alpha")
     with open(store / "items.jsonl", "a") as fh:
         fh.write("garbage\n")
-    before = (store / "items.jsonl").read_bytes()
-    rc, _, err = run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "w", *A)
-    assert rc == 2 and "P1b" in err and "items.jsonl" in err
-    assert (store / "items.jsonl").read_bytes() == before
+    assert run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "w", *A)[1] == "acknowledged items.jsonl line 2"
+    assert not item_fold((store / "items.jsonl").read_text("utf-8").split("\n")).torn
 
 
 def test_f2_abandon_done_on_a_torn_item_store_refuses_instead_of_reading_no_items(store, tmp_path, mkrepo, capsys, monkeypatch):

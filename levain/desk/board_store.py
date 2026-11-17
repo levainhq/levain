@@ -41,7 +41,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
-from levain.desk import work_attach
+from levain.desk import board_chain, work_attach
 
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
@@ -297,7 +297,10 @@ def read_item_lines(target: Target) -> list[str]:
             if not target.items_path.exists():
                 return []
             raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
-    return raw.decode("utf-8").splitlines()
+    lines = raw.decode("utf-8").split("\n")          # NOT splitlines(): the line numbers and the chain's hashes are the file's own
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _read_records(fd: int) -> list[dict]:
@@ -305,24 +308,43 @@ def _read_records(fd: int) -> list[dict]:
     return _records_from(_read_fd(fd))
 
 
+def ack_hint(file: str, n: int) -> str:
+    return f'to acknowledge it: levain board ack-torn --file {file} --line {n} --why "..."'
+
+
 def _records_from(raw: bytes) -> list[dict]:
+    """The items file's records (id and op are all the writer reads), or BoardError on a torn line: not JSON, no valid id, or a
+    broken chain (:func:`levain.desk.board_chain.check_chain`), unless an ``ack-torn`` record acknowledges exactly that line
+    (:func:`levain.desk.board_chain.acked_lines`). An ``ack-torn`` record itself carries no id and is not returned."""
     if raw and not raw.endswith(b"\n"):
         raise BoardError("the store does not end in a newline (a torn append); repair it before writing")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BoardError(f"the store holds invalid UTF-8 at byte {exc.start}; repair it before writing") from None
+    blines = raw.split(b"\n")[:-1] if raw else []
+    chain, acked = board_chain.check_chain(blines).by_line(), board_chain.acked_lines(blines)
     recs = []
     for n, line in enumerate(text.split("\n"), 1):          # NOT splitlines(): a record is one \n-terminated line
         if not line.strip():
             continue
+        why = None
         try:
             rec = json.loads(line)
-        except ValueError:
-            raise BoardError(f"the store holds a torn line ({n}): not JSON; repair it before writing") from None
-        if not isinstance(rec, dict) or not isinstance(rec.get("id"), str) or not ID_RE.fullmatch(rec["id"]):
-            raise BoardError(f"the store holds a torn line ({n}): no valid id; repair it before writing")
-        recs.append(rec)
+        except (ValueError, RecursionError):
+            rec, why = None, f"the store holds a torn line ({n}): not JSON"
+        if why is None and not isinstance(rec, dict):
+            why = f"the store holds a torn line ({n}): not a record"
+        elif why is None and n in chain:
+            why = f"the store's hash chain is broken at line {n}: {chain[n]}"
+        elif why is None and rec.get("op") != board_chain.ACK_OP and (not isinstance(rec.get("id"), str) or not ID_RE.fullmatch(rec["id"])):
+            why = f"the store holds a torn line ({n}): no valid id"
+        if why is not None:
+            if n in acked:
+                continue                                    # acknowledged: skipped exactly, as the fold skips it
+            raise BoardError(f"{why}; repair it before writing, or {ack_hint(ITEMS_NAME, n)}")
+        if rec.get("op") != board_chain.ACK_OP:
+            recs.append(rec)
     return recs
 
 
