@@ -2,7 +2,7 @@
 # (python3 tests/ci/link_invariants.py). No lane picks a subset: the reds of this class each came from the one test
 # a hand-picked subset omitted. One test path per line, relative to the repo root; `#` starts a comment.
 # The runner then also runs `pytest -m invariant -q` (the marker tier, tests/ci/invariant_tests.txt).
-# tests/test_link_invariants_list.py holds the four named below in this list.
+# tests/test_link_invariants_list.py pins every file below by name: change this list and that set together, deliberately.
 tests/test_seam_classes_census.py
 tests/test_live_marker.py
 tests/test_ci_root_closure.py
@@ -11,3 +11,5 @@ tests/test_slot_egress_cards.py
 tests/test_root_py39_floor.py
 # The marker list is held to the collected tests and the named failures.
 tests/test_ci_invariant_marker.py
+# The guard itself: it pins this list by name, so it must run at every link tip.
+tests/test_link_invariants_list.py
