@@ -159,18 +159,18 @@ def _split(raw: bytes) -> tuple[list[bytes], bool]:
     return parts, tail
 
 
-def _load(store_dir: Path) -> View:
+def _load(store_dir: Path, deadline: float | None = None) -> View:
     """The registry as it is on disk. The caller holds ``store.lock``. A store with no ``repos.jsonl`` has an INACTIVE registry
     (``active`` False, no repos): it is the file's existence that activates it. "Unreadable" is for a file that exists and cannot
-    be read."""
+    be read. ``deadline`` (a ``time.monotonic()`` instant) bounds the file's own shared lock (``LockWaiting``)."""
     sid = _store_id(store_dir)
     path = store_dir / REPOS_NAME
     if not path.exists():
         return View(rf.fold_repos([], store_id=sid), sid, b"", (), False)
-    raw = bs._read_stable(path, fcntl.LOCK_SH)
+    raw = bs._read_stable(path, fcntl.LOCK_SH, deadline)
     lines, tail = _split(raw)
     if tail:                                                    # an append in flight? read once more before judging it
-        raw = bs._read_stable(path, fcntl.LOCK_SH)
+        raw = bs._read_stable(path, fcntl.LOCK_SH, deadline)
         lines, tail = _split(raw)
     return View(rf.fold_repos(lines, store_id=sid, unterminated_tail=tail), sid, raw, tuple(lines))
 
@@ -968,16 +968,21 @@ def stale_audit(view_fold: rf.RepoFold, now: datetime) -> list[str]:
     return out
 
 
-def audit_for_state(target: bs.Target, now: datetime) -> list[str]:
+def audit_for_state(target: bs.Target, now: datetime, *, view: View | None = None, view_exc: Exception | None = None) -> list[str]:
     """The registry's audit lines for ``board state`` (the 72-hour rule, a torn registry, and a registry that cannot be read at
-    all: one ``registry: unreadable: <why>`` line). A store with no pointer, or no ``repos.jsonl`` yet, adds nothing."""
+    all: one ``registry: unreadable: <why>`` line). A store with no pointer, or no ``repos.jsonl`` yet, adds nothing.
+    Given the registry the caller already read under its own hold (``view``, or ``view_exc`` for the BoardError it raised)
+    this takes no lock: one snapshot, one lock. Without either it reads the registry under a shared lock of its own."""
     if not target.pointered:
         return []
-    try:
-        with bs.store_lock(target.store_dir, exclusive=False):
-            view = _load(target.store_dir)
-    except BoardError as exc:                    # never swallowed (W8): a registry that cannot be judged is an audit entry
-        return [f"registry: unreadable: {exc}"]
+    if view is None and view_exc is None:
+        try:
+            with bs.store_lock(target.store_dir, exclusive=False):
+                view = _load(target.store_dir)
+        except BoardError as exc:                    # never swallowed (W8): a registry that cannot be judged is an audit entry
+            return [f"registry: unreadable: {exc}"]
+    if view is None:
+        return [f"registry: unreadable: {view_exc}"]
     return audit_lines(view, now)
 
 

@@ -32,6 +32,7 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import sys
@@ -163,27 +164,37 @@ def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | 
 
 
 LOCK_WAITING = "the board store is locked by a writer; try again"
+LOCK_POLL = 0.005               # seconds between tries of the non-blocking lock (a hold is milliseconds), plus up to as much jitter
 
 
-def _lock_bounded(fd: int, flock_op: int, wait: float) -> None:
-    """``flock`` with a deadline: poll the non-blocking form, raise :class:`BoardError` (``LOCK_WAITING``) once ``wait`` seconds pass."""
-    deadline = time.monotonic() + wait
+class LockWaiting(BoardError):
+    """The lock was not free before the caller's deadline. Callers match this TYPE, never its text."""
+
+
+def _lock_bounded(fd: int, flock_op: int, deadline: float) -> None:
+    """``flock`` with a deadline (a ``time.monotonic()`` instant): poll the non-blocking form, raise :class:`LockWaiting`
+    once the deadline passes. The poll is not fair to a writer queued in the kernel; the wait is bounded, never silent."""
     while True:
         try:
             fcntl.flock(fd, flock_op | fcntl.LOCK_NB)
             return
         except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise BoardError(LOCK_WAITING) from None
-            time.sleep(0.02)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise LockWaiting(LOCK_WAITING) from None
+            time.sleep(min(left, LOCK_POLL * (1 + random.random())))
+
+
+def _deadline_of(wait: float | None) -> float | None:
+    return None if wait is None else time.monotonic() + wait
 
 
 def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_ok: bool = False,
-                  wait: float | None = None) -> int:
+                  deadline: float | None = None) -> int:
     """Open ``path`` (taking ``flock_op`` when given), then check it is still the file at ``path``: a git operation replaces a
     tracked file by a new inode, and a lock on the unlinked one excludes nobody. Retried a bounded number of times.
-    ``missing_ok``: a file that is not there returns -1 instead of refusing. ``wait``: give up on the lock after that many
-    seconds (``LOCK_WAITING``); None waits as long as it takes."""
+    ``missing_ok``: a file that is not there returns -1 instead of refusing. ``deadline`` (a ``time.monotonic()`` instant):
+    give up on the lock then (:class:`LockWaiting`), once for every retry pass together; None waits as long as it takes."""
     for _ in range(OPEN_RETRIES):
         try:
             fd = os.open(path, flags, 0o644)
@@ -195,14 +206,14 @@ def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_o
             raise BoardError(f"cannot open {path}: {exc}") from None
         if flock_op is not None:
             try:
-                if wait is None:
+                if deadline is None:
                     fcntl.flock(fd, flock_op)
                 else:
-                    _lock_bounded(fd, flock_op, wait)
+                    _lock_bounded(fd, flock_op, deadline)
             except OSError as exc:
                 os.close(fd)
                 raise BoardError(f"cannot lock {path}: {exc}") from None
-            except BoardError:
+            except BaseException:               # LockWaiting, KeyboardInterrupt, anything: the fd never leaks
                 os.close(fd)
                 raise
         if _same_file(fd, path):
@@ -249,18 +260,22 @@ class StoreHandle:
 
 
 @contextmanager
-def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False, wait: float | None = None) -> Iterator[StoreHandle]:
+def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False, wait: float | None = None,
+               deadline: float | None = None) -> Iterator[StoreHandle]:
     """Hold ``<store dir>/store.lock``: LOCK_EX when ``exclusive``, else LOCK_SH. Every store file's reader and writer
     uses it. Not held across git evidence reads. A writer never creates the store: under the exclusive lock the directory
     and ``store.id`` must exist, or it refuses (only ``use``, with ``setup``, makes a store). A reader never creates the
-    lock: a missing lock means no writer, and it reads without one. ``wait`` (seconds) bounds the wait for the lock: past it the
-    call refuses with ``LOCK_WAITING``; None, every existing caller's choice, waits as long as it takes."""
+    lock: a missing lock means no writer, and it reads without one. ``wait`` (seconds) or ``deadline`` (a ``time.monotonic()``
+    instant, so one bound can span several locks) bounds the wait for the lock: past it the call raises :class:`LockWaiting`;
+    with neither, the call waits as long as it takes."""
     store_dir = Path(store_dir)
+    if deadline is None:
+        deadline = _deadline_of(wait)
     if exclusive:
         if not setup:
             _require_store_exists(store_dir)
         try:
-            fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX, wait=wait)
+            fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX, deadline=deadline)
         except BoardError:
             if not setup:
                 _require_store_exists(store_dir)            # the store vanished while we opened: say so, not "cannot open"
@@ -272,7 +287,7 @@ def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False, wait: f
         finally:
             os.close(fd)                # closing releases the flock
         return
-    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True, wait=wait)
+    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True, deadline=deadline)
     if fd < 0:
         _require_store_exists(store_dir)            # no lock in a store that is gone is a dangling store, not an empty one
         yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock)
@@ -300,10 +315,10 @@ def _read_fd(fd: int) -> bytes:
     return raw
 
 
-def _read_stable(path: Path, flock_op: int | None = None) -> bytes:
+def _read_stable(path: Path, flock_op: int | None = None, deadline: float | None = None) -> bytes:
     """The bytes of ``path``, read from a file that is still the one at ``path`` afterwards; one retry if it was replaced."""
     for _ in range(2):
-        fd = _open_checked(path, os.O_RDONLY, flock_op)
+        fd = _open_checked(path, os.O_RDONLY, flock_op, deadline=deadline)
         try:
             raw = _read_fd(fd)
             if _same_file(fd, path):
@@ -313,16 +328,17 @@ def _read_stable(path: Path, flock_op: int | None = None) -> bytes:
     raise BoardError(f"{path} was replaced while it was read (a git operation?); retry")
 
 
-def read_item_lines(target: Target) -> list[str]:
+def read_item_lines(target: Target, deadline: float | None = None) -> list[str]:
     """The items file's lines, read under the shared lock. The fold decides what they mean (a torn line is a torn board).
-    A pointered store with no items file yet reads as empty; an explicit file that is missing raises BoardError."""
+    A pointered store with no items file yet reads as empty; an explicit file that is missing raises BoardError. ``deadline``
+    (a ``time.monotonic()`` instant) bounds every lock this read takes (:class:`LockWaiting`)."""
     if not target.pointered:
-        raw = _read_stable(target.items_path, fcntl.LOCK_SH)          # no store.lock in a store nobody set up
+        raw = _read_stable(target.items_path, fcntl.LOCK_SH, deadline)          # no store.lock in a store nobody set up
     else:
-        with store_lock(target.store_dir, exclusive=False):
+        with store_lock(target.store_dir, exclusive=False, deadline=deadline):
             if not target.items_path.exists():
                 return []
-            raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
+            raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH, deadline)
     lines = raw.decode("utf-8").split("\n")          # NOT splitlines(): the line numbers and the chain's hashes are the file's own
     if lines and lines[-1] == "":
         lines.pop()
@@ -738,7 +754,7 @@ def known_ids(target: Target) -> set[str]:
     if not target.items_path.exists():
         return set()
     with store_lock(target.store_dir, exclusive=False):
-        raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
+        raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH, deadline)
     return {r["id"] for r in _records_from(raw) if r.get("op") == "add"}
 
 

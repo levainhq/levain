@@ -1480,12 +1480,19 @@ def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, 
 
 
 def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
-               repo_evidence: Mapping[str, Evidence] | None = None, primary_repo: str | None = None) -> Board:
+               repo_evidence: Mapping[str, Evidence] | None = None, primary_repo: str | None = None,
+               label_primary: bool = False, unread_repos: Mapping[str, str] | None = None) -> Board:
     """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
     timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
     ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
     reads (the unattributed scan) is never a clean board, and neither is evidence too old, undated or fetched in the
     future (``stale_evidence``). An item is listed in the audit once.
+
+    ``label_primary`` puts the primary's repo name on its own git audit lines too (``<repo>: ...``, as every other repo's
+    have), for a board with no privileged repo; the flow-supplied sources stay unlabeled (they are board-wide).
+    ``unread_repos`` (``{repo: why}``) names repos in ``repo_evidence`` that were NOT read (their evidence holds only
+    unreadable sources, so their items read unknown): each says its ``why`` once, an audit entry and a problem line, in
+    place of one line per source.
 
     ``repo_evidence`` (``{repo: Evidence}``) is the cross-repo board: an item, and each dependency it waits on, is read
     from the evidence of the repo it belongs to, and an item whose repo has no entry reads unknown. ``evidence`` is the
@@ -1512,15 +1519,16 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
                         "no item of a read repo waits on them")
     if folded.torn:
         audit.append(AuditEntry("unknown", None, f"items file torn: {folded.torn_why}"))
+    pfx = f"{primary_repo}: " if label_primary and primary_repo else ""
     for source in sorted(evidence.unreadable):
-        why = f"{source} unreadable: {evidence.unreadable[source]}"
+        why = f"{pfx if source not in _FLOW_SOURCES else ''}{source} unreadable: {evidence.unreadable[source]}"
         audit.append(AuditEntry("unknown", None, why))
         problems.append(why)
     for st in states:                   # a check skipped because a source was not read is said, never silently passed
         problems.extend(ctx.notes.get(st.id, ()))
     stale = _evidence_problem(evidence, now)
     if stale:                           # with nothing to read (or only decided items) an old fetch would otherwise be a clean board
-        why = f"stale_evidence: {stale}"
+        why = f"stale_evidence: {pfx}{stale}"
         audit.append(AuditEntry("unknown", None, why))
         problems.append(why)
     for s in states:                    # one entry per item, whatever it carries
@@ -1543,6 +1551,11 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
         elif landed:                    # rule 6 was ruled out only by an orphan branch: the state follows rules 7-8, the audit still says it
             audit.append(AuditEntry("landed_not_closed", s.id, f"{_landed_why(*landed)}; reads {s.state} because an orphan branch carries more"))
     for repo, ev in others:             # the other repos' own sources, each said under its repo
+        if unread_repos and repo in unread_repos:
+            why = f"{repo}: {unread_repos[repo]}"
+            audit.append(AuditEntry("unknown", None, why))
+            problems.append(why)
+            continue
         for source in sorted(ev.unreadable):
             if source in _FLOW_SOURCES and source in evidence.unreadable:
                 continue                # the flow-supplied extra reaches every repo's evidence (every item fails closed); said once,
@@ -1558,7 +1571,9 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             problems.append(why)
     unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
     for u in unattributed:
-        audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))
+        audit.append(AuditEntry("unattributed_work", None, f"{pfx}{_short(u.sha)} {u.subject}".strip()))
+    if pfx:
+        unattributed = tuple(Unattributed(u.sha, f"{pfx}{u.subject}") for u in unattributed)
     for repo, ev in others:
         for u in sorted(ev.unattributed, key=lambda u: (u.sha, u.subject)):
             audit.append(AuditEntry("unattributed_work", None, f"{repo}: {_short(u.sha)} {u.subject}".strip()))
@@ -1566,7 +1581,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     if not folded.torn:                 # with a torn store most ids would look unknown for a reason already reported
         for iid, where in sorted(_trailer_ids(evidence).items(), key=lambda kv: _id_key(kv[0])):
             if iid not in folded.items:
-                audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(sorted(set(where)))}; the store does not hold it"))
+                audit.append(AuditEntry("unknown_id_in_trailer", iid, f"{pfx}named by {', '.join(sorted(set(where)))}; the store does not hold it"))
         for repo, ev in others:
             for iid, where in sorted(_trailer_ids(ev, git_only=True).items(), key=lambda kv: _id_key(kv[0])):
                 if iid not in folded.items:
