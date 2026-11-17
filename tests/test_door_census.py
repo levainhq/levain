@@ -15,7 +15,7 @@ _EXPECTED = frozenset({
     ("desk", "reply"), ("desk", "spawn"),
     ("desk", "report"), ("desk", "import-status"), ("desk", "apply-reports"), ("desk", "reports"),
     ("desk", "handoff", "worker"), ("desk", "log"),
-    ("desk", "open"), ("desk", "close"), ("desk", "handoff", "show"),
+    ("desk", "open"), ("desk", "close"), ("desk", "nightclose"), ("desk", "handoff", "show"),
     ("desk", "ready", "show"), ("desk", "ready", "add"), ("desk", "ready", "move"), ("desk", "ready", "correct"),
     # ND-1: the desk reads sensor events and writes its own decision on one; the sensor-side and operator-side event verbs stay out
     ("desk", "event", "list"), ("desk", "event", "ack"),

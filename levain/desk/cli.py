@@ -106,7 +106,7 @@ def _board_store(args: argparse.Namespace) -> EnvelopeStore:
 # the verbs that act on the desk itself (its lease, launches, setting, seams and ready queue): each opens the
 # store its desk is in (:func:`_desk_dir`), so one desk's whole family stays in one dispatch.db
 _FOLLOWS_DESK = frozenset({"take", "release", "beat", "claim", "wake", "launch", "agent", "status", "ready",
-                                  "watch", "close", "open", "handoff", "event", "order"})
+                                  "watch", "close", "open", "handoff", "event", "order", "nightclose"})
 
 
 def _opens_board(args: argparse.Namespace) -> bool:
@@ -1790,6 +1790,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return 0
         if cmd == "handoff" and args.handoff_cmd == "worker":
             return _coord_worker_handoff(args, out, store)
+        if cmd == "nightclose":
+            return _coord_nightclose(args, out, store)
         if cmd in ("close", "open", "handoff"):
             from levain.desk import seam_verbs
 
@@ -2192,6 +2194,27 @@ def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
         return work_attach.desk_apply(store, token)
     except Exception as exc:    # noqa: BLE001 - the verb this rides on has already done its work
         return [f"board reports: not applied ({exc})"]
+
+
+def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain desk nightclose --token N``: the morning quiescence (:func:`levain.desk.nightclose.nightclose`), run by
+    the day desk under its own lease. The effects half runs only when the store directory already holds the effect
+    journal (:data:`levain.desk.effect_attempts.JOURNAL_FILE`): the verb never creates it, so a desk with no night
+    writes no empty file and the effects half stays a no-op until the night path makes one."""
+    from levain.desk.effect_attempts import JOURNAL_FILE, Journal
+    from levain.desk.nightclose import nightclose
+
+    path = Path(store.directory) / JOURNAL_FILE
+    journal = Journal(path) if path.is_file() else None
+    got = nightclose(store, datetime.now(timezone.utc), token=args.token, journal=journal)
+    effects = (f"effects recorded {len(got.effects)}" + (f" ({', '.join(str(a) for a in got.effects)})" if got.effects else "")
+               if journal is not None else f"no effect journal exists yet ({JOURNAL_FILE} is not in {store.directory}): "
+                                           "effects not read")
+    _emit(out, args.json, {"owner": got.owner, "stopped": got.stopped, "handed": list(got.handed),
+                           "effects": list(got.effects), "journal": journal is not None},
+          f"nightclose: owner {got.owner}; stop {'written' if got.stopped else 'already covers every launch'}; "
+          f"events handed {len(got.handed)}" + (f" ({', '.join(got.handed)})" if got.handed else "") + f"; {effects}")
+    return 0
 
 
 def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
@@ -2919,6 +2942,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ccl.add_argument("--request-id", dest="request_id", default=None, metavar="ID", help="Required unless --plan.")
     ccl.add_argument("--prev-handoff-id", dest="prev_handoff_id", type=int, default=None, metavar="H")
     ccl.add_argument("--token", type=int, default=None, help="Your desk lease token (required unless --plan).")
+    cnc = c_sub.add_parser(
+        "nightclose", help="The morning quiescence: stop the night's claims and hand its open events to you.",
+        description="Run by the day desk once the night is over, under its own lease. Stops new claims by every "
+                    "launch created before now, hands every open trusted event nobody named holds to your launch, "
+                    "and, when the store holds the effect journal, records each started (unknown) effect as yours. "
+                    "It never creates the journal; with none it says so and runs the events half. Safe to repeat.")
+    cnc.add_argument("--token", type=int, required=True, help="Your desk lease token.")
     cop = c_sub.add_parser(
         "open", help="The brief for a seam, built from the stores; with --ack, acknowledge it.",
         description="Prints the open built for you (the one your launch was started with, else one for the latest "
@@ -3074,11 +3104,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cmh.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print what would change and change nothing.")
     cmh.set_defaults(func=run_move_home)
     not_door(cmh)
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw):
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, cnc, chs, chw):
         common(p)
         p.set_defaults(func=run_coord)
     # the desk's own verbs (its brief names these); the operator's verbs are declared beside them, never left out
-    door_ok(crt, cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
+    door_ok(crt, cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, cnc, chs, chw)
     not_door(ct, cw, ca, cl, cwa)
     not_door(rvl, rvc, rvo, rvf)
 

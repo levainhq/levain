@@ -38,7 +38,9 @@ from pathlib import Path
 
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 
-__all__ = ["Attempt", "BudgetSpent", "Journal", "STATUSES", "idem_key", "night_key"]
+__all__ = ["Attempt", "BudgetSpent", "JOURNAL_FILE", "Journal", "STATUSES", "idem_key", "night_key"]
+
+JOURNAL_FILE = "effect_attempts.db"     # the one name of the journal file inside a store directory
 
 STATUSES = ("unknown", "ok", "failed", "refused")
 SCHEMA: tuple[str, ...] = (
