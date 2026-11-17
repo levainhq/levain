@@ -110,7 +110,7 @@
   let hashWords = "";
   if (location.pathname === "/sign/drop" && wdm) {
     try { hashWords = decodeURIComponent(wdm[1]); } catch (e) { hashWords = ""; }
-    hashWords = hashWords.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").slice(0, 500);
+    hashWords = hashWords.replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "").slice(0, 500);
   }
   let pick = "";
   const pickV = vm ? vm[1] : "";
@@ -1075,7 +1075,7 @@
       const pre = window.sessionStorage.getItem("levain-drop-prefill");
       if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
     } catch (e) { /* the sheet opens empty */ }
-    if (hashWords) { words.value = hashWords; grow(words); }     // a tag's link: pre-filled for the person to read, never sent or signed by itself
+    if (hashWords) { words.value = hashWords; hashWords = ""; grow(words); }     // a tag's link: pre-filled for the person to read, never sent or signed by itself
     const keyBox = el("div", "env-keybox");
     keyBox.hidden = true;
     const acts = $("sheet-actions");

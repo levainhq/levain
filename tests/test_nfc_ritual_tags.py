@@ -103,6 +103,20 @@ def test_a_revoked_bed_token_sets_neither_the_word_nor_the_line(rig):
         assert _state(src)["state"] == "fine" and presence.read_word(q) is None
 
 
+def test_a_state_write_that_fails_never_fails_the_tap_and_leaks_no_detail(rig, monkeypatch):
+    from levain import writes
+
+    def boom(*a, **k):
+        raise RuntimeError("secret path /Users/x/context.json")
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok = _mint_bed(port)[1]["token"]
+        monkeypatch.setattr(writes, "apply_edit", boom)
+        st, got, _ = _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(tok))
+        assert st == 200 and got["word"] == "sleep" and got["state_line"]["set"] is False
+        assert "secret" not in json.dumps(got) and _state(src)["state"] == "fine"
+
+
 def test_the_text_is_on_the_record_and_the_public_list_but_the_secret_is_not(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
@@ -136,8 +150,9 @@ def test_the_drop_sheet_prefill_is_decoded_and_bounded_by_a_real_run():
             + "\n  return hashWords; };\n"
               "const out = [run('#words=%2Ffanin%20broad', '/sign/drop'), run('#words=%2Ffanin%20broad', '/sign/x'),\n"
               "  run('#words=%E0%A4%A', '/sign/drop'), run('#words=' + 'a'.repeat(900), '/sign/drop').length,\n"
-              "  run('#words=a%00b%07c', '/sign/drop'), run('#thread=abc&words=hi', '/sign/drop')];\n"
+              "  run('#words=a%00b%07c', '/sign/drop'), run('#thread=abc&words=hi', '/sign/drop'),\n"
+              "  run('#words=a%E2%80%AEb%E2%80%A8c', '/sign/drop')];\n"
               "console.log(JSON.stringify(out));")
     got = subprocess.run([node, "-e", prog], capture_output=True, text=True, timeout=20)
     assert got.returncode == 0, got.stderr
-    assert json.loads(got.stdout) == ["/fanin broad", "", "", 500, "abc", "hi"]
+    assert json.loads(got.stdout) == ["/fanin broad", "", "", 500, "abc", "hi", "abc"]

@@ -3256,7 +3256,7 @@ class _Handler(GuardedHandler):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
         state_line = None
-        if tap_state:      # the token's one fixed text, after its word landed: the operator's own governed state edit, tagged phone
+        if tap_state:      # the token's one fixed text, after its word landed and outside the presence lock (known edge: a revoke landing in that gap still sets the operator's own fixed text once)
             state_line = self._tap_state_write(tap_state[0])
         try:     # a write can make held pings due (a widened mute, devices on, back): start their push now, outside the lock
             from levain.webpush import held
@@ -3284,12 +3284,13 @@ class _Handler(GuardedHandler):
         except writes.EditError as exc:
             return {"text": text, "set": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - a state write never fails the tap that already set the word
-            return {"text": text, "set": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"text": text, "set": False, "error": f"the state line could not be written ({type(exc).__name__})"}
         return {"text": text, "set": True}
 
     def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/presence/token/new {name, words?}`` / ``/revoke {name}``: full credential only (the push gate
-        let a tap token through on the two presence routes alone). The new token is in THIS reply and nowhere else."""
+        let a tap token through on the two presence routes alone). The body is ``{name, words?, state?}``; ``state`` is the one
+        fixed state-line text a tap of that token also sets (it needs exactly one word). The new token is in THIS reply and nowhere else."""
         from levain.webpush import presence, presence_tokens
 
         try:
