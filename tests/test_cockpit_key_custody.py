@@ -660,6 +660,24 @@ def test_a_touch_id_signature_that_is_there_but_does_not_verify_is_never_called_
     assert "ssh-ed25519" in msg and "chars" in msg and "ssh-keygen ran" in msg
 
 
+def test_nonempty_output_that_is_no_signature_is_never_called_cancelled(tmp_path, monkeypatch):
+    # L3 r1 (codex MED, gemini HIGH): output that is there but unreadable is not a cancelled prompt
+    import levain.cockpit.keys as keys_mod
+    k = RealKey(tmp_path, "k")
+    _touch_id_sidecar(tmp_path)
+    _, sign = keys_mod.ssh_signer(k.path)
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if "-Y" in list(argv) and list(argv)[list(argv).index("-Y") + 1] == "sign":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"-----BEGIN SSH SIGNATURE-----\nAAAA\n")
+        return real_run(argv, **kw)
+    monkeypatch.setattr(keys_mod.subprocess, "run", run)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    assert "cancelled" not in str(err.value) and "not a readable signature" in str(err.value)
+
+
 def test_a_signature_without_the_presence_flag_is_named_for_it_not_called_cancelled(tmp_path, monkeypatch):
     import levain.cockpit.keys as keys_mod
     k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
@@ -667,7 +685,7 @@ def test_a_signature_without_the_presence_flag_is_named_for_it_not_called_cancel
     _, sign = keys_mod.ssh_signer(k.path)
     _signs_with(monkeypatch, other)
     monkeypatch.setattr(keys_mod._authority_sig, "_sshsig_type_and_flags", lambda sig: ("sk-ecdsa-sha2-nistp256@openssh.com", 0))
-    monkeypatch.setattr(keys_mod._authority, "presence_missing", lambda sig, pub: True)
+    monkeypatch.setattr(keys_mod._authority, "presence_missing", lambda sig, pub: True)   # flags 0 is an sk signature's
     with pytest.raises(KeyError_) as err:
         sign(b"m")
     assert "user-presence flag" in str(err.value) and "cancelled" not in str(err.value) and "flags 0x00" in str(err.value)

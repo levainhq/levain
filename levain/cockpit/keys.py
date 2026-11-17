@@ -900,6 +900,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                                 timeout=_SIGN_TIMEOUT if timeout is None else timeout, check=False, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
+        elapsed = time.monotonic() - started       # the sign step alone, never the verify below
         if cp.returncode != 0:
             raise KeyError_(f"ssh-keygen could not sign with {key_path} (exit {cp.returncode})")
         try:
@@ -907,30 +908,28 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         except UnicodeDecodeError:
             raise KeyError_("ssh-keygen's signature is not ASCII") from None
         # Checked here, at the moment of signing, so a signature the key did not make is named for what it
-        # is. Only "no signature came back" is called a cancelled Touch ID prompt (it lets ssh-keygen exit 0
-        # without one, measured 2026-10-12); a signature that IS there and fails the check is named as that,
-        # with what it carried, because calling a touched sign "cancelled" is a false record (11-17).
+        # is. Only an EMPTY result is called a cancelled Touch ID prompt (it lets ssh-keygen exit 0 without a
+        # signature, measured 2026-10-12); output that is there and fails the check is named as that, with
+        # what it carried, because calling a touched sign "cancelled" is a false record (11-17).
         if not _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
                                           namespace=namespace, ssh_keygen=ssh_keygen):
             # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
             # (a hand-made key enrolled with --custody touch-id has no sidecar)
             is_touch = touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER
-            elapsed = time.monotonic() - started
-            try:
-                sig_type, flags = _authority_sig._sshsig_type_and_flags(signature)     # raises when no signature is there
-            except (ValueError, UnicodeError):
-                sig_type = flags = None
-                present = False
-            else:
-                present = True
-            if not present:
+            if not signature.strip():
                 if is_touch:
-                    raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp}, "
-                                    "so nothing was signed")
+                    raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
+                                    f"(ssh-keygen ran {elapsed:.1f}s), so nothing was signed")
                 raise KeyError_(f"ssh-keygen returned no valid signature by {fp} ({key_path}), so nothing was signed")
-            carried = (f"{sig_type}, flags {'none' if flags is None else format(flags, '#04x')}, "
+            try:
+                sig_type, flags = _authority_sig._sshsig_type_and_flags(signature)
+            except Exception:  # noqa: BLE001 - whatever the parser raises, the output is named for what it is
+                raise KeyError_(f"ssh-keygen returned output that is not a readable signature for {fp} "
+                                f"({len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s), so nothing was signed") from None
+            carried = (f"{sig_type!r}, flags {'none' if flags is None else format(flags, '#04x')}, "
                        f"{len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s")
-            if _authority.presence_missing(signature, public_key):
+            # the presence message only for an sk signature: a plain one carries no flags byte to lack
+            if flags is not None and _authority.presence_missing(signature, public_key):
                 raise KeyError_(f"ssh-keygen returned a signature for {fp} without the user-presence flag ({carried}), "
                                 "so nothing was signed")
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}), "
