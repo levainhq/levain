@@ -26,6 +26,8 @@ evidence reads unknown). Exit 4 is a named read failure for the one cross-repo c
 but 0 and 3 as a failed read of that repo and fails closed); it is not a board.
 An explicit ``--items`` store that holds a ``store.id`` is read as a pointer-selected one (its lock, its registry, the whole board
 when ``--repo`` is absent); a repo holding items but absent from the registry reads unregistered: not read, items unknown.
+``store.id`` is checked for a regular file before it is read; ``items.jsonl`` and ``repos.jsonl`` are not, and a file swapped to a
+FIFO between that check and the read can block the read: only someone building the store by hand reaches it (L3 round 3).
 
 The JSON is the board (``schema``, ``as_of``, ``items``, ``audit``, ``unattributed``, ``problems``) plus one additive key,
 ``reader``: ``{repo, since, main_ref, <counts>}`` (every field on every path, a failure board included), for a human
