@@ -98,10 +98,13 @@ def test_each_unreadable_source_is_noticed_by_the_unreadable_check(source):
     assert LIVE_SEAT_ID in case["expect"], f"{LIVE_SEAT_CASE!r} no longer expects {LIVE_SEAT_ID}"
     ev = dict(case["evidence"])
     ev["unreadable"] = {source: "gone"}
+    if source in ("band", "waiters"):
+        ev["seats"] = []             # the seat was a positive claim that keeps its state; without it the item rests on the absence
     folded = bs.fold(case["items_lines"])
     board = bs.derive_all(folded, bs.Evidence.from_dict(ev), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
     item = {s.id: s for s in board.items}[LIVE_SEAT_ID]                            # by id: a second item never moves the assertion
-    assert item.state == "unknown" and f"{'main' if source in ('git', 'notes') else source} unreadable" in item.reason
+    want = f"{source}: gone" if source in bs.PRODUCER_SOURCES else "main unreadable"
+    assert item.state == "unknown" and want in item.reason
 
 
 def test_a_missing_fixture_fails_by_name_not_as_a_key_error_or_a_misleading_green():

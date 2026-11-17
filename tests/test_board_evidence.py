@@ -33,7 +33,7 @@ def read(w: World, **kw):
 
 def parsed(ev: dict) -> Evidence:
     """The evidence through B1's own reader: the proof that every required field is there."""
-    return Evidence.from_dict({**ev, "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}})
+    return Evidence.from_dict({**ev, "evidence_v": 1, "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}})
 
 
 def branch(ev: dict, name: str) -> dict:

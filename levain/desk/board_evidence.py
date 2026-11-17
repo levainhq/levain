@@ -1,10 +1,10 @@
 """levain.desk.board_evidence — the board's git evidence readers (READY_SCHEMA v2, slice B2).
 
 :mod:`levain.desk.board_state` is pure; this is the half that reads. :func:`read_git_evidence` runs git (read-only: it
-never fetches, never writes a ref, a note or the index) and returns the evidence object (``evidence_v`` 1) for the
+never fetches, never writes a ref, a note or the index) and returns the evidence object (``evidence_v`` :data:`~levain.desk.board_state.EVIDENCE_V`) for the
 sources levain owns: ``fetched_at``, ``main``, ``chain``, ``refs``/``merged``, ``branches`` and ``unattributed``.
-:func:`read_documents` stats the paths of ``document``/``run`` items. ``seats``, ``band`` and ``waiters`` are FLOW's
-(its roster, its band, its land waiters): they arrive as an extra object and are merged by the CLI.
+:func:`read_documents` stats the paths of ``document``/``run`` items. ``seats``, ``band`` and ``waiters`` are the PRODUCERS':
+Levain's own reads (:mod:`levain.desk.board_producers`) and any external producer's, and the CLI merges them as blocks.
 
 Rules the readers hold, each from a measured or ruled failure:
 
@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.desk.board_state import parse_timestamp
+from levain.desk.board_state import EVIDENCE_V, parse_timestamp
 
 __all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_NOTES_BYTES", "MAX_NOTES_ENTRIES", "MAX_OWN_COMMITS",
            "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S", "read_documents", "read_git_evidence", "repo_name_of"]
@@ -681,7 +681,7 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     main_short = f"{remote}/{main}"
     main_full = f"refs/remotes/{main_short}"            # fully qualified: a tag or a branch named `origin/main` must not win
     unreadable: dict[str, str] = {}
-    ev: dict[str, Any] = {"evidence_v": 1, "unreadable": unreadable}
+    ev: dict[str, Any] = {"evidence_v": EVIDENCE_V, "unreadable": unreadable}
     summary: dict[str, Any] = {"repo": repo_name, "since": since, "main_ref": main_short, "main_commits": 0, "main_records": 0,
                                "chain_refs": 0, "chain_commits": 0, "branches": 0, "refs": 0, "merged": 0, "unattributed": 0,
                                "diverged": [], "matched_by_key": 0}      # whole on every path: a failure board keeps its shape

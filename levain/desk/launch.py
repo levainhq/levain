@@ -857,6 +857,21 @@ def _agents(exe: str, *, cwd: str, env: dict[str, str]) -> list[dict[str, Any]] 
     return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
 
 
+def _agents_checked(exe: str, *, cwd: str, env: dict[str, str]) -> tuple[list[dict[str, Any]], int] | None:
+    """``(the dict rows of claude agents --json, how many rows were not dicts)``, or None when the list could not be read.
+    Where :func:`_agents` drops a row that is not an object, this says how many it would have dropped: the board's seat
+    evidence is incomplete when any was. :func:`_agents` itself is unchanged."""
+    try:
+        cp = _run([exe, "agents", "--json"], cwd=cwd, env=env, timeout=_CALL_TIMEOUT)
+        rows = json.loads(cp.stdout) if cp.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    kept = [r for r in rows if isinstance(r, dict)]
+    return kept, len(rows) - len(kept)
+
+
 def _listed(exe: str, name: str, *, cwd: str, env: dict[str, str]) -> list[dict[str, Any]]:
     """The ``claude agents --json`` rows whose ``name`` is ``name`` (by name only; an unread list lists none)."""
     return [r for r in _agents(exe, cwd=cwd, env=env) or [] if r.get("name") == name]

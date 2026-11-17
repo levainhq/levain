@@ -189,7 +189,7 @@
    "expect": {
     "levain#1": {
      "column": "unknown",
-     "reason_contains": "seats unreadable: malformed: a seat: items is required",
+     "reason_contains": "seats: producer flow unreadable (malformed row: a seat: items is required)",
      "state": "unknown"
     }
    },

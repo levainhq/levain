@@ -484,7 +484,7 @@ STRICT = [
 @pytest.mark.parametrize("source,value,field", STRICT, ids=[f"{s}-{f}-{i}" for i, (s, _, f) in enumerate(STRICT)])
 def test_a_signal_bearing_field_that_is_missing_or_wrong_makes_its_source_unreadable_never_empty(source, value, field):
     ev = bs.Evidence.from_dict(_ev_dict(**{source: value}))
-    assert ev.unreadable.get(source, "").startswith("malformed:") and field in ev.unreadable[source], ev.unreadable
+    assert "malformed" in ev.unreadable.get(source, "") and field in ev.unreadable[source], ev.unreadable
 
 
 #: the fields the interface spec leaves optional: a source that omits only these stays readable

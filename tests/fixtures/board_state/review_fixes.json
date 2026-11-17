@@ -196,7 +196,7 @@
    "expect": {
     "levain#1": {
      "column": "unknown",
-     "reason_contains": "seats unreadable: roster gone",
+     "reason_contains": "seats: roster gone",
      "state": "unknown"
     }
    },

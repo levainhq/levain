@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from levain.cli import main
+from levain.desk import board_producers
 from levain.desk.board_state import AUDIT_KINDS, COLUMNS, STATES
 from tests._board_git_world import DAY, OLD, World, git
 
@@ -49,6 +51,18 @@ def board(capsys, w: World, items: Path, extra: Path, *more: str):
     rc, out, err = run(capsys, "--json", "--items", str(items), "--evidence-extra", str(extra), "--repo", str(w.w),
                        "--since", "2026-11-12T00:00:00Z", *more)
     return rc, json.loads(out), err
+
+
+@pytest.fixture(autouse=True)
+def native_stub(monkeypatch):
+    """Levain's own reads would open the real consent store and run claude: every test here gets a native producer that
+    read nothing and was whole (seats and band; waiters only when declared), as a quiet install would."""
+    def stub(*, now, store_id, no_land_waiter=False, **_kw):
+        out = {s: board_producers._block(now, store_id, [], None) for s in ("seats", "band")}
+        if no_land_waiter:
+            out["waiters"] = board_producers._block(now, store_id, [], None)
+        return out
+    monkeypatch.setattr(board_producers, "native_blocks", stub)
 
 
 @pytest.fixture
@@ -196,7 +210,7 @@ def test_a_bad_now_exits_two(world, tmp_path, capsys):
 
 @pytest.mark.parametrize("body, why", [("[]", "must be a JSON object"), ("{bad", "cannot be read"),
                                        ('{"main": []}', "reads itself"), ('{"branches": []}', "reads itself"),
-                                       ('{"evidence_v": 2}', "not 1"), ('{"unreadable": []}', "unreadable must be an object"),
+                                       ('{"evidence_v": 3}', "not 1 or 2"), ('{"unreadable": []}', "unreadable must be an object"),
                                        ('{"documents": []}', "documents must be an object")])
 def test_an_unusable_evidence_extra_exits_two(world, tmp_path, capsys, body, why):
     p = tmp_path / "x.json"
@@ -211,12 +225,77 @@ def test_an_extra_that_does_not_exist_exits_two(world, tmp_path, capsys):
     assert rc == 2 and "--evidence-extra" in err
 
 
-def test_without_the_flow_sources_every_item_reads_unknown_and_the_audit_says_why(world, tmp_path, capsys):
-    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w),
+def test_without_flow_the_native_producer_leaves_only_the_waiter_dependent_items_unknown(world, tmp_path, capsys):
+    """T4's user-visible point: no flow, no external producer. Seats and band are native; waiters are not declared, so an
+    item that rests on the absence of a waiter reads unknown naming ``waiters``, and a closed item is still done."""
+    world.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    world.push_main()
+    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(1), item(3))), "--repo", str(world.w),
                      "--since", "2026-11-12T00:00:00Z")
     doc = json.loads(out)
-    assert rc == 3 and states(doc) == {"levain#3": "unknown"}
-    assert {"seats", "band", "waiters"} <= {a["why"].split(" ")[0] for a in doc["audit"]}
+    assert rc == 3 and states(doc) == {"levain#1": "done", "levain#3": "unknown"}
+    assert [s["reason"] for s in doc["items"] if s["id"] == "levain#3"] == ["waiters: not supplied"]
+    assert [a["why"] for a in doc["audit"] if a["id"] is None and "unreadable" in a["why"]] == ["waiters unreadable: not supplied"]
+
+
+def test_declaring_no_land_waiter_lets_the_native_producer_conclude_the_board(world, tmp_path, capsys):
+    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w),
+                     "--since", "2026-11-12T00:00:00Z", "--no-land-waiter")
+    doc = json.loads(out)
+    assert states(doc) == {"levain#3": "ready"} and doc["audit"] == [] and rc == 0
+
+
+def _producer_file(tmp_path, name, *, store_id=None, age_s=0, complete=True, **rows):
+    when = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    blocks = {s: {"producer": name, "store_id": store_id, "captured_at": when, "complete": complete, "rows": r}
+              for s, r in {"seats": [], "band": [], "waiters": [], **rows}.items()}
+    (tmp_path / f"evidence.{name}.json").write_text(json.dumps({"evidence_v": 2, "blocks": blocks}), encoding="utf-8")
+
+
+def test_an_external_producer_file_beside_the_items_supplies_the_waiters(world, tmp_path, capsys):
+    _producer_file(tmp_path, "acme", waiters=[{"branch": "queue/x", "items": ["levain#3"]}])
+    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(3), item(4))), "--repo", str(world.w),
+                     "--since", "2026-11-12T00:00:00Z", "--producer", "acme")
+    assert states(json.loads(out)) == {"levain#3": "landing", "levain#4": "ready"}
+
+
+def test_an_external_producer_that_is_missing_or_stale_blocks_absence_and_names_why(world, tmp_path, capsys):
+    argv = ("--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z",
+            "--no-land-waiter", "--producer", "acme")
+    doc = json.loads(run(capsys, *argv)[1])
+    assert "producer acme unreadable (no evidence.acme.json in the store)" in doc["items"][0]["reason"]
+    _producer_file(tmp_path, "acme", age_s=16 * 60)
+    doc = json.loads(run(capsys, *argv)[1])
+    assert "producer acme unreadable (stale 16 min)" in doc["items"][0]["reason"]
+
+
+def test_a_block_from_another_store_is_refused_by_the_store_id(world, tmp_path, capsys):
+    (tmp_path / "store.id").write_text("mine\n", encoding="utf-8")
+    _producer_file(tmp_path, "acme", store_id="theirs")
+    doc = json.loads(run(capsys, "--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w),
+                         "--since", "2026-11-12T00:00:00Z", "--no-land-waiter", "--producer", "acme")[1])
+    assert "evidence from another store" in doc["items"][0]["reason"]
+
+
+def test_a_store_with_no_id_says_so_when_a_block_names_one(world, tmp_path, capsys):
+    _producer_file(tmp_path, "acme", store_id="theirs")
+    rc, out, err = run(capsys, "--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w),
+                       "--since", "2026-11-12T00:00:00Z", "--no-land-waiter", "--producer", "acme")
+    assert "has no id" in err and states(json.loads(out)) == {"levain#3": "ready"}
+
+
+def test_the_blocks_form_of_the_extra_is_appended_and_a_block_cannot_claim_the_flat_form(world, tmp_path, capsys):
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    good = {"evidence_v": 2, "waiters": [{"producer": "flow", "store_id": None, "captured_at": when, "complete": True, "rows": []}]}
+    p = tmp_path / "x.json"
+    p.write_text(json.dumps(good))
+    argv = ("--json", "--items", str(write_items(tmp_path, item(3))), "--evidence-extra", str(p), "--repo", str(world.w),
+            "--since", "2026-11-12T00:00:00Z")
+    rc, out, err = run(capsys, *argv)
+    assert "waiters: producer flow unreadable" not in out and states(json.loads(out)) == {"levain#3": "unknown"}   # flow's seats and band are not supplied
+    p.write_text(json.dumps({"evidence_v": 2, "waiters": [dict(good["waiters"][0], form="flat")]}))
+    rc, out, err = run(capsys, *argv)
+    assert rc == 2 and "no form key" in err
 
 
 def test_a_directory_that_is_not_a_repository_is_exit_three_with_every_item_unknown(tmp_path, capsys):
