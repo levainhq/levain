@@ -204,7 +204,7 @@ def test_the_bound_and_truncated(world, capsys):
     for name, p in parts.items():
         assert sum(len(ln) + 1 for ln in p["lines"]) <= bc.PART_CHARS[name], name
     assert sum(bc.PART_CHARS.values()) <= bc.TOTAL_CHARS
-    assert len(out) // 4 < 10_000 * 2          # the JSON wrapper aside, the parts' text is under 8K tokens
+    assert doc["total_chars"] <= bc.TOTAL_CHARS
     # the item cap (10 of 40 matches) is not a scan-bound truncation; the plan is, by the part budget
     assert parts["charter"]["truncated"] and any("[truncated" in ln for ln in parts["charter"]["lines"])
     assert parts["record"]["lines"] and sum(len(ln) + 1 for ln in parts["record"]["lines"]) <= bc.PART_CHARS["record"]
@@ -238,7 +238,7 @@ def test_no_charter_is_unreadable_and_an_untracked_repo_is_said(world, tmp_path,
     assert rc == 0, err
     assert out.splitlines()[0].startswith("repo beta is untracked (mode tracking)")
     assert "charter: unreadable (no CHARTER.md on origin/main)" in out
-    assert "record[anneal]: unreadable (no path named" in out
+    assert "record[anneal]: unavailable (no path named" in out
     assert "record[flow]: unavailable (no path named" in out
     assert "item beta#1: b one" in out
 
@@ -257,17 +257,17 @@ def test_no_anneal_store_and_no_flow_db(world, capsys, tmp_path):
     rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(tmp_path / "nope.db"),
                        "--flow-episodes", str(tmp_path / "nope2.db"))
     assert rc == 0
-    assert f"record[anneal]: unreadable ({tmp_path / 'nope.db'} is not a file)" in out
-    assert f"record[flow]: unavailable ({tmp_path / 'nope2.db'} is not a file)" in out
+    assert f"record[anneal]: unreadable ({tmp_path / 'nope.db'} is not a file)" in out      # named and failed: unreadable
+    assert f"record[flow]: unreadable ({tmp_path / 'nope2.db'} is not a file)" in out
     # the other parts still print
     assert "--- 1. charter" in out and "- C1: it works" in out
 
 
-def test_a_flow_file_that_is_not_a_database_is_unavailable_not_a_crash(world, capsys, tmp_path):
+def test_a_flow_file_that_is_not_a_database_is_unreadable_not_a_crash(world, capsys, tmp_path):
     bad = tmp_path / "bad.db"
     bad.write_text("this is not sqlite")
     rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal), "--flow-episodes", str(bad))
-    assert rc == 0 and "record[flow]: unavailable (" in out and "worked alpha#1 step" in out
+    assert rc == 0 and "record[flow]: unreadable (" in out and "worked alpha#1 step" in out
 
 
 def test_the_flow_db_is_opened_read_only(world, capsys):
@@ -322,3 +322,123 @@ def test_context_does_not_edit_run_state():
     import inspect
     from levain.desk import board_cli
     assert "board_context" not in inspect.getsource(board_cli.run_state)
+
+
+# ------------------------------------------------------------------------------------------------- fix 2 (L1/L2 rulings)
+
+
+def test_cap_clips_a_long_line_and_never_evicts_the_lines_after_it():
+    out, cut = bc._cap(["x" * 20000], 9000)
+    assert cut and len(out) == 1 and out[0].startswith("xxx") and "[clipped " in out[0] and len(out[0]) <= 9000
+    out, _ = bc._cap(["x" * 20000, "after", "done: kept"], 9000)
+    assert out[-2:] == ["after", "done: kept"] and "[clipped " in out[0]
+
+
+def test_long_words_never_evict_the_done_line_or_dependencies(world, capsys):
+    assert main(["board", "add", "--repo", "alpha", "--title", "third", "--origin", "desk 1", "--depends", "item:alpha#1",
+                 "--words", "w" * 20000, "--done", "the real done", *A, "--key", "k:2", "--payload-hash", "d" * 64]) == 0
+    capsys.readouterr()
+    rc, out, _ = board(capsys, "context", "alpha#3", *world.args)
+    assert "[clipped " in out and "done: the real done  done_kind:" in out and "depends on: alpha#1: landed_not_closed" in out
+
+
+def test_the_whole_page_is_checked_against_the_total(world, capsys, monkeypatch):
+    from anneal_memory import Store
+    s = Store(world.anneal)
+    for i in range(40):
+        s.record(f"long {i} " + "word " * 200, "observation", source="seat-a", metadata={"tags": ["repo:alpha", "item:alpha#1"]})
+    s.close()
+    rc, out, _ = board(capsys, "context", "alpha#1", *world.args)
+    assert len(out.rstrip("\n")) <= bc.TOTAL_CHARS
+    monkeypatch.setattr(bc, "TOTAL_CHARS", 3000)          # the final check cuts, whatever the part caps say
+    rc, out, _ = board(capsys, "context", "alpha#1", *world.args)
+    assert len(out.rstrip("\n")) <= 3000 and "--- 5. conventions" in out
+    rc, out, _ = board(capsys, "context", "alpha#1", "--json", *world.args)
+    assert json.loads(out)["total_chars"] <= 3000
+
+
+def test_one_record_source_cannot_evict_the_other_or_the_artifacts(world, capsys):
+    from anneal_memory import Store
+    s = Store(world.anneal)
+    for i in range(40):
+        s.record(f"anneal {i} " + "word " * 200, "observation", source="seat-a", metadata={"tags": ["repo:alpha", "item:alpha#1"]})
+    s.close()
+    rc, out, _ = board(capsys, "context", "alpha#1", "--json", *world.args)
+    lines = [p for p in json.loads(out)["parts"] if p["part"] == "record"][0]["lines"]
+    assert any(ln.startswith("record[flow]:") for ln in lines) and any("flow side note" in ln for ln in lines)
+    assert any(ln.startswith("record[artifacts]:") for ln in lines)
+
+
+def test_an_episode_in_both_stores_or_both_sections_prints_once(world, capsys):
+    from anneal_memory import Store
+    s = Store(world.anneal)
+    s.record("flow side note for alpha#1", "observation", source="seat-a", metadata={"tags": ["repo:alpha", "item:alpha#1"]})
+    s.record("tagged and a decision", "decision", source="seat-a", metadata={"tags": ["repo:alpha", "item:alpha#1"]})
+    s.close()
+    rc, out, _ = board(capsys, "context", "alpha#1", *world.args)
+    assert out.count("flow side note for alpha#1") == 1 and out.count("tagged and a decision") == 1
+
+
+def test_a_cap_that_drops_matches_prints_how_many_more(world, capsys):
+    from anneal_memory import Store
+    s = Store(world.anneal)
+    for i in range(14):
+        s.record(f"n{i}", "observation", source="seat-a", metadata={"tags": ["repo:alpha", "item:alpha#1"]})
+    s.close()
+    rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal))
+    assert "  [5 more]" in out          # 15 distinct matches (14 + the fixture's), 10 shown
+
+
+def test_flow_window_and_order_are_chronological_across_offsets(tmp_path):
+    now = datetime.datetime(2026, 11, 17, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    d = datetime.timedelta
+
+    def at(delta, offset_h):
+        tz = datetime.timezone(d(hours=offset_h))
+        return (now + delta).astimezone(tz).isoformat().replace("+00:00", "Z")
+    db = tmp_path / "f.db"
+    c = sqlite3.connect(db)
+    c.executescript(FLOW_SCHEMA)
+    flow_add(c, "a", at(d(days=-10), 14), "observation", "a +14")                       # instant -10d
+    flow_add(c, "b", at(d(days=-10, hours=2), 0), "observation", "b Z")                 # instant -10d+2h
+    flow_add(c, "c", at(d(days=-10, hours=1), -5), "observation", "c -05")              # instant -10d+1h
+    flow_add(c, "old", at(d(days=-90, hours=-1), 14), "observation", "old +14")         # just outside the window
+    flow_add(c, "edge", at(d(days=-90, hours=1), -5), "observation", "edge -05")        # just inside, string-wise far outside
+    flow_add(c, "future", at(d(hours=3), 0), "observation", "future")                   # after now
+    c.commit()
+    c.close()
+    rows, total, bad = bc._read_flow(db, now)
+    assert [r.content for r in rows] == ["b Z", "c -05", "a +14", "edge -05"] and total == 4 and bad == 0
+
+
+def test_flow_read_failure_is_unreadable_with_no_second_attempt_and_no_stale_rows(world, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("permissions do not bind root")
+    d = world.root / "wal"
+    d.mkdir()
+    db = d / "f.db"
+    make_flow_db(db)
+    c = sqlite3.connect(db)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.commit()
+    c.close()
+    for side in ("-wal", "-shm"):
+        (d / ("f.db" + side)).unlink(missing_ok=True)      # no side files, and the directory cannot make them
+    os.chmod(d, 0o555)
+    try:
+        rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal), "--flow-episodes", str(db))
+    finally:
+        os.chmod(d, 0o755)
+    assert rc == 0 and "record[flow]: unreadable (" in out and "flow side note" not in out
+    assert "worked alpha#1 step" in out          # the other source still reads
+
+
+def test_an_empty_flag_is_honoured_and_unconfigured_is_unavailable(world, capsys, monkeypatch):
+    monkeypatch.setenv("LEVAIN_FLOW_EPISODES", str(world.flow))
+    rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal), "--flow-episodes", "")
+    assert "record[flow]: unreadable (an empty path was named)" in out and "flow side note" not in out
+    rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal))
+    assert "flow side note for alpha#1" in out                     # no flag: the environment
+    monkeypatch.delenv("LEVAIN_FLOW_EPISODES")
+    rc, out, _ = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal))
+    assert "record[flow]: unavailable (no path named" in out

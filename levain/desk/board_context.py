@@ -20,11 +20,14 @@ costs the others:
 A part that cannot be read prints ``<part>: unreadable (<why>)``, never empty. An unknown item id is refused naming it. An item
 of a repo that is not tracked prints what can be read and says the repo is untracked.
 
-The bound: :data:`PART_CHARS` caps each part's characters (tokens are counted as characters / 4); a cut part ends in a
-``[truncated ...]`` line. The caps add to :data:`TOTAL_CHARS` or less, so the whole page is under 8K tokens before headers.
+The bound: :data:`PART_CHARS` caps each part's characters and :func:`_enforce_total` checks the WHOLE printed page (mode line
+and headers included) against :data:`TOTAL_CHARS`, re-cutting the largest part until it fits; a cut part ends in a
+``[truncated ...]`` line. A line longer than its share is clipped with a ``[clipped N chars]`` marker, never dropped. Inside
+``record`` each source has its own sub-budget (:data:`RECORD_CHARS`), so one cannot evict another.
 
 Where the stores are: ``--anneal PATH`` (else ``$LEVAIN_ANNEAL_DB``) and ``--flow-episodes PATH`` (else
 ``$LEVAIN_FLOW_EPISODES``). No existing producer or install config names a read-only episodic.db path, so these are explicit.
+A source with no path named says ``unavailable``; a path that was named and cannot be read says ``unreadable`` with the first error.
 """
 from __future__ import annotations
 
@@ -48,13 +51,17 @@ from levain.desk import board_store as bs
 from levain.desk import charter
 from levain.desk.board_state import Evidence, derive_all, fold, parse_timestamp
 
-__all__ = ["ANNEAL_ENV", "FLOW_ENV", "PART_CHARS", "TOTAL_CHARS", "register", "run_context"]
+__all__ = ["ANNEAL_ENV", "FLOW_ENV", "PART_CHARS", "RECORD_CHARS", "TOTAL_CHARS", "register", "run_context"]
 
 ANNEAL_ENV = "LEVAIN_ANNEAL_DB"
 FLOW_ENV = "LEVAIN_FLOW_EPISODES"
-#: 8K tokens at 4 characters a token is 32,000 characters; the part caps below sum to 30,000 and leave the rest for headers.
-TOTAL_CHARS = 32_000
-PART_CHARS = {"charter": 9_000, "item": 3_500, "state": 4_500, "record": 12_000, "conventions": 1_000}
+TOKEN_TARGET = 8_000
+CHARS_PER_TOKEN = 3     # conservative: ids, hashes and paths run near this, prose a little above it
+TOTAL_CHARS = TOKEN_TARGET * CHARS_PER_TOKEN
+PART_CHARS = {"charter": 6_500, "item": 3_000, "state": 3_500, "record": 9_500, "conventions": 800}
+RECORD_CHARS = {"anneal": 3_600, "flow": 3_600, "artifacts": 1_800}
+WORDS_CHARS = 1_200
+MARK_CHARS = 300
 WINDOW_DAYS = 90
 MAX_SCAN = 50_000
 ITEM_EPISODES = 10
@@ -76,24 +83,47 @@ class Part:
     why: str = ""
     truncated: bool = False
 
+    def chars(self) -> int:
+        return sum(len(ln) + 1 for ln in self.lines)
+
     def to_dict(self) -> dict[str, Any]:
-        return {"part": self.name, "status": self.status, "why": self.why, "truncated": self.truncated, "lines": self.lines}
+        return {"part": self.name, "status": self.status, "why": self.why, "truncated": self.truncated, "chars": self.chars(),
+                "lines": self.lines}
 
 
 def _unreadable(name: str, why: str) -> Part:
     return Part(name, [f"{name}: unreadable ({why})"], "unreadable", why)
 
 
+def _clip_marked(text: str, n: int) -> str:
+    """``text`` cut to ``n`` characters INCLUDING a visible ``… [clipped N chars]`` marker; verbatim when it fits."""
+    if len(text) <= n:
+        return text
+    marker = f"… [clipped {len(text)} chars]"          # the widest the count can be, so the result never exceeds n
+    keep = max(0, n - len(marker))
+    return text[:keep] + f"… [clipped {len(text) - keep} chars]"
+
+
 def _cap(lines: list[str], budget: int) -> tuple[list[str], bool]:
-    """``lines`` cut at ``budget`` characters; a cut ends in a ``[truncated ...]`` line that is itself inside the budget."""
-    out, used = [], 0
-    for i, ln in enumerate(lines):
-        if used + len(ln) + 1 > budget - 60:
+    """``lines`` cut at ``budget`` characters. A line longer than a third of the budget is clipped (marker), so one
+    over-long line never evicts the lines after it; when later lines do not fit, the cut ends in a ``[truncated ...]`` line
+    that is itself inside the budget."""
+    out, used, clipped = [], 0, False
+    line_max = max(200, budget // 3)
+    for i, raw in enumerate(lines):
+        ln = _clip_marked(raw, line_max)
+        clipped = clipped or ln is not raw
+        room = budget - 60 - used - 1
+        if len(ln) > room:
+            if room >= 100 and not out:
+                out.append(_clip_marked(ln, room))      # the very first line is never lost entirely
+                used += len(out[-1]) + 1
+                i += 1
             rest = len(lines) - i
             return out + [f"[truncated: {rest} more line{'s' if rest != 1 else ''}]"], True
         out.append(ln)
         used += len(ln) + 1
-    return out, False
+    return out, clipped
 
 
 def _clip(text: str, n: int) -> str:
@@ -193,12 +223,13 @@ def _charter_part(repo: Any, name: str, item_id: str, folded: Any, derived: Deri
 
 
 def _item_part(item: Any, derived: Derived | None) -> Part:
-    lines = [f"item {item.id}: {item.title}",
-             f"words: {item.words or '(none given)'}",
-             f"origin: {item.origin}",
-             f"done: {item.done or '(none)'}  done_kind: {item.done_kind}"]
+    # his words verbatim, on their own sub-budget, so the done line and the dependencies always survive
+    lines = [f"item {item.id}: {_clip_marked(item.title, MARK_CHARS)}",
+             f"words: {_clip_marked(item.words, WORDS_CHARS) if item.words else '(none given)'}",
+             f"origin: {_clip_marked(str(item.origin), MARK_CHARS)}",
+             f"done: {_clip_marked(item.done, MARK_CHARS) if item.done else '(none)'}  done_kind: {item.done_kind}"]
     if item.decision is not None:
-        lines.append(f"decision: {item.decision.decision} ({item.decision.date}): {item.decision.words}")
+        lines.append(f"decision: {item.decision.decision} ({item.decision.date}): {_clip_marked(item.decision.words or '', MARK_CHARS)}")
     if not item.depends_on:
         lines.append("depends on: nothing")
     for link in item.depends_on:
@@ -228,7 +259,7 @@ def _state_part(item_id: str, derived: Derived) -> Part:
         lines.append(f"commits on main: {len(main)}")
         lines.extend(f"  {c.sha[:9]} {c.date or '-'}{' closes' if item_id in c.closes else ''}" for c in main[:COMMITS_SHOWN])
         if len(main) > COMMITS_SHOWN:
-            lines.append(f"  [truncated: {len(main) - COMMITS_SHOWN} more commits]")
+            lines.append(f"  [{len(main) - COMMITS_SHOWN} more]")
         for ch in ev.chain:
             n = sum(1 for c in ch.commits if item_id in c.items)
             if n:
@@ -242,6 +273,7 @@ def _state_part(item_id: str, derived: Derived) -> Part:
 
 @dataclass(frozen=True)
 class _Ep:
+    id: str
     at: str
     type: str
     source: str
@@ -263,18 +295,49 @@ def _tags_of(meta: Any) -> tuple[str, ...]:
     return tuple(t for t in tags if isinstance(t, str)) if isinstance(tags, (list, tuple)) else ()
 
 
-def _select(rows: list[_Ep], total: int, item_id: str, repo: str, unreadable: int) -> tuple[list[str], bool]:
+def _keys(e: _Ep) -> set[tuple[str, str]]:
+    """What makes two episodes the same one: the same id, or the same body (a capture sync copies an episode across stores)."""
+    k = {("body", " ".join(e.content.split()))}
+    if e.id:
+        k.add(("id", e.id))
+    return k
+
+
+def _distinct(matches: list[_Ep], seen: set[tuple[str, str]]) -> list[_Ep]:
+    out, local = [], set()
+    for e in matches:
+        k = _keys(e)
+        if k & seen or k & local:
+            continue
+        local |= k
+        out.append(e)
+    return out
+
+
+def _select(rows: list[_Ep], total: int, item_id: str, repo: str, unreadable: int,
+            seen: set[tuple[str, str]] | None = None) -> tuple[list[str], bool]:
     """Filter (rows are newest first), then cap, as :mod:`levain.agents.recall` does; ``truncated`` when the scan bound stopped
-    the read and a cap was not met."""
-    mine = [e for e in rows if f"item:{item_id}" in e.tags][:ITEM_EPISODES]
-    item_hit = sum(1 for e in rows if f"item:{item_id}" in e.tags)
-    decisions = [e for e in rows if e.type == "decision" and f"repo:{repo}" in e.tags][:DECISION_EPISODES]
-    cut = total > len(rows) and (item_hit < ITEM_EPISODES or len(decisions) < DECISION_EPISODES)
-    lines = [f"scanned {len(rows)} episodes in the last {WINDOW_DAYS} days" + (f"; {unreadable} with unreadable metadata" if unreadable else "")]
+    the read and a cap was not met. ``seen`` carries what an earlier source (or the item section) already printed, so one
+    episode is never shown twice."""
+    seen = set() if seen is None else seen
+    item_all = _distinct([e for e in rows if f"item:{item_id}" in e.tags], seen)
+    mine = item_all[:ITEM_EPISODES]
+    for e in mine:
+        seen |= _keys(e)
+    dec_all = _distinct([e for e in rows if e.type == "decision" and f"repo:{repo}" in e.tags], seen)
+    decisions = dec_all[:DECISION_EPISODES]
+    for e in decisions:
+        seen |= _keys(e)
+    cut = total > len(rows) and (len(item_all) < ITEM_EPISODES or len(dec_all) < DECISION_EPISODES)
+    lines = [f"scanned {len(rows)} episodes in the last {WINDOW_DAYS} days" + (f"; {unreadable} unreadable" if unreadable else "")]
     lines.append(f"tagged item:{item_id}: {len(mine)}" + (" (newest first)" if mine else ""))
     lines.extend(f"  {e.at} {e.type} {e.source}: {_clip(e.content, EPISODE_CHARS)}" for e in mine)
+    if len(item_all) > len(mine):
+        lines.append(f"  [{len(item_all) - len(mine)} more]")
     lines.append(f"decisions tagged repo:{repo}: {len(decisions)}" + (" (newest first)" if decisions else ""))
     lines.extend(f"  {e.at} {e.source}: {_clip(e.content, EPISODE_CHARS)}" for e in decisions)
+    if len(dec_all) > len(decisions):
+        lines.append(f"  [{len(dec_all) - len(decisions)} more]")
     if cut:
         lines.append("[truncated: the scan bound was hit before the window was exhausted; an absence is not proof]")
     return lines, cut
@@ -297,61 +360,62 @@ def _read_anneal(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
             bad += 1
             continue
         t = getattr(ep.type, "value", ep.type)
-        rows.append(_Ep(str(ep.timestamp), str(t), str(getattr(ep, "source", "")), str(ep.content), tags))
+        rows.append(_Ep(str(getattr(ep, "id", "") or ""), str(ep.timestamp), str(t), str(getattr(ep, "source", "")), str(ep.content), tags))
     return rows, res.total_matching, bad
 
 
 def _read_flow(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
-    """Flow's episodic.db opened READ-ONLY. ``mode=ro`` first (a live WAL store reads consistently); ``immutable=1`` only when
-    that open cannot be made (a read-only directory); neither ever writes the file.
+    """Flow's episodic.db opened READ-ONLY with ``mode=ro``, ONE attempt: any failure is the source's ``unreadable`` with that
+    first error (no second open, no ``immutable`` fallback: that ignores the live WAL and would serve stale rows). The main db
+    file is never written; SQLite may create the ``-wal``/``-shm`` side files next to it (they belong to the owning writer,
+    which creates them anyway).
 
     Flow keeps tags in its own table, ``episode_tags(episode_id, tag)`` (``scripts/episodic.py`` writes them there; no flow
-    writer puts tags in ``episodes.metadata``, so that path is not read). The window is an index-friendly lower bound on
-    ``episodes.timestamp`` (flow stamps carry a local offset, so the bound is widened by the largest UTC offset, 14 hours,
-    to never drop an episode at the edge); the newest MAX_SCAN rows are read, then only their tags."""
-    base = "file:" + quote(str(path))
-    last: Exception | None = None
-    for q in ("?mode=ro", "?mode=ro&immutable=1"):
-        try:
-            conn = sqlite3.connect(base + q, uri=True, timeout=5)
-            try:
-                since = (now - timedelta(days=WINDOW_DAYS, hours=14)).strftime(_STAMP)
-                total = conn.execute("SELECT COUNT(*) FROM episodes WHERE timestamp >= ?", (since,)).fetchone()[0]
-                got = conn.execute("SELECT id, timestamp, type, source, content FROM episodes WHERE timestamp >= ?"
-                                   " ORDER BY timestamp DESC LIMIT ?", (since, MAX_SCAN)).fetchall()
-                tags: dict[str, list[str]] = {}
-                ids = [r[0] for r in got]
-                for i in range(0, len(ids), 500):
-                    chunk = ids[i:i + 500]
-                    for eid, tag in conn.execute("SELECT episode_id, tag FROM episode_tags WHERE episode_id IN (%s)"
-                                                 % ",".join("?" * len(chunk)), chunk):
-                        tags.setdefault(eid, []).append(tag)
-            finally:
-                conn.close()
-            break
-        except sqlite3.Error as exc:
-            last = exc
-    else:
-        raise last or sqlite3.Error("cannot open")
-    rows = [_Ep(str(ts), str(typ), str(src or ""), str(content), tuple(tags.get(eid, ()))) for eid, ts, typ, src, content in got]
-    return rows, total, 0
+    writer puts tags in ``episodes.metadata``, so that path is not read). Flow stamps carry a local offset, so the window is a
+    string prefilter widened by the largest UTC offset (14 hours, index-friendly) and then the exact instant by
+    ``julianday(timestamp)``, which is also the sort: the window and the order are chronological across offsets. The newest
+    MAX_SCAN rows are read, then only their tags, all inside one read transaction."""
+    conn = sqlite3.connect("file:" + quote(str(path)) + "?mode=ro", uri=True, timeout=5, isolation_level=None)
+    try:
+        conn.execute("BEGIN")
+        wide = (now - timedelta(days=WINDOW_DAYS, hours=14)).strftime(_STAMP)
+        lo, hi = _window(now), now.strftime(_STAMP)
+        in_window = "timestamp >= ? AND julianday(timestamp) >= julianday(?) AND julianday(timestamp) <= julianday(?)"
+        total = conn.execute(f"SELECT COUNT(*) FROM episodes WHERE {in_window}", (wide, lo, hi)).fetchone()[0]
+        bad = conn.execute("SELECT COUNT(*) FROM episodes WHERE timestamp >= ? AND julianday(timestamp) IS NULL", (wide,)).fetchone()[0]
+        got = conn.execute(f"SELECT id, timestamp, type, source, content FROM episodes WHERE {in_window}"
+                           " ORDER BY julianday(timestamp) DESC LIMIT ?", (wide, lo, hi, MAX_SCAN)).fetchall()
+        tags: dict[str, list[str]] = {}
+        ids = [r[0] for r in got]
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for eid, tag in conn.execute("SELECT episode_id, tag FROM episode_tags WHERE episode_id IN (%s)"
+                                         % ",".join("?" * len(chunk)), chunk):
+                tags.setdefault(eid, []).append(tag)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    rows = [_Ep(str(eid), str(ts), str(typ), str(src or ""), str(content), tuple(tags.get(eid, ()))) for eid, ts, typ, src, content in got]
+    return rows, total, bad
 
 
-def _source_lines(label: str, given: str | None, env: str, reader: Any, status: str, item_id: str, repo: str, now: datetime
-                  ) -> tuple[list[str], bool, bool]:
-    """``(lines, truncated, read)`` for one episode source. ``status`` is the word an absent source says (``unreadable`` for
-    the anneal store, ``unavailable`` for flow's optional one)."""
-    named = given or os.environ.get(env)
-    if not named:
-        return [f"record[{label}]: {status} (no path named: pass the flag or set ${env})"], False, False
+def _source_lines(label: str, given: str | None, env: str, reader: Any, item_id: str, repo: str, now: datetime,
+                  seen: set[tuple[str, str]]) -> tuple[list[str], bool, bool]:
+    """``(lines, truncated, read)`` for one episode source. No path named says ``unavailable``; a path that was named (a flag,
+    even an empty one, else the environment) and cannot be read says ``unreadable`` with the first error."""
+    named = given if given is not None else (os.environ.get(env) or None)
+    if named is None:
+        return [f"record[{label}]: unavailable (no path named: pass the flag or set ${env})"], False, False
+    if not named.strip():
+        return [f"record[{label}]: unreadable (an empty path was named)"], False, False
     path = Path(named).expanduser()
     if not path.is_file():
-        return [f"record[{label}]: {status} ({path} is not a file)"], False, False
+        return [f"record[{label}]: unreadable ({path} is not a file)"], False, False
     try:
         rows, total, bad = reader(path, now)
     except Exception as exc:  # noqa: BLE001 - an unreadable store is said, never shown as an empty record
-        return [f"record[{label}]: {status} ({type(exc).__name__}: {_clip(str(exc), 120)})"], False, False
-    lines, cut = _select(rows, total, item_id, repo, bad)
+        return [f"record[{label}]: unreadable ({type(exc).__name__}: {_clip(str(exc), 120)})"], False, False
+    lines, cut = _select(rows, total, item_id, repo, bad, seen)
     return [f"record[{label}]:"] + ["  " + ln for ln in lines], cut, True
 
 
@@ -378,12 +442,15 @@ def _artifact_lines(repo: Any, item_id: str) -> list[str]:
 
 
 def _record_part(repo: Any, name: str, item_id: str, args: argparse.Namespace, now: datetime) -> Part:
+    seen: set[tuple[str, str]] = set()          # one episode prints once, across both sources and both sections
+    a, c1, ok_a = _source_lines("anneal", args.anneal, ANNEAL_ENV, _read_anneal, item_id, name, now, seen)
+    f, c2, ok_f = _source_lines("flow", args.flow_episodes, FLOW_ENV, _read_flow, item_id, name, now, seen)
     lines: list[str] = ["record:"]
-    cut = False
-    a, c1, ok_a = _source_lines("anneal", args.anneal, ANNEAL_ENV, _read_anneal, "unreadable", item_id, name, now)
-    f, c2, ok_f = _source_lines("flow", args.flow_episodes, FLOW_ENV, _read_flow, "unavailable", item_id, name, now)
-    lines += a + f + _artifact_lines(repo, item_id)
     cut = c1 or c2
+    for key, src in (("anneal", a), ("flow", f), ("artifacts", _artifact_lines(repo, item_id))):
+        capped, c = _cap(src, RECORD_CHARS[key])   # each source on its own sub-budget: one cannot evict another
+        lines += capped
+        cut = cut or c
     out, c3 = _cap(lines, PART_CHARS["record"])
     part = Part("record", out, truncated=cut or c3)
     if not (ok_a or ok_f):
@@ -404,6 +471,27 @@ def _conventions_part(repo: Any) -> Part:
 
 
 # ------------------------------------------------------------------------------------------------------------- the verb
+
+
+def _render(mode_line: str, parts: list[Part]) -> str:
+    pieces = [mode_line] if mode_line else []
+    for i, p in enumerate(parts, 1):
+        pieces.append(f"--- {i}. {p.name}")
+        pieces.append("\n".join(p.lines))
+    return "\n".join(pieces)
+
+
+def _enforce_total(mode_line: str, parts: list[Part]) -> str:
+    """The rendered page, checked against :data:`TOTAL_CHARS` as a whole: while over, the largest part is re-cut by the excess."""
+    text = _render(mode_line, parts)
+    for _ in range(20):
+        if len(text) <= TOTAL_CHARS:
+            return text
+        big = max(parts, key=Part.chars)
+        big.lines, _cut = _cap(big.lines, max(200, big.chars() - (len(text) - TOTAL_CHARS)))
+        big.truncated = True
+        text = _render(mode_line, parts)
+    return text[:TOTAL_CHARS]                   # unreachable with sane caps; the bound holds regardless
 
 
 def _refuse(msg: str) -> int:
@@ -460,15 +548,13 @@ def run_context(args: argparse.Namespace) -> int:
              _state_part(item_id, derived),
              _record_part(repo, name, item_id, args, now),
              _conventions_part(repo)]
+    mode_line = _clip(mode_line, MARK_CHARS) if mode_line else ""
+    text = _enforce_total(mode_line, parts)
     if args.json:
         print(json.dumps({"item": item_id, "repo": name, "untracked": bool(mode_line), "note": mode_line or None,
-                          "parts": [p.to_dict() for p in parts]}, indent=2))
+                          "total_chars": len(text), "parts": [p.to_dict() for p in parts]}, indent=2))
     else:
-        if mode_line:
-            print(mode_line)
-        for i, p in enumerate(parts, 1):
-            print(f"--- {i}. {p.name}")
-            print("\n".join(p.lines))
+        print(text)
     return 0
 
 
