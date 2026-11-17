@@ -3913,7 +3913,7 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
                         help="The HOME the seat runs with (default: this process's HOME). Its .claude.json receives the "
                              "workspace trust for the minted clone.")
     launch.add_argument("--dry-run", dest="dry_run", action="store_true",
-                        help="Only validate: print the argv, mint and start nothing.")
+                        help="Only validate: print the argv and the read budget variable, mint and start nothing.")
     common(launch)
     stop = sub.add_parser("stop", help="Stop a launched lane's seat: its process group only, verified against the mint log.")
     stop.add_argument("lane_key")

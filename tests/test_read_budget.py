@@ -212,7 +212,18 @@ def test_one_huge_line_is_named_plainly(tmp_path, env):
     p = tmp_path / "min.js"
     p.write_text("var a=1;" * 20_000 + "\n")                      # one 160KB line
     out = rb.decide_pre(_ev(p), env)
-    assert out and "Line 1 alone" in out and "desk" in out and "offset=" not in out
+    grants = str(tmp_path / "state" / "grants.json")
+    assert out and "Line 1 alone" in out and "offset=" not in out
+    assert f"the operator adds this path to {grants} by hand (no Levain command writes that file)" in out
+    assert "desk must grant" not in out and "desk-granted" not in out
+
+
+def test_the_deny_text_names_the_grants_file_and_no_levain_verb_writes_it(tmp_path, env):
+    """row 800 G1.4: the escape is a hand edit of ``<state>/grants.json``, and the text says exactly that."""
+    out = rb.decide_pre(_ev(_big(tmp_path)), env)
+    grants = str(tmp_path / "state" / "grants.json")
+    assert f"Only a path the operator has added to {grants} by hand reads whole (no Levain command writes that file)." in out
+    assert "desk-granted" not in out and "offset=1 limit=" in out
 
 
 def test_allow_large_unscoped_is_priced_as_the_whole_file(tmp_path, env):
@@ -261,7 +272,7 @@ def test_empty_file_gets_a_plain_message_not_none_bytes(tmp_path, env):
     p = tmp_path / "empty.txt"
     p.write_text("")
     assert rb.decide_pre(_ev(p), env) is None                     # an empty file is free
-    out = rb._deny_text(str(p), 0, 0, rb.FLOOR_BYTES, "x", 5, 7)
+    out = rb._deny_text(str(p), 0, 0, rb.FLOOR_BYTES, "x", 5, 7, str(tmp_path))
     assert "None" not in out and "empty" in out
 
 

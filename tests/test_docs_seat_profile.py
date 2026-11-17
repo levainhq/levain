@@ -305,10 +305,63 @@ def test_the_variables_added_after_the_allowlist_are_both_named():
     from levain import host_guard
     for name in _ENV_ADDED:
         assert name not in host_guard._ENV_ALLOW and not name.startswith(host_guard._ENV_ALLOW_PREFIXES)
-    hooks = _paragraph("Every seat also carries the read budget")
+    hooks = _paragraph("A seat this profile launches (`levain seat launch`) also carries")
     assert all(f"`{n}`" in hooks for n in _ENV_ADDED), hooks
     assert "the one variable" not in hooks and "allowlist above" not in hooks and "below" in hooks
     allow = _paragraph("only a short list of environment variables")
     assert all(f"`{n}`" in allow for n in _ENV_ADDED), allow
     assert all(f"`{n}`" in allow for n in sorted(host_guard._ENV_ALLOW)), allow
 
+
+
+# ---- row 800 L4 f800: what the read budget docs say about tuning, the ledger and the launch paths -----------------------
+
+_ROOT = Path(__file__).resolve().parents[1]
+CHANGELOG = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_the_read_budget_defaults_the_docs_state_are_the_codes_and_no_launcher_passes_them():
+    from levain.desk import read_budget as rb
+    for text in (" ".join(TEXT.split()), " ".join(CHANGELOG.split())):
+        for var in ("LEVAIN_READ_BUDGET_CALL", "LEVAIN_READ_BUDGET_SESSION", "LEVAIN_READ_BUDGET_TURNS"):
+            assert f"`{var}`" in text, var
+        assert f"default {rb.DEFAULT_CALL} " in text and f"default {rb.DEFAULT_SESSION}" in text
+        assert f"(default {rb.DEFAULT_TURNS}" in text and f"cap of {rb.DEFAULT_TURNS}" in text
+    flat_t, flat_c = " ".join(TEXT.split()), " ".join(CHANGELOG.split())
+    assert "NO Levain launcher passes them" in flat_c and "no Levain launcher passes them" in flat_t
+    assert "charged (allowed) Reads only: a denial writes nothing" in flat_t
+    assert "CHARGED (allowed) Reads only: a denial writes nothing" in flat_c
+    # the code agrees: the tuning names appear nowhere in a launcher
+    for rel in ("levain/seat_profile.py", "levain/seat_lease.py"):
+        src = (_ROOT / rel).read_text(encoding="utf-8")
+        assert "LEVAIN_READ_BUDGET_CALL" not in src and "LEVAIN_READ_BUDGET_TURNS" not in src, rel
+    launch_src = (_ROOT / "levain/desk/launch.py").read_text(encoding="utf-8")
+    assert 'startswith("LEVAIN_READ_BUDGET_")' in launch_src            # the desk path strips them from its environment
+    assert "LEVAIN_READ_BUDGET_CALL" not in launch_src
+
+
+_NOT_CARRIED = ("`user_scope`-on desk seat", "room child", "host room", "sealed reader", "sealed drafter",
+                "slot `vendor_argv` launch", "consent canary", "`consent --resume`", "session the operator starts by hand")
+
+
+def test_the_read_budget_not_carried_list_is_named_in_both_docs_and_the_carriers_are_the_two_the_code_has():
+    import re
+    para = " ".join(_paragraph("The read budget is carried by exactly two launch paths").split())
+    for name in _NOT_CARRIED:
+        assert name in para, name
+        assert name in " ".join(CHANGELOG.split()), name
+    assert "Every seat also carries" not in TEXT and "Every seat carries" not in (
+        _ROOT / "levain/seat_profile.py").read_text(encoding="utf-8")
+    # the code's consumers (installers of the hook), read as source text: exactly launch.py (desk/worker --bg) and seat_profile.py
+    installers, mentions = set(), set()
+    for f in sorted((_ROOT / "levain").rglob("*.py")):
+        rel = f.relative_to(_ROOT).as_posix()
+        if rel in ("levain/desk/read_budget.py", "levain/desk/read_budget_install.py"):
+            continue
+        src = f.read_text(encoding="utf-8")
+        if re.search(r"\bread_budget_install\.(seat_budget|install|planned)\b|\bread_budget\.settings_hooks\b", src):
+            installers.add(rel)
+        if re.search(r"read_budget|seat_budget", src):
+            mentions.add(rel)
+    assert installers == {"levain/desk/launch.py", "levain/seat_profile.py"}, installers
+    assert mentions - installers == {"levain/seat_lease.py"}, mentions         # the dry run's print of STATE_ENV only

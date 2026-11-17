@@ -230,8 +230,11 @@ def outline(path: str) -> dict[str, Any]:  # noqa: C901
             "approx": approx, "est": est}
 
 
-def _deny_text(path: str, nbytes: int, cost: int, max_bytes: int, why: str, remaining: int, offset: int | None) -> str:
-    """``max_bytes`` is what one read may carry now (at least FLOOR_BYTES); the retry is the longest range that fits it."""
+def _deny_text(path: str, nbytes: int, cost: int, max_bytes: int, why: str, remaining: int, offset: int | None,
+               state: str) -> str:
+    """``max_bytes`` is what one read may carry now (at least FLOOR_BYTES); the retry is the longest range that fits it.
+    ``state`` is the budget state directory: the text names its ``grants.json`` as the operator's hand-edited escape."""
+    grants = os.path.join(state, "grants.json")
     o = outline(path)
     start = offset or (o["entries"][0][0] if o["entries"] else 1)
     limit, first = _fit(path, start, max_bytes)
@@ -249,10 +252,11 @@ def _deny_text(path: str, nbytes: int, cost: int, max_bytes: int, why: str, rema
         return head + "The file has no lines to return (it is empty), so there is no range to retry."
     if limit < 1:
         return (head + f"Line {start} alone is {first} bytes, over the {max_bytes} one read may carry now, and Read cannot "
-                f"return part of a line: no offset/limit can pass. The desk must grant this path to read it whole.")
+                f"return part of a line: no offset/limit can pass. To read it whole the operator adds this path to {grants} by hand "
+                f"(no Levain command writes that file).")
     return (head + f"Retry with a range that fits, for example Read file_path={path!r} offset={start} limit={limit}, "
             f"or pick a section above and read part of its start-end lines (at most {max_bytes} bytes). "
-            f"A desk-granted path reads whole.")
+            f"Only a path the operator has added to {grants} by hand reads whole (no Levain command writes that file).")
 
 
 # ---- ledger and grants ---------------------------------------------------------------------------------------------
@@ -350,7 +354,7 @@ def decide_pre(event: Any, environ: Mapping[str, str], now: float | None = None)
         else:
             return None
         max_bytes = max(FLOOR_BYTES, (call_budget // max(1, remaining)) * BYTES_PER_TOKEN)
-        return _deny_text(real, nbytes, cost, max_bytes, why, remaining, offset)
+        return _deny_text(real, nbytes, cost, max_bytes, why, remaining, offset, state)
     except Exception:  # noqa: BLE001  (any doubt: the vendor decides)
         return None
 

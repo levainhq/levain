@@ -355,6 +355,9 @@ def test_a_dry_run_writes_no_read_budget_and_a_launch_carries_it(rig, monkeypatc
                             cockpit_root=rig.world.root, install=rig.tmp, out=out, err=err,
                             now=rig.world.clock.now + timedelta(minutes=1), managed=())
     assert rc == 0 and "read_budget-" in out.getvalue() and not (home / "read_budget").exists()
+    # row 800 G3.1: the dry run prints the variable that turns the hook on, with the value the launch would carry
+    state_dir = str(Path(os.path.abspath(home)) / "read_budget" / "state")
+    assert f"  env     LEVAIN_READ_BUDGET_DIR={state_dir}\n" in out.getvalue()
     plan = rig.launch()
     assert (home / "read_budget").is_dir()
     assert plan.profile.env["LEVAIN_READ_BUDGET_DIR"] == str(Path(os.path.abspath(home)) / "read_budget" / "state")

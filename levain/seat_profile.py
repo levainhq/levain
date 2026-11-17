@@ -599,7 +599,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     file tools' deny rules name it as defence in depth. Anything extra, changed, symlinked or untracked in it still
     refuses, as does every other protected name.
 
-    Every seat carries the read budget (levain row 800): its PreToolUse/PostToolUse ``Read`` hook groups are APPENDED to
+    A seat profile seat carries the read budget (levain row 800; the other carrier is a desk/worker ``claude --bg`` seat
+    with ``user_scope`` off, in ``levain.desk.launch``; no other launch path does): its PreToolUse/PostToolUse ``Read`` hook groups are APPENDED to
     the event lists (``seat_record`` stays first) and ``LEVAIN_READ_BUDGET_DIR`` rides ``env``. Its home is
     ``budget_home`` when given (:func:`levain.seat_canary.run_seat_canary` passes a per-run one under
     :data:`CANARY_BUDGET_DIRNAME` and removes its own per-run directory; the doctor passes the real levain home), else

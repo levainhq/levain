@@ -124,10 +124,22 @@ The canary and `levain seat launch --dry-run` pass no commit, so they exempt not
 
 Every tool call is recorded to the launcher key directory by `levain.seat_record` (`PreToolUse`, `PostToolUse` and
 `PostToolUseFailure` hooks), and permission requests are observed. With a seat-egress grant, a `Stop` and a `SessionEnd`
-hook run the push described under seat egress. Every seat also carries the read budget (row 800): a `PreToolUse` and a
-`PostToolUse` hook on `Read`, appended after the recording hooks, with `LEVAIN_READ_BUDGET_DIR` in the seat's environment.
-That variable and `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` are the two the profile adds after the environment allowlist
-(listed under seat egress below); neither is a credential.
+hook run the push described under seat egress. A seat this profile launches (`levain seat launch`) also carries the read
+budget (row 800): a `PreToolUse` and a `PostToolUse` hook on `Read`, appended after the recording hooks, with
+`LEVAIN_READ_BUDGET_DIR` in the seat's environment. That variable and `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` are the two
+the profile adds after the environment allowlist (listed under seat egress below); neither is a credential.
+
+The read budget is carried by exactly two launch paths: (a) a desk or worker `claude --bg` seat when `user_scope` is
+off, and (b) a seat profile seat (`levain seat launch`). It is NOT carried by a `user_scope`-on desk seat, the room
+child and the host room, the sealed reader and the sealed drafter, a slot `vendor_argv` launch, the consent canary and
+`consent --resume`, or a session the operator starts by hand. The hook script reads three tuning variables,
+`LEVAIN_READ_BUDGET_CALL` (default 100000 token-turns per Read), `LEVAIN_READ_BUDGET_SESSION` (default 1000000 for a
+session) and `LEVAIN_READ_BUDGET_TURNS` (default 40 turns), but no Levain launcher passes them, so a launched seat
+always runs on those defaults. "Remaining turns" is a count of the Reads the ledger has charged, priced against that
+fixed cap of 40, not the seat's real turn count. The ledger records charged (allowed) Reads only: a denial writes
+nothing, so the ledger is not an audit of what the budget blocked. The deny text says to read a large file in ranges
+(`offset` and `limit`); no Levain command writes grants, and the only way to read a path whole is for the operator to add
+it by hand to `grants.json` in the budget state directory (`LEVAIN_READ_BUDGET_DIR`).
 
 ### Where it stops
 
@@ -348,7 +360,8 @@ the seat is released kills its group and removes the roots that launch made. The
 for a failure after the profile is built and the mint row appended; a refusal before that point (a nested `.claude` in
 the clone, a managed-settings conflict) removes the roots and leaves no mint row.
 
-`levain seat launch ... --dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code.
+`levain seat launch ... --dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code. It also prints an `env` line with
+`LEVAIN_READ_BUDGET_DIR` and its value, the variable that turns the read budget hook on.
 
 `levain seat stop <lane>` stops that lane's seat: it finds the newest start row for the lane in the mint log and signals
 the recorded process group (SIGTERM, then SIGKILL after `--grace` seconds, default 10). It identifies the seat by the
