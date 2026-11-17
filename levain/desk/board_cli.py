@@ -166,6 +166,8 @@ def register(subparsers: Any) -> None:
     author_args(u)
     u.set_defaults(func=run_use)
     br.register_cli(sub, author_args, _author, items_help)
+    from levain.desk import board_context       # imported here: board_context reads this module's helpers
+    board_context.register(sub)
 
 
 def _fail(message: str) -> int:
