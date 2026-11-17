@@ -472,8 +472,10 @@ def _config_said(store_dir: Path) -> str:
 def run_use(args: argparse.Namespace) -> int:
     try:
         write = _write_use_config(args)
-        if args.sign:
+        if args.sign and args.import_focus is not None:
             raise bs.BoardError("use --import-focus writes asserted registry records (register, pause): --sign does not apply to it")
+        if args.sign:
+            raise bs.BoardError("use writes no record (it points this machine at a store): there is nothing to sign, so --sign does not apply")
         if args.import_focus is not None:
             store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
                                                            briefcase=args.briefcase, before_pointer=write)

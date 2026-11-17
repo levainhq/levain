@@ -592,8 +592,8 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     per-file record reader: ``_records_from`` for the items file, the registry's reader for ``repos.jsonl``; it may raise
     BoardError); ``build`` returns ``(record, write)`` and may raise BoardError. A file that ends in an unterminated line (only
     a ``parse`` that accepts one gets this far: an ``ack-torn`` is written after it) gets a newline first.
-    When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it
-    was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
+    When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read in this same locked read) and is
+    appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
     before the write the held fd's size is compared with the size of the bytes the record was built from: a lock-free writer
     that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
     break, which the verifier reports.
@@ -661,13 +661,13 @@ def _store_lines(target: Target) -> list[bytes]:
     return out
 
 
-def _graded(target: Target, rec: dict, seal, authority=None) -> dict:
+def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = "") -> dict:
     """The writer's word on a built record, before ``prev`` and before any prompt: the grade the seal's ``via`` claims
     (``asserted`` with none; a claimed grade is earned only by ``board_sign.admit`` after the ceremony), a signed record's
     author must be the operator, and the fixed policy (:func:`levain.desk.board_sign.require_policy`) must accept it. A
     record carrying ``cause`` has it checked here against the authority log read now (the seal's source, else
     ``authority``): for an unsigned record no blocking step follows this check; a sealed one is checked again by ``admit``
-    against the log replayed after the ceremony."""
+    against the log replayed after the ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write)."""
     from levain.desk import board_sign
     if seal is not None:
         board_sign.check_signable(rec)
@@ -678,7 +678,7 @@ def _graded(target: Target, rec: dict, seal, authority=None) -> dict:
         lines = _store_lines(target)
         source = seal.authority if seal is not None else authority
         snapshot = board_sign.read_authority(source) if source is not None else None
-    board_sign.require_policy(rec["op"], grade, rec, lines=lines, snapshot=snapshot)
+    board_sign.require_policy(rec["op"], grade, rec, lines=lines, snapshot=snapshot, decision=decision)
     return rec
 
 

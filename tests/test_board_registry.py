@@ -57,12 +57,14 @@ def home(tmp_path, monkeypatch):
     return h
 
 
-@pytest.fixture(autouse=True)
-def _decision_class_seam(tmp_path, monkeypatch):
-    """These tests are about the registry's rules, not about grades. begin-track, track, abandon-track and untrack are
-    decision-class (P2): each is called here with a seal over a THROWAWAY ssh key (the seam test_board_sign.py uses; a real
-    Touch ID ceremony cannot run in a test) whose authority log enrols it, so the writer earns ``signed-terminal`` for real.
-    The policy itself, unsigned and signed, is tested in test_board_registry_sign.py, which does not use this seam."""
+@pytest.fixture
+def decision_seal(tmp_path, monkeypatch):
+    """For the tests that REQUEST it (not autouse: L2 L4, levain 26), whose subject is the registry's rules, not grades.
+    begin-track, track, abandon-track and untrack are decision-class (P2): each is called with a seal over a THROWAWAY ssh
+    key (the seam test_board_sign.py uses; a real Touch ID ceremony cannot run in a test) whose authority log enrols it, so
+    the writer earns ``signed-terminal`` for real. It also seals a CLI call made without --sign, so a test using it can
+    assert NO unsigned-write refusal: the policy itself, unsigned and signed, is tested in test_board_registry_sign.py and
+    by every test here that does not request this fixture."""
     from tests.test_board_sign import Rig
     rig = Rig(tmp_path)
 
@@ -354,7 +356,7 @@ def test_move_rebases_onto_a_copy_of_the_same_repository_and_refuses_another(sto
 # I1: add
 
 
-def test_add_refuses_an_unregistered_an_untracked_and_an_aborting_repo(store, tmp_path, mkrepo, capsys):
+def test_add_refuses_an_unregistered_an_untracked_and_an_aborting_repo(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "t", "--origin", "d", *A)
     assert rc == 2 and "not registered" in err
@@ -373,7 +375,7 @@ def test_add_refuses_an_unregistered_an_untracked_and_an_aborting_repo(store, tm
     assert rc == 2 and "alpha is aborting" in err
 
 
-def test_add_to_a_tracked_repo_needs_no_key_and_amend_and_decide_are_never_refused(store, tmp_path, mkrepo, capsys):
+def test_add_to_a_tracked_repo_needs_no_key_and_amend_and_decide_are_never_refused(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -427,7 +429,7 @@ def test_the_flow_live_store_copy_takes_an_add_and_a_launch_hook_call_w6(home, t
 # begin-track, track
 
 
-def test_begin_track_records_the_manifest_owner_and_charter_before(store, tmp_path, mkrepo, capsys):
+def test_begin_track_records_the_manifest_owner_and_charter_before(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     land(a, "CHARTER.md", "# old\n")
     blob = git(a, "rev-parse", "origin/main:CHARTER.md")
@@ -440,14 +442,14 @@ def test_begin_track_records_the_manifest_owner_and_charter_before(store, tmp_pa
     assert r["manifest"] == json.loads(mf.read_text()) and r["manifest_sha256"] == hashlib.sha256(mf.read_bytes()).hexdigest()
 
 
-def test_charter_before_is_none_when_origin_main_has_no_charter(store, tmp_path, mkrepo, capsys):
+def test_charter_before_is_none_when_origin_main_has_no_charter(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
     assert reg_lines(store)[-1]["charter_before"] == "none"
 
 
-def test_a_repeated_begin_track_with_the_same_words_is_a_no_op_t2a(store, tmp_path, mkrepo, capsys):
+def test_a_repeated_begin_track_with_the_same_words_is_a_no_op_t2a(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     mf = manifest(tmp_path)
@@ -460,7 +462,7 @@ def test_a_repeated_begin_track_with_the_same_words_is_a_no_op_t2a(store, tmp_pa
     assert ok(capsys, "begin-track", "alpha", "--manifest", str(mf), "--words", "yes", "--owner", "d", "--migration", m, *A).startswith("already")
 
 
-def test_a_second_ceremony_gets_another_migration_id(store, tmp_path, mkrepo, capsys):
+def test_a_second_ceremony_gets_another_migration_id(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     mf = manifest(tmp_path)
@@ -472,7 +474,7 @@ def test_a_second_ceremony_gets_another_migration_id(store, tmp_path, mkrepo, ca
     assert len(ms) == 2 and ms[0] != ms[1]
 
 
-def test_begin_track_refuses_an_unregistered_a_tracking_a_tracked_repo_and_a_bad_manifest(store, tmp_path, mkrepo, capsys):
+def test_begin_track_refuses_an_unregistered_a_tracking_a_tracked_repo_and_a_bad_manifest(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
     assert rc == 2 and "not registered" in err
@@ -505,7 +507,7 @@ def test_begin_track_refuses_a_path_that_is_not_the_registered_repository(store,
     assert rc == 2 and "is not the registered repository" in err
 
 
-def test_track_refuses_without_a_begun_ceremony_a_charter_or_a_valid_one(store, tmp_path, mkrepo, capsys):
+def test_track_refuses_without_a_begun_ceremony_a_charter_or_a_valid_one(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
@@ -523,7 +525,7 @@ def test_track_refuses_without_a_begun_ceremony_a_charter_or_a_valid_one(store, 
     assert [r["op"] for r in reg_lines(store)] == ["register", "begin-track", "track"]
 
 
-def test_track_checks_the_plan_against_the_manifest_both_ways(store, tmp_path, mkrepo, capsys):
+def test_track_checks_the_plan_against_the_manifest_both_ways(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, plan_items=["a", "b"])), "--words", "y", *A)
@@ -542,7 +544,7 @@ def test_track_checks_the_plan_against_the_manifest_both_ways(store, tmp_path, m
     ok(capsys, "track", "alpha", "--words", "go", *A)
 
 
-def test_track_refuses_a_manifest_item_that_was_never_added(store, tmp_path, mkrepo, capsys):
+def test_track_refuses_a_manifest_item_that_was_never_added(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, plan_items=["a", "b"])), "--words", "y", *A)
@@ -553,7 +555,7 @@ def test_track_refuses_a_manifest_item_that_was_never_added(store, tmp_path, mkr
     assert rc == 2 and "never added" in err and "b" in err
 
 
-def test_track_writes_the_blob_that_passed_and_the_retire_entries_and_does_not_wait_for_stubs(store, tmp_path, mkrepo, capsys):
+def test_track_writes_the_blob_that_passed_and_the_retire_entries_and_does_not_wait_for_stubs(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     retire = [{"repo": "alpha", "path": "next.md"}, {"repo": "flow", "path": "projects/alpha/next.md"}]
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha", retire=retire)
@@ -564,7 +566,7 @@ def test_track_writes_the_blob_that_passed_and_the_retire_entries_and_does_not_w
     assert r["charter_blob"] == git(a, "rev-parse", "origin/main:CHARTER.md") and r["retire"] == retire
 
 
-def test_a_repeated_track_is_a_no_op_t2a_but_other_words_refuse(store, tmp_path, mkrepo, capsys):
+def test_a_repeated_track_is_a_no_op_t2a_but_other_words_refuse(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, store, a, "alpha")
     first = ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -585,7 +587,7 @@ def abandon_ready(capsys, tmp_path, store, a):
     return m, [add_item(capsys, "alpha", m, k) for k in "abc"]
 
 
-def test_abandon_track_cuts_every_item_with_the_abandons_words_and_cause(store, tmp_path, mkrepo, capsys):
+def test_abandon_track_cuts_every_item_with_the_abandons_words_and_cause(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, ids = abandon_ready(capsys, tmp_path, store, a)
     out = ok(capsys, "abandon-track", "alpha", "--words", "changed his mind", *A)
@@ -599,7 +601,7 @@ def test_abandon_track_cuts_every_item_with_the_abandons_words_and_cause(store, 
     assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].mode == "aborting"
 
 
-def test_abandon_track_rerun_after_a_crash_writes_only_the_missing_cuts_t2d(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_abandon_track_rerun_after_a_crash_writes_only_the_missing_cuts_t2d(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, ids = abandon_ready(capsys, tmp_path, store, a)
     real = bs.decide
@@ -625,7 +627,7 @@ def test_abandon_track_rerun_after_a_crash_writes_only_the_missing_cuts_t2d(stor
     assert ok(capsys, "abandon-track", "alpha", "--words", "no", *A) == "aborting alpha; cut 0 items"
 
 
-def test_abandon_track_refuses_other_modes_and_keeps_the_repo_locked(store, tmp_path, mkrepo, capsys):
+def test_abandon_track_refuses_other_modes_and_keeps_the_repo_locked(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
@@ -636,7 +638,7 @@ def test_abandon_track_refuses_other_modes_and_keeps_the_repo_locked(store, tmp_
     assert rc == 2 and "aborting" in err
 
 
-def test_abandon_done_needs_every_item_cut_and_the_charter_compensation(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_abandon_done_needs_every_item_cut_and_the_charter_compensation(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, ids = abandon_ready(capsys, tmp_path, store, a)
     rc, _, err = run(capsys, "abandon-done", "alpha", *A)
@@ -664,7 +666,7 @@ def test_abandon_done_needs_every_item_cut_and_the_charter_compensation(store, t
 # untrack
 
 
-def test_untrack_refuses_while_an_item_is_not_done_cut_or_parked(store, tmp_path, mkrepo, capsys):
+def test_untrack_refuses_while_an_item_is_not_done_cut_or_parked(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -675,7 +677,7 @@ def test_untrack_refuses_while_an_item_is_not_done_cut_or_parked(store, tmp_path
     assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "already untracked alpha"
 
 
-def test_untrack_refuses_a_repo_that_is_not_tracked(store, tmp_path, mkrepo, capsys):
+def test_untrack_refuses_a_repo_that_is_not_tracked(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
@@ -687,7 +689,7 @@ def test_untrack_refuses_a_repo_that_is_not_tracked(store, tmp_path, mkrepo, cap
 # repos: the read
 
 
-def test_repos_prints_entries_next_step_and_the_72_hour_audit_t2b(store, tmp_path, mkrepo, capsys):
+def test_repos_prints_entries_next_step_and_the_72_hour_audit_t2b(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", "--owner", "desk 9", *A)
@@ -704,7 +706,7 @@ def test_repos_prints_entries_next_step_and_the_72_hour_audit_t2b(store, tmp_pat
     assert rc == 3 and "alpha has been aborting" in out
 
 
-def test_the_audit_is_quiet_inside_72_hours_and_for_settled_repos(store, tmp_path, mkrepo, capsys):
+def test_the_audit_is_quiet_inside_72_hours_and_for_settled_repos(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     assert run(capsys, "repos", "--now", "2030-01-01T00:00:00Z")[0] == 0
@@ -716,7 +718,7 @@ def test_the_audit_is_quiet_inside_72_hours_and_for_settled_repos(store, tmp_pat
     assert len(br.stale_audit(fold, since + timedelta(hours=72, seconds=1))) == 1
 
 
-def test_board_state_audit_carries_the_stale_tracking_entry_t2b(store, tmp_path, mkrepo, capsys):
+def test_board_state_audit_carries_the_stale_tracking_entry_t2b(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
@@ -726,7 +728,7 @@ def test_board_state_audit_carries_the_stale_tracking_entry_t2b(store, tmp_path,
     assert br.audit_for_state(bs.resolve_store(None), datetime(2026, 11, 17, tzinfo=timezone.utc)) == []
 
 
-def test_repos_reports_a_stale_stub_and_a_path_that_is_another_repository_i3(store, tmp_path, mkrepo, capsys):
+def test_repos_reports_a_stale_stub_and_a_path_that_is_another_repository_i3(decision_seal, store, tmp_path, mkrepo, capsys):
     a, f = mkrepo("alpha"), mkrepo("flow")
     ok(capsys, "register", "flow", "--path", str(f), "--words", "w", *A)
     retire = [{"repo": "alpha", "path": "next.md"}, {"repo": "flow", "path": "projects/alpha/next.md"}, {"repo": "alpha", "path": "gone.md"}]
@@ -757,7 +759,7 @@ def test_repos_reports_a_stale_stub_and_a_path_that_is_another_repository_i3(sto
     assert f"flow: {os.path.realpath(f)} is not the registered repository" in out
 
 
-def test_repos_warns_about_a_tracked_repos_broken_charter_i2(store, tmp_path, mkrepo, capsys):
+def test_repos_warns_about_a_tracked_repos_broken_charter_i2(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -1038,7 +1040,7 @@ def test_a_stubs_item_of_another_ceremony_is_not_flagged_as_in_no_plan_group_t2i
     assert len(charter.check_text(text, repo_name="y", items=two)[1]) == 3
 
 
-def test_charter_check_cli_reads_the_stubs_key_off_the_store(store, tmp_path, mkrepo, capsys):
+def test_charter_check_cli_reads_the_stubs_key_off_the_store(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -1048,7 +1050,7 @@ def test_charter_check_cli_reads_the_stubs_key_off_the_store(store, tmp_path, mk
     assert rc == 0 and doc["valid"] and doc["warnings"] == []
 
 
-def test_decide_takes_an_optional_cause_that_must_be_a_sha(store, tmp_path, mkrepo, capsys):
+def test_decide_takes_an_optional_cause_that_must_be_a_sha(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     target = bs.resolve_store(None)
@@ -1108,7 +1110,7 @@ def test_r0_an_ack_torn_after_an_unterminated_tail_goes_through_append_with_a_ne
     assert json.loads(lines[2])["prev"] == hashlib.sha256(lines[1]).hexdigest()
 
 
-def test_w1_add_refuses_a_stubs_key_while_the_repo_is_tracking_design_5e(store, tmp_path, mkrepo, capsys):
+def test_w1_add_refuses_a_stubs_key_while_the_repo_is_tracking_design_5e(decision_seal, store, tmp_path, mkrepo, capsys):
     """Design 5 (e): contract_items are added AFTER `track`, so "no stub item is ever on the board while X's old files are
     still its source of truth"."""
     a = mkrepo("alpha")
@@ -1122,7 +1124,7 @@ def test_w1_add_refuses_a_stubs_key_while_the_repo_is_tracking_design_5e(store, 
     ok(capsys, "add", "--repo", "alpha", "--title", "s", "--origin", "d", "--key", f"{m}:stubs:alpha", "--payload-hash", HASH_A, *A)
 
 
-def test_w2_track_records_the_blob_whose_text_passed_even_if_origin_main_moves_during_it(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_w2_track_records_the_blob_whose_text_passed_even_if_origin_main_moves_during_it(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     passed = git(a, "rev-parse", "origin/main:CHARTER.md")
@@ -1191,7 +1193,7 @@ def test_w5_a_torn_line_that_is_not_utf8_can_be_acknowledged_by_its_raw_bytes(st
     assert ok(capsys, "pause", "alpha", "--words", "w", *A) == "paused alpha"
 
 
-def test_w7_an_explicit_migration_that_an_earlier_ceremony_used_refuses(store, tmp_path, mkrepo, capsys):
+def test_w7_an_explicit_migration_that_an_earlier_ceremony_used_refuses(decision_seal, store, tmp_path, mkrepo, capsys):
     a, b = mkrepo("alpha"), mkrepo("beta")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     ok(capsys, "register", "beta", "--path", str(b), "--words", "w", *A)
@@ -1267,7 +1269,7 @@ def tear_item_adds(store):
     p.write_text("".join("#" + ln + "\n" if json.loads(ln)["op"] == "add" else ln + "\n" for ln in p.read_text().splitlines()))
 
 
-def test_f1_ack_torn_on_the_items_file_is_taken_since_p1b_and_the_item_store_reads_again(store, tmp_path, mkrepo, capsys):
+def test_f1_ack_torn_on_the_items_file_is_taken_since_p1b_and_the_item_store_reads_again(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, store, a, "alpha")
     with open(store / "items.jsonl", "a") as fh:
@@ -1276,7 +1278,7 @@ def test_f1_ack_torn_on_the_items_file_is_taken_since_p1b_and_the_item_store_rea
     assert not item_fold((store / "items.jsonl").read_text("utf-8").split("\n")).torn
 
 
-def test_f2_abandon_done_on_a_torn_item_store_refuses_instead_of_reading_no_items(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_f2_abandon_done_on_a_torn_item_store_refuses_instead_of_reading_no_items(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, ids = abandon_ready(capsys, tmp_path, store, a)
     real = bs.decide
@@ -1290,7 +1292,7 @@ def test_f2_abandon_done_on_a_torn_item_store_refuses_instead_of_reading_no_item
     assert len(reg_lines(store)) == n and br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].mode == "aborting"
 
 
-def test_f3_untrack_refuses_a_torn_item_store_even_when_no_item_reads_as_the_repos(store, tmp_path, mkrepo, capsys):
+def test_f3_untrack_refuses_a_torn_item_store_even_when_no_item_reads_as_the_repos(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -1300,7 +1302,7 @@ def test_f3_untrack_refuses_a_torn_item_store_even_when_no_item_reads_as_the_rep
     assert rc == 2 and "torn" in err and len(reg_lines(store)) == n
 
 
-def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_missed(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_missed(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
@@ -1321,7 +1323,7 @@ def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_mi
     assert rc == 2 and "items not done, cut or parked" in err                  # run again: now it sees the add
 
 
-def test_f4_abandon_done_rechecks_every_item_reads_cut_under_the_lock(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_f4_abandon_done_rechecks_every_item_reads_cut_under_the_lock(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     a = mkrepo("alpha")
     m, ids = abandon_ready(capsys, tmp_path, store, a)
     ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
@@ -1433,7 +1435,7 @@ def test_f8_an_import_rerun_does_not_re_pause_a_repo_the_operator_resumed(home, 
     assert br.read_registry(tgt).fold.repos["beta"].attention == "active"
 
 
-def test_f9_withdrawn_abandon_done_checks_nothing_when_the_repo_had_a_charter_before(store, tmp_path, mkrepo, capsys):
+def test_f9_withdrawn_abandon_done_checks_nothing_when_the_repo_had_a_charter_before(decision_seal, store, tmp_path, mkrepo, capsys):
     """design.md 4.2, the abandon-done bullet: "where X had a charter before, nothing is checked, because section 5 keeps it
     (revision 6, complement r5: revision 5 required the old blob back, which a kept edit never passes)". F9 (require the old blob
     back) was withdrawn by the head: charter_before is a blob sha, origin/main's CHARTER.md differs, abandon-done still succeeds."""
@@ -1452,7 +1454,7 @@ def test_f10_load_has_no_flock_parameter():
     assert "flock" not in inspect.signature(br._load).parameters
 
 
-def test_f11_untrack_evidence_that_cannot_be_read_is_a_refusal_not_a_traceback(store, tmp_path, mkrepo, capsys, monkeypatch):
+def test_f11_untrack_evidence_that_cannot_be_read_is_a_refusal_not_a_traceback(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
     from levain.desk import board_evidence as be
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, store, a, "alpha")

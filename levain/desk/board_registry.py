@@ -41,6 +41,11 @@ Known edges, left open under the reachability line (nobody reaches them):
 * likewise a repo registered BY HAND at the same path between that snapshot and the import's ``register`` makes the
   import's register an unwritten no-op for that name: the hand record stands, and a ``paused`` focus state for that name
   still pauses it (a hand registration at ANOTHER path makes ``register`` refuse, which stops the import there).
+* a repo already ``aborting`` whose abandon-track is asserted, legacy, relayed or no longer valid can never finish its cuts
+  (no cause holds): re-run ``abandon-track`` signed to recover (it writes a fresh signed abandon the cuts cite);
+* the phone (passkey) path does not reach the registry verbs in 1.0: they are signed at the terminal (P2's door is T6's);
+* ``ack-torn`` of a torn SIGNED decision record is asserted (it acknowledges the tear, it re-decides nothing); P6's verify
+  reports who acknowledged it.
 """
 from __future__ import annotations
 
@@ -283,7 +288,8 @@ def _reg_parser(store_dir: Path, *, allow_torn: bool = False) -> Callable[[bytes
 
 
 def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tuple[dict | None, bool]], *,
-               allow_torn: bool = False, creates: bool = False, seal: Any = None) -> tuple[dict | None, bool]:
+               allow_torn: bool = False, creates: bool = False, seal: Any = None,
+               decision: Callable[[rf.RepoFold, dict], str] | None = None) -> tuple[dict | None, bool]:
     """Every registry write: ``board_store._append`` (the one write path) with the registry's reader. ``build(fold, store_id,
     raw)`` returns ``(record, write)``. Only ``creates`` (``register``, ``use --import-focus``) may start the file: any other
     verb on a store with no ``repos.jsonl`` refuses before ``_append`` opens (and so creates) it.
@@ -291,8 +297,10 @@ def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tup
     P2's policy is applied HERE, to every record a ``build`` returns for writing, inside the locked build and before ``prev``
     and before any signing prompt: ``board_store._graded`` takes the grade from ``seal`` (``asserted`` with none), requires an
     operator author on a signed record, and runs ``board_sign.require_policy`` (a decision-class op, ``begin-track|track|
-    abandon-track|untrack``, is refused unsigned). ``seal`` (a ``board_sign.Seal``) is then passed to ``_append``, which earns
-    the signed grade by ``admit`` after the ceremony."""
+    abandon-track|untrack``, is refused unsigned). ``decision(fold, record)``, when given, returns the words naming why THIS
+    record of an asserted-ok op is decision-class (``move``, :func:`levain.desk.board_sign.move_is_decision`), or ``""``; it
+    is judged on the fold read under the same lock. ``seal`` (a ``board_sign.Seal``) is then passed to ``_append``, which
+    earns the signed grade by ``admit`` after the ceremony."""
     bs._require_pointered(target)
     if not creates and not (target.store_dir / REPOS_NAME).exists():
         raise BoardError(NO_REGISTRY)
@@ -302,7 +310,7 @@ def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tup
     def graded(view: View) -> tuple[dict | None, bool]:
         rec, write = build(view.fold, view.store_id, view.raw)
         if write and rec is not None:
-            rec = bs._graded(target, rec, seal)
+            rec = bs._graded(target, rec, seal, decision=decision(view.fold, rec) if decision is not None else "")
         return rec, write
 
     return bs._append(target, graded, filename=REPOS_NAME, parse=parse, seal=seal)
@@ -354,7 +362,10 @@ def _fold_one(target: bs.Target, name: str) -> rf.Repo | None:
 def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
          now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """Re-base a registered repo onto ``path``. The new path must hold the same repository (the same root commits). The same
-    path with a different origin (a renamed remote) records the new origin; only a fully identical move is a no-op."""
+    path with a different origin (a renamed remote) records the new origin; only a fully identical move is a no-op.
+    A move of a ``tracking`` or ``tracked`` repo that changes its origin or root set is decision-class (needs ``seal``, as
+    ``begin-track``; head ruling levain 26, 11-17, L2 M1); the same repository relocated on disk, and any move of an
+    ``untracked`` repo, are asserted-ok."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     ident = identity(path)
 
@@ -369,7 +380,12 @@ def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("move", name, by, sid, {"words": words, **ident}, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    def decision(fold, rec):
+        from levain.desk import board_sign as sg
+        cur = fold.repos[name]
+        return sg.MOVE_DECISION if sg.move_is_decision(cur.mode, cur.origin, cur.root, rec["origin"], rec["root"]) else ""
+
+    _, written = _reg_write(target, build, seal=seal, decision=decision)
     return _fold_one(target, name), written
 
 
@@ -581,6 +597,21 @@ def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
     return None
 
 
+def _latest_abandon_holds(raw: bytes, name: str, migration: str, snapshot: Any) -> bool:
+    """Whether the latest abandon-track of ``(name, migration)`` in the registry bytes ``raw`` can be a cut's cause now."""
+    from levain.authority_sig import VerifierUnavailable
+    from levain.desk import board_sign as sg
+    lines, _ = _split(raw)
+    for line in reversed(lines):
+        rec = sg._parse(line)
+        if isinstance(rec, dict) and rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
+            try:
+                return sg.abandon_problem(rec, snapshot) is None
+            except VerifierUnavailable as exc:
+                raise BoardError(f"the abandon-track signature cannot be checked now ({exc}): nothing was written") from None
+    return False
+
+
 def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
                   now: str | None = None, seal: Any = None, authority: Any = None) -> tuple[rf.Repo | None, list[str]]:
     """``tracking`` becomes ``aborting``; every item keyed to the ceremony's M is decided ``cut`` with the abandon's words and
@@ -588,9 +619,18 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     first without all the second: run again on an ``aborting`` repo and only the missing cuts are written (T2-d, T2-f).
     The abandon is decision-class: it needs ``seal`` (a signed abandon, earned by ``admit``). The cuts are asserted decides
     whose ``cause`` (P2-d) must name that signed abandon, keyed to ITS migration M and the item keyed to M: ``authority`` (an
-    authority SOURCE, default the seal's) is what the cause check replays. A re-run on an ``aborting`` repo writes no new abandon
-    and still needs ``authority`` for the cuts it finishes.
+    authority SOURCE, default the seal's) is what the cause check replays; with ``seal`` it must be the seal's own source (or
+    not given). The abandon names ``items_last``, the sha256 of the items file's last line when it was written (``none``: no
+    line), read under the same lock: a cut's cause holds only for an item added before it (L2 M2, levain 26).
+    A re-run on an ``aborting`` repo writes no new abandon and still needs ``authority`` for the cuts it finishes, except a
+    SIGNED re-run whose latest abandon does not hold a cut (``board_sign.abandon_problem``: asserted, legacy, relayed, a key
+    since revoked, no ``items_last``): it writes a fresh signed abandon of the same migration (the fold reads it as a retry)
+    and the cuts cite that one.
     Returns ``(repo, ids cut by this call)``."""
+    from levain.desk import board_sign as sg
+    if seal is not None and authority is not None and authority is not getattr(seal, "authority", None):
+        raise BoardError("abandon-track: a signed abandon's cuts are checked against the seal's own authority source; "
+                         "another one was given")
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
@@ -602,10 +642,19 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     def build(fold, sid, raw):
         c = _need_repo(fold, name)
         if c.mode == "aborting" and c.migration == cur.migration:
-            return None, False
-        if c.mode != "tracking" or c.migration != cur.migration:
+            if seal is None or _latest_abandon_holds(raw, name, c.migration, sg.read_authority(seal.authority)):
+                return None, False
+            body_words = c.words                            # the recovery abandon re-signs the abandon already recorded
+        elif c.mode != "tracking" or c.migration != cur.migration:
             raise BoardError(f"{name} changed under the abandon ({c.mode}); run it again")
-        return _record("abandon-track", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
+        else:
+            body_words = words
+        items = _items_raw(target.store_dir)
+        _fold_items(items)                                  # a torn item store refuses here too, under the lock
+        tail = [ln for ln in items.split(b"\n") if ln]
+        last = hashlib.sha256(tail[-1]).hexdigest() if tail else sg.ITEMS_NONE
+        return _record("abandon-track", name, by, sid, {"words": body_words, "migration": c.migration, "items_last": last},
+                       author, now), True
 
     _reg_write(target, build, seal=seal)
     authority = authority if authority is not None else getattr(seal, "authority", None)
@@ -1224,8 +1273,13 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     def seal(a: Any) -> Any:
         """The ``--sign`` seal (None without it), built before the store is touched: an agent author or an install with no
-        authority log is refused here, before any prompt."""
-        return seal_of(a, author_of(a)) if seal_of is not None else None
+        authority log is refused here, before any prompt. ``--sign`` with no ``seal_of`` wired refuses: a sign flag that is
+        accepted and does nothing would write unsigned."""
+        if seal_of is None:
+            if getattr(a, "sign", False):
+                raise BoardError("--sign cannot be honoured here (no signer is wired into this CLI): nothing was written")
+            return None
+        return seal_of(a, author_of(a))
 
     def _source(a: Any) -> Any:
         """The authority source an UNSIGNED abandon-track's cuts are checked against (a re-run that finishes cuts). None when

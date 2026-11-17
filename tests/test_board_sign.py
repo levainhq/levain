@@ -492,11 +492,21 @@ def test_only_exact_known_grades_get_a_verdict_and_a_sig_off_a_signed_grade_is_b
 # ---------------------------------------------------------------------------------------- P2-d the cause (G2, G3, G4)
 
 
+def items_last(target: bs.Target) -> str:
+    """The abandon's ``items_last`` as the verb writes it: the sha256 of the items file's last line, ``none`` with none."""
+    p = target.store_dir / "items.jsonl"
+    tail = [ln for ln in (p.read_bytes() if p.exists() else b"").split(b"\n") if ln]
+    return hashlib.sha256(tail[-1]).hexdigest() if tail else sg.ITEMS_NONE
+
+
 def signed_abandon(target: bs.Target, signer: Rig, *, migration="M1", grade="signed-terminal", op="abandon-track",
-                   sign=True, junk=False) -> str:
-    """An abandon-track line written raw into repos.jsonl (the verb is T2's), signed by ``signer``; returns its cause."""
-    rec = {"v": 1, "op": op, "repo": "levain", "at": NOW, "prev": "0" * 64, "by": "phill", "migration": migration,
+                   sign=True, junk=False, repo="levain", last: str | None = "now") -> str:
+    """An abandon-track line written raw into repos.jsonl (the verb is T2's), signed by ``signer``; returns its cause.
+    ``last`` is its ``items_last``: ``"now"`` (default) names the items file's last line as of this call; None omits it."""
+    rec = {"v": 1, "op": op, "repo": repo, "at": NOW, "prev": "0" * 64, "by": "phill", "migration": migration,
            "words": "abandon", "author": OPERATOR, "grade": grade}
+    if last is not None:
+        rec["items_last"] = items_last(target) if last == "now" else last
     if sign:
         armored = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n" if junk else signer.sign(sg.signing_bytes(rec))
         rec = {**rec, "sig": {"sshsig": armored, "fingerprint": signer.fp, "via": "terminal"}}
@@ -522,9 +532,8 @@ def test_a_cut_caused_by_a_valid_signed_abandon_of_the_items_migration_is_accept
         cut(target, item, cause, rig.source())
         rec = items(target)[-1]
         assert rec["grade"] == "asserted" and rec["cause"] == cause and rec["id"] == item
-    lines = [*(target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[:1],
-             *(target.store_dir / "items.jsonl").read_bytes().split(b"\n")[:1]]
-    assert sg.verify_cause(items(target)[-2], lines, rig.snapshot()) is None            # P6's entry point
+    lines = [ln for name in ("items.jsonl", "repos.jsonl") for ln in (target.store_dir / name).read_bytes().split(b"\n") if ln]
+    assert sg.verify_cause(items(target)[-2], lines, rig.snapshot()) is None            # P6's entry point: both files' lines
 
 
 def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
@@ -600,6 +609,30 @@ def test_the_cli_checks_an_unsigned_cause_against_the_authority_log(target, rig,
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     assert main(argv) == 0, capsys.readouterr().err
     assert items(target)[-1]["cause"] == cause
+
+
+def test_a_cause_binds_the_abandons_repo_and_only_items_added_before_it_l2_m2(target, rig):
+    """L2 M2 (levain 26): the cut's item must be of the abandon's repo and its add must predate the abandon (at or before
+    the items line the abandon names in ``items_last``). Run by hand first on a scratch store: each case refused."""
+    before = keyed_item(target, "M1:plan-1")
+    elsewhere = signed_abandon(target, rig, repo="other")                       # repo "other", migration M1; the item is levain's
+    no_last = signed_abandon(target, rig, last=None)                            # an abandon written before items_last existed
+    empty_then = signed_abandon(target, rig, last=sg.ITEMS_NONE)                # the items file was empty at the abandon
+    gone = signed_abandon(target, rig, last="e" * 64)                           # names an items line that is not in the store
+    good = signed_abandon(target, rig)
+    reg = target.store_dir / "repos.jsonl"
+    reg.rename(reg.with_name("aside"))                  # these raw abandons are no registry the add's I1 check could read
+    after = keyed_item(target, "M1:plan-2")                                     # added AFTER every abandon above
+    reg.with_name("aside").rename(reg)
+    for item, cause, why in ((before, elsewhere, "was added for 'levain'"), (before, no_last, "items_last"),
+                             (before, empty_then, "was added after"), (before, gone, "is not in the store"),
+                             (after, good, "was added after")):
+        with pytest.raises(bs.BoardError, match="--sign") as exc:
+            cut(target, item, cause, rig.source())
+        assert why in str(exc.value), (why, str(exc.value))
+    assert not any(r["op"] == "decide" for r in items(target))
+    cut(target, before, good, rig.source())                                     # the item that predates it: accepted
+    assert items(target)[-1]["cause"] == good
 
 
 # ------------------------------------------------------------------------------ a real authority log's keys (G10)
