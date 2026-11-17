@@ -207,10 +207,10 @@ def _counted_head(conn: sqlite3.Connection) -> int:
     return top
 
 
-def _check_request_id(request_id: Any) -> None:
+def _check_request_id(request_id: Any, verb: str = "a close") -> None:
     if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > _REQUEST_ID_MAX \
             or not request_id.isprintable():
-        raise CoordError("a close needs a request id (one printable line): a retry names the same one")
+        raise CoordError(f"{verb} needs a request id (one printable line): a retry names the same one")
 
 
 def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_handoff_id: int | None, token: Any,

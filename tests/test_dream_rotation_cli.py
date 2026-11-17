@@ -182,3 +182,24 @@ def test_the_launch_brief_names_the_flag():
 
     text = "\n".join(cl._arrival_section("levain", ""))
     assert "coord open --dream-body-file PATH --token N" in text
+
+
+def test_the_loser_of_a_retry_race_is_refused_naming_the_winners_handoff(desk, capsys, monkeypatch):
+    from levain.desk import seam_verbs
+
+    _saved_after(desk)
+    real = seam_verbs._active
+    seen = []
+
+    def stale_active(store, token):      # both calls read the desk as live before either wrote
+        seen.append(token)
+        return real(store, token) if len(seen) == 1 else (desk.launch, "")
+
+    monkeypatch.setattr(seam_verbs, "_active", stale_active)
+    _run(desk, capsys)
+    before = _snapshot(desk)
+    cap = _run(desk, capsys, rc=1)
+    h = _handoffs(desk)[0]
+    assert len(seen) == 2
+    assert f"already handed over onto the dream at handoff {h[0]}" in cap.err and "the next desk it asks for opens it" in cap.err
+    assert _snapshot(desk) == before and len(_handoffs(desk)) == 1
