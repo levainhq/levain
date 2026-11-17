@@ -282,7 +282,8 @@ def _store(path: Path) -> tuple[dict[str, tuple[str, str | None]] | None, str]:
     problems is not complete, so it is skipped like an unreadable one, never trusted."""
     from levain.desk.board_state import fold
     try:
-        folded = fold(path.expanduser().read_text("utf-8").splitlines())
+        from levain.desk import board_store
+        folded = fold(board_store.read_item_lines(board_store.resolve_store(path)))
     except (OSError, ValueError, RuntimeError, RecursionError) as exc:
         return None, f"cannot be read ({type(exc).__name__})"
     if folded.torn or folded.problems:

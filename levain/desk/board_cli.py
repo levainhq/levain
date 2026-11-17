@@ -24,11 +24,12 @@ from pathlib import Path
 from typing import Any
 
 from levain.desk import board_evidence as be
+from levain.desk import board_store as bs
 from levain.desk.board_state import Evidence, derive_all, fold, parse_timestamp
 
 __all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
 
-ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
+ITEMS_ENV = bs.ITEMS_ENV
 #: Sources this CLI reads from git (or by stat). An extra object may not name them: two writers for one source is how
 #: a stale hand-made file would silently outvote git.
 READ_BY_CLI = ("fetched_at", "main", "chain", "refs", "merged", "branches", "unattributed")
@@ -67,6 +68,46 @@ def register(subparsers: Any) -> None:
                    help=f"Commits and branches older than this are out of the attribution scan (default {be.BOARD_EPOCH}).")
     p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
     p.set_defaults(func=run_state)
+
+    items_help = f"An explicit store (its items file or its directory); it must be this install's store. Default: ${ITEMS_ENV}."
+    a = sub.add_parser("add", description="Capture an item; prints its id.")
+    a.add_argument("--repo", required=True)
+    a.add_argument("--title", required=True)
+    a.add_argument("--origin", required=True, help="desk N | np-xxxxxxxx | STATUS_1_0.md#<n>@<blob sha> | found by <seat>, <path>")
+    a.add_argument("--words", default="", help="his words verbatim when he gave them")
+    a.add_argument("--done", default=None)
+    a.add_argument("--done-kind", dest="done_kind", default="merged", choices=bs.DONE_KINDS)
+    a.add_argument("--tier", default=None, choices=bs.TIERS)
+    a.add_argument("--depends", action="append", default=[], metavar="TYPED")
+    a.add_argument("--by", required=True)
+    a.add_argument("--key", default=None, help="An idempotency key: the same key and --payload-hash returns the existing id.")
+    a.add_argument("--payload-hash", dest="payload_hash", default=None, metavar="SHA256")
+    a.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    a.set_defaults(func=run_add)
+    m = sub.add_parser("amend", description="Replace fields of an item.")
+    m.add_argument("--id", required=True)
+    m.add_argument("--why", required=True)
+    m.add_argument("--by", required=True)
+    m.add_argument("--title")
+    m.add_argument("--words")
+    m.add_argument("--done")
+    m.add_argument("--done-kind", dest="done_kind", choices=bs.DONE_KINDS)
+    m.add_argument("--tier", choices=bs.TIERS)
+    m.add_argument("--depends", action="append", default=None, metavar="TYPED", help="replaces the item's depends_on")
+    m.add_argument("--clear", action="append", default=[], choices=bs.CLEARABLE)
+    m.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    m.set_defaults(func=run_amend)
+    d = sub.add_parser("decide", description="Record a ruling on an item.")
+    d.add_argument("--id", required=True)
+    d.add_argument("--decision", required=True, choices=bs.DECISIONS)
+    d.add_argument("--words", required=True)
+    d.add_argument("--by", required=True)
+    d.add_argument("--date", default=None)
+    d.add_argument("--items", type=Path, metavar="PATH", help=items_help)
+    d.set_defaults(func=run_decide)
+    u = sub.add_parser("use", description="Make DIR this install's item store (created if needed); writes the pointer last.")
+    u.add_argument("dir", type=Path, metavar="DIR")
+    u.set_defaults(func=run_use)
 
 
 def _fail(message: str) -> int:
@@ -118,14 +159,87 @@ def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True) 
     return None
 
 
-def run_state(args: argparse.Namespace) -> int:
-    items_path = args.items or (Path(os.environ[ITEMS_ENV]) if os.environ.get(ITEMS_ENV) else None)
-    if items_path is None:
-        return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}")
+def _refused(exc: Exception) -> int:
+    print(f"levain board: refused: {exc}", file=sys.stderr)
+    return EXIT_USAGE
+
+
+def _warn_unknown_deps(target: bs.Target, depends: Any) -> None:
+    refs = [d["ref"] for d in (bs.parse_link(x) for x in depends) if d["kind"] == "item"]
+    if refs:
+        held = bs.known_ids(target)
+        unknown = [r for r in refs if r not in held]
+        if unknown:
+            print(f"board: depends_on names {', '.join(unknown)}, which the store does not hold yet; the board will read it unknown until it does.",
+                  file=sys.stderr)
+
+
+def run_add(args: argparse.Namespace) -> int:
     try:
-        lines = Path(items_path).expanduser().read_text("utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        return _fail(f"the items file {items_path} cannot be read ({type(exc).__name__}: {exc})")
+        target = bs.resolve_store(args.items)
+        if target.pointered:
+            _warn_unknown_deps(target, args.depends)
+        item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
+                            done_kind=args.done_kind, tier=args.tier, depends=args.depends, key=args.key,
+                            payload_hash=args.payload_hash)
+        print(item_id)
+    except bs.BoardError as exc:
+        return _refused(exc)
+    return 0
+
+
+def run_amend(args: argparse.Namespace) -> int:
+    try:
+        target = bs.resolve_store(args.items)
+        fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
+                                    ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
+        if args.depends is not None:
+            if target.pointered:
+                _warn_unknown_deps(target, args.depends)
+            fields["depends_on"] = list(args.depends)
+        for c in dict.fromkeys(args.clear):          # a repeated --clear is one clear
+            key = "depends_on" if c == "depends" else c
+            if key in fields:
+                raise bs.BoardError(f"--{c.replace('_', '-')} and --clear {c} name the same field; give one")
+            fields[key] = [] if c == "depends" else None
+        print("amended", bs.amend(target, args.id, args.why, args.by, fields))
+    except bs.BoardError as exc:
+        return _refused(exc)
+    return 0
+
+
+def run_decide(args: argparse.Namespace) -> int:
+    try:
+        target = bs.resolve_store(args.items)
+        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date))
+    except bs.BoardError as exc:
+        return _refused(exc)
+    return 0
+
+
+def run_use(args: argparse.Namespace) -> int:
+    try:
+        store_dir, changed = bs.use(args.dir)
+    except bs.BoardError as exc:
+        return _refused(exc)
+    print(f"{'using' if changed else 'already using'} {store_dir}")
+    return 0
+
+
+def run_state(args: argparse.Namespace) -> int:
+    try:
+        target = bs.resolve_store(args.items)
+    except bs.BoardError as exc:
+        if str(exc).startswith("no items store"):
+            return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}")
+        return _refused(exc)
+    given = args.items or os.environ.get(ITEMS_ENV)
+    if not given and not target.pointered and not target.items_path.is_file():
+        return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
+    try:
+        lines = bs.read_item_lines(target)
+    except (OSError, UnicodeDecodeError, bs.BoardError) as exc:
+        return _fail(f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
         return _fail(f"--now {args.now!r} is not an ISO-8601 timestamp")

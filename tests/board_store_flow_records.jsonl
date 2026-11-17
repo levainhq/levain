@@ -1,0 +1,4 @@
+{"v":1,"op":"add","id":"levain#1","at":"2026-11-17T17:38:17Z","by":"levain 22","repo":"levain","title":"Port me","words":"his words  verbatim \u2014 \u00e9","origin":"desk 17","done":"docs/x.md","done_kind":"document","tier":"opus","depends_on":[{"kind":"item","ref":"levain#1"},{"kind":"gate","words":"wait for it","recheck":"2026-12-01"}]}
+{"v":1,"op":"add","id":"levain#2","at":"2026-11-17T17:38:18Z","by":"levain 22","repo":"levain","title":"Second","words":"","origin":"desk 17","done":null,"done_kind":"merged","tier":null,"depends_on":[]}
+{"v":1,"op":"amend","id":"levain#1","at":"2026-11-17T17:38:18Z","by":"levain 22","fields":{"title":"Port me 2","depends_on":[{"kind":"band","ref":"np-1a2b3c4d"}],"tier":null},"why":"re-scope"}
+{"v":1,"op":"decide","id":"levain#2","at":"2026-11-17T17:38:18Z","by":"levain 22","decision":"parked","words":"later, ok","date":"2026-11-17"}
