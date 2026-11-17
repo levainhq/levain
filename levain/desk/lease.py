@@ -88,6 +88,8 @@ SEVERAL_THREADS = "a worker holds one thread"
 # `levain desk wake` ended so a fresh one starts:
 # a stop, never a death, so the wake in the same transaction is never put into backoff by it (1030-42 L3 r1)
 REPLACED = "replaced while done"
+# a desk that handed itself over onto a dream's saved memory (:func:`end_for_dream`): a stop it chose, never a death
+DREAM_ROTATED = "handed over onto a dream"
 # a spawned worker whose one turn finished (its session listed done): ended so it no longer counts as a live spawn
 WORKER_DONE = "worker done"
 # a pending spawned worker whose record or thread no longer allows it (the thread merged away, closed or done)
@@ -121,7 +123,8 @@ SERVICE_HOLDER = "service"
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
 _SERVICE_CAUSES = ("takeover", "operator release", "lease lost before active", "pending past until",
-                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS, REPLACED, WORKER_DONE, SPAWN_REFUSED)
+                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS, REPLACED, DREAM_ROTATED, WORKER_DONE,
+                   SPAWN_REFUSED)
 MAX_DEATHS = 3
 
 _LAUNCH_ID = re.compile(r"ln-[0-9a-f]{32}")
@@ -1049,6 +1052,22 @@ def replace_done(conn: sqlite3.Connection, now: str, launch_id: str, *, asked: b
     held = lease(conn, now)
     if held is not None and held.holder == ln.session_key:
         _event(conn, now, "release", held.holder, token=held.token, until=None, cause="launch ended", by="service")
+    return _launch_row(conn, "launch_id", launch_id)
+
+
+def end_for_dream(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch:
+    """The live desk ``launch_id`` hands itself over onto a dream: written ``ended``, cause :data:`DREAM_ROTATED` (no
+    death), its lease released, so the caller's :func:`wake` in this transaction asks for the next desk. The ONE
+    writer of that cause. Refused (nothing written) unless the launch is an active desk launch whose session holds the
+    live lease, so no caller can end a desk that is not the live one with it."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "active" or ln.role != ROLE_DESK:
+        raise _refused(f"launch {launch_id} is not an active desk launch; a dream rotation ends only the live desk")
+    held = lease(conn, now)
+    if held is None or not held.live or held.holder != ln.session_key:
+        raise _refused(f"launch {launch_id} does not hold the live lease; a dream rotation ends only the live desk")
+    _launch_event(conn, now, launch_id, "ended", DREAM_ROTATED)
+    _event(conn, now, "release", held.holder, token=held.token, until=None, cause="launch ended", by="service")
     return _launch_row(conn, "launch_id", launch_id)
 
 
