@@ -113,6 +113,13 @@ def register(subparsers: Any) -> None:
     p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
     p.set_defaults(func=run_state)
 
+    def source_args(parser: Any) -> None:
+        parser.add_argument("--source", default=None, metavar="NP-ID",
+                            help=("Relay a band answer: the record is grade relayed (author kind agent), cites the row, and its words "
+                                  "must be a verbatim excerpt of the answer. Refused for an unknown or unanswered row."))
+        parser.add_argument("--band-dir", dest="band_dir", default=None, metavar="DIR",
+                            help="The band store --source reads (default: this install's consent directory).")
+
     def author_args(parser: Any) -> None:
         parser.add_argument("--sign", action="store_true",
                             help="Sign this record with the operator's Touch ID key (needs --author-kind operator, a fresh terminal, "
@@ -137,6 +144,7 @@ def register(subparsers: Any) -> None:
     a.add_argument("--depends", action="append", default=[], metavar="TYPED")
     a.add_argument("--by", required=True)
     author_args(a)
+    source_args(a)
     a.add_argument("--key", default=None, help="An idempotency key: the same key and --payload-hash returns the existing id.")
     a.add_argument("--payload-hash", dest="payload_hash", default=None, metavar="SHA256")
     a.add_argument("--items", type=str, metavar="PATH", help=items_help)
@@ -146,6 +154,7 @@ def register(subparsers: Any) -> None:
     m.add_argument("--why", required=True)
     m.add_argument("--by", required=True)
     author_args(m)
+    source_args(m)
     m.add_argument("--title")
     m.add_argument("--words")
     m.add_argument("--done")
@@ -161,6 +170,7 @@ def register(subparsers: Any) -> None:
     d.add_argument("--words", required=True)
     d.add_argument("--by", required=True)
     author_args(d)
+    source_args(d)
     d.add_argument("--date", default=None)
     d.add_argument("--cause", default=None, metavar="SHA256",
                    help="For a cut: the lowercase hex sha256 of the signed abandon-track record this cut derives from, over that line's "
@@ -391,10 +401,24 @@ def _seal(args: argparse.Namespace, author: dict[str, str]):
     return board_sign.terminal_seal(authority=board_sign.resolve_authority())
 
 
+def _relay(args: argparse.Namespace):
+    """``(np id, band source)`` when ``--source`` is given, else None. ``--band-dir`` alone is refused (it would do nothing).
+    An operator author is refused by the writer; the kind is also checked here, before any band store is opened."""
+    if args.source is None:
+        if args.band_dir is not None:
+            raise bs.BoardError("--band-dir only means something with --source")
+        return None
+    if args.author_kind == "operator":
+        raise bs.BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
+    from levain.desk import board_relay
+    return args.source, board_relay.band_source(args.band_dir)
+
+
 def run_add(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
         seal = _seal(args, author)
+        relay = _relay(args)
         target = bs.resolve_store(args.items)
         for spec in args.depends:               # a malformed link is a refusal, not an advisory
             bs.parse_link(spec)
@@ -402,7 +426,7 @@ def run_add(args: argparse.Namespace) -> int:
             _warn_unknown_deps(target, args.depends)
         item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
                             done_kind=args.done_kind, tier=args.tier, depends=args.depends, key=args.key,
-                            payload_hash=args.payload_hash, author=author, seal=seal)
+                            payload_hash=args.payload_hash, author=author, seal=seal, relay=relay)
         print(item_id)
     except bs.BoardError as exc:
         return _refused(exc)
@@ -413,6 +437,7 @@ def run_amend(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
         seal = _seal(args, author)
+        relay = _relay(args)
         target = bs.resolve_store(args.items)
         fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
                                     ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
@@ -427,7 +452,7 @@ def run_amend(args: argparse.Namespace) -> int:
             if key in fields:
                 raise bs.BoardError(f"--{c.replace('_', '-')} and --clear {c} name the same field; give one")
             fields[key] = [] if c == "depends" else None
-        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=author, seal=seal))
+        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=author, seal=seal, relay=relay))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
@@ -452,9 +477,10 @@ def run_decide(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
         seal = _seal(args, author)
+        relay = _relay(args)
         target = bs.resolve_store(args.items)
         print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
-                                   cause=args.cause, seal=seal, authority=_cause_authority(args, seal)))
+                                   cause=args.cause, seal=seal, authority=_cause_authority(args, seal), relay=relay))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
