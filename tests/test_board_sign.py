@@ -652,3 +652,42 @@ def test_a_deeply_nested_cited_line_is_refused_not_a_crash(target, rig):
         f.write(line + b"\n")
     with pytest.raises(bs.BoardError, match="not a record"):
         cut(target, item, hashlib.sha256(line).hexdigest(), rig.source())
+
+
+def test_an_append_between_the_two_post_seal_size_checks_is_refused_without_a_second_seal(target, rig, monkeypatch):
+    item = add_item(target)
+    path = target.store_dir / "items.jsonl"
+    first = path.read_bytes().split(b"\n")[0] + b"\n"
+    state: dict = {"armed": False, "fstats": 0, "appended": False}
+    base = revoking_factory(state, key="x")
+    real_os = bs.os
+
+    class Hooked:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def fstat(fd):
+            out = real_os.fstat(fd)
+            if state["armed"] and not state["appended"]:
+                state["fstats"] += 1
+                if state["fstats"] == 2:            # after the signed-path size check read its size, before the generic one
+                    with open(path, "ab") as f:
+                        f.write(first)
+                    state["appended"] = True
+            return out
+
+    def factory(p, bound):
+        fp, sign = base(p, bound)
+
+        def signing(message):
+            out = sign(message)
+            state["armed"] = True
+            return out
+        return fp, signing
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=factory, remote=lambda: None, in_agent_session=lambda: False,
+                            authority=rig.source())
+    monkeypatch.setattr(bs, "os", Hooked())
+    with pytest.raises(bs.BoardError, match="the board changed while you signed: sign again"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
+    assert state["appended"] and state["calls"] == 1

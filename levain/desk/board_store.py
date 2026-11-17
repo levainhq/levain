@@ -625,6 +625,8 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                     if not _same_file(fd, path) or os.fstat(fd).st_size != len(raw):
                         raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
                 if os.fstat(fd).st_size != len(raw):
+                    if seal is not None:
+                        raise BoardError(SIGNED_CHAIN_MOVED)    # every post-seal mismatch refuses: a re-build would seal again
                     continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
                 label = rec.get("id") or rec.get("repo") or rec.get("op")        # a registry record has no id
