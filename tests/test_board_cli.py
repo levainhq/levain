@@ -163,8 +163,8 @@ def test_documents_are_stat_d_by_the_cli_and_the_extra_cannot_outvote_it(world, 
 def test_a_missing_or_unreadable_items_file_exits_two(world, tmp_path, capsys):
     rc, out, err = run(capsys, "--json", "--items", str(tmp_path / "nope" / "items.jsonl"), "--repo", str(world.w))
     assert rc == 2 and out == "" and "items file" in err
-    rc, out, err = run(capsys, "--json", "--items", str(tmp_path / "nope.jsonl"), "--repo", str(world.w))     # any other file name is a shadow file
-    assert rc == 2 and out == "" and "--items must name a store directory or its items.jsonl" in err
+    rc, out, err = run(capsys, "--json", "--items", str(tmp_path / "nope.jsonl"), "--repo", str(world.w))     # a missing path gets the neutral refusal
+    assert rc == 2 and out == "" and "nope.jsonl: no such file or directory" in err
     (tmp_path / "b").mkdir()
     (tmp_path / "b" / "items.jsonl").write_bytes(b"\xff\xfe\x00bad")
     rc, out, err = run(capsys, "--json", "--items", str(tmp_path / "b" / "items.jsonl"), "--repo", str(world.w))

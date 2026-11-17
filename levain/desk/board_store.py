@@ -116,8 +116,8 @@ def _explicit_dir_and_file(given: Path) -> tuple[Path, Path]:
     if p.is_dir():
         return p, p / ITEMS_NAME
     if expanded.name != ITEMS_NAME:
-        if not os.path.lexists(expanded) and not expanded.name.endswith(".jsonl"):     # a missing directory; a missing *.jsonl is a shadow file
-            raise BoardError(f"--items {given}: no such directory")
+        if not os.path.lexists(expanded):
+            raise BoardError(f"--items {given}: no such file or directory")
         raise BoardError(f"--items must name a store directory or its {ITEMS_NAME}, not {str(given)!r}")
     parent = Path(os.path.realpath(expanded.parent))
     return parent, parent / ITEMS_NAME
@@ -246,6 +246,7 @@ def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False) -> Iter
         return
     fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True)
     if fd < 0:
+        _require_store_exists(store_dir)            # no lock in a store that is gone is a dangling store, not an empty one
         yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock)
         return
     try:
@@ -444,29 +445,29 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]]) ->
     _require_pointered(target)
     path = target.store_dir / target.items_path.name
     with store_lock(target.store_dir, exclusive=True) as held:
-        line = None                     # the serialised record, once one has been written
         for _ in range(OPEN_RETRIES):
             fd = held.open(target.items_path.name, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
             try:
                 empty = os.fstat(fd).st_size == 0           # a write into a zero-length file may have just created it
                 raw = _read_fd(fd)
-                if line is not None and line in raw.split(b"\n"):
-                    return rec, True            # the replacement kept our record (a copy made after the write): done
+                if not _same_file(fd, path):
+                    continue                    # replaced before anything was written (a git operation): open, read and build again
                 recs = _records_from(raw)
                 rec, write = build(recs)
-                if write:
-                    # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                    line = (json.dumps(rec, separators=(",", ":"))).encode("ascii")
-                    _write_all(fd, line + b"\n")
-                if _same_file(fd, path):
-                    if write and empty:
-                        _fsync_dir_or_warn(target.store_dir, rec["id"])
-                    return rec, write
+                if not write:
+                    return rec, False
+                # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
+                line = (json.dumps(rec, separators=(",", ":"))).encode("ascii")
+                _write_all(fd, line + b"\n")
+                if not _same_file(fd, path):
+                    raise BoardError(f"{path} was replaced while {rec['id']} was being written (a git operation?): the record may or may not be "
+                                     f"in the new file; run \"levain board state\" and check before retrying (an add with --key is safe to retry)")
+                if empty:
+                    _fsync_dir_or_warn(target.store_dir, rec["id"])
+                return rec, True
             finally:
                 os.close(fd)
-            # the file was replaced under the lock (a git operation): the record, if any, is in the unlinked inode.
-            # Open the current file, read it again; if it already holds the record, that is the write; else build again.
-        raise BoardError(f"{path} was replaced while a write was in flight (a git operation?) {OPEN_RETRIES} times; nothing was kept, retry")
+        raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
 
 
 def _check_repo_mode(repo: str) -> None:
@@ -615,7 +616,7 @@ def _write_store_id_once(held: StoreHandle) -> None:
             raise
     finally:
         os.close(fd)
-    _fsync_dir(held.dir)
+    _fsync_dir_or_warn(held.dir, STORE_ID_NAME)
 
 
 def _write_pointer(home: Path, store_dir: Path) -> None:

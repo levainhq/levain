@@ -286,38 +286,69 @@ def _replace_with_copy(path: Path) -> None:
     os.replace(copy, path)
 
 
-def test_a_write_that_landed_in_a_replaced_inode_is_redone_against_the_new_file(home, tmp_path, capsys, monkeypatch):
+def test_a_file_replaced_before_the_write_is_reread_and_written_once(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    real, calls = bs._read_fd, {"n": 0}
+
+    def read_then_swap(fd):
+        raw = real(fd)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _replace_with_copy(items)           # the replacement arrives after the open and read, before the write
+        return raw
+
+    monkeypatch.setattr(bs, "_read_fd", read_then_swap)
+    rc, out, err = run(capsys, *ADD)
+    assert rc == 0 and out == "levain#2", err
+    assert calls["n"] == 2
+    assert [json.loads(x)["id"] for x in lines(store)] == ["levain#1", "levain#2"]
+
+
+def test_a_store_replaced_before_every_write_refuses_and_writes_nothing(home, tmp_path, capsys, monkeypatch):
+    store = use(capsys, tmp_path / "s")
+    real = bs._read_fd
+    monkeypatch.setattr(bs, "_read_fd", lambda fd: (_replace_with_copy(store / "items.jsonl"), real(fd))[1])
+    rc, out, err = run(capsys, *ADD)
+    assert rc == 2 and "was replaced" in err and "nothing was written" in err
+    assert lines(store) == []
+
+
+def test_a_file_replaced_after_the_write_refuses_and_appends_nothing_to_the_new_file(home, tmp_path, capsys, monkeypatch):
     store = use(capsys, tmp_path / "s")
     assert run(capsys, *ADD)[0] == 0
     items = store / "items.jsonl"
     real, calls = bs._write_all, {"n": 0}
 
-    def swap_then_write(fd, payload):
+    def write_then_swap(fd, payload):
         calls["n"] += 1
-        if calls["n"] == 1:
-            _replace_with_copy(items)           # the replacement arrives between the open and the write
         real(fd, payload)
+        _replace_with_copy(items)               # a copy that already holds the written line, or (for a checkout) none
 
-    monkeypatch.setattr(bs, "_write_all", swap_then_write)
+    monkeypatch.setattr(bs, "_write_all", write_then_swap)
     rc, out, err = run(capsys, *ADD)
-    assert rc == 0 and out == "levain#2", err
-    assert calls["n"] == 2
-    ids = [json.loads(x)["id"] for x in lines(store)]
-    assert ids == ["levain#1", "levain#2"]          # the record is in the file at the path, once, with the id the NEW contents allow
+    assert rc == 2 and out == "" and calls["n"] == 1
+    assert f"was replaced while levain#2 was being written" in err and 'levain board state' in err and "--key" in err
+    assert [json.loads(x)["id"] for x in lines(store)] == ["levain#1", "levain#2"]      # the copy it got; nothing was appended to it
 
 
-def test_a_write_in_a_store_replaced_every_time_refuses_naming_the_replacement(home, tmp_path, capsys, monkeypatch):
+def test_a_file_replaced_after_the_write_by_one_without_the_record_gets_nothing_appended(home, tmp_path, capsys, monkeypatch):
     store = use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[0] == 0
+    items = store / "items.jsonl"
+    old = items.read_bytes()
     real = bs._write_all
 
-    def always(fd, payload):
-        _replace_with_copy(store / "items.jsonl")
+    def write_then_swap_back(fd, payload):
         real(fd, payload)
+        items.with_name("items.old").write_bytes(old)
+        os.replace(items.with_name("items.old"), items)      # the checkout restored the file without our line
 
-    monkeypatch.setattr(bs, "_write_all", always)
+    monkeypatch.setattr(bs, "_write_all", write_then_swap_back)
     rc, out, err = run(capsys, *ADD)
-    assert rc == 2 and "was replaced while a write was in flight" in err
-    assert lines(store) == []
+    assert rc == 2 and "may or may not be in the new file" in err
+    assert items.read_bytes() == old
 
 
 def test_a_read_of_a_replaced_file_is_retried_once_then_refused(home, tmp_path, capsys, monkeypatch):
@@ -521,24 +552,6 @@ def test_charter_check_prints_the_stores_own_refusal(home, tmp_path, capsys):
 # --------------------------------------------------------------------------------------------------- fix round 2
 
 
-def test_a_retry_after_a_replacement_that_kept_the_record_appends_nothing(home, tmp_path, capsys, monkeypatch):
-    store = use(capsys, tmp_path / "s")
-    assert run(capsys, *ADD)[0] == 0
-    real, calls = bs._write_all, {"n": 0}
-
-    def write_then_swap(fd, payload):
-        calls["n"] += 1
-        real(fd, payload)
-        if calls["n"] == 1:
-            _replace_with_copy(store / "items.jsonl")       # a copy that already holds the written line
-
-    monkeypatch.setattr(bs, "_write_all", write_then_swap)
-    rc, out, err = run(capsys, *ADD)
-    assert rc == 0 and out == "levain#2", err
-    assert calls["n"] == 1
-    assert [json.loads(x)["id"] for x in lines(store)] == ["levain#1", "levain#2"]
-
-
 def _dir_fsync_fails(monkeypatch, only):
     real = bs._fsync_dir
 
@@ -631,8 +644,34 @@ def test_an_invalid_depends_is_a_refusal_printed_once_and_nothing_is_written(hom
     assert rc == 2 and err.count("refused") == 1 and "could not check" not in err
 
 
-def test_a_missing_items_directory_is_worded_for_what_happened(home, tmp_path, capsys):
-    missing = tmp_path / "nope"
+@pytest.mark.parametrize("name", ["nope", "nope.jsonl", "nope.txt"])
+def test_a_missing_explicit_path_gets_one_neutral_refusal(home, tmp_path, capsys, name):
+    missing = tmp_path / name
     for verb in (("state", "--json"), ADD):
         rc, _, err = run(capsys, verb[0], "--items", str(missing), *verb[1:])
-        assert rc == 2 and f"--items {missing}: no such directory" in err and "must name a store" not in err
+        assert rc == 2 and f"--items {missing}: no such file or directory" in err and "must name a store" not in err
+
+
+@pytest.mark.parametrize("damage", ["gone", "no-store-id"])
+def test_a_shared_reader_of_a_vanished_store_refuses_instead_of_reading_empty(home, tmp_path, capsys, damage):
+    import shutil
+    store = use(capsys, tmp_path / "s")
+    target = bs.resolve_store()
+    (store / bs.LOCK_NAME).unlink()
+    if damage == "gone":
+        shutil.rmtree(store)
+    else:
+        (store / "store.id").unlink()
+    with pytest.raises(bs.BoardError, match="holds no store"):
+        with bs.store_lock(store, exclusive=False):
+            pass
+    with pytest.raises(bs.BoardError, match="holds no store"):
+        bs.read_store_id(target)
+
+
+def test_a_failed_directory_fsync_after_a_new_store_id_is_a_warning(home, tmp_path, capsys, monkeypatch):
+    store = tmp_path / "s"
+    _dir_fsync_fails(monkeypatch, store)
+    rc, out, err = run(capsys, "use", str(store))
+    assert rc == 0 and "io error" in err and str(store) in err
+    assert (store / "store.id").read_text().strip()
