@@ -359,7 +359,8 @@ def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
     plan = eg.rig.launch("lane-a")
     hooks = plan.profile.settings["hooks"]
     cmds = [h["command"] for event in ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PostToolUseFailure",
-                                       "PermissionRequest") for g in hooks[event] for h in g["hooks"]]
+                                       "PermissionRequest") for g in hooks[event] for h in g["hooks"]
+            if "read_budget-" not in h["command"]]    # the read budget's `/bin/sh -c` hook is not a `-m` Python hook
     assert len(cmds) == 6
     base = getattr(sys, "_base_executable", sys.executable)
     ub = tmp_path / "userbase"

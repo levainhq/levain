@@ -251,3 +251,64 @@ def test_a_root_that_overlaps_the_token_directory_is_refused(rig, tmp_path):
     base, keys, claude = rig
     with pytest.raises(sp.SeatRefusal, match="read-token directory"):
         build(rig, levain_home=base / "lane")
+
+
+# --- the read budget rides every seat (levain row 800) ---------------------------------------------------------------
+
+def _budget_entries(p):
+    return {ev: [g for g in p.settings["hooks"][ev] if any("read_budget-" in h["command"] for h in g["hooks"])]
+            for ev in ("PreToolUse", "PostToolUse")}
+
+
+def test_the_read_budget_hooks_are_appended_after_seat_record(rig):
+    import re
+    p = build(rig)
+    hooks = p.settings["hooks"]
+    assert set(hooks) == {"PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure"}   # no new event name
+    for ev, arg in (("PreToolUse", "pre"), ("PostToolUse", "post")):
+        assert "levain.seat_record" in hooks[ev][0]["hooks"][0]["command"]       # seat_record stays at index 0
+        assert len(hooks[ev]) == 2
+        group = hooks[ev][1]
+        assert group["matcher"] == "Read"
+        cmd = group["hooks"][0]["command"]
+        assert re.search(r"/read_budget/read_budget-[0-9a-f]{16}\.py", cmd) and f" {arg};" in cmd
+    assert all("read_budget-" not in h["command"] for g in hooks["PostToolUseFailure"] for h in g["hooks"])
+    assert all(len(v) == 1 for v in _budget_entries(p).values())
+
+
+def test_the_read_budget_dir_rides_the_profile_env_and_the_digest(rig):
+    import dataclasses
+    p = build(rig)
+    state = p.env["LEVAIN_READ_BUDGET_DIR"]
+    assert state.endswith("/levain-home/read_budget/state") and Path(state).is_dir()
+    assert "LEVAIN_READ_BUDGET_DIR" not in hg._ENV_ALLOW        # a deliberate addition outside host_env's allowlist
+    # the builder has no no-budget mode: strip the env var from a built profile instead
+    bare = dataclasses.replace(p, env={k: v for k, v in p.env.items() if k != "LEVAIN_READ_BUDGET_DIR"})
+    assert bare.digest() != p.digest()
+
+
+def test_the_read_budget_dir_inside_a_seat_root_refuses(rig):
+    base, _, _ = rig
+    with pytest.raises(sp.SeatRefusal, match="read budget directory"):
+        build(rig, levain_home=base / "lane" / "home")
+    assert not (base / "lane" / "home" / "read_budget").exists()
+
+
+@pytest.mark.parametrize("exc", [OSError("disk full"), ValueError("relative")])
+def test_a_read_budget_install_error_refuses_naming_it(rig, monkeypatch, exc):
+    from levain.desk import read_budget_install as rbi
+
+    def boom(home):
+        raise exc
+    monkeypatch.setattr(rbi, "install", boom)
+    with pytest.raises(sp.SeatRefusal, match="read budget could not be installed"):
+        build(rig)
+
+
+def test_a_dry_run_builds_the_same_hooks_and_env_and_writes_nothing(rig):
+    base, _, _ = rig
+    home = Path(os.environ["TMPDIR"]) / sp.CANARY_DIRNAME / "levain-home"
+    dry = build(rig, dry_run=True)
+    assert not (home / "read_budget").exists()
+    real = build(rig)
+    assert dry.settings["hooks"] == real.settings["hooks"] and dry.env == real.env and (home / "read_budget").is_dir()

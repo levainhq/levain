@@ -569,7 +569,7 @@ def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin
             made.append(Path(tempfile.mkdtemp(prefix=".dry-run-", dir=parent)))
         os.mkdir(made[0] / ".git", 0o700)   # a clone's own .git, which the profile requires to be a real directory
         profile = build_seat_profile(made[0], made[1], claude_bin=claude_bin, python=python, lease=lease,
-                                     key_dir=key_dir, egress=egress, **profile_kw)
+                                     key_dir=key_dir, egress=egress, dry_run=True, **profile_kw)
         argv = json.dumps([*profile.argv(headless=True, model=model), *([prompt] if prompt else [])])
         argv = argv.replace(str(profile.clone), str(clone)).replace(str(profile.return_dir), str(return_dir))
     except (SeatLaunchRefused, SeatRefusal) as exc:

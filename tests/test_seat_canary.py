@@ -821,3 +821,24 @@ def test_init_event_compares_the_levain_gh_tools_exactly():
         c = sc.check_seat_init(init(tools=tools))
         assert c.status == "fail" and "MCP tools" in c.evidence, tools
     assert status(ev(**{"P0.init": init(tools=[*CC_SEAT_TOOLS])}), "P0") == "fail"
+
+
+def test_the_canary_profile_carries_the_read_budget_under_its_own_prefix(tmp_path):
+    """Row 800. The canary has no levain home: its budget lives under the canary prefix, never the real home."""
+    import sys
+    from levain.seat_profile import real_levain_home
+    seen = {}
+
+    def factory(clone, ret, **kw):
+        prof = sc.build_seat_profile(clone, ret, **{**kw, "managed": []})
+        seen["state"] = prof.env["LEVAIN_READ_BUDGET_DIR"]
+        seen["hooks"] = prof.settings["hooks"]
+        raise RuntimeError("stop after the build")
+    try:
+        sc.run_seat_canary(claude_bin="/bin/echo", python=sys.executable, swap_attempts=1,
+                           drive=lambda argv, **d: _timed_out_turn(), profile_factory=factory, environ={**os.environ, "TMPDIR": str(tmp_path)})
+    except Exception:  # noqa: BLE001 - the verdict path is not under test
+        pass
+    assert "levain-seat-canary" in seen["state"] and "/levain-home/read_budget/state" in seen["state"]
+    assert not seen["state"].startswith(str(real_levain_home(os.environ)))
+    assert any("read_budget-" in h["command"] for g in seen["hooks"]["PreToolUse"] for h in g["hooks"])

@@ -286,3 +286,9 @@ def test_the_github_door_the_page_describes_is_the_codes():
     for cmd in ("levain seat gh-token set --owner", "levain seat gh-token clear --owner", "levain seat gh-token status"):
         assert cmd in TEXT
     assert f"push/{seat_gh.LOG_NAME}" in TEXT
+
+
+def test_the_one_env_variable_outside_the_allowlist_is_named():
+    """Row 800: ``LEVAIN_READ_BUDGET_DIR`` is added to the profile's env after ``host_env``, not allowlisted."""
+    from levain import host_guard
+    assert "LEVAIN_READ_BUDGET_DIR" in TEXT and "LEVAIN_READ_BUDGET_DIR" not in host_guard._ENV_ALLOW

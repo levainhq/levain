@@ -124,7 +124,9 @@ The canary and `levain seat launch --dry-run` pass no commit, so they exempt not
 
 Every tool call is recorded to the launcher key directory by `levain.seat_record` (`PreToolUse`, `PostToolUse` and
 `PostToolUseFailure` hooks), and permission requests are observed. With a seat-egress grant, a `Stop` and a `SessionEnd`
-hook run the push described under seat egress.
+hook run the push described under seat egress. Every seat also carries the read budget (row 800): a `PreToolUse` and a
+`PostToolUse` hook on `Read`, appended after the recording hooks, with `LEVAIN_READ_BUDGET_DIR` in the seat's environment
+(the one variable outside the env allowlist above).
 
 ### Where it stops
 

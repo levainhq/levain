@@ -537,7 +537,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
                        managed: Sequence[tuple[str, Any]] | None = None, platform: str = sys.platform,
                        home: Path | None = None, egress: Mapping[str, Any] | None = None,
                        cockpit_root: Path | str | None = None, levain_home: Path | str | None = None,
-                       tools: Sequence[str] = CC_SEAT_TOOLS, base_sha: str | None = None) -> SeatProfile:
+                       tools: Sequence[str] = CC_SEAT_TOOLS, base_sha: str | None = None,
+                       dry_run: bool = False) -> SeatProfile:
     """Build the terminal seat profile, or raise :class:`SeatRefusal` naming every problem found. ``lease=None`` is
     accepted only with ``canary_root`` under the fixed test prefix. Refuses a root that already holds an agent-config
     target, and an executable (python, claude) a seat could write.
@@ -558,7 +559,12 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     working tree) is launched read-only instead of refused. The bound that holds it read-only is the push
     (:func:`levain.seat_push.tree_refusal` refuses a lane tip that changes it); the sandbox's ``denyWrite`` and the
     file tools' deny rules name it as defence in depth. Anything extra, changed, symlinked or untracked in it still
-    refuses, as does every other protected name."""
+    refuses, as does every other protected name.
+
+    Every seat carries the read budget (levain row 800): its PreToolUse/PostToolUse ``Read`` hook groups are APPENDED to
+    the event lists (``seat_record`` stays first, no new event name) and ``LEVAIN_READ_BUDGET_DIR`` rides ``env``. Its
+    home is the levain home (the canary's own home under its prefix). ``dry_run`` names the same paths and writes
+    nothing (``levain seat launch --dry-run`` mints nothing)."""
     environ = os.environ if environ is None else environ
     tools = tuple(tools)
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
@@ -591,6 +597,10 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     problems += hg._check_exec(claude_bin, roots, "the claude binary")
     pkg = Path(__file__).resolve().parent
     problems += [f"the levain package ({pkg}) is inside a seat root" for r in roots if hg.is_within(pkg, r)]
+    # the read budget's script is exec'd by an unsandboxed hook: a seat that could write it would run code outside its bound
+    budget_dir = gh_home / "read_budget"
+    problems += [f"the read budget directory ({budget_dir}) is inside a seat root" for r in roots
+                 if hg.is_within(budget_dir, r)]
     if problems:
         raise SeatRefusal("; ".join(problems))
 
@@ -628,6 +638,14 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         from levain import seat_push
         hooks = {**hooks, **seat_push.hook_entries(python, clone=clone, key_dir=key_dir, cockpit_root=cockpit_root,
                                                    home=Path(levain_home))}
+    from levain.desk import read_budget, read_budget_install
+    try:
+        script, state = (read_budget_install.planned if dry_run else read_budget_install.install)(gh_home)
+        budget_hooks = read_budget.settings_hooks(python, script)
+    except (OSError, ValueError) as exc:
+        raise SeatRefusal(f"the read budget could not be installed ({type(exc).__name__}: {str(exc)[:200]})") from None
+    # APPEND, never replace: seat_record stays first in each event, and no event name is added
+    hooks = {**hooks, **{ev: [*hooks[ev], *groups] for ev, groups in budget_hooks.items()}}
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],
@@ -643,6 +661,10 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         trusted_hooks=hg.load_managed_trust(platform, environ, home))
     if problems:
         raise SeatRefusal("; ".join(problems))
-    env = {**hg.host_env(environ, roots=roots), "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}
+    # LEVAIN_READ_BUDGET_DIR is a DELIBERATE addition outside host_env's allowlist (the hook is inert without it). It is
+    # delivered through the profile's own env, which launch_seat hands the process and digest() binds, not through the
+    # settings ``env`` key (unmeasured under ``--setting-sources ""``). A path only, host-owned.
+    env = {**hg.host_env(environ, roots=roots), "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+           read_budget.STATE_ENV: state}
     return SeatProfile(clone=clone, return_dir=return_dir, roots=roots, claude_bin=claude_bin, settings=settings,
                        mcp_config=gh_mcp_config(python, gh_home), env=env, tools=tools)

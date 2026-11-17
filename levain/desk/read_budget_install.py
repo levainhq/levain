@@ -31,6 +31,12 @@ def _source() -> bytes:
     return Path(read_budget.__file__).read_bytes()
 
 
+def planned(home: str | os.PathLike[str]) -> tuple[str, str]:
+    """``(script, state_dir)`` exactly as :func:`install` would name them, WITHOUT writing anything (a dry run mints nothing)."""
+    base = Path(os.path.abspath(home)) / SUBDIR
+    return str(base / f"read_budget-{hashlib.sha256(_source()).hexdigest()[:16]}.py"), str(base / "state")
+
+
 def install(home: str | os.PathLike[str]) -> tuple[str, str]:
     """``(script, state_dir)``, absolute: the script written to ``<home>/read_budget/read_budget-<sha[:16]>.py`` (0600,
     replaced whole when missing, holding other bytes, or not mode 0600) and the state directory made (0700). OSError is the caller's."""

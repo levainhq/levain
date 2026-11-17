@@ -328,3 +328,20 @@ def test_a_lease_profile_without_the_levain_home_refuses(rig):
     with pytest.raises(SeatRefusal, match="needs the levain home"):
         sp.build_seat_profile(lane, ret, claude_bin=rig.claude, python=sys.executable, lease=lease,
                               key_dir=rig.key_dir, managed=())
+
+
+def test_a_dry_run_writes_no_read_budget_and_a_launch_carries_it(rig):
+    """Row 800. ``--dry-run`` mints nothing: the levain home has no read_budget directory after it; the real launch
+    installs the script and carries the hook and the state dir in the profile's own env."""
+    import io
+    home = sl._levain_home()
+    rig.sign_lease()
+    out, err = io.StringIO(), io.StringIO()
+    rc = sl.validate_launch("lane-p", str(rig.src), rig.sha, claude_bin=rig.claude, python=sys.executable,
+                            cockpit_root=rig.world.root, install=rig.tmp, out=out, err=err,
+                            now=rig.world.clock.now + timedelta(minutes=1), managed=())
+    assert rc == 0 and "read_budget-" in out.getvalue() and not (home / "read_budget").exists()
+    plan = rig.launch()
+    assert (home / "read_budget").is_dir()
+    assert plan.profile.env["LEVAIN_READ_BUDGET_DIR"] == str(Path(os.path.abspath(home)) / "read_budget" / "state")
+    assert plan.mint["profile_digest"] == plan.profile.digest()
