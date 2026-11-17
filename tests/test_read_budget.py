@@ -127,9 +127,11 @@ def test_outlines_markdown_json_and_unstructured(tmp_path):
 
 def test_settings_hooks_shape_and_absolute_paths():
     h = rb.settings_hooks("/usr/bin/python3", "/run/read_budget.py")
-    assert h["PreToolUse"][0]["matcher"] == "Read" and h["PostToolUse"][0]["hooks"][0]["command"].endswith(" post'")
+    assert h["PreToolUse"][0]["matcher"] == "Read"
+    assert h["PostToolUse"][0]["hooks"][0]["command"] == (
+        "/bin/sh -c '/usr/bin/python3 -I /run/read_budget.py post; c=$?; [ \"$c\" -eq 2 ] && exit 1; exit \"$c\"'")
     assert h["PreToolUse"][0]["hooks"][0]["command"] == (
-        "/bin/sh -c '[ -r /run/read_budget.py ] || exit 0; exec /usr/bin/python3 -I /run/read_budget.py pre'")
+        "/bin/sh -c '/usr/bin/python3 -I /run/read_budget.py pre; c=$?; [ \"$c\" -eq 2 ] && exit 1; exit \"$c\"'")
     assert h["PreToolUse"][0]["hooks"][0]["timeout"] == 10 == h["PostToolUse"][0]["hooks"][0]["timeout"]
     with pytest.raises(ValueError):
         rb.settings_hooks("python3", "/x.py")
@@ -276,7 +278,8 @@ def _run_hook(script, arg, stdin_text, extra_env):
     import os
     import subprocess
     import sys
-    cmd = rb.settings_hooks(sys.executable, str(script))["PreToolUse"][0]["hooks"][0]["command"].replace(" pre'", f" {arg}'")
+    ev = {"pre": "PreToolUse", "post": "PostToolUse"}[arg]
+    cmd = rb.settings_hooks(sys.executable, str(script))[ev][0]["hooks"][0]["command"]
     base = {k: v for k, v in os.environ.items() if k != rb.STATE_ENV}
     return subprocess.run(cmd, shell=True, input=stdin_text, capture_output=True, text=True,
                           env={**base, **extra_env}, timeout=30)
@@ -284,7 +287,14 @@ def _run_hook(script, arg, stdin_text, extra_env):
 
 def test_the_hook_command_fails_open_when_the_script_is_missing(tmp_path):
     got = _run_hook(tmp_path / "gone" / "read_budget.py", "pre", "{}", {})
-    assert got.returncode == 0 and got.stdout == ""
+    assert got.returncode != 2 and got.stdout == ""
+
+
+def test_the_hook_command_turns_a_script_exit_2_into_1(tmp_path):
+    s = tmp_path / "two.py"
+    s.write_text("import sys; sys.exit(2)\n")
+    got = _run_hook(s, "pre", "{}", {})
+    assert got.returncode == 1 and got.stdout == ""
 
 
 def test_the_hook_command_runs_the_real_script_to_the_same_output_as_main(tmp_path, env):

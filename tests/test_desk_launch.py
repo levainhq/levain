@@ -1449,10 +1449,10 @@ def test_a_launched_seat_settings_carry_the_read_budget_hooks_with_absolute_path
         assert entry["hooks"][0]["timeout"] == 10
         outer = shlex.split(entry["hooks"][0]["command"])
         assert outer[:2] == ["/bin/sh", "-c"] and len(outer) == 3
-        inner = shlex.split(outer[2].replace(";", " ;"))     # [ -r S ] || exit 0 ; exec PY -I S arg
-        assert inner[:2] == ["[", "-r"] and inner[3:8] == ["]", "||", "exit", "0", ";"] and inner[8] == "exec"
-        script, py = inner[2], inner[9]
-        assert os.path.isabs(py) and inner[10] == "-I" and inner[11] == script and inner[12] == arg
+        inner = shlex.split(outer[2].replace(";", " ;"))     # PY -I S arg ; c=$? ; [ "$c" -eq 2 ] && exit 1 ; exit "$c"
+        py, script = inner[0], inner[2]
+        assert os.path.isabs(py) and inner[1] == "-I" and inner[3] == arg and inner[4] == ";"
+        assert inner[5:] == ["c=$?", ";", "[", "$c", "-eq", "2", "]", "&&", "exit", "1", ";", "exit", "$c"]
         assert os.path.isabs(script) and Path(script).name.startswith("read_budget-") and Path(script).is_file()
 
 
@@ -1468,6 +1468,24 @@ def test_user_scope_on_gets_no_read_budget_hook_and_no_env(qdir, workdir, fake, 
     s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
     argv, call = _budget_launch(s, fake, qdir)
     assert "--settings" not in argv and call["budget_dir"] is None and not (qdir / "read_budget").exists()
+
+
+def test_user_scope_launch_strips_a_leaked_budget_env_from_the_parent(qdir, workdir, fake, live_hook, monkeypatch):
+    monkeypatch.setenv("LEVAIN_READ_BUDGET_DIR", "/leaked/state")
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    _argv, call = _budget_launch(s, fake, qdir)
+    assert call["budget_dir"] is None
+
+
+def test_install_tightens_looser_existing_directories(tmp_path):
+    from levain.desk import read_budget_install
+    base = tmp_path / "read_budget"
+    (base / "state").mkdir(parents=True)
+    os.chmod(base, 0o755)
+    os.chmod(base / "state", 0o755)
+    read_budget_install.install(tmp_path)
+    assert (base.stat().st_mode & 0o777) == 0o700 and ((base / "state").stat().st_mode & 0o777) == 0o700
 
 
 def test_the_installed_budget_script_is_the_package_file_byte_for_byte_and_stdlib_only(tmp_path):

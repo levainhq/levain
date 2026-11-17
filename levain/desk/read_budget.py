@@ -391,15 +391,17 @@ def decide_post(event: Any, environ: Mapping[str, str]) -> str | None:
 def settings_hooks(python: str, script: str) -> dict[str, Any]:
     """The ``hooks`` object for a seat's settings: PreToolUse and PostToolUse on :data:`HOOK_MATCHER`.
 
-    The command is fail-open: ``/bin/sh -c '[ -r SCRIPT ] || exit 0; exec PYTHON -I SCRIPT pre|post'``. A missing or
-    unreadable script would otherwise make ``python -I`` exit 2, which the harness treats as a BLOCKING hook error
-    (every Read refused); with the test it exits 0. A missing python (127) or a crash (1) is non-blocking already."""
+    The command is fail-open: ``/bin/sh -c 'PYTHON -I SCRIPT pre|post; c=$?; [ "$c" -eq 2 ] && exit 1; exit "$c"'``.
+    Exit 2 is a BLOCKING hook error (every Read refused) and is what ``python -I`` returns when the script is missing or
+    unreadable, whenever that happens (no test-then-exec window); it becomes 1, which does not block. :func:`main`
+    never returns 2, so the script's own result and stdout pass through unchanged. A missing python (127) and a crash
+    (1) are non-blocking already."""
     if not os.path.isabs(python) or not os.path.isabs(script):
         raise ValueError("the hook's python and script must be absolute paths")
     py, sc = shlex.quote(python), shlex.quote(script)
 
     def command(arg: str) -> str:
-        return "/bin/sh -c " + shlex.quote(f"[ -r {sc} ] || exit 0; exec {py} -I {sc} {arg}")
+        return "/bin/sh -c " + shlex.quote(f'{py} -I {sc} {arg}; c=$?; [ "$c" -eq 2 ] && exit 1; exit "$c"')
 
     return {ev: [{"matcher": HOOK_MATCHER,
                   "hooks": [{"type": "command", "command": command(arg), "timeout": HOOK_TIMEOUT_S}]}]
