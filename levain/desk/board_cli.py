@@ -114,8 +114,8 @@ def register(subparsers: Any) -> None:
     p.set_defaults(func=run_state)
 
     def source_args(parser: Any) -> None:
-        parser.add_argument("--source", default=None, metavar="NP-ID",
-                            help=("Relay a band answer: the record is grade relayed (author kind agent), cites the row, and its words "
+        parser.add_argument("--source", default=None, metavar="Q-ID|NP-ID",
+                            help=("Relay a band answer (a native q-<hex> question id, or flow's np-xxxxxxxx): the record is grade relayed (author kind agent), cites the row, and its words "
                                   "must be a verbatim excerpt of the answer. Refused for an unknown or unanswered row."))
         parser.add_argument("--band-dir", dest="band_dir", default=None, metavar="DIR",
                             help="The band store --source reads (default: this install's consent directory).")
