@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from levain.desk import work_attach
 
@@ -523,10 +523,13 @@ def _require_pointered(target: Target) -> None:
         raise BoardError(NO_STORE)
 
 
-def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *, filename: str = ITEMS_NAME) -> tuple[dict, bool]:
-    """Under the exclusive lock, hand ``build(records)`` the records of ``<store dir>/<filename>``; it returns ``(record,
-    write)`` and may raise BoardError. When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read
-    in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it
+def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filename: str = ITEMS_NAME,
+            parse: Callable[[bytes], Any] = _records_from) -> tuple[dict, bool]:
+    """Under the exclusive lock, hand ``build(parse(raw))`` the parsed bytes of ``<store dir>/<filename>`` (``parse`` is the
+    per-file record reader: ``_records_from`` for the items file, the registry's reader for ``repos.jsonl``; it may raise
+    BoardError); ``build`` returns ``(record, write)`` and may raise BoardError. A file that ends in an unterminated line (only
+    a ``parse`` that accepts one gets this far: an ``ack-torn`` is written after it) gets a newline first.
+    When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read in this same locked read) and is appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it
     was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
     before the write the held fd's size is compared with the size of the bytes the record was built from: a lock-free writer
     that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
@@ -543,20 +546,20 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *,
                 raw = _read_fd(fd)
                 if not _same_file(fd, path):
                     continue                    # replaced before anything was written (a git operation): open, read and build again
-                recs = _records_from(raw)
-                rec, write = build(recs)
+                rec, write = build(parse(raw))
                 if not write:
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
                 if os.fstat(fd).st_size != len(raw):
                     continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                _write_all(fd, canonical_bytes(rec) + b"\n")
+                label = rec.get("id") or rec.get("repo") or rec.get("op")        # a registry record has no id
+                _write_all(fd, (b"\n" if raw and not raw.endswith(b"\n") else b"") + canonical_bytes(rec) + b"\n")
                 if not _same_file(fd, path):
-                    raise BoardError(f"{path} was replaced while {rec['id']} was being written (a git operation?): the record may or may not be "
+                    raise BoardError(f"{path} was replaced while {label} was being written (a git operation?): the record may or may not be "
                                      f"in the new file; run \"levain board state\" and check before retrying (an add with --key is safe to retry)")
                 if empty:
-                    _fsync_dir_or_warn(target.store_dir, rec["id"])
+                    _fsync_dir_or_warn(target.store_dir, label)
                 return rec, True
             finally:
                 os.close(fd)

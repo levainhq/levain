@@ -90,8 +90,9 @@ class _Soft(Exception):
     """A well-formed record the state does not allow."""
 
 
-def line_sha256(line: str) -> str:
-    return hashlib.sha256(line.encode("utf-8")).hexdigest()
+def line_sha256(line: str | bytes) -> str:
+    """sha256 of a line: a ``bytes`` line is hashed as it is on disk, a ``str`` line as its UTF-8."""
+    return hashlib.sha256(line if isinstance(line, bytes) else line.encode("utf-8")).hexdigest()
 
 
 def _str(rec: Mapping[str, Any], key: str, *, empty_ok: bool = False) -> str:
@@ -116,15 +117,17 @@ def _retire(value: Any) -> tuple[Mapping[str, str], ...]:
         if not isinstance(e, dict) or set(e) != {"repo", "path"} or not isinstance(e["repo"], str) \
                 or not _REPO_RE.fullmatch(e["repo"]) or not isinstance(e["path"], str) or not e["path"].strip():
             raise _Bad("a retire entry is exactly {repo, path}")
+        if e["path"].startswith("/") or ".." in e["path"].split("/"):
+            raise _Bad("a retire path is relative to its repo's root (no leading / and no ..)")
         out.append({"repo": e["repo"], "path": e["path"]})
     return tuple(out)
 
 
 def _manifest(value: Any) -> dict:
-    if not isinstance(value, dict):
-        raise _Bad("manifest must be an object")
     """``plan_items`` are the KEYS ``k`` of X's own items (each is added as ``M:<k>``; the ids exist only after the add, so the
     manifest cannot name them); ``contract_items`` are the repos that get a stubs item; ``retire`` and ``record_dir`` are optional."""
+    if not isinstance(value, dict):
+        raise _Bad("manifest must be an object")
     plan, contract = value.get("plan_items"), value.get("contract_items")
     if not isinstance(plan, list) or len(set(plan)) != len(plan) or not all(isinstance(k, str) and k and not re.search(r"\s", k) for k in plan):
         raise _Bad("manifest plan_items must be a list of distinct item keys (no whitespace)")
@@ -251,11 +254,23 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     lines = list(lines)
     acks: dict[int, str] = {}
     parsed: list[Any] = []
+    texts: list[str | None] = []                 # None: the line is not text (bytes that are not UTF-8, or not a str at all)
+    shas: list[str] = []                         # of the line's RAW bytes: a bytes line is hashed as given, never as decoded text
     for n, raw in enumerate(lines, 1):
         rec: Any = _NOT_JSON
-        if isinstance(raw, str):
+        text: str | None = None
+        if isinstance(raw, bytes):
             try:
-                rec = json.loads(raw)
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+        elif isinstance(raw, str):
+            text = raw
+        texts.append(text)
+        shas.append(line_sha256(raw) if isinstance(raw, (str, bytes)) else "")
+        if text is not None:
+            try:
+                rec = json.loads(text)
             except (ValueError, RecursionError):
                 rec = _NOT_JSON
         parsed.append(rec)
@@ -273,9 +288,9 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     last = len(lines)
     for n, raw in enumerate(lines, 1):
         try:
-            if not isinstance(raw, str):
-                raise _Bad(f"not text ({type(raw).__name__})")
-            if not raw.strip():
+            if texts[n - 1] is None:
+                raise _Bad("not valid UTF-8" if isinstance(raw, bytes) else f"not text ({type(raw).__name__})")
+            if not texts[n - 1].strip():
                 continue
             rec = parsed[n - 1]
             if unterminated_tail and n == last:
@@ -292,7 +307,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
         except _Soft as e:
             problems.append(f"line {n}: {e}")
         except _Bad as e:
-            sha = line_sha256(raw) if isinstance(raw, str) else ""
+            sha = shas[n - 1]
             torn_lines.append((n, sha))
             if n in acks and acks[n] == sha:
                 acked.append(n)                 # skipped exactly; listed in ``acked``, not a problem

@@ -9,9 +9,12 @@ module is the verbs, one module, every write under :func:`levain.desk.board_stor
 
 A record is built by the item store's single builder (:func:`levain.desk.board_store.build_record`: author, grade, the key
 checks) with the repo name riding in its id slot, then reshaped to 4.2's key order (``v``, ``store``, ``op``, ``repo``, ``at``,
-``by``, ``words``, ...). :func:`_reg_append` is the registry's twin of ``board_store._append`` and not a call to it, because
-that function reads every line as an ITEM (a valid ``<repo>#<n>`` id, a clean file) and a registry record has none; it
-uses the same lock, inode re-check, ``_write_all``, ``chain_prev`` and ``prev`` stamp.
+``by``, ``words``, ...). There is ONE write path: ``board_store._append`` (the same lock, before-write rebuild, size re-check,
+``prev`` stamp and after-write refusal as an item). Every registry verb calls it through :func:`_reg_write` with
+``filename="repos.jsonl"`` and ``parse=`` the registry's reader (:func:`_reg_parser`), which folds ``repos.jsonl`` instead of
+reading item records.
+
+A store with no ``repos.jsonl`` has an INACTIVE registry (I1 off, the launch hook silent); the file's existence activates it.
 
 Item facts the verbs need (the keys ``M:<k>``, whether an item reads ``cut``) are read straight from the item records' own
 fields, never derived, so this module needs no evidence. The one exception is ``untrack``, which asks the board's derive.
@@ -97,7 +100,11 @@ class View:
     fold: rf.RepoFold
     store_id: str
     raw: bytes
-    lines: tuple[str, ...]
+    lines: tuple[bytes, ...]
+    active: bool = True                      # False: the store has no repos.jsonl (no registry yet)
+
+
+NO_REGISTRY = "no registry yet (levain board use --import-focus, or register a repo)"
 
 
 def _store_id(store_dir: Path) -> str:
@@ -110,30 +117,24 @@ def _store_id(store_dir: Path) -> str:
     return sid
 
 
-def _split(raw: bytes) -> tuple[list[str], bool]:
-    """The lines of ``raw`` split on ``\\n`` only, and whether the last one has no newline."""
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("utf-8", "replace")                  # the replacement char makes the line torn (not JSON) or changes its hash: both visible
-    parts = text.split("\n")
-    tail = parts[-1] != ""
+def _split(raw: bytes) -> tuple[list[bytes], bool]:
+    """The lines of ``raw`` (as BYTES, as written) split on ``\\n`` only, and whether the last one has no newline. The fold
+    decodes each line strictly and hashes its raw bytes (a torn line that is not UTF-8 can be acknowledged, W5)."""
+    parts = raw.split(b"\n")
+    tail = parts[-1] != b""
     if not tail:
         parts.pop()
     return parts, tail
 
 
 def _load(store_dir: Path, *, flock: bool = True) -> View:
-    """The registry as it is on disk. The caller holds ``store.lock``. A missing file with a store that holds items reads as
-    unreadable, never empty; a missing file in a store with none is an empty registry."""
+    """The registry as it is on disk. The caller holds ``store.lock``. A store with no ``repos.jsonl`` has an INACTIVE registry
+    (``active`` False, no repos): it is the file's existence that activates it. "Unreadable" is for a file that exists and cannot
+    be read."""
     sid = _store_id(store_dir)
     path = store_dir / REPOS_NAME
     if not path.exists():
-        items = store_dir / bs.ITEMS_NAME
-        if items.exists() and items.stat().st_size > 0:
-            raise BoardError(f"the registry is unreadable: {REPOS_NAME} is missing from a store that holds items "
-                             f"(register a repo to start it, or restore the file)")
-        return View(rf.fold_repos([], store_id=sid), sid, b"", ())
+        return View(rf.fold_repos([], store_id=sid), sid, b"", (), False)
     op = fcntl.LOCK_SH if flock else None
     raw = bs._read_stable(path, op)
     lines, tail = _split(raw)
@@ -143,11 +144,14 @@ def _load(store_dir: Path, *, flock: bool = True) -> View:
     return View(rf.fold_repos(lines, store_id=sid, unterminated_tail=tail), sid, raw, tuple(lines))
 
 
-def read_registry(target: bs.Target) -> View:
-    """The registry under the shared lock. Refuses with no pointer (the registry is not active) and on a torn file."""
+def read_registry(target: bs.Target, *, allow_inactive: bool = False) -> View:
+    """The registry under the shared lock. Refuses with no pointer, on a torn file and (unless ``allow_inactive``) on a store
+    with no ``repos.jsonl`` yet."""
     bs._require_pointered(target)
     with bs.store_lock(target.store_dir, exclusive=False):
         view = _load(target.store_dir)
+    if not view.active and not allow_inactive:
+        raise BoardError(NO_REGISTRY)
     if view.fold.torn:
         raise BoardError(_torn_text(view))
     return view
@@ -210,41 +214,33 @@ def _record(op: str, repo: str | None, by: str, store_id: str, body: Mapping[str
     return out
 
 
-def _reg_append(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tuple[dict | None, bool]], *,
-                filename: str = REPOS_NAME, allow_torn: bool = False) -> tuple[dict | None, bool]:
-    """Under the exclusive lock, hand ``build(fold, store_id, raw)`` the registry read in this same locked read; it returns
-    ``(record, write)`` and may raise BoardError. A written record gets ``prev`` (chain_prev of the bytes just read), is
-    appended as one line, and fsynced. The same replaced-file and exact-bytes retry rules as the item store's ``_append``."""
+def _reg_parser(store_dir: Path, *, allow_torn: bool = False, items: bool = False) -> Callable[[bytes], View]:
+    """The ``parse=`` of ``board_store._append`` for a registry write: the file's bytes as a :class:`View` (the fold, the
+    store id, the raw bytes). A torn registry refuses unless ``allow_torn`` (an ``ack-torn`` is how it is repaired). With
+    ``items`` the file is ``items.jsonl`` (an ``ack-torn`` for it): the fold is empty and only the raw bytes are meant."""
+    def parse(raw: bytes) -> View:
+        sid = _store_id(store_dir)
+        lines, tail = _split(raw)
+        if items:
+            return View(rf.fold_repos([], store_id=sid), sid, raw, tuple(lines))
+        folded = rf.fold_repos(lines, store_id=sid, unterminated_tail=tail)
+        view = View(folded, sid, raw, tuple(lines))
+        if folded.torn and not allow_torn:
+            raise BoardError(_torn_text(view))
+        return view
+    return parse
+
+
+def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tuple[dict | None, bool]], *,
+               filename: str = REPOS_NAME, allow_torn: bool = False, creates: bool = False) -> tuple[dict | None, bool]:
+    """Every registry write: ``board_store._append`` (the one write path) with the registry's reader. ``build(fold, store_id,
+    raw)`` returns ``(record, write)``. Only ``creates`` (``register``, ``use --import-focus``) may start the file: any other
+    verb on a store with no ``repos.jsonl`` refuses before ``_append`` opens (and so creates) it."""
     bs._require_pointered(target)
-    path = target.store_dir / filename
-    with bs.store_lock(target.store_dir, exclusive=True) as held:
-        sid = _store_id(target.store_dir)
-        line = None
-        rec: dict | None = None
-        for _ in range(bs.OPEN_RETRIES):
-            fd = held.open(filename, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
-            try:
-                empty = os.fstat(fd).st_size == 0
-                raw = bs._read_fd(fd)
-                if line is not None and line in raw.split(b"\n"):
-                    return rec, True
-                lines, tail = _split(raw)
-                folded = rf.fold_repos(lines, store_id=sid, unterminated_tail=tail)
-                if folded.torn and not allow_torn:
-                    view = View(folded, sid, raw, tuple(lines))
-                    raise BoardError(_torn_text(view))
-                rec, write = build(folded, sid, raw)
-                if write and rec is not None:
-                    rec = bs._with_prev(rec, bs.chain_prev(raw))
-                    line = bs.canonical_bytes(rec)
-                    bs._write_all(fd, (b"\n" if raw and not raw.endswith(b"\n") else b"") + line + b"\n")
-                if bs._same_file(fd, path):
-                    if write and empty:
-                        bs._fsync_dir_or_warn(target.store_dir, filename)
-                    return rec, bool(write)
-            finally:
-                os.close(fd)
-        raise BoardError(f"{path} was replaced while a write was in flight (a git operation?) {bs.OPEN_RETRIES} times; nothing was kept, retry")
+    if not creates and not (target.store_dir / filename).exists():
+        raise BoardError(NO_REGISTRY if filename == REPOS_NAME else f"{filename} does not exist: nothing to acknowledge")
+    parse = _reg_parser(target.store_dir, allow_torn=allow_torn, items=filename != REPOS_NAME)
+    return bs._append(target, lambda view: build(view.fold, view.store_id, view.raw), filename=filename, parse=parse)
 
 
 def _name(value: Any) -> str:
@@ -282,7 +278,7 @@ def register(target: bs.Target, name: str, path: str, words: str, by: str, *, au
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("register", name, by, sid, {"words": words, **ident}, author, now), True
 
-    rec, written = _reg_append(target, build)
+    rec, written = _reg_write(target, build, creates=True)
     return _fold_one(target, name), written
 
 
@@ -292,22 +288,23 @@ def _fold_one(target: bs.Target, name: str) -> rf.Repo | None:
 
 def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
          now: str | None = None) -> tuple[rf.Repo | None, bool]:
-    """Re-base a registered repo onto ``path``. The new path must hold the same repository (the same root commits)."""
+    """Re-base a registered repo onto ``path``. The new path must hold the same repository (the same root commits). The same
+    path with a different origin (a renamed remote) records the new origin; only a fully identical move is a no-op."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     ident = identity(path)
 
     def build(fold, sid, raw):
         cur = _need_repo(fold, name)
-        if cur.path == ident["path"]:
-            return None, False
         if tuple(ident["root"]) != cur.root:
             raise BoardError(f"{ident['path']} is not the repository {name} is registered as (its root commits differ)")
+        if cur.path == ident["path"] and ident["origin"] == cur.origin:
+            return None, False                      # fully identical; the same path with another origin records the new origin (W9)
         other = next((r.name for r in fold.repos.values() if r.path == ident["path"] and r.name != name), None)
         if other is not None:
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("move", name, by, sid, {"words": words, **ident}, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -321,7 +318,7 @@ def _set_attention(op: str, target: bs.Target, name: str, words: str, by: str, a
             return None, False
         return _record(op, name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -344,6 +341,19 @@ def _blob(path: str, ref: str = CHARTER_REF) -> str:
 
 def _derive_migration(name: str, manifest_sha: str, words: str, begins: int) -> str:
     return "m" + hashlib.sha256(f"{name}\0{manifest_sha}\0{words}\0{begins}".encode()).hexdigest()[:10]
+
+
+def _used_migrations(raw: bytes) -> set[str]:
+    """Every migration id a ``begin-track`` record of this registry file carries (any repo)."""
+    out = set()
+    for line in raw.split(b"\n"):
+        try:
+            r = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(r, dict) and r.get("op") == "begin-track" and isinstance(r.get("migration"), str):
+            out.add(r["migration"])
+    return out
 
 
 def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: str, by: str, *, author: Mapping[str, Any],
@@ -384,12 +394,15 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
             raise BoardError(f"{name} is already tracking (migration {cur.migration}): finish it with `track` or `abandon-track`")
         if cur.mode != "untracked":
             raise BoardError(f"{name} is {cur.mode}, not untracked: begin-track needs an untracked repo")
+        if migration is not None and migration in _used_migrations(raw):
+            raise BoardError(f"migration id {migration!r} was already used by a begin-track in this registry: each ceremony has its own M "
+                             f"(leave --migration off to derive a new one)")
         m = migration or _derive_migration(name, sha, words, cur.begins)
         body = {"words": words, "migration": m, "manifest": manifest, "manifest_sha256": sha, "owner": owner,
                 "charter_before": before}
         return _record("begin-track", name, by, sid, body, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -417,6 +430,27 @@ def _charter_state(path: str, name: str, items: Mapping | None) -> tuple[str | N
     return text, "", problems, warnings
 
 
+def _charter_by_blob(path: str, name: str, items: Mapping | None) -> tuple[str | None, str | None, str, list]:
+    """``(text, blob, why, problems)`` of CHARTER.md on origin/main, the blob sha read ONCE and the text read BY that sha
+    (``git cat-file blob <sha>``), so the blob a ``track`` records is the very one whose text passed the check (W2)."""
+    from levain.desk import charter
+    from levain.desk.board_evidence import _env
+    rc, blob = _git(path, "rev-parse", "--verify", "--quiet", f"{CHARTER_REF}:CHARTER.md")
+    if rc != 0 or not blob:
+        return None, None, "absent", []
+    try:
+        cp = subprocess.run(["git", "-C", str(path), "cat-file", "blob", blob], capture_output=True, timeout=GIT_TIMEOUT, env=_env())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, None, f"unreadable (git: {type(exc).__name__})", []
+    if cp.returncode != 0 or len(cp.stdout) > charter.MAX_BYTES:
+        return None, None, "unreadable (the blob cannot be read or is too large)", []
+    text, why = charter._decode(cp.stdout)
+    if text is None:
+        return None, None, why, []
+    problems, _ = charter.check_text(text, repo_name=name, items=items)
+    return text, blob, "", problems
+
+
 def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any], migration: str | None = None,
           now: str | None = None) -> tuple[rf.Repo | None, bool]:
     """The one switchover record (design 5(d)). Refuses unless X is ``tracking``, its charter passes ``charter check`` on
@@ -438,16 +472,13 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
     items, note = charter._store(target.items_path)
     if items is None:
         raise BoardError(f"the items store {note}: cannot check the charter's Plan against it")
-    text, why, problems, _ = _charter_state(cur.path, name, items)
+    text, blob, why, problems = _charter_by_blob(cur.path, name, items)
     if text is None:
         raise BoardError(f"{name} has no readable CHARTER.md on origin/main ({why}): land one, then track")
     if problems:
         first = problems[0]
         raise BoardError(f"{name}'s CHARTER.md on origin/main is not valid ({len(problems)} problems; first: line {first.line}: "
                          f"{first.text}); run `levain charter check --repo {cur.path}`")
-    rc, blob = _git(cur.path, "rev-parse", f"{CHARTER_REF}:CHARTER.md")
-    if rc != 0 or not blob:
-        raise BoardError(f"{name}'s CHARTER.md blob on origin/main cannot be read")
     plan = set(_plan_ids(text))
     manifest = cur.manifest or {}
 
@@ -480,7 +511,7 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
         body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
         return _record("track", name, by, sid, body, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -492,7 +523,7 @@ def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
         except ValueError:
             continue
         if isinstance(rec, dict) and rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
-            return hashlib.sha256(line.encode("utf-8")).hexdigest()
+            return hashlib.sha256(line).hexdigest()
     return None
 
 
@@ -516,7 +547,7 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
             raise BoardError(f"{name} changed under the abandon ({c.mode}); run it again")
         return _record("abandon-track", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
 
-    _reg_append(target, build)
+    _reg_write(target, build)
     view = read_registry(target)
     m = cur.migration or ""
     cause = _abandon_record_hash(view, name, m)
@@ -578,7 +609,7 @@ def abandon_done(target: bs.Target, name: str, words: str, by: str, *, author: M
             raise BoardError(f"{name} changed under the abandon-done ({c.mode}); run it again")
         return _record("abandon-done", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -625,7 +656,7 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
             raise BoardError(f"{name} is {c.mode}, not tracked")
         return _record("untrack", name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_append(target, build)
+    _, written = _reg_write(target, build)
     return _fold_one(target, name), written
 
 
@@ -672,9 +703,9 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
         return rec, True
 
     if file == REPOS_NAME:
-        _, written = _reg_append(target, build, allow_torn=True)
+        _, written = _reg_write(target, build, allow_torn=True)
     else:
-        _, written = _reg_append(target, build, filename=bs.ITEMS_NAME, allow_torn=True)
+        _, written = _reg_write(target, build, filename=bs.ITEMS_NAME, allow_torn=True)
     return written
 
 
@@ -690,6 +721,8 @@ def check_add(store_dir: Path, repo: str, key: str | None) -> None:
         raise BoardError(f"the registry cannot be read, so no item can be added: {exc}") from None
     if view.fold.torn:
         raise BoardError(f"no item can be added: {_torn_text(view)}")
+    if not view.active:
+        return                                           # no repos.jsonl: the registry is not active, I1 is off (W6)
     cur = view.fold.repos.get(repo)
     if cur is None:
         raise BoardError(f"{repo} is not registered: `levain board register {repo} --path <dir> --words \"...\"`, then track it")
@@ -698,6 +731,9 @@ def check_add(store_dir: Path, repo: str, key: str | None) -> None:
     if cur.mode == "tracking":
         if not (isinstance(key, str) and key.startswith((cur.migration or "") + ":")):
             raise BoardError(f"{repo} is tracking (migration {cur.migration}): an add for it must carry --key {cur.migration}:<k>")
+        if key.startswith(f"{cur.migration}:stubs:"):
+            raise BoardError(f"{repo} is tracking: no stub item is ever on the board while {repo}'s old files are still its source of "
+                             f"truth (design 5 (e)); add the {key!r} item only after `levain board track {repo}`")
         return
     raise BoardError(f"{repo} is {cur.mode}: the board holds items only for a tracking or tracked repo")
 
@@ -715,7 +751,9 @@ def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] 
         return False
     ident = identity(top)
     target = bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True)
-    view = read_registry(target)
+    view = read_registry(target, allow_inactive=True)
+    if not view.active:
+        return False                                    # no repos.jsonl: the registry is not active, the launch is as before (W6)
     for r in view.fold.repos.values():                  # a worktree of a known repo is that repo
         if r.path == ident["path"] or (tuple(ident["root"]) == r.root and ident["origin"] == r.origin):
             return False
@@ -803,15 +841,15 @@ def stale_audit(view_fold: rf.RepoFold, now: datetime) -> list[str]:
 
 
 def audit_for_state(target: bs.Target, now: datetime) -> list[str]:
-    """The registry's audit lines for ``board state`` (the 72-hour rule, and a torn registry). A registry that is absent or
-    not active adds nothing here: ``levain board repos`` is what names that."""
+    """The registry's audit lines for ``board state`` (the 72-hour rule, a torn registry, and a registry that cannot be read at
+    all: one ``registry: unreadable: <why>`` line). A store with no pointer, or no ``repos.jsonl`` yet, adds nothing."""
     if not target.pointered:
         return []
     try:
         with bs.store_lock(target.store_dir, exclusive=False):
             view = _load(target.store_dir)
-    except BoardError:
-        return []
+    except BoardError as exc:                    # never swallowed (W8): a registry that cannot be judged is an audit entry
+        return [f"registry: unreadable: {exc}"]
     out = [f"registry: {_torn_text(view)}"] if view.fold.torn else []
     return out + stale_audit(view.fold, now)
 
@@ -827,6 +865,8 @@ def report(target: bs.Target, now: datetime | None = None, *, check_paths: bool 
     problems = list(view.fold.problems)
     if view.fold.torn:
         raise BoardError(_torn_text(view))
+    if not view.active:
+        return {"store": view.store_id, "active": False, "repos": [], "problems": [], "audit": []}
     entries = []
     for r in sorted(view.fold.repos.values(), key=lambda r: r.name):
         d = r.to_dict()
@@ -851,10 +891,12 @@ def report(target: bs.Target, now: datetime | None = None, *, check_paths: bool 
         if r.mode == "tracked":
             d["problems"] += _stale_stubs(view, r)
         entries.append(d)
-    return {"store": view.store_id, "repos": entries, "problems": problems, "audit": stale_audit(view.fold, now)}
+    return {"store": view.store_id, "active": True, "repos": entries, "problems": problems, "audit": stale_audit(view.fold, now)}
 
 
 def format_report(doc: Mapping[str, Any]) -> list[str]:
+    if not doc.get("active", True):
+        return [NO_REGISTRY]
     out = [f"registry of store {doc['store']}: {len(doc['repos'])} repos, {len(doc['audit'])} audit entries"]
     for d in doc["repos"]:
         head = f"  {d['name']}: {d['mode']}"
@@ -873,6 +915,13 @@ def format_report(doc: Mapping[str, Any]) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------------- use --import-focus
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, author: Mapping[str, Any],
@@ -895,6 +944,9 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
     if "moved_to" in doc:
         if doc["moved_to"] != moved_to:
             raise BoardError(f"{focus} is a tombstone for {doc['moved_to']}, not this store ({moved_to})")
+        if not store_dir.is_dir() or not (store_dir / bs.STORE_ID_NAME).exists() or not (store_dir / REPOS_NAME).exists():
+            raise BoardError(f"{focus} is a tombstone for {moved_to}, but {store_dir} holds no store ({bs.STORE_ID_NAME} or {REPOS_NAME} "
+                             f"missing): the imported registry is gone; restore the store (only a first-time use creates one)")
         dest, changed = bs.use(store_dir, environ)
         return dest, changed, "already imported; pointer written"
     base = Path(briefcase).expanduser() if briefcase else focus.resolve().parent.parent.parent
@@ -906,6 +958,8 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
         if not bs.REPO_RE.fullmatch(name):
             raise BoardError(f"--import-focus: entry {key!r} is not a registry name")
         entries.append((name, str(base / key), ent["state"], ent["words"]))
+    if not entries:
+        raise BoardError(f"--import-focus {focus} holds no entries: nothing to import (use `levain board use DIR` without --import-focus)")
     if len({n for n, *_ in entries}) != len(entries):
         raise BoardError("--import-focus: two entries lower-case to the same name")
     refused = []
@@ -942,11 +996,12 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
             raise BoardError(f"{focus} changed while it was imported; nothing replaced it (run again)")
         os.replace(tmp, focus)
     except OSError as exc:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        _unlink_quietly(tmp)
         raise BoardError(f"cannot write the tombstone over {focus}: {exc}") from None
+    except BoardError:
+        _unlink_quietly(tmp)                    # the second bytes check refused: no stray tmp file is left in flow's state dir
+        raise
+    bs._fsync_dir_or_warn(focus.parent, f"the tombstone {focus.name}")      # durable BEFORE the pointer (W3); a failure after the replace is a warning
     dest, changed = bs.use(store_dir, environ)
     return dest, changed, f"imported {len(entries)} repos; {focus} is now a tombstone"
 

@@ -95,10 +95,18 @@ def ok(capsys, *argv):
 
 
 @pytest.fixture
-def store(home, tmp_path, capsys):
+def bare_store(home, tmp_path, capsys):
+    """A pointered store with NO repos.jsonl: the registry is inactive (W6)."""
     d = tmp_path / "store"
     ok(capsys, "use", str(d))
     return Path(os.path.realpath(d))
+
+
+@pytest.fixture
+def store(bare_store):
+    """A pointered store whose registry is ACTIVE (an empty repos.jsonl exists)."""
+    (bare_store / "repos.jsonl").touch()
+    return bare_store
 
 
 def reg_lines(store):
@@ -352,15 +360,39 @@ def test_add_to_a_tracked_repo_needs_no_key_and_amend_and_decide_are_never_refus
     assert rc == 2 and "alpha is untracked" in err
 
 
-def test_an_unreadable_registry_refuses_add_and_a_store_with_no_items_reads_empty(store, tmp_path, mkrepo, capsys):
-    (store / "items.jsonl").write_text("")
-    assert not (store / "repos.jsonl").exists()
-    assert br.read_registry(bs.resolve_store(None)).fold.repos == {}
-    (store / "items.jsonl").write_text(json.dumps({"v": 1, "op": "add", "id": "x#1"}) + "\n")
-    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "t", "--origin", "d", *A)
-    assert rc == 2 and "registry cannot be read" in err and "missing from a store that holds items" in err
-    rc, _, err = run(capsys, "repos")
-    assert rc == 2 and "unreadable" in err
+def test_a_store_with_no_repos_file_has_an_inactive_registry_w6(bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    (bare_store / "items.jsonl").write_text(json.dumps({"v": 1, "op": "add", "id": "x#1"}) + "\n")      # a store that holds items
+    assert not (bare_store / "repos.jsonl").exists()
+    assert br.read_registry(bs.resolve_store(None), allow_inactive=True).active is False
+    assert ok(capsys, "repos") == "no registry yet (levain board use --import-focus, or register a repo)"
+    assert run(capsys, "repos", "--json")[0] == 0
+    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "t", "--origin", "d", *A)      # I1 is off
+    assert rc == 0, err
+    assert br.register_for_launch(a) is False and not (bare_store / "repos.jsonl").exists()      # the launch hook does nothing
+    rc, _, err = run(capsys, "pause", "alpha", "--words", "w", *A)                               # no verb but register starts the file
+    assert rc == 2 and "no registry yet" in err and not (bare_store / "repos.jsonl").exists()
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)                        # the file's existence activates it
+    assert (bare_store / "repos.jsonl").exists()
+    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "t2", "--origin", "d", *A)
+    assert rc == 2 and "alpha is untracked" in err
+
+
+def test_the_flow_live_store_copy_takes_an_add_and_a_launch_hook_call_w6(home, tmp_path, mkrepo, capsys):
+    live = Path("/Users/phillipclapham/Briefcase/flow/state/board/items.jsonl")
+    if not live.exists():
+        pytest.skip("flow's live items.jsonl is not on this machine")
+    copy = tmp_path / "flowcopy"
+    copy.mkdir()
+    shutil.copyfile(live, copy / "items.jsonl")                         # a scratch COPY; the source is only read
+    assert (copy / "items.jsonl").stat().st_size > 0
+    ok(capsys, "use", str(copy))
+    a = mkrepo("alpha")
+    rc, out, err = run(capsys, "add", "--repo", "alpha", "--title", "on a copy of flow's store", "--origin", "desk 1", *A)
+    assert rc == 0, err
+    assert br.register_for_launch(a) is False
+    assert not (copy / "repos.jsonl").exists()
+    assert run(capsys, "state")[0] in (0, 3)                            # the state read is not wedged either
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -966,3 +998,202 @@ def test_decide_takes_an_optional_cause_that_must_be_a_sha(store, tmp_path, mkre
         bs.decide(target, iid, "cut", "w", "d", author={"kind": "operator", "name": "d"}, cause="nothex")
     bs.decide(target, iid, "parked", "w", "d", author={"kind": "operator", "name": "d"})
     assert "cause" not in item_lines(store)[-1]
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# round 1 fixes (levain#93): R0 one write path, W1..W9
+
+
+def test_r0_there_is_one_write_path_and_every_registry_verb_goes_through_append(store, tmp_path, mkrepo, capsys, monkeypatch):
+    assert "_reg_append" not in Path(br.__file__).read_text("utf-8")
+    seen = []
+    real = bs._append
+
+    def spy(target, build, **kw):
+        seen.append((kw.get("filename", "items.jsonl"), kw.get("parse") is not None))
+        return real(target, build, **kw)
+
+    monkeypatch.setattr(bs, "_append", spy)
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    assert seen == [("repos.jsonl", True), ("repos.jsonl", True)]
+
+
+def test_r0_a_registry_write_replaced_after_the_write_refuses_and_appends_nothing_to_the_new_file(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    reg = store / "repos.jsonl"
+    old = reg.read_bytes()
+    real, calls = bs._write_all, {"n": 0}
+
+    def write_then_swap_back(fd, payload):
+        calls["n"] += 1
+        real(fd, payload)
+        reg.with_name("repos.old").write_bytes(old)
+        os.replace(reg.with_name("repos.old"), reg)          # a checkout restored the file without our line
+
+    monkeypatch.setattr(bs, "_write_all", write_then_swap_back)
+    rc, out, err = run(capsys, "pause", "alpha", "--words", "w", *A)
+    assert rc == 2 and calls["n"] == 1                       # no retry: one write, then a refusal
+    assert "was replaced while alpha was being written" in err and "may or may not be in the new file" in err
+    assert reg.read_bytes() == old
+
+
+def test_r0_an_ack_torn_after_an_unterminated_tail_goes_through_append_with_a_newline_first(store, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    with open(store / "repos.jsonl", "ab") as fh:
+        fh.write(b'{"v":1,"op":"paus')
+    ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "2", "--why", "crash", *A)
+    lines = (store / "repos.jsonl").read_bytes().split(b"\n")
+    assert json.loads(lines[2])["prev"] == hashlib.sha256(lines[1]).hexdigest()
+
+
+def test_w1_add_refuses_a_stubs_key_while_the_repo_is_tracking_design_5e(store, tmp_path, mkrepo, capsys):
+    """Design 5 (e): contract_items are added AFTER `track`, so "no stub item is ever on the board while X's old files are
+    still its source of truth"."""
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
+    before = (store / "items.jsonl").read_bytes()
+    for k in (f"{m}:stubs:alpha", f"{m}:stubs:flow"):
+        rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "s", "--origin", "d", "--key", k, "--payload-hash", HASH_A, *A)
+        assert rc == 2 and "no stub item is ever on the board" in err and "design 5 (e)" in err, k
+    assert (store / "items.jsonl").read_bytes() == before
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    ok(capsys, "add", "--repo", "alpha", "--title", "s", "--origin", "d", "--key", f"{m}:stubs:alpha", "--payload-hash", HASH_A, *A)
+
+
+def test_w2_track_records_the_blob_whose_text_passed_even_if_origin_main_moves_during_it(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
+    passed = git(a, "rev-parse", "origin/main:CHARTER.md")
+    real, moved = br._git, {"n": 0}
+
+    def git_then_move(path, *args):
+        out = real(path, *args)
+        if args and args[0] == "rev-parse" and args[-1].endswith(":CHARTER.md") and not moved["n"]:
+            moved["n"] += 1
+            land(a, "CHARTER.md", "# something else entirely\n")        # a fetch moves origin/main right after the blob sha was read
+        return out
+
+    monkeypatch.setattr(br, "_git", git_then_move)
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    assert moved["n"] == 1
+    assert reg_lines(store)[-1]["charter_blob"] == passed != git(a, "rev-parse", "origin/main:CHARTER.md")
+
+
+def test_w3_the_tombstones_directory_is_fsynced_before_the_pointer_and_a_failure_is_a_warning(home, tmp_path, mkrepo, capsys, monkeypatch):
+    mkrepo("alpha")
+    focus = focus_file(tmp_path, {"alpha": ("active", "wa")})
+    order = []
+    real_fsync_dir, real_use = bs._fsync_dir, bs.use
+
+    def failing_dir_fsync(path):
+        if Path(path) == focus.parent:
+            order.append("dir-fsync")
+            raise OSError("disk says no")
+        return real_fsync_dir(path)
+
+    def spy_use(directory, environ=None):
+        order.append("pointer")
+        return real_use(directory, environ)
+
+    monkeypatch.setattr(bs, "_fsync_dir", failing_dir_fsync)
+    monkeypatch.setattr(bs, "use", spy_use)
+    rc, out, err = run(capsys, "use", str(tmp_path / "store"), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    assert rc == 0, err
+    assert order == ["dir-fsync", "pointer"]
+    assert "could not be fsynced" in err and (home / "board" / "STORE").exists()
+
+
+def test_w4_a_tombstone_whose_store_is_gone_refuses_and_creates_nothing(home, tmp_path, mkrepo, capsys):
+    mkrepo("alpha")
+    focus = focus_file(tmp_path, {"alpha": ("active", "wa")})
+    argv = ("use", str(tmp_path / "store"), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    ok(capsys, *argv)
+    shutil.rmtree(tmp_path / "store")
+    (home / "board" / "STORE").unlink()
+    rc, _, err = run(capsys, *argv)
+    assert rc == 2 and "holds no store" in err and "first-time use" in err
+    assert not (tmp_path / "store").exists() and not (home / "board" / "STORE").exists()
+
+
+def test_w5_a_torn_line_that_is_not_utf8_can_be_acknowledged_by_its_raw_bytes(store, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    with open(store / "repos.jsonl", "ab") as fh:
+        fh.write(b'\xff\xfe not utf-8\n')
+    rc, _, err = run(capsys, "repos")
+    assert rc == 2 and "not valid UTF-8" in err
+    ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "2", "--why", "bad bytes", *A)
+    ack = json.loads((store / "repos.jsonl").read_bytes().split(b"\n")[2])
+    assert ack["sha256"] == hashlib.sha256(b'\xff\xfe not utf-8').hexdigest()
+    assert run(capsys, "repos")[0] == 0
+    assert ok(capsys, "pause", "alpha", "--words", "w", *A) == "paused alpha"
+
+
+def test_w7_an_explicit_migration_that_an_earlier_ceremony_used_refuses(store, tmp_path, mkrepo, capsys):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "register", "beta", "--path", str(b), "--words", "w", *A)
+    mf = str(manifest(tmp_path))
+    ok(capsys, "begin-track", "alpha", "--manifest", mf, "--words", "y", "--migration", "mfirst1", *A)
+    assert ok(capsys, "begin-track", "alpha", "--manifest", mf, "--words", "y", "--migration", "mfirst1", *A).startswith("already tracking")    # the retry
+    rc, _, err = run(capsys, "begin-track", "beta", "--manifest", mf, "--words", "y", "--migration", "mfirst1", *A)
+    assert rc == 2 and "already used" in err
+    ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    ok(capsys, "abandon-done", "alpha", *A)
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", mf, "--words", "again", "--migration", "mfirst1", *A)
+    assert rc == 2 and "already used" in err and len([r for r in reg_lines(store) if r["op"] == "begin-track"]) == 1
+    ok(capsys, "begin-track", "alpha", "--manifest", mf, "--words", "again", *A)                          # a derived id is new
+
+
+def test_w8_audit_for_state_names_a_registry_that_cannot_be_read_instead_of_swallowing_it(store, mkrepo, capsys):
+    target = bs.resolve_store(None)
+    now = datetime.now(timezone.utc)
+    assert br.audit_for_state(target, now) == []
+    (store / "store.id").unlink()
+    (entry,) = br.audit_for_state(target, now)
+    assert entry.startswith("registry: unreadable: ") and "store.id" in entry
+
+
+def test_w9_move_at_the_same_path_with_a_new_origin_records_it_and_only_an_identical_move_is_a_no_op(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    assert ok(capsys, "move", "alpha", "--path", str(a), "--words", "same", *A) == "already at that path alpha"
+    git(a, "remote", "set-url", "origin", str(tmp_path / "bare" / "renamed.git"))
+    rc, out, _ = run(capsys, "repos")
+    assert rc == 3 and "is not the registered repository" in out
+    assert ok(capsys, "move", "alpha", "--path", str(a), "--words", "remote renamed", *A) == "moved alpha"
+    r = reg_lines(store)[-1]
+    assert r["op"] == "move" and r["origin"].endswith("renamed.git") and r["path"] == os.path.realpath(a)
+    assert run(capsys, "repos")[0] == 0
+    assert ok(capsys, "move", "alpha", "--path", str(a), "--words", "again", *A) == "already at that path alpha"
+
+
+def test_n2_a_second_bytes_check_that_refuses_leaves_no_tmp_file_behind(home, tmp_path, mkrepo, capsys, monkeypatch):
+    mkrepo("alpha")
+    focus = focus_file(tmp_path, {"alpha": ("active", "wa")})
+    original = focus.read_text()
+    real = os.fsync
+
+    def fsync_then_edit(fd):
+        real(fd)
+        if list(focus.parent.glob(".focus.json.*")):                # the tombstone's tmp file exists: edit the focus file now
+            focus.write_text(original.replace("wa", "edited"))
+
+    monkeypatch.setattr(br.os, "fsync", fsync_then_edit)
+    rc, _, err = run(capsys, "use", str(tmp_path / "store"), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    monkeypatch.setattr(br.os, "fsync", real)
+    assert rc == 2 and "changed while it was imported" in err
+    assert list(focus.parent.glob(".focus.json.*")) == []
+
+
+def test_n10_a_retire_path_must_be_relative_to_its_repo(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    for bad in ("/etc/passwd", "../x/next.md", "a/../../b"):
+        rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, retire=[{"repo": "alpha", "path": bad}])),
+                         "--words", "y", *A)
+        assert rc == 2 and "relative to its repo's root" in err, bad
