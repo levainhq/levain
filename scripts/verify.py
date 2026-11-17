@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -48,6 +49,7 @@ import os
 import platform
 import plistlib
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -443,10 +445,34 @@ def _leader_exited(p: subprocess.Popen) -> bool:
     cannot be handed to anyone else, so a killpg of it still reaches only this child's own group."""
     if p.returncode is not None:
         return True
+    if hasattr(os, "waitid"):
+        try:
+            return os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            return True
+    return _exited_kqueue(p.pid)
+
+
+def _exited_kqueue(pid: int) -> bool:
+    """The macOS path (CPython leaves os.waitid out there): a one-shot kqueue NOTE_EXIT watch, polled without waiting.
+    kqueue never reaps.  On a child that is already a zombie the registration itself answers ESRCH, which is also
+    the answer for a pid that is gone, so both read as exited."""
     try:
-        return os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-    except ChildProcessError:
-        return True
+        kq = select.kqueue()
+        try:
+            ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                               fflags=select.KQ_NOTE_EXIT)
+            got = kq.control([ev], 1, 0)
+        finally:
+            kq.close()
+    except OSError as e:
+        return e.errno == errno.ESRCH
+    for g in got:
+        if g.flags & select.KQ_EV_ERROR:
+            return g.data == errno.ESRCH
+        if g.fflags & select.KQ_NOTE_EXIT:
+            return True
+    return False
 
 
 def _kill_group(p: subprocess.Popen, grace: float = 5.0) -> None:

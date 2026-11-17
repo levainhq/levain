@@ -152,8 +152,10 @@ def test_concurrent_writers_in_both_clones_converge(two):
     jobs = [(ana if i % 2 else ben, f"src/f{i}.py") for i in range(8)]
     with ThreadPoolExecutor(8) as ex:
         results = list(ex.map(lambda j: subprocess.run(
-            [PY, "-m", "levain", "team", "record", "finding", "--paths", j[1], "--summary", f"note {j[1]}",
-             "--repo", str(j[0])], capture_output=True, text=True, timeout=120), jobs))
+            [PY, "-P", "-m", "levain", "team", "record", "finding", "--paths", j[1], "--summary", f"note {j[1]}",
+             "--repo", str(j[0])], capture_output=True, text=True, timeout=120,
+            # the tree under test, as the hook children get it: not the cwd's or the editable install's levain
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [SRC, os.environ.get("PYTHONPATH")]))}), jobs))
     codes = [r.returncode for r in results]
     print([r.stderr for r in results if r.returncode])
     assert codes == [0] * 8

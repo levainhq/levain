@@ -25,8 +25,12 @@ needs_openssh = pytest.mark.skipif(ssh_agent.openssh_problem() is not None,
 
 @pytest.fixture
 def home(monkeypatch):
-    """A short LEVAIN_HOME (a socket path has ~100 bytes) under /tmp, 0700, and the real run_root."""
-    d = Path(tempfile.mkdtemp(prefix="lvh", dir="/tmp"))
+    """A short LEVAIN_HOME (a socket path has ~100 bytes) under the temp dir, 0700, and the real run_root.
+
+    Under ``tempfile.gettempdir()``, not a literal /tmp: the spawn keyguard admits an agent socket only beneath the
+    temp dir, and on macOS (``/var/folders/..``) a /tmp home is outside it, so every ssh-add was refused there."""
+    d = Path(tempfile.mkdtemp(prefix="lvh"))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)     # no test sees the operator's real agent socket
     monkeypatch.setenv("LEVAIN_HOME", str(d))
     monkeypatch.setattr(ssh_agent, "run_root", lambda: (Path(os.environ["LEVAIN_HOME"]) / "run").resolve())
     started: list[ssh_agent.ScopedAgent] = []

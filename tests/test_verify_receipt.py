@@ -450,6 +450,30 @@ def test_terminate_children_kills_the_whole_group(tmp_path):
         os.kill(gpid, 0)
 
 
+def test_the_leader_exit_is_seen_without_os_waitid_and_without_reaping(monkeypatch):
+    """macOS has no os.waitid: the exit is read from a kqueue watch, and the leader stays an unreaped zombie."""
+    import select
+    if getattr(select, "kqueue", None) is None:
+        pytest.skip("kqueue is the BSD/macOS path")
+    monkeypatch.delattr(os, "waitid", raising=False)
+    p = subprocess.Popen(["sleep", "300"])
+    try:
+        assert verify._leader_exited(p) is False
+        os.kill(p.pid, signal.SIGKILL)
+        for _ in range(100):
+            if verify._leader_exited(p):
+                break
+            time.sleep(0.05)
+        assert verify._leader_exited(p) is True
+        assert p.returncode is None                       # not reaped by the check
+        assert os.waitpid(p.pid, os.WNOHANG)[0] == p.pid  # still ours to reap: the pid was never freed
+    finally:
+        p.poll()
+        if p.returncode is None:
+            p.kill()
+            p.wait()
+
+
 def test_a_leg_that_raises_keeps_its_traceback_in_status_and_stderr(repo, tmp_path, monkeypatch, capsys):
     r, sha = repo
     state = tmp_path / "state"
