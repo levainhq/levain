@@ -299,6 +299,7 @@ def _git_repo(path):
 
 
 def _store_file(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
     import json
     lines = []
     for iid, decision in rows:
@@ -350,11 +351,11 @@ def test_init_leaves_no_file_when_the_write_fails_and_refuses_a_trailing_newline
 
 def test_init_refuses_an_oversize_skeleton_before_writing_and_says_when_the_store_has_no_item(tmp_path, capsys):
     repo = _git_repo(tmp_path / "levain")
-    big = _store_file(tmp_path / "big.jsonl", [(f"levain#{i}", None) for i in range(1, charter.MAX_LINES + 1)])
+    big = _store_file(tmp_path / "big" / "items.jsonl",[(f"levain#{i}", None) for i in range(1, charter.MAX_LINES + 1)])
     assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(big)]) == 1
     err = capsys.readouterr().err
     assert "lines" in err and str(charter.MAX_LINES) in err and not (repo / "CHARTER.md").exists()
-    other = _store_file(tmp_path / "other.jsonl", [("flow#1", None)])
+    other = _store_file(tmp_path / "other" / "items.jsonl",[("flow#1", None)])
     assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(other), "--stdout"]) == 0
     assert "no live items of levain in the store" in capsys.readouterr().err
 
