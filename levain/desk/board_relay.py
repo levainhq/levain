@@ -15,6 +15,12 @@ Three things live here, and nothing else does:
 * :func:`relay_source`: the WRITE side. Reads the row at write time and refuses, or returns the ``source`` object.
 * :func:`verify_relayed` and :func:`check_manifest`: the READ side, pure over their inputs. They report the row's OWN
   grade and never promote it.
+
+Known edges, deliberate: a short excerpt ("yes") passes the verbatim check, since his whole answer is often one word (the
+verifier reports the row, so a reader sees the full answer); the band read runs under the board's exclusive lock so the
+digests are those of the answer at write time (bounded by the band store's busy timeout); an ``unknown``-graded answer can
+be relayed and is reported as exactly that, never promoted; :class:`NativeBandSource` holds a QuestionStore with no explicit
+close (one-shot CLI).
 """
 from __future__ import annotations
 
@@ -24,9 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from levain.desk.board_store import BoardError, HASH_RE, NP_RE
+from levain.desk.board_store import BoardError, GRADE_RELAYED, HASH_RE, NP_RE
 
-__all__ = ["BandRefusal", "BandRow", "BandSource", "NativeBandSource", "ROW_GRADES", "Verdict", "band_source",
+__all__ = ["BandRefusal", "BandRow", "BandSource", "LazyBand", "NativeBandSource", "ROW_GRADES", "Verdict", "band_source",
            "check_manifest", "digest", "relay_source", "verify_relayed"]
 
 #: the grades a band answer can carry, and how a verdict says them. An unlisted grade is refused, never guessed at.
@@ -134,6 +140,23 @@ def band_source(directory: Path | str | None = None) -> BandSource:
     return NativeBandSource(QuestionStore(directory))
 
 
+class LazyBand:
+    """The band the CLI hands the writer: :func:`band_source` is built on the first read, inside the guarded path, so a bad
+    ``--band-dir`` or a store that cannot be opened is a refusal (:func:`_row_of` maps any raise), never a traceback."""
+
+    def __init__(self, directory: Path | str | None = None) -> None:
+        self._directory = directory
+        self._source: BandSource | None = None
+
+    def row(self, np_id: str) -> BandRow:
+        if self._source is None:
+            self._source = band_source(self._directory)
+        return self._source.row(np_id)
+
+
+NP_UNREADABLE = ("np- rows are flow's band: their reader arrives with T12; cite a q- row (a native question id), or --sign")
+
+
 def _grade_words(grade: str) -> str:
     if grade not in ROW_GRADES:
         raise BandRefusal(f"the row carries a grade this reader does not know ({grade!r})")
@@ -158,9 +181,13 @@ def relay_source(np_id: str, words: str, source: BandSource) -> dict:
     """The WRITE side: read the row now, and refuse unless it is answered and ``words`` is a verbatim, non-blank substring
     of the answer. Returns the record's ``source`` object. Raises BoardError."""
     if not isinstance(np_id, str) or not (NP_RE.fullmatch(np_id) or Q_RE.fullmatch(np_id)):
-        raise BoardError(f"--source {np_id!r} is not np-xxxxxxxx or a native q-<24 hex> question id")
+        raise BoardError(f"--source {np_id!r} is not a native q-<24 hex> question id")
+    if NP_RE.fullmatch(np_id):                              # no production source reads one yet: refuse up front, never advertise it
+        raise BoardError(f"--source {np_id}: {NP_UNREADABLE}")
     if not isinstance(words, str) or not words.strip():
         raise BoardError("a relayed record must carry the words it relays: they must be a verbatim excerpt of the answer")
+    if re.search(r"[\x00-\x1f\x7f\x85\u2028\u2029]", words):    # the one-line rule decide already holds (board_store._one_line), on every verb
+        raise BoardError("relayed words must be one line with no control characters: quote one line of the answer")
     try:
         row = _row_of(source, np_id)
     except BandRefusal as exc:
@@ -175,8 +202,10 @@ def relay_source(np_id: str, words: str, source: BandSource) -> dict:
 def verify_relayed(rec: Mapping[str, Any], band_source: BandSource) -> Verdict:
     """The READ side, pure over its inputs. Re-reads the row, checks both digests and that ``words`` still occur verbatim,
     and says the ROW'S OWN grade (never the record's, never promoted)."""
-    src = rec.get("source") if isinstance(rec, Mapping) else None
-    if rec.get("grade") != "relayed" or not isinstance(src, Mapping):
+    if not isinstance(rec, Mapping):
+        return Verdict(False, "not a relayed record: it is not a mapping")
+    src = rec.get("source")
+    if rec.get("grade") != GRADE_RELAYED or not isinstance(src, Mapping):
         return Verdict(False, "not a relayed record: grade is not relayed or there is no source")
     if set(src) != set(SOURCE_KEYS) or not all(isinstance(src[k], str) for k in SOURCE_KEYS):
         return Verdict(False, f"malformed source: it must carry exactly {', '.join(SOURCE_KEYS)}, each a string")
@@ -191,10 +220,15 @@ def verify_relayed(rec: Mapping[str, Any], band_source: BandSource) -> Verdict:
     if digest(row.answer) != src["answer_sha256"] or digest(row.question) != src["question_sha256"]:
         return Verdict(False, "digest mismatch: the answer changed or the citation points elsewhere", row.answer_grade)
     if row.producer != src["producer"]:
-        return Verdict(False, f"digest mismatch: {np_id} is now served by {row.producer!r}, the record names "
+        return Verdict(False, f"producer mismatch: {np_id} is now served by {row.producer!r}, the record names "
                               f"{src['producer']!r}", row.answer_grade)
-    fields = rec.get("fields")
-    words = fields.get("words") if rec.get("op") == "amend" and isinstance(fields, Mapping) else rec.get("words")
+    if rec.get("op") == "amend":                            # an amend's words live in fields.words and nowhere else
+        fields = rec.get("fields")
+        if not isinstance(fields, Mapping) or not isinstance(fields.get("words"), str):
+            return Verdict(False, "malformed amend: a relayed amend carries its words in a fields mapping", row.answer_grade)
+        words = fields["words"]
+    else:
+        words = rec.get("words")
     if not isinstance(words, str) or not words.strip() or words not in row.answer:
         return Verdict(False, f"the record's words are not a verbatim excerpt of {np_id}'s answer", row.answer_grade)
     said = f"relaying {np_id}, {_grade_words(row.answer_grade)}"
@@ -212,9 +246,12 @@ def check_manifest(rec: Mapping[str, Any], row: BandRow, manifest_sha256: str | 
     if not isinstance(want, str) or not HASH_RE.fullmatch(want):
         return Verdict(False, "no manifest sha256 to check the question against")
     src = rec.get("source")
-    if isinstance(src, Mapping) and src.get("question_sha256") != digest(row.question):
+    cited = src.get("question_sha256") if isinstance(src, Mapping) else None
+    if not isinstance(cited, str) or not HASH_RE.fullmatch(cited):
+        return Verdict(False, "the record must cite this question by a lowercase sha256 in its source", row.answer_grade)
+    if cited != digest(row.question):
         return Verdict(False, "digest mismatch: the record cites a different question than the row holds", row.answer_grade)
-    if not re.search(rf"(?<![0-9a-f]){want}(?![0-9a-f])", row.question):
+    if not re.search(rf"(?<![0-9a-f]){want}(?![0-9a-f])", row.question, re.IGNORECASE):
         return Verdict(False, "the question does not carry the manifest's sha256: the answer cannot bind this manifest",
                        row.answer_grade)
     return Verdict(True, "the question carries the manifest's sha256", row.answer_grade)

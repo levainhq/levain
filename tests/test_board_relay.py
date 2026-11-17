@@ -1,7 +1,7 @@
-"""Relayed provenance (levain#97, P3): ``--source <np-id>`` on add, amend and decide, and the verifier that re-checks it.
+"""Relayed provenance (levain#97, P3): ``--source <q-id>`` on add, amend and decide, and the verifier that re-checks it.
 
-Each behaviour was first run once against a scratch board store and a scratch band (a fake source for ``np-`` ids, which
-the native source refuses; levain's own QuestionStore for the native one), then pinned here."""
+Each behaviour was first run once against a scratch board store and a scratch band (a fake source keyed by q- ids; levain's own
+QuestionStore for the native one), then pinned here."""
 from __future__ import annotations
 
 import json
@@ -15,7 +15,9 @@ from levain.consent.questions import QuestionStore
 from levain.desk import board_relay as br
 from levain.desk import board_store as bs
 
-NP = "np-1b3dd088"
+NP = "q-" + "1b3dd088" * 3
+NP2 = "q-" + "0000000a" * 3
+NP_FLOW = "np-1b3dd088"
 QUESTION = "Track flow under the registry? manifest sha256 " + "c" * 64
 ANSWER = "yes, track it. His sentence travels, never the rule read into it."
 EXCERPT = "His sentence travels"
@@ -57,7 +59,7 @@ def store(home, tmp_path, capsys) -> Path:
 
 @pytest.fixture
 def band(monkeypatch) -> FakeBand:
-    b = FakeBand(**{NP: signed_row(), "np-0000000a": br.BandRow("Is it signed?", "yes", "unsigned", "flow")})
+    b = FakeBand(**{NP: signed_row(), NP2: br.BandRow("Is it signed?", "yes", "unsigned", "flow")})
     monkeypatch.setattr(br, "band_source", lambda directory=None: b)
     return b
 
@@ -109,15 +111,15 @@ def test_an_unanswered_row_is_refused(store, monkeypatch, capsys):
 
 
 def test_an_unknown_np_id_is_refused(store, band, capsys):
-    rc, _, err = decide(capsys, EXCERPT, "np-ffffffff")
-    assert rc == 2 and "np-ffffffff is not a row this band holds" in err
+    rc, _, err = decide(capsys, EXCERPT, "q-" + "f" * 24)
+    assert rc == 2 and f"{'q-' + 'f' * 24} is not a row this band holds" in err
 
 
 def test_a_source_that_is_not_an_np_id_is_refused(store, band, capsys):
     rc, _, err = decide(capsys, EXCERPT, "q-abc")
-    assert rc == 2 and "is not np-xxxxxxxx or a native q-<24 hex>" in err
+    assert rc == 2 and "is not a native q-<24 hex> question id" in err
     rc, _, err = decide(capsys, EXCERPT, "3")                   # a band number is a view-relative handle
-    assert rc == 2 and "is not np-xxxxxxxx or a native q-<24 hex>" in err
+    assert rc == 2 and "is not a native q-<24 hex> question id" in err
 
 
 def test_source_with_an_operator_author_is_refused(store, band, capsys):
@@ -182,12 +184,12 @@ def relayed_rec(band: FakeBand, words: str = EXCERPT, np: str = NP) -> dict:
 
 def test_a_signed_answer_reports_signed_and_an_unsigned_one_reports_unsigned(band):
     assert str(br.verify_relayed(relayed_rec(band), band)) == f"relaying {NP}, a passkey-signed answer"
-    v = br.verify_relayed(relayed_rec(band, "yes", "np-0000000a"), band)
-    assert v.ok and v.text == "relaying np-0000000a, an unsigned answer" and v.grade == "unsigned"
+    v = br.verify_relayed(relayed_rec(band, "yes", NP2), band)
+    assert v.ok and v.text == f"relaying {NP2}, an unsigned answer" and v.grade == "unsigned"
 
 
 def test_a_row_grade_is_never_promoted_by_the_record(band):
-    rec = relayed_rec(band, "yes", "np-0000000a")
+    rec = relayed_rec(band, "yes", NP2)
     rec["grade"] = "relayed"
     assert "unsigned" in br.verify_relayed(rec, band).text
 
@@ -201,7 +203,7 @@ def test_an_answer_changed_later_reports_the_digest_mismatch(band):
 
 def test_a_citation_pointing_at_another_row_reports_the_digest_mismatch(band):
     rec = relayed_rec(band)
-    rec["source"]["np"] = "np-0000000a"
+    rec["source"]["np"] = NP2
     assert br.verify_relayed(rec, band).text.startswith("digest mismatch")
 
 
@@ -374,3 +376,140 @@ def _scratch_db(d):
     for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%\\_frozen' ESCAPE '\\'").fetchall():
         conn.execute(f"DROP TRIGGER {name}")
     return conn
+
+
+# ------------------------------------------------------------------------------------------------------- L3 round 1 (R1-R12)
+
+
+def test_r1_an_np_id_is_refused_up_front_with_the_named_reason_and_opens_no_band(store, monkeypatch, capsys):
+    def boom(directory=None):
+        raise AssertionError("the band must not be opened for an np- id")
+    monkeypatch.setattr(br, "band_source", boom)
+    rc, _, err = decide(capsys, EXCERPT, NP_FLOW)
+    assert rc == 2 and "np- rows are flow's band: their reader arrives with T12; cite a q- row" in err
+    assert len(records(store)) == 1
+
+
+def test_r2_check_manifest_fails_when_the_source_is_missing_or_malformed(band):
+    row = band.rows[NP]
+    for src in (None, "x", {}, {"question_sha256": 7}, {"question_sha256": br.digest(row.question).upper()}):
+        rec = {"op": "begin-track", "manifest_sha256": MANIFEST}
+        if src is not None:
+            rec["source"] = src
+        v = br.check_manifest(rec, row)
+        assert not v.ok and "lowercase sha256" in v.text, src
+    good = {"manifest_sha256": MANIFEST, "source": {"question_sha256": br.digest(row.question)}}
+    assert br.check_manifest(good, row).ok
+
+
+def test_r3_an_amend_without_a_fields_mapping_holding_words_fails_even_with_top_level_words(band):
+    rec = {**relayed_rec(band, "yes"), "op": "amend"}
+    for fields in (None, "junk", {}, {"words": 3}):
+        v = br.verify_relayed({**rec, "fields": fields}, band)
+        assert not v.ok and v.text.startswith("malformed amend"), fields
+    assert br.verify_relayed({**rec, "fields": {"words": "yes"}}, band).ok
+
+
+def test_r4_the_manifest_digest_boundary_is_case_insensitive():
+    for q in ("x " + "C" * 64 + "F", "x F" + "c" * 64, "x " + "c" * 64 + "A"):
+        rec = {"manifest_sha256": MANIFEST, "source": {"question_sha256": br.digest(q)}}
+        assert not br.check_manifest(rec, br.BandRow(q, "yes", "unsigned", "flow")).ok, q
+    q = "x " + "C" * 64 + " y"
+    rec = {"manifest_sha256": MANIFEST, "source": {"question_sha256": br.digest(q)}}
+    assert br.check_manifest(rec, br.BandRow(q, "yes", "unsigned", "flow")).ok
+
+
+def test_r5_a_non_mapping_record_is_a_failed_verdict(band):
+    for junk in ([1], "x", None, 3):
+        v = br.verify_relayed(junk, band)
+        assert not v.ok and "not a relayed record" in v.text
+
+
+def _add(capsys, *more):
+    return run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24",
+               "--words", EXCERPT, "--key", "k1", "--payload-hash", "a" * 64, *more)
+
+
+def test_r6_a_key_hit_under_source_must_be_a_relayed_record_citing_the_same_id(store, band, capsys):
+    rc, out, err = _add(capsys)                                 # unrelayed first
+    assert rc == 0, err
+    n = len(records(store))
+    rc, _, err = _add(capsys, "--source", NP)
+    assert rc == 2 and "not a relayed record citing" in err and len(records(store)) == n
+    rc, out2, err = run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24",
+                        "--words", EXCERPT, "--key", "k2", "--payload-hash", "b" * 64, "--source", NP)
+    assert rc == 0, err
+    again = ["add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24", "--words", EXCERPT,
+             "--key", "k2", "--payload-hash", "b" * 64]
+    assert run(capsys, *again, "--source", NP)[:2] == (0, out2)    # the same relay: the existing record
+    rc, _, err = run(capsys, *again, "--source", NP2)
+    assert rc == 2 and "not a relayed record citing" in err
+    assert run(capsys, *again)[:2] == (0, out2)                    # no --source: a relayed record is still the record
+
+
+def test_r7_a_band_that_cannot_be_built_or_read_is_a_refusal_never_a_traceback(store, monkeypatch, capsys, tmp_path):
+    original = br.band_source
+
+    def boom(directory=None):
+        raise OSError("disk on fire")
+    monkeypatch.setattr(br, "band_source", boom)
+    rc, _, err = decide(capsys, EXCERPT)
+    assert rc == 2 and "the band source failed (OSError)" in err
+    monkeypatch.setattr(br, "band_source", original)
+    f = tmp_path / "afile"
+    f.write_text("junk")
+    rc, _, err = decide(capsys, EXCERPT, NP, "--band-dir", str(f))
+    assert rc == 2 and "could not be read" in err
+
+
+def test_r7_a_store_on_no_directory_is_read_without_creating_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lhome"))
+    for src in (br.band_source(None), br.band_source(tmp_path / "nodir")):
+        with pytest.raises(br.BandRefusal, match="not a row this band holds"):
+            src.row(NP)
+    assert not (tmp_path / "nodir").exists() and not (tmp_path / "lhome").exists()
+    assert not list(tmp_path.rglob("questions.db"))
+
+
+def test_r8_a_changed_producer_says_so(band):
+    rec = relayed_rec(band)
+    rec["source"]["producer"] = "native"
+    v = br.verify_relayed(rec, band)
+    assert not v.ok and v.text.startswith("producer mismatch")
+
+
+MULTI_Q = "Track it?"
+MULTI_A = "yes, track it.\nHis sentence travels.\nnever the rule"
+
+
+def test_r9_a_multi_line_excerpt_is_refused_the_same_on_every_verb_and_one_line_of_it_passes(store, band, capsys):
+    band.rows[NP] = br.BandRow(MULTI_Q, MULTI_A, "unsigned", "flow")
+    span = "track it.\nHis sentence"
+    n = len(records(store))
+    verbs = {
+        "decide": lambda w: run(capsys, "decide", "--id", "levain#1", "--decision", "cut", "--words", w, "--by", "d", "--source", NP),
+        "add": lambda w: run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "d", "--words", w, "--source", NP),
+        "amend": lambda w: run(capsys, "amend", "--id", "levain#1", "--why", "w", "--by", "d", "--words", w, "--source", NP),
+    }
+    for name, call in verbs.items():
+        rc, _, err = call(span)
+        assert rc == 2 and "one line" in err, name
+    assert len(records(store)) == n
+    for name, call in verbs.items():
+        rc, _, err = call("His sentence travels")
+        assert rc == 0, (name, err)
+        assert br.verify_relayed(records(store)[-1], band).ok, name
+
+
+def test_r10_r11_r12_the_constants_and_the_id_width_and_a_missing_words_field(tmp_path):
+    from levain.desk import board_store as bstore
+    assert bstore.GRADE_RELAYED == "relayed" and br.GRADE_RELAYED is bstore.GRADE_RELAYED
+    d = tmp_path / "consent"
+    d.mkdir(mode=0o700)
+    qs = QuestionStore(d)
+    for i in range(5):
+        q = qs.file(agent="claude_code", agent_session_id=f"s{i}", what=f"q{i}?", options=(), rec="", blocks="b", cwd="/tmp",
+                    open_ended=True)
+        assert br.Q_RE.fullmatch(q.id), q.id
+    with pytest.raises(bstore.BoardError, match="must carry the words"):
+        br.relay_source(NP, None, FakeBand())

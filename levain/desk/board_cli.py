@@ -114,8 +114,8 @@ def register(subparsers: Any) -> None:
     p.set_defaults(func=run_state)
 
     def source_args(parser: Any) -> None:
-        parser.add_argument("--source", default=None, metavar="Q-ID|NP-ID",
-                            help=("Relay a band answer (a native q-<hex> question id, or flow's np-xxxxxxxx): the record is grade relayed (author kind agent), cites the row, and its words "
+        parser.add_argument("--source", default=None, metavar="Q-ID",
+                            help=("Relay a band answer (a native q-<24 hex> question id; flow's np- rows wait for T12's reader): the record is grade relayed (author kind agent), cites the row, and its words "
                                   "must be a verbatim excerpt of the answer. Refused for an unknown or unanswered row."))
         parser.add_argument("--band-dir", dest="band_dir", default=None, metavar="DIR",
                             help="The band store --source reads (default: this install's consent directory).")
@@ -411,7 +411,7 @@ def _relay(args: argparse.Namespace):
     if args.author_kind == "operator":
         raise bs.BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
     from levain.desk import board_relay
-    return args.source, board_relay.band_source(args.band_dir)
+    return args.source, board_relay.LazyBand(args.band_dir)
 
 
 def run_add(args: argparse.Namespace) -> int:
