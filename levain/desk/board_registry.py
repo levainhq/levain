@@ -968,18 +968,20 @@ def stale_audit(view_fold: rf.RepoFold, now: datetime) -> list[str]:
     return out
 
 
-def audit_for_state(target: bs.Target, now: datetime, *, view: View | None = None, view_exc: Exception | None = None) -> list[str]:
+def audit_for_state(target: bs.Target, now: datetime, *, view: View | None = None, view_exc: Exception | None = None,
+                    deadline: float | None = None) -> list[str]:
     """The registry's audit lines for ``board state`` (the 72-hour rule, a torn registry, and a registry that cannot be read at
     all: one ``registry: unreadable: <why>`` line). A store with no pointer, or no ``repos.jsonl`` yet, adds nothing.
     Given the registry the caller already read under its own hold (``view``, or ``view_exc`` for the BoardError it raised)
-    this takes no lock: one snapshot, one lock. Without either it reads the registry under a shared lock of its own."""
+    this takes no lock: one snapshot, one lock. Without either it reads the registry under a shared lock of its own, bounded by ``deadline`` (a ``time.monotonic()``
+    instant; None waits as long as it takes); a lock it could not get in time is an ``unreadable`` line like any other."""
     if not target.pointered:
         return []
     if view is None and view_exc is None:
         try:
-            with bs.store_lock(target.store_dir, exclusive=False):
-                view = _load(target.store_dir)
-        except BoardError as exc:                    # never swallowed (W8): a registry that cannot be judged is an audit entry
+            with bs.store_lock(target.store_dir, exclusive=False, deadline=deadline):
+                view = _load(target.store_dir, deadline)
+        except BoardError as exc:                    # LockWaiting is one; never swallowed (W8): a registry that cannot be judged is an audit entry
             return [f"registry: unreadable: {exc}"]
     if view is None:
         return [f"registry: unreadable: {view_exc}"]

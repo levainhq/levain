@@ -330,3 +330,146 @@ def test_a_pointered_store_with_no_registry_file_behaves_as_before_whatever_the_
     assert doc is not None, err
     assert doc["reader"]["repo"] == "alpha"
     assert rc == 3 and any(e["why"].startswith("registry: unreadable:") and "store.id" in e["why"] for e in doc["audit"])
+
+
+# --------------------------------------------------------------------------------------------------- T3 fix 2 (L3 round 1)
+
+
+def test_a_flock_on_the_items_file_alone_is_a_bounded_wait_too(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)                                             # flow's old board.py flocks items.jsonl, not store.lock
+    monkeypatch.setattr(bc, "STATE_LOCK_WAIT", 0.3)
+    fd = os.open(store / bs.ITEMS_NAME, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        t0 = time.monotonic()
+        rc, out, err = run(capsys, "state", "--json")
+        waited = time.monotonic() - t0
+    finally:
+        os.close(fd)
+    assert rc == bc.EXIT_LOCKED and "locked by a writer" in err and out == ""
+    assert 0.25 <= waited < 3
+
+
+def test_every_state_path_read_takes_the_deadline(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    missing: list[str] = []
+    real_read, real_open = bs._read_stable, bs._open_checked
+
+    def read(path, flock_op=None, deadline=None):
+        if flock_op is not None and deadline is None:
+            missing.append(f"_read_stable {path.name}")
+        return real_read(path, flock_op, deadline)
+
+    def opened(path, flags, flock_op=None, missing_ok=False, deadline=None):
+        if flock_op is not None and deadline is None:
+            missing.append(f"_open_checked {path.name}")
+        return real_open(path, flags, flock_op, missing_ok, deadline)
+
+    monkeypatch.setattr(bs, "_read_stable", read)
+    monkeypatch.setattr(bs, "_open_checked", opened)
+    for argv in ([], ["--repo", str(tmp_path / "repos" / "alpha")]):
+        assert _state(capsys, *argv)[0] in (0, 3)
+    assert missing == []
+
+
+def _unpoint(store):
+    (bs._home_dir(None) / bs.POINTER_NAME).unlink()
+
+
+def test_an_explicit_store_with_an_id_is_read_like_a_pointered_one(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    _unpoint(store)
+    taken: list[bool] = []
+    real = bs.store_lock
+
+    def counting(*args, **kw):
+        taken.append(True)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(bs, "store_lock", counting)
+    monkeypatch.chdir(tmp_path)                                                               # not a git repository: the cwd must not matter
+    for given in (store, store / bs.ITEMS_NAME):
+        taken.clear()
+        rc, doc, err = _state(capsys, "--items", str(given))
+        assert rc in (0, 3), err
+        assert [x["repo"] for x in doc["reader"]["repos"]] == ["alpha", "beta"] and {"alpha#1", "beta#1"} <= set(_states(doc))
+        assert len(taken) == 2
+    monkeypatch.setattr(bc, "STATE_LOCK_WAIT", 0.3)
+    monkeypatch.setattr(bs, "store_lock", real)
+    with bs.store_lock(store, exclusive=True):
+        assert run(capsys, "state", "--json", "--items", str(store))[0] == bc.EXIT_LOCKED    # and it waits on the store lock
+
+
+def test_an_explicit_dir_with_no_store_id_stays_a_plain_items_file(tmp_path, mkrepo, capsys, home, monkeypatch):
+    d = tmp_path / "plain"
+    d.mkdir()
+    (d / "items.jsonl").write_text("")
+    a = mkrepo("alpha")
+    monkeypatch.chdir(a)
+    rc, doc, err = _state(capsys, "--items", str(d))
+    assert rc in (0, 3), err and doc["reader"]["repo"] == "alpha"
+
+
+def test_a_repo_holding_items_but_absent_from_the_registry_reads_unknown_and_says_so(store, tmp_path, mkrepo, capsys):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    g = mkrepo("ghost")
+    track_ready(capsys, tmp_path, store, g, "ghost")                                          # an item in the store
+    path = store / "repos.jsonl"                                                              # the registry loses the repo (its own tail), the item stays
+    path.write_text("".join(ln for ln in path.read_text("utf-8").splitlines(True) if json.loads(ln)["repo"] != "ghost"))
+    rc, doc, err = _state(capsys)
+    assert rc == 3, err
+    assert _states(doc)["ghost#1"] == "unknown" and "alpha#1" in _states(doc)
+    lines = [e["why"] for e in doc["audit"] if e["id"] is None and e["why"].startswith("ghost: ")]
+    assert len(lines) == 1 and "not registered" in lines[0]
+    assert [x["repo"] for x in doc["reader"]["repos"]] == ["alpha", "beta"]
+
+
+def test_the_top_level_unattributed_holds_every_repos_commits_prefixed(store, tmp_path, mkrepo, capsys):
+    a, b = _two_tracked(capsys, tmp_path, store, mkrepo)
+    for repo in (a, b):
+        (repo / "x.txt").write_text("x")
+        git(repo, "add", ".")
+        git(repo, "commit", "-qm", f"stray work in {repo.name}")
+        git(repo, "push", "-q", "origin", "main")
+        git(repo, "fetch", "-q")
+    rc, doc, err = _state(capsys)
+    assert rc == 3, err
+    top = [u["subject"] for u in doc["unattributed"]]
+    assert any(s.startswith("alpha: ") for s in top) and any(s.startswith("beta: ") for s in top)
+    lines = [e["why"] for e in doc["audit"] if e["kind"] == "unattributed_work"]
+    assert len(top) == len(lines) == doc["reader"]["unattributed"]
+
+
+def test_a_stale_non_primary_repo_fails_closed_like_a_stale_primary(store, tmp_path, mkrepo, capsys, monkeypatch):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    stamps = {"alpha": "2026-11-17T09:00:00Z", "beta": "2026-11-10T09:00:00Z"}                 # alpha, the primary, is fresh
+    real = be.read_git_evidence
+
+    def hooked(repo, **kw):
+        ev, summary = real(repo, **kw)
+        ev["fetched_at"] = stamps[kw["repo_name"]]
+        return ev, summary
+
+    monkeypatch.setattr(be, "read_git_evidence", hooked)
+    rc, doc, err = _state(capsys, "--now", "2026-11-17T10:00:00Z")
+    assert rc == 3, err
+    stale = [e["why"] for e in doc["audit"] if e["why"].startswith("stale_evidence")]
+    assert len(stale) == 1 and stale[0].startswith("stale_evidence: beta: ")
+    assert doc["as_of"] == "2026-11-10T09:00:00Z"
+    beta = next(s for s in doc["items"] if s["id"] == "beta#1")
+    assert beta["state"] == "unknown" and "older than" in beta["reason"]
+
+
+def test_the_registry_audit_fallback_is_bounded_and_says_so_when_it_cannot_lock(store, tmp_path, mkrepo, capsys):
+    from datetime import datetime, timezone
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    target = bs.resolve_store(None)
+    now = datetime.now(timezone.utc)
+    with bs.store_lock(store, exclusive=True):
+        t0 = time.monotonic()
+        lines = bc.br.audit_for_state(target, now, deadline=bs._deadline_of(0.3))
+        waited = time.monotonic() - t0
+    assert 0.25 <= waited < 3
+    assert len(lines) == 1 and lines[0].startswith("registry: unreadable: ") and bs.LOCK_WAITING in lines[0]
+    assert bc.br.audit_for_state(target, now, deadline=bs._deadline_of(2)) == []                # the writer gone: nothing to say
+    assert bc.br.audit_for_state(target, now) == []                                            # no deadline: as before

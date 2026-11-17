@@ -20,6 +20,12 @@ that can be read. The ``--repo`` read keeps a registry problem as an audit line.
 
 Known edges. Git writes (a pull, a checkout) take no store lock, so the three store files can come from two commits. Git evidence
 is read after the store snapshot, so a trailer for an item added after the snapshot can read ``unknown_id_in_trailer`` once.
+A parked or cut item of a repo that cannot be read stays parked or cut: a decision is a record in the store, not git evidence, so
+the board shows it truthfully and the repo's own audit line says the repo cannot be read (an item whose STATE needs the repo's
+evidence reads unknown). Exit 4 is a named read failure for the one cross-repo caller (flow's ``scripts/ready.py`` treats any exit
+but 0 and 3 as a failed read of that repo and fails closed); it is not a board.
+An explicit ``--items`` store that holds a ``store.id`` is read as a pointer-selected one (its lock, its registry, the whole board
+when ``--repo`` is absent); a repo holding items but absent from the registry reads unregistered: not read, items unknown.
 
 The JSON is the board (``schema``, ``as_of``, ``items``, ``audit``, ``unattributed``, ``problems``) plus one additive key,
 ``reader``: ``{repo, since, main_ref, <counts>}`` (every field on every path, a failure board included), for a human
@@ -31,6 +37,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import dataclasses
 import json
 import os
 import sys
@@ -415,6 +422,8 @@ def run_state(args: argparse.Namespace) -> int:
             return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}")
         return _refused(exc)
     given = args.items or os.environ.get(ITEMS_ENV)
+    if not target.pointered and (target.store_dir / bs.STORE_ID_NAME).is_file():
+        target = dataclasses.replace(target, pointered=True)    # an explicit store that holds a store.id is a store: its lock, its registry
     if not given and not target.pointered and not target.items_path.is_file():
         return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
     store_id: str | None = None
@@ -475,6 +484,8 @@ def run_state(args: argparse.Namespace) -> int:
                 unread_why[name] = f"tracked repo cannot be read, its items read unknown: {gone}"
                 continue
             reads.append((name, Path(r.path)))
+        for name in sorted(held - set(view.fold.repos)):    # items of a repo the registry does not name: never dropped either
+            unread_why[name] = "the repo is not registered: not read, its items read unknown"
         if not reads:
             return _fail("the registry has no tracked repo that can be read" + (": " + "; ".join(f"{n}: {w}" for n, w in unread_why.items())
                          if unread_why else " (track one with `levain board begin-track`/`track`, or pass --repo)"))
