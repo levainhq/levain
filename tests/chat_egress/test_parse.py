@@ -307,10 +307,10 @@ def test_l3_a_hex_looking_label_that_is_no_number_stays_dns(raw):
 
 
 def _time_parse_keys(n, clock):
-    """Best of 3 wall time of one parse of an n-key query (the best of 3 drops scheduler noise)."""
+    """Best of 9 wall time of one parse of an n-key query (the best of 9 drops scheduler noise)."""
     query = "&".join(f"k{i}=v" for i in range(n))
     best = float("inf")
-    for _ in range(3):
+    for _ in range(9):
         t0 = clock()
         p = parse.parse(frame(query=query))
         best = min(best, clock() - t0)
@@ -330,6 +330,8 @@ def test_m1_names_dedupe_is_linear(clock=None, n=10_000):
 
 def test_m1_linearity_bound_rejects_a_quadratic_dedupe(monkeypatch):
     """The bound above has teeth: a quadratic stand-in for `Names` (a list scan per insert) must fail it."""
+    steps = [0]   # operation count, not wall time: a loaded runner cannot make a quadratic scan look linear
+
     class QuadNames(parse.Names):
         __slots__ = ()
 
@@ -337,14 +339,15 @@ def test_m1_linearity_bound_rejects_a_quadratic_dedupe(monkeypatch):
             seen = []
             for n in names:
                 f = fold_name(n)
-                if f not in seen:   # the list scan: O(n) per insert
+                steps[0] += 1 + len(seen)   # one step per element the list scan visits: O(n) per insert
+                if f not in seen:
                     seen.append(f)
             self._order = tuple(seen)
             self._set = frozenset(seen)
 
     monkeypatch.setattr(parse, "Names", QuadNames)
     with pytest.raises(AssertionError):
-        test_m1_names_dedupe_is_linear(n=3_000)
+        test_m1_names_dedupe_is_linear(clock=lambda: steps[0], n=3_000)
 
 
 def test_m1_linearity_holds_under_a_constant_slowdown():
