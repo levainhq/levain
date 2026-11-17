@@ -8,7 +8,7 @@ the write, and owns the rate limit (:class:`RateLimit`); this module decides not
 
 A token may also carry ONE fixed state-line text, set when it is created and never from a call: a tap of a token that
 names exactly one word then sets that word AND that text (the bed tag: ``sleep`` and ``Bed``). The text is part of the
-token's named allowed set and the cockpit shows it beside the words; no body or header of a tap can change it.
+token's named allowed set; no body or header of a tap can change it.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the pr
 FILE_NAME = "presence_tokens.json"
 DEFAULT_WORDS = ("away", "back", "quiet", "desk", "devices")
 NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
-STATE_MAX = 120     # a tag's state text is a word or two, far under the state line's own bound
+STATE_MAX = 120     # a tag's state text is a word or two
 MAX_TOKENS = 50
 _MAX_BYTES = 64 * 1024
 RATE_PER_MIN = 10
