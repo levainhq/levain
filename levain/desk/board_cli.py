@@ -1,4 +1,4 @@
-"""levain.desk.board_cli — ``levain board state``: the board's derived state, printed from git evidence (READY_SCHEMA v2).
+"""levain.desk.board_cli — ``levain board state``: the board's derived state, printed from git evidence (READY_SCHEMA v3).
 
 ``levain board state --json [--items PATH] [--evidence-extra PATH] [--repo PATH] [--now ISO]`` folds the item store,
 reads git itself (:mod:`levain.desk.board_evidence`), adds the producer blocks for ``seats``, ``band`` and ``waiters`` (Levain's
@@ -12,7 +12,8 @@ every source it feeds reads unreadable, every item reads unknown, the audit says
 
 The JSON is the board (``schema``, ``as_of``, ``items``, ``audit``, ``unattributed``, ``problems``) plus one additive key,
 ``reader``: ``{repo, since, main_ref, <counts>}`` (every field on every path, a failure board included), for a human
-checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; anything else is exit 2.
+checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; anything else is exit 2. A flat extra is judged by its own
+``fetched_at`` (else the file's modification time), never by the moment this process read it.
 """
 from __future__ import annotations
 
@@ -27,8 +28,8 @@ from typing import Any
 from levain.desk import board_evidence as be
 from levain.desk import board_store as bs
 from levain.desk import board_producers as bp
-from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, derive_all, fold,
-                                      parse_timestamp)
+from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
+                                      fold, parse_timestamp)
 
 __all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
 
@@ -37,7 +38,7 @@ ITEMS_ENV = bs.ITEMS_ENV
 #: a stale hand-made file would silently outvote git.
 READ_BY_CLI = ("fetched_at", "main", "chain", "refs", "merged", "branches", "unattributed")
 #: The keys an extra object may carry: the sources only FLOW can supply, the ones this process cannot stat, and the version.
-EXTRA_KEYS = ("evidence_v", *PRODUCER_SOURCES, "documents", "unreadable")
+EXTRA_KEYS = ("evidence_v", "fetched_at", *PRODUCER_SOURCES, "documents", "unreadable")
 EXIT_AUDIT = 3
 EXIT_USAGE = 2
 
@@ -49,15 +50,16 @@ def register(subparsers: Any) -> None:
     board = subparsers.add_parser("board", description="The work board. Item state is never stored; it is derived on every read.")
     sub = board.add_subparsers(dest="board_cmd", required=True)
     p = sub.add_parser(
-        "state", help="Print the board's derived state (READY_SCHEMA v2).",
+        "state", help="Print the board's derived state (READY_SCHEMA v3).",
         description=("Fold the item store, read git, and print the derived state of every item. Reads only. Exit 0 when the "
                      "audit is empty, 3 when it is not, 2 when the items file or an explicit option is unusable."))
     p.add_argument("--json", action="store_true", help="Print the Board as JSON (the contract flow's readers consume).")
     p.add_argument("--items", type=str, metavar="PATH",
                    help=f"The items store (items.jsonl). Default: ${ITEMS_ENV}; one of the two is required.")
     p.add_argument("--evidence-extra", dest="evidence_extra", type=Path, metavar="PATH",
-                   help="A JSON object with the evidence flow supplies (seats, band, waiters, documents, unreadable). "
-                        f"It may not name a source this command reads itself: {', '.join(READ_BY_CLI)}.")
+                   help="A JSON object with the evidence flow supplies (seats, band, waiters, documents, unreadable, fetched_at). "
+                        f"It may not name a source this command reads itself: {', '.join(READ_BY_CLI)} (its own fetched_at, "
+                        "when it carries one, is only the time it was captured).")
     p.add_argument("--producer", dest="producers", action="append", default=[], metavar="NAME",
                    help="An external evidence producer to expect (repeatable): its blocks are read from evidence.NAME.json "
                         "beside the items file. Levain's own reads of seats and band are always expected.")
@@ -136,12 +138,14 @@ def _split_also(raw: str) -> tuple[str | None, Path]:
 def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True, captured_at: str | None = None) -> str | None:
     """Fold the extra object into ``evidence``; the reason it cannot be used, or None. Only the keys flow supplies are
     accepted (``EXTRA_KEYS``): an unknown key would land in the evidence object unexamined, and a reason that is not a
-    string would crash whatever reads it later. The flat form (``evidence_v`` 1, or none) becomes ONE block per source from
-    :data:`FLAT_PRODUCER`, captured at ``captured_at`` (default: the evidence's ``fetched_at``); the blocks form
-    (``evidence_v`` 2) is a list of producer blocks per source, appended as given."""
+    string would crash whatever reads it later. The flat form (``evidence_v`` 1, or none) becomes ONE
+    :class:`~levain.desk.board_state.FlatBlock` per source from :data:`FLAT_PRODUCER`, captured at ``captured_at`` (default:
+    the extra's own ``fetched_at``, else none, which reads unreadable); the blocks form (``evidence_v`` 2) is a list of
+    producer blocks per source, appended as given and refused if one carries a ``form`` key. ``evidence["producers"]`` names,
+    per source, the producers that SUPPLIED it: a producer is expected only where it said something."""
     if not isinstance(extra, dict):
         return "the extra evidence must be a JSON object"
-    clash = sorted(k for k in extra if k in READ_BY_CLI)
+    clash = sorted(k for k in extra if k in READ_BY_CLI and k != "fetched_at")     # the extra's own fetched_at is its capture time, never git's
     if clash:
         return f"the extra evidence names {', '.join(clash)}, which this command reads itself"
     unknown = sorted(str(k) for k in extra if k not in EXTRA_KEYS)
@@ -150,31 +154,38 @@ def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True, 
     form = extra.get("evidence_v", FLAT_EVIDENCE_V)
     if type(form) is not int or form not in (FLAT_EVIDENCE_V, EVIDENCE_V):
         return f"the extra evidence_v is {form!r}, not {FLAT_EVIDENCE_V} or {EVIDENCE_V}"
-    when = captured_at if captured_at is not None else evidence.get("fetched_at")
-    names: list[str] = evidence.setdefault("producers", [])
-    if form == FLAT_EVIDENCE_V and FLAT_PRODUCER not in names:
-        names.append(FLAT_PRODUCER)
+    if "fetched_at" in extra and not isinstance(extra["fetched_at"], str):
+        return "the extra fetched_at must be a timestamp string"
+    when = captured_at if captured_at is not None else extra.get("fetched_at")
+    expected: dict[str, list[str]] = evidence.setdefault("producers", {})
+
+    def expect(source: str, producer: Any) -> None:
+        if isinstance(producer, str) and producer and producer not in expected.setdefault(source, []):
+            expected[source].append(producer)
+
     for key, value in extra.items():
-        if key == "evidence_v":
+        if key in ("evidence_v", "fetched_at"):
             continue
         if key in PRODUCER_SOURCES:
             if form == EVIDENCE_V:
                 if not isinstance(value, list) or not all(isinstance(b, dict) and "form" not in b for b in value):
                     return f"the extra {key} must be a list of producer blocks (objects with no form key)"
                 evidence.setdefault(key, []).extend(value)
-                names.extend(p for p in (b.get("producer") for b in value) if isinstance(p, str) and p and p not in names)
+                for b in value:
+                    expect(key, b.get("producer"))
             else:
-                evidence.setdefault(key, []).append({"producer": FLAT_PRODUCER, "form": "flat", "store_id": None,
-                                                     "captured_at": when, "complete": True, "rows": value})
+                evidence.setdefault(key, []).append(FlatBlock(producer=FLAT_PRODUCER, store_id=None, captured_at=when,
+                                                              complete=True, rows=value))
+                expect(key, FLAT_PRODUCER)
         elif key == "unreadable":
             if not isinstance(value, dict):
                 return "the extra unreadable must be an object of source to reason"
             for src, why in value.items():
                 if src in READ_BY_CLI:                  # the nested form of the clash above: a stale file must not outvote git
                     return f"the extra unreadable names {src}, which this command reads itself"
-                if not isinstance(why, str) or not why.strip():
+                if not isinstance(why, str):
                     return f"the extra unreadable[{src}] must be a string that says why"
-                evidence["unreadable"].setdefault(src, why)
+                evidence["unreadable"].setdefault(src, why.strip() or "unreadable (no reason given)")
         elif key == "documents":
             if not isinstance(value, dict):
                 return "the extra documents must be an object of path to boolean"
@@ -184,23 +195,36 @@ def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True, 
 
 
 def _store_id(store_dir: Path) -> str | None:
-    """The store's id (``<store dir>/store.id``), or None when it has none yet."""
+    """The store's id (``<store dir>/store.id``), or None when the file is missing or empty. Any other failure to read it
+    raises :class:`OSError` or :class:`UnicodeDecodeError`: a store whose id cannot be read is not one to judge blocks against."""
     try:
         return (store_dir / "store.id").read_text("utf-8").strip() or None
-    except (OSError, UnicodeDecodeError):
+    except FileNotFoundError:
         return None
 
 
+def _extra_stamp(extra: Any, path: Path) -> str | None:
+    """When a flat extra was captured: its own ``fetched_at``, else its file's modification time (UTC), never the moment it
+    was read: an old file must not read fresh because it was read just now."""
+    if isinstance(extra, dict) and isinstance(extra.get("fetched_at"), str):
+        return extra["fetched_at"]
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _attach_producers(evidence: dict[str, Any], native: dict[str, dict[str, Any]], external: dict[str, list[dict[str, Any]]],
-                      external_names: list[str], failures: dict[str, str]) -> None:
+                      failures: dict[str, str]) -> None:
     """Put the native and the external producers' blocks in front of whatever the extra supplied, and name the producers
-    expected per source: Levain's own for seats and band (and for waiters only when it declared them absent), every
-    external one named, and flow when its flat extra was given."""
-    named = [p for p in evidence.get("producers", []) if p != bp.NATIVE_PRODUCER]
+    expected per source: Levain's own for seats and band (and for waiters only when it declared them absent), an external
+    producer for the sources its file holds, flow for the sources its extra carries, and every producer whose file could not
+    be read for every source (it failed, so it cannot say it has nothing)."""
+    supplied: dict[str, list[str]] = evidence.get("producers") or {}
+    expected: dict[str, list[str]] = {}
     for source in PRODUCER_SOURCES:
         evidence[source] = [*([native[source]] if source in native else []), *external.get(source, []), *evidence.get(source, [])]
-    base = [*external_names, *[p for p in named if p not in external_names]]
-    evidence["producers"] = {s: [*([bp.NATIVE_PRODUCER] if s in native else []), *base] for s in PRODUCER_SOURCES}
+        names = [*([bp.NATIVE_PRODUCER] if source in native else []), *(b.get("producer") for b in external.get(source, [])),
+                 *failures, *supplied.get(source, [])]
+        expected[source] = list(dict.fromkeys(n for n in names if isinstance(n, str) and n))
+    evidence["producers"] = expected
     if failures:
         evidence["producer_failures"] = failures
 
@@ -305,22 +329,30 @@ def run_state(args: argparse.Namespace) -> int:
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
-    store_id = _store_id(store_dir)
+    try:
+        store_id = _store_id(store_dir)
+    except (OSError, UnicodeDecodeError) as exc:
+        return _fail(f"store.id could not be read: {type(exc).__name__}: {exc}")
+    producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
+    if bp.NATIVE_PRODUCER in producers:
+        return _fail(f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
     native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=args.no_land_waiter)
-    external, failures = bp.read_external(store_dir, args.producers)
+    external, failures = bp.read_external(store_dir, producers)
     if store_id is None and any(isinstance(b, dict) and b.get("store_id") for bl in external.values() for b in bl):
         print(f"levain board state: the store {store_dir} has no id, so an external block naming one is taken as this store's", file=sys.stderr)
     extra = None
+    flat_at: str | None = None
     if args.evidence_extra is not None:
+        extra_path = Path(args.evidence_extra).expanduser()
         try:
-            extra = json.loads(Path(args.evidence_extra).expanduser().read_text("utf-8"))
+            extra = json.loads(extra_path.read_text("utf-8"))
+            flat_at = _extra_stamp(extra, extra_path)
         except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
             return _fail(f"--evidence-extra {args.evidence_extra} cannot be read ({type(exc).__name__}: {exc})")
-        bad = _merge_extra(evidence, extra)
+        bad = _merge_extra(evidence, extra, captured_at=flat_at)
         if bad is not None:
             return _fail(f"--evidence-extra {args.evidence_extra}: {bad}")
-    flat_at = evidence.get("fetched_at")
-    _attach_producers(evidence, native, external, list(args.producers), failures)
+    _attach_producers(evidence, native, external, failures)
     primary = Evidence.from_dict(evidence, now=now, store_id=store_id)
     repo_evidence: dict[str, Evidence] | None = None
     also: list[dict[str, Any]] = []
@@ -337,7 +369,7 @@ def run_state(args: argparse.Namespace) -> int:
             ev2["documents"] = be.read_documents({i: it for i, it in folded.items.items() if it.repo == name}, other)
             if extra is not None:
                 _merge_extra(ev2, extra, primary=False, captured_at=flat_at)     # the same flow-supplied sources; validated once above
-            _attach_producers(ev2, native, external, list(args.producers), failures)
+            _attach_producers(ev2, native, external, failures)
             repo_evidence[name] = Evidence.from_dict(ev2, now=now, store_id=store_id)
             also.append(sum2)
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,

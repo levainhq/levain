@@ -1,4 +1,4 @@
-"""levain.desk.board_evidence — the board's git evidence readers (READY_SCHEMA v2, slice B2).
+"""levain.desk.board_evidence — the board's git evidence readers (READY_SCHEMA v3, slice B2).
 
 :mod:`levain.desk.board_state` is pure; this is the half that reads. :func:`read_git_evidence` runs git (read-only: it
 never fetches, never writes a ref, a note or the index) and returns the evidence object (``evidence_v`` :data:`~levain.desk.board_state.EVIDENCE_V`) for the

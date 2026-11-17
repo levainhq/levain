@@ -107,7 +107,7 @@ def test_evidence_never_raises_and_names_what_it_could_not_read():
 
 def test_unreadable_given_as_a_list_of_names_fails_closed_and_still_names_the_sources():
     ev = bs.Evidence.from_dict({"evidence_v": 1, "unreadable": ["seats"]})
-    assert ev.unreadable["seats"] == "unreadable" and "malformed unreadable" in ev.unreadable["evidence"]
+    assert ev.unreadable["seats"] == "unreadable (no reason given)" and "malformed unreadable" in ev.unreadable["evidence"]
 
 
 @pytest.mark.parametrize("bad", ["git exploded", 7, True, {"git": 5}, {"git": None}, [1, 2], {1: "x"}])

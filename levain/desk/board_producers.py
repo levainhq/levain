@@ -1,42 +1,50 @@
 """levain.desk.board_producers: the producers of the board's ``seats``, ``band`` and ``waiters`` evidence.
 
-Each source reaches :mod:`levain.desk.board_state` as producer blocks ``{producer, store_id, captured_at, complete,
-rows}``. This module writes the NATIVE producer's blocks (Levain's own reads, producer name :data:`NATIVE_PRODUCER`) and
-reads the EXTERNAL producers' files, ``<store dir>/evidence.<producer>.json``. The judgement (readable, complete,
-composed per predicate) is the fold's; here a block is only ever made or loaded, and a read that cannot be whole says
-``complete: false`` with the reason, never a short list passed off as whole.
+Each source reaches :mod:`levain.desk.board_state` as producer blocks ``{producer, store_id, captured_at, complete, rows}``.
+This module writes the NATIVE producer's blocks (Levain's own reads, producer name :data:`NATIVE_PRODUCER`) and reads the
+EXTERNAL producers' files, ``<store dir>/evidence.<producer>.json``. The judgement (readable, complete, composed per
+predicate) is the fold's; here a block is only ever made or loaded, and a read that cannot be whole says ``complete: false``
+with the reason, never a short list passed off as whole. A producer that cannot see something must not claim it.
 
-* ``seats``: the active claude launches of the desk store whose ``harness_session_id`` ``claude agents --json`` lists,
-  with the desk's own recheck (one read that misses a launch is not a death; a second read agrees first). A row that is
-  not an object in that list makes the block incomplete (:func:`levain.desk.launch._agents_checked`). A launch that is
-  not listed is not emitted: a dead seat holds nothing.
-* ``band``: the question store through :func:`levain.band_view.render_full`; its ``failed`` or ``pending`` makes the block
-  incomplete. An open question is an ``open`` row, an answered one a ``resolved`` row carrying its channel and its grade.
+* ``seats``: the active claude launches of the desk store, read through its read-only open. The block is whole ONLY when every
+  active claude launch is listed by ``claude agents --json`` AND carries a ``board_items`` attribute that is a list of strings
+  (the ids it was launched for). A launch without the attribute, with another kind of value, with no session yet, or not
+  listed makes the block incomplete and says which; the rows of the seats that were seen still go in (a positive claim stands).
+  No active claude launch is a whole, empty block. The read does not wait: a launch the list does not show is reported, not
+  re-read after a pause.
+* ``band``: the question store through :func:`levain.band_view.render_full` and the open authority rows (consent, sign,
+  extend) the band shows; its ``failed`` or ``pending``, an authority row whose shape cannot be read, or a store with
+  :data:`BAND_ROWS_MAX` rows (older ones unread) makes the block incomplete. An open question or authority row is an ``open``
+  row, an answered question a ``resolved`` row carrying its channel and its grade.
 * ``waiters``: ``none`` and complete ONLY when the caller says this install runs no land waiter; otherwise no block at all,
   so the source stays unreadable until a producer that runs waiters supplies it (the CLI does not expect the native one for it).
 
 An external file is ``{"evidence_v": 2, "blocks": {"seats": <block>, "band": <block>, "waiters": <block>}}`` and is read in
 ONE read of its whole bytes. The producer must write it by temp file, fsync and rename: the file is not under the store's
-lock, so a reader that opened a half-written file would see a torn one (which reads as that producer unreadable).
+lock, so a reader that opened a half-written file would see a torn one (which reads as that producer unreadable). A block in
+it must be an object naming that producer and carrying no ``form`` key; any other makes the whole file unreadable.
 """
 from __future__ import annotations
 
 import json
 import re
-import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from levain.desk.board_state import EVIDENCE_V, PRODUCER_SOURCES
 
-__all__ = ["NATIVE_PRODUCER", "native_blocks", "read_external"]
+__all__ = ["BAND_ROWS_MAX", "NATIVE_PRODUCER", "native_blocks", "read_external"]
 
 NATIVE_PRODUCER = "levain"
+#: How many band rows one read takes; a store that holds this many has older rows unread, so the block says incomplete.
+BAND_ROWS_MAX = 10_000
 _PRODUCER = re.compile(r"[a-z0-9][a-z0-9_-]*")
-_ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+")
-_ROWS_MAX = 1_000_000
+#: An item id as a whole token: not the tail of a longer word, path or id, and not followed by more of one (``app#2.txt`` is a
+#: file name, not item app#2; a full stop that ends a sentence still ends the id).
+_ITEM_ID = re.compile(r"(?<![\w.#/-])[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+(?![\w]|\.\w)")
+_MISSING = object()
 
 
 def _stamp(now: datetime) -> str:
@@ -72,8 +80,11 @@ def read_external(store_dir: Path, producers: Sequence[str]) -> tuple[dict[str, 
             failures[name] = f"{path.name} is not an evidence_v {EVIDENCE_V} file with a blocks object"
             continue
         got = doc["blocks"]
-        if any(isinstance(b, dict) and b.get("producer") != name for b in got.values()):
-            failures[name] = f"{path.name} holds a block naming another producer"
+        if any(not isinstance(b, dict) or b.get("producer") != name for b in got.values()):
+            failures[name] = f"{path.name} holds a block that is not an object naming {name} (it names another producer, or none)"
+            continue
+        if any("form" in b for b in got.values()):
+            failures[name] = f"{path.name} holds a block with a form key, which only the flat reader may set"
             continue
         for source in PRODUCER_SOURCES:
             if source in got:
@@ -81,11 +92,11 @@ def read_external(store_dir: Path, producers: Sequence[str]) -> tuple[dict[str, 
     return blocks, failures
 
 
-def native_blocks(*, now: datetime, store_id: str | None, no_land_waiter: bool = False, consent_dir: Path | None = None,
-                  recheck_s: float | None = None, sleep: Callable[[float], None] = time.sleep) -> dict[str, dict[str, Any]]:
+def native_blocks(*, now: datetime, store_id: str | None, no_land_waiter: bool = False,
+                  consent_dir: Path | None = None) -> dict[str, dict[str, Any]]:
     """The native producer's block for each of seats, band and waiters, captured at ``now`` (aware)."""
     out: dict[str, dict[str, Any]] = {}
-    for source, read in (("seats", lambda: _seats(consent_dir, now, recheck_s, sleep)), ("band", lambda: _band(consent_dir, now))):
+    for source, read in (("seats", lambda: _seats(consent_dir)), ("band", lambda: _band(consent_dir, now))):
         try:
             rows, why = read()
         except Exception as exc:                    # noqa: BLE001 - a read that blew up is an incomplete block, never a crash
@@ -96,63 +107,122 @@ def native_blocks(*, now: datetime, store_id: str | None, no_land_waiter: bool =
     return out
 
 
-def _seats(consent_dir: Path | None, now: datetime, recheck_s: float | None, sleep: Callable[[float], None]) -> tuple[list[dict[str, Any]], str | None]:
-    from levain.desk import launch, work_attach
+def _active_launches(directory: Path) -> tuple[Path, list[Any]]:
+    """``(the desk store's directory, its active claude launches)``, through the store's read-only open: this read never
+    makes a table or takes the write lock."""
+    from levain.desk import lease
     from levain.desk.store import CoordStore
+
+    store = CoordStore(directory)
+    conn = store.open_readonly()
+    try:
+        return store.directory, [ln for ln in lease._in_state(conn, "active") if ln.harness == "claude"]
+    finally:
+        conn.close()
+
+
+def _launch_items(launch: Any) -> list[str] | None:
+    """The item ids a launch was started for, or None when it carries no ``board_items`` list of strings."""
+    got = getattr(launch, "board_items", _MISSING)
+    if isinstance(got, (list, tuple)) and all(isinstance(i, str) for i in got):
+        return list(got)
+    return None
+
+
+def _seats(consent_dir: Path | None) -> tuple[list[dict[str, Any]], str | None]:
+    from levain.desk import launch, work_attach
 
     directory = Path(consent_dir) if consent_dir is not None else work_attach.live_consent_dir()
     if not (directory / "dispatch.db").exists():
         return [], None                             # no desk store has ever been made here: no launch, so no seat
-    store = CoordStore(directory)
-    active = [ln for ln in store.launches_active() if ln.harness == "claude" and ln.harness_session_id]
+    where, active = _active_launches(directory)
     if not active:
         return [], None
-    exe, env = launch._harness()
-    if exe is None:
-        return [], "claude is not on PATH, so no session could be listed"
-    cwd = str(store.directory)
-    got = launch._agents_checked(exe, cwd=cwd, env=env)
-    if got is None:
-        return [], "claude agents --json could not be read"
-    rows, bad = got
-    if any(ln.harness_session_id not in launch._by_session(rows) for ln in active):
-        sleep(launch.UNLISTED_RECHECK if recheck_s is None else recheck_s)
-        again = launch._agents_checked(exe, cwd=cwd, env=env)
-        if again is None:
-            return [], "claude agents --json could not be read again"
-        rows, bad = again
-    if bad:
-        return [], f"{bad} row(s) of claude agents --json are not objects"
-    listed = launch._by_session(rows)
-    seats = [{"name": ln.launch_id, "items": [i for i in (getattr(ln, "board_items", None) or ()) if isinstance(i, str)],
-              "since": ln.at, "branch": None}
-             for ln in active if ln.harness_session_id in listed and listed[ln.harness_session_id].get("state") != "done"]
-    return seats, None
+    whys: list[str] = []
+    listed: dict[str, dict[str, Any]] = {}
+    read_ok = False
+    with_session = [ln for ln in active if ln.harness_session_id]
+    if with_session:
+        exe, env = launch._harness()
+        got = launch._agents_checked(exe, cwd=str(where), env=env) if exe is not None else None
+        if exe is None:
+            whys.append("claude is not on PATH, so no session could be listed")
+        elif got is None:
+            whys.append("claude agents --json could not be read")
+        else:
+            rows, bad = got
+            read_ok = True
+            listed = launch._by_session(rows)
+            if bad:
+                whys.append(f"{bad} row(s) of claude agents --json are not objects")
+    seats: list[dict[str, Any]] = []
+    for ln in active:
+        items = _launch_items(ln)
+        if items is None:
+            whys.append(f"launch {ln.launch_id} carries no board_items (T7 writes it)")
+        if not ln.harness_session_id:
+            whys.append(f"launch {ln.launch_id} has no session yet")
+        elif read_ok and ln.harness_session_id not in listed:
+            whys.append(f"launch {ln.launch_id} not listed by claude agents")
+        elif ln.harness_session_id in listed and listed[ln.harness_session_id].get("state") != "done":
+            seats.append({"name": ln.launch_id, "items": items or [], "since": ln.at, "branch": None})
+    return seats, "; ".join(whys) or None
 
 
-def _grade(answer: Any) -> str:
-    """How a resolved row was answered: signed or not, by phone or at a terminal; ``unknown`` when the store cannot say."""
+def _grade(store: Any, question: Any) -> str:
+    """How a resolved row was answered: signed or not, by phone or at a terminal; ``unknown`` when the store cannot say.
+    A native answer carries no signing flag, so the answer's signing sidecar (:func:`levain.band_view.answer_sign_of`) says."""
+    from levain import band_view
+
+    answer = question.answer
+    signed = answer.signed
+    if signed is None:
+        try:
+            state = (band_view.answer_sign_of(store, question.id) or {}).get("sign_state")
+        except Exception:                           # noqa: BLE001 - a sidecar that cannot be read is a grade the store cannot say
+            state = None
+        signed = True if state == "signed" else False if state == "unsigned" else None
     where = "phone" if answer.channel == "phone" else "terminal"
-    if answer.signed is True:
+    if signed is True:
         return f"signed-{where}"
-    return f"unsigned-{where}" if answer.signed is False else "unknown"
+    return f"unsigned-{where}" if signed is False else "unknown"
+
+
+def _items_in(*texts: Any) -> list[str]:
+    return list(dict.fromkeys(i for t in texts if isinstance(t, str) for i in _ITEM_ID.findall(t)))
 
 
 def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]], str | None]:
-    from levain import band_view
+    from levain import band_sources, band_view
     from levain.consent.questions import QuestionStore
 
     store = QuestionStore(consent_dir) if consent_dir is not None else QuestionStore()
     seen = band_view.render_full(store, numbering=False, now=now)
+    whys: list[str] = []
     if seen.failed:
-        return [], "the band could not read an authority source"
+        whys.append("the band could not read an authority source")
     if seen.pending:
-        return [], "an open band item has no number yet"
+        whys.append("an open band item has no number yet")
     rows: list[dict[str, Any]] = []
-    for q in store.recent(_ROWS_MAX):
-        items = list(dict.fromkeys(_ITEM_ID.findall(f"{q.what} {q.blocks}")))
+    questions = store.recent(BAND_ROWS_MAX)
+    if len(questions) >= BAND_ROWS_MAX:
+        whys.append(f"more than {BAND_ROWS_MAX} band rows: older rows not read")
+    for q in questions:
+        items = _items_in(q.what, q.blocks)
         if q.answer is None:
             rows.append({"id": q.id, "state": "open", "items": items, "by": "", "grade": "unknown"})
+        elif not isinstance(q.answer.channel, str) or not q.answer.channel:
+            whys.append(f"the answer to {q.id} names no channel")
         else:
-            rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(q.answer)})
-    return rows, None
+            rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(store, q)})
+    if not band_view._foreign(store) and not seen.failed:          # the open authority rows (consent, sign, extend) the band shows
+        extras = band_sources.read_extras(store.directory, store._clock, now=now)
+        for e in extras.items:
+            if (e.unreadable is not None or not all(isinstance(x, str) and x for x in (e.source, e.ref))
+                    or not isinstance(e.what, str) or not isinstance(e.blocks, str)):
+                whys.append(f"authority row {e.source}:{e.ref} cannot be read")
+                continue
+            rows.append({"id": f"{e.source}:{e.ref}", "state": "open", "items": _items_in(e.what, e.blocks), "by": "", "grade": "unknown"})
+        if extras.failed:
+            whys.append("the band could not read an authority source")
+    return rows, "; ".join(dict.fromkeys(whys)) or None

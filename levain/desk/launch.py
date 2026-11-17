@@ -847,20 +847,17 @@ def _run(argv: list[str], *, cwd: str, env: dict[str, str], timeout: float) -> s
 
 
 def _agents(exe: str, *, cwd: str, env: dict[str, str]) -> list[dict[str, Any]] | None:
-    """Every ``claude agents --json`` row, or None when the list could not be read (an error, a timeout, output that
-    is not a JSON list): an unread list is no evidence that any session is gone."""
-    try:
-        cp = _run([exe, "agents", "--json"], cwd=cwd, env=env, timeout=_CALL_TIMEOUT)
-        rows = json.loads(cp.stdout) if cp.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else None
+    """Every ``claude agents --json`` row that is an object, or None when the list could not be read (an error, a timeout,
+    output that is not a JSON list): an unread list is no evidence that any session is gone. A row that is not an object is
+    dropped here; :func:`_agents_checked` is the one body and says how many."""
+    got = _agents_checked(exe, cwd=cwd, env=env)
+    return None if got is None else got[0]
 
 
 def _agents_checked(exe: str, *, cwd: str, env: dict[str, str]) -> tuple[list[dict[str, Any]], int] | None:
     """``(the dict rows of claude agents --json, how many rows were not dicts)``, or None when the list could not be read.
-    Where :func:`_agents` drops a row that is not an object, this says how many it would have dropped: the board's seat
-    evidence is incomplete when any was. :func:`_agents` itself is unchanged."""
+    The board's seat evidence is incomplete when any row was not an object, where the readers that stop and reap sessions
+    (:func:`_agents`) simply drop it."""
     try:
         cp = _run([exe, "agents", "--json"], cwd=cwd, env=env, timeout=_CALL_TIMEOUT)
         rows = json.loads(cp.stdout) if cp.returncode == 0 else None

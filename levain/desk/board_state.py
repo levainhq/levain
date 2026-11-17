@@ -35,8 +35,9 @@ from typing import Any, Callable
 
 __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
-    "FUTURE_SKEW_S", "Folded", "Item", "Link", "MAX_EVIDENCE_AGE_S", "SCHEMA", "EVIDENCE_V", "FLAT_EVIDENCE_V", "FLAT_PRODUCER", "PRODUCER_MAX_AGE_S", "PRODUCER_SOURCES", "BandRow", "STATES", "STATE_COLUMN", "STATE_KIND", "State", "TIERS",
-    "derive_all", "derive_state", "fold", "parse_timestamp",
+    "EVIDENCE_V", "FLAT_EVIDENCE_V", "FLAT_PRODUCER", "FUTURE_SKEW_S", "FlatBlock", "Folded", "GRADE_ORDER", "Item", "Link",
+    "MAX_EVIDENCE_AGE_S", "PRODUCER_FUTURE_SKEW_S", "PRODUCER_MAX_AGE_S", "PRODUCER_SOURCES", "SCHEMA", "BandRow", "STATES",
+    "STATE_COLUMN", "STATE_KIND", "State", "TIERS", "derive_all", "derive_state", "fold", "parse_timestamp",
 ]
 
 SCHEMA = "ready-v3"
@@ -48,8 +49,13 @@ FLAT_EVIDENCE_V = 1
 FLAT_PRODUCER = "flow"
 #: A producer block whose ``captured_at`` is older than this is not readable. One named constant so the line moves in one place.
 PRODUCER_MAX_AGE_S = 900
+#: A producer block captured MORE than this far ahead of ``now`` is not readable ("captured in the future").
+PRODUCER_FUTURE_SKEW_S = 60
 #: The sources that arrive as producer blocks.
 PRODUCER_SOURCES = ("seats", "band", "waiters")
+#: How a resolved band row was answered, weakest first. Two producers that resolved one row differently are read at the
+#: weaker grade; a grade this list does not hold is weaker than every one it does.
+GRADE_ORDER = ("unknown", "unsigned-terminal", "unsigned-phone", "signed-terminal", "signed-phone")
 #: Evidence older than this reads unknown (6 h: judged in the design page, to be set by the land waiter's own fetch
 #: cadence; one named constant so the line moves in one place).
 MAX_EVIDENCE_AGE_S = 21600
@@ -97,6 +103,11 @@ _GIT_SOURCES = ("main", "chain", "branches", "refs")
 
 class _Bad(Exception):
     """A value that is not the shape the contract states (the caller decides what that makes of the file)."""
+
+
+class FlatBlock(dict):
+    """A producer block of flow's flat form (rows with no store id): the ONLY way a block is read as flat. It is a type, not a
+    key, so no JSON a producer wrote can claim it; :mod:`levain.desk.board_cli` and the v1 reader below are the only builders."""
 
 
 class _Soft(Exception):
@@ -485,22 +496,27 @@ def _p_band(raw: Any) -> tuple[BandRow, ...]:
         raise _Bad("band needs both open and resolved")
     rows = [BandRow(str(k), "open", _strs(v, "a band row's item list"), "", "unknown") for k, v in _obj(b["open"], "band.open").items()]
     for k, v in _obj(b["resolved"], "band.resolved").items():
-        if not isinstance(v, str):
-            raise _Bad("band.resolved values must be strings")
+        if not isinstance(v, str) or not v.strip():
+            raise _Bad("band.resolved values must be non-empty strings (who resolved it)")
         rows.append(BandRow(str(k), "resolved", (), v, "unknown"))
     return tuple(rows)
 
 
 def _p_band_rows(raw: Any) -> tuple[BandRow, ...]:
-    """A producer block's rows: ``{id, state: open|resolved, items, by, grade}``. A row with no grade reads ``unknown``."""
+    """A producer block's rows: ``{id, state: open|resolved, items, by, grade}``, every key required. A row missing one, or
+    holding one of the wrong type, is malformed (never read as a default); a resolved row names who resolved it."""
     out = []
     for r in _seq(raw, "band rows"):
         o = _obj(r, "a band row")
         state = _req_str(o, "state")
         if state not in ("open", "resolved"):
             raise _Bad(f"a band row's state is open or resolved, not {state!r}")
-        out.append(BandRow(_req_str(o, "id"), state, _strs(o.get("items", []), "a band row's items"),
-                           _opt_str(o.get("by"), "by") or "", _opt_str(o.get("grade"), "grade") or "unknown"))
+        by, grade = _need(o, "by", "a band row"), _need(o, "grade", "a band row")
+        if not isinstance(by, str) or not isinstance(grade, str) or not grade.strip():
+            raise _Bad("a band row's by and grade must be strings (grade not empty)")
+        if state == "resolved" and not by.strip():
+            raise _Bad("a resolved band row names no resolver")
+        out.append(BandRow(_req_str(o, "id"), state, _strs(_need(o, "items", "a band row"), "a band row's items"), by, grade))
     return tuple(out)
 
 
@@ -518,8 +534,9 @@ def _p_unattributed(raw: Any) -> tuple[Unattributed, ...]:
 
 @dataclass(frozen=True)
 class _Block:
-    """One producer's block for one source, judged: ``why`` is None when it is readable (its store, its age, every row
-    parsed, its own ``complete`` true), and then ``rows`` are its claims; otherwise ``rows`` is empty."""
+    """One producer's block for one source, judged. ``rows`` are its claims: they stand whenever the block's store, age and
+    every row were readable, whatever its own ``complete`` says (a producer that saw only part still saw those rows).
+    ``why`` is None when the block is also whole (its own ``complete`` true) and otherwise says why absence cannot rest on it."""
     producer: str
     rows: tuple[Any, ...]
     why: str | None
@@ -531,11 +548,13 @@ def _read_block(source: str, raw: Any, *, now: datetime | None, store_id: str | 
     producer = raw.get("producer")
     if not isinstance(producer, str) or not producer:
         return _Block("?", (), "block names no producer")
-    flat = raw.get("form") == "flat"
+    flat = isinstance(raw, FlatBlock)
 
     def bad(why: str) -> _Block:
         return _Block(producer, (), why)
 
+    if "form" in raw and not flat:
+        return bad("block carries a form key (only the flat reader may set one)")
     sid = raw.get("store_id")
     if sid is not None and not isinstance(sid, str):
         return bad("store_id is not a string")
@@ -551,8 +570,8 @@ def _read_block(source: str, raw: Any, *, now: datetime | None, store_id: str | 
         age = (_utc(now) - ts).total_seconds()
         if age > PRODUCER_MAX_AGE_S:
             return bad(f"stale {int(age // 60)} min")
-        if age < -FUTURE_SKEW_S:
-            return bad("captured_at is in the future")
+        if age < -PRODUCER_FUTURE_SKEW_S:
+            return bad("captured in the future")
     parse = {"seats": _p_seats, "waiters": _p_waiters, "band": _p_band if flat else _p_band_rows}[source]
     try:
         rows = tuple(parse(raw.get("rows")))
@@ -562,18 +581,20 @@ def _read_block(source: str, raw: Any, *, now: datetime | None, store_id: str | 
         return bad("complete is not true or false")
     if not raw["complete"]:
         why = raw.get("why")
-        return bad("incomplete" + (f": {why}" if isinstance(why, str) and why else ""))
+        return _Block(producer, rows, "incomplete" + (f": {why}" if isinstance(why, str) and why else ""))
     return _Block(producer, rows, None)
 
 
 def _compose(source: str, obj: Mapping[str, Any], *, now: datetime | None, store_id: str | None,
              expected: Sequence[str] | None, failures: Mapping[str, str]) -> tuple[tuple[Any, ...], str | None]:
-    """``(rows, why absence cannot be concluded)`` for one source. A row from ANY readable producer stands; absence is
-    concluded (``why`` None) only when every expected producer has one readable block for the source."""
+    """``(rows, why absence cannot be concluded)`` for one source. A row from ANY readable block stands, whoever wrote it and
+    whether or not its producer is expected or failed; absence is concluded (``why`` None) only when every expected producer
+    has at least one block, every block of it whole, and it has not failed. Two blocks from one producer are one producer's
+    rows together, whole only if each is."""
     if obj.get("evidence_v") == FLAT_EVIDENCE_V:
         # flow's flat form: one block from FLAT_PRODUCER, captured when the evidence was fetched
-        raws: Any = [{"producer": FLAT_PRODUCER, "form": "flat", "store_id": None, "captured_at": obj.get("fetched_at"),
-                      "complete": True, "rows": obj[source]}] if source in obj else []
+        raws: Any = [FlatBlock(producer=FLAT_PRODUCER, store_id=None, captured_at=obj.get("fetched_at"),
+                               complete=True, rows=obj[source])] if source in obj else []
     else:
         raws = obj.get(source)
         if raws is None:
@@ -584,21 +605,21 @@ def _compose(source: str, obj: Mapping[str, Any], *, now: datetime | None, store
     named: dict[str, list[_Block]] = {}
     for b in blocks:
         named.setdefault(b.producer, []).append(b)
-    names = list(expected) if expected is not None else list(named)
+    names = list(expected) if expected is not None else [p for p in named if p != "?"]
     why: list[str] = []
+    if "?" in named:                            # a block that names no producer cannot be matched to one that is expected
+        why.append(f"a block is unreadable ({named['?'][0].why})")
     for p in names:
         got = named.get(p, [])
         if p in failures:
-            why.append(f"producer {p} unreadable ({failures[p]})")
+            why.append(f"producer {p} unreadable ({failures[p] or 'no reason given'})")
         elif not got:
             why.append(f"producer {p} unreadable (no block supplied)")
-        elif len(got) > 1:
-            why.append(f"producer {p} unreadable (two blocks for one producer)")
-        elif got[0].why:
-            why.append(f"producer {p} unreadable ({got[0].why})")
+        elif (first := next((b.why for b in got if b.why is not None), None)) is not None:
+            why.append(f"producer {p} unreadable ({first})")
     if not names:
         why.append("not supplied")
-    rows = tuple(r for p, got in named.items() if len(got) == 1 and p not in failures for r in got[0].rows)
+    rows = tuple(r for b in blocks for r in b.rows)
     return rows, "; ".join(why) or None
 
 
@@ -631,7 +652,8 @@ class Evidence:
         flow's flat form is then judged by the evidence's own age only). ``store_id`` is the store's id: a block naming
         another one is unreadable, and with None (the store has no id) a block naming any id is readable. The object may
         carry ``producers`` (the producers expected for every source, or ``{source: [producers]}``) and ``producer_failures`` (``{producer: why}`` for
-        one that could not be read at all); without ``producers`` the expected ones are those that supplied a block."""
+        one that could not be read at all); without ``producers`` the expected ones are those that supplied a block. Positive rows
+        of every readable block stand whatever else fails; a source that is unreadable takes only the absence."""
         unreadable: dict[str, str] = {}
         if not isinstance(obj, Mapping):
             unreadable["evidence"] = "not an object"
@@ -645,8 +667,8 @@ class Evidence:
             for k, v in pairs:
                 named = isinstance(k, str) and bool(k)
                 malformed = malformed or not named or not isinstance(v, str)
-                if named:                               # a source that was NAMED stays unreadable even if its reason is junk
-                    unreadable[k] = v if isinstance(v, str) and v else "unreadable"
+                if named:                               # a source that was NAMED stays unreadable even if its reason is junk or empty
+                    unreadable[k] = ("unreadable (no reason given)" if v == "" else v) if isinstance(v, str) else "unreadable"
             if malformed:
                 unreadable["evidence"] = "malformed unreadable (expected an object of source -> reason)"
 
@@ -673,22 +695,30 @@ class Evidence:
             return [p for p in names if isinstance(p, str) and p] if isinstance(names, (list, tuple)) else None
         fails = obj.get("producer_failures")
         fails = {str(k): str(v) for k, v in fails.items()} if isinstance(fails, Mapping) else {}
-        named_bad = {s for s in PRODUCER_SOURCES if s in unreadable}     # the evidence itself says it could not read these
         composed = {s: _compose(s, obj, now=now, store_id=store_id, expected=expected_for(s), failures=fails) for s in PRODUCER_SOURCES}
         for s, (_rows, why) in composed.items():            # the reason absence cannot be concluded: the source reads unreadable
-            if why:
-                unreadable.setdefault(s, why)
-        seats = () if "seats" in named_bad else composed["seats"][0]       # a source its writer called unreadable stands for nothing
-        waiters = () if "waiters" in named_bad else composed["waiters"][0]
+            if why is None:
+                continue
+            if s not in unreadable:
+                unreadable[s] = why
+            elif why != "not supplied":                     # a declared reason and a block's own both stand
+                unreadable[s] = f"{unreadable[s]}; {why}"
+        # An ``unreadable`` declaration, a failed or an incomplete producer takes the ABSENCE of a source; the positive rows of
+        # every readable block stand beside it (a source its writer called unreadable still proves what it did show).
+        seats, waiters = composed["seats"][0], composed["waiters"][0]
         band_open: dict[str, tuple[str, ...]] = {}
-        band_resolved: dict[str, str] = {}
-        band_grade: dict[str, str] = {}
-        for r in () if "band" in named_bad else composed["band"][0]:
+        resolutions: dict[str, set[tuple[str, str]]] = {}
+        for r in composed["band"][0]:
             if r.state == "open":
                 band_open[r.id] = tuple(dict.fromkeys(band_open.get(r.id, ()) + r.items))
             else:
-                band_resolved[r.id] = r.by
-                band_grade[r.id] = r.grade
+                resolutions.setdefault(r.id, set()).add((r.by, r.grade))
+        band_resolved: dict[str, str] = {}
+        band_grade: dict[str, str] = {}
+        for rid, pairs in resolutions.items():              # two producers that disagree: both are named, the weaker grade stands
+            ordered = sorted(pairs)
+            band_resolved[rid] = ordered[0][0] if len(ordered) == 1 else "; ".join(f"{by} ({grade})" for by, grade in ordered)
+            band_grade[rid] = min((g for _, g in ordered), key=lambda g: (GRADE_ORDER.index(g) if g in GRADE_ORDER else -1, g))
         documents = src("documents", _p_documents, {})
         unattributed = src("unattributed", _p_unattributed, ())    # no item needs it, so the BOARD reports it unread
         raw_fetched = obj.get("fetched_at")
@@ -700,7 +730,7 @@ class Evidence:
         """Why ``source`` cannot be trusted, or None. ``git`` stands for the four git-derived sources and ``notes`` for
         the trailers carried in refs/notes/board (part of ``main``)."""
         for key in (source, "git" if source in _GIT_SOURCES else None, "notes" if source == "main" else None):
-            if key and self.unreadable.get(key):
+            if key and key in self.unreadable:
                 return f"{key}: {self.unreadable[key]}" if key != source else self.unreadable[key]
         return None
 
@@ -854,6 +884,7 @@ class _Ctx:
         self.memo: dict[str, State] = {}
         self.stack: set[str] = set()
         self.causes: dict[str, str] = {}      # item id -> the name of the check that made it unknown
+        self.notes: dict[str, list[str]] = {}     # item id -> the checks that were skipped for it, each with its reason
         self._cycles: dict[str, tuple[str, ...] | None] = {}
 
     def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
@@ -902,6 +933,12 @@ class _Ctx:
             return st
         finally:
             self.ev, self.idx = saved
+
+    def note(self, item: Item, source: str) -> None:
+        """Say that a check which needs ``source``'s absence was not run for ``item``, because that source is unreadable."""
+        line = f"{item.id}: not checked: {source} {self.ev.unreadable[source]}"
+        if line not in self.notes.setdefault(item.id, []):
+            self.notes[item.id].append(line)
 
     def focus(self, item: Item) -> None:
         """Point ``ev``/``idx`` at the evidence of the repo ``item`` belongs to. A repo that was not read is not judged
@@ -999,6 +1036,9 @@ def _chk_dangling_band(ctx: _Ctx, item: Item):
     if item.done_kind == "band" and item.done:
         refs.append(item.done)
     gone = [r for r in refs if r not in ev.band_open and r not in ev.band_resolved]
+    if gone and "band" in ev.unreadable:        # "not in the band" is an absence: the rows that were read are not the whole band
+        ctx.note(item, "band")
+        return None
     return (f"band:{gone[0]} is not in the band", tuple(gone)) if gone else None
 
 
@@ -1028,9 +1068,11 @@ def _trailer_close(ctx: _Ctx, item: Item) -> MainCommit | None:
 
 def _chk_conflict_closed_seat(ctx: _Ctx, item: Item):
     closed, seats = _trailer_close(ctx, item), ctx.idx.live_seats(item.id)
-    if closed and seats:
+    if closed and seats:                        # a seat that was read stands, whatever else was not
         return (f"conflict: closed by {_short(closed.sha)} on main vs live seat {seats[0].name}"
                 f"{f' since {seats[0].since}' if seats[0].since else ''}", (closed.sha, seats[0].name))   # seats: by name
+    if closed and "seats" in ctx.ev.unreadable:
+        ctx.note(item, "seats")
     return None
 
 
@@ -1038,11 +1080,19 @@ def _chk_conflict_closed_band(ctx: _Ctx, item: Item):
     closed, rows = _trailer_close(ctx, item), ctx.idx.band_naming.get(item.id, [])
     if closed and rows:
         return f"conflict: closed by {_short(closed.sha)} on main vs open band row {rows[0]}", (closed.sha, rows[0])
+    if closed and "band" in ctx.ev.unreadable:
+        ctx.note(item, "band")
     return None
 
 
 def _chk_conflict_chain_orphan(ctx: _Ctx, item: Item):
-    chain, orphans = ctx.idx.chain.get(item.id), ctx.idx.orphans(item.id)
+    chain = ctx.idx.chain.get(item.id)
+    if chain and "seats" in ctx.ev.unreadable and not _trailer_close(ctx, item):
+        # an orphan is a branch no live seat holds: with the seats not all read, a branch with commits of its own may be held
+        if any(b.ahead > 0 for b in ctx.idx.branches.get(item.id, ())):
+            ctx.note(item, "seats")
+        return None
+    orphans = ctx.idx.orphans(item.id)
     if chain and orphans and not _trailer_close(ctx, item):     # a closing trailer on main wins: the orphan is a note on done
         b = max(orphans, key=_branch_key)
         return (f"conflict: in chain {chain[0][0]} vs orphan branch {b.name} {_short(b.tip)} "
@@ -1080,7 +1130,7 @@ def _rule_done(ctx: _Ctx, item: Item) -> State | None:
         c = _trailer_close(ctx, item)
         if not c:
             return None
-        orphans = ctx.idx.orphans(item.id)
+        orphans = [] if "seats" in ev.unreadable else ctx.idx.orphans(item.id)     # an orphan is a branch no seat holds
         note = f"; orphan branch {(b := max(orphans, key=_branch_key)).name} {_short(b.tip)} carries {b.ahead} commits main lacks" if orphans else ""
         return ctx.make(item, "done", f"closed by {_short(c.sha)} ({c.date or 'no date'}){note}", (c.sha,))
     path = (item.done or "").strip()
@@ -1221,20 +1271,25 @@ _RULES: tuple[tuple[str, Callable[[_Ctx, Item], State | None]], ...] = (
 )
 
 
-#: The states whose rule fired because nothing above it did: each rests on "no live seat holds it, no open band row names
-#: it, no waiter runs on it". A positive claim (a seat, an open row, a waiter) keeps its state whatever another producer says.
-_REST_ON_ABSENCE = frozenset({"landed_not_closed", "blocked", "ready_with_start", "needs_grooming", "ready"})
+#: Per resulting state, the sources whose ABSENCE the state rests on: every higher-precedence state whose predicate reads a
+#: producer source (needs_you: band; landing: the waiters; in_flight: the seats) had to be absent for this one to be reached.
+#: A positive claim (a seat, an open row, a waiter) is its own state's evidence, but it is still overridden by the states
+#: above it, so ``in_flight`` rests on the band and the waiters not holding it. ``done`` rests on none, except a ``band``
+#: item whose row is "not still open".
+_ABSENCE_OF: dict[str, tuple[str, ...]] = {
+    "needs_you": (), "landing": ("band",), "in_flight": ("band", "waiters"),
+    "landed_not_closed": PRODUCER_SOURCES, "blocked": PRODUCER_SOURCES, "ready_with_start": PRODUCER_SOURCES,
+    "needs_grooming": PRODUCER_SOURCES, "ready": PRODUCER_SOURCES,
+}
 
 
 def _absence_reason(ev: Evidence, item: Item, state: str) -> str | None:
     """Why ``state`` cannot be concluded, or None: the absence it rests on needs every expected producer readable and complete."""
-    if state in _REST_ON_ABSENCE:
-        sources = PRODUCER_SOURCES
-    elif state == "done" and item.done_kind == "band":      # "its np row is not still open" is an absence too
-        sources = ("band",)
+    if state == "done" and item.done_kind == "band":      # "its np row is not still open" is an absence too
+        sources: tuple[str, ...] = ("band",)
     else:
-        return None
-    bad = [f"{s}: {ev.unreadable[s]}" for s in sources if ev.unreadable.get(s)]
+        sources = _ABSENCE_OF.get(state, ())
+    bad = [f"{s}: {ev.unreadable[s]}" for s in sources if s in ev.unreadable]
     return "; ".join(bad) or None
 
 
@@ -1355,6 +1410,8 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
         why = f"{source} unreadable: {evidence.unreadable[source]}"
         audit.append(AuditEntry("unknown", None, why))
         problems.append(why)
+    for st in states:                   # a check skipped because a source was not read is said, never silently passed
+        problems.extend(ctx.notes.get(st.id, ()))
     stale = _evidence_problem(evidence, now)
     if stale:                           # with nothing to read (or only decided items) an old fetch would otherwise be a clean board
         why = f"stale_evidence: {stale}"

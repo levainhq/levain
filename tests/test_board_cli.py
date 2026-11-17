@@ -292,7 +292,7 @@ def test_the_blocks_form_of_the_extra_is_appended_and_a_block_cannot_claim_the_f
     argv = ("--json", "--items", str(write_items(tmp_path, item(3))), "--evidence-extra", str(p), "--repo", str(world.w),
             "--since", "2026-11-12T00:00:00Z")
     rc, out, err = run(capsys, *argv)
-    assert "waiters: producer flow unreadable" not in out and states(json.loads(out)) == {"levain#3": "unknown"}   # flow's seats and band are not supplied
+    assert states(json.loads(out)) == {"levain#3": "ready"}          # flow speaks for waiters only, so only waiters are wanted of it
     p.write_text(json.dumps({"evidence_v": 2, "waiters": [dict(good["waiters"][0], form="flat")]}))
     rc, out, err = run(capsys, *argv)
     assert rc == 2 and "no form key" in err
@@ -390,7 +390,6 @@ def test_a_failure_board_prints_the_whole_reader_key(world, tmp_path, capsys):
     ('{"unreadable": {"seats": 42}}', "unreadable[seats] must be a string"),
     ('{"unreadable": {"seats": null}}', "unreadable[seats] must be a string"),
     ('{"unreadable": {"seats": ["x"]}}', "unreadable[seats] must be a string"),
-    ('{"unreadable": {"seats": "  "}}', "unreadable[seats] must be a string"),
     ('{"unreadable": {"main": "stale"}}', "reads itself"),
     ('{"unreadable": {"branches": "stale"}}', "reads itself"),
     ('{"reader": "evil"}', "reader"),
@@ -509,3 +508,74 @@ def test_extra_documents_apply_to_the_primary_repo_only():
     primary, other = {"documents": {}}, {"documents": {}}
     assert _merge_extra(primary, extra) is None and _merge_extra(other, extra, primary=False) is None
     assert primary["documents"] == {"result.md": True} and other["documents"] == {}
+
+
+# ------------------------------------------------------------------------------------------------ the fix round (levain#91)
+def _items_argv(world, tmp_path, *more, n=3):
+    return ("--json", "--items", str(write_items(tmp_path, item(n))), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z", *more)
+
+
+def test_no_land_waiter_stands_unless_a_producer_actually_supplied_waiters(world, tmp_path, capsys):
+    """F5: flow is expected only for the sources its extra carries; an extra with no waiters leaves the declaration standing."""
+    p = tmp_path / "extra.json"
+    p.write_text(json.dumps({"seats": [], "band": {"open": {}, "resolved": {}}}))
+    rc, out, _ = run(capsys, *_items_argv(world, tmp_path, "--evidence-extra", str(p), "--no-land-waiter"))
+    assert states(json.loads(out)) == {"levain#3": "ready"} and rc == 0
+    p.write_text(json.dumps({"seats": [], "band": {"open": {}, "resolved": {}}, "waiters": []}))     # now flow speaks for waiters
+    old = datetime.now(timezone.utc).timestamp() - 20 * 60
+    os.utime(p, (old, old))
+    doc = json.loads(run(capsys, *_items_argv(world, tmp_path, "--evidence-extra", str(p), "--no-land-waiter"))[1])
+    assert doc["items"][0]["state"] == "unknown" and "producer flow unreadable (stale 20 min)" in doc["items"][0]["reason"]
+
+
+def test_an_external_producer_is_expected_only_for_the_sources_its_file_holds(world, tmp_path, capsys):
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    only = {"waiters": {"producer": "acme", "store_id": None, "captured_at": when, "complete": True, "rows": []}}
+    (tmp_path / "evidence.acme.json").write_text(json.dumps({"evidence_v": 2, "blocks": only}))
+    rc, out, _ = run(capsys, *_items_argv(world, tmp_path, "--producer", "acme"))
+    assert states(json.loads(out)) == {"levain#3": "ready"}                       # acme says nothing of seats, so none is wanted of it
+    (tmp_path / "evidence.acme.json").write_text("{torn")
+    doc = json.loads(run(capsys, *_items_argv(world, tmp_path, "--producer", "acme"))[1])
+    assert "producer acme unreadable (evidence.acme.json cannot be read" in doc["items"][0]["reason"]   # a failed file is wanted for all
+
+
+def test_a_flat_extra_is_as_old_as_its_own_fetched_at_or_its_file_never_the_moment_it_was_read(world, tmp_path, capsys):
+    """F19."""
+    extra = extra_file(tmp_path)
+    old = datetime.now(timezone.utc).timestamp() - 3600
+    os.utime(extra, (old, old))
+    doc = json.loads(run(capsys, *_items_argv(world, tmp_path, "--evidence-extra", str(extra)))[1])
+    assert doc["items"][0]["state"] == "unknown" and "producer flow unreadable (stale 60 min)" in doc["items"][0]["reason"]
+    fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    extra = extra_file(tmp_path, fetched_at=fresh)
+    os.utime(extra, (old, old))
+    doc = json.loads(run(capsys, *_items_argv(world, tmp_path, "--evidence-extra", str(extra)))[1])
+    assert doc["items"][0]["state"] == "ready"           # its own fetched_at is fresh, whatever its file's age
+
+
+def test_a_repeated_producer_is_one_producer_and_the_native_name_is_refused(world, tmp_path, capsys):
+    _producer_file(tmp_path, "acme", waiters=[])
+    twice = run(capsys, *_items_argv(world, tmp_path, "--producer", "acme", "--producer", "acme"))
+    once = run(capsys, *_items_argv(world, tmp_path, "--producer", "acme"))
+    assert twice[1] == once[1]
+    (tmp_path / "evidence.acme.json").unlink()
+    doc = json.loads(run(capsys, *_items_argv(world, tmp_path, "--producer", "acme", "--producer", "acme"))[1])
+    assert doc["items"][0]["reason"].count("producer acme unreadable") == 3          # once for each of the three sources
+    rc, out, err = run(capsys, *_items_argv(world, tmp_path, "--producer", "levain"))
+    assert rc == 2 and out == "" and "Levain's own producer" in err and "Traceback" not in err
+
+
+def test_a_store_id_that_cannot_be_read_refuses_the_run_but_a_missing_one_does_not(world, tmp_path, capsys):
+    """F10."""
+    rc, out, err = run(capsys, *_items_argv(world, tmp_path, "--no-land-waiter"))
+    assert rc == 0
+    (tmp_path / "store.id").mkdir()
+    rc, out, err = run(capsys, *_items_argv(world, tmp_path, "--no-land-waiter"))
+    assert rc == 2 and out == "" and "store.id could not be read" in err and "Traceback" not in err
+
+
+def test_an_empty_unreadable_reason_in_the_extra_is_replaced_not_refused(world, tmp_path, capsys):
+    extra = extra_file(tmp_path, unreadable={"seats": "   "})
+    rc, doc, err = board(capsys, world, write_items(tmp_path, item(3)), extra)
+    assert rc == 3 and doc["items"][0]["state"] == "unknown"
+    assert any("seats unreadable: unreadable (no reason given)" in p for p in doc["problems"])
