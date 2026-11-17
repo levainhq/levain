@@ -350,6 +350,8 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 continue
             if brk is not None and any(board_chain.honours(a, sha, brk) for _, a in mine):
                 note = "; its chain break is acknowledged, but the line is torn for itself: acknowledge it as a torn line"
+            elif any(a.chain and a.sha256 == sha for _, a in mine):
+                note = "; a chain-style ack names it, but the line is torn for itself (not a chain break): acknowledge it as a torn line"
             elif n in acks:
                 note = "; an ack-torn names it with a different sha256" if brk is None else "; an ack-torn names it, but not as it stands now"
             else:

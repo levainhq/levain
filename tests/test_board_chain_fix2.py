@@ -117,6 +117,7 @@ def test_a_chain_style_ack_never_drops_a_malformed_line_whose_chain_is_whole(sto
     append(store, hand_ack(store, 2, sha(line), want=sha(raw_lines(store)[0]), have=sha(raw_lines(store)[0])))
     f = folded(store)
     assert f.torn and f.dropped == () and f.acked == ()
+    assert "a chain-style ack names it" in f.problems[0] and "different sha256" not in f.problems[0]
     append(store, hand_ack(store, 2, sha(line)))                                    # only the torn-style ack drops it
     f = folded(store)
     assert not f.torn and f.dropped == ((2, 4),)
