@@ -226,29 +226,35 @@ def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_hand
     canon_body = canonical(body)
     with store._write(ROLE_DESK, token) as (conn, now):
         held, _launch = active_desk_fence(conn, now, token, "a handoff")
-        writer = held.holder
-        digest = hashlib.sha256(canonical({"kind": kind, "body": body, "writer": writer}).encode("utf-8")).hexdigest()
-        stored = _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE close_key = ?",
-                                   (request_id,)).fetchone())
-        if stored is not None:
-            if stored.request_digest != digest:
-                raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} by another "
-                                 "writer or with other words; a changed close takes a new request id")
-            if stored.prev_handoff_id != prev_handoff_id:
-                raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} naming "
-                                 f"previous handoff {stored.prev_handoff_id}, not {prev_handoff_id}; a retry names "
-                                 "the same one")
-            return stored
-        head = conn.execute("SELECT MAX(handoff_id) FROM seam_handoffs").fetchone()[0]
-        if prev_handoff_id != head:
-            if head is None or (prev_handoff_id is not None and not 1 <= prev_handoff_id <= head):
-                raise CoordError(f"the close named previous handoff {prev_handoff_id}; the latest is {head} "
-                                 "(name the latest handoff, or None when there is none)")
-            raise CoordError(f"a newer handoff exists (latest is {head}, the close named {prev_handoff_id})")
-        covers = _counted_head(conn)
-        conn.execute(
-            "INSERT INTO seam_handoffs (close_key, seam_kind, written_at, writer, gseq, covers_gseq, prev_handoff_id, "
-            "request_digest, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (request_id, kind, now, writer, next_gseq(conn, now), covers, prev_handoff_id, digest, canon_body))
-        return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE close_key = ?",
-                                 (request_id,)).fetchone())
+        return _append(conn, now, writer=held.holder, kind=kind, body=body, canon_body=canon_body,
+                       request_id=request_id, prev_handoff_id=prev_handoff_id)
+
+
+def _append(conn: sqlite3.Connection, now: str, *, writer: str, kind: str, body: dict, canon_body: str,
+            request_id: str, prev_handoff_id: int | None) -> SeamHandoff:
+    """The ONE insert into ``seam_handoffs``, inside the caller's fenced write transaction (``writer`` is the lease
+    holder the caller's fence returned): :func:`close` and the dream rotation both call it, so there is one set of
+    refusals. The caller has already checked the kind, the body and the request id."""
+    digest = hashlib.sha256(canonical({"kind": kind, "body": body, "writer": writer}).encode("utf-8")).hexdigest()
+    stored = _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE close_key = ?", (request_id,)).fetchone())
+    if stored is not None:
+        if stored.request_digest != digest:
+            raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} by another "
+                             "writer or with other words; a changed close takes a new request id")
+        if stored.prev_handoff_id != prev_handoff_id:
+            raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} naming "
+                             f"previous handoff {stored.prev_handoff_id}, not {prev_handoff_id}; a retry names "
+                             "the same one")
+        return stored
+    head = conn.execute("SELECT MAX(handoff_id) FROM seam_handoffs").fetchone()[0]
+    if prev_handoff_id != head:
+        if head is None or (prev_handoff_id is not None and not 1 <= prev_handoff_id <= head):
+            raise CoordError(f"the close named previous handoff {prev_handoff_id}; the latest is {head} "
+                             "(name the latest handoff, or None when there is none)")
+        raise CoordError(f"a newer handoff exists (latest is {head}, the close named {prev_handoff_id})")
+    covers = _counted_head(conn)
+    conn.execute(
+        "INSERT INTO seam_handoffs (close_key, seam_kind, written_at, writer, gseq, covers_gseq, prev_handoff_id, "
+        "request_digest, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (request_id, kind, now, writer, next_gseq(conn, now), covers, prev_handoff_id, digest, canon_body))
+    return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE close_key = ?", (request_id,)).fetchone())
