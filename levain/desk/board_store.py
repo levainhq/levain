@@ -924,6 +924,9 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         if not HASH_RE.fullmatch(payload_hash or ""):
             raise BoardError(f"payload hash {payload_hash!r} is not a lowercase sha256 hex digest")
         fields = {**fields, "key": key, "payload_hash": payload_hash}
+    if relay is not None:                       # the same source validator relay_source runs: an np- id is refused before any key hit returns
+        from levain.desk import board_relay
+        board_relay.check_source_id(relay[0])
 
     def build(recs):
         _check_repo_mode(target.store_dir, repo, key)

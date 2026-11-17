@@ -465,7 +465,7 @@ def test_r7_a_band_that_cannot_be_built_or_read_is_a_refusal_never_a_traceback(s
 def test_r7_a_store_on_no_directory_is_read_without_creating_one(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lhome"))
     for src in (br.band_source(None), br.band_source(tmp_path / "nodir")):
-        with pytest.raises(br.BandRefusal, match="not a row this band holds"):
+        with pytest.raises(br.BandRefusal, match="no band store at"):
             src.row(NP)
     assert not (tmp_path / "nodir").exists() and not (tmp_path / "lhome").exists()
     assert not list(tmp_path.rglob("questions.db"))
@@ -513,3 +513,27 @@ def test_r10_r11_r12_the_constants_and_the_id_width_and_a_missing_words_field(tm
         assert br.Q_RE.fullmatch(q.id), q.id
     with pytest.raises(bstore.BoardError, match="must carry the words"):
         br.relay_source(NP, None, FakeBand())
+
+
+def test_r13_an_np_source_is_refused_even_on_an_idempotent_key_hit(store, capsys):
+    rc, _, err = run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24",
+                     "--words", EXCERPT, "--key", "k9", "--payload-hash", "d" * 64)
+    assert rc == 0, err
+    items = store / "items.jsonl"                               # stage by hand a relayed record citing an np- id, under that key
+    lines = [json.loads(x) for x in items.read_text("utf-8").splitlines()]
+    for r in lines:
+        if r.get("key") == "k9":
+            r["grade"] = br.GRADE_RELAYED
+            r["source"] = {"np": NP_FLOW, "producer": "flow", "question_sha256": "0" * 64, "answer_sha256": "0" * 64}
+    items.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in lines), "utf-8")
+    n = len(lines)
+    rc, _, err = run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24",
+                     "--words", EXCERPT, "--key", "k9", "--payload-hash", "d" * 64, "--source", NP_FLOW)
+    assert rc == 2 and "np- rows are flow's band" in err and len(records(store)) == n
+
+
+def test_r14_a_missing_band_store_says_so(tmp_path):
+    from levain.consent.questions import QuestionStore
+    d = tmp_path / "nowhere"
+    with pytest.raises(br.BandRefusal, match="no band store at"):
+        br.NativeBandSource(QuestionStore(d)).row("q-" + "a" * 24)
