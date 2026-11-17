@@ -97,13 +97,17 @@ def _snapshot(qdir: Path) -> dict:
     """Every byte of the store: the database, its write-ahead log (absent and empty are the same: a reader may make an
     empty one), and every other file under the directory (subdirectories walked) but SQLite's shared-memory index."""
     out: dict = {}
-    for p in sorted(qdir.rglob("*")):      # a directory the store makes (the read budget's, beside the database) is walked, not read
-        if p.is_dir() or p.name.endswith("-shm"):
-            continue
-        body = p.read_bytes()
-        if p.name.endswith("-wal") and not body:
-            continue
-        out[str(p.relative_to(qdir))] = body
+    for p in sorted(qdir.rglob("*")):      # a directory the store makes (the read budget's, beside the database) is walked and RECORDED
+        rel = str(p.relative_to(qdir))
+        if p.is_symlink():                 # never followed (a link to an ancestor would recurse): its target is the content
+            out[rel] = ("symlink", os.readlink(p))
+        elif p.is_dir():
+            out[rel + "/"] = "directory"   # an empty directory a refused verb made is a change
+        elif not p.name.endswith("-shm"):
+            body = p.read_bytes()
+            if p.name.endswith("-wal") and not body:
+                continue
+            out[rel] = body
     return out
 
 
@@ -578,3 +582,13 @@ def _no_policy():
         def apply(self, verb, base):
             return base
     return _P()
+
+
+def test_the_store_snapshot_records_a_new_empty_directory_and_a_symlink_without_following_it(tmp_path: Path) -> None:
+    (tmp_path / "dispatch.db").write_bytes(b"x")
+    before = _snapshot(tmp_path)
+    (tmp_path / "made").mkdir()
+    assert _snapshot(tmp_path) != before                       # an empty directory is a change
+    (tmp_path / "loop").symlink_to(tmp_path)                    # a link to an ancestor must not recurse
+    after = _snapshot(tmp_path)
+    assert after["loop"] == ("symlink", str(tmp_path)) and "made/" in after
