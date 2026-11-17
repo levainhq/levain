@@ -257,6 +257,41 @@ def test_a_revoke_the_ledger_refuses_is_named_as_not_recorded():
     assert hasattr(EL, "REVOKED_MAX") and hasattr(EL, "REVOKED_KEEP_S")
 
 
+def test_the_revoke_retry_instructions_are_bounded_and_true_to_the_ledger():
+    from levain.slot import egress_ledger as EL
+    flat = " ".join(TEXT.split())
+    rsrc = _src(EL).split("def record_revoked")[1].split("__all__")[0]
+    # expiry is applied at the start of the same call, before the cap is counted: one wait frees the room
+    assert rsrc.index("if r.keep_until > now]") < rsrc.index("> REVOKED_MAX")
+    assert "keep = now + timedelta(seconds=REVOKED_KEEP_S)" in rsrc          # each row lapses KEEP_S after ITS write
+    assert 800 <= EL.REVOKED_KEEP_S <= 1000 and "about 15 minutes" in flat
+    assert "drops lapsed rows at the start of the next revoke, before it counts the cap" in flat
+    # both retry bullets name a stop and the answers that end the retry
+    assert "stop and treat it as a fault" in flat and "refused three times running, stop" in flat
+    assert "answers `removed` (the file now holds the id), not `recorded`, and either answer ends it" in flat
+    assert "ends on `recorded` (or `removed` if the grant landed in the file in between)" in flat
+    assert "re-run the revoke until it answers" not in flat
+    # the narrowed-file raise site: only when the file held the id (a removal), so its answer is `removed`
+    src = _src(EV)
+    assert "if removed and sd is not None:" in src
+    assert 'raise Refused(ERR_WRITE, "the narrowed file could not be written; the old one is in force")' in src
+    assert "a re-run that works answers `removed`" in flat
+
+
+def test_both_off_list_log_lines_carry_the_routes_egress_remedy():
+    assert front.OFF_LIST_REMEDY == "sudo install-helper routes-egress"
+    src = _src(front)
+    assert '(("host-not-allowed", "off-list"), ("host-not-allowed", "unattended"))' in " ".join(src.split()) \
+        or ('("host-not-allowed", "off-list"), ("host-not-allowed", "unattended")' in src)
+    assert "Both log lines carry the `routes-egress` remedy" in " ".join(TEXT.split())
+    assert 'raise Refused("host-not-allowed", "unattended")' in src and 'raise Refused("host-not-allowed", "off-list")' in src
+
+
+def test_the_unprepared_slot_answer_is_said_as_an_empty_list_everywhere():
+    flat = " ".join(TEXT.split())
+    assert "empty set" not in flat and flat.count("answers an empty list") == 2
+
+
 def test_a_missing_setup_step_two_is_said_not_to_be_caught_at_session_start():
     flat = " ".join(TEXT.split())
     assert "That check does not catch a missing setup step 2" in flat
@@ -273,9 +308,15 @@ def test_a_missing_setup_step_two_is_said_not_to_be_caught_at_session_start():
 
 
 def test_the_never_granted_rule_names_what_host_class_checks():
+    vsrc = _src(__import__("levain.slot.egress_verify", fromlist=["x"]))
     flat = " ".join(TEXT.split())
     assert "named in the `hosts` list of any route in the base map" in flat
-    assert "A route's `upstream` host is not on that list" in flat
+    # the doc does not promise an upstream host is grantable: the check reads `hosts` lists only, and nothing keeps an
+    # upstream name out of one
+    assert "A route's `upstream` host is not on that list" not in flat
+    assert "reads each route's `hosts` list only, never its `upstream` host" in flat
+    assert "is also written in some route's `hosts`, it is refused like any other host on that list" in flat
+    body = vsrc.split("def host_class")[1].split("def enrolled_key")[0].split('"""')[2]
+    assert "upstream" not in body                             # the check's code never reads an upstream host
     assert "on any route in the base map" not in flat
-    vsrc = _src(__import__("levain.slot.egress_verify", fromlist=["x"]))
     assert "any(host in hs for hs in hosts.values())" in vsrc and "VENDOR_HOSTS" in vsrc

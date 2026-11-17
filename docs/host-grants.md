@@ -19,9 +19,10 @@ files one for a tap, and the cockpit's list and revoke. Each section names the p
   session only.
 - Root keeps at most 16 grants per session file. Root never grants a host that is named in the `hosts` list of any
   route in the base map, whether or not this session uses that route (another vendor's brokered or passthrough route
-  included), or that is a model vendor's own host. A route's `upstream` host is not on that list, so a grant to it is
-  not refused for that reason. Levain files no card for such a host, and the end-of-session note says it was refused and
-  that no grant can allow it for this session. A grant to a name that is never granted (`localhost`, `*.local`,
+  included), or that is a model vendor's own host. Levain files no card for such a host, and the end-of-session note
+  says it was refused and that no grant can allow it for this session. (The check reads each route's `hosts` list
+  only, never its `upstream` host; if the same name is also written in some route's `hosts`, it is refused like any
+  other host on that list.) A grant to a name that is never granted (`localhost`, `*.local`,
   `*.internal`, `metadata.*` and the other names that are never the public internet) is refused. The front's address check still runs on a granted host: a name that resolves to a private or
   loopback address is refused.
 
@@ -50,7 +51,7 @@ A grant is issued by a tap on the phone's passkey, filed as a card by the sessio
 No card is filed when no cockpit is running for the signing queue. If root's `egress-grants-list` is refused when the
 session starts (for example `egress-grant-not-ready`), the supervisor says once that host cards are off for this
 session and the session goes on. That check does not catch a missing setup step 2: for a slot that `setup` or `repair`
-has not prepared, root's list answers an empty set, so cards are still filed, and the first sign is a tap that fails
+has not prepared, root's list answers an empty list, so cards are still filed, and the first sign is a tap that fails
 with "host grants are not set up for this install" (`egress-grant-not-ready`) and makes no grant.
 
 **Seats are not covered.** A seat's egress is its own lease (`levain seat egress`, see
@@ -98,10 +99,17 @@ narrow: it removes grants and never adds one.
 - `Revoke all` never touches that ledger.
 - A revoke of an id the file does not hold can be refused, and then **the revoke was not recorded**, so a signed grant
   still on its way can land afterwards. `egress-grant-ledger-full`: the revocation ledger is at its cap of live ids
-  (`REVOKED_MAX` in `levain/slot/egress_ledger.py`) and fails closed; a row lapses on its own after `REVOKED_KEEP_S`
-  (same file), so re-run the revoke after that. `egress-grant-write-failed`: root could not write the ledger ("the revocation may not be recorded:
-  revoke it again"); re-run the revoke until it answers `recorded`. The same name also refuses a narrowed file that
-  could not be written, and there the old file stays in force: re-run it too.
+  (`REVOKED_MAX` in `levain/slot/egress_ledger.py`) and fails closed. Each row lapses on its own `REVOKED_KEEP_S`
+  (same file, about 15 minutes) after it was written, and root drops lapsed rows at the start of the next revoke, before
+  it counts the cap, so one re-run after that wait finds room unless new revokes have filled it again. The wait is
+  not safe for an in-flight grant, which can land meanwhile: the re-run then answers `removed` (the file now holds the
+  id), not `recorded`, and either answer ends it. If the re-run is refused `egress-grant-ledger-full` again, stop and
+  treat it as a fault. `egress-grant-write-failed`: root could not write the ledger ("the revocation may not be
+  recorded: revoke it again"); re-run the revoke, which ends on `recorded` (or `removed` if the grant landed in the
+  file in between). If it is refused three times running, stop: the cause (a read-only or full disk, a permissions
+  fault) is not one a retry clears. The same name also refuses a narrowed file that could not be written; there the
+  grant was in the file, the old file stays in force, and a re-run that works answers `removed` (the other answer is
+  not possible for an id the file holds), with the same three-try limit.
 - Revoke while a delivery is in flight can answer `session-busy`: re-run the same command.
 - A grant whose signed bytes were already on their way to root when you revoked can still land seconds later; it
   shows up as a new row, not as a failure.
