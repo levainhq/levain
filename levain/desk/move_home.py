@@ -124,6 +124,14 @@ class _Changed(Exception):
     """A settings file changed between the read and the replace."""
 
 
+def _elide(path, keep: int = 80) -> str:
+    """``path`` as text, cut in the MIDDLE of the path only when it is long, so a refusal line can always carry its reason."""
+    text = str(path)
+    if len(text) <= keep:
+        return text
+    return f"{text[: keep // 2 - 1]}...{text[-(keep // 2 - 2):]}"
+
+
 def _replace_bytes(path: Path, raw: bytes, expected: bytes | None = None) -> None:
     """Replace ``path`` (through a link: the link's target) with ``raw``, atomically. With ``expected``, the file must still
     hold exactly those bytes when the replace happens (one check, no retry)."""
@@ -137,7 +145,7 @@ def _replace_bytes(path: Path, raw: bytes, expected: bytes | None = None) -> Non
         except OSError:
             pass
         if expected is not None and target.read_bytes() != expected:
-            raise _Changed(f"{path} changed while it was being rewritten")
+            raise _Changed(f"{_elide(path)} changed while it was being rewritten")
         os.replace(tmp, target)
     except BaseException:
         try:
@@ -349,7 +357,10 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
                 os.rename(new, old)
             except OSError:
                 pass
-        print(f"levain desk move-home: failed ({type(exc).__name__}: {str(exc)[:160]}); everything this run changed was "
+        # the reason comes whole: _Changed is private, so its message stands alone (its path already elided); any other
+        # error keeps its class name and a bounded text
+        what = str(exc) if isinstance(exc, _Changed) else f"{type(exc).__name__}: {str(exc)[:160]}"
+        print(f"levain desk move-home: failed ({what}); everything this run changed was "
               f"put back (the directory, the link, the stored directory and every settings file)", file=err)
         return 1
     if do_rename:

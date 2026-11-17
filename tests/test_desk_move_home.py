@@ -281,6 +281,25 @@ def test_the_dollar_home_spellings_are_rewritten_only_for_the_users_own_levain(t
     assert kept == data and ch == []             # a levain home elsewhere does not own the user's ~/.levain
 
 
+def test_changed_refusal_keeps_its_reason_under_a_long_path(tmp_path, monkeypatch):
+    long = tmp_path / ("d" * 120) / ("e" * 120)
+    long.mkdir(parents=True)
+    home, settings = _setup(long)
+    assert len(str(settings)) > 200
+    from levain.desk import move_home as mh
+    real = mh._replace_bytes
+
+    def racing(path, raw, expected=None):
+        if expected is not None:
+            Path(path).write_text('{"hooks": {}, "edited": true}')
+        real(path, raw, expected)
+
+    monkeypatch.setattr(mh, "_replace_bytes", racing)
+    rc, _, err = _run(home, settings)
+    assert rc == 1 and "changed while it was being rewritten" in err and "_Changed" not in err
+    assert "put back" in err
+
+
 def test_settings_changed_before_the_replace_refuses_and_changes_nothing(tmp_path, monkeypatch):
     home, settings = _setup(tmp_path)
     from levain.desk import move_home as mh
