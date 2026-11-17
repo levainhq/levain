@@ -675,3 +675,18 @@ def test_a_failed_directory_fsync_after_a_new_store_id_is_a_warning(home, tmp_pa
     rc, out, err = run(capsys, "use", str(store))
     assert rc == 0 and "io error" in err and str(store) in err
     assert (store / "store.id").read_text().strip()
+
+
+def test_same_file_needs_device_and_inode_to_match(tmp_path, monkeypatch):
+    p = tmp_path / "f"
+    p.write_text("x")
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert bs._same_file(fd, p)
+        real = os.stat(p)
+        other_dev = os.stat_result((real.st_mode, real.st_ino, real.st_dev + 1) + tuple(real)[3:])
+        monkeypatch.setattr(bs.os, "stat", lambda *_a, **_k: other_dev)
+        assert other_dev.st_ino == os.fstat(fd).st_ino
+        assert not bs._same_file(fd, p)
+    finally:
+        os.close(fd)

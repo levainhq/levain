@@ -21,8 +21,8 @@ reading or writing ``store.id`` and ``items.jsonl``, and any further store file.
 reads. The items file is also flocked on its own descriptor, so a writer that locks only that file excludes this one.
 
 Known limit: git's own writes (checkout, stash, merge) can REPLACE a tracked file by a new inode and take no lock. The
-protocol cannot exclude them; what it does is open every file under the lock and re-check ``fstat(fd).st_ino ==
-stat(path).st_ino`` (retried a bounded number of times, then refused), so a reader is never left judging a snapshot that
+protocol cannot exclude them; what it does is open every file under the lock and re-check that
+``(st_dev, st_ino)`` of ``fstat(fd)`` and ``stat(path)`` match (retried a bounded number of times, then refused), so a reader is never left judging a snapshot that
 was replaced under it.
 """
 from __future__ import annotations
@@ -175,11 +175,7 @@ def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_o
             except OSError as exc:
                 os.close(fd)
                 raise BoardError(f"cannot lock {path}: {exc}") from None
-        try:
-            same = os.fstat(fd).st_ino == os.stat(path).st_ino
-        except OSError:
-            same = False
-        if same:
+        if _same_file(fd, path):
             return fd
         os.close(fd)
     raise BoardError(f"{path} keeps being replaced under the lock (a git operation?); retry")
@@ -187,7 +183,8 @@ def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_o
 
 def _same_file(fd: int, path: Path) -> bool:
     try:
-        return os.fstat(fd).st_ino == os.stat(path).st_ino
+        a, b = os.fstat(fd), os.stat(path)
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
     except OSError:
         return False
 
