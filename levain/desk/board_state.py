@@ -581,7 +581,8 @@ def _read_block(source: str, raw: Any, *, now: datetime | None, store_id: str | 
         return bad("complete is not true or false")
     if not raw["complete"]:
         why = raw.get("why")
-        return _Block(producer, rows, "incomplete" + (f": {why}" if isinstance(why, str) and why else ""))
+        why = why.strip() if isinstance(why, str) else ""
+        return _Block(producer, rows, "incomplete" + (f": {why}" if why else ""))
     return _Block(producer, rows, None)
 
 
@@ -612,7 +613,7 @@ def _compose(source: str, obj: Mapping[str, Any], *, now: datetime | None, store
     for p in names:
         got = named.get(p, [])
         if p in failures:
-            why.append(f"producer {p} unreadable ({failures[p] or 'no reason given'})")
+            why.append(f"producer {p} unreadable ({failures[p].strip() or 'no reason given'})")
         elif not got:
             why.append(f"producer {p} unreadable (no block supplied)")
         elif (first := next((b.why for b in got if b.why is not None), None)) is not None:

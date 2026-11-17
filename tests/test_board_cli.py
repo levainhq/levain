@@ -622,3 +622,18 @@ def test_attach_producers_gives_each_call_its_own_blocks():
     first["seats"][0]["rows"].append("x")
     assert native["seats"]["rows"] == [] and second["seats"][0]["rows"] == []
     assert external["seats"][0]["rows"] == [] and len(native) == 1 and len(external["seats"]) == 1
+
+
+def test_attach_producers_copies_the_blocks_already_in_the_evidence_too():
+    """M2: a block the extra put in evidence[source] is not shared between the primary and an --also-repo evidence."""
+    import copy
+
+    from levain.desk import board_cli
+
+    shared = {"producer": "flow", "rows": []}
+    first, second = {"seats": [shared]}, {"seats": [shared]}       # what _merge_extra does: the same parsed block in both
+    board_cli._attach_producers(first, {}, {}, {})
+    board_cli._attach_producers(second, {}, {}, {})
+    assert first["seats"][0] is not second["seats"][0] and first["seats"][0] is not shared
+    first["seats"][0]["rows"].append("x")
+    assert second["seats"][0]["rows"] == [] and shared["rows"] == []

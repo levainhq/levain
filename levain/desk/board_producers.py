@@ -218,7 +218,11 @@ def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]]
         else:
             rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(store, q)})
     if not band_view._foreign(store):          # the open authority rows (consent, sign, extend) the band shows; read even when a source failed
-        extras = band_sources.read_extras(store.directory, store._clock, now=now)
+        try:
+            extras = band_sources.read_extras(store.directory, store._clock, now=now)
+        except Exception as exc:                # noqa: BLE001 - the authority rows are lost; the question rows already read still stand
+            whys.append(f"the band could not read an authority source ({type(exc).__name__})")
+            return rows, "; ".join(dict.fromkeys(whys))
         for e in extras.items:
             if (e.unreadable is not None or not all(isinstance(x, str) and x for x in (e.source, e.ref))
                     or not isinstance(e.what, str) or not isinstance(e.blocks, str)):

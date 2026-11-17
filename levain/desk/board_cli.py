@@ -230,7 +230,7 @@ def _attach_producers(evidence: dict[str, Any], native: dict[str, dict[str, Any]
     supplied: dict[str, list[str]] = evidence.get("producers") or {}
     expected: dict[str, list[str]] = {}
     for source in PRODUCER_SOURCES:
-        evidence[source] = [*([native[source]] if source in native else []), *external.get(source, []), *evidence.get(source, [])]
+        evidence[source] = [*([native[source]] if source in native else []), *external.get(source, []), *copy.deepcopy(evidence.get(source, []))]
         names = [*([bp.NATIVE_PRODUCER] if source in native else []), *(b.get("producer") for b in external.get(source, [])),
                  *failures, *supplied.get(source, [])]
         expected[source] = list(dict.fromkeys(n for n in names if isinstance(n, str) and n))

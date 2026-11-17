@@ -654,3 +654,34 @@ def test_evidence_from_dict_requires_now():
     """K4: no default, so a caller cannot forget the instant blocks are judged at."""
     with pytest.raises(TypeError):
         bs.Evidence.from_dict({"evidence_v": 1})
+
+
+def test_a_whitespace_reason_or_why_is_replaced_like_an_empty_one():
+    """M3: a block's why and a producer's failure reason are stripped before the truthiness test."""
+    got, _ = board_of(ev2(**whole("levain"), producer_failures={"flow": "  \n"}), _item(1))
+    reason = got["levain#1"].reason
+    assert "producer flow unreadable (no reason given)" in reason and "(  " not in reason
+    parts = merged(whole("levain"), whole("flow"))
+    parts["band"] = [blk("levain", []), blk("flow", [], complete=False, why="   ")]
+    got, _ = board_of(ev2(**parts), _item(1))
+    assert "producer flow unreadable (incomplete)" in got["levain#1"].reason
+    parts["band"] = [blk("levain", []), blk("flow", [], complete=False, why="  real why ")]
+    got, _ = board_of(ev2(**parts), _item(1))
+    assert "incomplete: real why)" in got["levain#1"].reason
+
+
+def test_native_band_keeps_its_open_question_rows_when_the_authority_reread_raises(monkeypatch, tmp_path):
+    """M1: a read_extras that raises costs the authority rows only; the question rows stand and the block is incomplete."""
+    from levain import band_sources
+
+    _store, qs, now = _numbered_store(tmp_path, "ALLOW the land of levain#9")
+
+    def boom(*a, **k):
+        raise OSError("disk gone")
+    monkeypatch.setattr(band_sources, "read_extras", boom)
+    got = bp.native_blocks(now=now, store_id="s1", consent_dir=tmp_path)["band"]
+    assert got["complete"] is False and "the band could not read an authority source (OSError)" in got["why"]
+    assert [r["id"] for r in got["rows"]] == [qs[0].id] and got["rows"][0]["items"] == ["levain#9"]
+    got = {**got, "captured_at": _stamp(1.0)}                       # the test store's clock is not the board's NOW
+    board, _ = board_of(ev2(seats=[blk("levain", [])], waiters=[blk("levain", [])], band=[got], producers=("levain",)), _item(9))
+    assert board["levain#9"].state == "needs_you"
