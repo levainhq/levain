@@ -160,6 +160,37 @@ def seam_note(recs: list[DreamRecord], started_at: str, lv: str, tail: str) -> s
             "writes the handoff alone. Nothing rotates you on its own.")
 
 
+def rollback_notes(conn: sqlite3.Connection, recs: list[DreamRecord], started_at: str) -> list[str]:
+    """The rollback-after-rotation notice (levain#86): one line per dream a rotation handed over onto that was rolled
+    back after the desk that started at ``started_at`` loaded it. READ ONLY, and derived, not stored: the notice is
+    the pairing of three records the store already holds, so there is nothing to write once and nothing to
+    acknowledge.
+
+    A line is told for an occurrence when (1) a ``consolidated`` card of it was filed no later than ``started_at``
+    (this desk's memory included that save), (2) a ``rolled-back`` card of it was filed after ``started_at`` (the text
+    this desk loaded was undone while it ran), and (3) the rotation wrote a handoff under ``dream-rotation:<occurrence>``
+    (:data:`levain.desk.dream_rotation.KEY_PREFIX`). A rollback of a dream no rotation used says nothing here. A desk
+    that started after the rollback loaded the restored text and is told nothing. The line tells; it opens, ends and
+    launches nothing, and asks nothing of the desk. Newest rollback first."""
+    from levain.desk.dream_rotation import KEY_PREFIX
+
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone() is None:
+        return []
+    saves = {r.occurrence: r for r in recs if r.kind == "consolidated"}
+    out: list[str] = []
+    for back in (r for r in recs if r.kind == "rolled-back"):
+        save = saves.get(back.occurrence)
+        if save is None or save.at > started_at or back.at <= started_at:
+            continue
+        if conn.execute("SELECT 1 FROM seam_handoffs WHERE close_key = ?", (KEY_PREFIX + back.occurrence,)).fetchone() is None:
+            continue
+        out.append(f"Dream rolled back: the dream of occurrence {back.occurrence} (saved {save.at}) was rolled back at "
+                   f"{back.at}, after the dream rotation that handed over onto it; this "
+                   f"desk started at {started_at} and holds the memory that dream saved, which is now undone. This is a "
+                   "notice only: nothing was opened, ended or launched for you.")
+    return out
+
+
 def _claimed_events(conn: sqlite3.Connection, launch_id: str) -> list[str]:
     """Sensor events whose latest lifecycle row hands them to ``launch_id`` (``claimed`` or ``delivered``): work its
     brief took and it has not acknowledged (``levain.desk.events``). An expired claim still counts until a pass writes
