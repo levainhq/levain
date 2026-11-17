@@ -542,3 +542,134 @@ def test_saves_all_rolled_back_before_the_desk_started_are_named_as_such(desk):
     _file(desk.directory, "rolled-back", start - timedelta(hours=2), occurrence="occ-1", reason="rolled back by operator")
     due, why = dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)
     assert due is False and why.startswith("every dream save in this store was rolled back")
+
+
+# --- levain#83: the dream rotation end to end -------------------------------------------------------------------------
+# One sequence on real stores: a real dream save (``consolidate_store``, a canned mind) into a real anneal store, the dream's
+# own card filed into the desk's review store, a due seam, the rotation, the next desk's launch request, its activation,
+# and what that desk reads. The launched desk's memory is the file its install's CLAUDE.md imports
+# (``@.levain/memory.continuity.md``), so "loaded" below is a read of that path under the SUCCESSOR launch's own cwd.
+_DREAMED = """\
+## State
+The dream of the 14th: the freshly saved memory a desk must load, with a marker the test reads back: PELICAN-83.
+
+## Active Threads
+- Getting my bearings: pointer: this session.
+
+## Patterns
+Nothing graduated yet.
+
+## Decisions
+Nothing committed yet.
+
+## Context
+The dream metabolized the opening episodes.
+
+## Understanding
+Early days.
+"""
+
+
+class _CannedMind:
+    name, source, unit, model = "canned", "canned", "tokens", "canned"
+
+    def compose(self, req):
+        from levain.dream import executor as ex
+
+        return ex.ComposeResult(text=_DREAMED, unit="tokens", input_tokens=1, output_tokens=1)
+
+
+def _dream_saves(install, tmp_path):
+    """A real dream save into ``install/.levain/memory.db``: returns the text anneal says it saved and the occurrence."""
+    from anneal_memory import FLOW_SCHEMA, Store
+
+    from levain.dream import executor as ex
+
+    store_dir = install / ".levain"
+    store_dir.mkdir(parents=True)
+    with Store(str(store_dir / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        for i in range(3):
+            s.record(content=f"Turn {i}: helped the operator.", episode_type="observation", source="t")
+    got = ex.consolidate_store(store_dir / "memory.db", mind=_CannedMind(), occurrence_dir=tmp_path / "occ")
+    assert (got.outcome, got.exit_code) == ("saved", 0), got
+    with Store(str(store_dir / "memory.db"), read_only=True) as s:
+        saved = s.load_continuity()
+    assert "PELICAN-83" in saved
+    return saved, "occ-83"
+
+
+def _loaded_memory(launch):
+    """What the next desk reads as its memory: the file the install's CLAUDE.md imports, under the launch's own cwd."""
+    from pathlib import Path
+
+    template = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "adapters" / "claude-code"
+                / "CLAUDE.md.template").read_text(encoding="utf-8")
+    assert "@.levain/memory.continuity.md" in template.splitlines()
+    return (Path(launch.cwd) / ".levain" / "memory.continuity.md").read_bytes().decode("utf-8")
+
+
+@pytest.fixture
+def dreamed(desk, tmp_path):
+    """The desk's agent runs in an install whose memory a dream then saves; the dream's card is filed after the desk
+    started. Returns (saved text, occurrence)."""
+    install = _dir(tmp_path, "install")
+    desk.coord_set_agent("claude", cwd=str(install))
+    saved, occ = _dream_saves(install, tmp_path)
+    _file(desk.directory, "consolidated", parse_stamp(_started(desk)) + timedelta(hours=1), occurrence=occ)
+    return saved, occ
+
+
+def _activate_successor(desk, successor):
+    """What the watcher does for a pending desk launch: spawn claimed, session activated. Returns the new lease token."""
+    assert desk.pending_desk().launch_id == successor.launch_id
+    desk.launch_claim_spawn(successor.launch_id, os.getpid())
+    got, why = desk.launch_activate(successor.launch_id, harness_session_id="h-" + successor.launch_id)
+    assert why is None and got.state == "active"
+    return desk.coord_status()["lease"]["token"]
+
+
+def test_a_dream_save_rotates_the_desk_and_the_next_desk_loads_the_saved_text_and_the_dream_open(desk, dreamed, capsys):
+    from levain.desk import dream_rotation
+
+    saved, occ = dreamed
+    got = dream_rotation.rotate(desk, token=desk.token, body=BODY)
+    assert isinstance(got, dream_rotation.Rotation) and got.occurrence == occ
+    assert got.handoff.seam_kind == "dream" and got.handoff.close_key == f"dream-rotation:{occ}"
+    token = _activate_successor(desk, got.successor)
+    # the new desk's loaded memory is the saved text, byte for byte
+    assert _loaded_memory(got.successor) == saved
+    # its open is the dream open, built from the rotation's handoff
+    desk.token = token
+    out = _open(desk, capsys)
+    assert "SEAM OPEN dream" in out and "--read-back-file PATH" in out
+    row = sqlite3.connect(desk.path).execute("SELECT seam_kind, signal_kind, signal_key FROM open_builds").fetchone()
+    assert row == ("dream", "dream", str(got.handoff.handoff_id))
+
+
+def _has_open_wiring():
+    from pathlib import Path
+
+    from levain.desk import cli as desk_cli
+
+    return "--dream-body-file" in Path(desk_cli.__file__).read_text(encoding="utf-8")
+
+
+def test_coord_open_with_a_dream_body_file_hands_over_and_the_next_desk_loads_the_saved_text(desk, dreamed, tmp_path, capsys):
+    # THROUGH ``coord open``: needs levain#82 slice 2 (the open wiring, branch seat/1116-26-r82b). A probe, not a skip mark:
+    # it skips while the flag is absent and runs the moment the branch carries it.
+    if not _has_open_wiring():
+        pytest.skip("needs levain#82 slice 2 (the open wiring), branch seat/1116-26-r82b")
+    saved, occ = dreamed
+    bf = tmp_path / "rot.json"
+    bf.write_text(json.dumps(BODY))
+    rotated = json.loads(_open(desk, capsys, "--dream-body-file", str(bf), "--json"))
+    assert rotated["rotated"] is True and rotated["occurrence"] == occ
+    successor = desk.pending_desk()
+    assert successor.launch_id == rotated["successor_launch_id"]
+    token = _activate_successor(desk, successor)
+    assert _loaded_memory(successor) == saved
+    desk.token = token
+    out = _open(desk, capsys)
+    assert "SEAM OPEN dream" in out
+    row = sqlite3.connect(desk.path).execute("SELECT seam_kind, signal_kind, signal_key FROM open_builds").fetchone()
+    assert row == ("dream", "dream", str(rotated["handoff_id"]))
