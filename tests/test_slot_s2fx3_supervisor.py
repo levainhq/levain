@@ -116,8 +116,30 @@ def gone(pid: int) -> bool:
     return False
 
 
+def read_int(path: Path, wait: float = 3.0) -> int:
+    """An integer a fake process writes to ``path``: the file can exist and still be empty (the fake creates it, then
+    writes), so an empty or partial read means "not yet" and is retried until ``wait`` seconds."""
+    end = time.monotonic() + wait
+    while True:
+        try:
+            return int(path.read_text())
+        except (OSError, ValueError):
+            if time.monotonic() >= end:
+                raise
+            time.sleep(0.01)
+
+
+def count_at_least(path: Path, n: int) -> bool:
+    """The counter file ``path`` reads >= ``n``. A missing, empty or half-written file is "not yet" (False), never an
+    error: a condition that raises in a watcher thread would kill the thread and leave the run hanging."""
+    try:
+        return int(path.read_text()) >= n
+    except (OSError, ValueError):
+        return False
+
+
 def pid_of(r: Rig, verb: str) -> int:
-    return int((r.store / f"pid-{verb}").read_text())
+    return read_int(r.store / f"pid-{verb}")
 
 
 # --- g4-1: a helper that cannot run, and teardown raising, never skip the pty's end -----------------------------------

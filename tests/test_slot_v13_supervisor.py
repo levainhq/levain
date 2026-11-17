@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from levain.slot import supervisor as SV
-from tests.test_slot_s2fx3_supervisor import rig as fx3_rig, stop_when
+from tests.test_slot_s2fx3_supervisor import read_int, rig as fx3_rig, stop_when
 from tests.test_slot_s2s_supervisor import SESSION, Rig, bounded, isolated_git  # noqa: F401
 
 
@@ -338,7 +338,7 @@ def test_stop_mid_probe_ends_the_probe_and_tears_down_once(tmp_path: Path, monke
     stop_when(r.store / "pid-probe", 0.2)
     assert r.run() == 1
     assert [x["verb"] for x in r.verbs()] == ["prepare", "render", "probe", "start", "probe", "teardown"]
-    assert gone(int((r.store / "pid-probe").read_text()))   # ended and reaped before teardown
+    assert gone(read_int(r.store / "pid-probe"))   # ended and reaped before teardown
     err = r.stderr()
     assert f"SIGTERM: ending session {SESSION}" in err and err.count("ended RETAINED") == 1
 

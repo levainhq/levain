@@ -31,7 +31,7 @@ from levain.consent.cockpit_origin import write_origin
 from levain.slot import egress_cards as EC
 from levain.slot import egress_grants as eg
 from levain.slot import supervisor as SV
-from tests.test_slot_s2fx3_supervisor import FX3_HELPER, gone, rig as fx3_rig
+from tests.test_slot_s2fx3_supervisor import FX3_HELPER, count_at_least, gone, read_int, rig as fx3_rig
 from tests.test_slot_s2s_supervisor import SESSION, bounded, isolated_git  # noqa: F401
 
 ORIGIN = "https://cockpit.example.net"
@@ -51,8 +51,9 @@ atexit.register(lambda: _ivl("t1"))
 def _count(name):
     p = os.path.join(store, name)
     n = int(open(p).read()) if os.path.exists(p) else 0
-    with open(p, "w") as f:
+    with open(p + ".tmp", "w") as f:
         f.write(str(n + 1))
+    os.replace(p + ".tmp", p)
     return n
 def _lock():
     fd = os.open(os.path.join(store, "session.lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -112,7 +113,10 @@ assert CARD_HELPER != FX3_HELPER
 def wait_for(cond: Callable[[], Any], seconds: float = 20.0, step: float = 0.02) -> Any:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        got = cond()
+        try:
+            got = cond()
+        except (OSError, ValueError):                  # a file a fake is mid-writing: not yet
+            got = None
         if got:
             return got
         time.sleep(step)
@@ -183,6 +187,7 @@ class Rig:
             self.r.seams.host = "darwin"
             self.r.seams.reprobe_s = every
         self.pushes: List[Dict[str, Any]] = []
+        self.stop_error: Optional[BaseException] = None
 
         def spawn(queue_dir, **kw):                                   # type: ignore[no-untyped-def]
             self.pushes.append({"queue": str(queue_dir), **kw})
@@ -198,7 +203,10 @@ class Rig:
 
     def stop_when(self, cond: Callable[[], Any], then: float = 0.3, seen: Optional[dict] = None) -> threading.Thread:
         def go() -> None:
-            wait_for(cond, 40)
+            try:
+                wait_for(cond, 40)
+            except BaseException as e:                 # a condition that is wrong must END the run, not hang it
+                self.stop_error = e
             time.sleep(then)
             if seen is not None:
                 seen["err"] = self.r.stderr()
@@ -580,7 +588,7 @@ def test_t14_the_relay_keeps_reading_while_a_slow_read_runs_and_a_stop_ends_it(t
         sizes["a"] = rig.r.out.stat().st_size
         time.sleep(1.0)
         sizes["b"] = rig.r.out.stat().st_size
-        sizes["pid"] = int((rig.store / "pid-egress-refusals").read_text())
+        sizes["pid"] = read_int(rig.store / "pid-egress-refusals")
         os.kill(os.getpid(), signal.SIGTERM)
     threading.Thread(target=go, daemon=True).start()
     assert rig.r.run() == 1
@@ -598,7 +606,7 @@ def test_t17_the_end_says_a_card_left_open_and_a_run_in_flight_is_ended_first(tm
     assert rig.r.run() == 1
     err = rig.r.stderr()
     assert f"host card for {HOST} was left open; it expires on its own and tapping it now does nothing" in err
-    pid = int((rig.store / "pid-egress-refusals").read_text())
+    pid = read_int(rig.store / "pid-egress-refusals")
     assert gone(pid)
     assert rig.verbs().count("teardown") == 1
 
@@ -664,7 +672,7 @@ def test_cards_are_off_with_no_queue_and_make_no_call(tmp_path: Path, monkeypatc
 @bounded(90)
 def test_no_cockpit_means_no_card_and_the_end_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quick: None) -> None:
     rig = Rig(tmp_path, monkeypatch, origin=False, **one_host())
-    rig.stop_when(lambda: (rig.store / "refusals").exists() and int((rig.store / "refusals").read_text()) >= 3, 0.5)
+    rig.stop_when(lambda: count_at_least(rig.store / "refusals", 3), 0.5)
     assert rig.r.run() == 1
     assert card_files(rig.queue) == [] and rig.pushes == []
     assert f"the cockpit was not running: no card was filed for {HOST}" in rig.r.stderr()
@@ -736,7 +744,7 @@ def test_t16_a_tap_during_a_slow_read_ends_it_and_the_delivery_starts_within_a_t
 
     def tap() -> None:
         wait_for(lambda: (rig.store / "refusing").exists(), 30)
-        mark["pid"] = int((rig.store / "pid-egress-refusals").read_text())
+        mark["pid"] = read_int(rig.store / "pid-egress-refusals")
         mark["tapped"] = time.time()
         tap_card(rig.queue)
     threading.Thread(target=lambda: (wait_for(lambda: card_files(rig.queue), 30), tap()), daemon=True).start()
@@ -861,7 +869,7 @@ def test_m1_a_claude_session_refused_a_codex_host_files_no_card_and_the_end_says
     ``egress-grant-host-routed``. Mutation: pass no routed set to the flow in ``_cards_preflight`` -> a card is filed."""
     routed = "api.openai.com"
     rig = Rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_REFUSALS=json.dumps([[routed]]))
-    rig.stop_when(lambda: (rig.store / "refusals").exists() and int((rig.store / "refusals").read_text()) >= 3, 0.5)
+    rig.stop_when(lambda: count_at_least(rig.store / "refusals", 3), 0.5)
     assert rig.r.run() == 1
     assert card_files(rig.queue) == [] and rig.pushes == []
     err = rig.r.stderr()
@@ -899,3 +907,38 @@ def test_m1_the_lanes_routed_set_is_roots_host_class_over_a_table(host: str) -> 
         root_refuses = True
     base = SV.read_base_map(Path("unused"), read=lambda p: raw)
     assert (host in SV.routed_hosts(base)) is root_refuses
+
+
+# --- the watcher never dies on a half-written counter (CI race: an empty read of a file written non-atomically) --------
+
+def test_count_at_least_treats_an_empty_or_missing_file_as_not_yet(tmp_path: Path) -> None:
+    p = tmp_path / "refusals"
+    assert count_at_least(p, 3) is False                   # missing
+    p.write_text("")
+    assert count_at_least(p, 3) is False                   # created, not yet written: the CI shape
+    p.write_text("2")
+    assert count_at_least(p, 3) is False
+    p.write_text("3")
+    assert count_at_least(p, 3) is True
+
+
+def test_read_int_waits_out_an_empty_file_and_a_stop_when_survives_a_raising_condition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = tmp_path / "pid-x"
+    p.write_text("")
+    threading.Timer(0.1, lambda: p.write_text("77")).start()
+    assert read_int(p) == 77
+    rig = Rig(tmp_path, monkeypatch)
+    killed: List[int] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(sig))
+    flaky = iter([ValueError("empty"), False, True])
+
+    def cond() -> Any:
+        v = next(flaky)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    rig.stop_when(cond, 0.0).join(5)                       # a ValueError is "not yet": the third call stops the run
+    assert killed == [signal.SIGTERM] and rig.stop_error is None
+    killed.clear()
+    rig.stop_when(lambda: 1 / 0, 0.0).join(5)              # a wrong condition still ENDS the run (no 90 s hang) ...
+    assert killed == [signal.SIGTERM] and isinstance(rig.stop_error, ZeroDivisionError)   # ... and the error is kept
