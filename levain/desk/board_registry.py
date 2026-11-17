@@ -978,6 +978,11 @@ def audit_for_state(target: bs.Target, now: datetime) -> list[str]:
             view = _load(target.store_dir)
     except BoardError as exc:                    # never swallowed (W8): a registry that cannot be judged is an audit entry
         return [f"registry: unreadable: {exc}"]
+    return audit_lines(view, now)
+
+
+def audit_lines(view: View, now: datetime) -> list[str]:
+    """The audit lines of a registry already read: a torn file, and the 72-hour rule."""
     out = [f"registry: {_torn_text(view)}"] if view.fold.torn else []
     return out + stale_audit(view.fold, now)
 

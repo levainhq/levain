@@ -6,6 +6,9 @@ own, :mod:`levain.desk.board_producers`; external ones named by ``--producer``; 
 supplies ``documents`` for paths this process cannot stat), and prints the
 :class:`~levain.desk.board_state.Board` as JSON. It is a read: it never writes a ref, a note, a file or the items store.
 
+With no ``--repo`` (and no ``--also-repo``) on a store that has a registry, every repo the registry holds as ``tracked`` is read,
+each by its own evidence (the first by name is the primary the cross-repo fold names the board's ``as_of`` from).
+
 Exit codes: 0 the audit is empty; 3 the audit holds an entry (the pace gate and the desk fail closed on it); 2 the items
 file (or an explicit ``--evidence-extra``/``--now``) is unreadable or unusable. Git that cannot be read is NOT exit 2:
 every source it feeds reads unreadable, every item reads unknown, the audit says so, exit 3.
@@ -46,6 +49,7 @@ READ_BY_CLI = ("fetched_at", "main", "chain", "refs", "merged", "branches", "una
 EXTRA_KEYS = ("evidence_v", "fetched_at", *PRODUCER_SOURCES, "documents", "unreadable")
 EXIT_AUDIT = 3
 EXIT_USAGE = 2
+STATE_LOCK_WAIT = 10.0          # seconds `board state` waits for a writer's store lock before it refuses (bs.LOCK_WAITING)
 
 
 def register(subparsers: Any) -> None:
@@ -71,7 +75,9 @@ def register(subparsers: Any) -> None:
     p.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter: Levain then declares waiters absent. Without it, waiters are "
                         "unknown until a producer that runs them supplies them.")
-    p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
+    p.add_argument("--repo", type=Path, default=None, metavar="PATH",
+                   help=("The repository to read. Without it, a store with a registry reads every tracked repo (each as its own "
+                         "--also-repo NAME=PATH); a store without one reads the repository here."))
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids, <name>#<n> (default: the directory that holds the repository's .git).")
     p.add_argument("--also-repo", dest="also_repo", action="append", default=[], metavar="[NAME=]PATH",
@@ -144,6 +150,14 @@ def register(subparsers: Any) -> None:
 def _fail(message: str) -> int:
     print(f"levain board state: {message}", file=sys.stderr)
     return EXIT_USAGE
+
+
+def _not_a_repo(path: str) -> str | None:
+    """Why ``path`` cannot be read as a git repository, or None when it can."""
+    if not os.path.isdir(path):
+        return f"{path} is gone (not a directory)"
+    rc, _ = br._git(path, "rev-parse", "--git-dir")
+    return None if rc == 0 else f"{path} is not a git repository"
 
 
 def _split_also(raw: str) -> tuple[str | None, Path]:
@@ -366,23 +380,58 @@ def run_state(args: argparse.Namespace) -> int:
         return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
     store_id: str | None = None
     store_id_exc: Exception | None = None
+    # No --repo (and no --also-repo) on a store with a registry: every tracked repo is read (T3). Otherwise one repo, as before.
+    whole = args.repo is None and not args.also_repo and target.pointered
+    view: br.View | None = None
+    view_exc: Exception | None = None
     try:
-        # items and store.id under ONE shared hold: a `use` racing this read cannot show store.id half-written
-        with (bs.store_lock(target.store_dir, exclusive=False) if target.pointered else contextlib.nullcontext()):
+        # items, repos.jsonl and store.id are read into memory under ONE shared hold, which is let go before any git read
+        # (a writer waits on the lock, not on the git reads); the wait for a writer is bounded.
+        with (bs.store_lock(target.store_dir, exclusive=False, wait=STATE_LOCK_WAIT) if target.pointered else contextlib.nullcontext()):
             lines = bs.read_item_lines(target)
             try:
                 store_id = _store_id(target.store_dir)
             except (ValueError, OSError) as exc:        # UnicodeDecodeError is a ValueError
                 store_id_exc = exc
+            if whole:
+                try:
+                    view = br._load(target.store_dir)
+                except bs.BoardError as exc:
+                    view_exc = exc
     except (OSError, UnicodeDecodeError, bs.BoardError) as exc:
+        if str(exc) == bs.LOCK_WAITING:
+            return _refused(exc)
         return _fail(f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
+    if view_exc is not None:
+        return _refused(view_exc)
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
         return _fail(f"--now {args.now!r} is not an ISO-8601 timestamp")
     folded = fold(lines)
-    repo = Path(args.repo).expanduser()
-    evidence, summary = be.read_git_evidence(repo, repo_name=args.repo_name, since=args.since)
-    cross = bool(args.also_repo)
+    reads: list[tuple[str | None, Path]]
+    unread: list[dict[str, Any]] = []
+    if whole and view is not None and view.active:
+        if view.fold.torn:
+            return _refused(bs.BoardError(br._torn_text(view)))
+        reads = []
+        for name, r in sorted(view.fold.repos.items()):
+            if r.mode != "tracked":                    # tracking is mid-ceremony, aborting is an abort, untracked holds no items; paused is attention only
+                continue
+            gone = _not_a_repo(r.path)
+            if gone is not None:                       # one bad repo never blanks the board: it is named, the others still derive
+                unread.append({"kind": "unknown", "id": None, "why": f"registry: tracked repo {name} cannot be read: {gone}"})
+                continue
+            reads.append((name, Path(r.path)))
+        if not reads:
+            return _fail("the registry has no tracked repo that can be read" + (": " + "; ".join(u["why"] for u in unread) if unread else
+                         " (track one with `levain board begin-track`/`track`, or pass --repo)"))
+        cross = True
+    else:
+        whole = False
+        reads = [(args.repo_name, args.repo if args.repo is not None else Path(".")), *[_split_also(x) for x in args.also_repo]]
+        cross = bool(args.also_repo)
+    repo = Path(reads[0][1]).expanduser()
+    evidence, summary = be.read_git_evidence(repo, repo_name=reads[0][0], since=args.since)
     # One repo reads every item, as before; with --also-repo each repo reads the items that belong to it.
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
@@ -417,8 +466,7 @@ def run_state(args: argparse.Namespace) -> int:
         if not summary["repo"]:
             return _fail(f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
         repo_evidence = {summary["repo"]: primary}
-        for raw in args.also_repo:
-            given, other = _split_also(raw)
+        for given, other in reads[1:]:
             ev2, sum2 = be.read_git_evidence(other, repo_name=given, since=args.since)
             name = sum2["repo"]
             if not name or name in repo_evidence:
@@ -432,8 +480,9 @@ def run_state(args: argparse.Namespace) -> int:
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
                        primary_repo=summary["repo"] if cross else None)
     doc = board.to_dict()
-    registry_audit = br.audit_for_state(target, now)         # T2-b: the 72-hour rule shows on the board's audit list too
-    doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit]
+    # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read, when there is one)
+    registry_audit = br.audit_lines(view, now) if whole and view is not None else br.audit_for_state(target, now)
+    doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit] + unread
     doc["reader"] = summary
     if also:
         doc["reader"] = {**summary, "also": also}
@@ -441,7 +490,7 @@ def run_state(args: argparse.Namespace) -> int:
         print(json.dumps(doc, indent=2, sort_keys=False))
     else:
         _print_table(doc)
-    return EXIT_AUDIT if board.audit or registry_audit else 0
+    return EXIT_AUDIT if board.audit or registry_audit or unread else 0
 
 
 def _print_table(doc: dict[str, Any]) -> None:

@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -161,10 +162,28 @@ def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | 
 # --------------------------------------------------------------------------------------------------------------- lock
 
 
-def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_ok: bool = False) -> int:
+LOCK_WAITING = "the board store is locked by a writer; try again"
+
+
+def _lock_bounded(fd: int, flock_op: int, wait: float) -> None:
+    """``flock`` with a deadline: poll the non-blocking form, raise :class:`BoardError` (``LOCK_WAITING``) once ``wait`` seconds pass."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, flock_op | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise BoardError(LOCK_WAITING) from None
+            time.sleep(0.02)
+
+
+def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_ok: bool = False,
+                  wait: float | None = None) -> int:
     """Open ``path`` (taking ``flock_op`` when given), then check it is still the file at ``path``: a git operation replaces a
     tracked file by a new inode, and a lock on the unlinked one excludes nobody. Retried a bounded number of times.
-    ``missing_ok``: a file that is not there returns -1 instead of refusing."""
+    ``missing_ok``: a file that is not there returns -1 instead of refusing. ``wait``: give up on the lock after that many
+    seconds (``LOCK_WAITING``); None waits as long as it takes."""
     for _ in range(OPEN_RETRIES):
         try:
             fd = os.open(path, flags, 0o644)
@@ -176,10 +195,16 @@ def _open_checked(path: Path, flags: int, flock_op: int | None = None, missing_o
             raise BoardError(f"cannot open {path}: {exc}") from None
         if flock_op is not None:
             try:
-                fcntl.flock(fd, flock_op)
+                if wait is None:
+                    fcntl.flock(fd, flock_op)
+                else:
+                    _lock_bounded(fd, flock_op, wait)
             except OSError as exc:
                 os.close(fd)
                 raise BoardError(f"cannot lock {path}: {exc}") from None
+            except BoardError:
+                os.close(fd)
+                raise
         if _same_file(fd, path):
             return fd
         os.close(fd)
@@ -224,17 +249,18 @@ class StoreHandle:
 
 
 @contextmanager
-def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False) -> Iterator[StoreHandle]:
+def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False, wait: float | None = None) -> Iterator[StoreHandle]:
     """Hold ``<store dir>/store.lock``: LOCK_EX when ``exclusive``, else LOCK_SH. Every store file's reader and writer
     uses it. Not held across git evidence reads. A writer never creates the store: under the exclusive lock the directory
     and ``store.id`` must exist, or it refuses (only ``use``, with ``setup``, makes a store). A reader never creates the
-    lock: a missing lock means no writer, and it reads without one."""
+    lock: a missing lock means no writer, and it reads without one. ``wait`` (seconds) bounds the wait for the lock: past it the
+    call refuses with ``LOCK_WAITING``; None, every existing caller's choice, waits as long as it takes."""
     store_dir = Path(store_dir)
     if exclusive:
         if not setup:
             _require_store_exists(store_dir)
         try:
-            fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX)
+            fd = _open_checked(store_dir / LOCK_NAME, os.O_RDWR | os.O_CREAT, fcntl.LOCK_EX, wait=wait)
         except BoardError:
             if not setup:
                 _require_store_exists(store_dir)            # the store vanished while we opened: say so, not "cannot open"
@@ -246,7 +272,7 @@ def store_lock(store_dir: Path, *, exclusive: bool, setup: bool = False) -> Iter
         finally:
             os.close(fd)                # closing releases the flock
         return
-    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True)
+    fd = _open_checked(store_dir / LOCK_NAME, os.O_RDONLY, fcntl.LOCK_SH, missing_ok=True, wait=wait)
     if fd < 0:
         _require_store_exists(store_dir)            # no lock in a store that is gone is a dangling store, not an empty one
         yield StoreHandle(store_dir, False)         # no writer ever ran here (``use`` creates the lock)
