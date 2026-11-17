@@ -82,6 +82,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "
                                "(TERMSIGN; message format levain-terminal-answer/1)"),
+    "levain-board": ("shipped", "levain/desk/board_sign.py",
+                     "the operator's signature (laptop Touch ID key, or the phone passkey through the cockpit) over one "
+                     "board record's canonical bytes without its sig field, prev and grade included"),
     "levain-desk-answer": ("shipped", "levain/consent/terminal_sign.py",
                            "the laptop Touch ID key's signature over a click in the cockpit served at the laptop "
                            "(TERMSIGN L5; message format levain-desk-answer/1)"),
