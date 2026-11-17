@@ -98,11 +98,28 @@ def test_an_acked_malformed_add_does_not_crash_the_registry_reader(store, capsys
 def test_no_consumer_reparses_a_raw_store_line_after_the_fold():
     """The class, pinned: the three consumers that used to ``json.loads`` raw store lines no longer do."""
     root = Path(bc.__file__).parent
-    for name, token in (("board_registry.py", "def _items_facts"), ("charter.py", "def _store"), ("board_store.py", "def _records_from")):
+    for name, token in (("board_registry.py", "def _items_facts"), ("charter.py", "def _store"), ("board_store.py", "def _records_from"),
+                        ("board_registry.py", "def _used_migrations"), ("board_registry.py", "def _abandon_record_hash")):
         src = (root / name).read_text()
         body = src[src.index(token):]
         body = body[:body.index("\ndef ", 10)]
-        assert "json.loads" not in body, name
+        for parser in ("json.loads", "json.load(", "literal_eval", "JSONDecoder"):
+            assert parser not in body, (name, token, parser)
+
+
+def test_a_chain_style_ack_never_drops_a_malformed_line_whose_chain_is_whole(store, capsys):
+    """L3 r2 (codex, deepseek): with no chain break, a chain-style ack of a malformed line's bytes used to drop it."""
+    add(capsys)
+    line = chained(store, {**WHOLE, "op": "frobnicate", "id": "levain#2"})       # chains correctly; malformed for itself
+    append(store, line)
+    f = folded(store)
+    assert f.torn and f.malformed == (2,)
+    append(store, hand_ack(store, 2, sha(line), want=sha(raw_lines(store)[0]), have=sha(raw_lines(store)[0])))
+    f = folded(store)
+    assert f.torn and f.dropped == () and f.acked == ()
+    append(store, hand_ack(store, 2, sha(line)))                                    # only the torn-style ack drops it
+    f = folded(store)
+    assert not f.torn and f.dropped == ((2, 4),)
 
 
 def test_charter_reads_the_key_from_the_fold_and_survives_an_acked_malformed_add(store, capsys):

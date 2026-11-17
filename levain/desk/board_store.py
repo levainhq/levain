@@ -332,7 +332,8 @@ def _records_from(raw: bytes) -> list[dict]:
         why = folded.torn_why
         if n is not None and why.startswith(f"line {n}: "):
             why = why[len(f"line {n}: "):]
-        raise BoardError(f"the store holds a torn line ({n}): {why}; repair it before writing"
+        where = f" ({n})" if n is not None else ""
+        raise BoardError(f"the store holds a torn line{where}: {why}; repair it before writing"
                          + (f", or {ack_hint(ITEMS_NAME, n)}" if n else ""))
     return [dict(r) for r in folded.records]
 

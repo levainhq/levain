@@ -389,11 +389,11 @@ def fold(lines: Iterable[str]) -> Folded:
         try:
             if isinstance(rec, _Bad):
                 raise rec
+            if brk is not None and board_chain.prev_ill_formed(rec):    # ack lines too, as repos_fold judges them
+                raise _Bad(board_chain.PREV_BAD)
             if rec.get("op") != board_chain.ACK_OP:
                 if brk is None:
                     _apply(rec, items)
-                elif board_chain.prev_ill_formed(rec):
-                    raise _Bad(board_chain.PREV_BAD)
                 else:
                     _apply(rec, dict(items))            # a chain-broken line is judged for shape on a copy; it applies only if acked
         except _Soft as e:
@@ -404,7 +404,7 @@ def fold(lines: Iterable[str]) -> Folded:
             malformed.append(n)
             torn_lines.append((n, sha))
             # a malformed line is dropped by a TORN-style ack of its bytes; a chain ack clears only the chain break (never this)
-            hit = next((pos for pos, a in mine if a.sha256 == sha and (brk is None or not a.chain)), None)
+            hit = next((pos for pos, a in mine if a.sha256 == sha and not a.chain), None)
             if hit is not None:
                 acked.append(n)                         # skipped exactly; listed in ``acked``, not a problem
                 dropped.append((n, hit))

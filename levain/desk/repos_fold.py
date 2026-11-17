@@ -343,7 +343,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
             malformed.append(n)
             torn_lines.append((n, sha))
             # a malformed line is dropped by a TORN-style ack of its bytes; a chain ack clears only the chain break (never this)
-            hit = next((pos for pos, a in mine if a.sha256 == sha and (brk is None or not a.chain)), None)
+            hit = next((pos for pos, a in mine if a.sha256 == sha and not a.chain), None)
             if hit is not None:
                 acked.append(n)                 # skipped exactly; listed in ``acked``, not a problem
                 dropped.append((n, hit))

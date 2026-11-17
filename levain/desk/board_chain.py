@@ -118,7 +118,7 @@ def _why_class(n: int, p: str, index: dict[str, list[int]]) -> str:
         return f"{between} inserted or moved between line {j} and line {n} (line {n} chained onto line {j})"
     later = [j for j in where if j > n]
     if later:
-        return f"lines were reordered (it chains onto line {min(later)}, which now follows it)"
+        return f"lines were reordered (it chains onto line {later[0]}, which now follows it)"
     return f"line {n - 1} was edited or deleted, or a line was inserted before line {n}"
 
 
