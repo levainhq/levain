@@ -823,6 +823,16 @@ def test_init_event_compares_the_levain_gh_tools_exactly():
     assert status(ev(**{"P0.init": init(tools=[*CC_SEAT_TOOLS])}), "P0") == "fail"
 
 
+def test_the_canary_leaves_a_caller_made_empty_parent_in_place(tmp_path, levain_home_outside_temp):
+    """L3 wire2 r2 codex LOW. A ``<levain home>/seat_canary`` that existed before the run (empty) is still there after
+    it. Revert: a ``budget_parent.rmdir()`` in ``run_seat_canary``'s cleanup."""
+    from levain import seat_profile as sp
+    parent = Path(os.path.realpath(sp.real_levain_home(os.environ))) / sp.CANARY_BUDGET_DIRNAME
+    parent.mkdir(mode=0o700)
+    _canary_budget_run(tmp_path, stop=True)
+    assert parent.is_dir() and not list(parent.iterdir())
+
+
 def _canary_budget_run(tmp_path, *, stop: bool):
     """Run the canary through the REAL builder; ``stop`` raises after the build (a failed run), else the turn times out."""
     import sys
@@ -847,19 +857,24 @@ def _canary_budget_run(tmp_path, *, stop: bool):
 
 
 @pytest.mark.parametrize("stop", [True, False])
-def test_the_canary_budget_home_is_per_run_outside_every_temp_root_and_removed(tmp_path, stop):
+def test_the_canary_budget_home_is_per_run_outside_every_temp_root_and_removed(tmp_path, stop,
+                                                                               levain_home_outside_temp):
     """Row 800, L3 wire2 r1 codex HIGH + LOW. The canary's root is under $TMPDIR, which its seat's sandbox can write, so
     its read budget lives in a per-run home under ``<real levain home>/seat_canary/<nonce>`` (never the home's own
-    ``read_budget``), and the run removes it, ledger and all. Revert: ``budget_home=`` in ``run_seat_canary`` (the state
-    is then under the canary prefix in $TMPDIR) or its ``rmtree`` (the home and its ledger stay)."""
+    ``read_budget``), and the run removes it, ledger and all. The 0700 ``seat_canary`` parent STAYS, empty (L3 wire2 r2
+    complement + codex LOW: removing it raced a concurrent run's install and could remove a directory this run did not
+    make). Revert: ``budget_home=`` in ``run_seat_canary`` (the state is then under the canary prefix in $TMPDIR), its
+    ``rmtree`` (the home and its ledger stay), or a ``rmdir`` of the parent (it is then gone)."""
     from levain import seat_profile as sp
     home = Path(os.path.realpath(sp.real_levain_home(os.environ)))
     seen = _canary_budget_run(tmp_path, stop=stop)
     state = Path(seen["state"])
     assert state.parent.parent.parent == home / sp.CANARY_BUDGET_DIRNAME and state.parts[-2:] == ("read_budget", "state")
-    assert not any(sp.hg.is_within(state, t) for t in sp.implicit_write_roots({"TMPDIR": str(tmp_path)}))
+    assert not any(sp.hg.is_within(state, t) for t in sp.implicit_write_roots({**os.environ, "TMPDIR": str(tmp_path)}))
     assert not any(sp.hg.is_within(state, r) for r in seen["allow"])
     assert any("read_budget-" in h["command"] for g in seen["hooks"]["PreToolUse"] for h in g["hooks"])
-    assert not os.path.lexists(state.parent.parent) and not os.path.lexists(home / sp.CANARY_BUDGET_DIRNAME)
+    parent = home / sp.CANARY_BUDGET_DIRNAME
+    assert not os.path.lexists(state.parent.parent)
+    assert parent.is_dir() and not list(parent.iterdir()) and (parent.stat().st_mode & 0o777) == 0o700
     assert not (home / "read_budget").exists()                       # the home's own budget is never touched
     assert not (tmp_path / sc.CANARY_DIRNAME / "levain-home" / "read_budget").exists()   # nor the shared prefix one

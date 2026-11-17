@@ -13,7 +13,7 @@ from levain import seat_profile as sp
 
 
 @pytest.fixture
-def rig(tmp_path, monkeypatch):
+def rig(tmp_path, monkeypatch, levain_home_outside_temp):
     tmp = Path(os.path.realpath(tmp_path))
     monkeypatch.setenv("TMPDIR", str(tmp))
     base = Path(tempfile_prefix(tmp)) / "n1"
@@ -36,6 +36,8 @@ def build(rig, **kw):
     args = dict(claude_bin=str(claude), python=sys.executable, lease=None, key_dir=keys, canary_root=base,
                 managed=[], environ={**os.environ, "TMPDIR": os.environ["TMPDIR"]})
     args.update(kw)
+    if args["lease"] is None:   # a lease-free build's own home is under $TMPDIR and refuses (L3 wire2 r2 codex H1)
+        args.setdefault("budget_home", Path(os.environ["LEVAIN_HOME"]) / "canary-budget")
     return sp.build_seat_profile(base / "lane", base / "ret", **args)
 
 
@@ -177,8 +179,8 @@ def test_lease_none_only_under_canary_prefix(rig, tmp_path):
 
 
 def _lease_home() -> Path:
-    """A levain home OUTSIDE the rig's $TMPDIR (the rig sets it to tmp_path): the conftest's per-test ``$LEVAIN_HOME``,
-    a sibling of tmp_path under pytest's base temp, which no implicit root of the rig's environ covers."""
+    """A levain home OUTSIDE every implicit root of the rig's environ, on Linux too (where tmp_path is under /tmp): the
+    rig's ``levain_home_outside_temp`` ``$LEVAIN_HOME``, under the account home's test scratch parent."""
     home = Path(os.path.realpath(os.environ["LEVAIN_HOME"])) / "lhome"
     assert not any(hg.is_within(home, t) for t in sp.implicit_write_roots(os.environ))
     return home
@@ -210,6 +212,46 @@ def test_an_explicit_budget_home_is_held_to_the_temp_roots_too(rig):
     """The canary's per-run home is checked as a lease's is: a ``budget_home`` under $TMPDIR refuses."""
     with pytest.raises(sp.SeatRefusal, match="temp directory"):
         build(rig, budget_home=Path(os.environ["TMPDIR"]) / "bh")
+
+
+@pytest.mark.parametrize("dry", [True, False])
+def test_a_lease_free_build_with_no_budget_home_is_held_to_the_temp_roots(rig, dry):
+    """L3 wire2 r2 codex H1. With neither a lease nor a ``budget_home`` the budget falls back to the canary prefix's
+    own home, under $TMPDIR: refused, nothing written. Revert: ``if lease is not None or budget_home is not None:``
+    around the implicit-root check (the build then passes and installs the script under $TMPDIR)."""
+    base = rig[0]
+    with pytest.raises(sp.SeatRefusal, match="read budget directory .* temp directory"):
+        sp.build_seat_profile(base / "lane", base / "ret", claude_bin=str(rig[2]), python=sys.executable, lease=None,
+                              key_dir=rig[1], canary_root=base, managed=[], environ=dict(os.environ), dry_run=dry)
+    assert not list(Path(os.environ["TMPDIR"]).rglob("read_budget"))
+
+
+def test_a_home_under_tmpdir_names_tmpdir_as_the_cause(rig, monkeypatch):
+    """L3 wire2 r2 complement LOW 4. ``TMPDIR=$HOME``: the default home is the one in use, so the message names the
+    matched root and says TMPDIR is the cause, never "set LEVAIN_HOME to the default". Revert: the TMPDIR branch of
+    ``_temp_root_problem``."""
+    user = Path(os.path.realpath(os.environ["LEVAIN_HOME"])) / "user"
+    (user / ".levain").mkdir(parents=True)
+    env = {**os.environ, "HOME": str(user), "TMPDIR": str(user)}
+    msg = sp._temp_root_problem(user / ".levain" / "read_budget", user, env)
+    assert f"is inside {user}," in msg and f"TMPDIR ({user}) is the cause" in msg and "the default" not in msg
+    base = rig[0]
+    monkeypatch.setenv("TMPDIR", str(user))
+    with pytest.raises(sp.SeatRefusal, match=r"TMPDIR \(.*\) is the cause") as exc:
+        build(rig, lease=_lease(base), canary_root=None, levain_home=user / ".levain", environ=env)
+    assert "the default" not in str(exc.value)
+
+
+def test_a_home_under_a_fixed_root_names_it_and_offers_the_default_only_when_safe(rig):
+    """L3 wire2 r2 complement LOW 4: the matched fixed root is named; the default ``~/.levain`` is offered only when it
+    lies outside every temp root and is not the home in use."""
+    safe = Path(os.path.realpath(os.environ["LEVAIN_HOME"])) / "user"
+    msg = sp._temp_root_problem(Path("/tmp/x/read_budget"), sp._real("/tmp"), {"HOME": str(safe), "TMPDIR": "/nowhere"})
+    assert f"is inside {sp._real('/tmp')}," in msg and "set LEVAIN_HOME" in msg and "TMPDIR (" not in msg
+    assert f"(the default {sp._real(safe / '.levain')} is)" in msg
+    in_tmp = sp._real("/tmp") / "u"     # a HOME under /tmp: its ~/.levain is no advice
+    msg = sp._temp_root_problem(in_tmp / ".levain" / "read_budget", sp._real("/tmp"), {"HOME": str(in_tmp)})
+    assert "set LEVAIN_HOME" in msg and "the default" not in msg
 
 
 def test_implicit_write_roots_are_resolved_and_carry_the_seats_tmpdir(tmp_path):
@@ -343,7 +385,7 @@ def test_the_read_budget_dir_rides_the_profile_env_and_the_digest(rig):
     import dataclasses
     p = build(rig)
     state = p.env["LEVAIN_READ_BUDGET_DIR"]
-    assert state.endswith("/levain-home/read_budget/state") and Path(state).is_dir()
+    assert state.endswith("/canary-budget/read_budget/state") and Path(state).is_dir()
     assert "LEVAIN_READ_BUDGET_DIR" not in hg._ENV_ALLOW        # a deliberate addition outside host_env's allowlist
     # the builder has no no-budget mode: strip the env var from a built profile instead
     bare = dataclasses.replace(p, env={k: v for k, v in p.env.items() if k != "LEVAIN_READ_BUDGET_DIR"})
@@ -353,7 +395,7 @@ def test_the_read_budget_dir_rides_the_profile_env_and_the_digest(rig):
 def test_the_read_budget_dir_inside_a_seat_root_refuses(rig):
     base, _, _ = rig
     with pytest.raises(sp.SeatRefusal, match="read budget directory"):
-        build(rig, levain_home=base / "lane" / "home")
+        build(rig, budget_home=base / "lane" / "home")
     assert not (base / "lane" / "home" / "read_budget").exists()
 
 
@@ -376,16 +418,16 @@ def _allow_write_overlaps(profile_settings: dict, budget_dir: Path) -> list[str]
             if hg.is_within(budget_dir, e) or hg.is_within(e, budget_dir)]
 
 
-@pytest.mark.parametrize("own_home", [False, True])
-def test_no_allow_write_entry_overlaps_the_read_budget_directory(rig, tmp_path, own_home):
+@pytest.mark.parametrize("lease", [False, True])
+def test_no_allow_write_entry_overlaps_the_read_budget_directory(rig, lease):
     """Desk ruling (L2 wire2): the seat's Bash must not be able to write the hook script or the ledger an unsandboxed
     hook execs and reads. For the profile ``build_seat_profile`` produces, no ``allowWrite`` entry covers the budget
-    directory and none lies inside it."""
-    if own_home:
-        home = Path(os.path.realpath(tmp_path)) / "levain-home"
-        p = build(rig, levain_home=home)
+    directory and none lies inside it: a lease launch's home and a lease-free build's ``budget_home``."""
+    if lease:
+        home = _lease_home()
+        p = build(rig, lease=_lease(rig[0]), canary_root=None, levain_home=home)
     else:
-        home = Path(os.environ["TMPDIR"]) / sp.CANARY_DIRNAME / "levain-home"
+        home = Path(os.environ["LEVAIN_HOME"]) / "canary-budget"
         p = build(rig)
     budget_dir = Path(os.path.realpath(home)) / "read_budget"
     assert budget_dir.is_dir() and Path(p.env["LEVAIN_READ_BUDGET_DIR"]).parent == budget_dir
@@ -405,7 +447,7 @@ def test_the_overlap_check_flags_a_covering_or_child_allow_write_entry(rig):
 
 def test_a_dry_run_builds_the_same_hooks_and_env_and_writes_nothing(rig):
     base, _, _ = rig
-    home = Path(os.environ["TMPDIR"]) / sp.CANARY_DIRNAME / "levain-home"
+    home = Path(os.environ["LEVAIN_HOME"]) / "canary-budget"
     dry = build(rig, dry_run=True)
     assert not (home / "read_budget").exists()
     real = build(rig)

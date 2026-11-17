@@ -82,6 +82,27 @@ def implicit_write_roots(environ: Mapping[str, str]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(_real(c) for c in (*IMPLICIT_TMP_ROOTS, *([tmpdir] if tmpdir else []))))
 
 
+def _temp_root_problem(budget_dir: Path, root: Path, environ: Mapping[str, str]) -> str:
+    """The refusal for a read budget inside the implicit temp root ``root``, naming that root and its cause. A fixed
+    root (:data:`IMPLICIT_TMP_ROOTS`, which :func:`implicit_write_roots` lists first) is the levain home's placement;
+    otherwise ``root`` is the seat's ``$TMPDIR`` and TMPDIR is the cause (``TMPDIR=$HOME`` refuses every launch, and
+    moving the home is not the fix). The default home is offered only when it is outside every temp root and is not
+    the home already in use (L3 wire2 r2 complement LOW 4)."""
+    head = (f"the read budget directory ({budget_dir}) is inside {root}, a temp directory the seat's sandbox lets it "
+            "write, so the seat could rewrite the hook script: ")
+    if root not in {_real(c) for c in IMPLICIT_TMP_ROOTS}:
+        return head + (f"TMPDIR ({environ.get('TMPDIR')}) is the cause, it contains the levain home; set TMPDIR to a "
+                       "directory that does not contain the levain home, or LEVAIN_HOME to one outside every temp root")
+    advice = "set LEVAIN_HOME to a directory outside every temp root"
+    user_home = environ.get("HOME")
+    if user_home and os.path.isabs(user_home):
+        default = _real(Path(user_home) / ".levain")
+        if (not any(hg.is_within(default, t) for t in implicit_write_roots(environ))
+                and not hg.is_within(budget_dir, default)):
+            advice += f" (the default {default} is)"
+    return head + advice
+
+
 class SeatRefusal(HostRefusal):
     """A seat profile is refused. ``str()`` is the reason shown to the operator."""
 
@@ -581,10 +602,11 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     Every seat carries the read budget (levain row 800): its PreToolUse/PostToolUse ``Read`` hook groups are APPENDED to
     the event lists (``seat_record`` stays first) and ``LEVAIN_READ_BUDGET_DIR`` rides ``env``. Its home is
     ``budget_home`` when given (:func:`levain.seat_canary.run_seat_canary` passes a per-run one under
-    :data:`CANARY_BUDGET_DIRNAME` and removes it), else the levain home (a canary built without one: its own home under
-    its prefix). A lease launch, and any ``budget_home`` given, refuses when the budget directory lies inside a seat root
-    or an :func:`implicit_write_roots` temp root: the seat could rewrite the script an unsandboxed hook execs (L3 wire2
-    r1 codex HIGH). The install runs only once every refusal is in (a refused build writes nothing). ``dry_run`` names
+    :data:`CANARY_BUDGET_DIRNAME` and removes its own per-run directory; the doctor passes the real levain home), else
+    the levain home (a lease-free build without one gets the canary's own home under its prefix in ``$TMPDIR``, which
+    then refuses). EVERY build refuses when the budget directory lies inside a seat root or an
+    :func:`implicit_write_roots` temp root: the seat could rewrite the script an unsandboxed hook execs (L3 wire2 r1
+    codex HIGH, r2 codex H1: the check is no longer conditional on a lease or a ``budget_home``). The install runs only once every refusal is in (a refused build writes nothing). ``dry_run`` names
     the same paths and writes nothing (``levain seat launch --dry-run`` mints nothing)."""
     environ = os.environ if environ is None else environ
     tools = tuple(tools)
@@ -623,13 +645,11 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     budget_dir = b_home / "read_budget"
     problems += [f"the read budget directory ({budget_dir}) is inside a seat root" for r in roots
                  if hg.is_within(budget_dir, r)]
-    if lease is not None or budget_home is not None:
-        # the sandbox's IMPLICIT writable roots too, not only allowWrite (L3 wire2 r1 codex HIGH)
-        tmp_hit = next((t for t in implicit_write_roots(environ) if hg.is_within(budget_dir, t)), None)
-        if tmp_hit is not None:
-            problems.append(f"the read budget directory ({budget_dir}) is inside {tmp_hit}, a temp directory the seat's "
-                            "sandbox lets it write, so the seat could rewrite the hook script: set LEVAIN_HOME to a "
-                            "directory outside every temp root (the default ~/.levain is)")
+    # the sandbox's IMPLICIT writable roots too, not only allowWrite (L3 wire2 r1 codex HIGH), for EVERY build: a
+    # lease-free one with no budget_home falls back to a home under the canary prefix in $TMPDIR (L3 wire2 r2 codex H1)
+    tmp_hit = next((t for t in implicit_write_roots(environ) if hg.is_within(budget_dir, t)), None)
+    if tmp_hit is not None:
+        problems.append(_temp_root_problem(budget_dir, tmp_hit, environ))
     if problems:
         raise SeatRefusal("; ".join(problems))
 

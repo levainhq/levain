@@ -5,7 +5,28 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 from levain import doctor
+
+
+@pytest.fixture(autouse=True)
+def _home(levain_home_outside_temp):
+    """The row builds dry against the real levain home (L3 wire2 r2 codex H1): one outside every implicit temp root,
+    on Linux CI too, where pytest's per-test home is under /tmp."""
+    return levain_home_outside_temp
+
+
+def test_row_refuses_a_levain_home_under_tmpdir_as_a_launch_would(tmp_path, monkeypatch):
+    """L3 wire2 r2 codex H1. Revert: the row building without ``budget_home=`` (its budget is then the canary
+    prefix's own home under $TMPDIR, which refuses on every machine) or the unconditional implicit-root check."""
+    monkeypatch.setenv("TMPDIR", os.path.realpath(tmp_path))
+    monkeypatch.setenv("LEVAIN_HOME", str(Path(os.path.realpath(tmp_path)) / "home"))
+    claude = tmp_path / "bin" / "claude"
+    claude.parent.mkdir()
+    claude.write_text("x")
+    (row,) = doctor._check_seat_profile(claude_bin=str(claude), python=sys.executable, managed=[])
+    assert not row.ok and "read budget directory" in row.detail and "temp directory" in row.detail   # detail: 400 chars
 
 
 def test_row_builds(tmp_path, monkeypatch):
@@ -41,4 +62,5 @@ def test_row_builds_dry_and_writes_no_read_budget_directory(tmp_path, monkeypatc
     (row,) = doctor._check_seat_profile(claude_bin=str(claude), python=sys.executable, managed=[])
     assert row.ok and not row.warn, row.detail
     assert not [p for p in Path(os.path.realpath(tmp_path)).rglob("*") if p.name == "read_budget"]
+    assert not [p for p in Path(os.environ["LEVAIN_HOME"]).rglob("*") if p.name == "read_budget"]
     assert not (Path(os.path.realpath(tmp_path)) / "levain-seat-canary" / "levain-home").exists()

@@ -268,6 +268,24 @@ def _isolate_levain_home(monkeypatch, tmp_path_factory):
     monkeypatch.setattr("levain.desk.door._own_home", lambda: own)
 
 
+@pytest.fixture
+def levain_home_outside_temp(monkeypatch):
+    """TEST ONLY: ``$LEVAIN_HOME`` set to a fresh 0700 directory OUTSIDE every implicit sandbox write root (``/tmp``,
+    ``/private/tmp``, ``/var/tmp``, ``/dev/shm``, ``$TMPDIR``) on macOS AND Linux, for a test that builds a seat
+    profile: the builder refuses a read budget under one (L3 wire2 r1 codex HIGH), and on Linux CI pytest's base temp,
+    so ``tmp_path`` and the per-test ``$LEVAIN_HOME`` above, is under ``/tmp`` (L3 wire2 r2 gemini LOW). It lives
+    under the account home's one test scratch parent (``anchor_scratch``) and is removed after the test."""
+    from levain import seat_profile as sp
+    from tests.autonomic_confirm_keys import anchor_scratch
+    scratch = anchor_scratch("levain-home-")
+    home = Path(os.path.realpath(scratch)) / "levain-home"
+    home.mkdir(mode=0o700)
+    assert not any(p == home or home.is_relative_to(p) for p in sp.implicit_write_roots(os.environ))
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    yield home
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
 _SESSION_HOME: list = []
 
 

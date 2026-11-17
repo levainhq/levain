@@ -29,12 +29,14 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def rig(tmp_path, monkeypatch):
+def rig(tmp_path, monkeypatch, levain_home_outside_temp):
     from levain.cockpit.firejournal import CockpitDB
     world = World(tmp_path)
     CockpitDB(world.root).set_install_class("reported")
     # the seat's $TMPDIR (an implicit sandbox write root) apart from the levain home: a lease launch refuses a read
-    # budget under it (L3 wire2 r1 codex HIGH), and pytest's homes all live under the real $TMPDIR
+    # budget under it (L3 wire2 r1 codex HIGH). pytest's homes all live under the real $TMPDIR, and on Linux CI under
+    # /tmp, a fixed implicit root: the levain home is levain_home_outside_temp's (L3 wire2 r2 gemini LOW)
+    r_home = levain_home_outside_temp
     seat_tmp = tmp_path / "seat-tmp"
     seat_tmp.mkdir()
     monkeypatch.setenv("TMPDIR", str(seat_tmp))
@@ -57,6 +59,7 @@ def rig(tmp_path, monkeypatch):
         pass
     r = Rig()
     r.world, r.src, r.sha, r.key_dir, r.claude, r.tmp = world, src, sha, key_dir, str(claude), tmp_path
+    r.home = r_home
     r.lanes, r.returns = tmp_path / "lanes", tmp_path / "returns"
 
     def sign_lease():
@@ -308,7 +311,7 @@ def test_a_launch_with_no_egress_grant_denies_the_real_token_directory_and_point
     """L3 z2b r1 HIGH. Revert: ``prepare_launch`` passing ``levain_home`` only under an egress grant (the MCP config
     then names the canary home under $TMPDIR and the real ``seat_gh`` is not denied), or the ``real_home`` member of
     ``gh_dirs`` in ``build_seat_profile``."""
-    home = rig.tmp / "real-levain-home"
+    home = rig.home / "real-levain-home"     # outside every implicit temp root, on Linux too
     home.mkdir()
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     rig.sign_lease()
@@ -337,13 +340,15 @@ def test_a_lease_profile_without_the_levain_home_refuses(rig):
 
 def test_a_dry_run_writes_no_read_budget_and_a_launch_carries_it(rig, monkeypatch):
     """Row 800. ``--dry-run`` mints nothing: the levain home has no read_budget directory after it; the real launch
-    installs the script and carries the hook and the state dir in the profile's own env. The home is this test's own,
-    under tmp_path (L3 wire2 r1 deepseek 4: the launch writes there, never into a real levain home)."""
+    installs the script and carries the hook and the state dir in the profile's own env. The home is this test's own
+    (L3 wire2 r1 deepseek 4: the launch writes there, never into a real levain home), outside every implicit temp root
+    on Linux too, where tmp_path is under /tmp (L3 wire2 r2 gemini LOW)."""
     import io
     from levain import host_guard as hg
-    monkeypatch.setenv("LEVAIN_HOME", str(rig.tmp / "levain-home"))
+    from levain import seat_profile as sp
+    monkeypatch.setenv("LEVAIN_HOME", str(rig.home / "levain-home"))
     home = sl._levain_home()
-    assert hg.is_within(home, rig.tmp) and not hg.is_within(home, os.environ["TMPDIR"])
+    assert hg.is_within(home, rig.home) and not any(hg.is_within(home, t) for t in sp.implicit_write_roots(os.environ))
     rig.sign_lease()
     out, err = io.StringIO(), io.StringIO()
     rc = sl.validate_launch("lane-p", str(rig.src), rig.sha, claude_bin=rig.claude, python=sys.executable,

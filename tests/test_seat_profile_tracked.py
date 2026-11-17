@@ -27,7 +27,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def rig(tmp_path, monkeypatch):
+def rig(tmp_path, monkeypatch, levain_home_outside_temp):
     tmp = Path(os.path.realpath(tmp_path))
     monkeypatch.setenv("TMPDIR", str(tmp))
     base = tmp / sp.CANARY_DIRNAME / "n1"
@@ -64,6 +64,8 @@ def build(rig, **kw):
     args = dict(claude_bin=str(claude), python=sys.executable, lease=None, key_dir=keys, canary_root=base,
                 managed=[], environ={**os.environ})
     args.update(kw)
+    if args["lease"] is None:   # the canary prefix's own budget home is under $TMPDIR and refuses (L3 wire2 r2 H1)
+        args.setdefault("budget_home", Path(os.environ["LEVAIN_HOME"]) / "canary-budget")
     return sp.build_seat_profile(base / "lane", base / "ret", **args)
 
 

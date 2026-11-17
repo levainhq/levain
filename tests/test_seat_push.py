@@ -34,7 +34,9 @@ class Egress:
         self.remote = tmp_path / "remote.git"
         subprocess.run(["git", "init", "-q", "--bare", str(self.remote)], check=True, env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
         self.url = f"file://{self.remote}"
-        self.home = tmp_path / "levain-home"
+        # outside every implicit sandbox write root, on Linux CI too (tmp_path is under /tmp there): a launch refuses a
+        # read budget under one (L3 wire2 r2 gemini LOW); the lease rig's levain_home_outside_temp holds it
+        self.home = rig.home / "egress-levain-home"
         self.home.mkdir()
         monkeypatch.setenv("LEVAIN_HOME", str(self.home))
         monkeypatch.setenv("HOME", str(tmp_path / "home"))

@@ -5565,9 +5565,11 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
         (base / "lane" / ".git").mkdir(parents=True)
         (base / "ret").mkdir()
         (base / "keys").mkdir()
+        # the read budget's home is the real levain home a lease launch installs into (dry: named, never written), so
+        # the row refuses where a launch would; the canary prefix's own home is under $TMPDIR and always refuses
         prof = sp.build_seat_profile(base / "lane", base / "ret", claude_bin=claude, python=python or sys.executable,
                                      lease=None, key_dir=base / "keys", canary_root=base, managed=managed,
-                                     dry_run=True)
+                                     dry_run=True, budget_home=sp.real_levain_home(os.environ))
         return [CheckResult("seat profile", True, f"builds (tools {','.join(prof.tools)}; digest {prof.digest()[:12]})")]
     except sp.SeatRefusal as exc:
         return [CheckResult("seat profile", False, f"refused: {exc}"[:400],
