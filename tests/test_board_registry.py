@@ -57,6 +57,32 @@ def home(tmp_path, monkeypatch):
     return h
 
 
+@pytest.fixture(autouse=True)
+def _decision_class_seam(tmp_path, monkeypatch):
+    """These tests are about the registry's rules, not about grades. begin-track, track, abandon-track and untrack are
+    decision-class (P2): each is called here with a seal over a THROWAWAY ssh key (the seam test_board_sign.py uses; a real
+    Touch ID ceremony cannot run in a test) whose authority log enrols it, so the writer earns ``signed-terminal`` for real.
+    The policy itself, unsigned and signed, is tested in test_board_registry_sign.py, which does not use this seam."""
+    from tests.test_board_sign import Rig
+    rig = Rig(tmp_path)
+
+    def wrap(name):
+        orig = getattr(br, name)
+
+        def sealed(*a, seal=None, **kw):
+            return orig(*a, seal=seal if seal is not None else rig.seal(), **kw)
+        monkeypatch.setattr(br, name, sealed)
+    for name in ("begin_track", "track", "abandon_track", "untrack"):
+        wrap(name)
+    real_decide = bs.decide
+
+    def decide(*a, **kw):                       # an item decide (not an abandon's cut, which carries a cause) is decision-class too
+        if kw.get("seal") is None and kw.get("cause") is None:
+            kw["seal"] = rig.seal()
+        return real_decide(*a, **kw)
+    monkeypatch.setattr(bs, "decide", decide)
+
+
 @pytest.fixture
 def mkrepo(tmp_path):
     def make(name):

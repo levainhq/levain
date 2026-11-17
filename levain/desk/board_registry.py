@@ -283,15 +283,29 @@ def _reg_parser(store_dir: Path, *, allow_torn: bool = False) -> Callable[[bytes
 
 
 def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tuple[dict | None, bool]], *,
-               allow_torn: bool = False, creates: bool = False) -> tuple[dict | None, bool]:
+               allow_torn: bool = False, creates: bool = False, seal: Any = None) -> tuple[dict | None, bool]:
     """Every registry write: ``board_store._append`` (the one write path) with the registry's reader. ``build(fold, store_id,
     raw)`` returns ``(record, write)``. Only ``creates`` (``register``, ``use --import-focus``) may start the file: any other
-    verb on a store with no ``repos.jsonl`` refuses before ``_append`` opens (and so creates) it."""
+    verb on a store with no ``repos.jsonl`` refuses before ``_append`` opens (and so creates) it.
+
+    P2's policy is applied HERE, to every record a ``build`` returns for writing, inside the locked build and before ``prev``
+    and before any signing prompt: ``board_store._graded`` takes the grade from ``seal`` (``asserted`` with none), requires an
+    operator author on a signed record, and runs ``board_sign.require_policy`` (a decision-class op, ``begin-track|track|
+    abandon-track|untrack``, is refused unsigned). ``seal`` (a ``board_sign.Seal``) is then passed to ``_append``, which earns
+    the signed grade by ``admit`` after the ceremony."""
     bs._require_pointered(target)
     if not creates and not (target.store_dir / REPOS_NAME).exists():
         raise BoardError(NO_REGISTRY)
     parse = _reg_parser(target.store_dir, allow_torn=allow_torn)
-    return bs._append(target, lambda view: build(view.fold, view.store_id, view.raw), filename=REPOS_NAME, parse=parse)
+    bs._preflight(seal)                                         # a seal's refusals that need no lock come before it
+
+    def graded(view: View) -> tuple[dict | None, bool]:
+        rec, write = build(view.fold, view.store_id, view.raw)
+        if write and rec is not None:
+            rec = bs._graded(target, rec, seal)
+        return rec, write
+
+    return bs._append(target, graded, filename=REPOS_NAME, parse=parse, seal=seal)
 
 
 def _name(value: Any) -> str:
@@ -312,7 +326,7 @@ def _need_repo(fold: rf.RepoFold, name: str) -> rf.Repo:
 
 
 def register(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
-             now: str | None = None, via: str | None = None) -> tuple[rf.Repo | None, bool]:
+             now: str | None = None, via: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """Put ``name`` in play, untracked. Records the path's realpath, origin and root set. A known name at the same path is a
     no-op; at another path it refuses and names ``move``. ``via`` marks the record's writer (``import-focus``). Returns ``(repo as folded, written)``."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
@@ -329,7 +343,7 @@ def register(target: bs.Target, name: str, path: str, words: str, by: str, *, au
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("register", name, by, sid, {"words": words, **ident, **({"via": via} if via else {})}, author, now), True
 
-    rec, written = _reg_write(target, build, creates=True)
+    rec, written = _reg_write(target, build, creates=True, seal=seal)
     return _fold_one(target, name), written
 
 
@@ -338,7 +352,7 @@ def _fold_one(target: bs.Target, name: str) -> rf.Repo | None:
 
 
 def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
-         now: str | None = None) -> tuple[rf.Repo | None, bool]:
+         now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """Re-base a registered repo onto ``path``. The new path must hold the same repository (the same root commits). The same
     path with a different origin (a renamed remote) records the new origin; only a fully identical move is a no-op."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
@@ -355,11 +369,11 @@ def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("move", name, by, sid, {"words": words, **ident}, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
-def _set_attention(op: str, target: bs.Target, name: str, words: str, by: str, author, now) -> tuple[rf.Repo | None, bool]:
+def _set_attention(op: str, target: bs.Target, name: str, words: str, by: str, author, now, seal=None) -> tuple[rf.Repo | None, bool]:
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     want = "paused" if op == "pause" else "active"
 
@@ -369,16 +383,16 @@ def _set_attention(op: str, target: bs.Target, name: str, words: str, by: str, a
             return None, False
         return _record(op, name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
-def pause(target, name, words, by, *, author, now=None):
-    return _set_attention("pause", target, name, words, by, author, now)
+def pause(target, name, words, by, *, author, now=None, seal=None):
+    return _set_attention("pause", target, name, words, by, author, now, seal)
 
 
-def resume(target, name, words, by, *, author, now=None):
-    return _set_attention("resume", target, name, words, by, author, now)
+def resume(target, name, words, by, *, author, now=None, seal=None):
+    return _set_attention("resume", target, name, words, by, author, now, seal)
 
 
 def _blob(path: str, ref: str = CHARTER_REF) -> str:
@@ -400,7 +414,8 @@ def _used_migrations(fold: Any) -> set[str]:
 
 
 def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: str, by: str, *, author: Mapping[str, Any],
-                owner: str | None = None, migration: str | None = None, now: str | None = None) -> tuple[rf.Repo | None, bool]:
+                owner: str | None = None, migration: str | None = None, now: str | None = None,
+                seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """X becomes ``tracking``. Refuses unless X is registered and untracked. The migration id is ``migration`` or derived from
     (name, manifest bytes, words, how many ceremonies X has had): a repeat with the same manifest and words after a lost
     response derives the same id and is a no-op (T2-a). Returns ``(repo, written)``."""
@@ -445,7 +460,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
                 "charter_before": before}
         return _record("begin-track", name, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
@@ -495,7 +510,7 @@ def _charter_by_blob(path: str, name: str, items: Mapping | None) -> tuple[str |
 
 
 def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any], migration: str | None = None,
-          now: str | None = None) -> tuple[rf.Repo | None, bool]:
+          now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """The one switchover record (design 5(d)). Refuses unless X is ``tracking``, its charter passes ``charter check`` on
     origin/main (I2), and the manifest's plan items (less any cut) and the charter's Plan ids are the same set, both ways.
     It does not wait for the stubs. A repeat on a ``tracked`` repo with the same migration and words is a no-op (T2-a)."""
@@ -554,7 +569,7 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
         body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
         return _record("track", name, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
@@ -567,10 +582,14 @@ def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
 
 
 def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
-                  now: str | None = None) -> tuple[rf.Repo | None, list[str]]:
+                  now: str | None = None, seal: Any = None, authority: Any = None) -> tuple[rf.Repo | None, list[str]]:
     """``tracking`` becomes ``aborting``; every item keyed to the ceremony's M is decided ``cut`` with the abandon's words and
     ``cause``, the hash of the abandon-track record. The registry record and the cuts are two files, so a crash can land the
     first without all the second: run again on an ``aborting`` repo and only the missing cuts are written (T2-d, T2-f).
+    The abandon is decision-class: it needs ``seal`` (a signed abandon, earned by ``admit``). The cuts are asserted decides
+    whose ``cause`` (P2-d) must name that signed abandon, keyed to ITS migration M and the item keyed to M: ``authority`` (an
+    authority SOURCE, default the seal's) is what the cause check replays. A re-run on an ``aborting`` repo writes no new abandon
+    and still needs ``authority`` for the cuts it finishes.
     Returns ``(repo, ids cut by this call)``."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
@@ -588,7 +607,8 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
             raise BoardError(f"{name} changed under the abandon ({c.mode}); run it again")
         return _record("abandon-track", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
 
-    _reg_write(target, build)
+    _reg_write(target, build, seal=seal)
+    authority = authority if authority is not None else getattr(seal, "authority", None)
     view = read_registry(target)
     m = cur.migration or ""
     cause = _abandon_record_hash(view, name, m)
@@ -600,7 +620,7 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     abandon_words = view.fold.repos[name].words if view.fold.repos[name].mode == "aborting" else words
     for iid in ids:
         if decision.get(iid) != "cut":
-            bs.decide(target, iid, "cut", abandon_words, by, author=author, cause=cause)
+            bs.decide(target, iid, "cut", abandon_words, by, author=author, cause=cause, authority=authority)
             cut.append(iid)
     return view.fold.repos.get(name), cut
 
@@ -630,7 +650,7 @@ def _uncut_text(name: str, uncut: list[str]) -> str:
 
 
 def abandon_done(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
-                 now: str | None = None) -> tuple[rf.Repo | None, bool]:
+                 now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """``aborting`` becomes ``untracked`` and the lock lifts. Refuses unless every item keyed to M reads cut AND the charter
     compensation holds. On an ``untracked`` repo it is a no-op."""
     name, words, by = _name(name), _words(words, required=False), bs._one_line(by, "by")
@@ -662,7 +682,7 @@ def abandon_done(target: bs.Target, name: str, words: str, by: str, *, author: M
             raise BoardError(f"abandon-done {name} refused: " + _uncut_text(name, late))
         return _record("abandon-done", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
@@ -693,7 +713,7 @@ def _unsettled_items(target: bs.Target, cur: rf.Repo) -> tuple[list[str], str]:
 
 
 def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
-            now: str | None = None) -> tuple[rf.Repo | None, bool]:
+            now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
     """Leave tracked mode (a forward act). Refuses while the repo has an item that is not done, cut or parked."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
@@ -717,7 +737,7 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
             raise BoardError(f"untrack {name} refused: the items changed under the check; run it again")
         return _record("untrack", name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_write(target, build)
+    _, written = _reg_write(target, build, seal=seal)
     return _fold_one(target, name), written
 
 
@@ -752,7 +772,7 @@ def _ack_body(parts: list[bytes], line: int, why: str, brk: Any, file: str, out:
 
 
 def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, author: Mapping[str, Any],
-             now: str | None = None, out: list[str] | None = None) -> bool:
+             now: str | None = None, out: list[str] | None = None, seal: Any = None) -> bool:
     """Append ``{"op": "ack-torn", "line": N, "sha256": <of that line's bytes>, "why": ...}`` to ``repos.jsonl`` or ``items.jsonl``:
     a reader then skips exactly that line. The hash is computed here from the bytes on disk, and the line must be torn by that
     file's fold, a broken chain (:mod:`levain.desk.board_chain`) included. Like every record the ack is chained onto the line
@@ -765,7 +785,7 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
         raise BoardError("--line must be a positive line number")
     why, by = bs._one_line(why, "why"), bs._one_line(by, "by")
     if file == bs.ITEMS_NAME:
-        return _ack_torn_items(target, line, why, by, author, now, out)
+        return _ack_torn_items(target, line, why, by, author, now, out, seal)
 
     def build(fold, sid, raw):
         parts = raw.split(b"\n")
@@ -781,12 +801,12 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
                          malformed=line in fold.malformed)
         return _record(rf.ACK, None, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build, allow_torn=True)
+    _, written = _reg_write(target, build, allow_torn=True, seal=seal)
     return written
 
 
 def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Mapping[str, Any], now: str | None,
-                    out: list[str] | None = None) -> bool:
+                    out: list[str] | None = None, seal: Any = None) -> bool:
     """``ack_torn`` for ``items.jsonl``: judged by the item fold, written by the one writer with no parse (a torn store is the
     case). The ack has no id; the fold and the writer's id reader both know it."""
     from levain.desk.board_state import fold
@@ -809,12 +829,13 @@ def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Map
                          malformed=line in folded.malformed)
         rec = bs.build_record(rf.ACK, "-", by, body, now, author=author)
         rec.pop("id")
-        return rec, True
+        return bs._graded(target, rec, seal), True
 
     bs._require_pointered(target)
     if not (target.store_dir / bs.ITEMS_NAME).exists():
         raise BoardError(f"{bs.ITEMS_NAME} does not exist; there is no line {line}")
-    _, written = bs._append(target, build, filename=bs.ITEMS_NAME, parse=lambda raw: raw)
+    bs._preflight(seal)
+    _, written = bs._append(target, build, filename=bs.ITEMS_NAME, parse=lambda raw: raw, seal=seal)
     return written
 
 
@@ -1190,7 +1211,8 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
 # -------------------------------------------------------------------------------------------------------------- CLI
 
 
-def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callable[[Any], dict], items_help: str) -> None:
+def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callable[[Any], dict], items_help: str,
+                 seal_of: Callable[[Any, dict], Any] | None = None) -> None:
     """Add the registry's verbs under ``levain board``."""
     def common(p: Any, *, words: bool | str = True) -> None:
         p.add_argument("name", metavar="NAME")
@@ -1199,6 +1221,20 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
         p.add_argument("--by", required=True)
         author_args(p)
         p.add_argument("--items", type=str, metavar="PATH", help=items_help)
+
+    def seal(a: Any) -> Any:
+        """The ``--sign`` seal (None without it), built before the store is touched: an agent author or an install with no
+        authority log is refused here, before any prompt."""
+        return seal_of(a, author_of(a)) if seal_of is not None else None
+
+    def _source(a: Any) -> Any:
+        """The authority source an UNSIGNED abandon-track's cuts are checked against (a re-run that finishes cuts). None when
+        this install has none: the policy's own refusal then speaks, not a missing-log one."""
+        from levain.desk import board_sign
+        try:
+            return board_sign.resolve_authority()
+        except BoardError:
+            return None
 
     def run(fn: Callable[[Any, bs.Target], Any]) -> Callable[[Any], int]:
         def inner(args: Any) -> int:
@@ -1242,27 +1278,29 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p = sub.add_parser("register", description="Put a repo in play (untracked). Idempotent for the same path.")
     common(p)
     p.add_argument("--path", required=True)
-    p.set_defaults(func=run(lambda a, t: said(a, *register(t, a.name, a.path, a.words, a.by, author=author_of(a)), "registered", "already registered")))
+    p.set_defaults(func=run(lambda a, t: said(a, *register(t, a.name, a.path, a.words, a.by, author=author_of(a), seal=seal(a)), "registered", "already registered")))
 
     p = sub.add_parser("move", description="Re-base a registered repo onto a new path (the same repository).")
     common(p)
     p.add_argument("--path", required=True)
-    p.set_defaults(func=run(lambda a, t: said(a, *move(t, a.name, a.path, a.words, a.by, author=author_of(a)), "moved", "already at that path")))
+    p.set_defaults(func=run(lambda a, t: said(a, *move(t, a.name, a.path, a.words, a.by, author=author_of(a), seal=seal(a)), "moved", "already at that path")))
 
     p = sub.add_parser("begin-track", description="Start the tracking ceremony for a registered, untracked repo.")
     common(p)
     p.add_argument("--manifest", required=True, metavar="FILE", help="JSON: plan_items (item keys), contract_items (repos), optional retire and record_dir.")
     p.add_argument("--owner", default=None, metavar="DESK", help="The desk that owns the ceremony.")
     p.add_argument("--migration", default=None, metavar="M", help="The migration id (default: derived, so a retry derives the same one).")
-    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration), "tracking", "already tracking")))
+    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, seal=seal(a)), "tracking", "already tracking")))
 
     p = sub.add_parser("track", description="The switchover record: the board becomes the repo's source of truth.")
     common(p)
     p.add_argument("--migration", default=None, metavar="M")
-    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration), "tracked", "already tracked")))
+    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, seal=seal(a)), "tracked", "already tracked")))
 
     def run_abandon(a: Any, t: bs.Target) -> None:
-        repo, cut = abandon_track(t, a.name, a.words, a.by, author=author_of(a))
+        sl = seal(a)
+        repo, cut = abandon_track(t, a.name, a.words, a.by, author=author_of(a), seal=sl,
+                                  authority=None if sl is not None or seal_of is None else _source(a))
         print(f"aborting {a.name}; cut {len(cut)} items" + (f": {', '.join(cut)}" if cut else ""))
     p = sub.add_parser("abandon-track", description="Abort a ceremony before track: the repo becomes aborting and its items are cut. Run again to finish the cuts.")
     common(p)
@@ -1270,16 +1308,16 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     p = sub.add_parser("abandon-done", description="Finish an abort: aborting becomes untracked once every item is cut and the compensation holds.")
     common(p, words=False)
-    p.set_defaults(func=run(lambda a, t: said(a, *abandon_done(t, a.name, "", a.by, author=author_of(a)), "untracked", "already untracked")))
+    p.set_defaults(func=run(lambda a, t: said(a, *abandon_done(t, a.name, "", a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
 
     p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut or parked.")
     common(p)
-    p.set_defaults(func=run(lambda a, t: said(a, *untrack(t, a.name, a.words, a.by, author=author_of(a)), "untracked", "already untracked")))
+    p.set_defaults(func=run(lambda a, t: said(a, *untrack(t, a.name, a.words, a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
 
     for verb, fn in (("pause", pause), ("resume", resume)):
         p = sub.add_parser(verb, description=f"{verb.capitalize()} a repo's attention. Repeating it is a no-op.")
         common(p)
-        p.set_defaults(func=run((lambda fn, verb: lambda a, t: said(a, *fn(t, a.name, a.words, a.by, author=author_of(a)), verb + "d", "already " + verb + "d"))(fn, verb)))
+        p.set_defaults(func=run((lambda fn, verb: lambda a, t: said(a, *fn(t, a.name, a.words, a.by, author=author_of(a), seal=seal(a)), verb + "d", "already " + verb + "d"))(fn, verb)))
 
     p = sub.add_parser("ack-torn", description="Acknowledge one torn line of repos.jsonl or items.jsonl (a malformed line, or a break in the hash chain): readers then skip exactly that line.")
     p.add_argument("--file", required=True, choices=(REPOS_NAME, bs.ITEMS_NAME))
@@ -1291,6 +1329,6 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     def run_ack(a: Any, t: bs.Target) -> None:
         said: list[str] = []
-        written = ack_torn(t, a.file, a.line, a.why, a.by, author=author_of(a), out=said)
+        written = ack_torn(t, a.file, a.line, a.why, a.by, author=author_of(a), out=said, seal=seal(a))
         print(said[-1] if written and said else f"{a.file} line {a.line} is already acknowledged")
     p.set_defaults(func=run(run_ack))

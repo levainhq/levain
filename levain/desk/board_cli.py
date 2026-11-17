@@ -179,7 +179,7 @@ def register(subparsers: Any) -> None:
                    help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
     author_args(u)
     u.set_defaults(func=run_use)
-    br.register_cli(sub, author_args, _author, items_help)
+    br.register_cli(sub, author_args, _author, items_help, _seal)
     from levain.desk import board_context       # imported here: board_context reads this module's helpers
     board_context.register(sub)
 
@@ -472,6 +472,8 @@ def _config_said(store_dir: Path) -> str:
 def run_use(args: argparse.Namespace) -> int:
     try:
         write = _write_use_config(args)
+        if args.sign:
+            raise bs.BoardError("use --import-focus writes asserted registry records (register, pause): --sign does not apply to it")
         if args.import_focus is not None:
             store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
                                                            briefcase=args.briefcase, before_pointer=write)
