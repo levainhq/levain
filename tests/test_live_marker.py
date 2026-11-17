@@ -292,6 +292,9 @@ EXEMPT = {
                                      "imports nothing of levain (pinned by test_room_readguard), and resolves no levain home",
     "levain/desk/room_turn_guard.py": "a standalone hook script the room launcher reads byte for byte and hashes per launch: "
                                       "stdlib only, imports nothing of levain, resolves no levain home",
+    "levain/desk/read_budget.py": "a standalone PreToolUse/PostToolUse hook script the launcher copies and runs under "
+                                  "`python -I read_budget.py pre|post`: stdlib only and self-contained (its docstring), imports "
+                                  "nothing of levain, and resolves no levain home (state dir comes from LEVAIN_READ_BUDGET_DIR)",
     "levain/desk/night_key.py": "the TAOSERV night key's forced command: stdlib only, imports nothing of levain (its docstring "
                                 "says it runs where levain is not installed), so a mark_live import would break it there; "
                                 "it resolves no levain home",
