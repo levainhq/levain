@@ -256,9 +256,9 @@ def _item_part(item: Any, derived: Derived | None) -> Part:
     for link in item.depends_on:
         if link.kind == "item" and link.ref:
             st = derived.states.get(link.ref) if derived is not None else None
-            lines.append(f"depends on: {link.label}: {st.state if st else 'state unreadable'}")
+            lines.append(f"depends on: {_s(link.label)}: {st.state if st else 'state unreadable'}")
         else:
-            lines.append(f"depends on: {link.label}")
+            lines.append(f"depends on: {_s(link.label)}")
     out, cut = _cap(lines, PART_CHARS["item"])
     return Part("item", out, truncated=cut)
 
@@ -351,7 +351,7 @@ def _select(rows: list[_Ep], total: int, item_id: str, repo: str, unreadable: in
     decisions = dec_all[:DECISION_EPISODES]
     for e in decisions:
         seen |= _keys(e)
-    cut = total > len(rows) and (len(item_all) < ITEM_EPISODES or len(dec_all) < DECISION_EPISODES)
+    cut = total > len(rows) + unreadable and (len(item_all) < ITEM_EPISODES or len(dec_all) < DECISION_EPISODES)
     lines = [f"scanned {len(rows)} episodes in the last {WINDOW_DAYS} days" + (f"; {unreadable} unreadable" if unreadable else "")]
     lines.append(f"tagged item:{item_id}: {len(mine)}" + (" (newest first)" if mine else ""))
     lines.extend(f"  {e.at} {e.type} {e.source}: {_clip(e.content, EPISODE_CHARS)}" for e in mine)
@@ -431,8 +431,12 @@ def _source_lines(label: str, given: str | None, env: str, reader: Any, item_id:
         return [f"record[{label}]: unavailable (no path named: pass the flag or set ${env})"], False, False
     if not named.strip():
         return [f"record[{label}]: unreadable (an empty path was named)"], False, False
-    path = Path(named).expanduser()
-    if not path.is_file():
+    try:                                         # a user-given path: ~nosuchuser (RuntimeError), a NUL (ValueError) is this source's
+        path = Path(named).expanduser()
+        is_file = path.is_file()
+    except (OSError, ValueError, RuntimeError) as exc:
+        return [f"record[{label}]: unreadable ({type(exc).__name__}: {_clip(str(exc), 120)})"], False, False
+    if not is_file:
         return [f"record[{label}]: unreadable ({path} is not a file)"], False, False
     try:
         rows, total, bad = reader(path, now)
@@ -447,13 +451,13 @@ def _artifact_lines(repo: Any, item_id: str) -> list[str]:
     the dated entries whose name carries the item (``NAME#N``, ``NAME-N`` or ``NAME_N``)."""
     if repo is None or not repo.record_dir:
         return ["record[artifacts]: unavailable (no record directory)"]
-    base = Path(repo.record_dir).expanduser()
     try:
+        base = Path(repo.record_dir).expanduser()
         names = sorted(os.listdir(base))
-    except OSError as exc:
-        return [f"record[artifacts]: unreadable ({base} cannot be listed: {type(exc).__name__})"]
+    except (OSError, ValueError, RuntimeError) as exc:
+        return [f"record[artifacts]: unreadable ({_clip(str(repo.record_dir), 120)} cannot be listed: {type(exc).__name__})"]
     name, _, n = item_id.partition("#")
-    forms = [re.compile(re.escape(f) + r"(?!\d)") for f in (item_id, f"{name}-{n}", f"{name}_{n}")]   # not a prefix of a longer number
+    forms = [re.compile(r"(?<![A-Za-z0-9])" + re.escape(f) + r"(?!\d)") for f in (item_id, f"{name}-{n}", f"{name}_{n}")]   # not a prefix of a longer number
     hits: list[str] = []
     for e in names:
         if e.startswith("pre-track-"):
@@ -479,6 +483,12 @@ def _record_part(repo: Any, name: str, item_id: str, args: argparse.Namespace, n
     if not (ok_a or ok_f):
         named = any(g is not None or os.environ.get(env) for g, env in ((args.anneal, ANNEAL_ENV), (args.flow_episodes, FLOW_ENV)))
         part.status, part.why = ("unreadable", "no episode source could be read") if named else ("unavailable", "no episode source was named")
+    else:
+        failed = [src[0].partition(": ")[0] + " " + src[0].partition(": ")[2] for src, ok, g, env in
+                  ((a, ok_a, args.anneal, ANNEAL_ENV), (f, ok_f, args.flow_episodes, FLOW_ENV))
+                  if not ok and (g is not None or os.environ.get(env))]
+        if failed:                                # status stays readable; the failed named source is said
+            part.why = "; ".join(failed)
     return part
 
 
@@ -564,9 +574,15 @@ def run_context(args: argparse.Namespace) -> int:
         repo_why = f"the registry is unreadable ({_clip(str(exc), 120)})"
         mode_line = f"repo {name}: {repo_why}"
 
-    repo_path = Path(repo.path) if repo is not None else (Path(args.repo).expanduser() if args.repo else None)
+    repo_path, repo_err = None, ""
+    try:
+        repo_path = Path(repo.path) if repo is not None else (Path(args.repo).expanduser() if args.repo else None)
+    except (OSError, ValueError, RuntimeError) as exc:
+        repo_err = f"--repo cannot be used ({type(exc).__name__}: {_clip(str(exc), 120)})"
     derived: Derived | None
-    if repo_path is None:
+    if repo_err:
+        derived = Derived({}, None, repo_err)
+    elif repo_path is None:
         derived = Derived({}, None, f"{repo_why or 'no repository path'}; pass --repo PATH to read git")
     else:
         try:

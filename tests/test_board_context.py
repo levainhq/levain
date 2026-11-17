@@ -547,3 +547,65 @@ def test_f3_8_anneal_total_matching_is_pre_limit(tmp_path):
     r = s.recall(limit=5)
     s.close()
     assert len(r.episodes) == 5 and r.total_matching == 12
+
+
+def test_f4_1_a_none_dependency_label_is_a_dash():
+    link = SimpleNamespace(kind="gate", ref=None, label=None)
+    item = SimpleNamespace(id="alpha#1", title="t", words="w", origin="o", done="d", done_kind="k", decision=None, depends_on=[link])
+    p = bc._item_part(item, None)
+    assert "depends on: —" in p.lines and "None" not in "\n".join(p.lines)
+
+
+def test_f4_2_a_bad_user_path_costs_only_its_source(world, capsys):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for bad in ("~nosuchuser_zz/x", "a\x00b"):
+        lines, cut, read = bc._source_lines("flow", bad, "X", bc._read_flow, "alpha#1", "alpha", now, set())
+        assert not read and lines[0].startswith("record[flow]: unreadable (")
+        assert bc._artifact_lines(SimpleNamespace(record_dir=bad), "alpha#1")[0].startswith("record[artifacts]: unreadable (")
+    rc, out, err = board(capsys, "context", "alpha#1", "--no-land-waiter", "--anneal", str(world.anneal), "--flow-episodes", "~nosuchuser_zz/x")
+    assert rc == 0, err
+    assert "record[flow]: unreadable (" in out and "record[anneal]:" in out and "worked alpha#1 step" in out
+
+
+def test_f4_2_a_bad_repo_flag_is_the_state_parts_unreadable(world, capsys):
+    store = world.store
+    (store / "repos.jsonl").rename(store / "repos.jsonl.off")
+    (store / "repos.jsonl").touch()
+    rc, out, err = board(capsys, "context", "alpha#1", "--repo", "~nosuchuser_zz/x", "--no-land-waiter", "--anneal", str(world.anneal))
+    assert rc == 0, err
+    assert "state: unreadable (--repo cannot be used (RuntimeError" in out and "worked alpha#1 step" in out
+
+
+def test_f4_3_a_failed_named_source_is_named_while_the_other_reads(world, capsys, tmp_path):
+    rc, out, _ = board(capsys, "context", "alpha#1", "--json", "--no-land-waiter", "--anneal", str(world.anneal),
+                       "--flow-episodes", str(tmp_path / "nope.db"))
+    rec = [p for p in json.loads(out)["parts"] if p["part"] == "record"][0]
+    assert rec["status"] == "ok" and "record[flow]" in rec["why"] and "unreadable" in rec["why"] and "anneal" not in rec["why"]
+
+
+def test_f4_4_rows_dropped_for_bad_metadata_do_not_claim_the_scan_bound():
+    rows = [bc._Ep("e1", "2026-11-17T00:00:00Z", "observation", "s", "c", ("item:alpha#1",))]
+    lines, cut = bc._select(rows, 3, "alpha#1", "alpha", 2)
+    assert not cut and not any("scan bound" in ln for ln in lines)
+    lines, cut = bc._select(rows, 3, "alpha#1", "alpha", 1)
+    assert cut
+
+
+def test_f4_5_an_artifact_form_needs_a_leading_boundary(tmp_path):
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    for n in ("2026-11-17_xalpha-1.md", "2026-11-17_xalpha_1.md", "2026-11-17_alpha-1.md"):
+        (rec / n).write_text("x")
+    out = bc._artifact_lines(SimpleNamespace(record_dir=str(rec)), "alpha#1")
+    assert out[1:] == ["  2026-11-17_alpha-1.md"]
+
+
+def test_f4_6_a_naive_now_is_utc(world, capsys):
+    c = sqlite3.connect(world.flow)
+    flow_add(c, "m1", "2026-11-17T16:30:00Z", "observation", "inside naive", ("item:alpha#1",))
+    flow_add(c, "m2", "2026-11-17T18:00:00Z", "observation", "after naive", ("item:alpha#1",))
+    c.commit()
+    c.close()
+    rc, out, err = board(capsys, "context", "alpha#1", "--now", "2026-11-17T17:00:00", *world.args)
+    assert rc == 0, err
+    assert "inside naive" in out and "after naive" not in out
