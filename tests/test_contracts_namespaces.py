@@ -36,7 +36,7 @@ def namespace_uses(tree: ast.AST):
             for kw in node.keywords:
                 if kw.arg == "namespace" and _str(kw.value) is not None:
                     yield _str(kw.value), node.lineno, "namespace="
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             args = node.args
             for a, d in zip(args.args[len(args.args) - len(args.defaults):] + args.kwonlyargs,
                             list(args.defaults) + list(args.kw_defaults)):
