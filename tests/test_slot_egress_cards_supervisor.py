@@ -51,9 +51,10 @@ atexit.register(lambda: _ivl("t1"))
 def _count(name):
     p = os.path.join(store, name)
     n = int(open(p).read()) if os.path.exists(p) else 0
-    with open(p + ".tmp", "w") as f:
+    tmp = "%s.%d.tmp" % (p, os.getpid())
+    with open(tmp, "w") as f:
         f.write(str(n + 1))
-    os.replace(p + ".tmp", p)
+    os.replace(tmp, p)
     return n
 def _lock():
     fd = os.open(os.path.join(store, "session.lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -109,6 +110,17 @@ assert CARD_HELPER != FX3_HELPER
 
 
 # --- helpers ---------------------------------------------------------------------------------------------------------
+
+STOP_ERRORS: List[BaseException] = []
+
+
+@pytest.fixture(autouse=True)
+def _a_stop_condition_that_raised_fails_its_test():
+    STOP_ERRORS.clear()
+    yield
+    errs, STOP_ERRORS[:] = list(STOP_ERRORS), []
+    assert not errs, "a stop_when condition raised (the run was ended, not satisfied): %r" % (errs,)
+
 
 def wait_for(cond: Callable[[], Any], seconds: float = 20.0, step: float = 0.02) -> Any:
     end = time.monotonic() + seconds
@@ -207,6 +219,7 @@ class Rig:
                 wait_for(cond, 40)
             except BaseException as e:                 # a condition that is wrong must END the run, not hang it
                 self.stop_error = e
+                STOP_ERRORS.append(e)                 # a wrong condition ENDS the run, and then fails its test (fixture below)
             time.sleep(then)
             if seen is not None:
                 seen["err"] = self.r.stderr()
@@ -942,3 +955,4 @@ def test_read_int_waits_out_an_empty_file_and_a_stop_when_survives_a_raising_con
     killed.clear()
     rig.stop_when(lambda: 1 / 0, 0.0).join(5)              # a wrong condition still ENDS the run (no 90 s hang) ...
     assert killed == [signal.SIGTERM] and isinstance(rig.stop_error, ZeroDivisionError)   # ... and the error is kept
+    STOP_ERRORS.clear()                                    # this test raised on purpose; the fixture would fail any other
