@@ -58,7 +58,7 @@ LEASE_VERBS = frozenset({"prepare", "render", "start", "resume", "teardown", "co
 #: §5.1 verbs that read a stdin blob; every other verb takes none ("—").
 STDIN_VERBS = frozenset({"prepare", "render", "egress-grant"})
 
-#: levain#66 S2: the four host-grant verbs (operator only, no lease; ``egress-grant`` alone reads stdin, an
+#: levain#66 S2: the host-grant verbs (operator only, no lease; ``egress-grant`` alone reads stdin, an
 #: :class:`EgressGrantInput` under its own 8 KiB cap).
 EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list", "egress-grants-all")
 EGRESS_GRANT_STDIN_MAX = 8 * 1024

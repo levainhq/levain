@@ -2,7 +2,8 @@
 desk design 2.8).
 
 ``OPEN -> pushed -> (tap or answer = ACKED)``; no ack by the retry time and the ping is pushed again; after the
-ceiling's pushes, a ``did_not_wake`` band row is written and the ping is over. The table is the state: a new process
+ceiling's pushes, the ping row closes as ``did_not_wake`` and a band row is written (``did_not_wake``, or
+``unreachable`` when no push was delivered); the ping is over. The table is the state: a new process
 over the same file resumes every open ping where the last left it.
 
 WHAT CLOSES A PING is :data:`ACK_SOURCES` and nothing else: a tap (a notificationclick, an ``opens`` row) or his answer
@@ -17,7 +18,9 @@ or link of the caller's. A push is CLAIMED (counted, the next due time set) in a
 sent, ONE row at a time immediately before its own send, so a crash loses at most the one in-flight attempt and never
 repeats one; a pass is bounded (:data:`MAX_PER_PASS` rows, :data:`PASS_WALL` seconds) so one tick never holds a night's
 attempts hostage. A failed push counts toward the ceiling like any other, and each ping keeps how many sends the sender
-reported as a 2xx: a ping that reaches its ceiling with none delivered is ``unreachable``, not "he did not wake".
+reported as a 2xx: a ping that reaches its ceiling with none delivered gets an ``unreachable`` band row, not a
+"he did not wake" one. The ping ROW's own state is ``did_not_wake`` for any ping closed unacknowledged; the band
+row's kind is what tells the two apart.
 
 NOT HERE: the next channel after N re-pushes (the design's Q4 follow-up), the heartbeat (:mod:`levain.desk.night_audit`)
 and every production caller (levain#16); nothing calls :meth:`OpenPings.tick` on a timer yet. Stdlib plus the repo's

@@ -318,6 +318,7 @@ def test_f3_a_ping_no_phone_took_is_unreachable_not_he_did_not_wake(tmp_path, cl
         pings.tick()
     row = pings.band_rows()[0]
     assert row["kind"] == "unreachable" and row["delivered"] == 0 and row["pushes"] == 2
+    assert pings.ping("notify:watcher")["state"] == "did_not_wake"     # the ping row's own state; the band row's kind differs
     assert "no push was delivered" in row["text"] and "did not wake" not in row["text"]
 
 

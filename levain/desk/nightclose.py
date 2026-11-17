@@ -173,7 +173,7 @@ def _close(conn: sqlite3.Connection, stamp: str, now: datetime, owner: str | Non
     new_stop = prior is None or prior[1] != who or conn.execute(
         "SELECT 1 FROM launches WHERE gseq > ? AND launch_id != ?", (prior[0], who)).fetchone() is not None
     todo = []
-    for (eid,) in conn.execute("SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall():
+    for eid in events._in_state(conn, ("retried", "claimed", "delivered"), trusted_only=True):
         ev = events._event(conn, eid)
         if ev.state == "retried" or (ev.state in ("claimed", "delivered") and ev.launch_id != who):
             todo.append(ev)

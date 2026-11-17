@@ -200,3 +200,25 @@ def test_with_no_launch_holding_the_lease_it_refuses_and_writes_nothing(store, t
         nightclose(store, clock(), token=token)
     assert rows(qdir, "SELECT COUNT(*) FROM event_states") == before
     assert issubclass(NightCloseRefused, CoordError)
+
+
+def test_the_close_issues_the_same_statements_at_any_count_of_settled_events(store, tmp_path, qdir, clock, pinger):
+    """The events half reads the open events in one statement: the STATEMENTS the close runs in the coord write
+    transaction do not grow with the settled events ever stored."""
+    from tests.test_desk_events import _settled_beats, _statements
+
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    _b, token = morning(store, a)
+    nightclose(store, clock(), token=token)
+
+    def again():
+        store.coord_beat(token)
+        assert nightclose(store, clock(), token=token).handed == ()
+
+    _settled_beats(store, clock, cred, 5, first=10)
+    clock.advance(minutes=3)
+    few = _statements(store, again)
+    _settled_beats(store, clock, cred, 40, first=15)
+    clock.advance(minutes=3)
+    many = _statements(store, again)
+    assert many == few, (few, many)
