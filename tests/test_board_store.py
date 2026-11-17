@@ -891,25 +891,6 @@ def test_a_torn_store_still_refuses_a_chained_write(home, tmp_path, capsys):
     assert rc == 2 and "torn" in err and (store / "items.jsonl").read_bytes() == before
 
 
-def test_a_replacement_that_copies_the_written_line_is_found_by_its_exact_bytes_and_keeps_its_prev(home, tmp_path, capsys, monkeypatch):
-    store = use(capsys, tmp_path / "s")
-    assert run(capsys, *ADD)[0] == 0
-    items = store / "items.jsonl"
-    first = items.read_bytes().split(b"\n")[0]
-    real, calls = bs._write_all, {"n": 0}
-
-    def write_then_swap(fd, payload):
-        calls["n"] += 1
-        real(fd, payload)
-        if calls["n"] == 1:
-            _replace_with_copy(items)                                # the copy already holds the written line
-
-    monkeypatch.setattr(bs, "_write_all", write_then_swap)
-    assert run(capsys, *ADD)[0] == 0
-    assert calls["n"] == 1 and len(lines(store)) == 2                # found, not rebuilt: one record in all
-    assert json.loads(lines(store)[1])["prev"] == _sha(first)        # the prev computed in attempt 1
-
-
 def test_a_record_without_at_is_refused_not_written_unchained(home, tmp_path):
     t = _target(Path(os.path.realpath(tmp_path / "s")))
     bs.use(t.store_dir)

@@ -522,8 +522,7 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *,
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
                 # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                line = canonical_bytes(rec)
-                _write_all(fd, line + b"\n")
+                _write_all(fd, canonical_bytes(rec) + b"\n")
                 if not _same_file(fd, path):
                     raise BoardError(f"{path} was replaced while {rec['id']} was being written (a git operation?): the record may or may not be "
                                      f"in the new file; run \"levain board state\" and check before retrying (an add with --key is safe to retry)")
