@@ -116,14 +116,32 @@ def clock():
 def test_the_verb_prints_the_count_and_the_names_on_one_line(store, tmp_path, qdir, clock, pinger, capsys):
     cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
     b, token = morning(store, a)
-    w1, _ = worker(store, token, "fix the build")
-    w2, _ = worker(store, token, "write the docs")
+    w1, t1 = worker(store, token, "fix the build")
+    w2, t2 = worker(store, token, "write the docs")
     assert main(["coord", "nightclose", "--token", str(token), "--queue-dir", str(qdir)]) == 0
     out = capsys.readouterr().out
     assert len(out.strip().splitlines()) == 1
-    assert out.strip().endswith(f"; seats recorded 2 ({w1.launch_id}, {w2.launch_id})")
+    on = ", ".join(f"{w.launch_id} claude threads {t}" for w, t in sorted(((w1, t1), (w2, t2)), key=lambda p: p[0].launch_id))
+    assert out.strip().endswith(f"; seats recorded 2 new; 2 on record for {b.launch_id} ({on})")
     assert main(["coord", "nightclose", "--token", str(token), "--queue-dir", str(qdir)]) == 0
-    assert capsys.readouterr().out.strip().endswith("; seats recorded 0")
+    again = capsys.readouterr().out.strip()                    # a retry: 0 new, the same two still named
+    assert again.endswith(f"; seats recorded 0 new; 2 on record for {b.launch_id} ({on})")
+
+
+def test_a_lost_print_does_not_lose_the_seats(store, tmp_path, qdir, clock, pinger, capsys):
+    """The close commits and its result never reaches the desk (simulated: the call is made directly): the retry the
+    desk runs names the seats from the durable records, and the JSON carries them too."""
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    b, token = morning(store, a)
+    w1, t1 = worker(store, token, "fix the build")
+    got = nightclose(store, clock(), token=token)
+    assert got.seats == (w1.launch_id,) and [r["launch_id"] for r in got.on_record] == [w1.launch_id]
+    assert main(["coord", "nightclose", "--token", str(token), "--queue-dir", str(qdir), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["seats"] == [] and [(r["launch_id"], r["threads"]) for r in out["on_record"]] == [(w1.launch_id, [t1])]
+    w2, _ = worker(store, token, "started after")
+    later = nightclose(store, clock(), token=token)
+    assert later.seats == (w2.launch_id,) and {r["launch_id"] for r in later.on_record} == {w1.launch_id, w2.launch_id}
 
 
 def test_the_day_desks_brief_tells_it_to_adopt_the_recorded_seats(store, tmp_path, qdir, clock, pinger):
@@ -131,3 +149,4 @@ def test_the_day_desks_brief_tells_it_to_adopt_the_recorded_seats(store, tmp_pat
     b, token = morning(store, a)
     text = launch_mod._brief_text(store, store.launch(b.launch_id))
     assert "nightclose_seat:" in text and "ADOPT those seats, never stop them" in text
+    assert "confirm each is still active in the roster first" in text

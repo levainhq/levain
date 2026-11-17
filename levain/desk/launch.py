@@ -537,7 +537,7 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
         "for you with its exact acknowledge line (run it); when nothing waits it says \"no light open needed\".",
         f"- In the morning, after a night with a night desk, run `{lv} coord nightclose --token N {tail}`: it stops the "
         "night's claims and hands its open events (and any started effect) to you, and records every working seat "
-        "(`nightclose_seat:` rows, named in its `seats recorded` line): ADOPT those seats, never stop them. An effect "
+        "(`nightclose_seat:` rows, named in its `seats recorded` line): ADOPT those seats, never stop them, but confirm each is still active in the roster first. An effect "
         "the night reserved after the read is recorded only by the next close: run it again until it reports "
         "`effects recorded 0`.",
         f"- {DAY_PARAGRAPH}",

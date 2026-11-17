@@ -222,3 +222,59 @@ def test_the_close_issues_the_same_statements_at_any_count_of_settled_events(sto
     clock.advance(minutes=3)
     many = _statements(store, again)
     assert many == few, (few, many)
+
+
+def test_the_set_based_reads_equal_the_old_per_event_loops_over_every_mix_of_states(store, tmp_path, qdir, clock, pinger):
+    """G3: ``unseen_event`` and the close's handed set read only the events in the wanted states. The REFERENCE below is
+    the old loop (every trusted event, one read each); over a store of many events in every lifecycle state (trusted and
+    untrusted) the two give identical answers."""
+    from tests.test_desk_events import _conn, launch
+
+    cred, a, evs = night(store, tmp_path, qdir, clock, pinger)
+    b, token = morning(store, a)
+    low = sensor(store, tmp_path, "low", "untrusted")
+    plan = [("received", None), ("claimed", a), ("claimed", b), ("delivered", a), ("delivered", b), ("acked", a),
+            ("suppressed", None), ("alerted", None), ("retried", None), ("retried", None), ("claimed", a),
+            ("delivered", a), ("received", None), ("acked", b)]
+    made = []
+    for i, (kind, who) in enumerate(plan * 3):
+        made.append(down(store, cred, 100 + i, subject=f"host-{i}").event.event_id)
+        with store._write() as (conn, now):
+            if kind != "received":
+                events._state(conn, now, made[-1], kind, launch_id=None if who is None else who.launch_id,
+                              claim_until=events._plus(now, events.CLAIM_TTL) if kind == "claimed" else None)
+    for i in range(5):          # untrusted ones are alerted at once (terminal): they must stay out of both sets
+        events.post(store, "low", 200 + i, "site_status", {"subject": f"u{i}", "state": "down"}, credential=low)
+
+    def old_unseen(conn, ln):
+        start = events._launch_start(conn, ln.launch_id)
+        for (eid,) in conn.execute("SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall():
+            row = conn.execute(f"SELECT kind, gseq FROM event_states WHERE event_id = ? AND {events._in('kind', events.LIFECYCLE)} "
+                               "ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
+            if row is None or row[0] not in events._AVAILABLE:
+                continue
+            claimed = conn.execute("SELECT 1 FROM event_states WHERE event_id = ? AND kind = 'claimed' AND launch_id = ?",
+                                   (eid, ln.launch_id)).fetchone()
+            if row[1] > start or claimed is None:
+                return eid
+        return None
+
+    def old_handed(conn, who):
+        out = []
+        for (eid,) in conn.execute("SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall():
+            ev = events._event(conn, eid)
+            if ev.state == "retried" or (ev.state in ("claimed", "delivered") and ev.launch_id != who):
+                out.append(ev.event_id)
+        return out
+
+    conn = _conn(qdir)
+    try:
+        for ln_id in (a.launch_id, b.launch_id):
+            ln = launch(store, ln_id)
+            assert events.unseen_event(conn, ln) == old_unseen(conn, ln)
+        want = old_handed(conn, b.launch_id)
+    finally:
+        conn.close()
+    assert len(want) > 10
+    got = nightclose(store, clock(), token=token)
+    assert list(got.handed) == want

@@ -49,8 +49,11 @@ projection the board draws: a worker's ``active`` is the watcher's reading). The
 launch, and the owner are never recorded (the night desk is stopped by the morning, not adopted). A seat that appears
 after a close is recorded by the NEXT, as for an effect; a re-run writes nothing twice. This is a RECORD and nothing
 else: no stop, no re-point, no transfer (a seat reports through the log, so none is needed), and no adoption logic here
-(the day desk reads the records, ``levain coord nightclose`` prints their count and names, and adopts). The seat's launch
-row is never written. Known edge: a record is never retired (bounded by owners x live seats), as for an effect.
+(the day desk reads the records, ``levain coord nightclose`` prints them, and adopts). The seat's launch row is never
+written. Every call returns the seats it recorded AND every record the owner holds (``on_record``, read in the same
+fenced transaction), so a retry after a lost print still names them. What a record does NOT promise: it is a SNAPSHOT at
+close time and is never retired, and ``active`` was the watcher's last reading then, so the seat may have ended since;
+the day desk confirms each recorded seat is still active in the roster before it adopts it. Known edge: a record is never retired (bounded by owners x live seats), as for an effect.
 """
 from __future__ import annotations
 
@@ -89,6 +92,7 @@ class NightClose:
     handed: tuple[str, ...] = ()    # event ids this call wrote ``claimed`` for the owner
     effects: tuple[int, ...] = ()   # attempt ids of the ``unknown`` effects this call recorded for the owner
     seats: tuple[str, ...] = ()     # launch ids of the live worker seats this call recorded for the owner
+    on_record: tuple[dict[str, Any], ...] = ()   # EVERY seat record the owner holds (this call's and earlier), key order
 
 
 def _latest_stop(conn: sqlite3.Connection) -> tuple[int, str | None] | None:
@@ -139,6 +143,24 @@ def _unrecorded_seats(conn: sqlite3.Connection, stamp: str, who: str) -> list[An
     return [ln for ln, _waiting in ready.live_seat_launches(conn, stamp)
             if ln.role != ROLE_DESK and ln.launch_id != who
             and conn.execute("SELECT 1 FROM meta WHERE key = ?", (_seat_key(ln.launch_id, who),)).fetchone() is None]
+
+
+def _seats_on_record(conn: sqlite3.Connection, who: str) -> tuple[dict[str, Any], ...]:
+    """Every seat record the owner holds, decoded, in key order: read in the caller's transaction, after its writes, so
+    a retry whose keys were all written by an earlier call still has the list. A row that cannot be read is skipped."""
+    out: list[dict[str, Any]] = []
+    for key, value in conn.execute("SELECT key, value FROM meta WHERE key GLOB ? ORDER BY key", (SEAT_PREFIX + "*",)):
+        if not key.endswith(":" + who):
+            continue
+        try:
+            rec = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("owner") == who and isinstance(rec.get("launch_id"), str):
+            out.append({"launch_id": rec["launch_id"], "harness": rec.get("harness"), "role": rec.get("role"),
+                        "threads": list(rec.get("threads") or []), "session_key": rec.get("session_key"),
+                        "at": rec.get("at")})
+    return tuple(out)
 
 
 def _read_unknown(journal: Any) -> list[Any]:
@@ -207,7 +229,7 @@ def _close(conn: sqlite3.Connection, stamp: str, now: datetime, owner: str | Non
         if ev.state == "retried" or (ev.state in ("claimed", "delivered") and ev.launch_id != who):
             todo.append(ev)
     if not todo and not new_stop and not started and not seats:
-        return NightClose(who, False)
+        return NightClose(who, False, on_record=_seats_on_record(conn, who))
     if new_stop:
         g = next_gseq(conn, stamp)
         conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
@@ -227,4 +249,4 @@ def _close(conn: sqlite3.Connection, stamp: str, now: datetime, owner: str | Non
                                                                 "threads": list(ln.threads),
                                                                 "session_key": ln.session_key, "at": utc_stamp(now)})))
     return NightClose(who, new_stop, tuple(e.event_id for e in todo), tuple(a.attempt_id for a in started),
-                      tuple(ln.launch_id for ln in seats))
+                      tuple(ln.launch_id for ln in seats), _seats_on_record(conn, who))
