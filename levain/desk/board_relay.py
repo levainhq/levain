@@ -10,8 +10,8 @@ holds them, so the citation cannot later attach to a different answer.
 Three things live here, and nothing else does:
 
 * :class:`BandSource`: the one way a row is read by id. :class:`NativeBandSource` is levain's own (a
-  :class:`~levain.consent.questions.QuestionStore`); the native source refuses an ``np-`` id (flow's band; pinned by a test), so
-  its source is flow's work to supply behind this same interface.
+  :class:`~levain.consent.questions.QuestionStore`, ``q-`` ids, producer ``native``); it refuses an ``np-`` id (flow's band;
+  pinned by a test), so flow's source is T12's work behind this same interface.
 * :func:`relay_source`: the WRITE side. Reads the row at write time and refuses, or returns the ``source`` object.
 * :func:`verify_relayed` and :func:`check_manifest`: the READ side, pure over their inputs. They report the row's OWN
   grade and never promote it.
@@ -36,6 +36,9 @@ ROW_GRADES = {
     "countersigned": "a countersigned answer",
     "signed": "a signed answer",
     "unsigned": "an unsigned answer",
+    "unsigned-phone": "an unsigned answer (phone)",
+    "unsigned-terminal": "an unsigned answer (terminal)",
+    "unknown": "an answer whose signing the band cannot say",
 }
 SOURCE_KEYS = ("np", "producer", "question_sha256", "answer_sha256")
 
@@ -73,16 +76,47 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-class NativeBandSource:
-    """Levain's own band (``questions.db``). It reads a ``q-…`` id or a number. An ``np-`` id is flow's, so it is unknown
-    here. The native store records no signature (``Answer.signed`` is None unless a host sets it), which reads as unsigned:
-    a grade the store cannot vouch for is never promoted. An option answer's text is its option key, as stored."""
+#: a native question id as ``QuestionStore`` mints it (``q-`` and 24 hex); a bare band number is a view-relative handle, never a citation
+Q_RE = re.compile(r"q-[0-9a-f]{24}")
+NATIVE_PRODUCER = "native"
 
-    def __init__(self, store: Any, producer: str = "levain") -> None:
+
+def native_grade(store: Any, question: Any) -> str:
+    """How a resolved native row was answered, the STORE'S CLAIM (the signature is not re-verified here): the same logic and
+    vocabulary as ``levain.desk.board_producers._grade`` (collapse into board_producers._grade at restack).
+
+    ``Answer.signed`` when set, else the signing sidecar's ``sign_state`` (``band_view.answer_sign_of``): ``signed`` -> signed,
+    ``unsigned`` -> unsigned, anything else, no sidecar row, or an unreadable sidecar -> ``unknown``. The place is ``phone`` when
+    the answer's channel is phone, else ``terminal``. Returns ``signed-phone | signed-terminal | unsigned-phone |
+    unsigned-terminal | unknown``; ``unknown`` is reported as such, never as signed."""
+    from levain import band_view
+
+    answer = question.answer
+    signed = answer.signed
+    if signed is None:
+        try:
+            state = (band_view.answer_sign_of(store, question.id) or {}).get("sign_state")
+        except Exception:                           # noqa: BLE001 - a sidecar that cannot be read is a grade the store cannot say
+            state = None
+        signed = True if state == "signed" else False if state == "unsigned" else None
+    where = "phone" if answer.channel == "phone" else "terminal"
+    if signed is True:
+        return f"signed-{where}"
+    return f"unsigned-{where}" if signed is False else "unknown"
+
+
+class NativeBandSource:
+    """Levain's own band (``questions.db``). It reads a native ``q-<hex>`` id; an ``np-`` id is flow's (T12's reader), so it
+    is not a row this band holds. The row's grade is the STORE'S CLAIM of a signature (:func:`native_grade`, one logic with board_producers._grade), never a
+    verification. An option answer's text is its option key, as stored."""
+
+    def __init__(self, store: Any, producer: str = NATIVE_PRODUCER) -> None:
         self._store = store
         self._producer = producer
 
     def row(self, np_id: str) -> BandRow:
+        if not isinstance(np_id, str) or not Q_RE.fullmatch(np_id):
+            raise BandRefusal(f"{np_id} is not a row this band holds")
         try:
             q = self._store.get(np_id)
         except Exception as exc:                            # noqa: BLE001 - any read failure is a refusal, never a crash
@@ -91,8 +125,7 @@ class NativeBandSource:
             raise BandRefusal(f"{np_id} is not a row this band holds")
         if q.answer is None:
             raise BandRefusal(f"{np_id} is unanswered")
-        signed = getattr(q.answer, "signed", None)
-        return BandRow(q.what, q.answer.value, "signed" if signed else "unsigned", self._producer)
+        return BandRow(q.what, q.answer.value, native_grade(self._store, q), self._producer)
 
 
 def band_source(directory: Path | str | None = None) -> BandSource:
@@ -124,8 +157,8 @@ def _row_of(source: BandSource, np_id: str) -> BandRow:
 def relay_source(np_id: str, words: str, source: BandSource) -> dict:
     """The WRITE side: read the row now, and refuse unless it is answered and ``words`` is a verbatim, non-blank substring
     of the answer. Returns the record's ``source`` object. Raises BoardError."""
-    if not isinstance(np_id, str) or not NP_RE.fullmatch(np_id):
-        raise BoardError(f"--source {np_id!r} is not np-xxxxxxxx")
+    if not isinstance(np_id, str) or not (NP_RE.fullmatch(np_id) or Q_RE.fullmatch(np_id)):
+        raise BoardError(f"--source {np_id!r} is not np-xxxxxxxx or a native q-<24 hex> question id")
     if not isinstance(words, str) or not words.strip():
         raise BoardError("a relayed record must carry the words it relays: they must be a verbatim excerpt of the answer")
     try:
@@ -164,7 +197,10 @@ def verify_relayed(rec: Mapping[str, Any], band_source: BandSource) -> Verdict:
     words = fields.get("words") if rec.get("op") == "amend" and isinstance(fields, Mapping) else rec.get("words")
     if not isinstance(words, str) or not words.strip() or words not in row.answer:
         return Verdict(False, f"the record's words are not a verbatim excerpt of {np_id}'s answer", row.answer_grade)
-    return Verdict(True, f"relaying {np_id}, {_grade_words(row.answer_grade)}", row.answer_grade)
+    said = f"relaying {np_id}, {_grade_words(row.answer_grade)}"
+    if row.producer == NATIVE_PRODUCER and row.answer_grade.startswith(("signed", "countersigned")):
+        said += " (per the band store's sign_state; the signature itself is re-verified by the trail verifier)"
+    return Verdict(True, said, row.answer_grade)
 
 
 def check_manifest(rec: Mapping[str, Any], row: BandRow, manifest_sha256: str | None = None) -> Verdict:

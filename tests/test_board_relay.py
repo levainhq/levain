@@ -115,7 +115,9 @@ def test_an_unknown_np_id_is_refused(store, band, capsys):
 
 def test_a_source_that_is_not_an_np_id_is_refused(store, band, capsys):
     rc, _, err = decide(capsys, EXCERPT, "q-abc")
-    assert rc == 2 and "is not np-xxxxxxxx" in err
+    assert rc == 2 and "is not np-xxxxxxxx or a native q-<24 hex>" in err
+    rc, _, err = decide(capsys, EXCERPT, "3")                   # a band number is a view-relative handle
+    assert rc == 2 and "is not np-xxxxxxxx or a native q-<24 hex>" in err
 
 
 def test_source_with_an_operator_author_is_refused(store, band, capsys):
@@ -274,8 +276,101 @@ def test_the_native_source_reads_a_q_id_and_refuses_np_unanswered_and_unknown(tm
         native.row(q.id)
     qs.answer(q.id, text="yes, ship it now", channel="cli")
     row = native.row(q.id)
-    assert row == br.BandRow("Ship the thing?", "yes, ship it now", "unsigned", "levain")
+    assert row == br.BandRow("Ship the thing?", "yes, ship it now", "unknown", "native")
     with pytest.raises(br.BandRefusal, match="not a row this band holds"):
         native.row(NP)                                  # flow's np ids are not levain's to read
     with pytest.raises(br.BandRefusal, match="not a row this band holds"):
         native.row("q-doesnotexist")
+
+
+# ------------------------------------------------------------------------------- native band: a signed answer is citable
+
+
+def _native(tmp_path, text="Track flow?", answer="yes, track it. His sentence travels."):
+    """A scratch consent dir with one open question answered through the band's own signed-answer insert; returns
+    ``(dir, store, question)``. ``sign`` is applied by the caller via :func:`_answer`."""
+    d = tmp_path / "consent"
+    d.mkdir(mode=0o700)
+    qs = QuestionStore(d)
+    q = qs.file(agent="claude_code", agent_session_id="s", what=text, options=(), rec="", blocks="b", cwd="/tmp",
+                open_ended=True)
+    return d, qs, q
+
+def _answer(qs, q, sign, channel="cli", text="yes, track it. His sentence travels."):
+    from levain import band_view as bv
+    (res,) = bv._answer_signed(qs, [{"ref": q.id, "text": text, "via": channel, "viewer": "t", "sign": sign}],
+                               channel=channel, deadline=None)
+    assert not isinstance(res, Exception), res
+
+
+def _signed(qs, q):
+    from levain import band_view as bv
+    return bv.Signing("signed", message="levain-desk-answer/1\nstore: x\n", sig="c2ln", fp="SHA256:f",
+                      versions={q.id: bv.subject_version(qs.get(q.id))})
+
+
+def _relay(capsys, store, d, q):
+    return run(capsys, "decide", "--id", "levain#1", "--decision", "cut", "--words", "His sentence travels",
+               "--by", "desk 24", "--source", q.id, "--band-dir", str(d))
+
+
+def test_a_signed_native_answer_is_cited_by_its_q_id_and_reported_signed(store, tmp_path, capsys):
+    d, qs, q = _native(tmp_path)
+    _answer(qs, q, _signed(qs, q), channel="phone")
+    rc, out, err = _relay(capsys, store, d, q)
+    assert rc == 0, err
+    rec = records(store)[-1]
+    assert rec["grade"] == "relayed" and rec["source"]["np"] == q.id and rec["source"]["producer"] == "native"
+    v = br.verify_relayed(rec, br.NativeBandSource(qs))
+    assert v.ok and v.grade == "signed-phone"
+    assert v.text == (f"relaying {q.id}, a passkey-signed answer (per the band store's sign_state; the signature "
+                      f"itself is re-verified by the trail verifier)")
+
+
+def test_a_signed_native_answer_at_a_terminal_reads_signed_terminal(tmp_path):
+    d, qs, q = _native(tmp_path)
+    _answer(qs, q, _signed(qs, q), channel="cli")
+    assert br.NativeBandSource(qs).row(q.id).answer_grade == "signed-terminal"
+
+
+def test_an_unsigned_native_answer_is_reported_unsigned(store, tmp_path, capsys):
+    from levain import band_view as bv
+    d, qs, q = _native(tmp_path)
+    _answer(qs, q, bv.Signing("unsigned", reason="remote"))
+    rc, _, err = _relay(capsys, store, d, q)
+    assert rc == 0, err
+    v = br.verify_relayed(records(store)[-1], br.NativeBandSource(qs))
+    assert v.ok and v.grade == "unsigned-terminal" and v.text == f"relaying {q.id}, an unsigned answer (terminal)"
+
+
+def test_an_unmapped_sign_state_or_no_sidecar_reads_unknown_never_signed(tmp_path):
+    from levain import band_view as bv
+    d, qs, q = _native(tmp_path)
+    _answer(qs, q, bv.Signing("unsigned", reason="remote"))
+    with _scratch_db(d) as conn:
+        conn.execute("UPDATE answer_context SET sign_state = 'countersigned-ish' WHERE question_id = ?", (q.id,))
+    row = br.NativeBandSource(qs).row(q.id)
+    assert row.answer_grade == "unknown" and br.ROW_GRADES["unknown"] in br.verify_relayed(
+        {"grade": "relayed", "source": br.relay_source(q.id, "His sentence", br.NativeBandSource(qs)),
+         "author": {"kind": "agent"}, "op": "decide", "words": "His sentence"}, br.NativeBandSource(qs)).text
+
+
+def test_a_native_answer_changed_after_the_citation_reports_the_digest_mismatch(store, tmp_path, capsys):
+    d, qs, q = _native(tmp_path)
+    _answer(qs, q, _signed(qs, q), channel="phone")
+    rc, _, err = _relay(capsys, store, d, q)
+    assert rc == 0, err
+    rec = records(store)[-1]
+    with _scratch_db(d) as conn:
+        conn.execute("UPDATE answers SET value = 'no, His sentence travels' WHERE question_id = ?", (q.id,))
+    v = br.verify_relayed(rec, br.NativeBandSource(qs))
+    assert not v.ok and v.text.startswith("digest mismatch") and v.grade == "signed-phone"
+
+
+def _scratch_db(d):
+    """The SCRATCH store's db with its append-only guards dropped, so a test can stage a state the writers never produce."""
+    import sqlite3
+    conn = sqlite3.connect(d / "questions.db")
+    for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%\\_frozen' ESCAPE '\\'").fetchall():
+        conn.execute(f"DROP TRIGGER {name}")
+    return conn
