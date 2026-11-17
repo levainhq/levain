@@ -14,6 +14,7 @@ import pytest
 
 from levain.cli import main
 from levain.desk import board_producers
+from levain.desk import board_store as bs
 from levain.desk.board_state import AUDIT_KINDS, COLUMNS, STATES
 from tests._board_git_world import DAY, OLD, World, git
 
@@ -63,6 +64,12 @@ def native_stub(monkeypatch):
             out["waiters"] = board_producers._block(now, store_id, [], None)
         return out
     monkeypatch.setattr(board_producers, "native_blocks", stub)
+
+@pytest.fixture(autouse=True)
+def _registry_not_under_test(monkeypatch):
+    """These tests are about the item writer and the CLI, not the registry: I1 (``add`` needs a tracked repo) is off here and
+    is tested live in tests/test_board_registry.py."""
+    monkeypatch.setattr(bs, "_check_repo_mode", lambda store_dir, repo, key: None)
 
 
 @pytest.fixture

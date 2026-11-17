@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.desk import board_evidence as be
+from levain.desk import board_registry as br
 from levain.desk import board_store as bs
 from levain.desk import board_producers as bp
 from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
@@ -131,7 +132,13 @@ def register(subparsers: Any) -> None:
     d.set_defaults(func=run_decide)
     u = sub.add_parser("use", description="Make DIR this install's item store (created if needed); writes the pointer last.")
     u.add_argument("dir", type=Path, metavar="DIR")
+    u.add_argument("--import-focus", dest="import_focus", type=Path, metavar="FILE",
+                   help="Import a focus.json as register/pause records, replace it by a tombstone, then write the pointer (re-runnable).")
+    u.add_argument("--briefcase", type=Path, metavar="DIR", help="Where the focus entries' directories are (default: three levels above FILE).")
+    u.add_argument("--by", default="levain board use", help="Who writes the imported records (default: the verb).")
+    author_args(u)
     u.set_defaults(func=run_use)
+    br.register_cli(sub, author_args, _author, items_help)
 
 
 def _fail(message: str) -> int:
@@ -335,6 +342,11 @@ def run_decide(args: argparse.Namespace) -> int:
 
 def run_use(args: argparse.Namespace) -> int:
     try:
+        if args.import_focus is not None:
+            store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
+                                                           briefcase=args.briefcase)
+            print(f"{'using' if changed else 'already using'} {store_dir} ({note})")
+            return 0
         store_dir, changed = bs.use(args.dir)
     except bs.BoardError as exc:
         return _refused(exc)
@@ -420,6 +432,8 @@ def run_state(args: argparse.Namespace) -> int:
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
                        primary_repo=summary["repo"] if cross else None)
     doc = board.to_dict()
+    registry_audit = br.audit_for_state(target, now)         # T2-b: the 72-hour rule shows on the board's audit list too
+    doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit]
     doc["reader"] = summary
     if also:
         doc["reader"] = {**summary, "also": also}
@@ -427,7 +441,7 @@ def run_state(args: argparse.Namespace) -> int:
         print(json.dumps(doc, indent=2, sort_keys=False))
     else:
         _print_table(doc)
-    return EXIT_AUDIT if board.audit else 0
+    return EXIT_AUDIT if board.audit or registry_audit else 0
 
 
 def _print_table(doc: dict[str, Any]) -> None:

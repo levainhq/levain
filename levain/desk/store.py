@@ -1294,8 +1294,13 @@ class CoordStore:
         """Ask for a launch under ``token``. ``attach_item`` also records the launch as the worker on that ready item
         (:func:`levain.desk.work_attach.attach_launch`), in this same transaction: an item this store does not
         hold refuses the whole request and leaves no launch."""
-        from levain.desk import lease, work_attach
+        from levain.desk import board_registry, lease, work_attach
 
+        if cwd:                 # I5: once the board registry is active, a seat is never launched in a repo it does not list
+            try:
+                board_registry.register_for_launch(cwd)
+            except board_registry.BoardError as exc:
+                raise CoordError(f"launch refused: {cwd} could not be registered on the board registry: {exc}") from None
         with self._write() as (conn, now):
             ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
                                       cwd=cwd, role_ref=role_ref)

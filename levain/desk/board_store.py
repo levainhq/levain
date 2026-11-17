@@ -563,8 +563,10 @@ def _append(target: Target, build: Callable[[list[dict]], tuple[dict, bool]], *,
         raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
 
 
-def _check_repo_mode(repo: str) -> None:
-    """Hook point: where a repo-mode check on ``add`` goes. No behaviour."""
+def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
+    """I1, under the exclusive lock: ``add`` only for a repo the registry holds as tracking (keyed to its migration) or tracked."""
+    from levain.desk import board_registry
+    board_registry.check_add(store_dir, repo, key)
 
 
 def add(target: Target, repo, title, origin, by, words="", done=None, done_kind="merged", tier=None, depends=(),
@@ -591,9 +593,9 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         if not HASH_RE.fullmatch(payload_hash or ""):
             raise BoardError(f"payload hash {payload_hash!r} is not a lowercase sha256 hex digest")
         fields = {**fields, "key": key, "payload_hash": payload_hash}
-    _check_repo_mode(repo)
 
     def build(recs):
+        _check_repo_mode(target.store_dir, repo, key)
         if key is not None:
             for r in recs:
                 if r.get("op") == "add" and r.get("key") == key:
@@ -670,7 +672,9 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author) -
     return _append(target, build)[0]["id"]
 
 
-def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author) -> str:
+def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None) -> str:
+    """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
+    ``abandon-track``'s cuts carry it); it is written after ``date`` only when given."""
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
@@ -679,7 +683,12 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
 
     def build(recs):
         _require_known(recs, item_id)
-        return build_record("decide", item_id, by, {"decision": decision, "words": words, "date": when}, now, author=author), True
+        body = {"decision": decision, "words": words, "date": when}
+        if cause is not None:
+            if not HASH_RE.fullmatch(cause):
+                raise BoardError(f"cause {cause!r} is not a lowercase sha256 hex digest")
+            body["cause"] = cause
+        return build_record("decide", item_id, by, body, now, author=author), True
 
     return _append(target, build)[0]["id"]
 

@@ -21,6 +21,13 @@ HASH_A = "a" * 64
 HASH_B = "b" * 64
 
 
+@pytest.fixture(autouse=True)
+def _registry_not_under_test(monkeypatch):
+    """These tests are about the item writer and the CLI, not the registry: I1 (``add`` needs a tracked repo) is off here and
+    is tested live in tests/test_board_registry.py."""
+    monkeypatch.setattr(bs, "_check_repo_mode", lambda store_dir, repo, key: None)
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / "lhome"

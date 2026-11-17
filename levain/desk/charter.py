@@ -64,10 +64,20 @@ class Problem:
         return {"line": self.line, "rule": self.rule, "text": self.text}
 
 
+_STUBS_KEY = re.compile(r"^[^:\s]+:stubs:([a-z0-9][a-z0-9._-]*)$")
+
+
+def _is_stubs_key(key: Any, repo: str) -> bool:
+    """True for the key ``M:stubs:<repo>`` of an item of ``repo`` (design 5(e), T2-i)."""
+    m = _STUBS_KEY.match(key) if isinstance(key, str) else None
+    return m is not None and m.group(1) == repo
+
+
 def check_text(text: str, *, repo_name: str | None = None,
-               items: Mapping[str, tuple[str, str | None]] | None = None) -> tuple[list[Problem], list[str]]:
+               items: Mapping[str, tuple] | None = None) -> tuple[list[Problem], list[str]]:
     """``(problems, warnings)`` for the charter ``text``. ``items`` maps an item id to ``(repo, decision or None)`` when
-    the store is at hand; without it the store checks are skipped, never guessed."""
+    the store is at hand (an optional third element is the item's idempotency key); without it the store checks are skipped,
+    never guessed."""
     problems: list[Problem] = []
     warnings: list[str] = []
 
@@ -195,7 +205,11 @@ def check_text(text: str, *, repo_name: str | None = None,
             if iid not in items:
                 bad(n, "store", f"{iid} is not in the board store")
         planned = {iid for _, iid, _ in plan_ids}
-        for iid, (repo, decision) in sorted(items.items()):
+        for iid, info in sorted(items.items()):
+            repo, decision = info[0], info[1]
+            key = info[2] if len(info) > 2 else None
+            if _is_stubs_key(key, repo):        # a stubs item of another repo's ceremony (`M:stubs:<repo>`) is never in this plan
+                continue
             if repo == name and iid not in planned and decision not in OUT_OF_PLAN:
                 warnings.append(f"{iid} is in the store and in no plan group")
 
@@ -277,20 +291,29 @@ def _read_path(path: Path) -> tuple[str | None, str]:
     return _decode(raw)
 
 
-def _store(path: Path) -> tuple[dict[str, tuple[str, str | None]] | None, str]:
+def _store(path: Path) -> tuple[dict[str, tuple] | None, str]:
     """``(items, why)``: the store folded, or None and why the store checks are skipped. A torn store or one with
     problems is not complete, so it is skipped like an unreadable one, never trusted."""
     from levain.desk import board_store
     from levain.desk.board_state import fold
     try:
-        folded = fold(board_store.read_item_lines(board_store.resolve_store(path)))
+        lines = board_store.read_item_lines(board_store.resolve_store(path))
+        folded = fold(lines)
     except board_store.BoardError as exc:
         return None, f"was refused: {exc}"
     except (OSError, ValueError, RuntimeError, RecursionError) as exc:
         return None, f"cannot be read ({type(exc).__name__})"
     if folded.torn or folded.problems:
         return None, f"is not a whole store ({'torn: ' + folded.torn_why if folded.torn else folded.problems[0]})"
-    return {i.id: (i.repo, i.decision.decision if i.decision else None) for i in folded.items.values()}, ""
+    keys: dict[str, Any] = {}
+    for ln in lines:                    # the item fold keeps no key: read it off the add record itself
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("op") == "add" and isinstance(rec.get("id"), str):
+            keys.setdefault(rec["id"], rec.get("key"))
+    return {i.id: (i.repo, i.decision.decision if i.decision else None, keys.get(i.id)) for i in folded.items.values()}, ""
 
 
 def run_check(args: Any) -> int:
