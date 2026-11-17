@@ -31,6 +31,9 @@ Known edges, left open under the reachability line (nobody reaches them):
 * a launch refused AFTER registration (a stale lease token, an unknown thread, a bad model) leaves a ``register`` record for the repo in cwd: the record is true, only earlier than its first launch (the lease and thread checks need the coordination db's transaction);
 * a replayed ``abandon-done`` on an already ``untracked`` repo is accepted with no migration check: a no-op there, and only a hand-written line produces it;
 * ``untrack`` refuses on any change to the items file between its check and its write: retryable, it says "run it again".
+* ``begin-track`` replayed AFTER ``track`` refuses ("tracked, not untracked"): T2-a's idempotence covers a lost-response
+  retry, which happens before ``track`` (a caller that ran ``track`` has seen ``begin-track`` succeed); ``track`` replayed
+  prints "already tracked";
 * ``register_for_launch`` reads ANY failure of ``git rev-parse --show-toplevel`` as "not in a repository", so a transient git
   failure there lets the launch go on unregistered (the next launch in that repo registers it);
 * ``use --import-focus`` judges each name's identity on a registry snapshot taken before its writes: a ``move`` that lands

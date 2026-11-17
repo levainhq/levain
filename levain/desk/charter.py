@@ -400,9 +400,10 @@ def skeleton_text(name: str, export: str, plan_ids: list[str] | None) -> str:
     return "\n".join(out)
 
 
-def _plan_ids(items: Mapping[str, tuple[str, str | None]], name: str) -> list[str]:
-    """NAME's items not decided out of the plan, in id order."""
-    return sorted((i for i, (repo, dec) in items.items() if repo == name and dec not in OUT_OF_PLAN),
+def _plan_ids(items: Mapping[str, tuple], name: str) -> list[str]:
+    """NAME's items not decided out of the plan, in id order. Each value is ``(repo, decision, ...)``, as :func:`_store`
+    builds it (it carries the item's key third)."""
+    return sorted((i for i, (repo, dec, *_rest) in items.items() if repo == name and dec not in OUT_OF_PLAN),
                   key=lambda iid: int(iid.rpartition("#")[2]))
 
 
