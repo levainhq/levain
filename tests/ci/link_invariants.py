@@ -30,13 +30,19 @@ TIMEOUT = 1800
 CLOSURE_TIMEOUT = 3600
 
 
+GUARD = "tests/test_link_invariants_list.py"   # the exact-set guard: the runner runs it even if a link's list drops its line
+
+
 def listed():
-    """The test paths of LINK_INVARIANTS, in file order (comments and blank lines dropped)."""
+    """The test paths of LINK_INVARIANTS, in file order (comments and blank lines dropped), plus GUARD if the list
+    omits it, so the list handed to pytest is never empty (no files would fall back to testpaths)."""
     out = []
     for line in LIST.read_text(encoding="utf-8").splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             out.append(line)
+    if GUARD not in out:
+        out.append(GUARD)
     return out
 
 
@@ -68,8 +74,9 @@ def run_step(label, tail, timeout=TIMEOUT):
     counts = {}
     for n, word in COUNT.findall(res.stdout.splitlines()[-1] if res.stdout.strip() else ""):
         counts[word] = int(n)
-    counts.setdefault("skipped", 0)
-    shown = " ".join("%d %s" % (n, w) for w, n in counts.items())
+    if counts:
+        counts.setdefault("skipped", 0)
+    shown = " ".join("%d %s" % (n, w) for w, n in counts.items()) or "no count read"
     print("%s: %s (%s)" % (label, "PASS" if res.returncode == 0 else "FAIL", shown))
     return res.returncode
 

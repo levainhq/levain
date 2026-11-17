@@ -59,3 +59,20 @@ def test_an_empty_derivation_raises(monkeypatch):
 def test_the_count_parser_keeps_errors_whole():
     assert [w for _, w in runner.COUNT.findall("2 errors in 1s")] == ["errors"]
     assert [w for _, w in runner.COUNT.findall("1 error, 3 passed, 4 skipped")] == ["error", "passed", "skipped"]
+
+
+def test_the_runner_runs_the_guard_even_when_the_list_drops_it(monkeypatch, tmp_path):
+    fake = tmp_path / "LINK_INVARIANTS"
+    fake.write_text("tests/test_live_marker.py\n", encoding="utf-8")
+    monkeypatch.setattr(runner, "LIST", fake)
+    assert runner.listed() == ["tests/test_live_marker.py", runner.GUARD]
+    fake.write_text("# nothing\n", encoding="utf-8")
+    assert runner.listed() == [runner.GUARD]
+
+
+def test_a_crash_before_any_count_prints_no_count_read(monkeypatch, capsys):
+    class Crash:
+        returncode, stdout = 2, "ImportError: boom\n"
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: Crash())
+    assert runner.run_step("listed files", ["x"]) == 2
+    assert "FAIL (no count read)" in capsys.readouterr().out
