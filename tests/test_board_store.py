@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from levain.cli import main
+from levain.desk import board_cli
 from levain.desk import board_store as bs
 from levain.desk.board_state import fold
 
@@ -437,7 +438,7 @@ def test_a_reader_does_not_create_store_lock(home, tmp_path, capsys):
     store = use(capsys, tmp_path / "s")
     (store / "store.lock").unlink()
     assert run(capsys, "state", "--json")[0] in (0, 3)
-    assert bs.read_store_id(bs.resolve_store()) is not None
+    assert board_cli._store_id(store) is not None
     assert bs.known_ids(bs.resolve_store()) == set()
     assert not (store / "store.lock").exists()
     assert run(capsys, *ADD)[1] == "levain#1"           # a writer takes it
@@ -666,7 +667,32 @@ def test_a_shared_reader_of_a_vanished_store_refuses_instead_of_reading_empty(ho
         with bs.store_lock(store, exclusive=False):
             pass
     with pytest.raises(bs.BoardError, match="holds no store"):
-        bs.read_store_id(target)
+        bs.read_item_lines(target)
+
+
+def test_state_reads_store_id_under_the_same_shared_hold_as_the_items(home, tmp_path, capsys, monkeypatch):
+    """Deterministic interleaving: at the moment `state` reads store.id, a writer (`use`) must still be locked out."""
+    import fcntl
+    store = use(capsys, tmp_path / "s")
+    seen = []
+    real = board_cli._store_id
+
+    def spy(store_dir):
+        fd = os.open(store_dir / bs.LOCK_NAME, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append("writer got in")
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                seen.append("locked out")
+        finally:
+            os.close(fd)
+        return real(store_dir)
+
+    monkeypatch.setattr(board_cli, "_store_id", spy)
+    run(capsys, "state", "--json")
+    assert seen == ["locked out"]
 
 
 def test_a_failed_directory_fsync_after_a_new_store_id_is_a_warning(home, tmp_path, capsys, monkeypatch):

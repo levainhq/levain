@@ -18,6 +18,7 @@ checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -56,14 +57,14 @@ def register(subparsers: Any) -> None:
                      "audit is empty, 3 when it is not, 2 when the items file or an explicit option is unusable."))
     p.add_argument("--json", action="store_true", help="Print the Board as JSON (the contract flow's readers consume).")
     p.add_argument("--items", type=str, metavar="PATH",
-                   help=f"The items store (items.jsonl). Default: ${ITEMS_ENV}; one of the two is required.")
+                   help=f"The store directory, or its items.jsonl. Default: ${ITEMS_ENV}; one of the two is required.")
     p.add_argument("--evidence-extra", dest="evidence_extra", type=Path, metavar="PATH",
                    help="A JSON object with the evidence flow supplies (seats, band, waiters, documents, unreadable, fetched_at). "
                         f"It may not name a source this command reads itself: {', '.join(READ_BY_CLI)} (its own fetched_at, "
                         "when it carries one, is only the time it was captured).")
     p.add_argument("--producer", dest="producers", action="append", default=[], metavar="NAME",
                    help="An external evidence producer to expect (repeatable): its blocks are read from evidence.NAME.json "
-                        "beside the items file. Levain's own reads of seats and band are always expected.")
+                        "in the store directory. Levain's own reads of seats and band are always expected.")
     p.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter: Levain then declares waiters absent. Without it, waiters are "
                         "unknown until a producer that runs them supplies them.")
@@ -324,8 +325,16 @@ def run_state(args: argparse.Namespace) -> int:
     given = args.items or os.environ.get(ITEMS_ENV)
     if not given and not target.pointered and not target.items_path.is_file():
         return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
+    store_id: str | None = None
+    store_id_exc: Exception | None = None
     try:
-        lines = bs.read_item_lines(target)
+        # items and store.id under ONE shared hold: a `use` racing this read cannot show store.id half-written
+        with (bs.store_lock(target.store_dir, exclusive=False) if target.pointered else contextlib.nullcontext()):
+            lines = bs.read_item_lines(target)
+            try:
+                store_id = _store_id(target.store_dir)
+            except (ValueError, OSError) as exc:        # UnicodeDecodeError is a ValueError
+                store_id_exc = exc
     except (OSError, UnicodeDecodeError, bs.BoardError) as exc:
         return _fail(f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
@@ -339,14 +348,10 @@ def run_state(args: argparse.Namespace) -> int:
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
-    try:
-        store_id = _store_id(store_dir)
-    except ValueError as exc:
-        if isinstance(exc, UnicodeDecodeError):
-            return _fail(f"store.id could not be read: {type(exc).__name__}: {exc}")
-        return _fail(str(exc))
-    except OSError as exc:
-        return _fail(f"store.id could not be read: {type(exc).__name__}: {exc}")
+    if store_id_exc is not None:
+        if isinstance(store_id_exc, ValueError) and not isinstance(store_id_exc, UnicodeDecodeError):
+            return _fail(str(store_id_exc))
+        return _fail(f"store.id could not be read: {type(store_id_exc).__name__}: {store_id_exc}")
     producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
     if bp.NATIVE_PRODUCER in producers:
         return _fail(f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")

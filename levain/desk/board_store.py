@@ -44,7 +44,7 @@ from levain.desk import work_attach
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
     "TWO_STORES", "add", "amend", "build_record", "decide", "next_id", "read_item_lines", "read_pointer",
-    "read_store_id", "resolve_store", "store_lock", "use",
+    "resolve_store", "store_lock", "use",
 ]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
@@ -293,14 +293,6 @@ def read_item_lines(target: Target) -> list[str]:
                 return []
             raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
     return raw.decode("utf-8").splitlines()
-
-
-def read_store_id(target: Target) -> str | None:
-    """The store's identity, or None when it has none yet."""
-    with store_lock(target.store_dir, exclusive=False):
-        if not (target.store_dir / STORE_ID_NAME).exists():
-            return None
-        return _read_stable(target.store_dir / STORE_ID_NAME).decode("utf-8", "replace").strip() or None
 
 
 def _read_records(fd: int) -> list[dict]:
