@@ -3273,7 +3273,7 @@ class _Handler(GuardedHandler):
     def _tap_state_write(self, text: str) -> "dict[str, Any]":
         """The state text a tap token carries, set through the governed ``operator_state`` edit (source ``phone``: it is a
         phone's tap). Fail-soft by design: the presence word has already landed, so a state line that cannot be written
-        is reported in the reply (``{"text", "set": False, "error"}``), never a failed tap."""
+        is reported in the reply (``state_line``: ``text``, ``set`` false, ``error``), never a failed tap."""
         from levain import writes
 
         scope = self.server.levain_source.write_scope
@@ -3282,7 +3282,7 @@ class _Handler(GuardedHandler):
         try:
             writes.apply_edit(scope, {"kind": "operator_state", "text": text, "source": "phone"})
         except writes.EditError as exc:
-            return {"text": text, "set": False, "error": str(exc)}
+            return {"text": text, "set": False, "error": "the state line could not be written"}   # the detail is for the server, never the tap's caller
         except Exception as exc:  # noqa: BLE001 - a state write never fails the tap that already set the word
             return {"text": text, "set": False, "error": f"the state line could not be written ({type(exc).__name__})"}
         return {"text": text, "set": True}
@@ -3307,7 +3307,8 @@ class _Handler(GuardedHandler):
         queue = self.server.signer.queue_dir
         try:
             if new:
-                if req.get("state") is not None and self.server.levain_source.write_scope is None:
+                if (req.get("state") is not None and (self.server.levain_source.write_scope is None
+                                                      or self.server.levain_source.context_json is None)):
                     return {"error": "presence_refused", "message": "this cockpit has no writable state line, so a token cannot set one"}, 422
                 rec, token = presence_tokens.create(queue, req["name"], req.get("words"), state=req.get("state"))
                 return {"token": token, "record": rec, "tokens": presence_tokens.list_public(queue)}, 200

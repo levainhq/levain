@@ -78,6 +78,8 @@ def test_the_state_text_is_fixed_at_creation_and_no_call_can_inject_one(rig):
     {"words": ["sleep"], "state": "x" * (presence_tokens.STATE_MAX + 1)},
     {"words": ["sleep"], "state": "two\nlines"},
     {"words": ["sleep"], "state": "bell\x07"},
+    {"words": ["sleep"], "state": "a‮b"},          # bidi override
+    {"words": ["sleep"], "state": "a b"},          # line separator
 ])
 def test_a_state_text_that_is_not_one_short_line_on_one_word_is_not_minted(rig, body):
     src, q = rig
@@ -115,6 +117,31 @@ def test_a_state_write_that_fails_never_fails_the_tap_and_leaks_no_detail(rig, m
         st, got, _ = _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(tok))
         assert st == 200 and got["word"] == "sleep" and got["state_line"]["set"] is False
         assert "secret" not in json.dumps(got) and _state(src)["state"] == "fine"
+
+
+def test_an_edit_refusal_detail_never_reaches_the_taps_caller(rig, monkeypatch):
+    from levain import writes
+
+    def refuse(*a, **k):
+        raise writes.EditError("store_unavailable", 503, "state file unavailable: /Users/x/.levain/context.json")
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok = _mint_bed(port)[1]["token"]
+        monkeypatch.setattr(writes, "apply_edit", refuse)
+        st, got, _ = _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(tok))
+        assert st == 200 and got["state_line"]["set"] is False and "/Users" not in json.dumps(got)
+
+
+def test_a_cockpit_with_no_state_file_mints_no_state_token(rig, monkeypatch):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        keep = src.context_json
+        object.__setattr__(src, "context_json", None)       # the source is a frozen dataclass: this test alone unsets it
+        try:
+            st, got, _ = _mint_bed(port)
+        finally:
+            object.__setattr__(src, "context_json", keep)
+        assert st == 422 and presence_tokens.list_public(q) == [], got
 
 
 def test_the_text_is_on_the_record_and_the_public_list_but_the_secret_is_not(rig):

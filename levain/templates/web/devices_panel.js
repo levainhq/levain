@@ -1312,6 +1312,7 @@
     if (!name) { prSay("Give the tap token a name."); return; }
     if (!words.length) { prSay("Pick at least one word it may set."); return; }
     const state = prState.value.trim();
+    if (prState.value && !state) { prSay("The state line is blank: clear it or type the text."); return; }
     if (state && words.length !== 1) { prSay("A token that sets a state line names exactly one word."); return; }
     if (tapBusy) return;
     tapBusy = true;
@@ -1341,7 +1342,8 @@
     prNew.appendChild(copy);
     const origin = window.location.origin;
     prNew.appendChild(el("p", "dev-link-n", "In Shortcuts or on the tag: send a POST to " + origin + "/webpush/presence/set"));
-    prNew.appendChild(el("p", "dev-link-n", "with the header X-Levain-Presence-Token set to this token and the JSON body {\"word\":\"away\"}."));
+    prNew.appendChild(el("p", "dev-link-n", "with the header X-Levain-Presence-Token set to this token and the JSON body {\"word\":\"" + ((rec.words && rec.words[0]) || "away") + "\"}."
+      + (rec.state ? " A tap also sets your state line to “" + rec.state + "”." : "")));
     prNew.hidden = false;
   }
   async function revokeTap(name) {
