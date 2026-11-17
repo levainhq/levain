@@ -1,0 +1,13 @@
+# The fixed list of cheap whole-stack invariant tests that EVERY link tip of a stacked landing runs, unchanged
+# (python3 tests/ci/link_invariants.py). No lane picks a subset: the reds of this class each came from the one test
+# a hand-picked subset omitted. One test path per line, relative to the repo root; `#` starts a comment.
+# The runner then also runs `pytest -m invariant -q` (the marker tier, tests/ci/invariant_tests.txt).
+# tests/test_link_invariants_list.py holds the four named below in this list.
+tests/test_seam_classes_census.py
+tests/test_live_marker.py
+tests/test_ci_root_closure.py
+tests/test_slot_egress_cards.py
+# The 3.9 root-run file the root-py39 CI job's closure covers (its other files: `link_invariants.py --all-root`).
+tests/test_root_py39_floor.py
+# The marker list is held to the collected tests and the named failures.
+tests/test_ci_invariant_marker.py
