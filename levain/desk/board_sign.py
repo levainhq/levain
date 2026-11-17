@@ -442,7 +442,7 @@ def prepare(target: bs.Target, verb: str, *, authority: AuthoritySource | None =
     """Build, under the lock and without writing, the record ``verb`` would write now, with grade ``signed-phone`` and its
     ``prev``; the caller hands ``message`` to the passkey ceremony. ``kwargs`` are the verb's own arguments (``author`` must be
     the operator; ``seal`` is refused). ``now`` is frozen here, after the arguments are merged (a ``now`` of None is replaced),
-    so :func:`commit_phone` re-builds the same bytes. ``authority`` (a source) is needed only to check a ``cause`` early.
+    so :func:`commit_phone` re-builds the same bytes. ``authority`` (a source) is required for a cut that carries a ``cause``: without it the build refuses with NO_AUTHORITY.
     Nothing is written."""
     if "seal" in kwargs:
         raise bs.BoardError("prepare makes its own seal: a seal argument is refused")
