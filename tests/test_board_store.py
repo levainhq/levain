@@ -36,6 +36,23 @@ def home(tmp_path, monkeypatch):
     return h
 
 
+@pytest.fixture(autouse=True)
+def stand_in_signer(monkeypatch):
+    """``decide`` is decision-class (P2): these tests are about the store's shape, so ``--sign`` here gets a seal that stamps a
+    placeholder signature, never Touch ID. Real signing and its verification are tests/test_board_sign.py's."""
+    from levain.desk import board_sign
+
+    class Stamp(board_sign.Seal):
+        via = "terminal"
+
+        def __call__(self, record):
+            return {**record, "sig": {"sshsig": "stand-in", "fingerprint": "SHA256:x", "via": "terminal"}}
+    monkeypatch.setattr(board_sign, "terminal_seal", lambda: Stamp())
+
+
+SIGNED = ("--author-kind", "operator", "--sign")
+
+
 def run(capsys, *argv):
     rc = main(["board", *argv])
     out, err = capsys.readouterr()
@@ -56,7 +73,7 @@ def lines(d: Path) -> list[str]:
 def sans_at(line: str) -> dict:
     """The record without what P1a adds (the stamp, ``prev``, ``author``, ``grade``): what flow's writer also wrote."""
     rec = json.loads(line)
-    for k in ("at", "prev", "author", "grade"):
+    for k in ("at", "prev", "author", "grade", "sig"):
         rec.pop(k, None)
     return rec
 
@@ -68,7 +85,7 @@ FLOW_CALLS = [
     ("add", "--repo", "levain", "--title", "Second", "--origin", "desk 17", "--by", "levain 22"),
     ("amend", "--id", "levain#1", "--why", "re-scope", "--by", "levain 22", "--title", "Port me 2", "--clear", "tier",
      "--depends", "band:np-1a2b3c4d"),
-    ("decide", "--id", "levain#2", "--decision", "parked", "--words", "later, ok", "--by", "levain 22", "--date", "2026-11-17"),
+    ("decide", "--id", "levain#2", "--decision", "parked", "--words", "later, ok", "--by", "levain 22", "--date", "2026-11-17", *SIGNED),
 ]
 
 
@@ -91,7 +108,7 @@ def test_every_verb_folds_cleanly(home, tmp_path, capsys):
     store = use(capsys, tmp_path / "store")
     for call in FLOW_CALLS:
         assert run(capsys, *call)[0] == 0
-    run(capsys, "decide", "--id", "levain#2", "--decision", "reopen", "--words", "back", "--by", "x")
+    run(capsys, "decide", "--id", "levain#2", "--decision", "reopen", "--words", "back", "--by", "x", *SIGNED)
     run(capsys, "add", "--repo", "flow", "--title", "k", "--origin", "o", "--by", "x", "--key", "k1", "--payload-hash", HASH_A)
     folded = fold(lines(store))
     assert not folded.torn and not folded.problems

@@ -114,6 +114,9 @@ def register(subparsers: Any) -> None:
     p.set_defaults(func=run_state)
 
     def author_args(parser: Any) -> None:
+        parser.add_argument("--sign", action="store_true",
+                            help="Sign this record with the operator's Touch ID key (needs --author-kind operator, a fresh terminal "
+                                 "and an enrolled terminal key). The lock is held while the prompt is up; a refused prompt writes nothing.")
         parser.add_argument("--author-kind", dest="author_kind", choices=bs.AUTHOR_KINDS, default="agent",
                             help="Who writes: an operator or an agent (default agent). The name is --by.")
         parser.add_argument("--launch-key", dest="launch_key", default=None, metavar="KEY",
@@ -156,6 +159,8 @@ def register(subparsers: Any) -> None:
     d.add_argument("--by", required=True)
     author_args(d)
     d.add_argument("--date", default=None)
+    d.add_argument("--cause", default=None, metavar="SHA256",
+                   help="For a cut: the sha256 of the signed or relayed abandon-track record this cut derives from.")
     d.add_argument("--items", type=str, metavar="PATH", help=items_help)
     d.set_defaults(func=run_decide)
     u = sub.add_parser("use", description="Make DIR this install's item store (created if needed); writes the pointer last.")
@@ -371,9 +376,20 @@ def _author(args: argparse.Namespace) -> dict[str, str]:
     return author
 
 
+def _seal(args: argparse.Namespace, author: dict[str, str]):
+    """The seal for ``--sign`` (None without it). An agent author with ``--sign`` is refused here, before any prompt."""
+    if not args.sign:
+        return None
+    if author["kind"] != "operator":
+        raise bs.BoardError("--sign signs as the operator: add --author-kind operator")
+    from levain.desk import board_sign
+    return board_sign.terminal_seal()
+
+
 def run_add(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         for spec in args.depends:               # a malformed link is a refusal, not an advisory
             bs.parse_link(spec)
@@ -381,7 +397,7 @@ def run_add(args: argparse.Namespace) -> int:
             _warn_unknown_deps(target, args.depends)
         item_id, _ = bs.add(target, args.repo, args.title, args.origin, args.by, words=args.words, done=args.done,
                             done_kind=args.done_kind, tier=args.tier, depends=args.depends, key=args.key,
-                            payload_hash=args.payload_hash, author=author)
+                            payload_hash=args.payload_hash, author=author, seal=seal)
         print(item_id)
     except bs.BoardError as exc:
         return _refused(exc)
@@ -391,6 +407,7 @@ def run_add(args: argparse.Namespace) -> int:
 def run_amend(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
                                     ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
@@ -405,7 +422,7 @@ def run_amend(args: argparse.Namespace) -> int:
             if key in fields:
                 raise bs.BoardError(f"--{c.replace('_', '-')} and --clear {c} name the same field; give one")
             fields[key] = [] if c == "depends" else None
-        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=author))
+        print("amended", bs.amend(target, args.id, args.why, args.by, fields, author=author, seal=seal))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
@@ -414,8 +431,10 @@ def run_amend(args: argparse.Namespace) -> int:
 def run_decide(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
-        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author))
+        print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
+                                   cause=args.cause, seal=seal))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0
