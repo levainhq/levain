@@ -212,9 +212,10 @@ def _on_tree(name: str) -> bool:
 
 def test_the_issuance_section_points_at_the_card_and_is_not_worded_as_unbuilt():
     flat = " ".join(TEXT.split())
-    assert "## How a grant is issued" in TEXT and "filed as a card by the session's supervisor (S4)" in flat
+    assert "## How a grant is issued" in TEXT and "filed as a card by the session's supervisor." in flat
     assert "planned" not in TEXT and "not built" not in TEXT
-    assert "levain#66 S2" in flat and "(S3)" in flat and "(S4)" in flat and "(S5)" in flat
+    assert flat.count("levain#66") == 1                                  # the one board pointer
+    assert not re.search(r"\bS[2-5][ab]?\b|S5b", TEXT)                      # no internal slice label
 
 
 @pytest.mark.skipif(not _on_tree("levain.slot.egress_cards"), reason="S4's cards are not on this tree")
@@ -242,3 +243,39 @@ def test_the_cockpit_claims_are_the_surfaces_code():
 def test_no_cockpit_route_or_argument_name_is_in_the_page():
     assert "/cockpit/" not in TEXT and "host_grants" not in TEXT          # a route is the code's to name, not this page's
     assert "Untrusted HTTP fields can reach only these validated helper invocations." in " ".join(TEXT.split())
+
+
+def test_a_revoke_the_ledger_refuses_is_named_as_not_recorded():
+    from levain.slot import egress_ledger as EL
+    src = _src(EV)
+    flat = " ".join(TEXT.split())
+    assert EL.ERR_FULL == "egress-grant-ledger-full" and EV.ERR_WRITE == "egress-grant-write-failed"
+    assert f"`{EL.ERR_FULL}`" in TEXT and f"`{EV.ERR_WRITE}`" in TEXT
+    assert 'raise Refused(ERR_WRITE, "the revocation may not be recorded: revoke it again")' in src
+    assert 'raise Refused(ERR_FULL, "revoked.jsonl is full")' in _src(EL)
+    assert "**the revoke was not recorded**" in flat and "`REVOKED_MAX`" in TEXT and "`REVOKED_KEEP_S`" in TEXT
+    assert hasattr(EL, "REVOKED_MAX") and hasattr(EL, "REVOKED_KEEP_S")
+
+
+def test_a_missing_setup_step_two_is_said_not_to_be_caught_at_session_start():
+    flat = " ".join(TEXT.split())
+    assert "That check does not catch a missing setup step 2" in flat
+    assert "host grants are not set up for this install" in flat
+    assert "`egress-grant-not-ready` can mean either step is missing" in flat
+    from levain.slot import egress_store as ES
+    assert ES.NOT_READY == "egress-grant-not-ready"
+    # the code the sentence rests on: a slot dir that is not there makes the list answer empty, not refuse
+    src = _src(EV)
+    assert "if e.name != ES.NOT_READY:\n            raise\n        sd = None" in src
+    if _on_tree("levain.slot.egress_cards"):
+        from levain.slot import egress_cards as EC
+        assert EC.NAMES[ES.NOT_READY][1] == "host grants are not set up for this install"
+
+
+def test_the_never_granted_rule_names_what_host_class_checks():
+    flat = " ".join(TEXT.split())
+    assert "named in the `hosts` list of any route in the base map" in flat
+    assert "A route's `upstream` host is not on that list" in flat
+    assert "on any route in the base map" not in flat
+    vsrc = _src(__import__("levain.slot.egress_verify", fromlist=["x"]))
+    assert "any(host in hs for hs in hosts.values())" in vsrc and "VENDOR_HOSTS" in vsrc

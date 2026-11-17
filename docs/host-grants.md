@@ -4,9 +4,8 @@ A governed session that runs in an egress slot reaches the network only through 
 admits only the hosts on the session's own list. A host grant is how you add one host to that list for one running
 session, with a tap, instead of editing the operator list with `routes-egress` and waiting.
 
-This page describes the whole stack: root's verbs and store (levain#66 S2), the gateway front that enforces a grant
-(S3), the card that files one for a tap (S4) and the cockpit's list and revoke (S5). Each section names the part it
-describes.
+This page describes the whole stack: root's verbs and store, the gateway front that enforces a grant, the card that
+files one for a tap, and the cockpit's list and revoke. Each section names the part it describes. Board row levain#66.
 
 ## What a grant is
 
@@ -18,9 +17,10 @@ describes.
 - A grant lasts until the end of the session or a chosen time, whichever is first: the choice `s` ("this session")
   is capped at 8 hours from issue, the choice `d` ("24 hours") at 24 hours from issue and still applies to this
   session only.
-- Root keeps at most 16 grants per session file. Root never grants a host that is on any route in the base map,
-  whether or not this session uses that route (another vendor's brokered or passthrough route included), or that is a
-  model vendor's own host; Levain files no card for such a host, and the end-of-session note says it was refused and
+- Root keeps at most 16 grants per session file. Root never grants a host that is named in the `hosts` list of any
+  route in the base map, whether or not this session uses that route (another vendor's brokered or passthrough route
+  included), or that is a model vendor's own host. A route's `upstream` host is not on that list, so a grant to it is
+  not refused for that reason. Levain files no card for such a host, and the end-of-session note says it was refused and
   that no grant can allow it for this session. A grant to a name that is never granted (`localhost`, `*.local`,
   `*.internal`, `metadata.*` and the other names that are never the public internet) is refused. The front's address check still runs on a granted host: a name that resolves to a private or
   loopback address is refused.
@@ -31,11 +31,12 @@ session has no person at the keyboard to tap, so a host it asks for that is not 
 refusal. On the wire the agent sees `X-Levain-Refused: host-not-allowed`, the same header for a host that is off the
 list for any reason. In the front's log the same line carries `refused: host-not-allowed` and a `detail`: `unattended`
 for these sessions, `off-list` for an interactive or login session whose host has no grant. The reason is in the
-log, not on the wire.
+log, not on the wire. Both log lines carry the `routes-egress` remedy; for an interactive or login session a card is
+the in-session route.
 
 ## How a grant is issued
 
-A grant is issued by a tap on the phone's passkey, filed as a card by the session's supervisor (S4). The steps:
+A grant is issued by a tap on the phone's passkey, filed as a card by the session's supervisor. The steps:
 
 1. While an interactive or login session runs on an egress slot, the supervisor asks root's `egress-refusals` which
    hosts the front refused as off-list for this session. The host is taken from root's log of those refusals; nothing
@@ -48,7 +49,9 @@ A grant is issued by a tap on the phone's passkey, filed as a card by the sessio
 
 No card is filed when no cockpit is running for the signing queue. If root's `egress-grants-list` is refused when the
 session starts (for example `egress-grant-not-ready`), the supervisor says once that host cards are off for this
-session and the session goes on.
+session and the session goes on. That check does not catch a missing setup step 2: for a slot that `setup` or `repair`
+has not prepared, root's list answers an empty set, so cards are still filed, and the first sign is a tap that fails
+with "host grants are not set up for this install" (`egress-grant-not-ready`) and makes no grant.
 
 **Seats are not covered.** A seat's egress is its own lease (`levain seat egress`, see
 [seat-profile.md](seat-profile.md)). Host grants are for slot sessions and never change a seat's route.
@@ -75,6 +78,9 @@ sudo <install-helper> enrol-authority-signer --principal YOUR_NAME --public-key 
   `--principal`, the same `--public-key`, `--confirm` if the first had it, and every `--passkey`. A line whose
   principal differs, or whose namespaces the new command would not keep, is refused `authority-signer-changed`, and a
   key left out of the command keeps its old line without the new purpose.
+- `egress-grant-not-ready` can mean either step is missing. Step 1 missing: the session start says host cards are off
+  for this session, and the raw `egress-grants-list` refuses. Step 2 missing: the raw `egress-grants-list` answers an
+  empty list, the session start says nothing, and the failed tap is the first sign.
 - Merged is not running: a build that has the code but not steps 1 and 2 admits nothing.
 
 ## What one revoke does, and what it does not claim
@@ -90,6 +96,12 @@ narrow: it removes grants and never adds one.
   writes it to a revocation ledger instead, so a signed grant that is still on its way to root cannot land afterwards.
   The answer says `recorded`, not `removed`.
 - `Revoke all` never touches that ledger.
+- A revoke of an id the file does not hold can be refused, and then **the revoke was not recorded**, so a signed grant
+  still on its way can land afterwards. `egress-grant-ledger-full`: the revocation ledger is at its cap of live ids
+  (`REVOKED_MAX` in `levain/slot/egress_ledger.py`) and fails closed; a row lapses on its own after `REVOKED_KEEP_S`
+  (same file), so re-run the revoke after that. `egress-grant-write-failed`: root could not write the ledger ("the revocation may not be recorded:
+  revoke it again"); re-run the revoke until it answers `recorded`. The same name also refuses a narrowed file that
+  could not be written, and there the old file stays in force: re-run it too.
 - Revoke while a delivery is in flight can answer `session-busy`: re-run the same command.
 - A grant whose signed bytes were already on their way to root when you revoked can still land seconds later; it
   shows up as a new row, not as a failure.
@@ -127,7 +139,7 @@ revoke), `host`, `expires` and `choice`; an expired grant is absent, though a re
 
 ## From the phone
 
-The cockpit lists and revokes host grants (S5a is the route, S5b-page the block on the Decisions view). A cockpit
+The cockpit lists and revokes host grants, in a block on its Decisions view. A cockpit
 serves it only when it was started by `levain serve --write` with the root runtime helper on disk.
 
 - **What it shows.** One call to root's `egress-grants-all` lists every live grant of your interactive or login egress
