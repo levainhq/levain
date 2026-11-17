@@ -211,7 +211,7 @@ Shipped (15), each with its owner:
 - `levain-terminal-answer` (levain/consent/terminal_sign.py)
 - `levain-desk-answer` (levain/consent/terminal_sign.py)
 
-Reserved (9), each with its owner:
+Reserved (10), each with its owner:
 
 - `levain-team-entry` (S1 F9 / F12)
 - `levain-manifest` (fleet design §11o item 1)
@@ -222,6 +222,7 @@ Reserved (9), each with its owner:
 - `levain-dispatch-authorise` (levain/dispatch/adopt.py)
 - `levain-thread-envelope` (levain/desk/envelope.py)
 - `levain-allowed-signers` (levain/qbroker/signers.py)
+- `levain-egress-host` (levain/slot/egress_grants.py)
 
 Reserved family `levain-team-<kind>`: P1's signed-envelope kinds, levain-team-<kind>; kind 'entry' is F9's, so no envelope kind is named 'entry'.
 <!-- /namespaces -->
