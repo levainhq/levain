@@ -238,8 +238,9 @@ jobs:
 
       - name: Keep the collected node ids
         # The shard-weights refresh (tests/ci/shard.py `weights`) needs the node ids of the CI platform: a macOS collection
-        # holds a different count, so the refresh refuses. One shard keeps them, and one Python (a refresh is one Python).
-        if: always() && matrix.python-version == '3.13' && matrix.shard == 0
+        # holds a different count, so the refresh refuses. One shard keeps them per Python (a refresh uses one Python's;
+        # a branch dispatch runs 3.12 only).
+        if: always() && matrix.shard == 0
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-nodes-py${{ matrix.python-version }}
