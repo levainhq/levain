@@ -202,13 +202,9 @@ def _items_facts(store_dir: Path) -> tuple[dict[str, dict], dict[str, str | None
     raw = _items_raw(store_dir)
     folded = _fold_items(raw)
     adds: dict[str, dict] = {}
-    for line in raw.decode("utf-8").split("\n"):
-        try:
-            rec = json.loads(line)
-        except (ValueError, RecursionError):
-            continue                                    # blank, or a torn line the fold skipped because an ack-torn names it
-        if isinstance(rec, dict) and rec.get("op") == "add" and rec["id"] in folded.items:
-            adds.setdefault(rec["id"], rec)
+    for rec in folded.records:                          # the records the fold accepted: nothing here re-parses a raw line
+        if rec.get("op") == "add" and rec["id"] in folded.items:
+            adds.setdefault(rec["id"], dict(rec))
     decision = {i: (it.decision.decision if it.decision else None) for i, it in folded.items.items()}
     return adds, decision
 
@@ -391,17 +387,9 @@ def _derive_migration(name: str, manifest_sha: str, words: str, begins: int) -> 
     return "m" + hashlib.sha256(f"{name}\0{manifest_sha}\0{words}\0{begins}".encode()).hexdigest()[:10]
 
 
-def _used_migrations(raw: bytes) -> set[str]:
-    """Every migration id a ``begin-track`` record of this registry file carries (any repo)."""
-    out = set()
-    for line in raw.split(b"\n"):
-        try:
-            r = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(r, dict) and r.get("op") == "begin-track" and isinstance(r.get("migration"), str):
-            out.add(r["migration"])
-    return out
+def _used_migrations(fold: Any) -> set[str]:
+    """Every migration id a ``begin-track`` record the registry fold accepted carries (any repo): nothing re-parses a raw line."""
+    return {r["migration"] for _, r in fold.records if r.get("op") == "begin-track" and isinstance(r.get("migration"), str)}
 
 
 def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: str, by: str, *, author: Mapping[str, Any],
@@ -442,7 +430,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
             raise BoardError(f"{name} is already tracking (migration {cur.migration}): finish it with `track` or `abandon-track`")
         if cur.mode != "untracked":
             raise BoardError(f"{name} is {cur.mode}, not untracked: begin-track needs an untracked repo")
-        if migration is not None and migration in _used_migrations(raw):
+        if migration is not None and migration in _used_migrations(fold):
             raise BoardError(f"migration id {migration!r} was already used by a begin-track in this registry: each ceremony has its own M "
                              f"(leave --migration off to derive a new one)")
         m = migration or _derive_migration(name, sha, words, cur.begins)
@@ -565,13 +553,9 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
 
 def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
     """sha256 of the abandon-track record of ``migration`` as written (the cause the cuts carry)."""
-    for line in reversed(view.lines):
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
-            return hashlib.sha256(line).hexdigest()
+    for n, rec in reversed(view.fold.records):            # the records the fold accepted, never a re-parse of a raw line
+        if rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
+            return hashlib.sha256(view.lines[n - 1]).hexdigest()
     return None
 
 
@@ -730,15 +714,28 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
     return _fold_one(target, name), written
 
 
-def _ack_body(parts: list[bytes], line: int, why: str, brk: Any, file: str, out: list[str] | None) -> dict:
+def _ack_body(parts: list[bytes], line: int, why: str, brk: Any, file: str, out: list[str] | None, *,
+              malformed: bool = False) -> dict:
     """The ack's fields for ``line`` of ``parts``: the line and the sha256 of its bytes, and for a CHAIN break ``want`` and ``have``
-    too (the exact break acknowledged). The confirmation text, saying exactly what is acknowledged, goes to ``out``."""
+    too (the exact break acknowledged). A line that is malformed IN ITSELF gets a torn-style ack (it is dropped, which clears its
+    chain break too): a chain ack would clear only the break and leave it torn. The ack is run through ``parse_ack`` here, so the
+    writer never appends a line its own readers reject; it refuses with the reason instead. The confirmation text, saying exactly
+    what is acknowledged, goes to ``out``."""
+    if malformed:
+        brk = None
     body: dict[str, Any] = {"line": line, "sha256": hashlib.sha256(parts[line - 1]).hexdigest(), "why": why}
+    if brk is not None:
+        body["want"], body["have"] = brk.want, brk.have
+    probe = {"op": board_chain.ACK_OP, "v": 1, "at": "-", "by": "-", **body}
+    try:
+        board_chain.parse_ack(probe)
+    except board_chain.AckError as exc:
+        raise BoardError(f"{file} line {line} cannot be acknowledged as a chain break ({exc}): acknowledge it as a torn "
+                         f"line instead (nothing was written)") from None
     if brk is None:
         if out is not None:
             out.append(f"acknowledged {file} line {line}: a torn line, dropped by every reader")
         return body
-    body["want"], body["have"] = brk.want, brk.have
     if out is not None:
         chained = f"it chained onto {brk.want}" if brk.want else "it carries no prev"
         out.append(f"acknowledged {file} line {line}: {chained}; line {line - 1} is now {brk.have}: an edit, "
@@ -773,7 +770,8 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
             return None, False
         if line not in {n for n, _ in fold.torn_lines}:
             raise BoardError(f"line {line} of {REPOS_NAME} is not torn")
-        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), file, out)
+        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), file, out,
+                         malformed=line in fold.malformed)
         return _record(rf.ACK, None, by, sid, body, author, now), True
 
     _, written = _reg_write(target, build, allow_torn=True)
@@ -800,7 +798,8 @@ def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Map
             return None, False
         if line not in {n for n, _ in folded.torn_lines}:
             raise BoardError(f"line {line} of {bs.ITEMS_NAME} is not torn")
-        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), bs.ITEMS_NAME, out)
+        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), bs.ITEMS_NAME, out,
+                         malformed=line in folded.malformed)
         rec = bs.build_record(rf.ACK, "-", by, body, now, author=author)
         rec.pop("id")
         return rec, True

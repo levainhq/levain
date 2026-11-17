@@ -41,11 +41,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-__all__ = ["ACK_OP", "Ack", "AckError", "Chain", "ChainBreak", "UNCHAINED", "acked_lines", "check_chain", "honours", "line_hash",
-           "parse_ack", "record_of"]
+__all__ = ["ACK_OP", "Ack", "AckError", "Chain", "ChainBreak", "PREV_BAD", "UNCHAINED", "acked_lines", "check_chain", "honours",
+           "line_hash", "parse_ack", "prev_ill_formed", "record_of"]
 
 ACK_OP = "ack-torn"
 UNCHAINED = "unchained record after the cutover (an old writer?)"
+PREV_BAD = "prev is not a 64 lowercase hex sha256"
 CUTOVER_BAD = "cutover prev does not commit the legacy prefix"
 _HEX = re.compile(r"[0-9a-f]{64}")
 _SUFFIX = "an edit, a deletion, an insertion or a reorder before line {n}"
@@ -100,14 +101,22 @@ def record_of(line: Any) -> dict | None:
     return rec if isinstance(rec, dict) else None
 
 
-def _why_class(n: int, p: str, hashes: list[str]) -> str:
-    """Name the break at line ``n`` (1-based) whose ``prev`` is ``p``, from the hash of every line."""
-    earlier = [j for j in range(1, n - 1) if hashes[j - 1] == p]
+def prev_ill_formed(rec: Any) -> bool:
+    """True when ``rec`` carries a ``prev`` that is not 64 lowercase hex: a malformation of the record itself (a chain ack cannot
+    name it, so the fold calls such a chain-broken line torn until it is acknowledged as a torn line)."""
+    return isinstance(rec, dict) and "prev" in rec and not (isinstance(rec["prev"], str) and _HEX.fullmatch(rec["prev"]) is not None)
+
+
+def _why_class(n: int, p: str, index: dict[str, list[int]]) -> str:
+    """Name the break at line ``n`` (1-based) whose ``prev`` is ``p``, from ``index`` (line hash -> the ascending line numbers
+    that hash to it; built once per check, so naming every break is linear)."""
+    where = index.get(p, ())
+    earlier = [j for j in where if j < n - 1]
     if earlier:
-        j = max(earlier)
+        j = earlier[-1]
         between = f"line {n - 1} was" if j == n - 2 else f"lines {j + 1}..{n - 1} were"
         return f"{between} inserted or moved between line {j} and line {n} (line {n} chained onto line {j})"
-    later = [j for j in range(n + 1, len(hashes) + 1) if hashes[j - 1] == p]
+    later = [j for j in where if j > n]
     if later:
         return f"lines were reordered (it chains onto line {min(later)}, which now follows it)"
     return f"line {n - 1} was edited or deleted, or a line was inserted before line {n}"
@@ -117,6 +126,9 @@ def check_chain(lines: Sequence[Any]) -> Chain:
     """Walk ``lines`` (split on ``\\n`` only, no trailing empty piece) and report every break."""
     blines = [_bytes(x) for x in lines]
     hashes = [hashlib.sha256(b).hexdigest() for b in blines]
+    index: dict[str, list[int]] = {}
+    for j, h in enumerate(hashes, 1):
+        index.setdefault(h, []).append(j)
     prefix = bytearray()
     cutover: int | None = None
     breaks: list[ChainBreak] = []
@@ -139,7 +151,7 @@ def check_chain(lines: Sequence[Any]) -> Chain:
             breaks.append(ChainBreak(n, f"{UNCHAINED} (line {n} carries no prev; line {n - 1} is {have})", None, have))
         elif rec["prev"] != have:
             want = rec["prev"]
-            klass = _why_class(n, want, hashes) if isinstance(want, str) else f"line {n - 1} was edited, or a line was inserted before line {n}"
+            klass = _why_class(n, want, index) if isinstance(want, str) else f"line {n - 1} was edited, or a line was inserted before line {n}"
             breaks.append(ChainBreak(n, f"{klass}: prev does not match line {n - 1} (line {n} chained onto {want}; line {n - 1} is now "
                                         f"{have}: {_SUFFIX.format(n=n)})", want if isinstance(want, str) else None, have))
     return Chain(tuple(breaks), cutover, len(blines) if cutover is None else cutover - 1)

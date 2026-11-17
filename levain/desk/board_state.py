@@ -192,6 +192,11 @@ class Folded:
     torn_why: str = ""
     acked: tuple[int, ...] = ()                                     # lines an ``ack-torn`` skipped
     torn_lines: tuple[tuple[int, str], ...] = ()                    # (line, sha256 of its bytes) of every torn line, acked or not
+    dropped: tuple[tuple[int, int], ...] = ()                       # (line, the line of the ack that dropped it): torn lines the fold skipped
+    kept: tuple[tuple[int, int], ...] = ()                          # (line, the line of the ack): chain-broken lines KEPT and applied
+    malformed: tuple[int, ...] = ()                                 # lines that are torn by themselves (shape), chain break or not
+    keys: Mapping[str, Any] = field(default_factory=dict)           # the ``key`` of the FIRST ``add`` of each id (the item keeps none)
+    records: tuple[Mapping[str, Any], ...] = ()                     # the records the fold accepted, in file order (acks excluded)
 
 
 def _req_str(obj: Mapping[str, Any], key: str, what: str | None = None) -> str:
@@ -339,7 +344,7 @@ def fold(lines: Iterable[str]) -> Folded:
     torn_why = ""
     breaks = board_chain.check_chain(lines).by_line()
     parsed: list[Any] = []                              # per line: the record, or the _Bad that parsing it raised, or None (blank)
-    acks: dict[int, list[board_chain.Ack]] = {}         # ANY ack of a line whose hash (and, for a chain break, break) matches accepts it
+    acks: dict[int, list[tuple[int, board_chain.Ack]]] = {}   # target line -> (the ack's own line, ack): ANY that matches accepts it
     for n, raw in enumerate(lines, 1):
         entry: Any = None
         if isinstance(raw, str) and raw.strip():
@@ -358,49 +363,91 @@ def fold(lines: Iterable[str]) -> Folded:
                     entry = _Bad(str(e))
                 else:
                     if n not in breaks and ack is not None:
-                        acks.setdefault(ack.line, []).append(ack)   # only from a line that itself parses and chains
+                        acks.setdefault(ack.line, []).append((n, ack))   # only from a line that itself parses and chains
         parsed.append(entry)
     acked: list[int] = []
     torn_lines: list[tuple[int, str]] = []
+    dropped: list[tuple[int, int]] = []
+    kept: list[tuple[int, int]] = []
+    malformed: list[int] = []
+    keys: dict[str, Any] = {}
+    records: list[Mapping[str, Any]] = []
     for n, raw in enumerate(lines, 1):
         if not isinstance(raw, str):                    # a file read in binary mode must not look like an empty store
             problems.append(f"line {n}: torn: not text ({type(raw).__name__})")
             torn_why = torn_why or f"line {n}: not text ({type(raw).__name__})"
+            malformed.append(n)
             continue
         rec = parsed[n - 1]
         if rec is None:
             continue
         brk = breaks.get(n)
         sha = board_chain.line_hash(raw)
+        mine = acks.get(n, ())
+        bad: _Bad | None = None
+        soft: _Soft | None = None
         try:
             if isinstance(rec, _Bad):
                 raise rec
-            if brk is not None:
-                if not any(board_chain.honours(a, sha, brk) for a in acks.get(n, ())):
-                    changed = "; an ack-torn names it, but not this break as it stands now" if n in acks else ""
-                    raise _Bad(brk.problem + changed)
+            if rec.get("op") != board_chain.ACK_OP:
+                if brk is None:
+                    _apply(rec, items)
+                elif board_chain.prev_ill_formed(rec):
+                    raise _Bad(board_chain.PREV_BAD)
+                else:
+                    _apply(rec, dict(items))            # a chain-broken line is judged for shape on a copy; it applies only if acked
+        except _Soft as e:
+            soft = e
+        except _Bad as e:
+            bad = e
+        if bad is not None:
+            malformed.append(n)
+            torn_lines.append((n, sha))
+            # a malformed line is dropped by a TORN-style ack of its bytes; a chain ack clears only the chain break (never this)
+            hit = next((pos for pos, a in mine if a.sha256 == sha and (brk is None or not a.chain)), None)
+            if hit is not None:
+                acked.append(n)                         # skipped exactly; listed in ``acked``, not a problem
+                dropped.append((n, hit))
+            else:
+                if brk is not None and any(board_chain.honours(a, sha, brk) for _, a in mine):
+                    note = f"; its chain break is acknowledged, but the line is torn for itself: acknowledge it as a torn line"
+                elif n in acks:
+                    note = "; an ack-torn names it with a different sha256" if brk is None else (
+                        "; an ack-torn names it, but not as it stands now")
+                else:
+                    note = ""
+                problems.append(f"line {n}: torn: {bad}{note}")
+                torn_why = torn_why or f"line {n}: {bad}" + (f" ({brk.problem})" if brk is not None else "")
+            continue
+        if brk is not None:
+            hit = next((pos for pos, a in mine if board_chain.honours(a, sha, brk)), None)
+            if hit is None:
+                changed = "; an ack-torn names it, but not this break as it stands now" if n in acks else ""
+                problems.append(f"line {n}: torn: {brk.problem}{changed}")
+                torn_why = torn_why or f"line {n}: {brk.problem}{changed}"
                 torn_lines.append((n, sha))
-                acked.append(n)                         # a chain break acknowledged: the record is KEPT, and applied below
-            if rec.get("op") == board_chain.ACK_OP:
-                if n in acks and brk is None:
-                    problems.append(f"line {n}: ack-torn names this line, which is not torn")
                 continue
+            torn_lines.append((n, sha))
+            acked.append(n)                             # a chain break acknowledged: the record is KEPT, and applied
+            kept.append((n, hit))
+            if rec.get("op") != board_chain.ACK_OP:
+                try:
+                    _apply(rec, items)
+                except _Soft as e:
+                    soft = e
+        if rec.get("op") == board_chain.ACK_OP:
             if n in acks and brk is None:
                 problems.append(f"line {n}: ack-torn names this line, which is not torn")
-            _apply(rec, items)
-        except _Soft as e:
-            problems.append(f"line {n}: {e}")
-        except _Bad as e:
-            if not any(t == n for t, _ in torn_lines):
-                torn_lines.append((n, sha))
-            if brk is None and any(board_chain.honours(a, sha, None) for a in acks.get(n, ())):
-                acked.append(n)                         # skipped exactly; listed in ``acked``, not a problem
-            elif n in acked:
-                pass
-            else:
-                problems.append(f"line {n}: torn: {e}" + ("; an ack-torn names it with a different sha256" if n in acks and brk is None else ""))
-                torn_why = torn_why or f"line {n}: {e}"
-    return Folded(items, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines))
+            continue
+        if n in acks and brk is None:
+            problems.append(f"line {n}: ack-torn names this line, which is not torn")
+        if soft is not None:
+            problems.append(f"line {n}: {soft}")
+        records.append(rec)
+        if rec.get("op") == "add" and isinstance(rec.get("id"), str):
+            keys.setdefault(rec["id"], rec.get("key"))
+    return Folded(items, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines), tuple(dropped), tuple(kept),
+                  tuple(malformed), keys, tuple(records))
 
 
 # ------------------------------------------------------------------------------------------------ the evidence

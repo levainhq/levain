@@ -364,7 +364,7 @@ def test_add_to_a_tracked_repo_needs_no_key_and_amend_and_decide_are_never_refus
 
 def test_a_store_with_no_repos_file_has_an_inactive_registry_w6(bare_store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
-    (bare_store / "items.jsonl").write_text(json.dumps({"v": 1, "op": "add", "id": "x#1"}) + "\n")      # a store that holds items
+    (bare_store / "items.jsonl").write_text(json.dumps({"v": 1, "op": "add", "id": "x#1", "at": "2026-11-17T00:00:00Z", "by": "b", "repo": "x", "title": "t", "origin": "o"}) + "\n")      # a store that holds items
     assert not (bare_store / "repos.jsonl").exists()
     assert br.read_registry(bs.resolve_store(None), allow_inactive=True).active is False
     assert ok(capsys, "repos") == "no registry yet (levain board use --import-focus, or register a repo)"

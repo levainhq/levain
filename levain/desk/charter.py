@@ -305,14 +305,7 @@ def _store(path: Path) -> tuple[dict[str, tuple] | None, str]:
         return None, f"cannot be read ({type(exc).__name__})"
     if folded.torn or folded.problems:
         return None, f"is not a whole store ({'torn: ' + folded.torn_why if folded.torn else folded.problems[0]})"
-    keys: dict[str, Any] = {}
-    for ln in lines:                    # the item fold keeps no key: read it off the add record itself
-        try:
-            rec = json.loads(ln)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and rec.get("op") == "add" and isinstance(rec.get("id"), str):
-            keys.setdefault(rec["id"], rec.get("key"))
+    keys = folded.keys                  # the fold returns each add's key: nothing here re-parses a raw line
     return {i.id: (i.repo, i.decision.decision if i.decision else None, keys.get(i.id)) for i in folded.items.values()}, ""
 
 

@@ -313,46 +313,28 @@ def ack_hint(file: str, n: int) -> str:
 
 
 def _records_from(raw: bytes) -> list[dict]:
-    """The items file's records (id and op are all the writer reads), or BoardError on a torn line: not JSON, no valid id, or a
-    broken chain (:func:`levain.desk.board_chain.check_chain`), unless an ``ack-torn`` record acknowledges exactly that line
-    (:func:`levain.desk.board_chain.acked_lines`): a torn line is then skipped, a chain-broken one KEPT. An ``ack-torn`` record
-    itself carries no id and is not returned."""
+    """The items file's records (id and op are all the writer reads), or BoardError on a torn line: not JSON, no valid id, a
+    shape the fold refuses, or a broken chain. It takes what the item FOLD (:func:`levain.desk.board_state.fold`) judged and
+    re-parses nothing: a torn line an ``ack-torn`` drops is skipped, a chain-broken one the ack names is KEPT (a chain ack clears
+    only the chain break; a line malformed in itself stays torn until a torn-style ack of it). An ``ack-torn`` record itself
+    carries no id and is not returned."""
     if raw and not raw.endswith(b"\n"):
         raise BoardError("the store does not end in a newline (a torn append); repair it before writing")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BoardError(f"the store holds invalid UTF-8 at byte {exc.start}; repair it before writing") from None
-    blines = raw.split(b"\n")[:-1] if raw else []
-    chain = board_chain.check_chain(blines)
-    breaks, acked = chain.by_line(), board_chain.acked_lines(blines, chain)
-    recs = []
-    for n, line in enumerate(text.split("\n"), 1):          # NOT splitlines(): a record is one \n-terminated line
-        if not line.strip():
-            continue
-        why = None
-        try:
-            rec = json.loads(line)
-        except (ValueError, RecursionError):
-            rec, why = None, f"the store holds a torn line ({n}): not JSON"
-        if why is None and not isinstance(rec, dict):
-            why = f"the store holds a torn line ({n}): not a record"
-        elif why is None and n in breaks and n not in acked:
-            why = f"the store's hash chain is broken at line {n}: {breaks[n].problem}"
-        elif why is None and rec.get("op") == board_chain.ACK_OP:
-            try:
-                board_chain.parse_ack(rec)
-            except board_chain.AckError as exc:
-                why = f"the store holds a torn line ({n}): {exc}"
-        elif why is None and (not isinstance(rec.get("id"), str) or not ID_RE.fullmatch(rec["id"])):
-            why = f"the store holds a torn line ({n}): no valid id"
-        if why is not None:
-            if n in acked:
-                continue                                    # a torn line, acknowledged: skipped exactly, as the fold skips it
-            raise BoardError(f"{why}; repair it before writing, or {ack_hint(ITEMS_NAME, n)}")
-        if rec.get("op") != board_chain.ACK_OP:
-            recs.append(rec)                                # a chain break acknowledged is KEPT, as the fold keeps it
-    return recs
+    from levain.desk.board_state import fold
+    lines = text.split("\n")[:-1] if raw else []          # NOT splitlines(): a record is one \n-terminated line
+    folded = fold(lines)
+    if folded.torn:
+        n = next((ln for ln, _ in folded.torn_lines if ln not in folded.acked), None)
+        why = folded.torn_why
+        if n is not None and why.startswith(f"line {n}: "):
+            why = why[len(f"line {n}: "):]
+        raise BoardError(f"the store holds a torn line ({n}): {why}; repair it before writing"
+                         + (f", or {ack_hint(ITEMS_NAME, n)}" if n else ""))
+    return [dict(r) for r in folded.records]
 
 
 # ------------------------------------------------------------------------------------------------------------- writing

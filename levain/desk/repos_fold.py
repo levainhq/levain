@@ -84,6 +84,10 @@ class RepoFold:
     torn_why: str = ""
     acked: tuple[int, ...] = ()
     torn_lines: tuple[tuple[int, str], ...] = field(default=())     # (line, sha256) of each torn line, acked or not
+    dropped: tuple[tuple[int, int], ...] = ()                       # (line, the line of the ack that dropped it): torn lines skipped
+    kept: tuple[tuple[int, int], ...] = ()                          # (line, the line of the ack): chain-broken lines KEPT and applied
+    malformed: tuple[int, ...] = ()                                 # lines torn by themselves (shape), chain break or not
+    records: tuple[tuple[int, Mapping[str, Any]], ...] = ()         # (line, record) of every record the fold accepted, acks excluded
 
 
 _NOT_JSON = object()
@@ -273,7 +277,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     torn; ``unterminated_tail`` says the last line has no newline (an append in flight, or a crash), and it is torn."""
     lines = list(lines)
     breaks = board_chain.check_chain(lines).by_line()
-    acks: dict[int, list[board_chain.Ack]] = {}  # ANY ack that honours the line accepts it: a corrected re-ack repairs
+    acks: dict[int, list[tuple[int, board_chain.Ack]]] = {}  # (the ack's own line, ack); ANY ack that honours the line accepts it: a corrected re-ack repairs
     parsed: list[Any] = []
     texts: list[str | None] = []                 # None: the line is not text (bytes that are not UTF-8, or not a str at all)
     shas: list[str] = []                         # of the line's RAW bytes: a bytes line is hashed as given, never as decoded text
@@ -302,14 +306,22 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
             except (_Bad, board_chain.AckError):
                 continue
             if ack is not None:
-                acks.setdefault(ack.line, []).append(ack)
+                acks.setdefault(ack.line, []).append((n, ack))
     repos: dict[str, Repo] = {}
     problems: list[str] = []
     torn_why = ""
     acked: list[int] = []
     torn_lines: list[tuple[int, str]] = []
+    dropped: list[tuple[int, int]] = []
+    kept: list[tuple[int, int]] = []
+    malformed: list[int] = []
+    records: list[tuple[int, Mapping[str, Any]]] = []
     last = len(lines)
     for n, raw in enumerate(lines, 1):
+        sha = shas[n - 1]
+        brk = breaks.get(n)
+        mine = acks.get(n, ())
+        bad: _Bad | None = None
         try:
             if texts[n - 1] is None:
                 raise _Bad("not valid UTF-8" if isinstance(raw, bytes) else f"not text ({type(raw).__name__})")
@@ -322,31 +334,47 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 raise _Bad("not JSON")
             if not isinstance(rec, dict):
                 raise _Bad("a record must be a JSON object")
-            brk = breaks.get(n)
-            if brk is not None:
-                if not any(board_chain.honours(a, shas[n - 1], brk) for a in acks.get(n, ())):
-                    raise _Bad(brk.problem + ("; an ack-torn names it, but not this break as it stands now" if n in acks else ""))
-                torn_lines.append((n, shas[n - 1]))
-                acked.append(n)                 # a chain break acknowledged: the record is KEPT, and applied below
             _validate(rec, store_id)
-            if n in acks and brk is None:
-                problems.append(f"line {n}: ack-torn names this line, which is not torn")
-            if rec["op"] != ACK:
-                _apply(rec, repos)
-        except _Soft as e:
-            problems.append(f"line {n}: {e}")
+            if n in breaks and board_chain.prev_ill_formed(rec):
+                raise _Bad(board_chain.PREV_BAD)
         except _Bad as e:
-            sha = shas[n - 1]
-            if not any(t == n for t, _ in torn_lines):
-                torn_lines.append((n, sha))
-            if n in breaks and n in acked:
-                pass                            # acknowledged break, but the record is torn for another reason: already listed
-            elif any(board_chain.honours(a, sha, breaks.get(n)) for a in acks.get(n, ())):
+            bad = e
+        if bad is not None:
+            malformed.append(n)
+            torn_lines.append((n, sha))
+            # a malformed line is dropped by a TORN-style ack of its bytes; a chain ack clears only the chain break (never this)
+            hit = next((pos for pos, a in mine if a.sha256 == sha and (brk is None or not a.chain)), None)
+            if hit is not None:
                 acked.append(n)                 # skipped exactly; listed in ``acked``, not a problem
+                dropped.append((n, hit))
+                continue
+            if brk is not None and any(board_chain.honours(a, sha, brk) for _, a in mine):
+                note = "; its chain break is acknowledged, but the line is torn for itself: acknowledge it as a torn line"
+            elif n in acks:
+                note = "; an ack-torn names it with a different sha256" if brk is None else "; an ack-torn names it, but not as it stands now"
             else:
-                if n in acks and n not in breaks:
-                    problems.append(f"line {n}: torn ({e}); an ack-torn names it with a different sha256")
-                else:
-                    problems.append(f"line {n}: torn: {e}")
-                torn_why = torn_why or f"line {n}: {e}"
-    return RepoFold(repos, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines))
+                note = ""
+            problems.append(f"line {n}: torn ({bad}){note}" if note.startswith("; an ack-torn names it with") else f"line {n}: torn: {bad}{note}")
+            torn_why = torn_why or f"line {n}: {bad}" + (f" ({brk.problem})" if brk is not None else "")
+            continue
+        if brk is not None:
+            hit = next((pos for pos, a in mine if board_chain.honours(a, sha, brk)), None)
+            if hit is None:
+                changed = "; an ack-torn names it, but not this break as it stands now" if n in acks else ""
+                problems.append(f"line {n}: torn: {brk.problem}{changed}")
+                torn_why = torn_why or f"line {n}: {brk.problem}{changed}"
+                torn_lines.append((n, sha))
+                continue
+            torn_lines.append((n, sha))
+            acked.append(n)                     # a chain break acknowledged: the record is KEPT, and applied below
+            kept.append((n, hit))
+        if n in acks and brk is None:
+            problems.append(f"line {n}: ack-torn names this line, which is not torn")
+        if rec["op"] != ACK:
+            records.append((n, rec))
+            try:
+                _apply(rec, repos)
+            except _Soft as e:
+                problems.append(f"line {n}: {e}")
+    return RepoFold(repos, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines), tuple(dropped), tuple(kept),
+                    tuple(malformed), tuple(records))

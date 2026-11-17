@@ -849,12 +849,15 @@ def test_the_first_chained_record_after_a_legacy_prefix_carries_the_hash_of_the_
     assert first["id"] == "levain#3"
 
 
+_ADD_BODY = {"repo": "levain", "title": "t", "origin": "o"}      # a whole add: the writer reads the store through the item fold
+
+
 def test_append_to_another_file_name_chains_that_file(home, tmp_path):
     store = Path(os.path.realpath(tmp_path / "s"))
     bs.use(store)
     t = _target(store)
     for n in (1, 2):
-        bs._append(t, lambda recs, n=n: (bs.build_record("add", f"levain#{n}", "b", {}, author=AGENT), True), filename="repos.jsonl")
+        bs._append(t, lambda recs, n=n: (bs.build_record("add", f"levain#{n}", "b", _ADD_BODY, author=AGENT), True), filename="repos.jsonl")
     raw = (store / "repos.jsonl").read_bytes().split(b"\n")[:-1]
     assert json.loads(raw[0])["prev"] == _sha(b"") and json.loads(raw[1])["prev"] == _sha(raw[0])
     assert not (store / "items.jsonl").exists()
@@ -863,7 +866,7 @@ def test_append_to_another_file_name_chains_that_file(home, tmp_path):
 def _chained_foreign(items: Path, rec_id: str = "flow#1", prev_fn=None) -> bytes:
     """A record another CHAINED writer appends (P1b: an unchained line after the cutover is a break, not a race): its prev is
     the hash of the file's last line as it is now."""
-    rec = bs._with_prev(bs.build_record("add", rec_id, "b", {}, "2026-11-17T00:00:00Z", author=AGENT), (prev_fn or bs.chain_prev)(items.read_bytes()))
+    rec = bs._with_prev(bs.build_record("add", rec_id, "b", {**_ADD_BODY, "repo": rec_id.partition("#")[0]}, "2026-11-17T00:00:00Z", author=AGENT), (prev_fn or bs.chain_prev)(items.read_bytes()))
     return bs.canonical_bytes(rec)
 
 
