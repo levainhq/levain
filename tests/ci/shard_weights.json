@@ -833,6 +833,7 @@
   "tests/test_room_host_d2.py": 9.4,
   "tests/test_room_open_check_hidden_1105.py": 0.9,
   "tests/test_room_phone.py": 1.5,
+  "tests/test_read_budget.py": 0.6,
   "tests/test_room_readguard.py": 6.6,
   "tests/test_room_resume_session_id.py": 0.9,
   "tests/test_room_rows_1105.py": 2.4,
