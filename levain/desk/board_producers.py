@@ -222,7 +222,11 @@ def _sign_queue(consent_dir: Path | None, environ: Mapping[str, str]) -> Path | 
     """The sign queue the countersign reads, resolved by the one resolver the filing path uses
     (:func:`levain.consent.answer_countersign.sign_queue_dir`): the live install's for the live store (``environ``: a named
     ``$LEVAIN_SIGN_QUEUE_DIR``, else its hook queue's ``claude_code.json``); for an explicit ``consent_dir`` (the hook queue is
-    the consent dir) that directory's own ``claude_code.json``, the environment never naming its queue."""
+    the consent dir) that directory's own ``claude_code.json``, the environment never naming its queue.
+
+    Known edge (L3 round 3, complement): a caller that passes the LIVE store as an explicit ``consent_dir``, while the filing
+    hook ran with ``$LEVAIN_SIGN_QUEUE_DIR`` set, reads the store's own queue rather than the env one, and a countersigned
+    answer grades unsigned. The live store is read with ``consent_dir=None``; pass that, never the live path."""
     from levain.consent import answer_countersign as ac
 
     try:
