@@ -154,7 +154,7 @@ levain init --answers-template > answers.json   # every question, blank, ready t
 levain init --adapter openhands --answers answers.json --path ./seat-1
 ```
 
-The answer file is a JSON object **keyed by slot name**, never an ordered list, so
+The answer file is a JSON object **keyed by question name** (each key names the one interview question it answers), never an ordered list, so
 you never have to know or match the order the interview happens to ask in:
 
 ```json
@@ -163,12 +163,12 @@ you never have to know or match the order the interview happens to ask in:
 
 `--answers-template` writes the blank file to stdout and a guide to *what each
 question is asking* to stderr — so the redirect above gives you valid JSON and you
-still get to read the questions. Every slot must be present; `""` is a real answer
+still get to read the questions. Every question's key must be present; `""` is a real answer
 meaning "skip this," exactly as pressing enter does in the terminal — except for
 your name and your partner's, which an entity is not allowed to be missing.
 
 `--answers` requires `--adapter`, and it never prompts for anything. If a field is
-missing, unknown, or has plainly landed in the wrong slot, it says so and installs
+missing, unknown, or has plainly landed under the wrong question, it says so and installs
 nothing — rather than writing a half-captured partner and reporting success.
 
 ## The consent queue
@@ -269,7 +269,7 @@ It runs against Ollama by default, through `--model`/`--base-url` — or any Ope
 
 On macOS, any program can read the command line and environment of every other program running as the same user. That includes tokens passed in an environment variable. No sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. So an entity whose bash runs as you can read the secrets your other programs were started with.
 
-`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS and Linux, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor reads and writes as it, inside the entity's workspace only:
+`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS and Linux, headless chat turns, `--task` runs and scheduled entities execute bash as that user, and the file editor reads and writes as it, inside the entity's workspace only:
 
 - the kernel refuses to give that user the environment of your processes;
 - files only you can read are out of its reach, and so is your home directory;
@@ -303,7 +303,7 @@ When it undoes, everything the entity created stays owned by its retired user id
 
 **What carries between commands.** Each command runs in a fresh bash. The working directory, `cd -` and exported variables carry to the next command; functions, aliases, `set` options, traps and unexported variables do not, as in a new terminal. levain learns that a command finished, and its exit status, from the operating system, never from anything the shell prints.
 
-## Hand it a schedule — the governed seat
+## Hand it a schedule — the governed entity
 
 `levain daemon install-seat` takes the sovereign entity above and runs it unattended, on a cadence, while you're away.
 
@@ -313,7 +313,7 @@ levain daemon install-seat --path ./ada --task "check the queue and report" --in
 
 **We never ask the model whether what it's about to do is safe.** The gate that halts an action reads the *tool*, not the model's opinion of itself — because a gate the entity can talk its way through is not a gate. By default, every action the seat takes that reaches outside itself — a shell command, a file write, anything efferent — halts before it executes: exit code 4 in the seat's log, the activity that led up to it right there for you to read. It's not a permission prompt, because an unattended seat has nobody to ask, and there's no queue holding the action for you to approve later — the halt ends that run, and the next scheduled turn starts fresh (and will halt again at the same point if the task still needs that action). Because bash is classified as efferent by *kind*, not by what the command actually does, a seat task that needs the shell at all will halt on it every run, even for something as harmless as `ls` — plan seat tasks around the file-editor hand where you can, or expect to be reading a lot of exit-4 logs. This default can be turned off per entity (`efferent_gate: "ungated"` in `.levain/confinement.json`), which is a real escape hatch and not a decision to make lightly for something that runs unattended.
 
-The seat is wall-clock bounded (`--max-seconds`, 1800 seconds by default; the consolidate phase has its own `--consolidate-max-seconds`, 900 by default, on top of the first, so a run can last roughly the sum of the two; `--consolidate-max-seconds 0` leaves the consolidate unbounded), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a turn bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." A consolidate that runs out of time does not change the exit code, which stays the turn's; it reports on stderr. And it consolidates its own memory — after each scheduled turn it checks the backlog and consolidates once enough new episodes have accumulated (`--consolidate-every N` is an episode count, not a cadence; default: the wrap-nudge threshold) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
+The scheduled run is wall-clock bounded (`--max-seconds`, 1800 seconds by default; the consolidate phase has its own `--consolidate-max-seconds`, 900 by default, on top of the first, so a run can last roughly the sum of the two; `--consolidate-max-seconds 0` leaves the consolidate unbounded), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a turn bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." A consolidate that runs out of time does not change the exit code, which stays the turn's; it reports on stderr. And it consolidates its own memory — after each scheduled turn it checks the backlog and consolidates once enough new episodes have accumulated (`--consolidate-every N` is an episode count, not a cadence; default: the wrap-nudge threshold) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
 
 ## Keep it in sync — `doctor` and `update`
 
@@ -358,7 +358,7 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 
 - **It is that entity, not your partner.** The chat entity boots from its own `seed/` (origin, world, partnership, memory), its own consolidated memory and its own crystallized-pattern recall. Each completed turn is captured to that entity's store. Nothing consolidates it until someone runs `levain wrap` on it.
 - **Actions wait for you, under the default gate.** Chat turns run headless: with the entity's default gate, a proposed efferent action halts the turn and the panel shows the held call for you to Approve or Reject. A `--task` run and a scheduled seat halt at the same point and exit instead; chat is the only headless driver that waits for your answer. The `levain run` REPL waits only if you pin it to `gated`. By default it never stops to ask about an action, the same as an entity set to `ungated` under any driver (the confinement floor still applies to both). Each launch of `levain serve --chat` mints a token, printed at startup; on macOS the browser opens unlocked with it, elsewhere open the printed link.
-- **No drive reads your standard credential stores unless you allow them: not chat, not a scheduled seat, not the `levain run` REPL.** Those are `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.pypirc`, `~/.npmrc`, `~/.docker/config.json`, `~/.kube/config`, the cloud CLIs' token caches (`~/.aws/sso/cache`, `~/.aws/cli/cache`, `~/.aws/login/cache`, `~/.aws/boto/cache`, `~/.config/gcloud`, `~/.azure`), and on macOS the Keychain. Reading a file is not an action, so the gate would never ask; the floor denies the read instead, in every drive. That includes the `levain run` REPL: you see a turn's activity only after it ran, so a read a prompt injection asked for is already in the model's context by the time you see it. An entity that needs `gh` or `aws`, in the REPL or anywhere else, sets `"deny_standard_creds": false` in its `.levain/confinement.json`.
+- **No drive reads your standard credential stores unless you allow them: not chat, not a scheduled entity, not the `levain run` REPL.** Those are `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.pypirc`, `~/.npmrc`, `~/.docker/config.json`, `~/.kube/config`, the cloud CLIs' token caches (`~/.aws/sso/cache`, `~/.aws/cli/cache`, `~/.aws/login/cache`, `~/.aws/boto/cache`, `~/.config/gcloud`, `~/.azure`), and on macOS the Keychain. Reading a file is not an action, so the gate would never ask; the floor denies the read instead, in every drive. That includes the `levain run` REPL: you see a turn's activity only after it ran, so a read a prompt injection asked for is already in the model's context by the time you see it. An entity that needs `gh` or `aws`, in the REPL or anywhere else, sets `"deny_standard_creds": false` in its `.levain/confinement.json`.
 - **Conversations live in server memory.** A restart of `levain serve` ends every one.
 - **`--path` and `--chat` are independent.** `--path` picks whose memory the cockpit shows; `--chat` picks which entity the chat talks to. Nothing checks that they match, so the page can show one entity's memory while the chat talks to another. `--path` defaults to the current directory, so start `levain serve --chat ./ada` from your own install and the page shows your memory beside ada's chat. Point both at the same directory when you want them to agree.
 
@@ -529,7 +529,7 @@ levain daemon install-seat  # install a governed, scheduled entity — see "Hand
 levain daemon install-feeds # install the review-feed runner on a schedule (no model)
 levain daemon status        # is it actually installed and running?
 levain daemon would-install  # dry-run: show what install would do, change nothing
-levain daemon restart       # restart a running serve or seat, e.g. after new code
+levain daemon restart       # restart a running serve or scheduled entity, e.g. after new code
 levain daemon uninstall
 ```
 
@@ -629,13 +629,13 @@ Operator-class developers: the people who already feel session-amnesia as a real
 - **Harnesses:** Claude Code and Codex CLI (hook-wired, with the consent queue; the agent versions the consent hook was run against are pinned in `TESTED_VERSIONS` in `levain/consent/canary.py`, and `levain init` wires it for any other version with a WARN line; check an untested version with `levain verify-hooks`), plus `openhands` (hookless, scaffolds a sovereign entity; shipped as is). One adapter per install — separate installs if you need more than one.
 - **Tested Linux:** Ubuntu 24.04 on arm64 (aarch64). Slot isolation was run once, on a fresh guest of that kind; other distributions and x86 are untested. See [docs/linux-first-install.md](docs/linux-first-install.md).
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
-- **Always-on daemon and governed seats:** macOS (launchd) and Linux (`systemd --user`); Windows is planned.
+- **Always-on daemon and governed scheduled entities:** macOS (launchd) and Linux (`systemd --user`); Windows is planned.
 - **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) needs an OS sandbox: `sandbox-exec` on macOS, `bwrap` on Linux. Where there is none, or the host refuses it (see the Linux section above), the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
-- **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled seat. `daemon install-seat` warns loudly at install time if you're about to install one that way; `doctor` doesn't re-check it on a seat that's already running.
+- **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled entity. `daemon install-seat` warns loudly at install time if you're about to install one that way; `doctor` doesn't re-check it on a scheduled entity that's already running.
 - **Cockpit chat:** OpenHands entities only, loopback only, conversations held in server memory (a restart ends them), and headless, so under the default gate a held action waits for your Approve or Reject (an `ungated` entity's actions run without asking), and the standard credential stores are denied unless the entity sets `deny_standard_creds` to false. `--path` and `--chat` are not checked against each other.
 - **Cockpit room:** opt-in (`--room DIR`, with `--write`). By default Claude's own tools, a shell and writes included, under `bypassPermissions` as your user, behind levain's pinned turn guard (which refuses background and long-running work, not outward acts); it reads `DIR`'s project settings and can reach the web. `--room-confined` is the read-and-search room with no shell, whose `WebSearch` is still an egress channel and which can refuse to open when your own Claude settings widen its read scope. See *The cockpit's Claude room*.
 - **TLS in a chat's network sandbox (macOS):** the sandbox keeps macOS's certificate service out of reach, so a client that verifies certificates through it fails TLS in chat: Go tools such as `gh`, `terraform` and `kubectl`, and Swift's `URLSession`. Chat sets `PIP_USE_DEPRECATED=legacy-certs` so that `pip` checks certificates itself, against Levain's chat certificate. A `pip` older than 24.2 (such as the 21.x that ships with Xcode's Python) refuses that setting and stops; run it as `env -u PIP_USE_DEPRECATED pip ...`.
-- **One seat at a time:** a governed seat runs one entity on one schedule. Coordinating several scheduled entities as a fleet is not built yet — see *Where this is going* below.
+- **One scheduled entity per schedule:** a governed schedule runs one entity on one schedule. Coordinating several scheduled entities as a fleet is not built yet — see *Where this is going* below.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
 - **Levain confines no Claude Code or Codex session.** For those agents it installs hooks and consent paths. A consent hook answers a permission prompt; it does not stop an agent running as your user from doing what your user can do outside that prompt.
 - **Start Claude Code at the workspace root unless the workspace is a git repository's root.** Levain's Claude Code hooks live in `.claude/settings.local.json` when the workspace is its own git repository's root, and a session started in any folder under it is gated. When the workspace is nested inside a larger repository, is a linked worktree or submodule, or is not a git folder, the hooks stay in `.claude/settings.json`, which Claude Code reads only from the folder a session starts in: a session started in a subfolder runs none of levain's hooks (no consent queue, no gate, no memory hooks), so start it at the workspace root; moving into a subfolder during the session keeps them. A workspace set up before `git init` moves to the local layout on the next `levain update`. (Codex is not affected by this. Its hooks are written to the Codex home's `hooks.json`, which is `$CODEX_HOME` if set, else `~/.codex`, so they apply to every Codex session that uses that home. Whether Codex invokes them is subject to the trust gap above: `levain verify-hooks` confirms.)
@@ -667,9 +667,9 @@ documented here rather than only in the script. The gate fails closed; the delib
 
 Everything above is installable today. This section is future tense on purpose: what follows is not shipped.
 
-- **The desk's standing orders.** Designed, not shipped. Memory crystallizes; the desk earns latitude. What earns it is the desk, never a binding: every act under a standing order has the desk as its full-context reader when it acts.
+- **The desk's standing orders.** The standing order is in the source and unreleased: a signed authority-log kind, a signing verb (`levain desk order sign`), and the desk's effect verbs that act under one. What is not built: the effect verbs ship with their arming gate closed (a reviewed commit opens it, and no verb, flag or file does), and it does not check the band rows its facts name. Memory crystallizes; the desk earns latitude. What earns it is the desk, never a binding: every act under a standing order has the desk as its full-context reader when it acts.
 
-- **A fleet of seats.** `daemon install-seat` runs one governed entity on one schedule. Coordinating several of those scheduled entities — an inter-entity bus, cross-seat aggregation, one place to see and steer them from — is a real target but a later one, and it inherits the same gate discipline: nothing about running more entities relaxes what any single one is allowed to do unattended.
+- **A fleet of scheduled entities.** `daemon install-seat` runs one governed entity on one schedule. Coordinating several of those scheduled entities — an inter-entity bus, cross-entity aggregation, one place to see and steer them from — is a real target but a later one, and it inherits the same gate discipline: nothing about running more entities relaxes what any single one is allowed to do unattended.
 
 None of this changes what ships today. Until any of this ships, the only automatic way past an OpenHands entity's efferent gate is the same all-or-nothing `ungated` override that exists now; the other way is a person approving a held call, as the cockpit chat lets you. (Claude Code and Codex permission prompts are a different gate, answered by the consent queue.)
 

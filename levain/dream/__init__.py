@@ -1,1 +1,1 @@
-"""levain.dream — the dream seam (BUILD_PLAN r7 R-16). Only the root parser is registered; nothing is built behind it."""
+"""levain.dream: the dream, a memory consolidation run on a copy of the store (the `levain dream` verbs are in `cli`)."""
