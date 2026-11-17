@@ -207,6 +207,12 @@ def _counted_head(conn: sqlite3.Connection) -> int:
     return top
 
 
+def _check_request_id(request_id: Any) -> None:
+    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > _REQUEST_ID_MAX \
+            or not request_id.isprintable():
+        raise CoordError("a close needs a request id (one printable line): a retry names the same one")
+
+
 def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_handoff_id: int | None, token: Any,
           ) -> SeamHandoff:
     """Append one handoff, or return the stored one a retry names. Refused before anything is opened: an unknown kind,
@@ -216,9 +222,7 @@ def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_hand
     if kind not in KINDS:
         raise CoordError(f"a seam handoff is of kind {', '.join(KINDS)}, not {kind!r} (a light open writes none)")
     body = _check_body(body)
-    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > _REQUEST_ID_MAX \
-            or not request_id.isprintable():
-        raise CoordError("a close needs a request id (one printable line): a retry names the same one")
+    _check_request_id(request_id)
     if token is None or not isinstance(token, int) or isinstance(token, bool):
         raise CoordError("a close needs the desk's identity (the live lease token); nothing was written")
     if prev_handoff_id is not None and (not isinstance(prev_handoff_id, int) or isinstance(prev_handoff_id, bool)):

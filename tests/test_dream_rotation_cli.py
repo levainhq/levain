@@ -81,30 +81,31 @@ def test_a_retry_by_the_rotated_desk_is_refused_naming_its_handoff_and_writes_no
     assert _snapshot(desk) == before and len(_handoffs(desk)) == 1
 
 
-def test_a_handoff_already_stored_for_the_occurrence_is_named_and_nothing_is_written(desk, capsys):
+def test_a_handoff_already_stored_for_the_occurrence_is_refused_naming_it_and_the_desk_stays_live(desk, capsys):
     _saved_after(desk)
     stored = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="dream-rotation:occ-1",
                                  prev_handoff_id=None, token=desk.token)
     before = _snapshot(desk)
-    got = json.loads(_run(desk, capsys, "--json").out)
-    assert got == {"rotated": False, "already_rotated": True, "handoff_id": stored.handoff_id, "occurrence": "occ-1"}
+    cap = _run(desk, capsys, "--json", rc=1)
+    assert cap.out == "" and "this is not a rotation" in cap.err
+    assert f"handoff {stored.handoff_id}" in cap.err and "dream-rotation:occ-1" in cap.err
     assert _snapshot(desk) == before and _holder(desk) == desk.launch.session_key
-    text = _run(desk, capsys).out
-    assert f"handoff {stored.handoff_id}" in text and "nothing was written" in text
+    assert len(_launches(desk)) == 1
 
 
-def test_a_manual_dream_close_is_adopted_through_the_verb(desk, capsys):
+def test_a_manual_close_for_an_older_dream_is_not_adopted_through_the_verb(desk, capsys):
     from datetime import timedelta
 
     from levain.cockpit.consent import parse_stamp
 
-    _saved_after(desk, hours=0.001)
+    _saved_after(desk, hours=0.001, occurrence="occ-A")
+    _saved_after(desk, hours=0.002, occurrence="occ-B")
     desk._clock = lambda: parse_stamp(_requested(desk)) + timedelta(minutes=1)
-    manual = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-1", prev_handoff_id=None,
-                                 token=desk.token)
+    by_hand = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-A", prev_handoff_id=None,
+                                  token=desk.token)
     got = json.loads(_run(desk, capsys, "--json").out)
-    assert got["rotated"] is True and got["handoff_id"] == manual.handoff_id
-    assert [h[1] for h in _handoffs(desk)] == ["by-hand-1"]
+    assert got["rotated"] is True and got["occurrence"] == "occ-B" and got["handoff_id"] != by_hand.handoff_id
+    assert [h[1] for h in _handoffs(desk)] == ["by-hand-A", "dream-rotation:occ-B"]
 
 
 def test_a_desk_that_is_not_due_writes_nothing(desk, capsys):

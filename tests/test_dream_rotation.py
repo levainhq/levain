@@ -1,8 +1,9 @@
 """levain#82 slice 1: the dream rotation's write path (``levain.desk.dream_rotation.rotate``), with no CLI. Each test
 is a reproduced sequence on a real store: a real card filed through the dream's own builder, a real active desk launch,
-a real ``rotate`` call. Nothing here drives ``coord open``: no caller of ``rotate`` exists yet."""
+a real ``rotate`` call. Nothing here drives ``coord open``."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import timedelta
 from types import SimpleNamespace
@@ -49,7 +50,7 @@ def test_a_due_desk_rotation_writes_one_dream_handoff_and_one_pending_desk(desk)
     _saved_after(desk)
     before = _launches(desk)
     got = _rotate(desk)
-    assert isinstance(got, dream_rotation.Rotation) and got.occurrence == "occ-1" and not got.adopted
+    assert isinstance(got, dream_rotation.Rotation) and got.occurrence == "occ-1"
     assert got.handoff.seam_kind == "dream" and got.handoff.close_key == "dream-rotation:occ-1"
     assert got.handoff.writer == desk.launch.session_key and got.handoff.prev_handoff_id is None
     assert [h[1:3] for h in _handoffs(desk)] == [("dream-rotation:occ-1", "dream")]
@@ -79,14 +80,14 @@ def test_a_second_rotation_for_the_same_occurrence_writes_nothing(desk):
     assert first.successor is not None
 
 
-def test_a_handoff_already_stored_under_the_occurrences_key_is_returned_and_nothing_is_written(desk):
+def test_a_handoff_already_stored_under_the_occurrences_key_is_not_a_rotation_and_nothing_is_written(desk):
     _saved_after(desk)
     stored = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="dream-rotation:occ-1",
                                  prev_handoff_id=None, token=desk.token)
     before = _snapshot(desk.directory)
     got = _rotate(desk)
-    assert isinstance(got, dream_rotation.Rotation) and got.handoff == stored
-    assert got.ended is None and got.successor is None
+    assert isinstance(got, dream_rotation.AlreadyStored) and not isinstance(got, dream_rotation.Rotation)
+    assert got.handoff == stored and got.occurrence == "occ-1"
     assert _snapshot(desk.directory) == before        # not even a lease beat, and the desk is still live
     assert desk.coord_status()["lease"]["holder"] == desk.launch.session_key
 
@@ -126,26 +127,6 @@ def test_an_expired_successor_leaves_the_dream_handoff_for_the_next_desk(desk):
     assert seam_handoffs.latest(desk).handoff_id == got.handoff.handoff_id       # the handoff is the durable half
     with desk._write() as (conn, now):                                           # the next wake asks for a desk again
         assert lease.wake(conn, now, night=True) is not None
-
-
-def test_a_manual_dream_close_is_adopted_not_doubled(desk):
-    _saved_after(desk, hours=0.001)
-    later = parse_stamp(_requested(desk)) + timedelta(minutes=1)      # the desk closed by hand after the save
-    desk._clock = lambda: later
-    manual = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-1", prev_handoff_id=None,
-                                 token=desk.token)
-    got = _rotate(desk, {**BODY, "state_line": "a different line"})
-    assert got.adopted and got.handoff == manual and got.successor is not None and got.ended is not None
-    assert [h[1] for h in _handoffs(desk)] == ["by-hand-1"]
-
-
-def test_a_manual_dream_close_from_before_the_save_is_not_adopted(desk):
-    first = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-0", prev_handoff_id=None,
-                                token=desk.token)
-    _saved_after(desk)
-    got = _rotate(desk)
-    assert not got.adopted and got.handoff.prev_handoff_id == first.handoff_id
-    assert [h[1] for h in _handoffs(desk)] == ["by-hand-0", "dream-rotation:occ-1"]
 
 
 def test_the_rotated_desk_is_not_counted_as_a_death(desk):
@@ -280,3 +261,36 @@ def test_a_claim_between_the_advisory_read_and_the_write_stops_the_rotation(desk
     assert isinstance(got, dream_rotation.NotDue) and got.why.startswith("mid-work:")
     assert _handoffs(desk) == before_handoffs
     assert desk.coord_status()["lease"]["holder"] == desk.launch.session_key
+
+
+def test_a_manual_close_for_an_older_dream_is_not_adopted_for_the_newer_one(desk):
+    _saved_after(desk, hours=0.001, occurrence="occ-A")
+    _saved_after(desk, hours=0.002, occurrence="occ-B")
+    desk._clock = lambda: parse_stamp(_requested(desk)) + timedelta(minutes=1)      # the desk closed by hand for A
+    by_hand = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-A", prev_handoff_id=None,
+                                  token=desk.token)
+    got = _rotate(desk, {**BODY, "state_line": "B's own line"})
+    assert isinstance(got, dream_rotation.Rotation) and got.occurrence == "occ-B"
+    assert got.handoff.close_key == "dream-rotation:occ-B" and got.handoff.prev_handoff_id == by_hand.handoff_id
+    assert json.loads(got.handoff.body)["state_line"] == "B's own line"
+    assert [h[1] for h in _handoffs(desk)] == ["by-hand-A", "dream-rotation:occ-B"]
+
+
+@pytest.mark.parametrize("key", ["x" * 500, "two\nlines:"])
+def test_a_rotation_has_the_same_key_checks_a_close_has(desk, key, monkeypatch):
+    _saved_after(desk)
+    monkeypatch.setattr(dream_rotation, "KEY_PREFIX", key)
+    before = _snapshot(desk.directory)
+    with pytest.raises(CoordError):
+        _rotate(desk)
+    assert _snapshot(desk.directory) == before
+
+
+def test_a_manual_dream_close_is_never_taken_for_the_rotation_handoff(desk):
+    _saved_after(desk, hours=0.001)
+    desk._clock = lambda: parse_stamp(_requested(desk)) + timedelta(minutes=1)      # by hand, after the save
+    manual = seam_handoffs.close(desk, kind="dream", body=BODY, request_id="by-hand-1", prev_handoff_id=None,
+                                 token=desk.token)
+    got = _rotate(desk)
+    assert got.handoff.close_key == "dream-rotation:occ-1" and got.handoff.prev_handoff_id == manual.handoff_id
+    assert [h[1] for h in _handoffs(desk)] == ["by-hand-1", "dream-rotation:occ-1"]
