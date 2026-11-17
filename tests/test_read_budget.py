@@ -68,7 +68,7 @@ def test_ledger_charge_by_post_hook_and_session_budget_denies_a_later_scoped_rea
     assert len(rows) == 1 and rows[0]["bytes"] == 4000 and rows[0]["price"] == rb.price(4000, 10)
     assert note is None                                   # 10_000 <= the 20_000 ceiling: no note
     # the session has 0 left: even a scoped read priced above what is left is denied; another session is untouched
-    assert rb.decide_pre(_ev(p, offset=1, limit=200), env)
+    assert rb.decide_pre(_ev(p, offset=1, limit=600), env)
     assert rb.decide_pre(_ev(p, sid="other", offset=1, limit=20), env) is None
 
 
@@ -130,3 +130,101 @@ def test_settings_hooks_shape_and_absolute_paths():
     assert h["PreToolUse"][0]["matcher"] == "Read" and h["PostToolUse"][0]["hooks"][0]["command"].endswith(" post")
     with pytest.raises(ValueError):
         rb.settings_hooks("python3", "/x.py")
+
+
+# ---- review fixes (b1686fix): each test was run failing before its fix -----------------------------------------------
+import re
+
+
+def _retry(out):
+    m = re.search(r"offset=(\d+) limit=(\d+)", out)
+    return int(m.group(1)), int(m.group(2))
+
+
+def test_file_over_scan_cap_prices_the_range_and_the_retry_passes(tmp_path, env):
+    p = tmp_path / "huge.log"
+    p.write_text(("x" * 99 + "\n") * 90_000)                       # 9MB, over SCAN_CAP
+    assert p.stat().st_size > rb.SCAN_CAP
+    assert rb.decide_pre(_ev(p, offset=5, limit=10), env) is None  # a ranged read is priced by its range
+    out = rb.decide_pre(_ev(p), env)
+    assert out and out.startswith(rb.DENY_PREFIX)
+    off, lim = _retry(out)
+    assert rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
+
+
+def test_spent_ledger_never_wedges_a_tiny_read_and_the_retry_passes(tmp_path, env):
+    p = _big(tmp_path)
+    env["LEVAIN_READ_BUDGET_SESSION"] = "5000"
+    post = {"tool_name": "Read", "session_id": "s1", "cwd": "/", "tool_input": {"file_path": str(p)},
+            "tool_response": "x" * 4000}
+    rb.decide_post(post, env)
+    tiny = tmp_path / "tiny.txt"
+    tiny.write_text("one line\n")
+    assert rb.decide_pre(_ev(tiny), env) is None                  # under the floor: always passes
+    assert rb.decide_pre(_ev(p, offset=1, limit=1), env) is None
+    out = rb.decide_pre(_ev(p, offset=1, limit=600), env)         # over the floor, ledger spent: denied...
+    assert out
+    off, lim = _retry(out)
+    assert rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None  # ...and the named retry can pass
+
+
+def test_images_and_binary_are_not_denied_with_an_outline(tmp_path, env):
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x01" * 60_000)
+    assert rb.decide_pre(_ev(png), env) is None
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.4 " + b"abc" * 60_000)
+    assert rb.decide_pre(_ev(pdf), env) is None
+    blob = tmp_path / "blob.dat"
+    blob.write_bytes(b"abc\x00" * 60_000)
+    assert rb.decide_pre(_ev(blob), env) is None
+    post = {"tool_name": "Read", "session_id": "s1", "cwd": "/", "tool_input": {"file_path": str(png)},
+            "tool_response": "y" * 400_000}
+    rb.decide_post(post, env)
+    assert rb._rows(env[rb.STATE_ENV], "s1")[0]["bytes"] <= rb.FLOOR_BYTES   # a fixed small charge
+
+
+def test_retry_starts_at_the_first_section_and_a_scoped_retry_keeps_its_offset(tmp_path, env):
+    p = tmp_path / "pre.py"
+    p.write_text("# preamble\n" * 59 + "".join(f"def f{i}(x):\n    return x + {i}\n\n" for i in range(400)))
+    out = rb.decide_pre(_ev(p), env)
+    off, lim = _retry(out)
+    assert off == 60 and rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
+    out = rb.decide_pre(_ev(p, offset=500, limit=900), env)
+    off, lim = _retry(out)
+    assert off == 500 and rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
+
+
+def test_front_dense_file_retry_is_sized_by_the_real_lines(tmp_path, env):
+    p = tmp_path / "dense.txt"
+    p.write_text(("d" * 399 + "\n") * 100 + "t\n" * 3000)
+    out = rb.decide_pre(_ev(p), env)
+    off, lim = _retry(out)
+    assert rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
+
+
+def test_one_huge_line_is_named_plainly(tmp_path, env):
+    p = tmp_path / "min.js"
+    p.write_text("var a=1;" * 20_000 + "\n")                      # one 160KB line
+    out = rb.decide_pre(_ev(p), env)
+    assert out and "Line 1 alone" in out and "desk" in out and "offset=" not in out
+
+
+def test_allow_large_unscoped_is_priced_as_the_whole_file(tmp_path, env):
+    env["LEVAIN_READ_BUDGET_CALL"] = "60000"
+    p = tmp_path / "three.txt"
+    p.write_text("123456789\n" * 3000)                            # first 2000 lines pass, the whole file does not
+    assert rb.decide_pre(_ev(p), env) is None
+    assert rb.decide_pre(_ev(p, allow_large=True), env)
+    assert rb.decide_pre(_ev(p, allow_large=True, offset=1, limit=100), env) is None
+
+
+def test_outline_counts_lines_like_read_and_caps_text(tmp_path):
+    md = tmp_path / "ff.md"
+    md.write_text("# A\n\x0c\nx y\n# B\n" + "# " + "t" * 500 + "\n")
+    o = rb.outline(str(md))
+    assert o["lines"] == 5 and [e[0] for e in o["entries"]] == [1, 4, 5]
+    assert all(len(e[2]) <= 120 for e in o["entries"])
+    js = tmp_path / "k.json"
+    js.write_text(json.dumps({"k" * 500: 1}))
+    assert all(len(e[2]) <= 120 for e in rb.outline(str(js))["entries"])
