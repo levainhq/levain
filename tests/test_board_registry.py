@@ -758,7 +758,7 @@ def test_a_torn_registry_refuses_every_reader_and_writer_until_acked(store, mkre
     assert rc == 2 and "is not torn" in err
     rc, _, err = run(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "9", "--why", "w", *A)
     assert rc == 2 and "there is no line 9" in err
-    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "2", "--why", "test", *A) == "acknowledged repos.jsonl line 2"
+    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "2", "--why", "test", *A).startswith("acknowledged repos.jsonl line 2")
     r = reg_lines_tolerant(store)[-1]
     assert r["op"] == "ack-torn" and r["line"] == 2 and r["sha256"] == hashlib.sha256(b"garbage").hexdigest() and r["why"] == "test"
     assert run(capsys, "repos")[0] == 0
@@ -782,7 +782,7 @@ def _registry_with_old_writer_line(store, mkrepo, capsys):
 def test_p1b_an_unchained_registry_line_after_the_cutover_is_torn_and_every_reader_and_writer_refuses_naming_it(store, mkrepo, capsys):
     _registry_with_old_writer_line(store, mkrepo, capsys)
     fold = rf.fold_repos((store / "repos.jsonl").read_bytes().split(b"\n")[:-1], store_id=(store / "store.id").read_text().strip())
-    assert fold.torn and fold.torn_why == "line 3: unchained record after the cutover (an old writer?)"
+    assert fold.torn and fold.torn_why.startswith("line 3: unchained record after the cutover (an old writer?)")
     before = (store / "repos.jsonl").read_bytes()
     for argv in (("repos",), ("resume", "alpha", "--words", "w", *A)):
         rc, _, err = run(capsys, *argv)
@@ -792,17 +792,17 @@ def test_p1b_an_unchained_registry_line_after_the_cutover_is_torn_and_every_read
 
 def test_p1b_ack_torn_on_the_registry_re_anchors_and_a_second_break_after_it_refuses_again(store, mkrepo, capsys):
     line = _registry_with_old_writer_line(store, mkrepo, capsys)
-    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "3", "--why", "stale checkout", *A) == "acknowledged repos.jsonl line 3"
+    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "3", "--why", "stale checkout", *A).startswith("acknowledged repos.jsonl line 3")
     ack = reg_lines(store)[-1]
     assert ack["op"] == "ack-torn" and ack["sha256"] == hashlib.sha256(line).hexdigest() and ack["prev"] == ack["sha256"]
-    assert run(capsys, "repos")[0] == 0                            # derives again; the old writer's record is skipped, not applied
+    assert run(capsys, "repos")[0] == 0                            # derives again; the old writer's record is acknowledged and KEPT
     assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].attention == "paused"
     assert ok(capsys, "resume", "alpha", "--words", "w", *A) == "resumed alpha"
     with open(store / "repos.jsonl", "ab") as fh:
         fh.write(line + b"\n")
     rc, _, err = run(capsys, "repos")
     assert rc == 2 and "line 6: unchained record after the cutover (an old writer?)" in err
-    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "6", "--why", "again", *A) == "acknowledged repos.jsonl line 6"
+    assert ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "6", "--why", "again", *A).startswith("acknowledged repos.jsonl line 6")
     assert run(capsys, "repos")[0] == 0
 
 
@@ -1246,7 +1246,7 @@ def test_f1_ack_torn_on_the_items_file_is_taken_since_p1b_and_the_item_store_rea
     track_ready(capsys, tmp_path, store, a, "alpha")
     with open(store / "items.jsonl", "a") as fh:
         fh.write("garbage\n")
-    assert run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "w", *A)[1] == "acknowledged items.jsonl line 2"
+    assert run(capsys, "ack-torn", "--file", "items.jsonl", "--line", "2", "--why", "w", *A)[1].startswith("acknowledged items.jsonl line 2")
     assert not item_fold((store / "items.jsonl").read_text("utf-8").split("\n")).torn
 
 
@@ -1546,3 +1546,24 @@ def test_n4_launch_request_takes_a_one_shot_threads_iterable_whole(store, home, 
     except CoordError:
         pass                                                         # an unknown thread: refused AFTER the lease read what was asked
     assert seen == [("t1",)]
+
+
+def test_p1b_fix1_a_registry_chain_ack_keeps_the_line_and_binds_the_break(store, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    ok(capsys, "resume", "alpha", "--words", "w", *A)
+    p = store / "repos.jsonl"
+    lines = p.read_bytes().split(b"\n")[:-1]
+    lines[1] = lines[1].replace(b'"words":"w"', b'"words":"edited"')                # line 2 edited: line 3 no longer chains onto it
+    p.write_bytes(b"\n".join(lines) + b"\n")
+    rc, _, err = run(capsys, "repos")
+    assert rc == 2 and "line 2 was edited or deleted" in err and "ack-torn --file repos.jsonl --line 3" in err
+    out = ok(capsys, "ack-torn", "--file", "repos.jsonl", "--line", "3", "--why", "hand edit", *A)
+    assert "line 2 is now " in out and "an edit, a deletion, an insertion or a reorder before line 3" in out
+    assert run(capsys, "repos")[0] == 0
+    assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].attention == "active"     # line 3 (the resume) is KEPT
+    lines = p.read_bytes().split(b"\n")[:-1]
+    lines[1] = lines[1].replace(b'"words":"edited"', b'"words":"edited-again"')
+    p.write_bytes(b"\n".join(lines) + b"\n")
+    assert run(capsys, "repos")[0] == 2                                              # the same line before is edited again: breaks again

@@ -57,6 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from levain.desk import board_chain
 from levain.desk import board_store as bs
 from levain.desk import repos_fold as rf
 from levain.desk.board_store import BoardError
@@ -230,7 +231,9 @@ def _fold_items(raw: bytes) -> Any:
         lines.pop()
     folded = fold(lines)
     if folded.torn:
-        raise BoardError(f"the items store is torn ({folded.torn_why}); repair it first")
+        n = next((ln for ln, _ in folded.torn_lines if ln not in folded.acked), None)
+        hint = f", or {bs.ack_hint(bs.ITEMS_NAME, n)}" if n else ""
+        raise BoardError(f"the items store is torn ({folded.torn_why}); repair it first{hint}")
     return folded
 
 
@@ -727,19 +730,38 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
     return _fold_one(target, name), written
 
 
+def _ack_body(parts: list[bytes], line: int, why: str, brk: Any, file: str, out: list[str] | None) -> dict:
+    """The ack's fields for ``line`` of ``parts``: the line and the sha256 of its bytes, and for a CHAIN break ``want`` and ``have``
+    too (the exact break acknowledged). The confirmation text, saying exactly what is acknowledged, goes to ``out``."""
+    body: dict[str, Any] = {"line": line, "sha256": hashlib.sha256(parts[line - 1]).hexdigest(), "why": why}
+    if brk is None:
+        if out is not None:
+            out.append(f"acknowledged {file} line {line}: a torn line, dropped by every reader")
+        return body
+    body["want"], body["have"] = brk.want, brk.have
+    if out is not None:
+        chained = f"it chained onto {brk.want}" if brk.want else "it carries no prev"
+        out.append(f"acknowledged {file} line {line}: {chained}; line {line - 1} is now {brk.have}: an edit, "
+                   f"a deletion, an insertion or a reorder before line {line}. The line is kept; a later change to it or to line "
+                   f"{line - 1} breaks again")
+    return body
+
+
 def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, author: Mapping[str, Any],
-             now: str | None = None) -> bool:
+             now: str | None = None, out: list[str] | None = None) -> bool:
     """Append ``{"op": "ack-torn", "line": N, "sha256": <of that line's bytes>, "why": ...}`` to ``repos.jsonl`` or ``items.jsonl``:
     a reader then skips exactly that line. The hash is computed here from the bytes on disk, and the line must be torn by that
     file's fold, a broken chain (:mod:`levain.desk.board_chain`) included. Like every record the ack is chained onto the line
-    before it, so after a tear at the tail its ``prev`` is the hash it names. Returns False when the line is already acknowledged."""
+    before it, so after a tear at the tail its ``prev`` is the hash it names. A chain break's ack also names the break (``want`` and
+    ``have``), and the line stays in the fold. ``out`` receives the confirmation text. Returns False when the line is already
+    acknowledged."""
     if file not in (REPOS_NAME, bs.ITEMS_NAME):
         raise BoardError(f"--file must be {REPOS_NAME} or {bs.ITEMS_NAME}")
     if not isinstance(line, int) or isinstance(line, bool) or line < 1:
         raise BoardError("--line must be a positive line number")
     why, by = bs._one_line(why, "why"), bs._one_line(by, "by")
     if file == bs.ITEMS_NAME:
-        return _ack_torn_items(target, line, why, by, author, now)
+        return _ack_torn_items(target, line, why, by, author, now, out)
 
     def build(fold, sid, raw):
         parts = raw.split(b"\n")
@@ -751,14 +773,15 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
             return None, False
         if line not in {n for n, _ in fold.torn_lines}:
             raise BoardError(f"line {line} of {REPOS_NAME} is not torn")
-        sha = hashlib.sha256(parts[line - 1]).hexdigest()
-        return _record(rf.ACK, None, by, sid, {"line": line, "sha256": sha, "why": why}, author, now), True
+        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), file, out)
+        return _record(rf.ACK, None, by, sid, body, author, now), True
 
     _, written = _reg_write(target, build, allow_torn=True)
     return written
 
 
-def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Mapping[str, Any], now: str | None) -> bool:
+def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Mapping[str, Any], now: str | None,
+                    out: list[str] | None = None) -> bool:
     """``ack_torn`` for ``items.jsonl``: judged by the item fold, written by the one writer with no parse (a torn store is the
     case). The ack has no id; the fold and the writer's id reader both know it."""
     from levain.desk.board_state import fold
@@ -777,8 +800,8 @@ def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Map
             return None, False
         if line not in {n for n, _ in folded.torn_lines}:
             raise BoardError(f"line {line} of {bs.ITEMS_NAME} is not torn")
-        rec = bs.build_record(rf.ACK, "-", by, {"line": line, "sha256": hashlib.sha256(parts[line - 1]).hexdigest(), "why": why},
-                              now, author=author)
+        body = _ack_body(parts, line, why, board_chain.check_chain(parts).by_line().get(line), bs.ITEMS_NAME, out)
+        rec = bs.build_record(rf.ACK, "-", by, body, now, author=author)
         rec.pop("id")
         return rec, True
 
@@ -1244,6 +1267,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p.add_argument("--items", type=str, metavar="PATH", help=items_help)
 
     def run_ack(a: Any, t: bs.Target) -> None:
-        written = ack_torn(t, a.file, a.line, a.why, a.by, author=author_of(a))
-        print(f"acknowledged {a.file} line {a.line}" if written else f"{a.file} line {a.line} is already acknowledged")
+        said: list[str] = []
+        written = ack_torn(t, a.file, a.line, a.why, a.by, author=author_of(a), out=said)
+        print(said[-1] if written and said else f"{a.file} line {a.line} is already acknowledged")
     p.set_defaults(func=run(run_ack))

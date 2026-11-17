@@ -20,7 +20,7 @@ Three entry points, all pure (no file, no clock, no environment: ``now`` is a pa
 The state, column and audit-kind sets each have ONE definition here (:data:`STATE_COLUMN`, :data:`AUDIT_KINDS`):
 the emit sites and the schema document test read those, so the documented set cannot drift from the emitted one.
 Stdlib only, and no ``levain`` import beyond its stdlib-only sibling :mod:`levain.desk.board_chain` (the one chain checker
-both stores' folds share), so the module can be copied with that one file and a conformance run needs nothing else.
+both stores' folds share), so the module needs one sibling file (the chain checker) and nothing else: copy both.
 """
 from __future__ import annotations
 
@@ -329,22 +329,37 @@ def fold(lines: Iterable[str]) -> Folded:
     A broken CHAIN (:func:`levain.desk.board_chain.check_chain`: an unchained record after the cutover, a ``prev`` that does
     not match the line before, a cutover that does not commit the legacy prefix) is one more way a line is torn, named in
     ``torn_why``. An ``ack-torn`` record ``{op, line, sha256, why}`` whose ``sha256`` is the hash of that line's bytes makes
-    the fold skip exactly that line, torn or chain-broken; an ack of a line that is not torn is a problem and skips nothing.
-    Acknowledged lines are in ``acked``; every torn line, acknowledged or not, is in ``torn_lines``."""
+    the fold DROP that torn line. An ack of a CHAIN break (the line parses) also carries ``want`` and ``have`` and binds that exact
+    break: it is honoured only while both still hold, and the line is then KEPT and applied. An ack of a line that is not torn is
+    a problem and skips nothing. Acks are collected only from lines that themselves parse and chain. Acknowledged lines are in
+    ``acked``; every torn line, acknowledged or not, is in ``torn_lines``."""
     lines = list(lines)
     items: dict[str, Item] = {}
     problems: list[str] = []
     torn_why = ""
     breaks = board_chain.check_chain(lines).by_line()
-    acks: dict[int, set[str]] = {}                      # ANY ack of a line whose hash matches accepts it
-    for raw in lines:
-        if isinstance(raw, str) and board_chain.ACK_OP in raw:
+    parsed: list[Any] = []                              # per line: the record, or the _Bad that parsing it raised, or None (blank)
+    acks: dict[int, list[board_chain.Ack]] = {}         # ANY ack of a line whose hash (and, for a chain break, break) matches accepts it
+    for n, raw in enumerate(lines, 1):
+        entry: Any = None
+        if isinstance(raw, str) and raw.strip():
             try:
-                rec = json.loads(raw)
-                target, sha = _ack_target(rec)
-            except (ValueError, RecursionError, _Bad):
-                continue
-            acks.setdefault(target, set()).add(sha)
+                entry = json.loads(raw)                 # the text as it stands, as the checker and the writer parse it
+            except RecursionError:                      # a line of 100,000 brackets overflows the parser's stack: torn, not a crash
+                entry = _Bad("not JSON (nested too deeply)")
+            except ValueError as e:
+                entry = _Bad(f"not JSON ({e})")
+            if not isinstance(entry, (Mapping, _Bad)):
+                entry = _Bad("a record must be a JSON object")
+            if isinstance(entry, Mapping) and entry.get("op") == board_chain.ACK_OP:
+                try:
+                    ack = board_chain.parse_ack(entry)
+                except board_chain.AckError as e:
+                    entry = _Bad(str(e))
+                else:
+                    if n not in breaks and ack is not None:
+                        acks.setdefault(ack.line, []).append(ack)   # only from a line that itself parses and chains
+        parsed.append(entry)
     acked: list[int] = []
     torn_lines: list[tuple[int, str]] = []
     for n, raw in enumerate(lines, 1):
@@ -352,56 +367,40 @@ def fold(lines: Iterable[str]) -> Folded:
             problems.append(f"line {n}: torn: not text ({type(raw).__name__})")
             torn_why = torn_why or f"line {n}: not text ({type(raw).__name__})"
             continue
-        line = raw.strip()
-        if not line:
+        rec = parsed[n - 1]
+        if rec is None:
             continue
+        brk = breaks.get(n)
+        sha = board_chain.line_hash(raw)
         try:
-            try:
-                rec = json.loads(line)
-            except RecursionError:                      # a line of 100,000 brackets overflows the parser's stack: torn, not a crash
-                raise _Bad("not JSON (nested too deeply)") from None
-            except ValueError as e:
-                raise _Bad(f"not JSON ({e})") from None
-            if not isinstance(rec, Mapping):
-                raise _Bad("a record must be a JSON object")
-            if n in breaks:
-                raise _Bad(breaks[n])
+            if isinstance(rec, _Bad):
+                raise rec
+            if brk is not None:
+                if not any(board_chain.honours(a, sha, brk) for a in acks.get(n, ())):
+                    changed = "; an ack-torn names it, but not this break as it stands now" if n in acks else ""
+                    raise _Bad(brk.problem + changed)
+                torn_lines.append((n, sha))
+                acked.append(n)                         # a chain break acknowledged: the record is KEPT, and applied below
             if rec.get("op") == board_chain.ACK_OP:
-                _ack_target(rec)                        # shape only; an ack changes no item
-                if n in acks:
+                if n in acks and brk is None:
                     problems.append(f"line {n}: ack-torn names this line, which is not torn")
                 continue
-            if n in acks:
+            if n in acks and brk is None:
                 problems.append(f"line {n}: ack-torn names this line, which is not torn")
             _apply(rec, items)
         except _Soft as e:
             problems.append(f"line {n}: {e}")
         except _Bad as e:
-            sha = board_chain.line_hash(raw)
-            torn_lines.append((n, sha))
-            if sha in acks.get(n, ()):
+            if not any(t == n for t, _ in torn_lines):
+                torn_lines.append((n, sha))
+            if brk is None and any(board_chain.honours(a, sha, None) for a in acks.get(n, ())):
                 acked.append(n)                         # skipped exactly; listed in ``acked``, not a problem
+            elif n in acked:
+                pass
             else:
-                problems.append(f"line {n}: torn: {e}" + ("; an ack-torn names it with a different sha256" if n in acks else ""))
+                problems.append(f"line {n}: torn: {e}" + ("; an ack-torn names it with a different sha256" if n in acks and brk is None else ""))
                 torn_why = torn_why or f"line {n}: {e}"
     return Folded(items, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines))
-
-
-def _ack_target(rec: Any) -> tuple[int, str]:
-    """``(line, sha256)`` of an ``ack-torn`` record, or :class:`_Bad` when it is not one or is ill-shaped."""
-    if not isinstance(rec, Mapping) or rec.get("op") != board_chain.ACK_OP:
-        raise _Bad("not an ack-torn record")
-    if type(rec.get("v")) is not int or rec["v"] != 1:
-        raise _Bad(f"unknown record version {rec.get('v')!r}")
-    _req_str(rec, "at")
-    _req_str(rec, "by")
-    _req_str(rec, "why")
-    n, sha = rec.get("line"), rec.get("sha256")
-    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-        raise _Bad("ack-torn line must be a positive integer")
-    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
-        raise _Bad("ack-torn sha256 must be 64 lowercase hex")
-    return n, sha
 
 
 # ------------------------------------------------------------------------------------------------ the evidence

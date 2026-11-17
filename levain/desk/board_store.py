@@ -315,7 +315,8 @@ def ack_hint(file: str, n: int) -> str:
 def _records_from(raw: bytes) -> list[dict]:
     """The items file's records (id and op are all the writer reads), or BoardError on a torn line: not JSON, no valid id, or a
     broken chain (:func:`levain.desk.board_chain.check_chain`), unless an ``ack-torn`` record acknowledges exactly that line
-    (:func:`levain.desk.board_chain.acked_lines`). An ``ack-torn`` record itself carries no id and is not returned."""
+    (:func:`levain.desk.board_chain.acked_lines`): a torn line is then skipped, a chain-broken one KEPT. An ``ack-torn`` record
+    itself carries no id and is not returned."""
     if raw and not raw.endswith(b"\n"):
         raise BoardError("the store does not end in a newline (a torn append); repair it before writing")
     try:
@@ -323,7 +324,8 @@ def _records_from(raw: bytes) -> list[dict]:
     except UnicodeDecodeError as exc:
         raise BoardError(f"the store holds invalid UTF-8 at byte {exc.start}; repair it before writing") from None
     blines = raw.split(b"\n")[:-1] if raw else []
-    chain, acked = board_chain.check_chain(blines).by_line(), board_chain.acked_lines(blines)
+    chain = board_chain.check_chain(blines)
+    breaks, acked = chain.by_line(), board_chain.acked_lines(blines, chain)
     recs = []
     for n, line in enumerate(text.split("\n"), 1):          # NOT splitlines(): a record is one \n-terminated line
         if not line.strip():
@@ -335,16 +337,21 @@ def _records_from(raw: bytes) -> list[dict]:
             rec, why = None, f"the store holds a torn line ({n}): not JSON"
         if why is None and not isinstance(rec, dict):
             why = f"the store holds a torn line ({n}): not a record"
-        elif why is None and n in chain:
-            why = f"the store's hash chain is broken at line {n}: {chain[n]}"
-        elif why is None and rec.get("op") != board_chain.ACK_OP and (not isinstance(rec.get("id"), str) or not ID_RE.fullmatch(rec["id"])):
+        elif why is None and n in breaks and n not in acked:
+            why = f"the store's hash chain is broken at line {n}: {breaks[n].problem}"
+        elif why is None and rec.get("op") == board_chain.ACK_OP:
+            try:
+                board_chain.parse_ack(rec)
+            except board_chain.AckError as exc:
+                why = f"the store holds a torn line ({n}): {exc}"
+        elif why is None and (not isinstance(rec.get("id"), str) or not ID_RE.fullmatch(rec["id"])):
             why = f"the store holds a torn line ({n}): no valid id"
         if why is not None:
             if n in acked:
-                continue                                    # acknowledged: skipped exactly, as the fold skips it
+                continue                                    # a torn line, acknowledged: skipped exactly, as the fold skips it
             raise BoardError(f"{why}; repair it before writing, or {ack_hint(ITEMS_NAME, n)}")
         if rec.get("op") != board_chain.ACK_OP:
-            recs.append(rec)
+            recs.append(rec)                                # a chain break acknowledged is KEPT, as the fold keeps it
     return recs
 
 
@@ -479,17 +486,16 @@ def chain_prev(raw: bytes) -> str:
         return hashlib.sha256(lines[-1]).hexdigest()
     if any(_carries_prev(line) for line in lines[:-1]):
         return hashlib.sha256(lines[-1]).hexdigest()
+    if not raw.endswith(b"\n"):                 # an unterminated legacy tail: ``_append`` completes it with a newline, and the
+        raw += b"\n"                            # checker hashes the prefix with each line's newline, so hash the bytes as they will be
     return hashlib.sha256(raw).hexdigest()
 
 
 def _carries_prev(line: bytes) -> bool:
     """True when ``line`` is a JSON object with a ``prev`` key. A line that cannot be parsed (not JSON, or nested too deep for
     the parser) carries none."""
-    try:
-        rec = json.loads(line)
-    except (ValueError, RecursionError):
-        return False
-    return isinstance(rec, dict) and "prev" in rec
+    rec = board_chain.record_of(line)           # the checker's own parse: a BOM line is judged the same here and there
+    return rec is not None and "prev" in rec
 
 
 def _with_prev(rec: dict, prev: str) -> dict:

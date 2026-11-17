@@ -12,7 +12,8 @@ Two kinds of trouble, as in the item store's fold:
 * a TORN line (not JSON, not an object, an unknown version or op, a missing or ill-shaped required field, another store's
   id, an unterminated tail, or a line where the hash chain breaks: :func:`levain.desk.board_chain.check_chain`) makes the
   whole registry torn: nothing can be trusted past it. ``torn`` and ``torn_why``
-  say so, and every reader refuses until an ``ack-torn`` record names exactly that line and the sha256 of its bytes.
+  say so, and every reader refuses until an ``ack-torn`` record names exactly that line and the sha256 of its bytes (a chain break
+  also names its ``want`` and ``have``, and the line is then KEPT: see :mod:`levain.desk.board_chain`).
 * a well-formed record that no state allows (a ``track`` on an untracked repo, a ``register`` over another path) is a
   PROBLEM line: skipped, listed, never fatal.
 
@@ -167,11 +168,10 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
     if store_id is not None and rec.get("store") != store_id:
         raise _Bad(f"evidence from another store ({rec.get('store')!r}, this store is {store_id!r})")
     if op == ACK:
-        if not isinstance(rec.get("line"), int) or isinstance(rec.get("line"), bool) or rec["line"] < 1:
-            raise _Bad("ack-torn line must be a positive integer")
-        if not isinstance(rec.get("sha256"), str) or not _HASH_RE.fullmatch(rec["sha256"]):
-            raise _Bad("ack-torn sha256 must be 64 lowercase hex")
-        _str(rec, "why")
+        try:
+            board_chain.parse_ack(rec)              # the one judge of an ack's shape
+        except board_chain.AckError as exc:
+            raise _Bad(str(exc)) from None
         return
     _repo_name(rec)
     _str(rec, "words", empty_ok=True)
@@ -273,7 +273,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     torn; ``unterminated_tail`` says the last line has no newline (an append in flight, or a crash), and it is torn."""
     lines = list(lines)
     breaks = board_chain.check_chain(lines).by_line()
-    acks: dict[int, set[str]] = {}              # ANY ack of a line whose hash matches accepts it: a corrected re-ack repairs
+    acks: dict[int, list[board_chain.Ack]] = {}  # ANY ack that honours the line accepts it: a corrected re-ack repairs
     parsed: list[Any] = []
     texts: list[str | None] = []                 # None: the line is not text (bytes that are not UTF-8, or not a str at all)
     shas: list[str] = []                         # of the line's RAW bytes: a bytes line is hashed as given, never as decoded text
@@ -295,12 +295,14 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
             except (ValueError, RecursionError):
                 rec = _NOT_JSON
         parsed.append(rec)
-        if isinstance(rec, dict) and rec.get("op") == ACK:
+        if isinstance(rec, dict) and rec.get("op") == ACK and n not in breaks:      # only from a line that itself parses and chains
             try:
                 _validate(rec, store_id)
-            except _Bad:
+                ack = board_chain.parse_ack(rec)
+            except (_Bad, board_chain.AckError):
                 continue
-            acks.setdefault(rec["line"], set()).add(rec["sha256"])
+            if ack is not None:
+                acks.setdefault(ack.line, []).append(ack)
     repos: dict[str, Repo] = {}
     problems: list[str] = []
     torn_why = ""
@@ -320,10 +322,14 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 raise _Bad("not JSON")
             if not isinstance(rec, dict):
                 raise _Bad("a record must be a JSON object")
-            if n in breaks:
-                raise _Bad(breaks[n])
+            brk = breaks.get(n)
+            if brk is not None:
+                if not any(board_chain.honours(a, shas[n - 1], brk) for a in acks.get(n, ())):
+                    raise _Bad(brk.problem + ("; an ack-torn names it, but not this break as it stands now" if n in acks else ""))
+                torn_lines.append((n, shas[n - 1]))
+                acked.append(n)                 # a chain break acknowledged: the record is KEPT, and applied below
             _validate(rec, store_id)
-            if n in acks:
+            if n in acks and brk is None:
                 problems.append(f"line {n}: ack-torn names this line, which is not torn")
             if rec["op"] != ACK:
                 _apply(rec, repos)
@@ -331,11 +337,14 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
             problems.append(f"line {n}: {e}")
         except _Bad as e:
             sha = shas[n - 1]
-            torn_lines.append((n, sha))
-            if sha in acks.get(n, ()):
+            if not any(t == n for t, _ in torn_lines):
+                torn_lines.append((n, sha))
+            if n in breaks and n in acked:
+                pass                            # acknowledged break, but the record is torn for another reason: already listed
+            elif any(board_chain.honours(a, sha, breaks.get(n)) for a in acks.get(n, ())):
                 acked.append(n)                 # skipped exactly; listed in ``acked``, not a problem
             else:
-                if n in acks:
+                if n in acks and n not in breaks:
                     problems.append(f"line {n}: torn ({e}); an ack-torn names it with a different sha256")
                 else:
                     problems.append(f"line {n}: torn: {e}")
