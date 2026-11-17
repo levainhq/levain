@@ -246,6 +246,7 @@ jobs:
           name: pytest-nodes-py${{ matrix.python-version }}
           path: ${{ runner.temp }}/nodes.txt
           retention-days: 7
+          overwrite: true   # a re-run of this job in the same run (the land waiter reruns) must not fail on the name
           if-no-files-found: ignore
 
       - name: Keep the flake rerun record

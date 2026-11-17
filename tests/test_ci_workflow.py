@@ -143,7 +143,7 @@ def test_stage0_cannot_fail_quietly():
     assert "continue-on-error" not in job
     assert [s.get("name") for s in job["steps"] if "continue-on-error" in s] == []
     # nor can a run line swallow a pytest exit
-    swallowed = [s.get("name") for s in job["steps"] if re.search(r"\|\|\s*true|set \+e", s.get("run", ""))]
+    swallowed = [s.get("name") for s in job["steps"] if re.search(r"\|\|\s*(true|exit 0|:)(\s|$)|set \+e", s.get("run", ""))]
     assert swallowed == []
 
 

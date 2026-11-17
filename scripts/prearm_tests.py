@@ -34,13 +34,16 @@ TAIL = "PREARM ONLY: this is a filter, the full suite still runs on the landing 
 
 def git(*args):
     r = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"prearm: git {' '.join(args)} failed ({r.returncode}): {r.stderr.strip()}\nrun the full suite instead")
     return [x for x in r.stdout.splitlines() if x]
 
 
 def changed_files(base):
-    out = git("diff", "--name-only", f"{base}...HEAD") + git("diff", "--name-only", "HEAD") + git(
-        "ls-files", "--others", "--exclude-standard")
-    return sorted({f for f in out if (ROOT / f).exists() or f.endswith((".py", ".json", ".yml"))})
+    # --no-renames: a rename lists BOTH paths, so tests that named the old path are still reached
+    out = git("diff", "--name-only", "--no-renames", f"{base}...HEAD") + git(
+        "diff", "--name-only", "--no-renames", "HEAD") + git("ls-files", "--others", "--exclude-standard")
+    return sorted(set(out))
 
 
 def dotted(rel):
@@ -172,6 +175,8 @@ def main():
     addopts = re.search(r'addopts\s*=\s*"([^"]*)"', (ROOT / "pyproject.toml").read_text())
     # serial: -n0 overrides an `-n` in addopts (disabling the xdist plugin instead would abort pytest on the unknown option)
     xdist = ["-n0"] if addopts and re.search(r"(^|\s)(-n|--numprocesses|--dist)", addopts.group(1)) else []
+    if a.basetemp:
+        os.makedirs(a.basetemp, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="prearm-", dir=a.basetemp)
     runs = [sorted(chosen)] + ([["-m", "invariant", "tests"]] if a.invariant else [])
     rc, counts = 0, {"passed": 0, "failed": 0, "skipped": 0, "error": 0}
@@ -183,17 +188,23 @@ def main():
             last = ""
             for line in p.stdout:
                 print(line, end="")
-                if re.search(r"\d+ (passed|failed|skipped|error)", line):
+                if re.search(r"\d+ (passed|failed|skipped|errors?).* in \d", line):  # pytest's final summary line
                     last = line
             p.wait()
+            if not last:
+                print(f"pytest exited {p.returncode} with no summary line: NOT a pass")
+                rc = rc or p.returncode or 3
             rc = rc or p.returncode
-            for n, w in re.findall(r"(\d+) (passed|failed|skipped|error)", last):
-                counts[w] += int(n)
+            for n, w in re.findall(r"(\d+) (passed|failed|skipped|errors?)", last):
+                counts[w.rstrip("s") if w.startswith("error") else w] += int(n)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     c = counts
     skip = f" (skipped tests did not run, e.g. needs_browser without Chrome: not a pass)" if c["skipped"] else ""
     print(f"{TAIL} passed={c['passed']} failed={c['failed']} errors={c['error']} skipped={c['skipped']}{skip}")
+    if not rc and not c["passed"]:
+        print("no selected test passed (all skipped or none ran): exit 3, the link is NOT covered by this filter")
+        return 3
     return rc
 
 
