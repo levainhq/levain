@@ -9,6 +9,10 @@ SHAPE, never vocabulary, so an ordinary English word is never refused.
 :func:`check_text` is pure over the file text (no git, no network, no model). In Levain 1.0 the verb WARNS: it prints the
 refusal text behind a ``levain: warning (charter not yet enforced):`` prefix and exits 0 whatever it found. Only an
 unusable command line (argparse) exits 2.
+
+``init`` writes a skeleton whose every blank is a ``<fill: what goes here>`` token (the Plan is prefilled from the store).
+:func:`check_text` refuses exactly those tokens (an empty ``<fill:>`` too) and nothing else: ``<br>``, ``Vec<T>`` and
+``a<b`` are ordinary prose and pass.
 """
 from __future__ import annotations
 
@@ -45,8 +49,8 @@ _JUDGED = re.compile(r"\[judged: [^\]]*\]")
 _SHA = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _GLYPH = re.compile(r"[✅☑✔]|\[[xX ]\]")
-_PLACEHOLDER = re.compile(r"<[^\s<>][^<>]*>")
-_NAME = re.compile(r"^[a-z][a-z0-9_-]*$")
+_PLACEHOLDER = re.compile(r"<fill:[^<>]*>")      # the ONE token `init` writes; any other angle-bracketed text is prose
+_NAME = re.compile(r"[a-z][a-z0-9_-]*")
 
 
 @dataclass(frozen=True)
@@ -203,7 +207,7 @@ def check_text(text: str, *, repo_name: str | None = None,
             bad(n, "status", "a check-mark glyph or task box (status does not live in the charter)")
         if _DATE.search(_JUDGED.sub("", ln)):
             bad(n, "status", "a date outside a [judged: ...] tag (a dated line is a status line)")
-    # A skeleton's `<...>` token is a blank not yet filled; a charter holding one is not a charter.
+    # A skeleton's `<fill: ...>` token is a blank not yet filled; a charter holding one is not a charter.
     for i, ln in enumerate(lines):
         for m in _PLACEHOLDER.finditer(ln):
             bad(i + 1, "placeholder", f"placeholder: {m.group(0)} on line {i + 1} is not filled")
@@ -349,20 +353,20 @@ def run_check(args: Any) -> int:
 
 
 _SKELETON_BODIES = {
-    "Purpose": ["<one paragraph: what this repo is for and for whom>"],
-    "Criteria": ["- C1: <a checkable statement of done-for-the-product> [judged: <who>]"],
-    "Constraints": ["- K1: <an opinion or limit the work must hold>"],
+    "Purpose": ["<fill: one paragraph, why this repo exists and for whom>"],
+    "Criteria": ["- C1: <fill: a checkable statement of done-for-the-product> [judged: <fill: who>]"],
+    "Constraints": ["- K1: <fill: an opinion or limit the work must hold>"],
 }
 
 
 def skeleton_text(name: str, export: str, plan_ids: list[str] | None) -> str:
-    """The charter skeleton: every body a ``<...>`` placeholder, except a Plan prefilled with ``plan_ids`` (None or
+    """The charter skeleton: every body a ``<fill: ...>`` placeholder, except a Plan prefilled with ``plan_ids`` (None or
     empty: the Plan holds one placeholder line)."""
     out = [f"# Charter: {name}", "Charter-Version: 1", f"Export: {export}", ""]
     for sec in SECTIONS:
         out.append(f"## {sec}")
         if sec == "Plan":
-            out.extend([f"- {i}" for i in plan_ids] if plan_ids else ["- <repo>#<n>"])
+            out.extend([f"- {i}" for i in plan_ids] if plan_ids else ["- <fill: a board item id, NAME#n>"])
         else:
             out.extend(_SKELETON_BODIES[sec])
         out.append("")
@@ -382,7 +386,7 @@ def _toplevel(path: Path) -> Path | None:
                             capture_output=True, text=True, timeout=30, env=_env())
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return None
-    out = cp.stdout.strip()
+    out = cp.stdout.removesuffix("\n")
     return Path(out) if cp.returncode == 0 and out else None
 
 
@@ -392,7 +396,7 @@ def run_init(args: Any) -> int:
         return 1
 
     name = args.name
-    if not _NAME.match(name):
+    if not _NAME.fullmatch(name):
         return refuse(f"the name {name!r} must be lowercase letters, digits, '_' or '-', starting with a letter (it is the "
                       "prefix of the repo's item ids).")
     root: Path | None = None
@@ -409,20 +413,36 @@ def run_init(args: Any) -> int:
         if items is None:
             return refuse(f"the items file {args.items} {why}; nothing was written.")
         plan_ids = _plan_ids(items, name)
+        if not plan_ids:
+            print(f"levain charter init: no live items of {name} in the store", file=sys.stderr)
     text = skeleton_text(name, args.export, plan_ids)
+    n_lines, n_bytes = len(text.split("\n")) - 1, len(text.encode("utf-8"))
+    if n_lines > MAX_LINES or n_bytes > MAX_BYTES:
+        return refuse(f"the skeleton would be {n_lines} lines and {n_bytes} bytes; the limits are {MAX_LINES} lines and "
+                      f"{MAX_BYTES} bytes; nothing was written.")
     if args.stdout:
         sys.stdout.write(text)
         return 0
     assert root is not None
     target = root / "CHARTER.md"
+    tmp = root / f".CHARTER.md.{os.getpid()}.tmp"
     try:
-        with target.open("x", encoding="utf-8") as fh:      # "x" never overwrites, even against a race
-            fh.write(text)
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.link(tmp, target)        # fails if the target exists, even against a race: never an overwrite, never partial
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     except FileExistsError:
         return refuse(f"{target} already exists; it is never overwritten.")
     except OSError as exc:
         return refuse(f"cannot write {target}: {type(exc).__name__}.")
-    print(f"levain charter init: wrote {target}; replace every <...> placeholder, then run `levain charter check --worktree`.")
+    print(f"levain charter init: wrote {target}; replace every <fill: ...> placeholder, then run `levain charter check --worktree`.")
     return 0
 
 
@@ -447,7 +467,7 @@ def register(subparsers: Any) -> None:
     q = sub.add_parser(
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
-                     "<...> placeholder that `check` refuses until it is replaced. Never overwrites."))
+                     "<fill: ...> placeholder that `check` refuses until it is replaced. Never overwrites."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")

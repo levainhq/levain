@@ -315,14 +315,48 @@ def _store_file(path, rows):
 
 def _fill(text):
     import re
-    return re.sub(r"<[^\s<>][^<>]*>", "filled", text)
+    return re.sub(r"<fill:[^<>]*>", "filled", text)
 
 
 def test_a_placeholder_token_is_a_problem_on_any_line_and_the_real_charter_has_none():
     assert [p for p in charter.check_text(REAL, repo_name="levain")[0] if p.rule == "placeholder"] == []
-    probs, _ = charter.check_text(REAL.replace("Python 3.12 or later", "<version> or later"), repo_name="levain")
+    probs, _ = charter.check_text(REAL.replace("Python 3.12 or later", "<fill: version> or later"), repo_name="levain")
     hit = [p for p in probs if p.rule == "placeholder"]
-    assert len(hit) == 1 and hit[0].text == f"placeholder: <version> on line {hit[0].line} is not filled"
+    assert len(hit) == 1 and hit[0].text == f"placeholder: <fill: version> on line {hit[0].line} is not filled"
+
+
+def test_only_the_fill_token_is_refused_and_other_angle_brackets_are_prose():
+    for ok in ("<br>", "Vec<T>", "p99<200ms and p50>5ms", "<>", "< todo>", "[check: pytest <a.txt >out]"):
+        probs, _ = charter.check_text(REAL.replace("Python 3.12 or later", f"{ok} or later"), repo_name="levain")
+        assert [p for p in probs if p.rule == "placeholder"] == [], ok
+    for bad in ("<fill:>", "<fill: x>"):
+        probs, _ = charter.check_text(REAL.replace("Python 3.12 or later", f"{bad} or later"), repo_name="levain")
+        assert len([p for p in probs if p.rule == "placeholder"]) == 1, bad
+
+
+def test_init_leaves_no_file_when_the_write_fails_and_refuses_a_trailing_newline_name(tmp_path, capsys, monkeypatch):
+    import os
+    repo = _git_repo(tmp_path / "levain")
+    def boom(fd):
+        raise OSError("disk")
+    monkeypatch.setattr(os, "fsync", boom)
+    assert main(["charter", "init", "levain", "--repo", str(repo)]) == 1
+    assert "cannot write" in capsys.readouterr().err
+    assert sorted(p.name for p in repo.iterdir()) == [".git"]
+    monkeypatch.undo()
+    assert main(["charter", "init", "levain\n", "--repo", str(repo), "--stdout"]) == 1
+    assert "must be lowercase" in capsys.readouterr().err
+
+
+def test_init_refuses_an_oversize_skeleton_before_writing_and_says_when_the_store_has_no_item(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "levain")
+    big = _store_file(tmp_path / "big.jsonl", [(f"levain#{i}", None) for i in range(1, charter.MAX_LINES + 1)])
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(big)]) == 1
+    err = capsys.readouterr().err
+    assert "lines" in err and str(charter.MAX_LINES) in err and not (repo / "CHARTER.md").exists()
+    other = _store_file(tmp_path / "other.jsonl", [("flow#1", None)])
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(other), "--stdout"]) == 0
+    assert "no live items of levain in the store" in capsys.readouterr().err
 
 
 def test_init_writes_the_skeleton_with_the_plan_prefilled_in_id_order(tmp_path, capsys):
@@ -353,7 +387,7 @@ def test_init_without_a_store_says_so_and_holds_one_placeholder_plan_line(tmp_pa
     assert main(["charter", "init", "levain", "--repo", str(repo)]) == 0
     assert "no --items store was read" in capsys.readouterr().err
     text = (repo / "CHARTER.md").read_text(encoding="utf-8")
-    assert text.endswith("## Plan\n- <repo>#<n>\n")
+    assert text.endswith("## Plan\n- <fill: a board item id, NAME#n>\n")
     assert charter.check_text(_fill(text), repo_name="levain")[0][0].rule == "plan"   # `- filled` is not an item id: not a charter either
 
 
