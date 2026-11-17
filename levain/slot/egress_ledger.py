@@ -21,7 +21,8 @@ verb), with its two locks and the install's own ``store_id``.
     and then another. A filesystem that cannot flock a directory fd (EBADF, ENOLCK, EOPNOTSUPP, ENOTSUP) is ``not-ready``.
     Known edges: a stale empty ``verify.lock`` from an earlier release stays as an orphan (nothing reads it); the lock's
     exclusivity holds while no other code flocks the grants directory; revocation latency is bounded by one in-flight
-    verify.
+    verify; during a live upgrade an old process holding the legacy ``verify.lock`` file and a new process holding the
+    directory lock do not exclude each other, so two ssh-keygen verifications can overlap for that window.
 
 A ledger that does not parse is ``egress-grant-ledger`` and is never read as empty or rewritten. Every write replaces
 the file whole by a unique temp and a rename (never an append: a torn tail would brick the ledger), synced as
@@ -69,7 +70,7 @@ _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_LOCK = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _O_DIR_LOCK = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 #: what a filesystem that cannot flock a directory fd answers: a refusal, not a crash
-_NO_DIR_LOCK = frozenset(getattr(errno, n) for n in ("EBADF", "ENOLCK", "EOPNOTSUPP", "ENOTSUP") if hasattr(errno, n))
+_NO_DIR_LOCK = frozenset(getattr(errno, n) for n in ("EBADF", "ENOLCK", "ENOSYS", "EOPNOTSUPP", "ENOTSUP") if hasattr(errno, n))
 _USED_KEYS = frozenset({"grant", "session", "host", "issued", "keep_until"})
 _REVOKED_KEYS = frozenset({"grant", "keep_until"})
 

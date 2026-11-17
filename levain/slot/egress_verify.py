@@ -44,7 +44,7 @@ def host_class(ctx: object, host: str) -> None:
 def enrolled_key(ctx: object, fingerprint: str) -> Tuple[str, str, str]:
     """``(principals, options, key)`` of the line of root's signers file whose fingerprint is ``fingerprint`` and whose
     options are exactly ``namespaces="..."`` naming :data:`levain.slot.egress_grants.NAMESPACE`; ``principals`` is the
-    line's principals field verbatim and ``key`` is ``<type> <base64>``. Else
+    line's principals field with its surrounding double quotes removed (a quoted field comes back unquoted) and ``key`` is ``<type> <base64>``. Else
     ``egress-grant-unenrolled`` (an absent file included)."""
     from levain.slot import install_helper as IH
 

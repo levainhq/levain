@@ -147,6 +147,14 @@ def test_enrolled_key_returns_the_principals_field_verbatim_and_the_line_still_v
     assert deliver(w, good)[0] == RH.EXIT_OK
 
 
+def test_enrolled_key_returns_a_quoted_principals_field_with_its_quotes_removed(real):
+    from levain.slot import egress_verify as EVY
+    w, good, _o, _a = real
+    _enrol(w, '"alice@example.org"', good)
+    got = EVY.enrolled_key(w_ctx(w), IH.blob_fingerprint(good.public))
+    assert got[0] == "alice@example.org"
+
+
 def test_a_star_principal_enrolled_line_verifies(real):
     w, good, _o, _a = real
     _enrol(w, "*", good)
@@ -165,7 +173,7 @@ def _grants_fd(w):
     return os.open(w.L / "routes" / "grants", os.O_RDONLY | os.O_DIRECTORY)
 
 
-@pytest.mark.parametrize("name", ["EBADF", "ENOLCK", "EOPNOTSUPP", "ENOTSUP"])
+@pytest.mark.parametrize("name", ["EBADF", "ENOLCK", "ENOSYS", "EOPNOTSUPP", "ENOTSUP"])
 def test_a_filesystem_that_cannot_flock_a_directory_is_a_not_ready_refusal(real, monkeypatch, name):
     import errno
     import fcntl
