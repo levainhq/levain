@@ -127,7 +127,10 @@ def test_outlines_markdown_json_and_unstructured(tmp_path):
 
 def test_settings_hooks_shape_and_absolute_paths():
     h = rb.settings_hooks("/usr/bin/python3", "/run/read_budget.py")
-    assert h["PreToolUse"][0]["matcher"] == "Read" and h["PostToolUse"][0]["hooks"][0]["command"].endswith(" post")
+    assert h["PreToolUse"][0]["matcher"] == "Read" and h["PostToolUse"][0]["hooks"][0]["command"].endswith(" post'")
+    assert h["PreToolUse"][0]["hooks"][0]["command"] == (
+        "/bin/sh -c '[ -r /run/read_budget.py ] || exit 0; exec /usr/bin/python3 -I /run/read_budget.py pre'")
+    assert h["PreToolUse"][0]["hooks"][0]["timeout"] == 10 == h["PostToolUse"][0]["hooks"][0]["timeout"]
     with pytest.raises(ValueError):
         rb.settings_hooks("python3", "/x.py")
 
@@ -267,3 +270,35 @@ def test_line_number_prefixes_are_priced(tmp_path, env):
     out = rb.decide_pre(_ev(p), env)
     off, lim = _retry(out)
     assert lim < 2000 and rb.decide_pre(_ev(p, offset=off, limit=lim), env) is None
+
+
+def _run_hook(script, arg, stdin_text, extra_env):
+    import os
+    import subprocess
+    import sys
+    cmd = rb.settings_hooks(sys.executable, str(script))["PreToolUse"][0]["hooks"][0]["command"].replace(" pre'", f" {arg}'")
+    base = {k: v for k, v in os.environ.items() if k != rb.STATE_ENV}
+    return subprocess.run(cmd, shell=True, input=stdin_text, capture_output=True, text=True,
+                          env={**base, **extra_env}, timeout=30)
+
+
+def test_the_hook_command_fails_open_when_the_script_is_missing(tmp_path):
+    got = _run_hook(tmp_path / "gone" / "read_budget.py", "pre", "{}", {})
+    assert got.returncode == 0 and got.stdout == ""
+
+
+def test_the_hook_command_runs_the_real_script_to_the_same_output_as_main(tmp_path, env):
+    import pathlib
+    big = _big(tmp_path)
+    raw = json.dumps(_ev(big))
+    out = io.StringIO()
+    assert rb.main(["pre"], io.StringIO(raw), out, env) == 0 and out.getvalue()
+    script = pathlib.Path(rb.__file__)
+    got = _run_hook(script, "pre", raw, {rb.STATE_ENV: env[rb.STATE_ENV], "LEVAIN_READ_BUDGET_CALL": "20000",
+                                         "LEVAIN_READ_BUDGET_TURNS": "10"})
+    assert got.returncode == 0 and got.stdout == out.getvalue()
+    # a tiny Read passes silently through the real command too
+    tiny = tmp_path / "tiny.txt"
+    tiny.write_text("hi\n")
+    ok = _run_hook(script, "pre", json.dumps(_ev(tiny)), {rb.STATE_ENV: env[rb.STATE_ENV]})
+    assert ok.returncode == 0 and ok.stdout == ""

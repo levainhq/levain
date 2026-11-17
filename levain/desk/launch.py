@@ -1132,7 +1132,10 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
         exe = found
         # row 800: a seat Levain launches carries the read budget unless the operator's own layer is on (user_scope)
         from levain.desk import read_budget_install
-        budget = None if user_scope else read_budget_install.seat_budget(store.directory)
+        try:
+            budget = None if user_scope else read_budget_install.seat_budget(store.directory)
+        except (OSError, ValueError) as exc:     # ValueError: sys.executable empty or relative (nothing spawned yet)
+            return fail(f"the read budget could not be installed ({type(exc).__name__}: {str(exc)[:200]})")
         if budget is not None:
             env = {**env, **budget["env"]}
         brief = _write_brief(store, got)

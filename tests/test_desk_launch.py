@@ -1446,9 +1446,14 @@ def test_a_launched_seat_settings_carry_the_read_budget_hooks_with_absolute_path
     for ev, arg in (("PreToolUse", "pre"), ("PostToolUse", "post")):
         (entry,) = hooks[ev]
         assert entry["matcher"] == "Read"
-        cmd = shlex.split(entry["hooks"][0]["command"])
-        assert os.path.isabs(cmd[0]) and cmd[1] == "-I" and os.path.isabs(cmd[2]) and cmd[3] == arg
-        assert Path(cmd[2]).name.startswith("read_budget-") and Path(cmd[2]).is_file()
+        assert entry["hooks"][0]["timeout"] == 10
+        outer = shlex.split(entry["hooks"][0]["command"])
+        assert outer[:2] == ["/bin/sh", "-c"] and len(outer) == 3
+        inner = shlex.split(outer[2].replace(";", " ;"))     # [ -r S ] || exit 0 ; exec PY -I S arg
+        assert inner[:2] == ["[", "-r"] and inner[3:8] == ["]", "||", "exit", "0", ";"] and inner[8] == "exec"
+        script, py = inner[2], inner[9]
+        assert os.path.isabs(py) and inner[10] == "-I" and inner[11] == script and inner[12] == arg
+        assert os.path.isabs(script) and Path(script).name.startswith("read_budget-") and Path(script).is_file()
 
 
 def test_a_launched_seat_env_and_settings_name_the_budget_state_dir(store, fake, qdir, live_hook, workdir):
@@ -1567,6 +1572,9 @@ def test_the_layer_flags_are_the_comma_form_as_one_argument():
     # measured accepted by a real `claude --bg` on Claude Code 2.1.314 (1030-42 dietrun): one comma argument, inline JSON
     assert cl._layer_args(False) == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
     assert cl._layer_args(True) == []
+    # the legacy argv (no budget) is exactly the old list
+    assert cl._layer_args(user_scope=False, budget=None) == [
+        "--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
 
 
 @pytest.mark.parametrize("asked", [False, True])
@@ -3010,3 +3018,35 @@ def test_a_listed_session_is_ours_under_the_new_name_or_the_old(store, fake, liv
            "name": prefix + launch_id.removeprefix("ln-"), "cwd": str(workdir.resolve()), "state": "working"}
     assert cl._ours(store, row).launch_id == launch_id
     assert cl._ours(store, {**row, "cwd": "/elsewhere"}) is None
+
+
+def test_a_read_budget_install_that_raises_value_error_fails_the_launch_not_pending(store, fake, live_hook, qdir, monkeypatch):
+    from levain.desk import read_budget_install
+
+    def boom(*a, **k):
+        raise ValueError("the hook's python and script must be absolute paths")
+    monkeypatch.setattr(read_budget_install, "seat_budget", boom)
+    launch_id = woken(store, "layers")
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "the read budget could not be installed" in got.refusal and "ValueError" in got.refusal
+    assert store.launch(launch_id).state == "failed" and fake.spawns() == []
+
+
+def test_a_read_budget_install_oserror_names_the_read_budget(store, fake, live_hook, qdir, monkeypatch):
+    from levain.desk import read_budget_install
+
+    def boom(*a, **k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(read_budget_install, "seat_budget", boom)
+    launch_id = woken(store, "layers")
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and got.refusal.startswith("the read budget could not be installed")
+    assert store.launch(launch_id).state == "failed" and fake.spawns() == []
+
+
+def test_the_install_rewrites_a_script_whose_mode_is_not_0600(tmp_path):
+    from levain.desk import read_budget_install
+    script, _state = read_budget_install.install(tmp_path)
+    os.chmod(script, 0o644)
+    assert read_budget_install.install(tmp_path)[0] == script
+    assert (os.stat(script).st_mode & 0o777) == 0o600

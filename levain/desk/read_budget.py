@@ -34,7 +34,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, TextIO
 
-__all__ = ["BYTES_PER_TOKEN", "DENY_PREFIX", "HOOK_MATCHER", "STATE_ENV", "charge", "decide_pre", "main", "outline",
+__all__ = ["BYTES_PER_TOKEN", "DENY_PREFIX", "HOOK_MATCHER", "HOOK_TIMEOUT_S", "STATE_ENV", "charge", "decide_pre", "main", "outline",
            "price", "settings_hooks", "slice_bytes"]
 
 BYTES_PER_TOKEN = 4
@@ -50,6 +50,7 @@ LINE_PREFIX_BYTES = 8           # ESTIMATE: Read renders each line as a right-al
 FLOOR_BYTES = 4096              # a Read priced at or under this many bytes ALWAYS passes (a seat is never wedged)
 NONTEXT_EXT = frozenset((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".heic", ".pdf"))
 HOOK_MATCHER = "Read"
+HOOK_TIMEOUT_S = 10          # the hook's own bound, seconds (the harness default is 60)
 STATE_ENV = "LEVAIN_READ_BUDGET_DIR"
 DENY_PREFIX = "READ BUDGET: "
 
@@ -388,11 +389,20 @@ def decide_post(event: Any, environ: Mapping[str, str]) -> str | None:
 
 
 def settings_hooks(python: str, script: str) -> dict[str, Any]:
-    """The ``hooks`` object for a seat's settings: PreToolUse and PostToolUse on :data:`HOOK_MATCHER`."""
+    """The ``hooks`` object for a seat's settings: PreToolUse and PostToolUse on :data:`HOOK_MATCHER`.
+
+    The command is fail-open: ``/bin/sh -c '[ -r SCRIPT ] || exit 0; exec PYTHON -I SCRIPT pre|post'``. A missing or
+    unreadable script would otherwise make ``python -I`` exit 2, which the harness treats as a BLOCKING hook error
+    (every Read refused); with the test it exits 0. A missing python (127) or a crash (1) is non-blocking already."""
     if not os.path.isabs(python) or not os.path.isabs(script):
         raise ValueError("the hook's python and script must be absolute paths")
-    base = f"{shlex.quote(python)} -I {shlex.quote(script)}"
-    return {ev: [{"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": f"{base} {arg}"}]}]
+    py, sc = shlex.quote(python), shlex.quote(script)
+
+    def command(arg: str) -> str:
+        return "/bin/sh -c " + shlex.quote(f"[ -r {sc} ] || exit 0; exec {py} -I {sc} {arg}")
+
+    return {ev: [{"matcher": HOOK_MATCHER,
+                  "hooks": [{"type": "command", "command": command(arg), "timeout": HOOK_TIMEOUT_S}]}]
             for ev, arg in (("PreToolUse", "pre"), ("PostToolUse", "post"))}
 
 

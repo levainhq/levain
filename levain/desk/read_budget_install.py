@@ -33,7 +33,7 @@ def _source() -> bytes:
 
 def install(home: str | os.PathLike[str]) -> tuple[str, str]:
     """``(script, state_dir)``, absolute: the script written to ``<home>/read_budget/read_budget-<sha[:16]>.py`` (0600,
-    replaced whole when missing or holding other bytes) and the state directory made (0700). OSError is the caller's."""
+    replaced whole when missing, holding other bytes, or not mode 0600) and the state directory made (0700). OSError is the caller's."""
     base = Path(os.path.abspath(home)) / SUBDIR
     state = base / "state"
     for d in (base, state):
@@ -41,7 +41,7 @@ def install(home: str | os.PathLike[str]) -> tuple[str, str]:
     data = _source()
     path = base / f"read_budget-{hashlib.sha256(data).hexdigest()[:16]}.py"
     try:
-        same = path.read_bytes() == data
+        same = path.read_bytes() == data and (path.stat().st_mode & 0o777) == 0o600
     except OSError:
         same = False
     if not same:
