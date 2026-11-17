@@ -1167,7 +1167,7 @@ class _Grants:
         self.tick_s = tick_s
         self._clock = clock
         self._read = read
-        self._log = log
+        self._sink = log
         #: every open granted tunnel: id(counts) -> (counts, the entry that admitted it, client writer, upstream
         #: writer). The watcher ends the ones whose grant is gone from the file.
         self.open: dict[int, tuple[dict, "eg.Entry", asyncio.StreamWriter, asyncio.StreamWriter]] = {}
@@ -1237,9 +1237,9 @@ class _Grants:
         return grants
 
     def _note(self, rec: dict) -> None:
-        if self._log is not None:
+        if self._sink is not None:
             try:
-                self._log(rec)
+                self._sink(rec)
             except Exception:   # a log that fails never decides a grant
                 pass
 
