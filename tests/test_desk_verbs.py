@@ -95,15 +95,15 @@ def _held_back(store_, lid: str) -> Outcome:
 
 def _snapshot(qdir: Path) -> dict:
     """Every byte of the store: the database, its write-ahead log (absent and empty are the same: a reader may make an
-    empty one), and every other file in the directory but SQLite's shared-memory index."""
+    empty one), and every other file under the directory (subdirectories walked) but SQLite's shared-memory index."""
     out: dict = {}
-    for p in sorted(qdir.iterdir()):
-        if p.name.endswith("-shm"):
+    for p in sorted(qdir.rglob("*")):      # a directory the store makes (the read budget's, beside the database) is walked, not read
+        if p.is_dir() or p.name.endswith("-shm"):
             continue
         body = p.read_bytes()
         if p.name.endswith("-wal") and not body:
             continue
-        out[p.name] = body
+        out[str(p.relative_to(qdir))] = body
     return out
 
 
