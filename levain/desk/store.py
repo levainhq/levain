@@ -1298,7 +1298,8 @@ class CoordStore:
 
         # I5: once the board registry is active, a seat is never launched in a repo it does not list. A launch the lease will
         # refuse for its shape alone (a worker asking for several threads) registers nothing: the refusal below is side-effect free.
-        if cwd and not (role == "worker" and len(list(threads)) > 1):
+        threads = tuple(threads)                    # one pass over a one-shot iterable: the count below and the lease read the same threads
+        if cwd and not (role == "worker" and len(threads) > 1):
             try:
                 board_registry.register_for_launch(cwd)
             except board_registry.BoardError as exc:

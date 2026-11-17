@@ -27,7 +27,10 @@ Known edges, left open under the reachability line (nobody reaches them):
 * a deeply nested JSON manifest, focus file or item line can raise RecursionError in the reader that parses it;
 * a multi-GB ``CHARTER.md`` blob is read whole by git before the 1 MiB check refuses it;
 * I1 runs before ``add``'s idempotent-key hit, so a lost-response retry after the repo moved to ``aborting`` is refused (the repo is being aborted);
-* a torn registry refuses every launch (fail-closed by design, I5).
+* a torn registry refuses every launch (fail-closed by design, I5);
+* a launch refused AFTER registration (a stale lease token, an unknown thread, a bad model) leaves a ``register`` record for the repo in cwd: the record is true, only earlier than its first launch (the lease and thread checks need the coordination db's transaction);
+* a replayed ``abandon-done`` on an already ``untracked`` repo is accepted with no migration check: a no-op there, and only a hand-written line produces it;
+* ``untrack`` refuses on any change to the items file between its check and its write: retryable, it says "run it again".
 """
 from __future__ import annotations
 
@@ -74,6 +77,11 @@ def _git(path: str | Path, *args: str) -> tuple[int, str]:
     return cp.returncode, cp.stdout.decode("utf-8", "replace").strip() if cp.returncode == 0 else cp.stderr.decode("utf-8", "replace").strip()
 
 
+class NoCommit(BoardError):
+    """The repository exists and has no commit yet (an unborn HEAD): nothing identifies it. The ONLY identity failure that
+    means that; any other (git failing, the repository vanished) is a plain :class:`BoardError`."""
+
+
 def identity(path: str | Path, *, top: bool = True) -> dict[str, Any]:
     """``{path, origin, root}`` of the repository at ``path`` (its realpath; ``top``: the path must be the repository's top
     directory). Refuses a path that is not a repository or has no commit."""
@@ -86,7 +94,10 @@ def identity(path: str | Path, *, top: bool = True) -> dict[str, Any]:
     real = os.path.realpath(out)
     rc, roots = _git(real, "rev-list", "--max-parents=0", "HEAD")
     if rc != 0 or not roots:
-        raise BoardError(f"{real} has no commit yet: nothing identifies the repository")
+        head_rc, _ = _git(real, "rev-parse", "--verify", "--quiet", "HEAD")
+        if head_rc == 1:                                # git's answer for a ref that does not exist (an unborn HEAD)
+            raise NoCommit(f"{real} has no commit yet: nothing identifies the repository")
+        raise BoardError(f"{real}: git could not list the root commits (rc {rc}): {roots or 'no output'}")
     rc, origin = _git(real, "config", "--get", "remote.origin.url")
     return {"path": real, "origin": origin if rc == 0 else "", "root": sorted(roots.split())}
 
@@ -281,9 +292,9 @@ def _need_repo(fold: rf.RepoFold, name: str) -> rf.Repo:
 
 
 def register(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
-             now: str | None = None) -> tuple[rf.Repo | None, bool]:
+             now: str | None = None, via: str | None = None) -> tuple[rf.Repo | None, bool]:
     """Put ``name`` in play, untracked. Records the path's realpath, origin and root set. A known name at the same path is a
-    no-op; at another path it refuses and names ``move``. Returns ``(repo as folded, written)``."""
+    no-op; at another path it refuses and names ``move``. ``via`` marks the record's writer (``import-focus``). Returns ``(repo as folded, written)``."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     ident = identity(path)
 
@@ -296,7 +307,7 @@ def register(target: bs.Target, name: str, path: str, words: str, by: str, *, au
         other = next((r.name for r in fold.repos.values() if r.path == ident["path"]), None)
         if other is not None:
             raise BoardError(f"{ident['path']} is already registered as {other}")
-        return _record("register", name, by, sid, {"words": words, **ident}, author, now), True
+        return _record("register", name, by, sid, {"words": words, **ident, **({"via": via} if via else {})}, author, now), True
 
     rec, written = _reg_write(target, build, creates=True)
     return _fold_one(target, name), written
@@ -789,7 +800,7 @@ def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] 
     that is not in a git repository, or a repository with no commit yet (nothing identifies it), registers nothing and the
     launch goes on. The decision is made INSIDE the write (under the exclusive lock): a repo another writer registered meanwhile
     is a no-op, and a name another repository holds gets a derived one. Raises BoardError when the register fails (a torn or
-    unreadable registry): that refuses the launch. Returns True when a record was written."""
+    unreadable registry) or when git cannot identify the repository for any reason but "no commit yet": that refuses the launch. Returns True when a record was written."""
     store_dir = bs.read_pointer(environ)
     if store_dir is None:
         return False
@@ -798,7 +809,7 @@ def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] 
         return False
     try:
         ident = identity(top)
-    except BoardError:
+    except NoCommit:
         return False                                    # no commit yet: nothing identifies the repository, nothing to register
     target = bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True)
     view = read_registry(target, allow_inactive=True)
@@ -974,16 +985,25 @@ def _unlink_quietly(path: Path) -> None:
         pass
 
 
-def _attention_touched(view: View, name: str) -> bool:
-    """Whether the registry holds a ``pause`` or ``resume`` record of ``name`` (its attention has been decided by someone)."""
-    for line in view.lines:
-        try:
-            r = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(r, dict) and r.get("repo") == name and r.get("op") in ("pause", "resume"):
-            return True
-    return False
+IMPORT_VIA = "import-focus"
+
+
+def _import_still_owns(repo: rf.Repo) -> bool:
+    """Whether a re-run of the import may still set ``repo``'s attention: the import's own ``register`` record (marked ``via``)
+    is its only history in the FOLD. A repo registered by hand, or one anyone has paused, resumed or changed since, is his."""
+    return repo.via == IMPORT_VIA and repo.history == 0
+
+
+def _import_identity_clash(fold: rf.RepoFold, name: str, ident: Mapping[str, Any]) -> str | None:
+    """None when the registry's ``name`` is the repository ``ident`` (or ``name`` is unknown and ``ident``'s path is free)."""
+    cur = fold.repos.get(name)
+    if cur is None:
+        other = next((r.name for r in fold.repos.values() if r.path == ident["path"]), None)
+        return f"{name}: {ident['path']} is already registered as {other}" if other is not None else None
+    if (cur.path, cur.origin, cur.root) == (ident["path"], ident["origin"], tuple(ident["root"])):
+        return None
+    return (f"{name}: the registry holds {cur.path} (origin {cur.origin or 'none'}, root {', '.join(cur.root)}), the focus file names "
+            f"{ident['path']} (origin {ident['origin'] or 'none'}, root {', '.join(ident['root'])})")
 
 
 def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, author: Mapping[str, Any],
@@ -1025,9 +1045,10 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
     if len({n for n, *_ in entries}) != len(entries):
         raise BoardError("--import-focus: two entries lower-case to the same name")
     refused = []
+    idents: dict[str, dict[str, Any]] = {}
     for name, path, state, words in entries:                          # nothing is written until every entry can be
         try:
-            identity(path)
+            idents[name] = identity(path)
             _words(words)
         except BoardError as exc:
             refused.append(f"{name}: {exc}")
@@ -1041,11 +1062,14 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
         raise BoardError(f"cannot set up the store at {store_dir}: {exc}") from None
     target = bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True)      # privileged: open until the pointer is written
     known = read_registry(target, allow_inactive=True)                  # a re-run after a partial import: what the registry holds is his now
+    clashes = [c for name, *_ in entries if (c := _import_identity_clash(known.fold, name, idents[name])) is not None]
+    if clashes:                                                         # a known name is skipped only when it IS this repository
+        raise BoardError("--import-focus refused, nothing written:\n  " + "\n  ".join(clashes))
     for name, path, state, words in entries:
         if name not in known.fold.repos:
-            register(target, name, path, words, by, author=author)
-        elif _attention_touched(known, name):
-            continue                                                    # paused or resumed since: never re-paused by a re-run
+            register(target, name, path, words, by, author=author, via=IMPORT_VIA)
+        elif not _import_still_owns(known.fold.repos[name]):
+            continue                                                    # his by hand, or decided since: never re-paused by a re-run
         if state == "paused":
             pause(target, name, words, by, author=author)
     if focus.read_bytes() != data:

@@ -60,6 +60,8 @@ class Repo:
     retire: tuple[Mapping[str, str], ...] = ()
     record_dir: str | None = None
     begins: int = 0                          # how many begin-track records this repo has had (a new ceremony's M differs)
+    via: str | None = None                   # the ``via`` marker of the register record that created the repo (``import-focus``: the import wrote it)
+    history: int = 0                         # records the fold accepted for this repo after its creating ``register``
 
     def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "path": self.path, "mode": self.mode, "attention": self.attention, "since": self.since,
@@ -196,13 +198,25 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
 
 
 def _apply(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
+    """Apply one record the fold accepts. ``history`` counts every record after the one that created the repo, and only those
+    the fold ACCEPTED (a torn line never reaches here; a record that is a problem raises before the count)."""
+    from dataclasses import replace
+
+    existed = rec["repo"] in repos
+    _apply_one(rec, repos)
+    if existed:
+        repos[rec["repo"]] = replace(repos[rec["repo"]], history=repos[rec["repo"]].history + 1)
+
+
+def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
     from dataclasses import replace
 
     op, name, at = rec["op"], rec["repo"], rec["at"]
     cur = repos.get(name)
     if op == "register":
         if cur is None:
-            repos[name] = Repo(name, rec["path"], rec["origin"], tuple(sorted(rec["root"])), since=at, words=rec["words"])
+            repos[name] = Repo(name, rec["path"], rec["origin"], tuple(sorted(rec["root"])), since=at, words=rec["words"],
+                               via=rec["via"] if isinstance(rec.get("via"), str) else None)
         elif cur.path != rec["path"]:
             raise _Soft(f"register {name}: already registered at {cur.path}, not {rec['path']}; use move")
         return

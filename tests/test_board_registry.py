@@ -1383,3 +1383,114 @@ def test_f11_untrack_evidence_that_cannot_be_read_is_a_refusal_not_a_traceback(s
         monkeypatch.setattr(be, "read_git_evidence", lambda *x, _e=exc, **k: (_ for _ in ()).throw(_e))
         rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
         assert rc == 2 and "refused" in err and "Traceback" not in err
+
+
+# ---- round 3 (N1-N4) ------------------------------------------------------------------------------------------------
+
+
+def test_n1_a_git_failure_while_identifying_a_repo_refuses_the_launch_unregistered_never_proceeds(store, home, tmp_path, mkrepo, monkeypatch):
+    a = mkrepo("alpha")
+    real = br._git
+
+    def failing_rev_list(path, *args):
+        if args and args[0] == "rev-list":
+            return 128, "fatal: could not read object database"
+        return real(path, *args)
+
+    monkeypatch.setattr(br, "_git", failing_rev_list)
+    with pytest.raises(br.BoardError) as e:
+        br.register_for_launch(a, {"LEVAIN_HOME": str(home)})
+    assert not isinstance(e.value, br.NoCommit)
+    cs = CoordStore(tmp_path / "board")
+    token = cs.coord_take()
+    with pytest.raises(CoordError):
+        cs.launch_request(token, harness="claude", role=ROLE_DESK, cwd=str(a))
+    assert (store / "repos.jsonl").read_bytes() == b""
+
+
+def test_n1_only_a_repo_with_no_commit_is_the_no_commit_signal(tmp_path):
+    d = tmp_path / "fresh"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True)
+    with pytest.raises(br.NoCommit):
+        br.identity(d)
+
+
+def _two_alphas(tmp_path, mkrepo, capsys):
+    """A store holding ``alpha`` at repo ``other``'s path, and a briefcase whose ``alpha`` is a different repository."""
+    mkrepo("alpha")
+    other = mkrepo("other")
+    store = tmp_path / "store"
+    sd = Path(os.path.realpath(store))
+    ok(capsys, "use", str(store), "--by", "d")
+    tgt = bs.Target(sd, sd / "items.jsonl", True)
+    br.register(tgt, "alpha", str(other), "w", "d", author={"kind": "operator", "name": "d"})
+    return sd, store
+
+
+def test_n2_an_import_whose_name_is_registered_at_another_repository_refuses_and_tombstones_nothing(home, tmp_path, mkrepo, capsys):
+    sd, store = _two_alphas(tmp_path, mkrepo, capsys)
+    focus = focus_file(tmp_path, {"alpha": ("paused", "wa")})
+    before = focus.read_bytes()
+    n = len(reg_lines(sd))
+    rc, _, err = run(capsys, "use", str(store), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    assert rc == 2 and "alpha" in err and str(tmp_path / "repos" / "alpha") in err and "other" in err
+    assert focus.read_bytes() == before and len(reg_lines(sd)) == n
+
+
+def test_n2_a_matching_partial_import_registration_is_skipped_not_refused(home, tmp_path, mkrepo, capsys):
+    mkrepo("alpha")
+    store = tmp_path / "store"
+    sd = Path(os.path.realpath(store))
+    ok(capsys, "use", str(store), "--by", "d")
+    tgt = bs.Target(sd, sd / "items.jsonl", True)
+    br.register(tgt, "alpha", str(tmp_path / "repos" / "alpha"), "w", "d", author={"kind": "operator", "name": "d"})
+    focus = focus_file(tmp_path, {"alpha": ("active", "wa")})
+    ok(capsys, "use", str(store), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    assert [r["op"] for r in reg_lines(sd)] == ["register"]
+
+
+def test_n3_an_acknowledged_torn_pause_or_resume_line_is_not_a_decision_of_the_registry():
+    torn = rec("resume", n=2, store="z" * 32)                    # another store's line: torn
+    lines = [rec("register", via="import-focus"), torn,
+             json.dumps({"v": 1, "store": SID, "op": "ack-torn", "line": 2, "sha256": hashlib.sha256(torn.encode()).hexdigest(),
+                         "why": "w", "at": "2026-11-17T10:00:05Z", "by": "d"})]
+    f = rf.fold_repos(lines, store_id=SID)
+    assert not f.torn and f.acked == (2,)
+    x = f.repos["x"]
+    assert x.via == "import-focus" and x.history == 0
+    f = rf.fold_repos(lines[:1] + [rec("pause", n=2)], store_id=SID)
+    assert f.repos["x"].history == 1
+    f = rf.fold_repos(lines[:1] + [rec("resume", n=2, repo="ghost")], store_id=SID)      # a soft problem: not accepted
+    assert f.repos["x"].history == 0
+
+
+def test_n3_a_repo_registered_by_hand_with_no_pause_record_is_not_paused_by_an_import_rerun(home, tmp_path, mkrepo, capsys):
+    mkrepo("alpha")
+    store = tmp_path / "store"
+    sd = Path(os.path.realpath(store))
+    ok(capsys, "use", str(store), "--by", "d")
+    tgt = bs.Target(sd, sd / "items.jsonl", True)
+    br.register(tgt, "alpha", str(tmp_path / "repos" / "alpha"), "by hand", "d", author={"kind": "operator", "name": "d"})
+    focus = focus_file(tmp_path, {"alpha": ("paused", "wa")})
+    ok(capsys, "use", str(store), "--import-focus", str(focus), "--briefcase", str(tmp_path / "repos"), "--by", "d")
+    assert br.read_registry(tgt).fold.repos["alpha"].attention == "active"
+
+
+def test_n4_launch_request_takes_a_one_shot_threads_iterable_whole(store, home, tmp_path, mkrepo, monkeypatch):
+    from levain.desk import lease
+    a = mkrepo("alpha")
+    seen = []
+    real = lease.request_launch
+
+    def spy(conn, now, token, **kw):
+        seen.append(tuple(kw["threads"]))
+        return real(conn, now, token, **kw)
+
+    monkeypatch.setattr(lease, "request_launch", spy)
+    cs = CoordStore(tmp_path / "board")
+    token = cs.coord_take()
+    try:
+        cs.launch_request(token, harness="claude", role="worker", threads=(t for t in ["t1"]), cwd=str(a))
+    except CoordError:
+        pass                                                         # an unknown thread: refused AFTER the lease read what was asked
+    assert seen == [("t1",)]
