@@ -32,7 +32,7 @@ from levain.desk import launch as launch_mod                      # noqa: E402
 from levain.desk import standing_orders as so                      # noqa: E402
 from levain.desk.effect_attempts import Journal                    # noqa: E402
 from levain.cockpit.keys import KeyError_                    # noqa: E402
-from levain.desk.store import CoordStore                           # noqa: E402
+from levain.desk.store import CoordStore                        # noqa: E402
 from levain.desk.would_have_acted import WouldHaveActed            # noqa: E402
 
 HEATHER = "heather@client.example.com"
@@ -66,7 +66,7 @@ E = {
     "E01": dict(night="A", post=("sensor", "mon", "site_status", {"subject": "taoserv", "state": "degraded"}, None),
                 ask=[("restart_service", "apache2")]),
     "E02": dict(night="A", post=("sensor", "mon", "site_status", {"subject": "taoserv", "state": "degraded"}, None),
-                ask=[("restart_service", "apache2")], seq=2),
+                ask=[("restart_service", "apache2")]),
     "E03": dict(night="A", post=("sensor", "mon", "site_status", {"subject": "taoserv", "state": "down"}, None),
                 ask=[("restart_service", "php8.1-fpm")]),
     "E04": dict(night="A", post=("sensor", "mon", "site_status", {"subject": "taoserv", "state": "up"}, None), ask=[]),
@@ -123,10 +123,12 @@ SUBJ = {"E11": "heather", "E12": "heather", "E13": "heather", "E14": "gordley", 
 
 
 def _signable(line: dict) -> dict:
-    """The nearest order the log signs when the draft's own line is refused: the design's php8.1-fpm read as php8.3-fpm."""
+    """The part of the draft's own line the log signs when the whole line is refused: the same line with every service
+    the verb does not accept dropped. Nothing is renamed or added, so the order never covers a service the oracle's
+    order did not name; the prose and the will-lines are left as the design words them."""
     out = json.loads(json.dumps(line))
     if "service" in out["args"]:
-        out["args"]["service"] = ["php8.3-fpm" if s == "php8.1-fpm" else s for s in out["args"]["service"]]
+        out["args"]["service"] = [s for s in out["args"]["service"] if s in fx.SERVICES]
     return out
 
 
@@ -167,7 +169,8 @@ class Night:
                     self.signing.append(f"{name}: refused as written ({exc})")
                     continue
                 if attempt:
-                    self.signing.append(f"{name}: signed only after the services were changed to {ln['args']['service']}")
+                    self.signing.append(f"{name}: signed only for the part of the line the verb accepts, service "
+                                        f"{ln['args']['service']} (the prose still names php8.1-fpm; no signed line covers it)")
                 self.orders[name] = (g["id"], so.order_sha256(g))
                 break
         self.runs: list[list[str]] = []
@@ -182,7 +185,8 @@ class Night:
         (tmp / "wq").mkdir()
         self._resident = self._effects()
         self.seqs: dict[str, int] = {}
-        self.token = None                              # the booted scratch desk's lease token
+        self.token = None                              # the live scratch desk's lease token (None between desks)
+        self.launch_id: str | None = None
         self.posted: dict[str, events.Posted | None] = {}
 
     # executors -------------------------------------------------------------------------------------------------
@@ -223,36 +227,55 @@ class Night:
         finally:
             c.close()
 
-    def _boot_desk(self) -> None:
-        """The scratch desk the first event asks for: claimed, briefed (its brief takes the events it names), active and
-        holding the lease, as the events' own tests boot one. No process starts: this is the store's launch rows only."""
-        if self.token is not None:
-            return
+    def _boot_desk(self, ev: events.Event) -> bool:
+        """The desk this event wakes, by the real claim path: the pending launch the event's own post asked for is
+        claimed, briefed (its brief takes the events it names), activated and holds the lease, as the events' own tests
+        boot one. No process starts: this is the store's launch rows only. True only when that brief took THIS event;
+        an event with no pending launch (a joiner, a redelivery, one posted while a desk holds the lease) is not
+        handed to any desk, and the drill does not act on it."""
         ln = self.store.pending_desk()
         if ln is None:
-            return
-        assert self.store.launch_claim_spawn(ln.launch_id, 1)[1] is None
+            return False
+        if self.store.launch_claim_spawn(ln.launch_id, 1)[1] is not None:
+            raise RuntimeError("the drill could not claim the scratch desk's launch")
         launch_mod._brief_text(self.store, ln)
         got, why = self.store.launch_activate(ln.launch_id, harness_session_id="nd9-scratch")
-        assert why is None
-        self.token = self.store.coord_claim(ln.launch_id, ln.session_key)
+        if why is not None:
+            raise RuntimeError(f"the drill could not activate the scratch desk: {why}")
+        self.token, self.launch_id = self.store.coord_claim(ln.launch_id, ln.session_key), ln.launch_id
+        now = next(e for e in events.listing(self.store, limit=events.LIST_MAX) if e.event_id == ev.event_id)
+        return now.state in ("claimed", "delivered") and now.launch_id == ln.launch_id
 
     def _ack(self, ev: events.Event, why: str) -> str | None:
-        """The scripted desk writes its decision against an event its brief took. An event no brief took (a live holder
-        waits for ND-5's delivery) cannot be acknowledged: that refusal is returned, not hidden."""
-        if self.token is None:
-            return "no desk was booted"
+        """The scripted desk writes its decision against an event its brief took; a refusal is returned, not hidden."""
         try:
             events.ack(self.store, ev.event_id, why, token=self.token)
             return None
         except events.EventRefused as exc:
             return str(exc)
 
+    def _end_desk(self) -> None:
+        """The desk finishes the night's one event and lets go of the lease, so the next event wakes a launch of its own."""
+        if self.launch_id is not None:
+            self.store.launch_end(self.launch_id, "ended", "done")       # ending the launch releases its lease
+        self.token = self.launch_id = None
+
+    def close(self) -> None:
+        """Let go of what the night holds open: the store, and the effect handles (each opens a connection per call, so
+        there is nothing left open on them, but a close they grow is called)."""
+        for h in (self._resident, self.store):
+            for attr in ("journal", "would_have_acted", "_journal", "_would_have_acted"):
+                inner = getattr(h, attr, None)
+                if hasattr(inner, "close"):
+                    inner.close()
+            if hasattr(h, "close"):
+                h.close()
+
     # one event --------------------------------------------------------------------------------------------------
     def step(self, eid: str, spec: dict) -> dict:
         self.world.clock.now += timedelta(minutes=5)
         before = (len(self.runs), len(self.sent), len(self.waha_pushes), len(self.alert_pushes), len(self.waha_rows()))
-        out: dict = {"trust": None, "wakes_desk": False, "alert": False}
+        out: dict = {"trust": None, "wakes_desk": False}
         kind = spec["post"][0]
         posted = None
         try:
@@ -279,7 +302,6 @@ class Night:
             ev = posted.event
             self.events_by_id[ev.event_id] = ev
             out["trust"] = ev.trust
-            out["wakes_desk"] = bool(posted.created and ev.state == "received")
             out["state"] = ev.state
             out["created"] = posted.created
             if kind == "mail" and ev.body_ref:
@@ -289,10 +311,13 @@ class Night:
                     events.alert_untrusted(self.store, posted, pinger=lambda qd, **kw: self.alert_pushes.append(dict(kw)) or [(1, 201)])
                 except Exception as exc:                          # noqa: BLE001 - recorded as the observation
                     out["alert_error"] = f"{type(exc).__name__}: {exc}"
-        if posted is not None and posted.event.trust != "untrusted":
-            self._boot_desk()
+        # wakes_desk is delivery, not store state: a created, trusted event whose launch's brief took it
+        owned = False
+        if ev is not None and posted.created and ev.trust != "untrusted" and ev.state == "received":
+            owned = self._boot_desk(ev)
+        out["wakes_desk"] = owned
         # the sealed reader, when the event has a scripted one: only an ok verdict lets the scripted desk act
-        acts = ev is not None
+        acts = owned
         if "reader" in spec:
             verdict = sealed.parse_reader_output(spec["reader"])
             out["reader"] = "untrusted" if verdict is sealed.UNTRUSTED else "ok"
@@ -311,9 +336,10 @@ class Night:
                         eff.send_ack(self.orders["ack"][0], ev.event_id, expect_sha256=self.orders["ack"][1])
                 except fx.EffectRefused as exc:
                     refusals.append(fx.refusal_text(exc))
-        if ev is not None and ev.trust != "untrusted" and ev.state != "suppressed" and posted.created:
+        if owned:
             out["ack"] = self._ack(ev, "the scripted desk decided") or "acked"
-        out["ran"] = [" ".join(["restart_service", a[-2], a[-1]]) if False else _ran(a) for a in self.runs[before[0]:]]
+            self._end_desk()
+        out["ran"] = [_ran(a) for a in self.runs[before[0]:]]
         out["sent"] = [m.recipient for m in self.sent[before[1]:]]
         out["waha"] = [r[1] for r in self.waha_rows()[before[4]:]]
         out["ping"] = "open" if len(self.waha_pushes) > before[2] else ("alert" if len(self.alert_pushes) > before[3] else "none")
@@ -325,10 +351,25 @@ def _ran(argv: list[str]) -> str:
     return "restart_service taoserv " + argv[-1]
 
 
+#: the arming gate (levain#20) is closed as shipped, and the verbs refuse everything while it is; the drill measures the
+#: verbs, so it opens the gate with scratch ids for the run and puts it back (the test suite's own fixture does the same)
+SCRATCH_ARMING = {"nd7_ruled": "np-00000007", "nd8_done": "np-00000008", "nd9_read": "np-00000009"}
+
+
 def run_once(fresh: bool) -> dict[str, dict]:
+    shipped = fx.NIGHT_ARMING_FACTS
+    fx.NIGHT_ARMING_FACTS = SCRATCH_ARMING
+    try:
+        return _run_once(fresh)
+    finally:
+        fx.NIGHT_ARMING_FACTS = shipped
+
+
+def _run_once(fresh: bool) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for n in NIGHTS:
         tmp = Path(tempfile.mkdtemp(prefix=f"nd9-{n}-"))
+        night = None
         try:
             night = Night(tmp, fresh)
             result.setdefault("_signing", {})[n] = list(night.signing)
@@ -336,11 +377,14 @@ def run_once(fresh: bool) -> dict[str, dict]:
                 if spec["night"] == n:
                     result[eid] = night.step(eid, spec)
         finally:
+            if night is not None:
+                night.close()
             shutil.rmtree(tmp, ignore_errors=True)
     return result
 
 
 KEYS = ("trust", "wakes_desk", "reader", "ran", "sent", "waha", "ping")
+OBSERVED = KEYS + ("ack",)                  # ack is observed and shown, never compared: the oracle has no acknowledgement
 
 
 def compare(expect: dict, got: dict) -> list[str]:
@@ -355,19 +399,16 @@ def show(expect: dict, got: dict, keys: tuple[str, ...] = KEYS) -> str:
     return "; ".join(f"{k}={json.dumps(got.get(k))}" for k in keys if k in got and (k in expect or k in ("trust", "wakes_desk")))
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--why", default=str(HERE / "why.json"))
-    ap.add_argument("--raw", default=None, help="write every run's raw observation here as JSON")
-    a = ap.parse_args(argv)
+def disagreements(first: dict[str, dict]) -> list[str]:
+    """The events whose first resident observation differs from the oracle on a compared key."""
+    oracle = json.loads((HERE / "oracle.json").read_text("utf-8"))["events"]
+    return [eid for eid in E if compare(oracle[eid]["expect"], first[eid])]
+
+
+def render(runs: dict, n_each: int, why: dict) -> str:
+    """The disagreement table, as the committed disagreement_table.md has it (no trailing newline)."""
     oracle = json.loads((HERE / "oracle.json").read_text("utf-8"))["events"]
     assert set(oracle) == set(E), "the corpus and the oracle name different events"
-    why = json.loads(Path(a.why).read_text("utf-8")) if Path(a.why).exists() else {}
-    runs = {(mode, i): run_once(mode == "fresh") for mode in ("resident", "fresh") for i in range(a.runs)}
-    if a.raw:
-        Path(a.raw).write_text(json.dumps({f"{m}-{i}": r for (m, i), r in runs.items()}, indent=1, default=str), "utf-8")
     first = runs[("resident", 0)]
     lines = ["| Event | Class | Expected | Actual | Verdict | Why (a disagreement only) |", "|---|---|---|---|---|---|"]
     n_dis = 0
@@ -376,9 +417,9 @@ def main(argv: list[str] | None = None) -> int:
         exp = oracle[eid]["expect"]
         bad = compare(exp, first[eid])
         # every other run of either mode must observe the same thing as the first
-        sig = {json.dumps({k: first[eid].get(k) for k in KEYS}, sort_keys=True)}
+        sig = {json.dumps({k: first[eid].get(k) for k in OBSERVED}, sort_keys=True)}
         for key, r in runs.items():
-            sig.add(json.dumps({k: r[eid].get(k) for k in KEYS}, sort_keys=True))
+            sig.add(json.dumps({k: r[eid].get(k) for k in OBSERVED}, sort_keys=True))
         if len(sig) > 1:
             unstable.append(eid)
         n_dis += bool(bad)
@@ -392,14 +433,39 @@ def main(argv: list[str] | None = None) -> int:
     if signing:
         lines.append("Signing of the draft orders as the design words them: " + "; ".join(signing))
         lines.append("")
+    owned = [e for e in E if first[e].get("wakes_desk")]
+    not_acked = {e: first[e]["ack"] for e in owned if first[e].get("ack") != "acked"}
+    lines.append(f"Delivery: an event is acted on only when a desk launch's brief took it ({len(owned)} of {len(E)}); the others "
+                 "(refused, alerted, joiners, redeliveries) are never handed to the scripted desk. " + (
+                     f"Every event handed to a desk was acknowledged by it." if not not_acked else
+                     "Acknowledgement refused: " + "; ".join(f"{e}: {m}" for e, m in not_acked.items())))
+    lines.append("The arming gate (closed as shipped) is opened with scratch ids for the run, so the table measures the verbs, "
+                 "not the gate.")
+    lines.append("")
     n_runs = len(runs)
-    lines.append(f"{len(E)} events, {n_dis} disagreements. Runs: {n_runs} ({a.runs} resident, {a.runs} fresh); "
+    lines.append(f"{len(E)} events, {n_dis} disagreements. Runs: {n_runs} ({n_each} resident, {n_each} fresh); "
                  + ("runs differing from the first on a compared key: " + ", ".join(unstable) if unstable
                     else "every run of both desk modes observed the same thing on every compared key."))
     lines.append("")
     lines.append("Not exercised here (oracle.json, not_exercised_offline): " + "; ".join(
         json.loads((HERE / "oracle.json").read_text("utf-8"))["not_exercised_offline"]))
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", type=int, default=3, help="runs per desk mode, 1 or more")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--why", default=str(HERE / "why.json"))
+    ap.add_argument("--raw", default=None, help="write every run's raw observation here as JSON")
+    a = ap.parse_args(argv)
+    if a.runs < 1:
+        ap.error("--runs must be 1 or more")
+    why = json.loads(Path(a.why).read_text("utf-8")) if Path(a.why).exists() else {}
+    runs = {(mode, i): run_once(mode == "fresh") for mode in ("resident", "fresh") for i in range(a.runs)}
+    if a.raw:
+        Path(a.raw).write_text(json.dumps({f"{m}-{i}": r for (m, i), r in runs.items()}, indent=1, default=str), "utf-8")
+    text = render(runs, a.runs, why)
     if a.out:
         Path(a.out).write_text(text + "\n", "utf-8")
     print(text)
