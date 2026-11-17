@@ -22,6 +22,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -425,19 +426,24 @@ def run_init(args: Any) -> int:
         return 0
     assert root is not None
     target = root / "CHARTER.md"
-    tmp = root / f".CHARTER.md.{os.getpid()}.tmp"
+    tmp: str | None = None
     try:
         try:
-            with tmp.open("w", encoding="utf-8") as fh:
+            # A random name made with O_CREAT|O_EXCL: it never follows a planted symlink, never reopens a stale file (a hard
+            # link left by a killed run would otherwise be truncated through "w"), and two inits cannot share it.
+            fd, tmp = tempfile.mkstemp(dir=root, prefix=".CHARTER.md.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.fchmod(fh.fileno(), 0o644)     # mkstemp makes 0600; the charter is an ordinary tracked file
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.link(tmp, target)        # fails if the target exists, even against a race: never an overwrite, never partial
         finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
     except FileExistsError:
         return refuse(f"{target} already exists; it is never overwritten.")
     except OSError as exc:

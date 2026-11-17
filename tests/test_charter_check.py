@@ -416,3 +416,26 @@ def test_init_stdout_prints_and_writes_nothing_and_a_torn_store_writes_nothing(t
     bad.write_text("not json\n", encoding="utf-8")
     assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(bad)]) == 1
     assert not (repo / "CHARTER.md").exists()
+
+
+def test_init_never_touches_a_stale_old_style_temp_and_leaves_no_temp_behind(tmp_path, capsys):
+    import os
+    real = tmp_path / "real"
+    real.mkdir()
+    repo = _git_repo(real / "levain")
+    (repo / "CHARTER.md").write_text("KEEP ME\n", encoding="utf-8")
+    stale = repo / f".CHARTER.md.{os.getpid()}.tmp"
+    os.link(repo / "CHARTER.md", stale)         # what a run killed between link and unlink leaves behind
+    assert main(["charter", "init", "levain", "--repo", str(repo)]) == 1       # the target exists: refused
+    assert "already exists" in capsys.readouterr().err
+    assert (repo / "CHARTER.md").read_text(encoding="utf-8") == "KEEP ME\n" and stale.read_text(encoding="utf-8") == "KEEP ME\n"
+    assert sorted(p.name for p in repo.iterdir()) == sorted([".git", "CHARTER.md", stale.name])
+    (tmp_path / "other").mkdir()
+    other = _git_repo(tmp_path / "other" / "levain")
+    os.link(repo / "CHARTER.md", other / stale.name)     # a stale name in a fresh repo, still linked to the real charter
+    assert main(["charter", "init", "levain", "--repo", str(other)]) == 0
+    assert (repo / "CHARTER.md").read_text(encoding="utf-8") == "KEEP ME\n"
+    assert (other / stale.name).read_text(encoding="utf-8") == "KEEP ME\n"
+    assert sorted(p.name for p in other.iterdir()) == sorted([".git", "CHARTER.md", stale.name])
+    assert (other / "CHARTER.md").read_text(encoding="utf-8").startswith("# Charter: levain")
+    assert oct((other / "CHARTER.md").stat().st_mode & 0o777) == "0o644"
