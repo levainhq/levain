@@ -18,6 +18,7 @@ checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -195,20 +196,28 @@ def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True, 
 
 
 def _store_id(store_dir: Path) -> str | None:
-    """The store's id (``<store dir>/store.id``), or None when the file is missing or empty. Any other failure to read it
-    raises :class:`OSError` or :class:`UnicodeDecodeError`: a store whose id cannot be read is not one to judge blocks against."""
+    """The store's id (``<store dir>/store.id``), or None when the file is missing. A file that exists but is empty or blank
+    raises :class:`ValueError`, and any other failure to read it :class:`OSError` or :class:`UnicodeDecodeError`: a store whose
+    id cannot be read is not one to judge blocks against."""
     try:
-        return (store_dir / "store.id").read_text("utf-8").strip() or None
+        text = (store_dir / "store.id").read_text("utf-8").strip()
     except FileNotFoundError:
         return None
+    if not text:
+        raise ValueError("store.id is empty: the store is damaged")
+    return text
 
 
-def _extra_stamp(extra: Any, path: Path) -> str | None:
-    """When a flat extra was captured: its own ``fetched_at``, else its file's modification time (UTC), never the moment it
-    was read: an old file must not read fresh because it was read just now."""
+def _read_extra(path: Path) -> tuple[Any, str]:
+    """``(the parsed extra, when it was captured)``: its own ``fetched_at``, else the modification time (UTC) of the SAME open
+    descriptor the rows were read from (never a second stat by pathname, which can name another file), never the moment it was
+    read: an old file must not read fresh because it was read just now."""
+    with open(path, "rb") as fh:
+        extra = json.loads(fh.read().decode("utf-8"))
+        mtime = os.fstat(fh.fileno()).st_mtime
     if isinstance(extra, dict) and isinstance(extra.get("fetched_at"), str):
-        return extra["fetched_at"]
-    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return extra, extra["fetched_at"]
+    return extra, datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _attach_producers(evidence: dict[str, Any], native: dict[str, dict[str, Any]], external: dict[str, list[dict[str, Any]]],
@@ -217,6 +226,7 @@ def _attach_producers(evidence: dict[str, Any], native: dict[str, dict[str, Any]
     expected per source: Levain's own for seats and band (and for waiters only when it declared them absent), an external
     producer for the sources its file holds, flow for the sources its extra carries, and every producer whose file could not
     be read for every source (it failed, so it cannot say it has nothing)."""
+    native, external = copy.deepcopy(native), copy.deepcopy(external)       # this call's own blocks: nothing is shared across repos
     supplied: dict[str, list[str]] = evidence.get("producers") or {}
     expected: dict[str, list[str]] = {}
     for source in PRODUCER_SOURCES:
@@ -331,7 +341,11 @@ def run_state(args: argparse.Namespace) -> int:
     store_dir = target.store_dir
     try:
         store_id = _store_id(store_dir)
-    except (OSError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
+        if isinstance(exc, UnicodeDecodeError):
+            return _fail(f"store.id could not be read: {type(exc).__name__}: {exc}")
+        return _fail(str(exc))
+    except OSError as exc:
         return _fail(f"store.id could not be read: {type(exc).__name__}: {exc}")
     producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
     if bp.NATIVE_PRODUCER in producers:
@@ -345,8 +359,7 @@ def run_state(args: argparse.Namespace) -> int:
     if args.evidence_extra is not None:
         extra_path = Path(args.evidence_extra).expanduser()
         try:
-            extra = json.loads(extra_path.read_text("utf-8"))
-            flat_at = _extra_stamp(extra, extra_path)
+            extra, flat_at = _read_extra(extra_path)
         except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
             return _fail(f"--evidence-extra {args.evidence_extra} cannot be read ({type(exc).__name__}: {exc})")
         bad = _merge_extra(evidence, extra, captured_at=flat_at)

@@ -28,7 +28,7 @@ def _evidence(**kw) -> dict:
 def test_landed_work_behind_an_orphan_branch_and_an_expired_gate_is_named_in_the_gate_expired_reason():
     ev = _evidence(main=[{"sha": "a" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#1"], "closes": []}],
                    branches=[{"name": "seat/x-i1-y", "tip": "b" * 40, "date": "2026-11-12T13:00:00Z", "ahead": 2, "items": ["levain#1"]}])
-    board = bs.derive_all(bs.fold([_item(1, [GATE])]), bs.Evidence.from_dict(ev), now=NOW)
+    board = bs.derive_all(bs.fold([_item(1, [GATE])]), bs.Evidence.from_dict(ev, now=None), now=NOW)
     (s,) = board.items
     assert s.state == "unknown" and "past its recheck" in s.reason     # the orphan skipped rule 6, rule 7 reads the gate
     (entry,) = board.audit
@@ -38,6 +38,6 @@ def test_landed_work_behind_an_orphan_branch_and_an_expired_gate_is_named_in_the
 
 def test_an_expired_gate_alone_keeps_its_plain_reason():
     ev = _evidence(branches=[{"name": "seat/x-i1-y", "tip": "b" * 40, "date": "2026-11-12T13:00:00Z", "ahead": 2, "items": ["levain#1"]}])
-    board = bs.derive_all(bs.fold([_item(1, [GATE])]), bs.Evidence.from_dict(ev), now=NOW)
+    board = bs.derive_all(bs.fold([_item(1, [GATE])]), bs.Evidence.from_dict(ev, now=None), now=NOW)
     (entry,) = board.audit
     assert entry.kind == "gate_expired" and entry.why == 'gate "Phill\'s look" past its recheck 2026-11-10'

@@ -647,7 +647,7 @@ class Evidence:
     band_grade: Mapping[str, str] = field(default_factory=dict)       # resolved band row -> how it was answered
 
     @classmethod
-    def from_dict(cls, obj: Any, *, now: datetime | None = None, store_id: str | None = None) -> "Evidence":
+    def from_dict(cls, obj: Any, *, now: datetime | None, store_id: str | None = None) -> "Evidence":
         """``now`` judges each producer block's ``captured_at`` (a block of the v2 form read with no ``now`` is unreadable;
         flow's flat form is then judged by the evidence's own age only). ``store_id`` is the store's id: a block naming
         another one is unreadable, and with None (the store has no id) a block naming any id is readable. The object may
@@ -668,7 +668,7 @@ class Evidence:
                 named = isinstance(k, str) and bool(k)
                 malformed = malformed or not named or not isinstance(v, str)
                 if named:                               # a source that was NAMED stays unreadable even if its reason is junk or empty
-                    unreadable[k] = ("unreadable (no reason given)" if v == "" else v) if isinstance(v, str) else "unreadable"
+                    unreadable[k] = (v.strip() or "unreadable (no reason given)") if isinstance(v, str) else "unreadable"
             if malformed:
                 unreadable["evidence"] = "malformed unreadable (expected an object of source -> reason)"
 
@@ -947,7 +947,7 @@ class _Ctx:
             return
         ev = self.repo_ev.get(item.repo)
         if ev is None:
-            ev = Evidence.from_dict({"unreadable": {"evidence": f"repo {item.repo} not read (no evidence supplied for it)"}})
+            ev = Evidence.from_dict({"unreadable": {"evidence": f"repo {item.repo} not read (no evidence supplied for it)"}}, now=self.now)
         self.ev, self.idx = ev, ev.index
 
     def cycle(self, iid: str) -> tuple[str, ...] | None:
@@ -1131,6 +1131,8 @@ def _rule_done(ctx: _Ctx, item: Item) -> State | None:
         if not c:
             return None
         orphans = [] if "seats" in ev.unreadable else ctx.idx.orphans(item.id)     # an orphan is a branch no seat holds
+        if "seats" in ev.unreadable and any(b.ahead > 0 for b in ctx.idx.branches.get(item.id, ())):
+            ctx.note(item, "seats")             # the orphan note was not checked: say so
         note = f"; orphan branch {(b := max(orphans, key=_branch_key)).name} {_short(b.tip)} carries {b.ahead} commits main lacks" if orphans else ""
         return ctx.make(item, "done", f"closed by {_short(c.sha)} ({c.date or 'no date'}){note}", (c.sha,))
     path = (item.done or "").strip()

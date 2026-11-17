@@ -25,7 +25,7 @@ def _evidence(**over):
           "refs": [], "merged": [], "branches": [], "seats": [], "band": {"open": {}, "resolved": {}},
           "waiters": [], "documents": {}, "unattributed": []}
     ev.update(over)
-    return bs.Evidence.from_dict(ev)
+    return bs.Evidence.from_dict(ev, now=None)
 
 
 def _state(lines, ev):

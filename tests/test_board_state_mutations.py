@@ -101,11 +101,11 @@ def test_each_unreadable_source_is_noticed_by_the_unreadable_check(source):
     if source in bs.PRODUCER_SOURCES:
         # the seat is a positive claim, and one stands even when the source is declared unreadable (that takes the ABSENCE only);
         # without it the item rests on the absence, which an unreadable source cannot conclude
-        kept = bs.derive_all(bs.fold(case["items_lines"]), bs.Evidence.from_dict(ev), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
+        kept = bs.derive_all(bs.fold(case["items_lines"]), bs.Evidence.from_dict(ev, now=None), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
         assert {s.id: s for s in kept.items}[LIVE_SEAT_ID].state == ("in_flight" if source == "seats" else "unknown")
         ev["seats"] = []
     folded = bs.fold(case["items_lines"])
-    board = bs.derive_all(folded, bs.Evidence.from_dict(ev), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
+    board = bs.derive_all(folded, bs.Evidence.from_dict(ev, now=None), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
     item = {s.id: s for s in board.items}[LIVE_SEAT_ID]                            # by id: a second item never moves the assertion
     want = f"{source}: gone" if source in bs.PRODUCER_SOURCES else "main unreadable"
     assert item.state == "unknown" and want in item.reason

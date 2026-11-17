@@ -22,7 +22,7 @@ def load_cases() -> list[dict[str, Any]]:
 
 def run_case(bs: ModuleType, case: dict[str, Any]):
     folded = bs.fold(case["items_lines"])
-    board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"]), now=bs.parse_timestamp(case["now"]))
+    board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"], now=None), now=bs.parse_timestamp(case["now"]))
     return folded, board
 
 

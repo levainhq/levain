@@ -22,7 +22,7 @@ def _evidence(**kw) -> bs.Evidence:
             "merged": [], "branches": [], "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {},
             "unattributed": []}
     base.update(kw)
-    return bs.Evidence.from_dict(base)
+    return bs.Evidence.from_dict(base, now=None)
 
 
 DEP_LANDED_ON_B = {"sha": "b" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#1"], "closes": ["levain#1"]}

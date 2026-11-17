@@ -263,7 +263,7 @@ def test_flat_evidence_v1_is_one_block_from_flow_captured_at_fetched_at():
 
 def test_a_v2_block_with_no_clock_is_unreadable_not_assumed_fresh():
     folded = bs.fold([_item(1)])
-    ev = bs.Evidence.from_dict(ev2(**merged(whole("levain"), whole("flow"))))
+    ev = bs.Evidence.from_dict(ev2(**merged(whole("levain"), whole("flow"))), now=None)
     assert "no clock" in ev.unreadable["seats"]
     assert bs.derive_all(folded, ev, now=NOW).items[0].state == "unknown"
 
@@ -607,3 +607,50 @@ def test_native_grades_come_from_the_answer_sidecar_when_the_answer_cannot_say(m
     monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: states[qid])
     got = {r["id"]: r["grade"] for r in bp.native_blocks(now=now, store_id=None, consent_dir=tmp_path)["band"]["rows"]}
     assert got == {qs[0].id: "signed-phone", qs[1].id: "unsigned-terminal", qs[2].id: "unknown"}
+
+
+# ------------------------------------------------------------------------------------------------ the fix round 2 (levain#91)
+def test_native_band_reads_the_authority_rows_even_when_a_source_failed(monkeypatch, tmp_path):
+    """K1 (F8): a failed read still makes the block incomplete, but the authority rows that could be read go in as open rows."""
+    from levain import band_sources, band_view
+
+    _store, _qs, now = _numbered_store(tmp_path, "an ordinary question")
+
+    class R:
+        failed, pending = True, False
+    monkeypatch.setattr(band_view, "render_full", lambda *a, **k: R())
+    monkeypatch.setattr(band_sources, "read_extras", lambda *a, **k: band_sources.Extras(items=[_extra("rq-1", "ALLOW the land of levain#9")]))
+    got = bp.native_blocks(now=now, store_id="s1", consent_dir=tmp_path)["band"]
+    assert got["complete"] is False and "authority source" in got["why"]
+    assert "consent:rq-1" in {r["id"] for r in got["rows"]}
+
+
+def test_a_launch_that_is_done_is_skipped_before_the_board_items_check(monkeypatch, tmp_path):
+    """K6: a finished launch holds nothing, so one with no board_items does not make the block incomplete."""
+    _seats_world(monkeypatch, tmp_path, [_Launch(1, "a", _NO), _Launch(2, "b", ["levain#2"])],
+                 [([{"sessionId": "a", "state": "done"}, {"sessionId": "b"}], 0)])
+    got = bp.native_blocks(now=NOW, store_id=None, consent_dir=tmp_path)["seats"]
+    assert got["complete"] is True, got
+    assert [r["name"] for r in got["rows"]] == ["ln-2"]
+
+
+def test_an_orphan_note_on_a_done_item_says_so_when_the_seats_were_not_all_read():
+    """K7: F17's problems line, for the orphan-branch note of a closed item."""
+    main = [{"sha": "a" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#1"], "closes": ["levain#1"]}]
+    branches = [{"name": "seat/own", "tip": "d" * 40, "date": "2026-11-12T12:00:00Z", "ahead": 2, "items": ["levain#1"]}]
+    got, b = board_of(_stale_flow_seats(main=main, branches=branches), _item(1))
+    assert got["levain#1"].state == "done" and "orphan branch" not in got["levain#1"].reason
+    assert any(p.startswith("levain#1: not checked: seats") for p in b.problems)
+
+
+def test_a_declared_reason_is_stripped_and_a_blank_one_is_replaced():
+    """K8."""
+    base = {"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z"}
+    ev = bs.Evidence.from_dict({**base, "unreadable": {"seats": "  roster down \n", "band": " \t "}}, now=None)
+    assert ev.unreadable["seats"] == "roster down" and ev.unreadable["band"] == "unreadable (no reason given)"
+
+
+def test_evidence_from_dict_requires_now():
+    """K4: no default, so a caller cannot forget the instant blocks are judged at."""
+    with pytest.raises(TypeError):
+        bs.Evidence.from_dict({"evidence_v": 1})

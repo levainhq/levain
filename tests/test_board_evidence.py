@@ -33,7 +33,7 @@ def read(w: World, **kw):
 
 def parsed(ev: dict) -> Evidence:
     """The evidence through B1's own reader: the proof that every required field is there."""
-    return Evidence.from_dict({**ev, "evidence_v": 1, "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}})
+    return Evidence.from_dict({**ev, "evidence_v": 1, "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}}, now=None)
 
 
 def branch(ev: dict, name: str) -> dict:
@@ -52,7 +52,7 @@ def test_an_empty_world_emits_every_source_as_an_empty_list_and_B1_reads_all_of_
 
 def test_only_flows_sources_and_the_stat_d_documents_are_left_to_the_cli_and_the_extra(world):
     ev, _ = read(world)
-    p = Evidence.from_dict(ev)
+    p = Evidence.from_dict(ev, now=None)
     assert set(p.unreadable) == {"seats", "band", "waiters", "documents"}      # the readers supply the rest
 
 
@@ -435,7 +435,7 @@ def test_a_path_that_is_not_a_repository_names_every_source_unreadable_and_emits
     assert set(ev["unreadable"]) == {"main", "chain", "branches", "refs", "unattributed"}
     for source in ("main", "chain", "branches", "refs", "unattributed", "merged", "fetched_at"):
         assert source not in ev
-    p = Evidence.from_dict(ev)
+    p = Evidence.from_dict(ev, now=None)
     assert p.unreadable_reason("main") and "cannot be read" in p.unreadable_reason("main")
 
 

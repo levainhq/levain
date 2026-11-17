@@ -579,3 +579,46 @@ def test_an_empty_unreadable_reason_in_the_extra_is_replaced_not_refused(world, 
     rc, doc, err = board(capsys, world, write_items(tmp_path, item(3)), extra)
     assert rc == 3 and doc["items"][0]["state"] == "unknown"
     assert any("seats unreadable: unreadable (no reason given)" in p for p in doc["problems"])
+
+
+# ------------------------------------------------------------------------------------------------ the fix round 2 (levain#91)
+@pytest.mark.parametrize("body", ["", "  \n"])
+def test_a_store_id_that_exists_but_is_empty_refuses_the_run(world, tmp_path, capsys, body):
+    """K2 (F10): only a missing file means no id; a blank one is a damaged store."""
+    (tmp_path / "store.id").write_text(body)
+    rc, out, err = run(capsys, *_items_argv(world, tmp_path, "--no-land-waiter"))
+    assert rc == 2 and out == "" and "store.id is empty: the store is damaged" in err and "Traceback" not in err
+
+
+def test_a_flat_extra_without_fetched_at_takes_its_time_from_the_descriptor_it_was_read_from(tmp_path, monkeypatch):
+    """K3: one fstat on the open file, never a second stat by pathname."""
+    from levain.desk import board_cli
+
+    p = tmp_path / "extra.json"
+    p.write_text(json.dumps({"seats": []}))
+    os.utime(p, (1_700_000_000, 1_700_000_000))
+    import types
+    seen = []
+    proxy = types.SimpleNamespace(fstat=lambda fd: seen.append(fd) or os.fstat(fd), environ=os.environ)     # no stat by pathname exists on it
+    monkeypatch.setattr(board_cli, "os", proxy)
+    extra, stamp = board_cli._read_extra(p)
+    assert extra == {"seats": []} and stamp == "2023-11-14T22:13:20Z" and len(seen) == 1
+    p.write_text(json.dumps({"seats": [], "fetched_at": "2026-11-12T10:00:00Z"}))
+    assert board_cli._read_extra(p)[1] == "2026-11-12T10:00:00Z"
+
+
+def test_attach_producers_gives_each_call_its_own_blocks():
+    """K5: the primary and every --also-repo get copies; no block is shared or duplicated across calls."""
+    from levain.desk import board_cli
+
+    native = {"seats": {"producer": "levain", "rows": []}}
+    external = {"seats": [{"producer": "acme", "rows": []}]}
+    first, second = {"seats": []}, {"seats": []}
+    board_cli._attach_producers(first, native, external, {})
+    board_cli._attach_producers(second, native, external, {})
+    for ev in (first, second):
+        assert [b["producer"] for b in ev["seats"]] == ["levain", "acme"]
+    assert first["seats"][0] is not second["seats"][0] and first["seats"][0] is not native["seats"]
+    first["seats"][0]["rows"].append("x")
+    assert native["seats"]["rows"] == [] and second["seats"][0]["rows"] == []
+    assert external["seats"][0]["rows"] == [] and len(native) == 1 and len(external["seats"]) == 1

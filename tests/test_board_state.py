@@ -36,7 +36,7 @@ def test_every_case_reproduces_through_derive_state():
     """derive_state is the same function as one row of derive_all."""
     for case in CASES:
         folded = bs.fold(case["items_lines"])
-        ev = bs.Evidence.from_dict(case["evidence"])
+        ev = bs.Evidence.from_dict(case["evidence"], now=None)
         now = bs.parse_timestamp(case["now"])
         board = {s.id: s for s in bs.derive_all(folded, ev, now=now).items}
         if folded.torn:
@@ -92,27 +92,27 @@ def test_a_torn_file_reads_every_item_unknown_decided_ones_included():
     f = bs.fold([_line(), _line("decide", decision="cut", words="no", date="2026-11-12"), "{"])
     ev = bs.Evidence.from_dict({"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [],
                                 "chain": [], "refs": [], "merged": [], "branches": [], "seats": [],
-                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     assert [s.state for s in bs.derive_all(f, ev, now=NOW).items] == ["unknown"]
 
 
 # ------------------------------------------------------------------------------------------------ evidence
 def test_evidence_never_raises_and_names_what_it_could_not_read():
     for junk in (None, 5, "x", [], {}, {"evidence_v": 1, "main": 3, "seats": {"a": 1}, "band": [], "documents": {"p": "yes"}}):
-        ev = bs.Evidence.from_dict(junk)
+        ev = bs.Evidence.from_dict(junk, now=None)
         assert ev.unreadable, junk
-    ev = bs.Evidence.from_dict({"evidence_v": 1, "main": [{"sha": ""}], "band": {"open": {}}, "branches": [{"name": "b"}]})
+    ev = bs.Evidence.from_dict({"evidence_v": 1, "main": [{"sha": ""}], "band": {"open": {}}, "branches": [{"name": "b"}]}, now=None)
     assert {"main", "band", "branches"} <= set(ev.unreadable)
 
 
 def test_unreadable_given_as_a_list_of_names_fails_closed_and_still_names_the_sources():
-    ev = bs.Evidence.from_dict({"evidence_v": 1, "unreadable": ["seats"]})
+    ev = bs.Evidence.from_dict({"evidence_v": 1, "unreadable": ["seats"]}, now=None)
     assert ev.unreadable["seats"] == "unreadable (no reason given)" and "malformed unreadable" in ev.unreadable["evidence"]
 
 
 @pytest.mark.parametrize("bad", ["git exploded", 7, True, {"git": 5}, {"git": None}, [1, 2], {1: "x"}])
 def test_a_malformed_unreadable_value_fails_closed(bad):
-    ev = bs.Evidence.from_dict({"evidence_v": 1, "unreadable": bad})
+    ev = bs.Evidence.from_dict({"evidence_v": 1, "unreadable": bad}, now=None)
     assert "malformed unreadable" in ev.unreadable["evidence"]
 
 
@@ -124,7 +124,7 @@ def test_the_latest_closing_commit_is_named_whatever_the_list_order():
             "branches": [], "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}
     for order in ([mc(1, "2026-11-10T00:00:00Z"), mc(2, "2026-11-11T00:00:00Z")],
                   [mc(2, "2026-11-11T00:00:00Z"), mc(1, "2026-11-10T00:00:00Z")]):
-        s = bs.derive_all(f, bs.Evidence.from_dict({**base, "main": order}), now=NOW).items[0]
+        s = bs.derive_all(f, bs.Evidence.from_dict({**base, "main": order}, now=None), now=NOW).items[0]
         assert s.state == "done" and sha[2][:9] in s.reason and sha[1][:9] not in s.reason
 
 
@@ -133,7 +133,7 @@ def test_naive_evidence_times_are_read_as_utc():
     base = {"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00", "unreadable": {}, "main": [], "chain": [], "refs": [],
             "merged": [], "branches": [], "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [],
             "documents": {}, "unattributed": []}
-    got = bs.derive_all(f, bs.Evidence.from_dict(base), now=NOW).items[0]
+    got = bs.derive_all(f, bs.Evidence.from_dict(base, now=None), now=NOW).items[0]
     assert got.state != "unknown"
 
 
@@ -141,7 +141,7 @@ def test_a_naive_now_is_refused_with_a_reason_not_guessed_at():
     f = bs.fold([_line()])
     ev = bs.Evidence.from_dict({"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [],
                                 "chain": [], "refs": [], "merged": [], "branches": [], "seats": [],
-                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     naive = datetime(2026, 11, 12, 20, 0)
     with pytest.raises(TypeError, match="timezone-aware"):
         bs.derive_all(f, ev, now=naive)
@@ -162,7 +162,7 @@ def test_the_board_serialises_with_the_schema_word():
     folded, board = None, None
     case = next(c for c in CASES if c["expect"])               # a board with at least one item, whatever file sorts first
     folded = bs.fold(case["items_lines"])
-    board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"]), now=NOW)
+    board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"], now=None), now=NOW)
     d = json.loads(json.dumps(board.to_dict()))
     assert d["schema"] == "ready-v3" and set(d) == {"schema", "as_of", "items", "audit", "unattributed", "problems"}
     assert set(d["items"][0]) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"}
@@ -179,7 +179,7 @@ def _chain_world(n: int, low_waits_on_high: bool):
     ev = bs.Evidence.from_dict({"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [],
                                 "chain": [], "refs": [], "merged": [], "branches": [],
                                 "seats": [{"name": "s", "items": [f"levain#{root}"], "since": None, "branch": None}],
-                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     return lines, ev, root
 
 
@@ -206,7 +206,7 @@ def test_a_dependency_chain_deeper_than_the_interpreter_can_recurse_still_answer
                    depends_on=[] if i == n else [{"kind": "item", "ref": "levain#%d" % (i + 1)}]) for i in range(1, n + 1)]
     ev = bs.Evidence.from_dict({"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [],
                                 "chain": [], "refs": [], "merged": [], "branches": [], "seats": [],
-                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     board = bs.derive_all(bs.fold(lines), ev, now=NOW)
     states = {s.id: s.state for s in board.items}
     assert states["levain#%d" % n] == "ready" and states["levain#1"] == "blocked"
@@ -311,7 +311,7 @@ def test_property_derive_all_never_raises_and_stays_inside_the_closed_set():
     rng = random.Random(1112)
     for _ in range(200):
         lines, raw = _random_world(rng)
-        board = bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(raw), now=NOW)
+        board = bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(raw, now=None), now=NOW)
         json.dumps(board.to_dict())
         for s in board.items:
             assert s.state in bs.STATES and s.column == bs.STATE_COLUMN[s.state]
@@ -343,7 +343,7 @@ def _shuffled(raw, rng: random.Random):
 
 
 def _board_dict(lines, raw):
-    return bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(raw), now=NOW).to_dict()
+    return bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(raw, now=None), now=NOW).to_dict()
 
 
 def test_the_whole_board_does_not_depend_on_the_order_the_evidence_is_listed_in():
@@ -372,10 +372,10 @@ def test_equal_dates_are_broken_by_sha_and_by_name_not_by_list_position():
     same = "2026-11-11T00:00:00Z"
     a = {"sha": "a" * 40, "date": same, "items": ["levain#1"], "closes": ["levain#1"]}
     b = {"sha": "b" * 40, "date": same, "items": ["levain#1"], "closes": ["levain#1"]}
-    reasons = {bs.derive_all(f, bs.Evidence.from_dict({**base, "main": order}), now=NOW).items[0].reason for order in ([a, b], [b, a])}
+    reasons = {bs.derive_all(f, bs.Evidence.from_dict({**base, "main": order}, now=None), now=NOW).items[0].reason for order in ([a, b], [b, a])}
     assert len(reasons) == 1
     seat = lambda n: {"name": n, "items": ["levain#1"], "since": None, "branch": None}                    # noqa: E731
-    reasons = {bs.derive_all(f, bs.Evidence.from_dict({**base, "seats": order}), now=NOW).items[0].reason
+    reasons = {bs.derive_all(f, bs.Evidence.from_dict({**base, "seats": order}, now=None), now=NOW).items[0].reason
                for order in ([seat("s1"), seat("s2")], [seat("s2"), seat("s1")])}
     assert len(reasons) == 1
 
@@ -384,7 +384,7 @@ def test_item_ids_that_tie_numerically_still_sort_the_same_way_in_any_file_order
     la, lb = _line(iid="levain#01"), _line(iid="levain#1")
     ev = bs.Evidence.from_dict({"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [],
                                 "chain": [], "refs": [], "merged": [], "branches": [], "seats": [],
-                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+                                "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     ids = {tuple(s.id for s in bs.derive_all(bs.fold(order), ev, now=NOW).items) for order in ([la, lb], [lb, la])}
     assert len(ids) == 1
 
@@ -460,7 +460,7 @@ def test_the_id_sort_key_never_raises_and_orders_numerically():
 
 def test_a_store_with_a_huge_item_id_boards_and_sorts_after_the_small_ones():
     lines = [_line(iid="levain#" + "9" * 5000), _line(iid="levain#10"), _line(iid="levain#2")]
-    board = bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(_ev_dict()), now=NOW)
+    board = bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(_ev_dict(), now=None), now=NOW)
     assert [s.id for s in board.items] == ["levain#2", "levain#10", "levain#" + "9" * 5000]
 
 
@@ -483,7 +483,7 @@ STRICT = [
 
 @pytest.mark.parametrize("source,value,field", STRICT, ids=[f"{s}-{f}-{i}" for i, (s, _, f) in enumerate(STRICT)])
 def test_a_signal_bearing_field_that_is_missing_or_wrong_makes_its_source_unreadable_never_empty(source, value, field):
-    ev = bs.Evidence.from_dict(_ev_dict(**{source: value}))
+    ev = bs.Evidence.from_dict(_ev_dict(**{source: value}), now=None)
     assert "malformed" in ev.unreadable.get(source, "") and field in ev.unreadable[source], ev.unreadable
 
 
@@ -500,11 +500,11 @@ OPTIONAL = [
 
 @pytest.mark.parametrize("source,value", OPTIONAL, ids=[f"{s}-{i}" for i, (s, _) in enumerate(OPTIONAL)])
 def test_the_fields_the_spec_leaves_optional_stay_optional(source, value):
-    assert bs.Evidence.from_dict(_ev_dict(**{source: value})).unreadable == {}
+    assert bs.Evidence.from_dict(_ev_dict(**{source: value}), now=None).unreadable == {}
 
 
 def test_a_branch_without_ahead_is_not_read_as_ahead_zero():
-    ev = bs.Evidence.from_dict(_ev_dict(branches=[{"name": "seat/x", "tip": "t", "items": ["levain#1"]}]))
+    ev = bs.Evidence.from_dict(_ev_dict(branches=[{"name": "seat/x", "tip": "t", "items": ["levain#1"]}]), now=None)
     s = bs.derive_all(bs.fold([_line()]), ev, now=NOW).items[0]
     assert s.state == "unknown" and "ahead is required" in s.reason
 
@@ -541,16 +541,16 @@ def test_the_future_skew_is_one_named_constant():
 
 @pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-12:00", "9999-12-31T23:59:59.999999Z"])
 def test_extreme_fetch_times_read_unknown_and_never_raise(stamp):
-    board = bs.derive_all(bs.fold([_line()]), bs.Evidence.from_dict(_ev_dict(fetched_at=stamp)), now=NOW)
+    board = bs.derive_all(bs.fold([_line()]), bs.Evidence.from_dict(_ev_dict(fetched_at=stamp), now=None), now=NOW)
     assert board.items[0].state == "unknown" and any(p.startswith("stale_evidence:") for p in board.problems)
     json.dumps(board.to_dict())
 
 
 def test_sources_that_alias_one_failure_are_named_once_and_different_failures_stay_apart():
     f = bs.fold([_line()])
-    one = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "fetch failed"})), now=NOW).items[0].reason
+    one = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "fetch failed"}), now=None), now=NOW).items[0].reason
     assert one.count("fetch failed") == 1 and "(also chain, branches)" in one
-    two = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "G", "chain": "C"})), now=NOW).items[0].reason
+    two = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "G", "chain": "C"}), now=None), now=NOW).items[0].reason
     assert two == "main unreadable: git: G (also branches); chain unreadable: C"
 
 
@@ -561,7 +561,7 @@ def test_each_audited_item_id_appears_in_the_audit_exactly_once_per_world():
              _line(iid="levain#3", done="d", tier="sonnet")]
     ev = bs.Evidence.from_dict(_ev_dict(
         main=[{"sha": "a" * 40, "date": "2026-11-11T00:00:00Z", "items": ["levain#1", "levain#2", "levain#3"], "closes": []}],
-        branches=[{"name": "seat/x", "tip": "b" * 40, "date": None, "ahead": 1, "items": ["levain#2"]}]))
+        branches=[{"name": "seat/x", "tip": "b" * 40, "date": None, "ahead": 1, "items": ["levain#2"]}]), now=None)
     board = bs.derive_all(bs.fold(lines), ev, now=NOW)
     ids = [a.id for a in board.audit if a.id]
     assert sorted(ids) == ["levain#1", "levain#2", "levain#3"], board.audit
@@ -579,7 +579,7 @@ def _orphan_world(closes: bool):
                   {"ref": "queue/1114-land3/nd1", "tip": "2" * 40, "commits": [{"sha": "2" * 40, "items": ["levain#8"]}]}],
         "branches": [{"name": "seat/1114-44-storeresolver", "tip": "3" * 40, "date": "2026-11-11T09:00:00Z", "ahead": 23, "items": ["levain#1"]},
                      {"name": "seat/1114-41-nd1ci", "tip": "4" * 40, "date": "2026-11-11T09:00:00Z", "ahead": 37, "items": ["levain#8"]}],
-        "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+        "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []}, now=None)
     return {s.id: s for s in bs.derive_all(bs.fold(lines), ev, now=NOW).items}
 
 

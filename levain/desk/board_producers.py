@@ -157,6 +157,8 @@ def _seats(consent_dir: Path | None) -> tuple[list[dict[str, Any]], str | None]:
                 whys.append(f"{bad} row(s) of claude agents --json are not objects")
     seats: list[dict[str, Any]] = []
     for ln in active:
+        if ln.harness_session_id in listed and listed[ln.harness_session_id].get("state") == "done":
+            continue                                # a finished launch holds nothing: it is neither a seat nor a gap
         items = _launch_items(ln)
         if items is None:
             whys.append(f"launch {ln.launch_id} carries no board_items (T7 writes it)")
@@ -164,7 +166,7 @@ def _seats(consent_dir: Path | None) -> tuple[list[dict[str, Any]], str | None]:
             whys.append(f"launch {ln.launch_id} has no session yet")
         elif read_ok and ln.harness_session_id not in listed:
             whys.append(f"launch {ln.launch_id} not listed by claude agents")
-        elif ln.harness_session_id in listed and listed[ln.harness_session_id].get("state") != "done":
+        elif ln.harness_session_id in listed:
             seats.append({"name": ln.launch_id, "items": items or [], "since": ln.at, "branch": None})
     return seats, "; ".join(whys) or None
 
@@ -215,7 +217,7 @@ def _band(consent_dir: Path | None, now: datetime) -> tuple[list[dict[str, Any]]
             whys.append(f"the answer to {q.id} names no channel")
         else:
             rows.append({"id": q.id, "state": "resolved", "items": items, "by": q.answer.channel, "grade": _grade(store, q)})
-    if not band_view._foreign(store) and not seen.failed:          # the open authority rows (consent, sign, extend) the band shows
+    if not band_view._foreign(store):          # the open authority rows (consent, sign, extend) the band shows; read even when a source failed
         extras = band_sources.read_extras(store.directory, store._clock, now=now)
         for e in extras.items:
             if (e.unreadable is not None or not all(isinstance(x, str) and x for x in (e.source, e.ref))
