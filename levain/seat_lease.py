@@ -583,10 +583,12 @@ def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin
             shutil.rmtree(p, ignore_errors=True)
     print(f"seat launch validated (not started, nothing minted): lane {lane_key}", file=out)
     print(f"  clone   {clone}\n  return  {return_dir}\n  digest  (made at the launch: it binds the minted paths)", file=out)
-    print("  argv    " + argv, file=out)
-    # the hook is inert without this variable: the one line that shows what turns the read budget on
+    # the hook is inert without this variable: the one line that shows what turns the read budget on. It prints BEFORE
+    # the argv line, which stays the last line of the output: a reader that takes everything after "  argv    " as JSON
+    # keeps working (tests/test_seat_launch.py parses it that way).
     from levain.desk import read_budget
     print(f"  env     {read_budget.STATE_ENV}={profile.env.get(read_budget.STATE_ENV, '(absent)')}", file=out)
+    print("  argv    " + argv, file=out)
     return 0
 
 
