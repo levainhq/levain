@@ -17,11 +17,12 @@ Invariants this relies on, so a change to one of them is a change here:
 * a desk's launch row ``at`` is the stamp the launch was REQUESTED (``launches.at``, written with the pending event),
   before the process is spawned or activated, and a desk loads the memory text when it starts, so a save after that
   stamp may be memory it does not hold. Earlier than the load, never later: a dream that saves between the request
-  and the load draws a note the desk did not need (harmless), and none is missed;
+  and the load reads as a seam (:func:`rotation_due`) for memory the desk already holds: the cost is an extra rotation,
+  and none is missed;
 * a rollback card is keyed by the occurrence of the save it undoes (``dream-rollback:<occurrence>``), so a rollback
   cancels exactly that occurrence's save, whatever stamp it carries.
 
-The rotation itself is the desk's own act through ``coord close --kind dream`` (:mod:`levain.desk.seam_handoffs`), at a
+The rotation itself is the desk's own act through :func:`levain.desk.dream_rotation.rotate` (its one caller is the ``coord open`` verb that takes a dream body), at a
 seam it is not in. Nothing here starts it, fences it or authorises it: :func:`rotation_due` only SAYS whether a desk is
 at such a seam with a dream to rotate onto, and writes nothing. Stdlib only.
 """
