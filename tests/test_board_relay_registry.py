@@ -233,7 +233,9 @@ def test_a_cut_owed_after_a_relayed_abandon_needs_the_band_to_finish(world, caps
     assert sum(r["op"] == "abandon-track" for r in reg(store)) == 1                           # the relayed abandon held: no fresh one
 
 
-def test_a_relayed_abandon_whose_answer_changed_is_rewritten_by_a_relayed_rerun(world, capsys, monkeypatch):
+def test_a_relayed_abandon_whose_answer_changed_is_not_rewritten_by_a_relayed_rerun(world, capsys, monkeypatch):
+    """levain 32 ruling (P3 fix 5): the standing abandon is never replaced. Its band row no longer says it, so it causes no
+    cut: the relayed re-run refuses by name and writes nothing, and a relayed decide per item finishes."""
     from levain.desk import board_store as bs
     store, _, _, band, _ = _begun(world, capsys)
     real = bs.decide
@@ -241,11 +243,14 @@ def test_a_relayed_abandon_whose_answer_changed_is_rewritten_by_a_relayed_rerun(
     assert run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)[0] == 2
     monkeypatch.setattr(bs, "decide", real)
     band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "no, abandon it, and say so twice", "unsigned-terminal", "native")
-    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "say so twice", "--source", Q2, *BY)   # the first abandon no longer verifies: a fresh one
-    assert rc == 0, err
-    assert sum(r["op"] == "abandon-track" for r in reg(store)) == 2
-    assert reg(store)[-1]["source"]["answer_sha256"] == br.digest("no, abandon it, and say so twice")
-    assert out.startswith("aborting alpha; cut 2 items")
+    before = (store / "repos.jsonl").read_bytes()
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "say so twice", "--source", Q2, *BY)
+    assert rc == 2 and "(relayed) stands" in err and "does not verify" in err and "never writes a second abandon-track" in err
+    assert (store / "repos.jsonl").read_bytes() == before
+    for iid in ("alpha#1", "alpha#2"):
+        rc, _, err = run(capsys, "decide", "--id", iid, "--decision", "cut", "--words", "say so twice", "--source", Q2, *BY)
+        assert rc == 0, err
+    assert run(capsys, "abandon-track", "alpha", "--words", "say so twice", *BY)[1].startswith("aborting alpha; nothing to cut")
 
 
 def test_the_policy_refusal_names_a_q_id_not_an_np_id(world, capsys):
@@ -300,24 +305,24 @@ def _cause(store: Path) -> str:
     return hashlib.sha256((store / "repos.jsonl").read_text("utf-8").splitlines()[-1].encode()).hexdigest()
 
 
-def test_f4_1_a_relayed_recovery_relays_the_callers_words_and_the_fold_takes_them(world, capsys, monkeypatch):
+def test_f4_1_a_relayed_rerun_reads_the_callers_words_and_never_makes_them_the_repos(world, capsys, monkeypatch):
+    """Fix 4 relayed the caller's words into a fresh abandon and the fold made them the repo's; the levain 32 ruling (P3 fix 5)
+    withdraws both: the words are still read against the answer, nothing is written, and the repo keeps the first words."""
     from levain.desk import board_registry as brg
     from levain.desk import board_store as bs
     store, _, _, band, _ = _crashed_abandon(world, capsys, monkeypatch)
     band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "cancel it instead", "unsigned-terminal", "native")
     rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)
     assert rc == 2 and "not a verbatim excerpt" in err                # the caller's words are checked, not skipped
+    before = (store / "repos.jsonl").read_bytes()
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "cancel it instead", "--source", Q2, *BY)
-    assert rc == 0 and out.startswith("aborting alpha; cut 2 items"), err
-    ab = reg(store)[-1]
-    assert ab["op"] == "abandon-track" and ab["words"] == "cancel it instead" and br.verify_relayed(ab, band).ok
-    assert sum(r["op"] == "abandon-track" for r in reg(store)) == 2
-    cuts = [r for r in items(store) if r["op"] == "decide"]
-    assert len(cuts) == 2 and all(c["words"] == "cancel it instead" and c["cause"] == _cause(store) for c in cuts)
-    assert brg.read_registry(bs.resolve_store(str(store))).fold.repos["alpha"].words == "cancel it instead"
+    assert rc == 2 and "never writes a second abandon-track" in err, err
+    assert (store / "repos.jsonl").read_bytes() == before and sum(r["op"] == "abandon-track" for r in reg(store)) == 1
+    assert not [r for r in items(store) if r["op"] == "decide"]
+    assert brg.read_registry(bs.resolve_store(str(store))).fold.repos["alpha"].words == "no, abandon it"
 
 
-def test_f4_2_a_source_on_a_no_op_abandon_is_read_and_must_be_the_landed_relay(world, capsys):
+def test_f4_2_a_source_on_a_no_op_abandon_is_read_but_need_not_be_the_landed_relay(world, capsys):
     from levain.desk import board_registry as brg
     from levain.desk import board_store as bs
     store, _, _, band, _ = _begun(world, capsys)
@@ -328,10 +333,11 @@ def test_f4_2_a_source_on_a_no_op_abandon_is_read_and_must_be_the_landed_relay(w
     rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "not in it", "--source", Q2, *BY)
     assert rc == 2 and "not a verbatim excerpt" in err
     band.rows[Q3] = br.BandRow("Abandon?", "abandon it", "unsigned-terminal", "native")
-    rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "abandon it", "--source", Q3, *BY)
-    assert rc == 2 and f"not a relayed record citing {Q3}" in err and "relayed citing " + Q2 in err
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "abandon it", "--source", Q3, *BY)
+    assert rc == 0 and out.startswith("aborting alpha; nothing to cut"), err     # levain 32: another row is not an error
+    assert "(relayed) stands" in out and f"--source {Q3} read, not recorded" in out and "'abandon it' not recorded" in out
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "abandon it", "--source", Q2, *BY)
-    assert rc == 0 and out.startswith("aborting alpha; cut 0 items"), err
+    assert rc == 0 and out.startswith("aborting alpha; nothing to cut"), err
     with pytest.raises(bs.BoardError, match="author kind must be agent"):
         brg.abandon_track(bs.resolve_store(str(store)), "alpha", "abandon it", "phill",
                           author={"kind": "operator", "name": "phill"}, relay=(Q2, band))

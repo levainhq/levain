@@ -525,17 +525,27 @@ def _read_relay(relay, words, manifest_sha256: str | None = None, *, require_man
     return board_relay.relay_source(np_id, words, band, manifest_sha256, require_manifest=require_manifest)
 
 
-def _relay_hit(relay, words, landed: Mapping[str, Any] | None, author: Mapping[str, object] | None, what: str,
-               manifest_sha256: str | None = None, *, require_manifest: bool = False) -> None:
-    """A write that lands nothing (an idempotent hit, a no-op re-run) under ``--source`` still answers for it: the author is
-    an agent (a relay is the desk's act), the band row is read NOW and ``words`` must be a verbatim excerpt of its answer
-    (with the manifest digest where the verb holds one), and the record already there (``landed``, the ``what``) must be
-    ``relayed`` citing the SAME id; else it refuses, naming what is there. No relay: nothing to check."""
+def _relay_read(relay, words, author: Mapping[str, object] | None, manifest_sha256: str | None = None, *,
+                require_manifest: bool = False) -> None:
+    """A ``--source`` that writes no record still answers for itself: the author is an agent (a relay is the desk's act) and
+    the band row is read NOW, ``words`` a verbatim excerpt of its answer (with the manifest digest where the verb holds one).
+    No relay: nothing to check."""
     if relay is None:
         return
     if _author(author)["kind"] != "agent":
         raise BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
     _read_relay(relay, words, manifest_sha256, require_manifest=require_manifest)
+
+
+def _relay_hit(relay, words, landed: Mapping[str, Any] | None, author: Mapping[str, object] | None, what: str,
+               manifest_sha256: str | None = None, *, require_manifest: bool = False) -> None:
+    """An idempotent hit under ``--source`` (begin-track, track, add's key) still answers for it: :func:`_relay_read`, and the
+    record already there (``landed``, the ``what``) must be ``relayed`` citing the SAME id; else it refuses, naming what is
+    there. No relay: nothing to check. (An ``abandon-track`` re-run is not a hit: its standing abandon may be of any grade,
+    and it reads the relay only: ``board_registry.abandon_track``.)"""
+    if relay is None:
+        return
+    _relay_read(relay, words, author, manifest_sha256, require_manifest=require_manifest)
     src = landed.get("source") if isinstance(landed, Mapping) else None
     if isinstance(landed, Mapping) and landed.get("grade") == GRADE_RELAYED and isinstance(src, Mapping) \
             and src.get("np") == relay[0]:

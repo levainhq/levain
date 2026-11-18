@@ -494,11 +494,15 @@ def test_the_cli_rerun_of_an_unsigned_abandon_track_refuses_without_a_log_and_fi
     assert raw(store) == before and items_raw(store) == items_before
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
-    assert rc == 0 and out == f"aborting alpha; cut 1 items: {ids[1]}", err
+    assert rc == 0 and out.splitlines()[0] == f"aborting alpha; cut 1 items: {ids[1]}", err
+    assert out.splitlines()[1].endswith("(signed-terminal) stands")       # P3 fix 5: the re-run names the abandon that stands
     assert raw(store) == before                                          # no new abandon: the cut cites the signed one
 
 
-def test_an_aborting_repo_with_an_asserted_abandon_recovers_by_a_signed_rerun_ruling_5(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+def test_an_aborting_repo_with_an_asserted_abandon_is_finished_by_signed_decides_not_a_second_abandon_ruling_5(
+        store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """Ruling 5's recovery (a signed re-run writing a fresh signed abandon over the asserted one) is withdrawn by the levain 32
+    ruling (P3 fix 5): the asserted abandon stands, no re-run writes a second one, and each owed item is cut by a signed decide."""
     tgt = bs.resolve_store(None)
     repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
     iid = keyed(tgt, "alpha", f"{m}:a")
@@ -510,17 +514,20 @@ def test_an_aborting_repo_with_an_asserted_abandon_recovers_by_a_signed_rerun_ru
     assert br.read_registry(tgt).fold.repos["alpha"].mode == "aborting"
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     before, items_before = raw(store), items_raw(store)
-    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)    # unsigned: stuck, and says how to recover
-    assert rc == 2 and "graded 'asserted': it must be signed or relayed (re-run `abandon-track` with --sign or --source)" in err, err
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)    # unsigned: stuck, and says how to finish
+    assert rc == 2 and "graded 'asserted': it must be signed or relayed" in err and NEVER in err, err
+    assert f"`levain board decide --id {iid} --decision cut --sign`" in err
     assert raw(store) == before and items_raw(store) == items_before
-    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
-    assert cut == [iid]
-    fresh = json.loads(abandon_line(store))
-    assert fresh["grade"] == "signed-terminal" and fresh["migration"] == m and fresh["words"] == "w"   # re-signs the recorded words
-    assert json.loads([x for x in items_raw(store).decode().splitlines()][-1])["cause"] == hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    with pytest.raises(bs.BoardError, match=NEVER):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert raw(store) == before and items_raw(store) == items_before
+    bs.decide(tgt, iid, "cut", "no", "desk 1", author=OP, now=NOW, seal=rig.seal())
     n = len(reg_lines(store))
-    assert br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())[1] == []
-    assert len(reg_lines(store)) == n                                    # it holds now: a signed re-run writes nothing
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)    # nothing owed now: a no-op that says so
+    assert rc == 0 and out.splitlines()[0] == "aborting alpha; nothing to cut" and "(asserted) stands" in out, err
+    assert len(reg_lines(store)) == n
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
 
 
 def test_a_signed_abandon_with_another_authority_source_is_refused_l1_5(tgt, store, tmp_path, mkrepo, rig):
@@ -552,6 +559,8 @@ def test_register_cli_with_no_signer_refuses_sign_instead_of_ignoring_it_l1_4(st
 
 # ------------------------------------------------------------ fix 2 (levain 29 rulings A and D): each case reproduced first
 
+NEVER = "A re-run never writes a second abandon-track"                   # levain 32 ruling (P3 fix 5)
+
 
 def _crash_cuts(monkeypatch):
     """bs.decide raising: the abandon lands, no cut does (a crash between the two files)."""
@@ -573,11 +582,12 @@ def _lockfree_add(store, iid: str, key: str) -> None:
         f.write(bs.canonical_bytes(bs._with_prev(rec, bs.chain_prev(data))) + b"\n")
 
 
-def test_an_item_added_after_the_anchor_is_recovered_by_a_signed_rerun_ruling_a(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+def test_an_item_added_after_the_anchor_is_cut_by_a_signed_decide_not_a_second_abandon_ruling_a(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
     """complement 16 / deepseek 75 / gemini 724 / codex MED 60, reproduced on 77bd80ff8: an add of M:late landing between the
     abandon's anchor and its cuts made the cut refuse ("added after"), and the signed re-run wrote NO fresh abandon (the old
     one "held"): the repo stayed aborting for good. Now the latest abandon does not hold while an uncut item of M sits after
-    its anchor: an unsigned re-run says so by name, a signed one writes a fresh abandon whose anchor covers it."""
+    its anchor: a re-run, unsigned or signed, says so by name and writes nothing (levain 32 ruling, P3 fix 5: never a second
+    abandon), naming the signed decide that cuts it; the repo then finishes."""
     repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
     first = keyed(tgt, "alpha", f"{m}:a")
     real_read = br.read_registry
@@ -592,18 +602,15 @@ def test_an_item_added_after_the_anchor_is_recovered_by_a_signed_rerun_ruling_a(
     with pytest.raises(bs.BoardError, match="alpha#2 was added after the cited abandon-track"):
         br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
     monkeypatch.setattr(br, "read_registry", real_read)
-    n_abandons = raw(store).count(b'"op":"abandon-track"')
     before = raw(store), items_raw(store)
-    with pytest.raises(bs.BoardError, match=r"alpha#2 was added after the cited abandon-track: .*\): re-run abandon-track signed"):
-        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
-    assert (raw(store), items_raw(store)) == before
-    tail_before = [ln for ln in items_raw(store).split(b"\n") if ln][-1]
-    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
-    assert cut == ["alpha#2"] and raw(store).count(b'"op":"abandon-track"') == n_abandons + 1
-    assert json.loads(abandon_line(store))["items_last"] == hashlib.sha256(tail_before).hexdigest()
+    for kw in ({"authority": rig.source()}, {"seal": rig.seal()}):
+        with pytest.raises(bs.BoardError, match=r"alpha#2 was added after the cited abandon-track: .*\)\. " + NEVER
+                           + r".*decide --id alpha#2 --decision cut --sign"):
+            br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, **kw)
+        assert (raw(store), items_raw(store)) == before
+    bs.decide(tgt, "alpha#2", "cut", "no", "desk 1", author=OP, now=NOW, seal=rig.seal())
     decides = [json.loads(x) for x in items_raw(store).decode().splitlines() if '"op":"decide"' in x]
     assert {d["id"] for d in decides} == {first, "alpha#2"}
-    assert all(d["cause"] == hashlib.sha256(abandon_line(store).encode()).hexdigest() for d in decides if d["id"] == "alpha#2")
     br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
     assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
 
@@ -634,9 +641,10 @@ def test_a_lock_taking_add_during_the_abandons_prompt_refuses_the_abandon_and_th
     assert late in cut and len(cut) == 2
 
 
-def test_a_signed_rerun_recovers_when_the_abandons_anchor_left_the_items_file_codex_med_60(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+def test_a_rerun_whose_abandons_anchor_left_the_items_file_refuses_and_a_signed_decide_finishes_codex_med_60(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
     """codex MED 60: the items file was cut back past the abandon's anchor (a repair), leaving an uncut item. On 77bd80ff8 the
-    signed re-run wrote no fresh abandon and every cut failed on the missing anchor."""
+    signed re-run wrote no fresh abandon and every cut failed on the missing anchor. Since levain 32 (P3 fix 5) no re-run writes
+    one: it refuses by name, and a signed decide finishes the item."""
     repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a", "b"))
     a = keyed(tgt, "alpha", f"{m}:a")
     keyed(tgt, "alpha", f"{m}:b")
@@ -646,10 +654,13 @@ def test_a_signed_rerun_recovers_when_the_abandons_anchor_left_the_items_file_co
     monkeypatch.setattr(bs, "decide", real)
     lines = items_raw(store).split(b"\n")
     (store / "items.jsonl").write_bytes(b"\n".join(lines[:-2]) + b"\n")          # the last add (the anchor) repaired away
-    with pytest.raises(bs.BoardError, match=r"\(items_last\) is not in the items file\): re-run abandon-track signed"):
-        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
-    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
-    assert cut == [a]
+    before = raw(store), items_raw(store)
+    for kw in ({"authority": rig.source()}, {"seal": rig.seal()}):
+        with pytest.raises(bs.BoardError, match=r"\(items_last\) is not in the items file\)\. " + NEVER):
+            br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, **kw)
+        assert (raw(store), items_raw(store)) == before
+    bs.decide(tgt, a, "cut", "no", "desk 1", author=OP, now=NOW, seal=rig.seal())
+    assert br._uncut(store, "alpha", m) == []
 
 
 def test_an_unsigned_rerun_whose_abandon_no_longer_verifies_refuses_by_name_ruling_d(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
@@ -663,9 +674,9 @@ def test_an_unsigned_rerun_whose_abandon_no_longer_verifies_refuses_by_name_ruli
         br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
     monkeypatch.setattr(bs, "decide", real)
     before = raw(store), items_raw(store)
-    with pytest.raises(bs.BoardError, match=r"cannot be the cause of the cuts still owed \(.*revoked.*\): re-run abandon-track signed"):
+    with pytest.raises(bs.BoardError, match=r"cannot be the cause of the cuts still owed \(.*revoked.*\)\. " + NEVER):
         br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source(revoked_seq=2))
-    with pytest.raises(bs.BoardError, match="re-run abandon-track signed"):
+    with pytest.raises(bs.BoardError, match=NEVER):
         br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=stranger.source())
     assert (raw(store), items_raw(store)) == before
 
@@ -720,13 +731,14 @@ def _item_after_anchor(tgt, store, rig, m, held):
 
 @pytest.mark.parametrize("make", [_foreign_store_line, _prev_mismatch_line, _item_after_anchor],
                          ids=["foreign-store", "prev-mismatch", "item-after-anchor"])
-def test_whenever_a_cut_citing_the_latest_abandon_is_refused_a_signed_rerun_writes_a_fresh_abandon_fix3(
+def test_whenever_a_cut_citing_the_latest_abandon_is_refused_every_rerun_refuses_by_name_fix3(
         make, tgt, store, tmp_path, mkrepo, rig, monkeypatch):
     """gemini MED 205 / deepseek HIGH 244 / complement 43, 46, reproduced on c946cc866 with the throwaway key: the recovery
     judged the latest abandon by ``abandon_problem`` alone, so a foreign-store line or a prev mismatch "held", the signed
     re-run wrote nothing, and every cut it then tried was refused by ``verify_cause``: the repo stayed aborting. Now the
     recovery calls ``board_sign.cut_cause_problem``, the predicate ``verify_cause`` is: the invariant is that whenever a cut
-    citing the latest abandon would be refused, a signed re-run writes a fresh signed abandon and its cuts verify."""
+    citing the latest abandon would be refused, a re-run says so (levain 32, P3 fix 5: signed or not, it writes no second
+    abandon), and a signed decide per owed item finishes the repo."""
     m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
     why = make(tgt, store, rig, m, held)
     view = br.read_registry(tgt)
@@ -736,18 +748,14 @@ def test_whenever_a_cut_citing_the_latest_abandon_is_refused_a_signed_rerun_writ
     problems = [sg.verify_cause({"id": i, "cause": cause}, lines, rig.snapshot()) for i in uncut]
     assert any(p and why in p for p in problems), problems                  # the cut citing the latest abandon is refused
     before = raw(store), items_raw(store)
-    with pytest.raises(bs.BoardError, match=r"cannot be the cause of the cuts still owed \(.*" + why + r".*\): re-run abandon-track signed"):
-        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
-    assert (raw(store), items_raw(store)) == before
-    n_abandons = raw(store).count(b'"op":"abandon-track"')
-    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
-    assert sorted(cut) == sorted(uncut) and raw(store).count(b'"op":"abandon-track"') == n_abandons + 1
-    fresh = json.loads(abandon_line(store))
-    assert fresh["grade"] == "signed-terminal" and fresh["store"] == view.store_id
-    lines = bs._store_lines(tgt)
-    decides = [json.loads(x) for x in lines.items if b'"op":"decide"' in x]
-    assert {d["id"] for d in decides} == set(uncut)
-    assert all(sg.verify_cause(d, lines, rig.snapshot()) is None for d in decides)
+    for kw in ({"authority": rig.source()}, {"seal": rig.seal()}):
+        with pytest.raises(bs.BoardError, match=r"cannot be the cause of the cuts still owed \(.*" + why + r".*\)\. " + NEVER):
+            br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, **kw)
+        assert (raw(store), items_raw(store)) == before
+    for i in uncut:
+        bs.decide(tgt, i, "cut", "no", "desk 1", author=OP, now=NOW, seal=rig.seal())
+    decides = [json.loads(x) for x in bs._store_lines(tgt).items if b'"op":"decide"' in x]
+    assert {d["id"] for d in decides} == set(uncut) and all("cause" not in d for d in decides)
     br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
     assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
 
@@ -1406,3 +1414,109 @@ def test_a_file_made_before_the_snapshot_is_read_and_built_on_not_signed_over_b_
     lines = path.read_bytes().splitlines()
     assert racing is None and made and prompts == [1] and len(lines) == 2
     assert json.loads(lines[1])["prev"] == bs.chain_prev(lines[0] + b"\n")
+
+
+# ------------------------------- fix 5 (levain 32 ruling, P3 r5 (a)/(b)): an abandon re-run never rewrites the standing abandon
+
+Q5 = "q-" + "5" * 24
+
+
+def _ceremonies(monkeypatch) -> list[int]:
+    """Count every signing ceremony (the Touch ID prompt) from here on; each still runs."""
+    seen: list[int] = []
+    real = sg.ceremony
+
+    def counted(seal, record):
+        seen.append(1)
+        return real(seal, record)
+    monkeypatch.setattr(sg, "ceremony", counted)
+    return seen
+
+
+def _band(monkeypatch, answer: str):
+    from levain.desk import board_relay as brl
+    from tests.test_board_relay_registry import FakeBand
+    band = FakeBand(**{Q5: brl.BandRow("Abandon alpha's ceremony?", answer, "unsigned-terminal", "native")})
+    monkeypatch.setattr(brl, "band_source", lambda directory=None: band)
+    return band
+
+
+def test_f5_a_relayed_rerun_on_a_signed_abandon_writes_no_record_and_its_cuts_cite_the_signed_one(
+        store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """levain 32 ruling (levain 30's item (b)), reproduced on 270c30560: a relayed re-run on a repo whose SIGNED abandon holds
+    wrote a fresh RELAYED abandon (its --source needed no authority log, so the signed one did not hold for it), the fold took
+    its words, and every later cut cited the weaker grade. Now the signed abandon stands: no registry record, the repo's
+    words unchanged, the owed cuts cite it, and the output names the words it did not record."""
+    tgt = bs.resolve_store(None)
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a", "b"))
+    ids = [keyed(tgt, "alpha", f"{m}:a"), keyed(tgt, "alpha", f"{m}:b")]
+    real = _crash_cuts(monkeypatch)
+    with pytest.raises(bs.BoardError, match="simulated crash"):
+        br.abandon_track(tgt, "alpha", "changed his mind", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(bs, "decide", real)
+    signed_line = abandon_line(store)
+    signed_hash = hashlib.sha256(signed_line.encode()).hexdigest()
+    assert json.loads(signed_line)["grade"] == "signed-terminal"
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    _band(monkeypatch, "drop it, other words entirely")
+    prompts = _ceremonies(monkeypatch)
+    before = raw(store)
+    rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "not in it", "--source", Q5, "--by", "seat-1")
+    assert rc == 2 and "not a verbatim excerpt" in err, err                     # the relay is still read, and must hold
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "drop it", "--source", Q5, "--by", "seat-1")
+    assert rc == 0, err
+    assert raw(store) == before and prompts == []                                # no registry record, no prompt
+    assert out.splitlines()[0] == f"aborting alpha; cut 2 items: {', '.join(ids)}"
+    assert f"the abandon-track {signed_hash[:12]} (signed-terminal) stands" in out and "'drop it' not recorded" in out
+    assert br.read_registry(tgt).fold.repos["alpha"].words == "changed his mind"
+    decides = [json.loads(x) for x in items_raw(store).decode().splitlines() if '"op":"decide"' in x]
+    assert [d["id"] for d in decides] == ids
+    assert all(d["cause"] == signed_hash and d["words"] == "changed his mind" for d in decides)
+    lines = bs._store_lines(tgt)
+    assert all(sg.verify_cause(d, lines, rig.snapshot()) is None for d in decides)
+
+
+def test_f5_an_asserted_abandon_then_a_signed_rerun_writes_no_second_abandon(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """levain 32 ruling: the FIRST applied abandon stands, whatever the re-run's grade. On 270c30560 a signed re-run over an
+    asserted abandon wrote a fresh signed one (ruling 5's recovery). Now nothing is written and nothing is prompted for: the
+    re-run refuses naming the asserted abandon that stands and the way to finish (a signed or relayed decide per item)."""
+    tgt = bs.resolve_store(None)
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    sid = br.read_registry(tgt).store_id
+    forged = {"v": 1, "store": sid, "op": "abandon-track", "repo": "alpha", "at": NOW, "by": "x", "words": "w",
+              "migration": m, "author": OP, "grade": "asserted", "prev": bs.chain_prev(raw(store))}
+    _append_reg(store, bs.canonical_bytes(forged))
+    prompts = _ceremonies(monkeypatch)
+    before = raw(store), items_raw(store)
+    with pytest.raises(bs.BoardError) as exc:
+        br.abandon_track(tgt, "alpha", "no, other words", "desk 1", author=OP, seal=rig.seal())
+    assert "graded 'asserted'" in str(exc.value) and "never writes a second abandon-track" in str(exc.value)
+    assert f"decide --id {iid} --decision cut --sign" in str(exc.value)
+    assert (raw(store), items_raw(store)) == before and prompts == []
+    assert br.read_registry(tgt).fold.repos["alpha"].words == "w"
+    bs.decide(tgt, iid, "cut", "no", "desk 1", author=OP, now=NOW, seal=rig.seal())          # the way out it names
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
+
+
+def test_f5_a_rerun_with_nothing_owed_is_a_no_op_that_says_so_and_never_prompts(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """A re-run that needs no cut writes nothing, raises no prompt, and says which abandon stands; on 270c30560 the CLI said
+    only "cut 0 items", and a relayed one citing another row than the landed abandon's was refused."""
+    tgt = bs.resolve_store(None)
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    keyed(tgt, "alpha", f"{m}:a")
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    held = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    _band(monkeypatch, "abandon it")
+    prompts = _ceremonies(monkeypatch)
+    before = raw(store), items_raw(store)
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    assert rc == 0 and out.splitlines()[0] == "aborting alpha; nothing to cut", err
+    assert f"the abandon-track {held[:12]} (signed-terminal) stands" in out and "not recorded" not in out
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "abandon it", "--source", Q5, "--by", "seat-1")
+    assert rc == 0 and out.splitlines()[0] == "aborting alpha; nothing to cut", err
+    assert "'abandon it' not recorded" in out
+    assert br.abandon_track(tgt, "alpha", "other", "desk 1", author=OP, seal=rig.seal())[1] == []
+    assert (raw(store), items_raw(store)) == before and prompts == []
