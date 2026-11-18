@@ -50,6 +50,11 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     "turn_lease_events", "chat_egress_events",
     # missions (CH-H2): append-only records with no gseq; a mission closes through its threads' own counted events
     "missions", "mission_revisions", "mission_acceptances",
+    # a mission draft's link (H1-5): the mission a draft series was written for, append-only, written in the same
+    # transaction as the series' first revision, which is counted in envelope_drafts. It takes a gseq from next_gseq, but a
+    # link is the draft's own record (the lapse check compares it), not something that happened since the operator left,
+    # so by the rule that classified worker_attach it is bookkeeping; promoting it to COUNTED is the head's call
+    "mission_drafts",
     # the room (RM-A): a proposal's settling record, no gseq; a committed one names the drop it became, and that drop is
     # counted in its own table
     "proposal_events",

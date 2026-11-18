@@ -136,15 +136,18 @@ def _cards(store: Any, thread_id: str) -> list[dict[str, Any]]:
                                               queue_dir=store.directory)]
 
 
-def _cards_after(store: Any, thread_id: Callable[[], str | None]) -> dict[str, Any]:
-    """The cards for a reply to a write that has COMMITTED. Finding the thread (a store read, or a field of the stored
-    body) and reading its cards (another verifier call) both run inside the one guard: whatever either raises, the
-    write stands, so the reply says what was written and asks for the cards again rather than becoming a refusal that
-    claims nothing changed. A thread of None answers no cards. The caller's ``store_id`` is the one ``_store`` already
+def _cards_after(store: Any, thread_id: Callable[[], str | list[str] | None]) -> dict[str, Any]:
+    """The cards for a reply to a write that has COMMITTED. Finding the threads (a store read, or a field of the stored
+    body) and reading their cards (another verifier call each) both run inside the one guard: whatever either raises,
+    the write stands, so the reply says what was written and asks for the cards again rather than becoming a refusal
+    that claims nothing changed. A thread of None answers no cards; a list answers each thread's cards in that order
+    (a draft that binds several threads shows each one's). The caller's ``store_id`` is the one ``_store`` already
     matched before the write, never a fresh read after it."""
     try:
         tid = thread_id()
-        return {} if tid is None else {"cards": _cards(store, tid)}
+        if tid is None:
+            return {}
+        return {"cards": [c for t in ([tid] if isinstance(tid, str) else tid) for c in _cards(store, t)]}
     except Exception as exc:  # noqa: BLE001  (any fault here is after the commit; the reply must still report it)
         return {"cards": None, "cards_note": f"the cards could not be read just now ({type(exc).__name__}): "
                                               "read the cards again"}
@@ -215,9 +218,9 @@ def _withdraw(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
     except CoordError as exc:
         raise drafts.DraftStale(_not_withdrawn(store, req["draft_id"], exc)) from None
 
-    def thread() -> str | None:
+    def thread() -> list[str] | None:
         newest = drafts.latest(store, req["draft_id"])
-        return None if newest is None else newest.thread_id
+        return None if newest is None else [b["thread_id"] for b in newest.proposal["binds"]]
 
     return {"withdrawn": {"draft_id": req["draft_id"], "revision": revision}, **_cards_after(store, thread),
             "store_id": req["store_id"]}
@@ -341,9 +344,13 @@ def _accept(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
         phone._draft_reviews.pop(req["review_id"], None)
     return {"created": created, "envelope": {"envelope_id": stored.envelope_id, "signer_fp": stored.signer_fp,
                                               "signer_class": stored.signer_class},
-            **_cards_after(store, lambda: _bound_thread(stored)), "store_id": kept["store_id"]}
+            **_cards_after(store, lambda: _bound_threads(stored)), "store_id": kept["store_id"]}
 
 
-def _bound_thread(stored: Any) -> str:
-    """The thread a draft envelope was bound to (a drafted body binds exactly one)."""
-    return stored.body["binds"][0]["thread_id"]
+def _bound_threads(stored: Any) -> list[str]:
+    """The threads a draft envelope was bound to, in the body's order (one for a thread's draft, each child for a
+    mission's)."""
+    binds = stored.body["binds"]
+    if not binds:
+        raise ValueError("a drafted body binds at least one thread")      # a fault of the reply, caught by its guard
+    return [b["thread_id"] for b in binds]

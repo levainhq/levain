@@ -1,12 +1,13 @@
 """levain.desk.envelope_draft — the signed draft envelope's record, digest and shapes (H1-1), pure.
 
-A DRAFT is one attempt to get one envelope signed for one thread: a SERIES (``ed-`` + 32 hex) of REVISIONS 1..N, each
+A DRAFT is one attempt to get one envelope signed for one thread, or for the children of one mission (its proposal then
+binds each, and the ``mission_drafts`` table links the series to the mission): a SERIES (``ed-`` + 32 hex) of REVISIONS 1..N, each
 a proposal (an envelope body without its ``draft`` key, whose editable values may still be ``null``) plus the records
 it cites. A signature over the revision's body covers the draft's id, revision and digest (the body's ``draft`` key),
 so one signature commits the exact digest he saw: a revision written after the render is another digest, and the store
 refuses a signature over the old one (:mod:`levain.desk.envelope_drafts`, :meth:`EnvelopeStore.accept_envelope`).
 
-This module holds what needs no store: the two tables and their triggers (:data:`ENVELOPE_DRAFT_SCHEMA`), the shape
+This module holds what needs no store: the tables and their triggers (:data:`ENVELOPE_DRAFT_SCHEMA`), the shape
 checks of a proposal and its cites, the digest (:func:`draft_digest`) and the two diffs a signer is shown. A cite is a
 CLAIM OF RELEVANCE (the drafter names a record for a field), never proof the record supports it; and the writer
 principal (``by``) is neither signed nor shown, because before S1 nothing authenticates it. Stdlib only.
@@ -92,6 +93,19 @@ ENVELOPE_DRAFT_SCHEMA: tuple[str, ...] = (
     "NEW.revision IS NOT (SELECT MAX(revision) FROM envelope_drafts WHERE draft_id = NEW.draft_id) OR EXISTS "
     "(SELECT 1 FROM envelopes WHERE json_extract(body, '$.draft.draft_id') = NEW.draft_id) BEGIN SELECT "
     "RAISE(ABORT, 'only the latest revision of an unsigned draft is withdrawn'); END",
+    # a mission draft's link (H1-5): the series' ANCHOR thread is the row in envelope_drafts; this names the mission the
+    # series was written for, at the mission revision and children hash it read. Not in the signed bytes or the digest:
+    # the signed ``binds`` is the authority, the link is what the lapse check compares
+    "CREATE TABLE IF NOT EXISTS mission_drafts (draft_id TEXT PRIMARY KEY, "
+    "mission_id TEXT NOT NULL REFERENCES missions(mission_id), mission_revision INTEGER NOT NULL CHECK "
+    "(mission_revision >= 1), children_sha256 TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL)",
+    *_append_only("mission_drafts", "a mission draft link"),
+    "CREATE TRIGGER IF NOT EXISTS mission_drafts_no_replace BEFORE INSERT ON mission_drafts WHEN EXISTS (SELECT 1 FROM "
+    "mission_drafts WHERE draft_id = NEW.draft_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, "
+    "'a mission draft link is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS mission_drafts_names_a_series BEFORE INSERT ON mission_drafts WHEN NOT EXISTS "
+    "(SELECT 1 FROM envelope_drafts WHERE draft_id = NEW.draft_id AND revision = 1) BEGIN SELECT RAISE(ABORT, "
+    "'a mission draft link names a draft series that exists'); END",
 )
 
 
@@ -156,8 +170,14 @@ def check_proposal(proposal: Any) -> dict[str, Any]:
         raise DraftError("only the editable values, and supersedes, may be null")
     if proposal["format"] != env.BODY_FORMAT or proposal["origin"] != "worded":
         raise DraftError(f"a draft proposal is a worded {env.BODY_FORMAT} envelope")
-    if not isinstance(proposal["binds"], list) or len(proposal["binds"]) != 1:
-        raise DraftError("a draft binds exactly one thread")
+    binds = proposal["binds"]
+    if not isinstance(binds, list) or not binds:
+        raise DraftError("a draft binds at least one thread")
+    # sorted by thread id: the first bind is the series' anchor thread. A proposal with several binds is a mission draft
+    # (see ``envelope_drafts.create_mission_draft``); a thread named twice is refused by ``env.parse_body`` below
+    ids = [b.get("thread_id") if isinstance(b, dict) else None for b in binds]
+    if all(isinstance(i, str) for i in ids) and ids != sorted(ids):
+        raise DraftError("a draft's binds are sorted by thread id")
     check_fields({k: proposal[k] for k in EDITABLE})
     ref = {"draft_id": "ed-" + "0" * 32, "revision": 1, "digest": "sha256:" + "0" * 64}
     try:
