@@ -16,14 +16,14 @@ Every command here is a `levain board` or `levain charter` verb. `levain board <
 | Conventions (how to build and test) | the repo's own (AGENTS.md, CLAUDE.md, CONTRIBUTING) | the same files. Tracking does not change them, as long as `retire` does not name them (see Known edges) |
 | STATE (what is open, in flight, built, done) | the operator's own files | the board: items in Levain's store, with state derived on every read from git, seats and the band. No file holds it by hand |
 | RECORD (decisions, handoffs, findings) | the operator's own | episodes in the operator's memory store, tagged `repo:<name>` and `item:<name>#<n>`. Artifacts (design pages, review transcripts) are files in a record directory outside the repo's git |
-| The board | holds no items for it (once the store has a registry; see Known edges) | holds its items |
+| The board | holds no live items for it (once the store has a registry; see Known edges). An abandoned tracking leaves its cut items behind | holds its items |
 | A seat's context | the repo's own files | `levain board context <name>#<n>`, plus the conventions files |
 
 An untracked repo is fully supported. The desk launches seats in it, and a seat reads the repo's own files. Levain draws no board column for it.
 
 Three rules hold in every install:
 
-- **The board holds items only for repos that are tracking or tracked.** Once a store has a registry, `levain board add` refuses any other repo, and says why. An `aborting` repo is refused too. Before a store's first registration that check is off; see [Known edges](#known-edges).
+- **The board takes new items only for repos that are tracking or tracked.** Once a store has a registry, `levain board add` refuses any other repo, and says why. An `aborting` repo is refused too. A repo whose tracking was abandoned keeps the items that were cut; they stay in the store (see Known edges). Before a store's first registration that check is off; see [Known edges](#known-edges).
 - **Levain writes no state.** Stored records are registrations, items, decisions and mode changes. State is computed when you read it.
 - **A repo is in play only by a `register` record.** A directory scan can find a repo; finding it does not put it in play.
 
@@ -47,7 +47,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
    levain board register X --words "<the operator's words>" --by <desk> --path <repo directory>
    ```
 
-   The repo needs at least one commit. Without one, `register` refuses: nothing identifies the repository. The name X must match `[a-z0-9][a-z0-9._-]*`: lowercase only. `register Alpha` prints `refused: repo 'Alpha' must match [a-z0-9][a-z0-9._-]*`. X is a name, not the directory's name; the directory is what `--path` says.
+   The repo needs at least one commit. Without one, `register` refuses: nothing identifies the repository. `register` accepts a name that matches `[a-z0-9][a-z0-9._-]*`: lowercase only. `register Alpha` prints `refused: repo 'Alpha' must match [a-z0-9][a-z0-9._-]*`. A repo that will be tracked needs the stricter rule `[a-z][a-z0-9_-]*`: it starts with a letter and has no `.`. `charter init` refuses any other name (`levain charter init: the name 'v2.app' must be lowercase letters, digits, '_' or '-', starting with a letter (it is the prefix of the repo's item ids).`), and the charter's Plan lines are read only as `- <name>#<n>` with that same pattern. A repo registered as `v2.app` or `2fa` can stay untracked, but it can never get a valid charter, so the ceremony cannot reach `track`. X is a name, not the directory's name; the directory is what `--path` says.
 
 2. **The desk reads X's existing memory, read-only.** That is `next.md` or `brief.md`, any project memory, status pages, TODO files, the README and the conventions files.
 
@@ -55,7 +55,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
 4. **The operator reads it and answers in conversation.** Edits go back to step 3.
 
-5. **The desk runs the ceremony in this order.** A keyed `add` repeats safely (see (b)), and `begin-track` derives its migration id when `--migration` is omitted, so a retry derives the same one. The ceremony's decision-class writes (`begin-track`, `track`, `decide`, and `abandon-track` on the abort path) each carry provenance: `--sign` or `--source <q-id>`, as [Signing and relaying](#signing-and-relaying-decision-class-writes) says. Without one the write is refused. The examples below carry `--source`, because the desk runs the ceremony and relays the operator's answered band row.
+5. **The desk runs the ceremony in this order.** A keyed `add` repeats safely (see (b)), and `begin-track` derives its migration id when `--migration` is omitted (from X's name, the manifest's bytes, `--words` and how many ceremonies X has had), so a retry with the same manifest and `--words` derives the same one. The ceremony's decision-class writes (`begin-track`, `track`, `decide`, and `abandon-track` on the abort path) each carry provenance: `--sign` or `--source <q-id>`, as [Signing and relaying](#signing-and-relaying-decision-class-writes) says. Without one the write is refused. The examples below carry `--source`, because the desk runs the ceremony and relays the operator's answered band row.
 
    - **(a) Begin.** Writes the migration id and locks X to new work. Decision-class, so it carries `--source` (or `--sign`). The band question the desk files for this yes must carry the sha256 of the manifest file, so the answer binds exactly that manifest:
 
@@ -74,7 +74,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
      }
      ```
 
-     `begin-track` prints the migration id: `tracking alpha (migration mf538fa9a1e)`. That id is the `M` in `--key M:<k>`; `board repos` shows it too, and a retry prints `already tracking alpha (migration ...)` with the same id. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
+     `begin-track` prints the migration id: `tracking alpha (migration mf538fa9a1e)`. That id is the `M` in `--key M:<k>`; `board repos` shows it too, and a retry prints `already tracking alpha (migration ...)` with the same id, but only when the manifest's bytes, `--words`, `--owner` and the migration id (given or derived) all match the first call, and, on a relayed call, the same `--source`. Any other `begin-track` on a tracking repo is refused: `alpha is already tracking (migration M): finish it with `track` or `abandon-track``. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
 
    - **(b) Expand: the items.** Each item is added with its key and a hash of its fields:
 
@@ -84,7 +84,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main --repo-name X --items <store>` reports `X's CHARTER.md (origin/main) is a valid charter.` once it is. The charter's title must name the registered repo X. `check` takes the repo's name from the directory it runs in, so when the directory is named otherwise (a clone called `clone-dir` for repo `alpha`) the title reads `names 'alpha', not this repository's name 'clone-dir'` until `--repo-name X` is passed. `check` only reports and exits 0; `track` is the gate. It runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --repo <X's directory> --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --repo <X's directory> --ref origin/main --repo-name X --items <store>` reports `X's CHARTER.md (origin/main) is a valid charter.` once it is. The charter's title must name the registered repo X. Both verbs act on the git work tree they run in unless `--repo` names another, so a desk standing in some other repo would write or read that repo's charter (and outside any work tree `init` exits 1 with `. is not inside a git work tree.`). `check` takes the repo's name from the directory that holds the repository's `.git`, so when the directory is named otherwise (a clone called `clone-dir` for repo `alpha`) the title reads `names 'alpha', not this repository's name 'clone-dir'` until `--repo-name X` is passed. `check` only reports and exits 0; `track` is the gate. It runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut.
 
      To cut an item: `levain board decide --id X#<n> --decision cut --words "<a verbatim excerpt of the operator's answer>" --by <desk> --source <q-id>` (it prints `decided X#<n>`; `decide` is decision-class, so `--sign` is the other way to carry it). A cut item must also leave the landed Plan: `charter init --items` leaves a cut item out of a Plan it writes, but a Plan already landed is edited by hand and landed again before `track` will pass. A stalled landing only means the switch has not happened, and X stays locked.
 
@@ -109,14 +109,14 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 `levain board repos` lists each repo's mode and the next step. `levain board state` derives every item's state when you read it, and `levain board context X#<n>` prints one item's context.
 
 - The `as of` time in `board state`'s header is the time of the last fetch of origin, not of the read. `--now` does not move it; it moves when origin has changed.
-- On a store with no land-waiter configured, items read `unknown` (`waiters: not supplied`) and `board state` exits 3. Pass `--no-land-waiter` to read the items without one: `levain board state --no-land-waiter`, and the same for `board context`.
+- On a store with no land-waiter configured, items read `unknown` (`waiters: not supplied`) and `board state` exits 3. Pass `--no-land-waiter` to read the items without one: `levain board state --no-land-waiter`, and the same for `board context`. The flag declares only the waiters absent. The seats are read from the desk's launch records on their own: a launch carries the items it was started for when it was started with `--item`, and while an active Levain launch was started without it, items that rest on the absence of a seat still read `unknown` naming that launch (`launch <id> carries no board_items (it was started without --item)`), and `board state` still exits 3.
 - `board state` exits 3 while its audit is not empty, whatever the items say.
 
 ## Charter
 
-`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name and the Export filled in. Its Plan is prefilled with one line per live item when `--items` names a store; otherwise the Plan is a placeholder line. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
+`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name and the Export filled in. Its Plan is prefilled with one line per item of that name not decided cut, parked or out of 1.0 when `--items` names a store; otherwise the Plan is a placeholder line. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced; `check` reports it and still exits 0. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
 
-`levain charter check` reads the charter, from origin/main by default. In this release it only warns: it prints what a valid charter needs and exits 0 either way.
+`levain charter check` reads the charter, from origin/main by default. It only warns: it prints what a valid charter needs and exits 0 either way, so it is not a gate.
 
 ## A seat on a tracked item
 
@@ -128,7 +128,7 @@ A worker launched for a tracked item is told to:
 - put `Board-Seat: <durable key>` on every closing commit;
 - write decisions and handoffs as episodes tagged `repo:NAME` and `item:NAME#N`.
 
-The desk's brief teaches these five rules. The close check a tracked seat must pass is `levain/desk/seat_close.py`. Nothing in Levain calls it yet; see Known edges.
+The desk's brief teaches these five rules. The close check a tracked seat must pass is `check_close` in `levain/desk/seat_close.py`; see Known edges.
 
 ## Signing and relaying: decision-class writes
 
@@ -138,13 +138,13 @@ The writer holds one fixed policy, and it checks it before it signs or writes an
 
 **Two ways to give provenance.**
 
-1. **`--sign`: the operator at the laptop, Touch ID.** The operator runs the verb in a fresh terminal (not inside an agent session, and not a remote one), with `--author-kind operator`. The write needs a terminal key and the authority log that enrols it, and the record is verified against that log before it is written. It shows the Touch ID prompt; a refused or cancelled prompt writes nothing. No lock is held while the prompt is up, so if another write lands on the store meanwhile the signed write refuses (`the board changed while you signed: sign again`) and writes nothing; run it again. `--sign` is the only way to write `untrack` and `move`. This page documents it from the verb's help and the code: the prompt needs the operator's hand, so the run below does not include one. Example:
+1. **`--sign`: the operator at the laptop, Touch ID.** The operator runs the verb in a fresh terminal (not inside an agent session, and not a remote one), with `--author-kind operator`. The write needs a terminal key and the authority log that enrols it, and the record is verified against that log before it is written. It shows the Touch ID prompt; a refused or cancelled prompt writes nothing. No lock is held while the prompt is up, so if another write lands on the store meanwhile the signed write refuses (`the board changed while you signed: sign again`) and writes nothing; run it again. `--sign` is the only way to write `untrack`, and the only way to write a `move` that is decision-class (see above). This page documents it from the verb's help and the code: the prompt needs the operator's hand, so the run below does not include one. Example:
 
    ```
    levain board track alpha --words "yes, track alpha" --by phill --sign --author-kind operator
    ```
 
-2. **`--source <q-id>`: the desk relays his answered band row.** The desk files the question in the band, the operator answers it, and the desk writes the record citing the row. `<q-id>` is a native question id, `q-` and 24 hex characters; a bare band number or a flow `np-` id is refused (see Known edges). `--words` must be a verbatim excerpt of the answer (one line, no control characters): his sentence travels, never a paraphrase. The row must exist and be answered. `begin-track` and `track` carry one more rule: the question's text must carry the sha256 of the manifest file, so a yes binds exactly that manifest. `--band-dir` names the band store when it is not this install's own. `--source` is taken by `add`, `amend`, `decide`, `begin-track`, `track` and `abandon-track`; `untrack` and `move` do not take it. A complete relayed ceremony, run on a scratch store (the desk filed the question `Begin tracking alpha? manifest sha256 <sha256 of manifest.json>` and the operator answered `yes, begin tracking alpha`):
+2. **`--source <q-id>`: the desk relays the operator's answered band row.** The desk files the question in the band, the operator answers it, and the desk writes the record citing the row. `<q-id>` is a native question id, `q-` and 24 hex characters; a bare band number or a flow `np-` id is refused (see Known edges). `--words` must be a verbatim excerpt of the answer (one line, no control characters): the operator's sentence travels, never a paraphrase. The row must exist and be answered. `begin-track` and `track` carry one more rule: the question's text must carry the sha256 of the manifest file, so a yes binds exactly that manifest. `--band-dir` names the band store when it is not this install's own. `--source` is taken by `add`, `amend`, `decide`, `begin-track`, `track` and `abandon-track`; `untrack` and `move` do not take it, so a decision-class `move` can only be signed. A complete relayed ceremony, run on a scratch store (the desk filed the question `Begin tracking alpha? manifest sha256 <sha256 of manifest.json>` and the operator answered `yes, begin tracking alpha`):
 
    ```
    $ levain board begin-track alpha --words "yes, begin tracking alpha" --by "desk 1" --manifest manifest.json --source q-edaeeda02f7993f1ea3219ef --band-dir band
@@ -165,13 +165,13 @@ $ levain board begin-track alpha --words "yes, begin tracking alpha" --by "desk 
 levain board: refused: begin-track is a decision-class write: it needs --sign (the operator's Touch ID), or --source <q-id> (the band's question id, q-<24 hex>) relaying his answer; an asserted record is refused
 ```
 
-`track`, `decide` and `abandon-track` refuse in the same words, each naming its own verb. `untrack` and `move` do not take `--source`, so their refusal names `--sign` only: `untrack is a decision-class write: it needs --sign (the operator's Touch ID); an asserted record is refused`.
+`track`, `decide` and `abandon-track` refuse in the same words, each naming its own verb. `untrack` does not take `--source`, so its refusal names `--sign` only: `untrack is a decision-class write: it needs --sign (the operator's Touch ID); an asserted record is refused`.
 
 A relayed write that does not hold is refused too, and nothing is written:
 
 - words that are not in the answer: `--source q-e89a...: the words are not a verbatim excerpt of the answer: 'yes please track alpha' (his sentence travels, never a paraphrase; quote exactly what the answer says)`;
 - a `begin-track` or `track` whose question does not carry the manifest's digest: `--source q-a164...: the question does not carry the manifest's sha256: the answer cannot bind this manifest`;
-- a flow row: `--source np-1b3dd088: np- rows are flow's band: their reader arrives with T12; cite a q- row (a native question id), or --sign`.
+- a flow row: `--source np-1b3dd088: np- rows are flow's band: ...`, and the message says to cite a q- row (a native question id) or `--sign`.
 
 ## Authorship and grades
 
@@ -288,9 +288,9 @@ levain board trail verify: no breaks
 The words, as the code prints them:
 
 - `legacy`: a line from before the chain began. `asserted by NAME, unsigned`: a named author with no signature. `operator, signed with a ceremony`: the operator's signature verified against your authority log.
-- `agent NAME, relaying q-... (signed answer)` and `(unsigned answer)`: the desk relayed a band answer, and the answer's own signature does or does not bind his words. A relayed record is never promoted past its answer.
+- `agent NAME, relaying q-... (signed answer)` and `(unsigned answer)`: the desk relayed a band answer, and the answer's own signature does or does not bind the operator's words. A relayed record is never promoted past its answer.
 - `anchored through line N`: a signed record at line N commits every record up to it, so none of them could have been rewritten without the operator's key. The tail line then counts the records after the last signed one as unanchored: anyone who can write the file could have rewritten them. The tail line is always printed.
-- `NOT ANCHORED`: no signature stands as an anchor. It is printed when the only signatures that verify are under keys a bundle names (below), when no signed record verifies, when the file breaks at or before the last signed record, or when the signing key has since been revoked. A key revoked since is reported (`revoked since (seq N)`), never silently valid and never a break by itself. Only the bundle-keys case was run; the other three are from the code.
+- `NOT ANCHORED`: no signature stands as an anchor. It is printed when the only signatures that verify are under keys a bundle names (below), when no signed record verifies, when the file breaks at or before the last signed record, or when the signing key has since been revoked. A key revoked since is reported, never silently valid and never a break by itself. It reads differently by line: the `NOT ANCHORED` line says `its signer's key is revoked since (seq N)`, and a signed record's own line ends `, by a key revoked since (seq N)`. A close line says something else again (below). Only the bundle-keys case was run; the other three are from the code.
 - A line that names who closed an item quotes the words of [Who closed an item: `closed_by`](#who-closed-an-item-closed_by); that section says what each tier proves and does not.
 - `no kept head given`: the file can be cut at its end and still verify. Give `--head items=<hash>` (and `repos=<hash>`), the heads `export` printed. A head that is still on the chain reads `kept head ... is the current head: nothing was removed`. One that is not reads `TRUNCATION OR REWRITE: kept head ... is not on this chain (the file now ends at ...): records were removed or rewritten`, and that is a break.
 
@@ -325,7 +325,7 @@ What a close line can say:
 - `BREAK close ...`: any one predicate is refuted. The line names the predicate and what the repo shows. One refuted predicate is a break, whatever else holds. A recorded close for an item the bundle's own records show open or closed by the band, or do not hold at all, is a break too, as is a recorded commit when the repo holds a different close for the item.
 - `recorded in the bundle, not re-derived here: <why>`: a predicate is undetermined, and the reason is something this install lacks: no authority log, a key its log does not hold, no launch record here (launch records belong to one install), an unreadable object, or a repo that does not hold the commit. An undetermined predicate never hides a refuted one, and `verify` still exits `0`. Exit `0` there means nothing was shown wrong, not that the close was checked. When the repo itself is not reachable the line reads `(recorded in the bundle, not re-derived (repo not available))`.
 - A close the repo shows that the bundle does not record is said, and is not a break. A bundle that records no closes prints this install's own derivation and says so.
-- A signature that verifies under a key this install's log has revoked reads `signature by <principal> verifies; that key is revoked in this install's authority log (seq N)`. It never says "since". It is undetermined, so it exits `0`. Not run here; from the code.
+- A signature that verifies under a key this install's log has revoked reads `signature by <principal> verifies; that key is revoked in this install's authority log (seq N)`. On a close line the wording never says "since". It is undetermined, so it exits `0`. Not run here; from the code.
 
 Nothing in a bundle relaxes a check. A `degraded` flag it records is ignored, and its `note` is printed as the bundle's and is never compared. A recorded close the bundle says it could not read claims nothing, and `verify` prints what this install derives.
 
@@ -348,7 +348,7 @@ bundle: out.json
 items=<hash> repos=<hash>
 ```
 
-The bundle carries his words, so a destination inside a git work tree is refused, as is overwriting a file. With no `--out` it goes to `<levain home>/board-trail/`.
+The bundle carries the operator's words, so a destination inside a git work tree is refused, as is overwriting a file. With no `--out` it goes to `<levain home>/board-trail/`.
 
 **A bundle's own keys are never the trust root.** `verify BUNDLE` replays the authority log of the verifier's own install (`--data-root` names another) and reads the bundle's keys as claims compared against it. On a machine that holds the authority log, a bundle gives the same verdicts as the live store, and the header says so: `authority: the log this install holds, replayed now (seq 2, head h); the bundle's 1 key(s) were compared to it`. A key the bundle names that the log does not hold the same way is a break. On a machine with no authority log of its own the same bundle reads:
 
@@ -364,22 +364,22 @@ Exit `0` there means nothing is broken, not that anything is anchored.
 **Known edges of the trail:**
 
 - **The tail is not anchored, and a bundle edit there passes.** A record after the last signed one can be rewritten and its chain recomputed. On the scratch bundle, changing a title in the last (unsigned) item and verifying the result gave `no breaks` and a different head. Only a kept head from an earlier export catches it.
-- **A signature is checked against the authority log as it is now.** Whether it was valid at the record's own time is later work.
-- **An answer's signature binds his words, not the chain.** An option pick is signed as `(letter) label`; the verdict then says the signature covers the pick and not the words the record quotes.
+- **A signature is checked against the authority log as it is now.** Whether it was valid at the record's own time is not checked.
+- **An answer's signature binds the operator's words, not the chain.** An option pick is signed as `(letter) label`; the verdict then says the signature covers the pick and not the words the record quotes.
 - **A revoked key is not told apart by time.** A signed close under a key this install's log has revoked reads as undetermined. An unsigned bundle carries no export time, so a promotion made after the revocation looks the same as an honest export made before it.
-- **Asserted `move`s cost O(M squared).** Each asserted `move` is judged on the registry as it stood before it. Measured: about 28 seconds for 2,000 of them. A registry that long is not a real store.
+- **Asserted `move`s cost O(M squared).** Each asserted `move` is judged on the registry as it stood before it. Measured on commit 0c79ee3aa with 2,000 moves: about 28 seconds; not re-measured since. A registry that long is not a real store.
 
 ## Known edges
 
-- **A signed decision rests on the operator's hand.** `--sign` needs a Touch ID prompt in a fresh terminal, a terminal key and an authority log that enrols it. A desk seat cannot sign, so a desk relays with `--source`, and `untrack` and `move` (which take no `--source`) wait for the operator.
-- **`--source` takes native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) is refused until flow's reader exists.
-- **The phone route is not on this page's ceremony.** The writer takes a phone signature (`signed-phone`), but the cockpit door that signs with the passkey is a separate, later piece.
+- **A signed decision rests on the operator's hand.** `--sign` needs a Touch ID prompt in a fresh terminal, a terminal key and an authority log that enrols it. A desk seat cannot sign, so a desk relays with `--source`, and `untrack`, and a `move` that changes a tracking, tracked or aborting repo's origin or root set (neither takes `--source`), wait for the operator.
+- **`--source` takes native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) is refused: this tree has no reader for flow's band.
+- **The phone route is not on this page's ceremony.** The writer takes a phone signature (`signed-phone`), but this page's ceremony uses only `--sign` (Touch ID) and `--source`.
 - **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
-- **Closing a tracked seat is not checked yet.** `levain/desk/seat_close.py` holds the check, and nothing in Levain calls it. Flow's seat close is the caller, and that side is not written.
+- **A tracked seat's close is checked by a function that Levain's own code does not call.** `check_close` in `levain/desk/seat_close.py` is a pure function over facts its caller reads; in this tree only tests call it.
 - **Before a store's first registration, `add` takes items for any repo.** The registry is inactive until the store has a `repos.jsonl`, and the mode check starts with it.
 - **An aborted repo that holds cut items keeps one audit line.** After `abandon-done`, `board state` carries `unknown: -: X: the repo is untracked, not tracked: not read` for as long as the repo has cut items.
 - **`add --key` does not check the key against the manifest.** `board add --key M:k3` succeeds for a `k3` that is not in `plan_items` and gets an id; `track` is what refuses it, when the Plan and the manifest differ.
-- **Agent names are asserted, not key-bound.** Binding an agent to a key is 1.1.
+- **Agent names are asserted, not key-bound.** Nothing binds an agent's name to a key.
 - **The registry and the store belong to one install.** A second machine needs the same store.
 - **The stub check reads only the paths named in `retire` at tracking.** A status file added later is not caught.
 - **Git operations are outside the store's lock.** A `checkout`, `stash` or `merge` can replace a store file. Levain re-checks each file it opens by inode and refuses a replacement it cannot read past.
