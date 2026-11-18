@@ -42,16 +42,16 @@ OUT_OF_PLAN = ("cut", "parked", "out-of-1.0")
 _TITLE = re.compile(r"^# Charter: (\S+)$")
 _CRITERION = re.compile(r"^- (C\d+): (.+)$")
 _CONSTRAINT = re.compile(r"^- (K\d+): (.+)$")
-_PLAN_ID = re.compile(r"^- ([a-z][a-z0-9_-]*)#(\d+)$")
-_TAG = re.compile(r"\[(check: [^\]]+|item: [a-z][a-z0-9_-]*#\d+|judged: [^\]]+)\]\s*$")
+_PLAN_ID = re.compile(r"^- ([a-z0-9][a-z0-9._-]*)#(\d+)$")
+_TAG = re.compile(r"\[(check: [^\]]+|item: [a-z0-9][a-z0-9._-]*#\d+|judged: [^\]]+)\]\s*$")
 _TAGS_ANY = re.compile(r"\[(?:check|item|judged):")
-_ITEM_TAG = re.compile(r"\[item: ([a-z][a-z0-9_-]*#\d+)\]\s*$")
+_ITEM_TAG = re.compile(r"\[item: ([a-z0-9][a-z0-9._-]*#\d+)\]\s*$")
 _JUDGED = re.compile(r"\[judged: [^\]]*\]")
 _SHA = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _GLYPH = re.compile(r"[✅☑✔]|\[[xX ]\]")
 _PLACEHOLDER = re.compile(r"<fill:[^<>]*>")      # the ONE token `init` writes; any other angle-bracketed text is prose
-_NAME = re.compile(r"[a-z][a-z0-9_-]*")
+_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
 @dataclass(frozen=True)
@@ -448,8 +448,8 @@ def run_init(args: Any) -> int:
 
     name = args.name
     if not _NAME.fullmatch(name):
-        return refuse(f"the name {name!r} must be lowercase letters, digits, '_' or '-', starting with a letter (it is the "
-                      "prefix of the repo's item ids).")
+        return refuse(f"the name {name!r} must be lowercase letters, digits, '.', '_' or '-', starting with a letter or digit (the "
+                      "name `levain board register` takes, and the prefix of the repo's item ids).")
     root: Path | None = None
     if not args.stdout or args.repo is not None:     # --stdout alone needs no repository
         where = args.repo if args.repo is not None else Path(".")
