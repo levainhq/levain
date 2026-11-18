@@ -2,7 +2,9 @@
 
 What changed in the desk store since the operator's last VERIFIED reply, rendered by Levain from records that
 carry the store's ``gseq`` ("one store-wide order for every authority and event row: never wall-clock"): ``replies``,
-``launch_events``, ``lease_events``, ``ready_journal`` and ``chat_messages``. Never model-written. Thread splits and
+``launch_events``, ``lease_events`` and ``chat_messages``. Board changes are NOT in it (T7, levain#101): the board is a JSONL
+store, which one SQLite snapshot cannot join, and the v1 ``ready_journal`` takes no more rows; the desk's open prints one board
+block (:func:`levain.desk.seam._board`) instead. Never model-written. Thread splits and
 state changes carry no ``gseq`` and are not in it; a reply written before ``replies`` had the column (NULL ``gseq``) has
 no place in the order, so it is excluded and the header counts it.
 
@@ -100,10 +102,6 @@ def _lease_line(kind: str, holder: str, cause: str, by: str) -> str:
     return f"lease {_clean(kind, 20)}: {_clean(holder)} ({_clean(cause)}, by {_clean(by, 20)})"
 
 
-def _ready_line(item_id: str, from_category: str | None, to_category: str, who: str) -> str:
-    return f"{_clean(item_id)}: {_clean(from_category, 20) or 'new'} -> {_clean(to_category, 20)} ({_clean(who)})"
-
-
 def _chat_line(author_kind: str, recipient: str, thread_id: str) -> str:
     return f"chat message from {_clean(author_kind, 20)} to {_clean(recipient, 20)} on thread {_short_id(thread_id)}"
 
@@ -123,7 +121,6 @@ _SOURCES: tuple[_Source, ...] = (
             "e.kind, e.launch_id, l.role, e.cause", _launch_line, "l.role != 'room'"),
     # a beat is the holder staying alive, a frequent record and never news (the design lists claim, release, lapse, takeover)
     _Source("lease_events", "lease_events", "gseq", "kind, holder, cause, by", _lease_line, "kind != 'beat'"),
-    _Source("ready_journal", "ready_journal", "gseq", "id, from_category, to_category, who", _ready_line),
     _Source("chat_messages", "chat_messages", "gseq", "author_kind, recipient, thread_id", _chat_line),
 )
 

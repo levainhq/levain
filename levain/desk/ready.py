@@ -58,8 +58,8 @@ from levain.intention_legacy import READY_SOURCE_KEY
 
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
-    "JournalAhead", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
-    "FACT_COLS", "item_facts", "live_seat_launches", "migrate_item_facts", "ready_counts", "record_landed", "replay", "slug",
+    "JournalAhead", "RETIRED", "V1Retired", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
+    "FACT_COLS", "item_facts", "live_seat_launches", "migrate_item_facts", "ready_counts", "replay", "slug",
 ]
 
 SCHEMA_VERSION = 1
@@ -498,36 +498,6 @@ def item_facts(store: CoordStore | Path | str, item_id: str) -> dict:
     return _read(st, query)
 
 
-def record_landed(conn: sqlite3.Connection, now: str, token: int, item_id: str, sha: str, branch: str | None, *,
-                  by: str, why: str) -> int:
-    """A ``landed`` fact on an item: a new state version identical to the current one but for ``landed_sha`` and
-    ``branch``, with its journal record (same category, same status, source ``correction``, ``who`` = ``by``). Inside
-    the caller's write transaction. Never moves an item: for the service (``by == "service"``) a schema trigger
-    refuses any other change (:data:`levain.desk.work_attach.WORK_SCHEMA`). Returns the new version."""
-    if not isinstance(sha, str) or _OID.fullmatch(sha) is None:
-        raise CoordError("a landed sha is a full 40 or 64 hex object id")
-    if branch is not None:
-        branch = _line("branch", branch, 200)
-    diverged = _diverged(conn, item_id)
-    if diverged:
-        raise diverged[0]
-    found = _current(conn, item_id)
-    if not found:
-        raise CoordError(f"{item_id} is not in the desk store")
-    prior = found[0]
-    state = {**{k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")},
-             **_facts(conn, item_id), "category": prior["category"], "status": prior["status"],
-             "landed_sha": sha, "branch": branch}
-    ver = prior["ver"] + 1
-    ts, iso = _local_iso(now)
-    rec = {"ts": ts, "iso": iso, "id": item_id, "repo": state["repo"], "from_status": prior["status"],
-           "to_status": prior["status"], "from_category": prior["category"], "to_category": prior["category"],
-           "who": by, "why": _line("why", why, _WHY_MAX), "source": "correction", "applied_by": None}
-    _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
-    _insert_state(conn, state, item_id=item_id, ver=ver, who=by, at=now)
-    return ver
-
-
 def _store_of(store: CoordStore | Path | str) -> CoordStore:
     return store if isinstance(store, CoordStore) else CoordStore(store)
 
@@ -729,216 +699,34 @@ def replay(records: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     return out
 
 
-# ------------------------------------------------------------------------------------------------ the one writer
-def _line(name: str, value: Any, high: int) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise CoordError(f"{name} is required, never empty")
-    value = value.strip()
-    # printable only: no line break of any kind (\x0b, \x85, \u2028 ...), no escape sequence for a terminal
-    if len(value) > high or not value.isprintable():
-        raise CoordError(f"{name} is one line of at most {high} printable characters")
-    return value
-
-
-def _check_token(token: Any) -> int:
-    if token is None:
-        raise CoordError("a lifecycle write needs the desk's identity (the live lease token); no state "
-                         "was written. Reads need none")
-    if not isinstance(token, int) or isinstance(token, bool):
-        raise CoordError("the desk's identity is the lease token, an integer")
-    return token
-
-
-def _check_to(to: Any) -> str:
-    if to == "needs-you":
-        raise CoordError("needs-you is a projection of the band (SCHEMA §2, §5): a move into it goes through the "
-                         "band, never through the writer")
-    if to not in WRITABLE_CATEGORIES:
-        raise CoordError(f"unknown category {str(to)[:40]!r}; one of {', '.join(WRITABLE_CATEGORIES)}")
-    return to
-
-
-def _check_id(item_id: Any) -> str:
-    if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
-        raise CoordError("an item id is 1 to 200 of A-Z a-z 0-9 + . _ : - (e.g. levain:<slug>), never a position")
-    if item_id.startswith(_PROJECTION_PREFIXES):
-        raise CoordError(f"{item_id} is a projection id (seat:, ci:, np-): projections are never writable")
-    return item_id
-
+# ------------------------------------------------------------------------------------------------ the v1 writer, retired
+RETIRED = ("the v1 ready queue is retired (levain#101): no more rows are written to it. The board is "
+           "`levain board add` / `levain board amend` / `levain board decide`, and its state is `levain board state`")
 
 _UNSET = object()
 
 
-def _fields(item_id: str, *, title: Any, tier: Any, done_line: Any, depends_on: Any, rank: Any,
-            hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
-    """The optional state fields a caller set, checked; ``_UNSET`` ones are left out (kept from the current state)."""
-    out: dict[str, Any] = {}
-    if title is not _UNSET:
-        out["title"] = _line("title", title, _TITLE_MAX)
-    if tier is not _UNSET:
-        if tier is not None and tier not in TIERS:
-            raise CoordError(f"unknown tier {str(tier)[:20]!r}; one of {', '.join(TIERS)}")
-        out["tier"] = tier
-    if done_line is not _UNSET:
-        out["done_line"] = None if done_line is None else _line("done_line", done_line, _DONE_MAX)
-    if depends_on is not _UNSET:
-        if isinstance(depends_on, str) or not isinstance(depends_on, (builtins.list, tuple)):
-            raise CoordError("depends_on is a list of item ids")
-        deps: builtins.list = []
-        for d in depends_on:
-            if not isinstance(d, str) or _ITEM_ID.fullmatch(d) is None:
-                raise CoordError(f"a dependency is an item id (got {str(d)[:40]!r})")
-            if d == item_id:
-                raise CoordError(f"{item_id} cannot depend on itself")
-            if d.startswith(_PROJECTION_PREFIXES):
-                raise CoordError(f"{d} is a projection id (seat:, ci:, np-): never a dependency, it is never done")
-            if d not in deps:
-                deps.append(d)
-        if len(deps) > _DEPENDS_MAX:
-            raise CoordError(f"at most {_DEPENDS_MAX} dependencies")
-        out["depends_on"] = deps
-    for name, value, high in (("hold", hold, _WHY_MAX), ("residue", residue, _WHY_MAX), ("ref", ref, _REF_MAX)):
-        if value is not _UNSET:
-            out[name] = None if value is None else _line(name, value, high)
-    if rank is not _UNSET and rank is not None:
-        if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank <= 10**9:
-            raise CoordError("rank is an integer from 0")
-        out["rank"] = rank
-    return out
+class V1Retired(CoordError):
+    """A write to the v1 ready queue (``ready_journal`` / ``ready_items`` / ``worker_attach``). The tables and their
+    append triggers stay, so what they hold stays readable and immutable; this is the ONE v1 write function, and it
+    raises, so "no more rows" is enforced in code and never left as a convention."""
 
 
-def _local_iso(now: str) -> tuple[float, str]:
-    when = parse_stamp(now)
-    return when.timestamp(), when.astimezone().isoformat(timespec="seconds")
+def _transition(store: CoordStore, token: Any, item_id: Any, **_: Any) -> dict:
+    """THE v1 write path: retired. It checks nothing and writes nothing."""
+    raise V1Retired(RETIRED)
 
 
-def _insert_journal(conn: sqlite3.Connection, rec: Mapping[str, Any], *, ver: int, gseq: int, at: str,
-                    token: int) -> None:
-    conn.execute(
-        "INSERT INTO ready_journal (id, ver, gseq, ts, iso, at, repo, from_status, to_status, from_category, "
-        "to_category, who, why, source, applied_by, lease_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (rec["id"], ver, gseq, rec["ts"], rec["iso"], at, rec["repo"], rec["from_status"], rec["to_status"],
-         rec["from_category"], rec["to_category"], rec["who"], rec["why"], rec["source"], rec["applied_by"], token))
+def add(store: CoordStore, token: Any, item_id: str, **kw: Any) -> dict:
+    """Retired: raises :class:`V1Retired`."""
+    return _transition(store, token, item_id, **kw)
 
 
-def _insert_state(conn: sqlite3.Connection, state: Mapping[str, Any], *, item_id: str, ver: int, who: str,
-                  at: str) -> None:
-    conn.execute(
-        "INSERT INTO ready_items (id, ver, repo, title, status, category, tier, done_line, depends_on, rank, set_by, "
-        f"set_at, {', '.join(FACT_COLS)}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {', '.join('?' * len(FACT_COLS))})",
-        (item_id, ver, state["repo"], state["title"], state["status"], state["category"], state["tier"],
-         state["done_line"], json.dumps(state["depends_on"]), state["rank"], who, at,
-         *(state.get(c) for c in FACT_COLS)))
+def move(store: CoordStore, token: Any, item_id: str, **kw: Any) -> dict:
+    """Retired: raises :class:`V1Retired`."""
+    return _transition(store, token, item_id, **kw)
 
 
-def _refuse_cycle(conn: sqlite3.Connection, item_id: str, deps: Sequence[str]) -> None:
-    """Refuse ``depends_on`` that closes a cycle through the store's current items (read under the write lock):
-    every item on it would be held forever."""
-    graph = {r["id"]: r["depends_on"] for r in _current(conn)}
-    stack, seen = [*deps], set()
-    while stack:
-        d = stack.pop()
-        if d == item_id:
-            raise CoordError(f"{item_id} depending on {', '.join(deps)} closes a dependency cycle back to itself")
-        if d not in seen:
-            seen.add(d)
-            stack.extend(graph.get(d, ()))
-
-
-class _Written(dict):
-    """A journal record that also carries ``ver``: the version its own write transaction produced. Still exactly the
-    SCHEMA §6 fields as a mapping."""
-
-    def __init__(self, rec: Mapping[str, Any], *, ver: int) -> None:
-        super().__init__(rec)
-        self.ver = ver
-
-
-def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: Any, why: Any, source: str,
-                creating: bool, repo: Any = None, **fields: Any) -> dict:
-    """THE write path: checks, then ONE fenced write transaction that writes the journal record and then the state
-    row; a failure anywhere rolls both back. Returns the journal record (SCHEMA §6 fields) as a :class:`_Written` (a plain dict with ``.ver``, the version this transaction wrote)."""
-    token = _check_token(token)
-    why = _line("why", why, _WHY_MAX)
-    who = _line("who", who, _WHO_MAX)
-    to = _check_to(to)
-    item_id = _check_id(item_id)
-    changes = _fields(item_id, **fields)
-    if creating:
-        if not isinstance(repo, str) or _REPO.fullmatch(repo) is None:
-            raise CoordError("an item's repo is its project key (flow, levain, ...)")
-        if "title" not in changes:
-            raise CoordError("a new item needs a title")
-    try:
-        # a lifecycle write never makes a store: a desk holding a live lease always has one
-        with store._write(ROLE_DESK, token, create=False) as (conn, now):
-            if not _lifecycle_present(conn):        # a store made before C13: the write path makes the tables, in its txn
-                for stmt in LIFECYCLE_SCHEMA:
-                    conn.execute(stmt)
-            diverged = _diverged(conn, item_id)     # loud and named, before a write that would fail on the journal's key
-            if diverged:
-                raise diverged[0]
-            found = _current(conn, item_id)
-            prior = found[0] if found else None
-            if creating and prior is not None:
-                raise CoordError(f"{item_id} already exists ({prior['category']}); move or correct it")
-            if not creating and prior is None:
-                raise CoordError(f"{item_id} is not in the desk store; add it first")
-            facts = _facts(conn, item_id) if prior is not None else dict.fromkeys(FACT_COLS)
-            if prior is None:
-                rank = changes.get("rank")
-                if rank is None:
-                    top = conn.execute(f"SELECT MAX(rank) FROM ({_CURRENT}) WHERE repo = ?", (repo,)).fetchone()[0]
-                    rank = 1 if top is None else top + 1
-                state = {"repo": repo, "title": changes["title"], "tier": changes.get("tier"),
-                         "done_line": changes.get("done_line"), "depends_on": changes.get("depends_on", []),
-                         "rank": rank, **{c: changes[c] for c in FACT_COLS if c in changes}}
-            else:
-                state = {k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")}
-                state.update(changes)
-            if "depends_on" in changes:
-                _refuse_cycle(conn, item_id, state["depends_on"])
-            for c in FACT_COLS:         # a move carries every fact it was not asked to change
-                state.setdefault(c, facts[c])
-            state["category"] = state["status"] = to        # v1: the status IS the category name (§3)
-            if prior is not None and all(state[k] == {**prior, **facts}[k] for k in (*_STATE_FIELDS, *FACT_COLS)):
-                raise CoordError(f"{item_id} already reads so; nothing to write")
-            ver = 1 if prior is None else prior["ver"] + 1
-            ts, iso = _local_iso(now)
-            rec = {"ts": ts, "iso": iso, "id": item_id, "repo": state["repo"],
-                   "from_status": None if prior is None else prior["status"], "to_status": state["status"],
-                   "from_category": None if prior is None else prior["category"], "to_category": to,
-                   "who": who, "why": why, "source": source, "applied_by": None}
-            _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
-            _insert_state(conn, state, item_id=item_id, ver=ver, who=who, at=now)
-    except StoreAbsent as exc:
-        raise CoordError(f"no desk store at {Path(str(store.path)).parent}; no state was written") from exc
-    return _Written(rec, ver=ver)           # the version THIS transaction wrote, never a later read of the journal
-
-
-def add(store: CoordStore, token: Any, item_id: str, *, repo: str, title: str, who: str, why: str,
-        to: str = "backlog", tier: Any = None, done_line: Any = None, depends_on: Any = (),
-        rank: Any = None, hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
-    """A new item, in ``to`` (default ``backlog``), with its ``add`` journal record. Refused if the id exists."""
-    return _transition(store, token, item_id, to=to, who=who, why=why, source="add", creating=True, repo=repo,
-                       title=title, tier=tier, done_line=done_line, depends_on=[*depends_on]
-                       if isinstance(depends_on, (builtins.list, tuple)) else depends_on, rank=rank,
-                       hold=hold, residue=residue, ref=ref)
-
-
-def move(store: CoordStore, token: Any, item_id: str, *, to: str, who: str, why: str, title: Any = _UNSET,
-         tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET,
-         hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
-    """Move an existing item to ``to`` (and change any field given), with its ``move`` journal record."""
-    return _transition(store, token, item_id, to=to, who=who, why=why, source="move", creating=False,
-                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank,
-                       hold=hold, residue=residue, ref=ref)
-
-
-def correct(store: CoordStore, token: Any, item_id: str, *, to: str, who: str, why: str, title: Any = _UNSET,
-            tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET,
-         hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
-    """Correct a wrong state: a NEW record with ``source: "correction"`` (§6), never an edit of an old one."""
-    return _transition(store, token, item_id, to=to, who=who, why=why, source="correction", creating=False,
-                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank,
-                       hold=hold, residue=residue, ref=ref)
+def correct(store: CoordStore, token: Any, item_id: str, **kw: Any) -> dict:
+    """Retired: raises :class:`V1Retired`."""
+    return _transition(store, token, item_id, **kw)

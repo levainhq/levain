@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Removed
+
+- **BREAKING: the v1 ready queue is retired, every write path (board levain#101, slice of levain#88).** `levain desk ready add|move|correct`, `levain desk import-status` and `levain desk report` now refuse (exit 2, nothing written, no store opened, no token needed), naming `levain board add`. `ready.add`, `move` and `correct` raise `levain.desk.ready.V1Retired` through `ready._transition`, the one remaining v1 write function; `ready.record_landed` is deleted; `status_import.import_status` and `work_attach.enqueue_report` raise. `apply_reports`, `desk_apply` (`levain desk apply-reports`) and the watch's pass (`work_attach.watch_apply`) no longer write a `worker_attach` row, a refusal, a landed sha or a `sessions_seen` sighting; a report still queued at the switch is drained once, read-only, into one log line and recorded in `reports.drained` beside the queue, never applied. The v1 tables (`ready_journal`, `ready_items`, `worker_attach`, `report_refusals`) and their append triggers stay, so what they hold stays readable and immutable. `levain desk ready show [--repo NAME]` now prints `levain board state`'s board for that repo and one line saying the queue is retired. A caller of the old verbs (scripts, hooks, seats) must move to `levain board add|amend|decide` and `levain board state`.
+- **Board changes leave the desk's ordered `gseq` stream (board levain#101).** The work delta in a desk reply, `levain desk log` and the open's Since section no longer read `ready_journal` (`ready_journal` moves from the counted tables to the exempt ones): the stream is one SQLite snapshot, which a JSONL board cannot join. The desk's open prints one board block from `levain board state`'s own read (`board_cli.state_doc`), and `Board: cannot-derive (...)` when it cannot be read, never an empty board.
+
+### Changed
+
+- **`coord launch_request(attach_item=)` and `coord spawn --item` are the v2 claim (board levain#101).** The item is a board id (`NAME#N`, a malformed one refuses the whole request and leaves no launch); it is written on the launch record in the request's own transaction (new table `launch_board_items`, read as `Launch.board_items`, which `board_producers`' seats block reads), and no v1 item is required or read. `spawn --item` no longer opens `<levain home>/board`; the claim rides the desk's own store like the launch.
+
 ### Added
 
 - **The read budget logs every deny (board levain row 800, residue R3).** When `decide_pre` denies a Read it appends one JSON row (`path`, `bytes`, `price`, `remaining`, `session`, `utc`) to `denials-<session hash>.jsonl` beside the ledger in the state directory; a write failure is swallowed and never changes the decision. Allows write nothing.
