@@ -24,11 +24,13 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
@@ -860,6 +862,59 @@ def signing_public_key(key_path: Path) -> str:
     return normalise_public_key(text)
 
 
+_SK_RETRIES = 1                # a security-key answer that does not verify is asked for once more, never twice (levain#125)
+_SIGN_FAILURE_KEEP = 20        # evidence files kept per key directory; older ones are deleted when a new one is written
+_SIGN_FAILURE_DIR = "sign-failures"
+_SIGN_FAILURE_PREFIX = "sigfail-"
+
+
+@dataclass(frozen=True)
+class _SkRefusal:
+    """An sk signature that carried the presence flag but did not verify: what ``sign`` needs to retry and to say so."""
+    flags: int
+    carried: str
+    detail: str
+    evidence: str                # the evidence file's path, or "evidence not written (<why>)"
+
+
+def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
+                        counter: int | None, detail: str, namespace: str, attempt: int) -> str:
+    """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
+    (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
+    (it has no data root or diagnostics directory of its own). The last :data:`_SIGN_FAILURE_KEEP` are kept; older
+    ones are deleted. The file holds the armored signature, its flags byte and counter, BOTH ssh-keygen verdicts
+    (``detail``), the key fingerprint and the time.
+
+    It holds the message's sha256 and NEVER the message: the message is what a person was asked to authorise
+    (a consent answer, a ruling's words), and a diagnostics file that sat on disk would become a second, unguarded copy of
+    it. The hash is enough to tie the file to the message the caller still holds, and the armored signature is enough to
+    re-run ``check-novalidate`` once that message is in hand. Returns the path, or ``evidence not written (why)``: a
+    diagnostic never changes whether a sign is refused."""
+    try:
+        directory = Path(key_path).parent / _SIGN_FAILURE_DIR
+        directory.mkdir(mode=0o700, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        record = {"format": "levain-sign-failure/1", "time": now.isoformat(), "fingerprint": fp, "namespace": namespace,
+                  "algorithm": sig_type, "flags": format(flags, "#04x"), "counter": counter, "attempt": attempt,
+                  "message_sha256": hashlib.sha256(message).hexdigest(), "message_bytes": len(message),
+                  "ssh_keygen": detail, "signature": signature}
+        body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
+        stem = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid()}-{attempt}"
+        path = directory / f"{stem}.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        mine = sorted(p for p in directory.iterdir() if p.name.startswith(_SIGN_FAILURE_PREFIX) and p.suffix == ".json")
+        for old in mine[:max(0, len(mine) - _SIGN_FAILURE_KEEP)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 - the evidence is a courtesy; the refusal is the point
+        return f"evidence not written ({type(exc).__name__}: {getattr(exc, 'strerror', None) or exc})"
+
+
 def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                namespace: str = NAMESPACE, timeout: float | None = None) -> tuple[str, Signer]:
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
@@ -884,6 +939,31 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     no_agent = is_encrypted_file(key_path) or (sidecar is not None and sidecar.custody == PASSPHRASE)
 
     def sign(message: bytes) -> str:
+        """One signature over ``message``. A security-key (sk-*) answer that does not verify is asked for ONCE more (a
+        new sign over the same message, so a second touch); that retry loop is these few lines and nothing else: the
+        bound is :data:`_SK_RETRIES`, a constant, and ``_once`` itself never retries. Everything else (a cancel, a
+        timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt."""
+        first = _once(message, 1)
+        if isinstance(first, str):
+            return first
+        failed = [first]
+        for n in range(_SK_RETRIES):
+            # stderr is the terminal's, where the touch prompt already goes; the words say what happened, not that it is safe
+            print("the key's answer did not check out; touch again", file=sys.stderr, flush=True)
+            again = _once(message, n + 2)
+            if isinstance(again, str):
+                return again
+            failed.append(again)
+        a, b = failed[0], failed[-1]
+        raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp}, and both attempts failed "
+                        f"(the key's answer did not check out, and touching again did not help): "
+                        f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.detail}; {a.evidence}); "
+                        f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.detail}; {b.evidence}); "
+                        "so nothing was signed")
+
+    def _once(message: bytes, attempt: int) -> "str | _SkRefusal":
+        """One ``ssh-keygen -Y sign`` and its check: the signature, a :class:`_SkRefusal` for an sk signature that
+        presence-checks but does not verify (the one retryable failure), or a raised :class:`KeyError_`."""
         from levain.launch import child_env
 
         # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
@@ -934,6 +1014,16 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                                 "so nothing was signed")
             detail = _authority_sig.verify_failure_detail(message, signature, public_key=public_key,
                                                           namespace=namespace, ssh_keygen=ssh_keygen)
+            if flags is not None and sig_type.startswith("sk-"):
+                try:
+                    counter = _authority_sig._sshsig_type_flags_counter(signature)[2]
+                except Exception:  # noqa: BLE001 - the counter is evidence only
+                    counter = None
+                # kept as evidence, then handed to ``sign`` for its one retry; the file's path rides in the error text
+                evidence = _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
+                                               flags=flags, counter=counter, detail=detail, namespace=namespace,
+                                               attempt=attempt)
+                return _SkRefusal(flags, carried, detail, evidence)
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
                             "so nothing was signed")
         return signature

@@ -122,7 +122,14 @@ def sshsig_public_key(armored: Any) -> tuple[str, str, str]:
 
 
 def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
-    """The signature algorithm inside an armored SSHSIG, and its FIDO flags byte (None for a non-sk
+    """:func:`_sshsig_type_flags_counter` without the counter: the algorithm and the FIDO flags byte (None for a
+    non-sk algorithm). Raises ValueError on anything malformed."""
+    sig_type, flags, _counter = _sshsig_type_flags_counter(armored)
+    return sig_type, flags
+
+
+def _sshsig_type_flags_counter(armored: str) -> tuple[str, int | None, int | None]:
+    """The signature algorithm inside an armored SSHSIG, and its FIDO flags byte and counter (None for a non-sk
     algorithm). Raises ValueError on anything malformed.
 
     The SSHSIG blob (OpenSSH PROTOCOL.sshsig §"Blob format"): byte[6] "SSHSIG", uint32 version (1),
@@ -139,14 +146,14 @@ def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     webauthn = sig_type == _WEBAUTHN_SIG_TYPE
     if not (sig_type.startswith("sk-") or webauthn):
         inner.end()
-        return sig_type, None
+        return sig_type, None, None
     flags = inner.take(1)[0]
-    inner.u32()
+    counter = inner.u32()
     if webauthn:
         for _ in range(3):          # origin, clientData, extensions: ssh-keygen checks them against the message
             inner.string()
     inner.end()
-    return sig_type, flags
+    return sig_type, flags, counter
 
 
 def presence_missing(signature: str, public_key: str) -> bool:
