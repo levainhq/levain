@@ -127,3 +127,36 @@ def test_an_np_id_is_refused_up_front_on_the_ceremony_verbs(world, capsys):
     rc, _, err = run(capsys, "track", "alpha", "--words", "y", "--source", "np-1b3dd088", *BY)
     assert rc == 2 and "np-" in err
     assert [r["op"] for r in reg(store)] == ["register"]
+
+
+@pytest.mark.parametrize("kind", ["agent", "operator"])
+def test_source_with_sign_is_refused_on_every_verb_and_writes_nothing(world, capsys, kind):
+    store, _, mf, sha, band = world
+    band.rows[Q1] = br.BandRow(f"Begin? {sha}", "yes", "unsigned-terminal", "native")
+    verbs = (["add", "--repo", "alpha", "--title", "x", "--origin", "d", "--words", "yes"],
+             ["amend", "--id", "alpha#1", "--why", "w", "--words", "yes"],
+             ["decide", "--id", "alpha#1", "--decision", "cut", "--words", "yes"],
+             ["begin-track", "alpha", "--manifest", str(mf), "--words", "yes"],
+             ["track", "alpha", "--words", "yes"])
+    for verb in verbs:
+        rc, _, err = run(capsys, *verb, "--source", Q1, "--sign", "--author-kind", kind, *BY)
+        assert rc == 2 and "--source and --sign cannot be used together" in err, verb
+    assert [r["op"] for r in reg(store)] == ["register"] and not (store / "items.jsonl").exists()
+
+
+def test_the_writers_refuse_a_relay_and_a_seal_together_whatever_the_cli(world):
+    from levain.desk import board_registry as brg
+    from levain.desk import board_store as bs
+    store, _, mf, sha, band = world
+    target = bs.resolve_store(str(store))
+    relay, seal, author = (Q1, band), object(), {"kind": "operator", "name": "desk 24"}
+    with pytest.raises(bs.BoardError, match="never both"):
+        bs.add(target, "alpha", "t", "d", "desk 24", author=author, relay=relay, seal=seal)
+    with pytest.raises(bs.BoardError, match="never both"):
+        bs.amend(target, "alpha#1", "w", "desk 24", {"words": "y"}, author=author, relay=relay, seal=seal)
+    with pytest.raises(bs.BoardError, match="never both"):
+        bs.decide(target, "alpha#1", "cut", "y", "desk 24", author=author, relay=relay, seal=seal)
+    with pytest.raises(bs.BoardError, match="never both"):
+        brg.begin_track(target, "alpha", mf, "y", "desk 24", author=author, relay=relay, seal=seal)
+    with pytest.raises(bs.BoardError, match="never both"):
+        brg.track(target, "alpha", "y", "desk 24", author=author, relay=relay, seal=seal)
