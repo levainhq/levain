@@ -2320,7 +2320,7 @@ def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
                           got["skipped"].items())
         only = " only" if got["skipped"] else ""
         _emit(out, args.json, got, f"away ON for {', '.join(got['marked'])}{only}, on the operator's word in drop "
-                                   f"{args.drop_id}; KNOW {got['item_id']} tells him. Only he can leave it.{skipped}")
+                                   f"{args.drop_id}; KNOW {got['item_id']} tells the operator. Only the operator can leave it.{skipped}")
         return 0
     threads = [args.thread] if args.thread else [t.thread_id for t in store.threads()]
     with read_transaction(store._connect) as conn:
@@ -2602,7 +2602,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     # sensor events (ND-1): never drops. The sensors' verbs (register, retire, post, progress) are not the desk's; it
     # reads (list) and writes its decision (ack) through the door, under its lease token
-    evp = c_sub.add_parser("event", help="Sensor events: reports from registered sensors, never his words.")
+    evp = c_sub.add_parser("event", help="Sensor events: reports from registered sensors, never the operator's words.")
     ev_sub = evp.add_subparsers(dest="event_cmd", required=True)
     evr = ev_sub.add_parser("register", help="Register a sensor with a trust ceiling; writes its credential file (yours).")
     evr.add_argument("--sensor", required=True, help="The sensor's id: a-z 0-9 . _ -")
@@ -2668,7 +2668,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     # standing orders (ND-2): his signed authority for the night desk. The operator's verbs, never the desk's door:
     # the desk reads its orders quoted in its brief, and signs nothing
-    orp = c_sub.add_parser("order", help="Standing orders: what he signed the night desk to do on judgement.")
+    orp = c_sub.add_parser("order", help="Standing orders: what the operator signed the night desk to do on judgement.")
     or_sub = orp.add_subparsers(dest="order_cmd", required=True)
     ors = or_sub.add_parser("sign", help="Show the whole restatement of an order and sign it with a laptop key.")
     ors.add_argument("--file", type=Path, required=True, metavar="ORDER_JSON",
@@ -2747,7 +2747,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     can = c_sub.add_parser(
         "answer", help="Answer a seat's question as your own KNOW (never the operator's answer).",
         description="Files a KNOW (the operator's review queue, never a push) and delivers it to the asking session "
-                    "labelled as yours. The question stays open: the operator may still answer, and his answer is "
+                    "labelled as yours. The question stays open: the operator may still answer, and the operator's answer is "
                     "the one that counts. Refused (escalate instead) outside the envelope.")
     can.add_argument("ref", help="The question's number or id.")
     pick = can.add_mutually_exclusive_group(required=True)
@@ -2758,7 +2758,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     pick.add_argument("--stdin", action="store_true", help="Your answer, read from stdin.")
     can.add_argument("--token", type=int, required=True, help="Your desk lease token.")
     can.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
-    ces = c_sub.add_parser("escalate", help="Leave a seat's question to the operator (an ANSWER waiting on him).")
+    ces = c_sub.add_parser("escalate", help="Leave a seat's question to the operator (an ANSWER waiting on the operator).")
     ces.add_argument("ref", help="The question's number or id.")
     ces.add_argument("--why", default=None, help="Why it is the operator's, one line.")
     _text_flags(ces)
@@ -2778,7 +2778,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     crp = c_sub.add_parser(
         "reply", help="Answer words dropped from the cockpit or the phone (one reply per drop, within 24 hours).",
         description="Files your reply to a drop, shown on the Desk panel with Levain's block frozen at this "
-                    "moment (what changed since his last message, and the question band). The store refuses a drop "
+                    "moment (what changed since the operator's last message, and the question band). The store refuses a drop "
                     "that does not exist, a second reply to a drop, and a drop older than the window.")
     crp.add_argument("drop_id", metavar="DROP", help="The drop you answer.")
     crp.add_argument("--text", default=None, help="Your reply.")
@@ -2849,10 +2849,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     crs.set_defaults(func=_coord_reports)
     door_ok(crs)
     caw = c_sub.add_parser(
-        "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
+        "away", help="Read a drop as the operator's word that they are away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
-                    "UNDECIDED for his morning card, and files a KNOW saying so. Leaving away takes his signature.")
-    caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say he is away.")
+                    "UNDECIDED for the operator's morning card, and files a KNOW saying so. Leaving away takes the operator's signature.")
+    caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say the operator is away.")
     caw.add_argument("--token", type=int, required=True, help="Your desk lease token.")
     ccl = c_sub.add_parser(
         "close", help="Leave a handoff for the next desk (a rotation, the operator leaving, a dream).",
@@ -2863,7 +2863,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "In the body, name rows by id (dr-..., item keys), never by ordinal: the next desk "
                     "sees ids, not your order. Each field is one line (a newline or control is refused). "
                     "--plan instead prints the operator-walk checklist (read-only; it writes nothing and takes no "
-                    "--body-file): what to walk with him before you write the operator handoff.")
+                    "--body-file): what to walk with the operator before you write the operator handoff.")
     ccl.add_argument("--plan", action="store_true",
                      help="Print the operator-walk checklist, derived from the stores; writes nothing.")
     ccl.add_argument("--kind", default=None, choices=_seam_handoffs.KINDS, help="Required unless --plan.")
@@ -2896,7 +2896,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="With --light: the gap under which no light open is needed (default 4).")
     cop.add_argument("--dream-body-file", dest="dream_body_file", type=Path, default=None, metavar="PATH",
                      help="Hand this desk over onto the memory a dream saved: PATH is the handoff body (JSON, every "
-                          "key). Your statement that you are at a seam (not while he is typing, not mid-work); it "
+                          "key). Your statement that you are at a seam (not while the operator is typing, not mid-work); it "
                           "writes the dream handoff and asks for the next desk, only when a dream saved after you "
                           "started and nothing of yours is claimed or unacknowledged. Refused with --light or --ack.")
     cop.add_argument("--verbose", action="store_true",
