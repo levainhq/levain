@@ -87,34 +87,11 @@ Q_RE = re.compile(r"q-[0-9a-f]{24}")
 NATIVE_PRODUCER = "native"
 
 
-def native_grade(store: Any, question: Any) -> str:
-    """How a resolved native row was answered, the STORE'S CLAIM (the signature is not re-verified here): the same logic and
-    vocabulary as ``levain.desk.board_producers._grade`` (collapse into board_producers._grade at restack).
-
-    ``Answer.signed`` when set, else the signing sidecar's ``sign_state`` (``band_view.answer_sign_of``): ``signed`` -> signed,
-    ``unsigned`` -> unsigned, anything else, no sidecar row, or an unreadable sidecar -> ``unknown``. The place is ``phone`` when
-    the answer's channel is phone, else ``terminal``. Returns ``signed-phone | signed-terminal | unsigned-phone |
-    unsigned-terminal | unknown``; ``unknown`` is reported as such, never as signed."""
-    from levain import band_view
-
-    answer = question.answer
-    signed = answer.signed
-    if signed is None:
-        try:
-            state = (band_view.answer_sign_of(store, question.id) or {}).get("sign_state")
-        except Exception:                           # noqa: BLE001 - a sidecar that cannot be read is a grade the store cannot say
-            state = None
-        signed = True if state == "signed" else False if state == "unsigned" else None
-    where = "phone" if answer.channel == "phone" else "terminal"
-    if signed is True:
-        return f"signed-{where}"
-    return f"unsigned-{where}" if signed is False else "unknown"
-
-
 class NativeBandSource:
     """Levain's own band (``questions.db``). It reads a native ``q-<hex>`` id; an ``np-`` id is flow's (T12's reader), so it
-    is not a row this band holds. The row's grade is the STORE'S CLAIM of a signature (:func:`native_grade`, one logic with board_producers._grade), never a
-    verification. An option answer's text is its option key, as stored."""
+    is not a row this band holds. The row's grade is the STORE'S CLAIM of a signature (``board_producers._grade``, the one
+    grade function the board's evidence and this relay share), never a verification. An option answer's text is its option key,
+    as stored."""
 
     def __init__(self, store: Any, producer: str = NATIVE_PRODUCER) -> None:
         self._store = store
@@ -138,7 +115,8 @@ class NativeBandSource:
             raise BandRefusal(f"{np_id} is not a row this band holds")
         if q.answer is None:
             raise BandRefusal(f"{np_id} is unanswered")
-        return BandRow(q.what, q.answer.value, native_grade(self._store, q), self._producer)
+        from levain.desk import board_producers
+        return BandRow(q.what, q.answer.value, board_producers._grade(self._store, q), self._producer)
 
 
 def band_source(directory: Path | str | None = None) -> BandSource:

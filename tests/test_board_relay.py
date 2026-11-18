@@ -539,3 +539,14 @@ def test_r14_a_missing_band_store_says_so(tmp_path):
     d = tmp_path / "nowhere"
     with pytest.raises(br.BandRefusal, match="no band store at"):
         br.NativeBandSource(QuestionStore(d)).row("q-" + "a" * 24)
+
+
+def test_the_native_row_grade_is_board_producers_one_grade_function(tmp_path):
+    from levain.desk import board_producers as bp
+    d = tmp_path / "consent"
+    d.mkdir(mode=0o700)
+    qs = QuestionStore(d)
+    q = qs.file(agent="claude_code", agent_session_id="s", what="Ship?", options=(), rec="", blocks="b", cwd="/tmp", open_ended=True)
+    qs.answer(q.id, text="yes", channel="phone")
+    assert not hasattr(br, "native_grade")
+    assert br.NativeBandSource(qs).row(q.id).answer_grade == bp._grade(qs, qs.get(q.id)) == "unknown"
