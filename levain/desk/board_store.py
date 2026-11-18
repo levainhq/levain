@@ -754,7 +754,7 @@ def known_ids(target: Target) -> set[str]:
     if not target.items_path.exists():
         return set()
     with store_lock(target.store_dir, exclusive=False):
-        raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH, deadline)
+        raw = _read_stable(target.store_dir / target.items_path.name, fcntl.LOCK_SH)
     return {r["id"] for r in _records_from(raw) if r.get("op") == "add"}
 
 

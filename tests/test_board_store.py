@@ -456,6 +456,13 @@ def test_a_reader_does_not_create_store_lock(home, tmp_path, capsys):
     assert (store / "store.lock").exists()
 
 
+def test_known_ids_reads_a_store_that_holds_an_item(home, tmp_path, capsys):
+    """Regression (levain 29, 11-17): the T3 restack left an undefined name in known_ids; only the empty-store path was tested."""
+    use(capsys, tmp_path / "s")
+    assert run(capsys, *ADD)[1] == "levain#1"
+    assert bs.known_ids(bs.resolve_store()) == {"levain#1"}
+
+
 def test_short_writes_are_looped_to_the_end(home, tmp_path, capsys, monkeypatch):
     real = os.write
     monkeypatch.setattr(bs.os, "write", lambda fd, data: real(fd, bytes(data)[:1]))
