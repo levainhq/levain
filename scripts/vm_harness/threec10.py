@@ -160,6 +160,15 @@ def usage_microdollars(fetch: Fetch, key: str, timeout: float = 15) -> int:
     return round(usage * 1_000_000)
 
 
+def install_answer(out: str, cred: str) -> str:
+    """What may be recorded of a stdin-fed install's stdout: never a line of it (a partial echo of the key survives any scrub),
+    only a refusal the script itself can print, in its own exact words, else the length."""
+    for ln in out.splitlines():
+        if re.fullmatch(re.escape(f"cred-refused {cred}: ") + r"(?:[\w./-]*/" + re.escape(f"{cred}.json") + r" already exists|empty credential)", ln):
+            return ln
+    return f"stdout withheld ({len(out)} chars)"
+
+
 def credential_json(cred: str, key: str) -> str:
     """The keys credential file for a static OpenRouter key (the shape ``levain.broker.creds.parse`` reads)."""
     if not CRED_NAME_RE.fullmatch(cred):
@@ -300,14 +309,14 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         refusal = next((ln for ln in lines if ln.startswith("cred-refused ")), None)
         if refusal:
             refused = True        # nothing of ours was written: a file that was there is never removed
-            done(sid, "REFUSED", detail=refusal)
+            done(sid, "REFUSED", detail=install_answer(out, cfg.cred))
             return False
         if f"cred-installed {cfg.cred}" in lines:
             state = "confirmed"
         else:
             if attempted_from != "confirmed":
                 state, uncertain_why, uncertain_payload = "uncertain", f"{sid}: the install script printed neither cred-installed nor cred-refused", payload
-            done(sid, "ERROR", raw=lines[-1] if lines else "", detail="no cred-installed line: install result UNCERTAIN")
+            done(sid, "ERROR", detail=f"no cred-installed line (exit 0, {install_answer(out, cfg.cred)}): install result UNCERTAIN")
             return False
         judged(sid, lines, 0)
         return results[sid].status == "PASS"

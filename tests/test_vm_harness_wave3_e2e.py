@@ -132,7 +132,7 @@ class World:
             script, name = argv[4], argv[7]
             if script == T3.INSTALL_SCRIPT:
                 if argv[8] != "replace" and name in self.files:
-                    return f"cred-refused {name}: already exists\n"
+                    return f"cred-refused {name}: {argv[6]}/keys/cred/{name}.json already exists\n"
                 self.files[name] = text
                 return f"cred-installed {name}\n"
             if script == T3.REMOVE_SCRIPT:
@@ -424,6 +424,16 @@ def test_an_existing_credential_refuses_and_is_left(tmp_path):
     w.files[CRED] = "HIS"
     _w, _ev, (status, steps, _p) = go(tmp_path, w)
     assert by_id(steps)["W1"].status == "REFUSED" and status == "REFUSED" and w.files == {CRED: "HIS"}
+
+
+def test_an_install_that_exits_clean_echoing_part_of_the_key_records_no_stdout_line(tmp_path):
+    w = World()
+    frag = KEY[:20]
+    orig = w.stdin_run
+    w.stdin_run = lambda argv, text, timeout=60: (frag + "\n") if argv[4] == T3.INSTALL_SCRIPT else orig(argv, text, timeout)
+    _w, ev, (_status, steps, path) = go(tmp_path, w)
+    assert by_id(steps)["W1"].status == "ERROR"
+    assert frag not in (ev / "steps.log").read_text() and frag not in path.read_text()
 
 
 # ---- couplings to the product -------------------------------------------------------------------------------------------

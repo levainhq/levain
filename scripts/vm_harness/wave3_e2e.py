@@ -63,7 +63,7 @@ from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, profi
 from scripts.vm_harness.journey8 import LEVAIN_ROOT, StepResult, levain_argv
 from scripts.vm_harness.runbook import Evidence, RunbookError, Verdict, capture, judge, overall
 from scripts.vm_harness.threec10 import (CRED_NAME_RE, INSTALL_SCRIPT, REMOVE_SCRIPT, USD, VERIFY_SCRIPT, FetchError,
-                                         credential_json, default_fetch, lineage_rows, usage_microdollars)
+                                         credential_json, default_fetch, install_answer, lineage_rows, usage_microdollars)
 
 KEY_ENV = "LEVAIN_WAVE3_KEY"
 RUNNER_MODULE = "levain.dispatch.run_jobs"
@@ -414,10 +414,10 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
         lines = out.splitlines()
         refusal = next((ln for ln in lines if ln.startswith("cred-refused ")), None)
         if refusal:
-            raise StepFail(refusal, status="REFUSED")
+            raise StepFail(install_answer(out, cfg.cred), status="REFUSED")
         if f"cred-installed {cfg.cred}" not in lines:
             cred.update(state="uncertain", why="W1: the install script printed neither cred-installed nor cred-refused")
-            raise StepFail("no cred-installed line: install result UNCERTAIN", status="ERROR")
+            raise StepFail(f"no cred-installed line (exit 0, {install_answer(out, cfg.cred)}): install result UNCERTAIN", status="ERROR")
         cred["state"] = "confirmed"
 
     def cleanup() -> list[str]:

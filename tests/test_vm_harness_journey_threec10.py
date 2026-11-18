@@ -97,7 +97,7 @@ class World:
         assert store == STORE
         if script == T.INSTALL_SCRIPT:
             if argv[8] != "replace" and name in self.files:
-                return f"cred-refused {name}: already exists\n"
+                return f"cred-refused {name}: {store}/keys/cred/{name}.json already exists\n"
             self.files[name] = text
             return f"cred-installed {name}\n"
         if script == T.REMOVE_SCRIPT:
@@ -487,6 +487,17 @@ def test_t5_replaces_only_after_a_confirmed_t1(tmp_path):
     w, _ev, (status, _s, _p) = go(tmp_path)
     modes = [a[8] for a in w.argvs if len(a) > 8 and a[4] == T.INSTALL_SCRIPT]
     assert modes == ["new", "replace"] and status == "PASS"
+
+
+def test_an_install_that_exits_clean_echoing_part_of_the_key_records_no_stdout_line(tmp_path):
+    w = World()
+    frag = LIMITED[:20]
+    orig = w.stdin_run
+    w.stdin_run = lambda argv, text, timeout=60: (frag + "\n") if argv[4] == T.INSTALL_SCRIPT else orig(argv, text, timeout)
+    _w, ev, (_status, steps, path) = go(tmp_path, w)
+    t1 = by_id(steps)["T1"]
+    assert t1.status == "ERROR" and frag not in t1.raw and frag not in t1.detail      # the returned record too, not only the files
+    assert frag not in (ev / "steps.log").read_text() and frag not in path.read_text()
 
 
 def test_an_install_that_prints_nothing_is_uncertain_not_ours(tmp_path):
