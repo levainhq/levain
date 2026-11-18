@@ -3888,7 +3888,7 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 /* a part of the whole input not yet shown is tinted (the page clears the tint as the browser reports the part shown), and the button
    above the block goes to the first one: a touch fling passes parts without showing them (row 1118-12, card_format.js longText) */
 .long-whole > pre.long-full span.ns { background: rgba(214, 150, 0, 0.18); }
-.long-whole > .long-jump { display: block; width: 100%; min-height: var(--hit-min, 44px); margin: 0 0 var(--sp-2); padding: var(--sp-2) var(--sp-3); text-align: left; cursor: pointer; color: var(--text); background: transparent; border: 1px solid var(--line); border-radius: var(--r-sm); font: var(--fw-semibold) var(--fs-meta) var(--sans); }
+.long-whole > .long-jump { display: block; width: 100%; min-height: var(--hit-min, 44px); margin: 0 0 var(--sp-2); padding: var(--sp-2) var(--sp-3); text-align: left; cursor: pointer; color: var(--text); background: transparent; border: 1px solid var(--line); border-radius: var(--r-sm); font: var(--fw-semibold) var(--fs-meta) var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .long-whole > .long-jump[hidden] { display: none; }
 .long-whole > .long-jump:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 /* what of a long input is not yet shown, beside the answers: Allow opens once it is all seen (card_format.js seenGate) */

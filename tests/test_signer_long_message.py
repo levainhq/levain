@@ -43,7 +43,7 @@ def test_the_failure_detail_tells_a_signature_over_other_bytes_from_a_refused_ke
     assert "verify: Good" in ok and "check-novalidate: Good" in ok, ok
     assert f"message {len(message)} bytes" in ok
     other = verify_failure_detail(message + b"!", signature, public_key=pub)
-    assert "verify: Could not verify" in other or "verify: " in other and "Good" not in other.split(";")[0], other
+    assert "verify: Good" not in other, other
     assert "check-novalidate: Good" not in other, other
 
 

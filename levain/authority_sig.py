@@ -267,7 +267,7 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
 
 
 def verify_failure_detail(message: bytes, signature: str, *, public_key: str, namespace: str = NAMESPACE,
-                          ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, timeout: float = 10.0) -> str:
+                          ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, timeout: float = 2.0) -> str:
     """Words for a signature :func:`verify_link_sig` refused, for an error message only (never a verdict; nothing
     reads it back): what ``ssh-keygen -Y verify`` says about it against the key, and whether the signature is
     consistent over ``message`` at all (``-Y check-novalidate``, which takes the key out of the question). Told apart,
@@ -289,16 +289,19 @@ def verify_failure_detail(message: bytes, signature: str, *, public_key: str, na
         return (lines[0][:160] if lines else "no output") + f" (exit {cp.returncode})"
 
     out: list[str] = []
-    for label, build in (
-            ("verify", lambda fds: [str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", "authority-signer",
-                                    "-n", namespace, "-s", f"/dev/fd/{fds[1]}"]),
-            ("check-novalidate", lambda fds: [str(keygen), "-Y", "check-novalidate", "-n", namespace,
-                                              "-s", f"/dev/fd/{fds[1]}"])):
+    # each check names the pipes it reads: verify the signers line and the signature, check-novalidate the signature only
+    # (an unread pipe passed to the child would be a pipe nothing drains). A short bound each (the sign has already
+    # finished: this is error text, and must not hold the refusal back).
+    for label, readers, argv in (
+            ("verify", (signers, sig_bytes), lambda fds: [str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I",
+                                                         "authority-signer", "-n", namespace, "-s", f"/dev/fd/{fds[1]}"]),
+            ("check-novalidate", (sig_bytes,), lambda fds: [str(keygen), "-Y", "check-novalidate", "-n", namespace,
+                                                           "-s", f"/dev/fd/{fds[0]}"])):
         fds: list[int] = []
         try:
-            fds.append(_pipe_reading(signers))
-            fds.append(_pipe_reading(sig_bytes))
-            cp = subprocess.run(build(fds), input=message, capture_output=True, timeout=timeout,
+            for data in readers:
+                fds.append(_pipe_reading(data))
+            cp = subprocess.run(argv(fds), input=message, capture_output=True, timeout=timeout,
                                 env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
             out.append(f"{label}: {first(cp)}")
         except Exception as exc:  # noqa: BLE001
@@ -306,4 +309,4 @@ def verify_failure_detail(message: bytes, signature: str, *, public_key: str, na
         finally:
             for fd in fds:
                 os.close(fd)
-    return "; ".join(out) + f"; message {len(message)} bytes, sha256 {hashlib.sha256(message).hexdigest()[:12]}"
+    return "; ".join(out) + f"; message {len(message)} bytes"
