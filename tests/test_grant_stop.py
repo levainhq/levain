@@ -171,7 +171,8 @@ def test_t10_a_snapshot_that_cannot_name_a_grants_signers_stops_the_grant(world,
     no_current = replace(state, grant_seqs=MappingProxyType({}))
     zero = replace(state, grant_born=MappingProxyType({**state.grant_born, LID: 0}))
     past_head = replace(state, grant_seqs=MappingProxyType({**state.grant_seqs, LID: state.seq + 1}))
-    for broken in (short, longer, no_born, no_current, zero, past_head):
+    none = replace(state, link_signers=None)       # review r1: None fails closed, never a TypeError
+    for broken in (short, longer, no_born, no_current, zero, past_head, none):
         assert auth.grant_signers(broken, LID) is None
         assert auth.grant_stop_reason(broken, LID) is not None
         assert LID not in auth.grants_in_force(broken)

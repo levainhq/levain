@@ -1279,7 +1279,7 @@ def graduation_links(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str]
     if not graduation_grant(state.policy.grants.get(grant_id)):
         return None
     born, current = state.grant_born.get(grant_id), state.grant_seqs.get(grant_id)
-    signers = state.link_signers
+    signers = state.link_signers or ()          # a snapshot built with None names no signer: fails closed, never raises
     if born is None or current is None or len(signers) != state.seq \
             or not (1 <= born <= state.seq and 1 <= current <= state.seq):
         return None
@@ -1300,7 +1300,7 @@ def grant_signers(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str] | 
     if state.policy.grants.get(grant_id) is None:
         return None
     born, current = state.grant_born.get(grant_id), state.grant_seqs.get(grant_id)
-    signers = state.link_signers
+    signers = state.link_signers or ()          # None: fails closed (stopped), never a TypeError in a USE path
     if born is None or current is None or len(signers) != state.seq \
             or not (1 <= born <= state.seq and 1 <= current <= state.seq):
         return None

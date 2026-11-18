@@ -326,7 +326,8 @@ def _stopped_voice_keys(data_root: Path | str) -> dict[str, str]:
     """``provider -> why`` for each voice key the policy holds that a revoked signing key stopped
     (:func:`levain.authority.grant_stop_reason`), so the readout can say "stopped" where it would say "no key". Words
     only: nothing reads it to decide anything. Its own read of the log, so it is asked only when a provider shows no key
-    in force; a log that cannot be read says nothing here (``authority`` says that)."""
+    in force; a log that cannot be read says nothing here (``authority`` says that). Known edge, kept (review r1): a key
+    set or revoked between the two reads can show one wrong status word for one serve pass; no authority rides on it."""
     try:
         state = custody.authority_for(data_root)()
         return {str(g.get("provider")): why for gid, g in state.policy.grants.items()

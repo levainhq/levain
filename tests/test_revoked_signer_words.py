@@ -323,6 +323,32 @@ def test_t16_seat_lease_and_egress_list_say_stopped(world, capsys) -> None:
     assert code == 0 and out.startswith("se-aaaaaaaaaaaa") and STOPPED_ONE_LIVE in out and "no live seat-egress grant" not in out
 
 
+def test_review_r1_a_stopped_seat_grant_missing_a_field_lists_and_never_crashes(world, capsys, monkeypatch) -> None:
+    """Complement LOW (line 83): a foreign writer's stopped seat grant that lacks a display field still lists, its id
+    and fields through markers; the list never raises KeyError."""
+    from dataclasses import replace
+    from types import MappingProxyType
+
+    from levain import seat_lease as sl
+
+    world.lease("sl-aaaaaaaaaaaa")
+    world.egress("se-aaaaaaaaaaaa")
+    world.revoke_key("a", by="b")
+    real = sl._replay
+
+    def stripped(root):
+        state = real(root)
+        drop = {"lanes_parent", "returns_parent", "push_remote", "allowed_domains"}
+        grants = {gid: ({k: v for k, v in g.items() if k not in drop} if gid in ("sl-aaaaaaaaaaaa", "se-aaaaaaaaaaaa")
+                        else g) for gid, g in state.policy.grants.items()}
+        return replace(state, policy=replace(state.policy, grants=MappingProxyType(grants)))
+    monkeypatch.setattr(sl, "_replay", stripped)
+    code, out, err = _out(capsys, "seat", "lease", "list", "--data-root", str(world.root))
+    assert code == 0 and out.startswith("sl-aaaaaaaaaaaa  lanes   returns   ") and STOPPED_ONE_LIVE in out, (out, err)
+    code, out, err = _out(capsys, "seat", "egress", "list", "--data-root", str(world.root))
+    assert code == 0 and out.startswith("se-aaaaaaaaaaaa  lanes   remote   domains -  ") and STOPPED_ONE_LIVE in out, (out, err)
+
+
 def test_t16_a_lease_that_is_revoked_still_reads_as_none(world, capsys) -> None:
     """The stopped words are for a lease the policy still holds: with none held the old words stand."""
     code, out, _err = _out(capsys, "seat", "lease", "list", "--data-root", str(world.root))

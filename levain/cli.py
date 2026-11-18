@@ -3985,6 +3985,7 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             return 0
         if args.seat_lease_cmd == "list":
             from levain.authority import SEAT_LEASE_KIND
+            from levain.cockpit.display_safe import visible
             from levain.consent.grants import stopped_line
 
             state = seat_lease._replay(root)
@@ -3992,9 +3993,10 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             lease = None if state is None else seat_lease.live_lease(state, now)
             stopped = None if state is None or lease is not None else seat_lease.stopped_lease(state, now)
             if stopped is not None:     # the policy holds it, a launch reads it as no lease: say which and why
+                # a display path never crashes on a field a foreign writer left out; creator strings through visible
                 held = state.policy.grants[stopped[0]]
-                print(f"{stopped[0]}  lanes {held['lanes_parent']}  returns {held['returns_parent']}  "
-                      f"{stopped_line(stopped[1], SEAT_LEASE_KIND)}")
+                print(f"{visible(str(stopped[0]))}  lanes {visible(str(held.get('lanes_parent', '')))}  returns "
+                      f"{visible(str(held.get('returns_parent', '')))}  {stopped_line(stopped[1], SEAT_LEASE_KIND)}")
             else:
                 print("no live seat-root lease" if lease is None else
                       f"{lease['id']}  lanes {lease['lanes_parent']}  returns {lease['returns_parent']}  "
@@ -4098,6 +4100,7 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
 
     if args.seat_egress_cmd == "list":
         from levain.authority import SEAT_EGRESS_KIND
+        from levain.cockpit.display_safe import visible
         from levain.consent.grants import stopped_line
 
         state = seat_lease._replay(root)
@@ -4105,9 +4108,13 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
         grant = None if state is None else seat_push.live_egress(state, now)
         stopped = None if state is None or grant is not None else seat_push.stopped_egress(state, now)
         if stopped is not None:         # the policy holds it, a push reads it as no grant: say which and why
+            # a display path never crashes on a field a foreign writer left out; creator strings through visible
             held = state.policy.grants[stopped[0]]
-            print(f"{stopped[0]}  lanes {held['lanes_parent']}  remote {held['push_remote']}  "
-                  f"domains {','.join(held['allowed_domains']) or '-'}  {stopped_line(stopped[1], SEAT_EGRESS_KIND)}")
+            domains = held.get("allowed_domains")
+            shown = ",".join(str(visible(str(d))) for d in domains) if isinstance(domains, (list, tuple)) else ""
+            print(f"{visible(str(stopped[0]))}  lanes {visible(str(held.get('lanes_parent', '')))}  remote "
+                  f"{visible(str(held.get('push_remote', '')))}  domains {shown or '-'}  "
+                  f"{stopped_line(stopped[1], SEAT_EGRESS_KIND)}")
         else:
             print("no live seat-egress grant" if grant is None else
                   f"{grant['id']}  lanes {grant['lanes_parent']}  remote {grant['push_remote']}  "

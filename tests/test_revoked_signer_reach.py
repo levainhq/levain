@@ -19,7 +19,7 @@ import levain.authority as auth
 from levain.cockpit.consent import utc_stamp
 
 pytest.importorskip("cryptography")
-from tests.test_authority_graduation_kind import V1, consent  # noqa: E402
+from tests.test_authority_graduation_kind import GP, V1, consent, grad  # noqa: E402
 from tests.test_grant_stop import Laptops  # noqa: E402
 
 CG, CG2 = "cg-000000000001", "cg-000000000002"
@@ -36,6 +36,14 @@ def _policy_with(state: auth.AuthoritySnapshot, **grants) -> dict:
     p = state.policy
     return {"raise_to": auth._thaw(p.raise_to), "timeouts": auth._thaw(p.timeouts),
             "grants": {**auth._thaw(p.grants), **grants}}
+
+
+def test_graduation_links_fails_closed_on_a_snapshot_with_no_signer_list(world):
+    from dataclasses import replace
+
+    state = world.link({"op": "create_grant", "grant": grad(world)}, "a")
+    assert auth.graduation_links(state, GP) == (world.fp("a"), world.fp("a"))
+    assert auth.graduation_links(replace(state, link_signers=None), GP) is None
 
 
 # --- 2: a stopped grant stays stopped whatever op changes it -----------------------------------------------------------
