@@ -28,12 +28,19 @@ directory. A destination inside a git work tree is refused; so is overwriting a 
 
 Known edges, stated rather than hidden:
 
-* A signature is checked against the authority log as it is NOW: the log carries no time on a key, so "valid at the record's
-  time" is not decidable. A key revoked since is reported ("revoked since (seq N)"), never silently valid and never a break by
-  itself; a key that was never enrolled, quarantined or of the wrong class is a break.
-* A relayed record's band answer is re-read as the band holds it (or as the bundle carried it); the row's grade is the band
-  store's claim of a signature. Re-verifying the answer's own signature is ``levain consent receipts verify``'s job.
-* A cut's ``cause`` is not re-judged here (head note: it is judged AS OF THE CUT'S POSITION, never against today's fold).
+* A signature is checked against the authority log as it is NOW. Whether it was valid AT THE RECORD'S TIME arrives with part B
+  (P4's authority reader knows when a key's links were written; every signature check, records and closes, will go through that
+  one reader). A key revoked since is reported ("revoked since (seq N)"), never silently valid and never a break by itself; a
+  key that was never enrolled, quarantined or of the wrong class is a break.
+* A relayed record's band answer is re-read as the band holds it (or as the bundle carried it, with the answer's own signature,
+  ``sig`` and ``message``, as the band store holds them). That signature is re-verified here with the consent code the answer was
+  made with (``levain.consent.terminal_sign.verify``, in the namespace its message names, against the authority log's keys): the
+  record reads "(signed answer)" only when it verifies; an answer with no signature reads "(unsigned answer)" and is never
+  promoted; a signature that does not verify is a break, because it claims what it is not.
+* A cut's ``cause`` is judged AS OF THE CUT'S OWN POSITION, never against today's fold (see :func:`cause_problem_at`): the items
+  file up to the line before the cut, the registry up to and including the cited abandon (the two files share no clock, so the
+  registry is read to the last line the cut could not predate), through the ONE predicate the writer uses
+  (``board_sign.cut_cause_problem``).
 * Per-close author verdicts (P4's tiers) are part B: :func:`close_verdicts` is the seam and returns nothing.
 """
 from __future__ import annotations
@@ -146,6 +153,18 @@ class _LiveBand:
                 raise rel.BandRefusal(f"the band could not be opened ({type(exc).__name__})") from None
         return self._band.row(np_id)
 
+    def sign(self, np_id: str) -> Any:
+        """The answer's own signing record as the band store holds it, or None."""
+        self.row(np_id)                                 # opens the band (a refusal here is the row's)
+        own = getattr(self._band, "sign", None)
+        if own is not None:
+            return own(np_id)
+        store = getattr(self._band, "_store", None)
+        if store is None:
+            return None
+        from levain import band_view
+        return band_view.answer_sign_of(store, np_id)
+
 
 class _BundleBand:
     """The cited answers a bundle carries, as a band source."""
@@ -160,6 +179,10 @@ class _BundleBand:
         if "unreadable" in got:
             raise rel.BandRefusal(f"{np_id} could not be read when the bundle was made: {got['unreadable']}")
         return rel.BandRow(got["question"], got["answer"], got["answer_grade"], got["producer"])
+
+    def sign(self, np_id: str) -> Any:
+        got = self._answers.get(np_id)
+        return got.get("sign") if isinstance(got, Mapping) else None
 
 
 # ------------------------------------------------------------------------------------------------------------ the verdicts
@@ -205,14 +228,6 @@ def _what(rec: Mapping[str, Any]) -> str:
     return " ".join(str(x) for x in (rec.get("op", "?"), ident) if x is not None)
 
 
-def _answer_word(grade: str) -> str:
-    if grade.startswith(("signed", "countersigned")):
-        return "signed answer"
-    if grade.startswith("unsigned"):
-        return "unsigned answer"
-    return "answer of unknown signing"
-
-
 def _acks(lines: Sequence[bytes], chain: bc.Chain) -> dict[int, tuple[int, bc.Ack]]:
     """line number -> (the acking record's line, the ack), by the writer's own rule (:func:`board_chain.acked_lines`), keeping
     who acknowledged: only a line that itself parses and chains can ack."""
@@ -249,6 +264,69 @@ def _signed_problem(rec: Mapping[str, Any], trail: Trail) -> tuple[sg.Verdict | 
         return None, f"the signature cannot be checked here ({exc})"
 
 
+def cause_problem_at(rec: Mapping[str, Any], n: int, trail: Trail) -> str | None:
+    """Why the ``cause`` of the cut at items line ``n`` did not hold when it was written, or None when it did. The predicate is
+    ``board_sign.cut_cause_problem``, the one the writer asks, handed the items file as it stood BEFORE the cut (lines
+    ``1..n-1``) and the registry up to and including the cited abandon: an abandon the fold applied, of a repo aborting that
+    migration, located through the item fold, signed or relayed. Never today's fold: after ``abandon-done`` every old cut would
+    fail "currently aborting". A cause that names no line of the registry is judged against the whole registry (the predicate says
+    so)."""
+    from levain.authority_sig import VerifierUnavailable
+    if not (rec.get("op") == "decide" and rec.get("decision") == "cut"):
+        return "cause belongs to a decide of cut only"
+    repos = trail.lines["repos.jsonl"]
+    cause = rec.get("cause")
+    at = next((i for i, ln in enumerate(repos) if hashlib.sha256(ln).hexdigest() == cause), None)
+    upto = repos if at is None else repos[:at + 1]
+    tail_open = bool(trail.unterminated.get("repos.jsonl")) and len(upto) == len(repos)
+    store = bs.StoreLines(tuple(trail.lines["items.jsonl"][:n - 1]), tuple(upto), trail.store_id, tail_open, False)
+    try:
+        return sg.cut_cause_problem(cause, rec.get("id"), store, trail.snapshot, trail.band)
+    except VerifierUnavailable as exc:
+        return f"the cause cannot be checked here ({exc})"
+
+
+def answer_signature(np_id: str, trail: Trail) -> tuple[bool, str, str]:
+    """``(signed, problem, note)`` for the band answer ``np_id``'s OWN signature. ``signed`` is True only when it verifies. No
+    signature material (the band holds none, or the bundle carries none) is ``(False, "", "")``: unsigned, never promoted. A
+    signature that is there and does not verify is a ``problem``. ``note`` says a key revoked since."""
+    from levain.authority import quarantined
+    from levain.authority_sig import VerifierUnavailable
+    from levain.consent import terminal_sign as ts
+    reader = getattr(trail.band, "sign", None)
+    try:
+        sign = reader(np_id) if reader is not None else None
+    except Exception as exc:                            # noqa: BLE001 - a sidecar that cannot be read is no signature to check
+        return False, f"the answer's signature record cannot be read ({type(exc).__name__})", ""
+    if not isinstance(sign, Mapping) or sign.get("sign_state") != "signed" or not sign.get("sig") or not sign.get("message"):
+        return False, "", ""
+    sig, message, fp = sign["sig"], sign["message"], sign.get("signer_fp")
+    if not isinstance(sig, str) or not isinstance(message, str) or not isinstance(fp, str):
+        return False, "the answer's signature record is malformed", ""
+    if trail.snapshot is None:
+        return False, NO_AUTHORITY_FOR.format(why=trail.why_no_authority or "none was given"), ""
+    key = trail.snapshot.keys.get(fp)
+    if key is None:
+        return False, f"the answer's signer {fp} is not a key in the authority log", ""
+    if key.compromised_since is not None or quarantined([key]):
+        return False, f"the answer's signer {fp} is {'compromised' if key.compromised_since is not None else 'quarantined'}", ""
+    desk = message.startswith(ts.DESK_FORMAT + "\n")
+    try:
+        parsed = (ts.parse_desk_verified if desk else ts.parse_verified)(message.encode("utf-8"))
+    except (ts.MessageError, ValueError) as exc:
+        return False, f"the answer's signed message cannot be read ({exc})", ""
+    if np_id not in {e.item for e in parsed.entries}:
+        return False, f"the answer's signed message does not name {np_id}", ""
+    try:
+        got = ts.verify(message.encode("utf-8"), sig, f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "phill",
+                        namespace=ts.DESK_NAMESPACE if desk else ts.NAMESPACE, ctk=lambda _fp: (None, ""))
+    except VerifierUnavailable as exc:
+        return False, f"the answer's signature cannot be checked here ({exc})", ""
+    if not got.ok or got.fingerprint != fp:
+        return False, f"the answer's signature does not verify ({got.problem or 'it names another key'})", ""
+    return True, "", ("by a key revoked since" if key.revoked_seq is not None else "")
+
+
 def _manifest_sha(rec: Mapping[str, Any], begins: Mapping[tuple[Any, Any], str]) -> str | None:
     if rec.get("op") == "begin-track":
         return rec.get("manifest_sha256")
@@ -261,6 +339,9 @@ def _relayed(rec: Mapping[str, Any], trail: Trail, begins: Mapping[tuple[Any, An
     if not got.ok:
         return False, f"relayed citation does not hold: {got.text}"
     src = rec["source"]
+    signed, problem, note = answer_signature(src["np"], trail)
+    if problem:
+        return False, f"relayed citation does not hold: {problem}"
     if rec.get("op") in ("begin-track", "track"):
         manifest = _manifest_sha(rec, begins)
         if manifest is None:
@@ -269,7 +350,8 @@ def _relayed(rec: Mapping[str, Any], trail: Trail, begins: Mapping[tuple[Any, An
         said = rel.check_manifest(rec, row, manifest)
         if not said.ok:
             return False, f"relayed citation does not hold: {said.text}"
-    return True, f"agent {name}, relaying {src['np']} ({_answer_word(got.grade or '')})"
+    word = ("signed answer" + (f", {note}" if note else "")) if signed else "unsigned answer"
+    return True, f"agent {name}, relaying {src['np']} ({word})"
 
 
 def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport:
@@ -305,6 +387,11 @@ def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport
                 rep.notes.append(f"line {n} chain break, acknowledged by {acked_by(n)}: {brk.problem}")
             else:
                 rep.breaks.append(f"line {n}: {brk.problem}")
+        if "cause" in rec and name == "items.jsonl":
+            why_cause = cause_problem_at(rec, n, trail)
+            if why_cause is not None:
+                rep.breaks.append(f"line {n}: {_what(rec)}: the cause does not hold as of this cut: {why_cause}")
+                rep.records.append(RecordLine(n, _what(rec), f"the cause does not hold as of this cut: {why_cause}", False))
         grade = rec.get("grade")
         pre_cutover = chain.cutover is None or n < chain.cutover
         what = _what(rec)
@@ -427,6 +514,9 @@ def collect_answers(trail: Trail) -> dict[str, Any]:
                 row = rel._row_of(trail.band, src["np"])
                 out[src["np"]] = {"producer": row.producer, "question": row.question, "answer": row.answer,
                                   "answer_grade": row.answer_grade}
+                sign = trail.band.sign(src["np"]) if hasattr(trail.band, "sign") else None
+                if isinstance(sign, Mapping):
+                    out[src["np"]]["sign"] = {k: sign.get(k) for k in ("sig", "message", "signer_fp", "sign_state", "sign_reason")}
             except rel.BandRefusal as exc:
                 out[src["np"]] = {"unreadable": str(exc)}
     return out

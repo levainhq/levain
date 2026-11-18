@@ -11,11 +11,14 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from levain.cli import main
+from levain.cockpit import keys as ckeys
+from levain.consent import terminal_sign as ts
 from levain.desk import board_chain as bc
 from levain.desk import board_registry as br
 from levain.desk import board_relay as rel
@@ -42,6 +45,30 @@ class FakeBand:
         if np_id not in self.rows:
             raise rel.BandRefusal(f"{np_id} is not a row this band holds")
         return self.rows[np_id]
+
+
+class SignBand(FakeBand):
+    """A band whose rows also carry the answer's own signing record (what ``band_view.answer_sign_of`` returns)."""
+
+    def __init__(self, signs: dict, **rows: rel.BandRow) -> None:
+        super().__init__(**rows)
+        self.signs = signs
+
+    def sign(self, np_id: str):
+        return self.signs.get(np_id)
+
+
+def answer_sig(rig: Rig, np_id: str, *, tamper: bool = False, other: str | None = None) -> dict:
+    """A real answer signature over a terminal-answer message naming ``np_id`` (``other``: names that item instead)."""
+    msg = ts.build_message(store="levain-questions:abc", install="abc", session="s1", view="1", typed="yes", nonce="0123456789abcdef",
+                           at=datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc),
+                           entries=[ts.Entry(other or np_id, "rv-1", "Cut it?", "information", answer="(a) yes")])
+    sig = ckeys.ssh_signer(rig.path, namespace=ts.NAMESPACE)[1](msg)
+    if tamper:                                          # alter signature bytes inside the armored body
+        head, body, tail = sig.partition("\n")[0], sig.splitlines()[1:-1], sig.splitlines()[-1]
+        body[1] = body[1][:10] + ("A" if body[1][10] != "A" else "B") + body[1][11:]
+        sig = "\n".join([head, *body, tail]) + "\n"
+    return {"sig": sig, "message": msg.decode("utf-8"), "signer_fp": rig.fp, "sign_state": "signed", "sign_reason": None}
 
 
 def git(cwd, *args):
@@ -100,7 +127,7 @@ def build_world(tmp_path: Path, monkeypatch) -> World:
     mf = tmp_path / "manifest.json"
     mf.write_text(json.dumps({"plan_items": ["a"], "contract_items": []}))
     sha = hashlib.sha256(mf.read_bytes()).hexdigest()
-    band = FakeBand(**{Q1: rel.BandRow("Cut alpha#3?", ANSWER, "signed-phone", "native"),
+    band = SignBand({Q1: answer_sig(rig, Q1)}, **{Q1: rel.BandRow("Cut alpha#3?", ANSWER, "signed-phone", "native"),
                        Q2: rel.BandRow(f"Begin tracking beta? manifest sha256 {sha}", "yes, begin beta", "unsigned-terminal", "native")})
     monkeypatch.setattr(rel, "band_source", lambda directory=None: band)
     alpha, beta = make_repo(tmp_path, "alpha"), make_repo(tmp_path, "beta")
@@ -405,6 +432,45 @@ def test_an_unsigned_relayed_answer_is_reported_as_exactly_that_and_a_signed_one
     assert {r.n: r.verdict for r in report(world)["items.jsonl"].records}[6].endswith("(signed answer)")
 
 
+def _relay_report(world):
+    return {r.n: r for r in report(world)["items.jsonl"].records}[6]
+
+
+def test_a_relayed_record_on_an_answer_with_no_signature_reads_unsigned_never_promoted(world, capsys):
+    world.band.signs.clear()                            # the row's grade still CLAIMS signed-phone; there is nothing to verify
+    r = _relay_report(world)
+    assert r.ok and r.verdict == f"agent desk 24, relaying {Q1} (unsigned answer)"
+    assert run(capsys, "verify")[0] == 0
+
+
+def test_a_relayed_record_on_an_answer_whose_signature_bytes_are_altered_is_a_break(world, capsys):
+    world.band.signs[Q1] = answer_sig(world.rig, Q1, tamper=True)
+    r = _relay_report(world)
+    assert not r.ok and "the answer's signature does not verify" in r.verdict
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "does not verify" in out
+
+
+def test_an_answer_signed_for_another_item_or_by_an_unenrolled_key_is_a_break(world):
+    world.band.signs[Q1] = answer_sig(world.rig, Q1, other=Q2)
+    assert "does not name" in _relay_report(world).verdict
+    world.band.signs[Q1] = {**answer_sig(world.rig, Q1), "signer_fp": "SHA256:" + "A" * 43}
+    assert "is not a key in the authority log" in _relay_report(world).verdict
+
+
+def test_an_answer_signature_is_carried_by_the_bundle_and_re_verified_from_it(world, capsys):
+    assert run(capsys, "export", "--out", str(world.out) + os.sep)[0] == 0
+    bundle = next(world.out.glob("trail-*.json"))
+    assert json.loads(bundle.read_text("utf-8"))["answers"][Q1]["sign"]["sign_state"] == "signed"
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0 and f"relaying {Q1} (signed answer)" in out
+    doc = json.loads(bundle.read_text("utf-8"))
+    doc["answers"][Q1]["sign"] = answer_sig(world.rig, Q1, tamper=True)
+    bundle.write_text(json.dumps(doc))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and "the answer's signature does not verify" in out
+
+
 def test_a_relayed_begin_track_whose_question_does_not_carry_the_manifest_is_a_break(world, capsys):
     world.band.rows[Q2] = rel.BandRow("Begin tracking beta? manifest sha256 " + "e" * 64, "yes, begin beta", "unsigned-terminal", "native")
     # the digest check fires first (the question changed); a record re-written for the new question hits the manifest check
@@ -425,6 +491,56 @@ def test_a_band_that_cannot_be_opened_is_a_per_record_break_not_a_crash(world, c
     monkeypatch.setattr(rel, "band_source", boom)
     rc, out, err = run(capsys, "verify")
     assert rc == 3 and "the band could not be opened" in out
+
+
+# ---------------------------------------------------------------------------------------- a cut's cause, as of its position
+
+
+def abandon_world(world: World):
+    """alpha abandoned under a signed abandon (its remaining item cut, asserted, citing it), then abandon-done: every old cut now
+    fails "its repo is aborting", and each must still verify."""
+    repo, cuts = br.abandon_track(world.target, "alpha", "walk away from alpha", "phill", author=OP, seal=world.rig.seal())
+    assert cuts
+    br.abandon_done(world.target, "alpha", "", "phill", author=OP, seal=world.rig.seal())
+    assert br.read_registry(world.target).fold.repos["alpha"].mode == "untracked"
+    return cuts
+
+
+def forge_cut(world: World, cause: str, item: str = "alpha#2") -> None:
+    lines = world.lines("items.jsonl")
+    cut = next(bc.record_of(x) for x in reversed(lines) if (bc.record_of(x) or {}).get("cause"))
+    forged = {**cut, "cause": cause, "id": item, "prev": bc.line_hash(lines[-1])}
+    world.write("items.jsonl", lines + [json.dumps(forged, separators=(",", ":")).encode()])
+
+
+def test_a_cut_whose_cause_held_when_written_verifies_after_abandon_done(world, capsys):
+    abandon_world(world)
+    cut = next(bc.record_of(x) for x in reversed(world.lines("items.jsonl")) if (bc.record_of(x) or {}).get("cause"))
+    assert sg.cut_cause_problem(cut["cause"], cut["id"], bs._store_lines(world.target), None, world.band) is not None   # today's fold refuses it
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+
+
+def test_a_cut_with_a_forged_cause_is_a_break_with_a_reason(world, capsys):
+    abandon_world(world)
+    reg = next(x for x in world.lines("repos.jsonl") if (bc.record_of(x) or {}).get("op") == "register")
+    forge_cut(world, hashlib.sha256(reg).hexdigest())
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "the cause does not hold as of this cut: cause names a record that is not an abandon-track" in out
+    lines = world.lines("items.jsonl")[:-1]
+    world.write("items.jsonl", lines)
+    forge_cut(world, "ab" * 32)
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "names no abandon-track record in the store's registry" in out
+
+
+def test_a_cut_of_an_item_the_cited_abandon_does_not_cover_is_a_break(world, capsys):
+    """The real abandon's hash, on an item that is not keyed to its migration: the predicate's item half holds as of the cut."""
+    abandon_world(world)
+    abandon = next(x for x in world.lines("repos.jsonl") if (bc.record_of(x) or {}).get("op") == "abandon-track")
+    forge_cut(world, hashlib.sha256(abandon).hexdigest(), "alpha#1")
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "the cause does not hold as of this cut" in out and "alpha#1" in out
 
 
 # --------------------------------------------------------------------------------------------------- the part B seam
