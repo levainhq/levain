@@ -145,8 +145,11 @@ def _title_of(store: Any, thread_id: str) -> str:
 
 def _shared(store: Any, thread_id: str) -> dict[str, Any] | None:
     """What a thread's head says when ONE envelope heads several threads: ``{envelope_id, mission_id, threads}`` (each
-    thread with its title, sorted by id), or None for a head that binds only this thread or no head at all. The mission
-    is the one whose draft series was signed into the head, or None when the envelope came from no mission draft."""
+    thread with its title and ``ended``, sorted by id), or None for a head that binds only this thread or no head at
+    all. The threads are the ones the envelope was SIGNED over (its binds, append-only); ``ended`` is True when the
+    envelope no longer holds for that thread by the store's own facts (:meth:`EnvelopeStore._store_refusal`: killed, by
+    a detach or a narrowing; ended with its thread; moved past its revision; stopped). The mission is the one whose draft
+    series was signed into the head, or None when the envelope came from no mission draft."""
     from levain.desk import envelope_drafts as drafts
     from levain.desk.envelopes import EnvelopeStore
 
@@ -166,19 +169,23 @@ def _shared(store: Any, thread_id: str) -> dict[str, Any] | None:
                                "ON m.draft_id = json_extract(e.body, '$.draft.draft_id') WHERE e.envelope_id = ?",
                                (head.envelope_id,)).fetchone()
             mission = None if row is None else row[0]
+        now = store._stamp()
         return {"envelope_id": head.envelope_id, "mission_id": mission,
-                "threads": [{"thread_id": t, "title": store._must_thread(conn, t).title} for t in ids]}
+                "threads": [{"thread_id": t, "title": store._must_thread(conn, t).title,
+                             "ended": EnvelopeStore._store_refusal(conn, now, head.envelope_id, t) is not None}
+                            for t in ids]}
 
 
 def _sheet_lines(store: Any, body_text: str) -> list[str]:
     """The plain words a signature over SEVERAL threads adds to the sheet, or nothing for a one-thread draft (whose sheet
-    is exactly what it was). Every bound thread by title, that this one signature covers exactly these threads, the
-    budget each may use and the most they may use together (the budget is a gauge per thread, so N threads each get the
-    whole of it), that a thread added later is not covered, and what the sheet does NOT show per thread."""
+    is exactly what it was). That this one signature covers exactly these threads, what the budget does across them
+    (:func:`levain.desk.spec_card.budget_words`: the gauge meters each thread on its own against the whole budget), every
+    bound thread by title, that a thread added later is not covered, and what the sheet does NOT show per thread.
+    ``body_text`` is the body the builder made, so its budget names every key with an integer."""
     import json
 
     from levain.desk import envelope_drafts as drafts
-    from levain.desk.spec_card import plain_budget
+    from levain.desk.spec_card import budget_words
 
     body = json.loads(body_text)
     binds = body["binds"]
@@ -186,16 +193,10 @@ def _sheet_lines(store: Any, body_text: str) -> list[str]:
     if n < 2:
         return []
     ids = [b["thread_id"] for b in binds]
-    words = plain_budget(body.get("budget"), n)
-    if words is None:
-        size = f"this one signature covers these {n} threads, with no budget limit set for any of them"
-    else:
-        each, together = words
-        size = (f"this one signature covers these {n} threads, each up to {each}, up to {n} x ({each}) together "
-                f"({together}); a thread added later is not covered")
+    size = f"this one signature covers these {n} threads; a thread added later is not covered"
     with drafts._reading(store) as conn:
         names = [store._must_thread(conn, t).title for t in ids]
-    return [size, *(f"thread {t}: {title}" for t, title in zip(ids, names)),
+    return [size, budget_words(body["budget"], n), *(f"thread {t}: {title}" for t, title in zip(ids, names)),
             "a thread added to the mission later is NOT covered: it needs a signature of its own",
             "what changed for each thread is not shown on this sheet: each thread's revision and members are in the "
             "\"binds\" field of what exactly gets signed",

@@ -66,6 +66,7 @@ from levain.desk.chat_lease import check_owner
 from levain.desk.room_launch import RoomLaunchError
 from levain.desk.room_serve import RoomServeError
 from levain.desk.envelope_drafts import SpecRefused
+from levain.desk.missions import InMission
 from levain.desk.spec_card import TapRefused
 from levain.desk.store import SURFACES, WORDS_MAX, CoordError, DropConflict
 
@@ -201,7 +202,7 @@ def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any
                 "thread_id": None, "replaced_by": None}
         if spec is not None:
             card.update(_envelope_facts(conn, pid, state, drop_id, spec[0], spec[1], json.loads(quoted), now))
-            card.update(_mission_facts(conn, pid, spec[1]))
+            card.update(_mission_facts(conn, pid, now))
         out.append(card)
     return out
 
@@ -232,11 +233,15 @@ def _envelope_facts(conn: sqlite3.Connection, pid: str, state: str, drop_id: str
     return out
 
 
-def _mission_facts(conn: sqlite3.Connection, pid: str, spec_text: str) -> dict[str, Any]:
-    """What a MISSION card adds, from read-only SQL: every child thread with the desk's title for it, the budget line (what
-    each thread may use and what they may use together), and, once the operator's tap made the mission, its id. A thread card adds
-    nothing (no key), so its read is what it was. Never the desk's ``mission_threads`` (it creates a missing table, which a
-    ``mode=ro`` connection cannot)."""
+def _mission_facts(conn: sqlite3.Connection, pid: str, now: str) -> dict[str, Any]:
+    """What a MISSION card adds, from read-only SQL: every child thread with the desk's title for it, once the operator's
+    tap made the mission its id, and the grant as it stands NOW: ``grant`` is None before the tap, then ``unsigned``,
+    ``withdrawn`` or ``signed`` (an envelope was signed from the draft the tap made), and each thread's ``ended`` says
+    whether that envelope no longer holds for it by the store's own facts (killed, by a detach or a narrowing; ended with
+    its thread; moved past its revision; stopped). No budget: the card's field may hold other bytes than the room's spec,
+    so the budget is read from the bytes (the reading) and from the signed body (the sheet), never from the room's spec.
+    A thread card adds nothing (no key), so its read is what it was. Never the desk's ``mission_threads`` (it creates a
+    missing table, which a ``mode=ro`` connection cannot)."""
     if not threads._has(conn, "mission_spec_proposals"):
         return {}
     row = conn.execute("SELECT threads_json FROM mission_spec_proposals WHERE proposal_id = ?", (pid,)).fetchone()
@@ -244,23 +249,24 @@ def _mission_facts(conn: sqlite3.Connection, pid: str, spec_text: str) -> dict[s
         return {}
     ids = json.loads(row[0])
     has_events = threads._has(conn, "thread_events")
-    titles = []
+    out: dict[str, Any] = {"threads": [], "mission_id": None, "grant": None}
+    envelope = None
+    if threads._has(conn, "spec_card_taps") and threads._has(conn, "mission_drafts"):
+        link = conn.execute("SELECT m.mission_id, m.draft_id FROM spec_card_taps t JOIN mission_drafts m ON m.draft_id = "
+                            "t.draft_id WHERE t.proposal_id = ?", (pid,)).fetchone()
+        if link is not None:
+            out["mission_id"], draft_id = link
+            signed = conn.execute("SELECT envelope_id FROM envelopes WHERE json_extract(body, '$.draft.draft_id') = ?",
+                                  (draft_id,)).fetchone() if threads._has(conn, "envelopes") else None
+            gone = conn.execute("SELECT 1 FROM envelope_draft_withdrawals WHERE draft_id = ?", (draft_id,)).fetchone() \
+                if threads._has(conn, "envelope_draft_withdrawals") else None
+            envelope = None if signed is None else signed[0]
+            out["grant"] = "signed" if envelope is not None else "withdrawn" if gone is not None else "unsigned"
     for t in ids:
         found = conn.execute("SELECT value FROM thread_events WHERE thread_id = ? AND field = 'title' ORDER BY seq DESC "
                              "LIMIT 1", (t,)).fetchone() if has_events else None
-        titles.append({"thread_id": t, "title": found[0] if found else ""})
-    out: dict[str, Any] = {"threads": titles, "mission_id": None, "budget_line": None}
-    try:
-        spec = json.loads(spec_text)
-    except ValueError:
-        spec = None
-    words = spec_card.plain_budget(spec.get("budget") if isinstance(spec, dict) else None, len(ids))
-    if words is not None:
-        out["budget_line"] = f"each thread up to {words[0]}; up to {len(ids)} x that together ({words[1]})"
-    if threads._has(conn, "spec_card_taps") and threads._has(conn, "mission_drafts"):
-        link = conn.execute("SELECT m.mission_id FROM spec_card_taps t JOIN mission_drafts m ON m.draft_id = t.draft_id "
-                            "WHERE t.proposal_id = ?", (pid,)).fetchone()
-        out["mission_id"] = None if link is None else link[0]
+        ended = envelope is not None and EnvelopeStore._store_refusal(conn, now, envelope, t) is not None
+        out["threads"].append({"thread_id": t, "title": found[0] if found else "", "ended": ended})
     return out
 
 
@@ -788,12 +794,13 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
     words, outbox = req.get("words"), req.get("outbox_id")
     if not isinstance(words, str) or not words.strip() or len(words) > WORDS_MAX:
         return _refusal("bad_request", f"a drop is a non-empty string of at most {WORDS_MAX} characters", 400)
-    thread = _envelope_thread(host, proposal_id)          # the card's kind is the SERVER's row, never the request's
+    thread, children = _envelope_card(host, proposal_id)   # the card's kind is the SERVER's row, never the request's
     if action == "preview":
         if thread is None:
             return _refusal("no_proposal", f"proposal {proposal_id} is not an envelope card", 404)
         try:
-            got = spec_card.preview(_envelope_store(host), thread, words)
+            # a mission card's reading names every child and the budget across them, as the tap and the sheet read it
+            got = spec_card.preview(_envelope_store(host), thread, words, threads=children)
         except CoordError as exc:
             return _spec_refusal(exc)
         return 200, {"proposal_id": proposal_id, "thread_id": thread, **got}
@@ -818,14 +825,16 @@ def _envelope_store(host: RoomHost) -> EnvelopeStore:
     return store if isinstance(store, EnvelopeStore) else EnvelopeStore(store.directory)
 
 
-def _envelope_thread(host: RoomHost, proposal_id: str) -> str | None:
-    """The thread an ENVELOPE card is for, read from the server's own row; None for a plain drop card or no card."""
+def _envelope_card(host: RoomHost, proposal_id: str) -> tuple[str | None, tuple[str, ...] | None]:
+    """(thread, children) of an ENVELOPE card, read from the server's own rows: the thread it is for (a mission
+    card's anchor) and, for a MISSION card, its whole thread set; (None, None) for a plain drop card or no card."""
     conn = host.store._connect()
     try:
         spec = coordroom.spec_of(conn, proposal_id)
+        children = None if spec is None else coordroom.mission_threads(conn, proposal_id)
     finally:
         conn.close()
-    return None if spec is None else spec.thread_id
+    return (None, None) if spec is None else (spec.thread_id, children)
 
 
 def _tap_envelope(host: RoomHost, proposal_id: str, words: str, outbox: str, surface: str, req: dict[str, Any]
@@ -863,6 +872,8 @@ def _spec_refusal(exc: CoordError) -> tuple[int, dict[str, Any]]:
     text = str(exc)
     if isinstance(exc, SpecRefused):
         return _refusal("spec_refused", text, 409)
+    if isinstance(exc, InMission):          # "thread ... is already in mission ...": the card is still open, not settled
+        return _refusal("in_mission", text, 409)
     if text.startswith("no proposal") or text.startswith("a drop ") or text.startswith("outbox_id ") \
             or " is expired" in text or " is already " in text or " is committed" in text or " is dismissed" in text:
         return _proposal_refusal(exc)

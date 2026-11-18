@@ -727,9 +727,12 @@ def test_the_signing_line_of_an_earlier_attempt_is_not_shown_beside_the_next(tmp
 
 # --- H1-5 lane 3: one signature over several threads ----------------------------------------------------------------------
 KIDS = [("th-head-1", "part 0"), ("th-head-2", "part 1"), ("th-head-3", "part 2")]
-SHARED = {"envelope_id": HEAD_ID, "mission_id": "ms-" + "a" * 32, "threads": [{"thread_id": t, "title": n} for t, n in KIDS]}
-SHEET = ["no head", "this one signature covers these 3 threads, each up to 40 tool calls, up to 3 x (40 tool calls) together "
-         "(120 tool calls); a thread added later is not covered", *(f"thread {t}: {n}" for t, n in KIDS)]
+# th-head-2's grant has ended (a detach killed it): the server marks it, the page must say so (fix 3, L2 F4)
+SHARED = {"envelope_id": HEAD_ID, "mission_id": "ms-" + "a" * 32,
+          "threads": [{"thread_id": t, "title": n, "ended": t == "th-head-2"} for t, n in KIDS]}
+SHEET = ["no head", "this one signature covers these 3 threads; a thread added later is not covered",
+         "budget, counted for each thread on its own: a thread starts no new step once it has used 40 tool calls",
+         *(f"thread {t}: {n}" for t, n in KIDS)]
 
 
 def _mission_accept(groups: list[dict[str, Any]]) -> Step:
@@ -759,10 +762,11 @@ def test_the_sheet_lists_every_thread_and_a_card_in_a_group_acts_on_its_own_thre
     ])
     for t, n in KIDS:
         assert f"thread {t}: {n}" in v["sheet"], v
-    assert "this one signature covers these 3 threads" in v["sheet"] and "up to 3 x (40 tool calls) together" in v["sheet"], v
+    assert "this one signature covers these 3 threads" in v["sheet"] and "counted for each thread on its own" in v["sheet"], v
     assert "not covered" in v["sheet"], v
     assert v["titles"] == "|".join(f"Thread {n} ({t})" for t, n in KIDS), v
-    assert v["shared"].startswith("shared: mission ms-" + "a" * 32 + " covers 3 threads: part 0 (th-head-1); part 1"), v
+    assert v["shared"] == ("shared: mission ms-" + "a" * 32 + " was signed over 3 threads: part 0 (th-head-1); "
+                           "part 1 (th-head-2, its grant has ended); part 2 (th-head-3)"), v
     rules = [r for a, r in stub.posts if a == "draft-rule"]
     assert [r["thread_id"] for r in rules] == ["th-head-3"], rules          # the card was about the THIRD child, not the anchor
     assert stub.bad == []

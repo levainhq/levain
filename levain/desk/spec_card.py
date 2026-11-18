@@ -19,15 +19,17 @@ proposal's ``proposal_events`` row and the link's UNIQUE keys make the tap exact
 
 A MISSION card (H1-5 lane 2) names several threads. Its tap is the same one transaction with two more writes at the
 front: the mission is created from the card's thread set (his tap is what makes it; the room never does, and neither
-does the door), then the mission's draft series is opened over every child (:func:`drafts._write_mission_revision`, which
-reads the children under the lock and refuses what a mission envelope cannot cover), and only then the drop and the spec
-revision. The tap still signs nothing and writes no envelope."""
+does the door; when an earlier tap made a mission over exactly that set and every draft of it was withdrawn unsigned,
+that mission is drafted again rather than a second one made, :func:`_released`), then the mission's draft series is
+opened over every child (:func:`drafts._write_mission_revision`, which reads the children under the lock and refuses
+what a mission envelope cannot cover), and only then the drop and the spec revision. The tap still signs nothing and
+writes no envelope."""
 from __future__ import annotations
 
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.desk import envelope as env
@@ -91,12 +93,13 @@ def check_mission_threads(store: EnvelopeStore, conn: sqlite3.Connection, thread
     """Why ``thread_ids`` cannot be drafted together under one signature, as a :class:`CoordError` in plain words, or
     nothing. Read-only, on the caller's connection: the door runs it under its write lock so a card is never made for a
     set a tap could only refuse, and the tap's own writer (:func:`drafts._write_mission_revision`) holds the same
-    rules again under the tap's lock. Each thread must be an open work thread outside any mission, hold at least one
-    drop, hold no signed envelope yet, and have no draft series of its own open; and the threads must share a drop."""
+    rules again under the tap's lock. Each thread must be an open work thread outside any mission (but the one
+    :func:`_released` names, which a tap reuses), hold at least one drop, hold no signed envelope yet, and have no draft
+    series of its own open; and the threads must share a drop."""
     ids = sorted(set(thread_ids))
     if len(ids) != len(thread_ids) or len(ids) < 2:
         raise CoordError("a mission names two or more different threads")
-    ms._member_check(conn, ids, mission_id=None)
+    ms._member_check(conn, ids, mission_id=_released(conn, ids))
     threads = [store._must_thread(conn, t) for t in ids]
     for t in threads:
         if t.kind != "work" or t.state != "open":
@@ -114,38 +117,75 @@ def check_mission_threads(store: EnvelopeStore, conn: sqlite3.Connection, thread
     drafts._shared_drop(conn, threads)
 
 
-def plain_budget(budget: Any, n: int) -> tuple[str, str] | None:
-    """``(each, together)`` in plain words for a signed budget shared by ``n`` threads: what ONE thread may use, and what
-    ``n`` threads may use together (every set value times ``n``). None when the budget sets no value at all. The sign
-    sheet and the room card say the same words, so both read them here."""
-    if not isinstance(budget, dict):
+def _released(conn: sqlite3.Connection, thread_ids: Sequence[str]) -> str | None:
+    """The mission a card over exactly ``thread_ids`` drafts again, or None: one whose children are now exactly that set,
+    that an earlier card's tap made (a ``spec_card_taps`` row links one of its draft series), and whose every draft
+    series was withdrawn with no envelope signed from it. A withdrawn draft granted nothing, and the mission row cannot
+    be removed (append-only), so without this a correction after a withdrawal could never be drafted over those threads.
+    Reusing it adds no thread and no authority: the tap still opens an unsigned series over the children the lock reads."""
+    if not all(ms._has(conn, t) for t in ("missions", "mission_drafts", "spec_card_taps", "envelope_draft_withdrawals",
+                                          "envelopes")):
         return None
+    want = sorted(thread_ids)
+    for (mid,) in conn.execute("SELECT mission_id FROM missions ORDER BY rowid"):
+        if sorted(ms._latest(conn, mid)[1]) != want:
+            continue
+        tapped = conn.execute("SELECT 1 FROM spec_card_taps t JOIN mission_drafts m ON m.draft_id = t.draft_id WHERE "
+                              "m.mission_id = ? LIMIT 1", (mid,)).fetchone()
+        held = conn.execute(
+            "SELECT 1 FROM mission_drafts m WHERE m.mission_id = ? AND (NOT EXISTS (SELECT 1 FROM "
+            "envelope_draft_withdrawals w WHERE w.draft_id = m.draft_id) OR EXISTS (SELECT 1 FROM envelopes e WHERE "
+            "json_extract(e.body, '$.draft.draft_id') = m.draft_id)) LIMIT 1", (mid,)).fetchone()
+        return mid if tapped is not None and held is None else None
+    return None
 
-    def say(k: str, v: int) -> str:
-        return {"tool_calls": f"{v} tool calls", "tokens": f"{v} tokens", "dollars_cents": f"${v / 100:.2f}",
-                "hours": f"{v} hours"}[k]
 
-    keys = [k for k in env.BUDGET_KEYS if type(budget.get(k)) is int]
-    if not keys:
-        return None
-    return ", ".join(say(k, budget[k]) for k in keys), ", ".join(say(k, budget[k] * n) for k in keys)
+_METER_WORDS = {"tool_calls": "tool calls", "tokens": "tokens", "hours": "hours of active work"}
+
+
+def budget_words(budget: Mapping[str, int], n: int) -> str:
+    """What a budget does for ``n`` threads under one signature, in the words of :mod:`levain.desk.budget`'s gauge: each
+    thread is metered on its own against the whole budget (tool calls, tokens, hours of active work); a thread whose
+    count is at or past a limit starts no new step, and a step already running is not cut off, so "together" is the
+    per-thread limits added up plus whatever was running; a limit of 0 is reached at once; dollars are not metered.
+    ``budget`` is a whole budget, every key an integer (a signed body's, or :func:`drafts.parse_spec`'s, which writes 0
+    for a key it does not name). The sign sheet (:func:`levain.desk.draft_sign._sheet_lines`) and a mission card's
+    reading (:func:`_mission_lines`) both say exactly this."""
+    from levain.desk.budget import METERS, NOT_METERED
+
+    if set(budget) != set(env.BUDGET_KEYS) or any(type(budget[k]) is not int for k in budget):
+        raise ValueError("a budget names every key with an integer")
+    if set(METERS) | set(NOT_METERED) != set(env.BUDGET_KEYS) or set(METERS) != set(_METER_WORDS):
+        raise ValueError("a budget key this sheet has no words for")       # a new key is never shown as metered
+    metered = [k for k in env.BUDGET_KEYS if k in METERS]
+    zero = [k for k in metered if budget[k] == 0]
+    if zero:
+        head = (f"budget: the limit for {' and '.join(_METER_WORDS[k] for k in zero)} is 0, and a limit of 0 is reached "
+                f"at once, so none of these {n} threads can start a new step under this signature")
+    else:
+        each = ", ".join(f"{budget[k]} {_METER_WORDS[k]}" for k in metered)
+        together = ", ".join(f"{budget[k] * n} {_METER_WORDS[k]}" for k in metered)
+        head = (f"budget, counted for each thread on its own: a thread starts no new step once it has used {each} "
+                f"(whichever it reaches first); so these {n} threads use up to {n} x that together ({together}), plus "
+                "any step already running when a thread reached its limit: a running step is not cut off")
+    cents = sum(budget[k] for k in NOT_METERED)
+    tail = "dollars are not counted: nothing meters or stops on them" + (
+        f", so the ${cents / 100:.2f} written here limits nothing" if cents else "")
+    return f"{head}; {tail}"
 
 
 def _mission_lines(conn: sqlite3.Connection, store: EnvelopeStore, thread_ids: Sequence[str],
                    fields: dict[str, Any]) -> list[dict[str, Any]]:
     """What a mission card says in plain words beyond the spec's own lines: every child thread by title, that ONE
-    signature covers exactly these threads, the budget each may use and what they may use together, and that a thread
-    attached to the mission later is not covered. Pure over what it reads."""
+    signature covers exactly these threads, what the budget does across them (:func:`budget_words`, when the words name
+    a budget), and that a thread attached to the mission later is not covered. Pure over what it reads."""
     titles = [f"{store._must_thread(conn, t).title} ({t})" for t in thread_ids]
     n = len(titles)
     lines = [{"field": "mission", "wider": False,
               "text": f"one signature covers these {n} threads: " + "; ".join(titles)}]
     budget = fields.get("budget")
-    if budget:
-        each = ", ".join(f"{k} {budget[k]}" for k in env.BUDGET_KEYS if k in budget)
-        total = ", ".join(f"{k} {budget[k] * n}" for k in env.BUDGET_KEYS if k in budget)
-        lines.append({"field": "budget_together", "wider": False,
-                      "text": f"each up to {each}, up to {n} x ({each}) together: {total}"})
+    if budget is not None:
+        lines.append({"field": "budget_together", "wider": False, "text": budget_words(budget, n)})
     lines.append({"field": "mission_later", "wider": False,
                   "text": "a thread attached to this mission later is NOT covered: it needs a signature of its own"})
     return lines
@@ -248,8 +288,13 @@ def tap(store: EnvelopeStore, proposal_id: str, words: str, outbox_id: str, surf
             write = lambda **kw: drafts._write_revision(store, conn, now, thread_id=spec.thread_id, **kw)   # noqa: E731
         else:
             # his tap makes the mission, here and nowhere else, inside this transaction: a fault anywhere below takes the
-            # mission row back with the rest. The series is opened over the children as the lock reads them now
-            box["mission_id"] = ms._create(conn, now, list(children), "operator").mission_id
+            # mission row back with the rest. A mission an earlier tap made over exactly these threads, whose drafts
+            # were all withdrawn unsigned, is drafted again instead (:func:`_released`). The series is opened over the
+            # children as the lock reads them now
+            again = _released(conn, children)
+            if again is None:
+                again = ms._create(conn, now, list(children), "operator").mission_id
+            box["mission_id"] = again
             series = drafts._write_mission_revision(store, conn, now, box["mission_id"], draft_id=None, fields={},
                                                     cites=[], parent=None, by="operator")
             write = lambda **kw: drafts._write_mission_revision(store, conn, now, box["mission_id"], **kw)  # noqa: E731

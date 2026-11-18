@@ -377,35 +377,37 @@ def test_the_page_locks_the_field_while_a_tap_is_in_flight_and_reads_no_dead_car
 from tests.test_spec_card_mission import family  # noqa: E402
 from tests.test_spec_card_mission import propose as mission_propose  # noqa: E402
 
-BUDGET_LINE = "each thread up to 200 tool calls, 2000000 tokens, $5.00, 2 hours; up to 3 x that together (600 tool calls, " \
-              "6000000 tokens, $15.00, 6 hours)"
-
-
-def test_the_read_of_a_mission_card_names_every_child_by_title_and_the_budget_line(served):
-    """Failure: a mission card the page could only draw as ONE thread (the anchor), hiding the other children and what the
-    signature lets them use together."""
+def test_the_read_of_a_mission_card_names_every_child_by_title_and_no_budget_of_its_own(served):
+    """Failure: a mission card the page could only draw as ONE thread (the anchor), hiding the other children. And (fix 3,
+    L1 F2 + L2 F7) its ``budget_line`` was read from the ROOM's stored spec, beside a field he may have edited and after
+    a tap over other bytes: the card now carries no budget; the reading of the bytes (preview) and the sign sheet do."""
     _d, ts = family(served.ctx)
     p = mission_propose(served, [t.thread_id for t in ts], spec_text(served.ctx))
     [c] = cards(served)
     assert c["proposal_id"] == p.proposal_id and c["kind"] == "envelope" and c["thread_id"] == ts[0].thread_id
-    assert c["threads"] == [{"thread_id": t.thread_id, "title": t.title} for t in ts] and len(ts) == 3
+    assert c["threads"] == [{"thread_id": t.thread_id, "title": t.title, "ended": False} for t in ts] and len(ts) == 3
     assert all(t.title for t in ts)
-    assert c["budget_line"] == BUDGET_LINE and c["mission_id"] is None
+    assert "budget_line" not in c and c["mission_id"] is None and c["grant"] is None
 
 
 def test_a_thread_card_read_carries_no_mission_key(one):
     """A thread card's read is what it was: none of the mission's keys."""
     [c] = cards(one)
-    assert not {"threads", "budget_line", "mission_id"} & set(c)
+    assert not {"threads", "budget_line", "mission_id", "grant"} & set(c)
 
 
-def test_a_tapped_mission_card_names_the_mission_his_tap_made(served):
+def _mission_tap(served):
     _d, ts = family(served.ctx)
     text = spec_text(served.ctx)
     p = mission_propose(served, [t.thread_id for t in ts], text)
     body = {"words": text, "outbox_id": "ob-tap00001", "thread_id": ts[0].thread_id, "input_sha256": words_sha256(text)}
     status, got = act(served, p, "commit", body)
     assert status == 200, got
+    return ts, p, got
+
+
+def test_a_tapped_mission_card_names_the_mission_his_tap_made(served):
+    _ts, _p, _got = _mission_tap(served)
     [c] = cards(served)
     conn = sqlite3.connect(served.store.path)
     try:
@@ -413,15 +415,85 @@ def test_a_tapped_mission_card_names_the_mission_his_tap_made(served):
     finally:
         conn.close()
     assert c["state"] == "committed" and c["mission_id"] == mission and len(c["threads"]) == 3
-    assert c["budget_line"] == BUDGET_LINE
+    assert c["grant"] == "unsigned" and "budget_line" not in c
+
+
+def test_the_committed_card_reads_the_grant_as_it_stands_signed_then_after_a_detach(served, monkeypatch):
+    """Failure (fix 3, L2 F4 + F6, L1 F6): the committed card said "Mission ms-... covers 3 threads" under "Nothing is
+    signed yet", and kept saying it after a detach killed a child's grant; nothing read the draft or the kills."""
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk import missions
+
+    monkeypatch.setattr(cockpit_room, "datetime", type("D", (), {"now": staticmethod(lambda tz=None: served.ctx.clk[0])}))
+    ts, _p, got = _mission_tap(served)
+    signed, _since, _against = built(served.ctx, drafts.latest(served.store, got["draft_id"]))
+    served.ctx.accept(signed)
+    [c] = cards(served)
+    assert c["grant"] == "signed" and [t["ended"] for t in c["threads"]] == [False, False, False]
+    missions.detach(served.store, c["mission_id"], ts[1].thread_id)
+    [c] = cards(served)
+    assert c["grant"] == "signed" and [t["ended"] for t in c["threads"]] == [False, True, False]
+
+
+def test_a_withdrawn_mission_card_says_withdrawn(served):
+    from levain.desk import envelope_drafts as drafts
+
+    _ts, _p, got = _mission_tap(served)
+    drafts.withdraw(served.store, got["draft_id"], by="operator")
+    [c] = cards(served)
+    assert c["grant"] == "withdrawn"
+
+
+def test_the_preview_route_of_a_mission_card_reads_every_child_and_the_budget(served):
+    """Failure (fix 3, L1 F1, reproduced on d2d74713a): the page's preview route called ``spec_card.preview`` with no
+    ``threads``, so the mission lines (every child, one signature, the budget per thread) never reached him."""
+    from levain.desk import spec_card
+
+    _d, ts = family(served.ctx)
+    text = spec_text(served.ctx)
+    p = mission_propose(served, [t.thread_id for t in ts], text)
+    status, got = act(served, p, "preview", {"words": text})
+    assert status == 200, got
+    fields = {line["field"]: line["text"] for line in got["lines"]}
+    assert {"mission", "budget_together", "mission_later"} <= set(fields), got["lines"]
+    assert all(t.thread_id in fields["mission"] for t in ts)
+    assert fields["budget_together"] == spec_card.budget_words(BUDGET, 3)
+    # the reading follows the bytes he edited, never the room's stored spec
+    edited = spec_text(served.ctx, budget={**BUDGET, "tool_calls": 7})
+    _s, got = act(served, p, "preview", {"words": edited})
+    assert "7 tool calls" in {line["field"]: line["text"] for line in got["lines"]}["budget_together"]
+
+
+def test_a_tap_refused_because_a_child_joined_another_mission_is_not_called_settled(served):
+    """Failure (fix 3, L1 F7, reproduced on d2d74713a): "thread ... is already in mission ..." matched the sentence test
+    for a settled card, so the page was told ``proposal_settled`` about a card that is still open."""
+    from levain.desk import missions
+
+    _d, ts = family(served.ctx)
+    text = spec_text(served.ctx)
+    p = mission_propose(served, [t.thread_id for t in ts], text)
+    missions.create_mission(served.store, [ts[1].thread_id])
+    body = {"words": text, "outbox_id": "ob-tap00001", "thread_id": ts[0].thread_id, "input_sha256": words_sha256(text)}
+    status, got = act(served, p, "commit", body)
+    assert status == 409 and got["error"] == "in_mission", got
 
 
 def test_the_page_draws_a_mission_card_from_its_children_and_adds_no_sign_control():
     env = _fn("renderEnvelopeCard", "renderRoom")
     assert "c.children" in env or "kids" in env
-    assert "c.budgetLine" in env and "covers" in env and "not covered" in env
+    assert "budgetLine" not in env and "not covered" in env
+    assert " covers " not in env                         # no present-tense cover claim on a card (fix 3, L2 F6)
     assert "Sign" not in env.replace("signed", "").replace("signing", "").replace("sign.", "")    # the card has no Sign control
     assert env.count('"Draft it"') == 1
+
+
+def test_before_the_tap_the_card_says_the_tap_makes_the_mission_and_holds_the_threads():
+    """Failure (fix 3, L2 F5): the pre-tap card said only "nothing is signed until you tap"; that the tap also makes the
+    mission and that none of the threads can then hold a draft of its own was said only on the sign sheet, after it."""
+    env = _fn("renderEnvelopeCard", "renderRoom")
+    pre = env[env.index("var replaced"):]
+    assert "also makes these" in pre and "one mission" in pre
+    assert "none of them can hold a draft of its own" in pre
 
 
 @needs_browser
@@ -444,8 +516,12 @@ def test_in_a_browser_a_mission_card_lists_every_child_and_the_budget_with_no_si
     first, buttons, committed, links, nbuttons = out["values"][1], out["values"][2], out["values"][5], out["values"][6], out["values"][7]
     for t in ts:
         assert t.title in first and t.thread_id in first and t.title in committed
-    assert "one signature covers these" in first or "under one signature" in first
-    assert "up to 3 x" in first and "$15.00" in first and "not covered" in first
+    assert "one signature covers these 3 threads" in first and "under one signature" in first
+    # the budget is the reading of the bytes (the preview route, now carrying the threads), in the sheet's words
+    assert "counted for each thread on its own" in first and "dollars are not counted" in first
+    assert "$15.00" not in first and "not covered" in first
+    assert "also makes these 3 threads one mission" in first and "none of them can hold a draft of its own" in first
     assert buttons == "Draft it|Not now"
-    assert "Mission ms-" in committed and "covers 3 threads" in committed and "$15.00" in committed
+    assert "Mission ms-" in committed and "would cover exactly these 3 threads" in committed
+    assert "Nothing is signed yet" in committed and " covers " not in committed and "$" not in committed
     assert links.split("|") == ["/sign/drop#thread=" + t.thread_id for t in ts] and nbuttons == 0

@@ -1417,11 +1417,12 @@
         if (Array.isArray(d.stop_at)) out.push("stops: from " + hfield(d.stop_at[0]) + " to " + hfield(d.stop_at[1]));
         return out;
       };
-      // a head that covers several threads says so: the mission (when a mission's draft was signed into it) and each thread by title
+      // a head signed over several threads says so: the mission (when a mission's draft was signed into it), each thread by
+      // title, and each thread the grant no longer holds for (the server's ``ended``: a detach, a narrowing, its thread ended)
       const sharedLine = (sh) => {
         const ts = sh && Array.isArray(sh.threads) ? sh.threads : [];
         const who = sh && typeof sh.mission_id === "string" && sh.mission_id ? "mission " + sh.mission_id : "one envelope";
-        return el("p", "env-hint head-shared", "shared: " + who + " covers " + ts.length + " threads: " + ts.map((t) => String(t.title || "(no title)") + " (" + String(t.thread_id) + ")").join("; "));
+        return el("p", "env-hint head-shared", "shared: " + who + " was signed over " + ts.length + " threads: " + ts.map((t) => String(t.title || "(no title)") + " (" + String(t.thread_id) + (t.ended === true ? ", its grant has ended" : "") + ")").join("; "));
       };
       let groupSet = null;        // the threads a mission's signature covered, once a reply drew them: every read names each of them
       const hcards = (cards, shared) => {

@@ -157,8 +157,9 @@ ENVELOPE_TOOL: dict[str, Any] = {
         "publishes, budget {tool_calls, tokens, dollars_cents, hours} and stop (a duration such as \"2h\"): name only "
         "what the operator said. A launch grant is never part of a draft. Name the repo and branch explicitly. For ONE "
         "envelope over SEVERAL work threads that hold a drop in common, pass threads (a list of 2 or more) INSTEAD of "
-        "thread: one tap then makes the mission and its draft, and one signature covers exactly those threads (each up to "
-        "the budget, so up to N times the budget together; a thread attached later is not covered). Never both."),
+        "thread: one tap then makes the mission and its draft, and one signature covers exactly those threads (each thread "
+        "is metered on its own against the whole budget, and dollars are not metered; a thread attached later is not "
+        "covered). Never both."),
     "inputSchema": {
         "type": "object",
         "properties": {

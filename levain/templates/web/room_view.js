@@ -222,10 +222,10 @@
                  kind: p.kind === "envelope" ? "envelope" : "drop", thread: p.thread_id == null ? "" : String(p.thread_id),
                  title: p.title == null ? "" : String(p.title), quoted: p.quoted_words == null ? "" : String(p.quoted_words),
                  replacedBy: p.replaced_by == null ? "" : String(p.replaced_by), signedHead: p.signed_head === true,
-                 // a MISSION card (the server sends these keys only for one): every child with its title, the budget line,
-                 // and the mission the operator's tap made
-                 children: Array.isArray(p.threads) ? p.threads.map(function (t) { return { thread: String(t.thread_id), title: t.title == null ? "" : String(t.title) }; }) : null,
-                 mission: p.mission_id == null ? "" : String(p.mission_id), budgetLine: p.budget_line == null ? "" : String(p.budget_line) };
+                 // a MISSION card (the server sends these keys only for one): every child with its title and whether the
+                 // signed grant has ended for it, the mission the operator's tap made, and the grant as it stands now
+                 children: Array.isArray(p.threads) ? p.threads.map(function (t) { return { thread: String(t.thread_id), title: t.title == null ? "" : String(t.title), ended: t.ended === true }; }) : null,
+                 mission: p.mission_id == null ? "" : String(p.mission_id), grant: p.grant == null ? "" : String(p.grant) };
       })
     };
   }
@@ -458,23 +458,29 @@
   // screen is for exactly these bytes; the tap posts the thread the card shows and the hash of that reading.
   function renderEnvelopeCard(doc, c, hooks, drafts, card) {
     var open = "/sign/drop#thread=" + encodeURIComponent(c.thread), kids = c.children;
-    // a mission card names every child by title and the budget each may use; a thread card has none of this
+    // a mission card names every child by title (and, once signed, each one whose grant has ended); a thread card has
+    // none of this. The budget is never the card's: the reading of the bytes says it before the tap, the sign sheet after
     function children(label) {
       card.appendChild(el(doc, "div", "rv-note", label));
       kids.forEach(function (k) {
-        var line = el(doc, "div", "rv-readline", (k.title || "(no title)") + " (" + k.thread + ")");
+        var line = el(doc, "div", "rv-readline", (k.title || "(no title)") + " (" + k.thread + ")" + (k.ended ? ": its grant has ended" : ""));
         card.appendChild(line);
       });
-      if (c.budgetLine) card.appendChild(el(doc, "div", "rv-note rv-budget", c.budgetLine));
       card.appendChild(el(doc, "div", "rv-note", "A thread attached to the mission later is not covered."));
     }
     if (c.state === "committed" || c.state === "dismissed") {
-      card.appendChild(el(doc, "div", "rv-note", c.state === "committed" ? "Drafted: open the thread to review and sign. Nothing is signed yet." : "Not drafted."));
+      var drafted = !kids ? "Drafted: open the thread to review and sign. Nothing is signed yet."
+        : c.grant === "signed" ? "Drafted and signed."
+        : c.grant === "withdrawn" ? "Drafted, then withdrawn: nothing was signed."
+        : "Drafted: open a thread to review and sign. Nothing is signed yet.";
+      card.appendChild(el(doc, "div", "rv-note", c.state === "committed" ? drafted : "Not drafted."));
       if (c.state === "committed") {
         card.appendChild(el(doc, "div", "rv-text", c.words));
         if (kids) {
-          if (c.mission) card.appendChild(el(doc, "div", "rv-note", "Mission " + c.mission + " covers " + kids.length + " threads."));
-          children("One signature covers exactly these " + kids.length + " threads:");
+          var made = c.mission ? "Mission " + c.mission + ", made by your tap: " : "";
+          children(made + (c.grant === "signed" ? "one signature was given over these " + kids.length + " threads:"
+            : c.grant === "withdrawn" ? "the draft over these " + kids.length + " threads was withdrawn, so no signature holds for them:"
+            : "one signature would cover exactly these " + kids.length + " threads, once you sign it:"));
           kids.forEach(function (k) {
             var l = el(doc, "a", "rv-link", "Open " + (k.title || k.thread)); l.setAttribute("href", "/sign/drop#thread=" + encodeURIComponent(k.thread)); card.appendChild(l);
           });
@@ -490,7 +496,11 @@
       : "The room can draft this for you to review. Nothing is signed or sent until you tap, and signing is a separate tap."));
     card.appendChild(el(doc, "div", "rv-note", "You said:"));
     card.appendChild(el(doc, "div", "rv-text rv-quote", c.quoted));
-    if (kids) children("For " + kids.length + " threads, under one signature:");
+    if (kids) {
+      children("For " + kids.length + " threads, under one signature:");
+      // what the tap does beyond drafting (lane 1's refusals), said before he taps, not only on the sign sheet after it
+      card.appendChild(el(doc, "div", "rv-note", "Draft it also makes these " + kids.length + " threads one mission. Until that draft is signed or withdrawn, none of them can hold a draft of its own."));
+    }
     else card.appendChild(el(doc, "div", "rv-note", "For thread " + c.thread + (c.title ? ", titled " + c.title : "")));
     card.appendChild(el(doc, "div", "rv-note", "Drafted by the room from your words. Edit freely."));
     var ta = el(doc, "textarea", "rv-cardwords");
@@ -576,7 +586,7 @@
     }
     var keep = {};
     m.proposals.forEach(function (c, i) {
-      var key = [c.state, c.words, c.summary, c.kind, c.thread, c.title, c.quoted, c.replacedBy, c.signedHead, c.mission, c.budgetLine, JSON.stringify(c.children)].join("\u0000"), have = own(st.cards, c.id) ? st.cards[c.id] : null;
+      var key = [c.state, c.words, c.summary, c.kind, c.thread, c.title, c.quoted, c.replacedBy, c.signedHead, c.mission, c.grant, JSON.stringify(c.children)].join("\u0000"), have = own(st.cards, c.id) ? st.cards[c.id] : null;
       if (!have || have.key !== key) { st.cards[c.id] = have = { key: key, node: renderCard(doc, c, hooks, drafts) }; }
       keep[c.id] = true;
       if (st.cardsBox.children[i] !== have.node) st.cardsBox.insertBefore(have.node, st.cardsBox.children[i] || null);

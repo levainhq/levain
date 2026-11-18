@@ -249,6 +249,80 @@ def test_a_tap_is_refused_when_a_child_joined_another_mission_after_the_card(car
     p = propose(card, [t.thread_id for t in ts], words)
     ms.create_mission(ctx.store, [ts[1].thread_id])
     _refused_tap(card, p, words, f"thread {ts[1].thread_id} is already in mission")
+    with pytest.raises(CoordError) as e:
+        tap(card, p, words)
+    assert type(e.value).__name__ == "InMission"           # typed, so a surface never reads it as a settled card (L1 F7)
+
+
+def _withdrawn_tap(card):
+    """Tap a mission card over three fresh threads, then withdraw its draft unsigned. -> (threads, first tap)"""
+    _d, ts = family(card.ctx)
+    words = spec_text(card.ctx)
+    first = tap(card, propose(card, [t.thread_id for t in ts], words), words)
+    drafts.withdraw(card.store, first.draft_id, by="operator")
+    return ts, first
+
+
+def test_a_corrected_card_over_the_same_threads_after_a_withdrawal_reuses_the_mission(card, door):
+    """Failure (fix 3, L1 F3, reproduced on d2d74713a): tap, withdraw the draft unsigned, then the room proposes the
+    corrected card over the same threads: the door refused it "thread ... is already in mission", so no mission card
+    could ever be drafted over those threads again. Now the door makes the card and the tap opens a new series over the
+    mission the first tap made; no second mission, nothing signed."""
+    ts, first = _withdrawn_tap(card)
+    ids = [t.thread_id for t in ts]
+    reply = door(threads=ids)
+    assert not _refused(reply), _why(reply)
+    c = card.store._connect()
+    try:
+        pid = c.execute("SELECT proposal_id FROM mission_spec_proposals ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+    finally:
+        c.close()
+    words = spec_text(card.ctx)
+    before = counts(card.store)
+    again = spec_card.tap(card.store, pid, words, "tap-0002-bbbb", "cockpit", thread_echo=ids[0],
+                          input_sha256=words_sha256(words))
+    after = counts(card.store)
+    assert again.created and again.mission_id == first.mission_id and again.draft_id != first.draft_id
+    assert after["missions"] == before["missions"] == 1 and after["mission_revisions"] == before["mission_revisions"]
+    assert after["mission_drafts"] - before["mission_drafts"] == 1 and after["envelopes"] == 0
+
+
+def test_a_card_over_another_set_after_a_withdrawal_is_still_refused_and_a_signed_mission_is_never_reused(card, door):
+    """The release is bounded: only a card naming EXACTLY the withdrawn mission's threads reuses it. A card over two of
+    them is refused (each thread is in one mission at a time), and a mission whose draft was signed is never reused."""
+    ts, first = _withdrawn_tap(card)
+    before = counts(card.store)
+    reply = door(threads=[ts[0].thread_id, ts[1].thread_id])
+    assert _refused(reply) and f"is already in mission {first.mission_id}" in _why(reply), _why(reply)
+    assert counts(card.store) == before
+    c = card.store._connect()
+    try:
+        assert spec_card._released(c, [t.thread_id for t in ts]) == first.mission_id
+    finally:
+        c.close()
+    words = spec_text(card.ctx)
+    _d, others = family(card.ctx)
+    signed_tap = tap(card, propose(card, [t.thread_id for t in others], words), words, outbox="tap-0003-cccc")
+    signed, _since, _against = built(card.ctx, drafts.latest(card.store, signed_tap.draft_id))
+    card.ctx.accept(signed)
+    c = card.store._connect()
+    try:
+        assert spec_card._released(c, [t.thread_id for t in others]) is None
+    finally:
+        c.close()
+
+
+def test_a_mission_the_desk_grouped_is_never_reused_by_a_card(card, door):
+    """Q1: a mission comes into being only by his tap. A mission no tap made (create_mission, by the desk) whose draft was
+    withdrawn is not released to a card: the door still refuses."""
+    ctx = card.ctx
+    d, ts = family(ctx)
+    m = ms.create_mission(ctx.store, [t.thread_id for t in ts], by="operator")
+    f = fields_for(ctx)
+    dr = drafts.create_mission_draft(ctx.store, m.mission_id, f, cites_for(d, f), by="operator")
+    drafts.withdraw(ctx.store, dr.draft_id, by="operator")
+    reply = door(threads=[t.thread_id for t in ts])
+    assert _refused(reply) and f"is already in mission {m.mission_id}" in _why(reply), _why(reply)
 
 
 def test_a_tap_is_refused_when_a_child_closed_after_the_card(card):
@@ -376,8 +450,10 @@ def test_the_reading_of_a_mission_card_names_every_child_the_budget_and_what_is_
     for t in ts:
         assert t.title in text and t.thread_id in text
     assert f"one signature covers these {len(ts)} threads" in text
-    each = ", ".join(f"{k} {BUDGET[k]}" for k in ("tool_calls", "tokens", "dollars_cents", "hours") if k in BUDGET)
-    assert f"each up to {each}, up to {len(ts)} x ({each}) together" in text
+    # the sheet's own words for the budget, from the one helper (L1 F4: a third wording, "tool_calls 200", is gone)
+    fields, _named, _span = drafts.parse_spec(words, Source(), card.store)
+    [budget] = [line["text"] for line in got["lines"] if line["field"] == "budget_together"]
+    assert budget == spec_card.budget_words(fields["budget"], len(ts)) and "tool_calls" not in budget
     assert "NOT covered" in text and "attached to this mission later" in text
     assert got["signed_head"] is False and got["input_sha256"] == words_sha256(words)
 

@@ -40,8 +40,8 @@ from levain.desk.envelopes import EnvelopeStore
 from levain.desk.store import CoordError, CoordStore, _append_only, _in
 from levain.desk.legacy import KIND_DESK_REPLY, ROLE_DESK, SQL_ROLE_DESK
 
-__all__ = ["MISSION_SCHEMA", "AcceptanceRefused", "Mission", "MissionAcceptance", "Snapshot", "accept", "accept_message",
-           "attach", "create_mission", "detach", "get_mission", "list_missions", "snapshot_of", "unacked_know_items"]
+__all__ = ["MISSION_SCHEMA", "AcceptanceRefused", "InMission", "Mission", "MissionAcceptance", "Snapshot", "accept",
+           "accept_message", "attach", "create_mission", "detach", "get_mission", "list_missions", "snapshot_of", "unacked_know_items"]
 
 _MISSION_ID = re.compile(r"^ms-[0-9a-f]{32}$")
 _CAUSES = ("create", "attach", "detach")
@@ -84,6 +84,11 @@ class AcceptanceRefused(CoordError):
     def __init__(self, why: str, message: str) -> None:
         super().__init__(message)
         self.why = why
+
+
+class InMission(CoordError):
+    """A thread named for a mission already belongs to one (a thread is in at most one mission at a time). Typed so a
+    surface names it by its type, never by matching its sentence."""
 
 
 @dataclass(frozen=True)
@@ -283,7 +288,7 @@ def _member_check(conn: sqlite3.Connection, thread_ids: Sequence[str], *, missio
             raise CoordError(f"thread {t} is not a work thread: only work carries an acceptance")
         for (mid,) in conn.execute("SELECT mission_id FROM missions ORDER BY rowid"):
             if mid != mission_id and t in _latest(conn, mid)[1]:
-                raise CoordError(f"thread {t} is already in mission {mid}")
+                raise InMission(f"thread {t} is already in mission {mid}")
 
 
 def _by(store: CoordStore, by: str, token: object) -> tuple[str, object]:
@@ -318,7 +323,7 @@ def attach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "ope
         _must_mission(conn, mission_id)
         _, children, _ = _latest(conn, mission_id)
         if thread_id in children:
-            raise CoordError(f"thread {thread_id} is already in mission {mission_id}")
+            raise InMission(f"thread {thread_id} is already in mission {mission_id}")
         _member_check(conn, [thread_id], mission_id=mission_id)
         _revise(conn, mission_id, [*children, thread_id], "attach", by, now)
         return _view(conn, mission_id)
@@ -330,7 +335,9 @@ def detach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "ope
     A detach also ends the mission envelope's grant for that child (Q4): a per-thread ``kill`` by the service for each
     envelope signed from a draft of this mission that binds the thread, written on this transaction's connection, so
     the revision and the kills land together or not at all. It only takes authority away. A thread this mission once
-    held and no longer does is a no-op, not an error."""
+    held and no longer does is a no-op, not an error. What ends is the grant of THIS mission's signatures only: an
+    envelope signed for the thread on its own (a renewal of a lapsed mission envelope binds one thread and comes from a
+    thread draft, not a mission draft) is that signature's own grant and is not killed here."""
     by, token = _by(store, by, token)
     with store._write(by, token) as (conn, now):
         _must_mission(conn, mission_id)
