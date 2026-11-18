@@ -247,14 +247,14 @@ def test_unreadable_usage_cause_iii_c_a_child_whose_command_line_differs_is_not_
     cannot verify: it settles NOTHING, the row stays launched holding its slot, the reservation stays open (no zero is
     debited), the child is still alive, and an attention line names the group. Once the group is gone by hand the next
     tick settles it whole, unreadable."""
-    inst, row, child = _sigkill_mid_compose(tmp_path)
+    inst, row, child = _sigkill_mid_compose(tmp_path, need_native=True)      # on the sh shape the lines differ whatever is edited
     occ = row["occurrence_id"]
     prog = inst.anneal / "dream" / occ / "progress.json"
-    doc = json.loads(prog.read_text())
-    assert "--max-budget-usd" in doc["child_argv"]
-    doc["child_argv"][doc["child_argv"].index("--max-budget-usd") + 1] = "9.999999"      # a different command line
-    prog.write_text(json.dumps(doc), encoding="utf-8")
     try:
+        doc = json.loads(prog.read_text())
+        assert "--max-budget-usd" in doc["child_argv"]
+        doc["child_argv"][doc["child_argv"].index("--max-budget-usd") + 1] = "9.999999"      # a different command line
+        prog.write_text(json.dumps(doc), encoding="utf-8")
         first = _tick(inst, 61)
         print("\n[alive] tick 1:", first.rc, repr(first.text))
         (held,) = inst.rows()

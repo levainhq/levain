@@ -45,8 +45,9 @@ def group_alive(pgid: int) -> bool:
 
 
 # A native program has no interpreter in its command line, which is what ``ps`` reads for the real ``claude`` (a native
-# executable on the one install measured: claude 2.1.327, 11-18, levain#131). So the stub's entry point is this launcher: it is started with the argv the fire
-# records, and runs the ``sh`` script as its child.
+# executable on the one install measured: claude 2.1.327, 11-18, levain#131). So the stub's entry point is this
+# launcher: it is started with the argv the fire records, and runs the ``sh`` script as its child. SIGTERM and SIGINT
+# are blocked until the child exists, so one that lands in that window is forwarded to it, never dropped.
 _LAUNCHER = r"""#include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -59,31 +60,48 @@ static void fwd(int sig) { if (kid > 0) kill(kid, sig); }
 int main(int argc, char **argv) {
     char **a = calloc((size_t)argc + 2, sizeof *a);
     int st;
+    sigset_t block, old;
     a[0] = "/bin/sh";
     a[1] = {script};
     for (int i = 1; i < argc; i++) a[i + 1] = argv[i];
+    sigemptyset(&block);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGINT);
+    sigprocmask(SIG_BLOCK, &block, &old);
     signal(SIGTERM, fwd);
     signal(SIGINT, fwd);
     kid = fork();
     if (kid < 0) return 127;
-    if (kid == 0) { execv("/bin/sh", a); _exit(127); }
+    if (kid == 0) { sigprocmask(SIG_SETMASK, &old, NULL); execv("/bin/sh", a); _exit(127); }
+    sigprocmask(SIG_SETMASK, &old, NULL);
     while (waitpid(kid, &st, 0) < 0) if (errno != EINTR) return 127;
     return WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
 }
 """
 
 
+def _c_string(text: str) -> str:
+    """``text`` as a C string literal: printable ASCII as is, every other byte (and the quote and backslash) as an octal escape."""
+    out = []
+    for b in text.encode("utf-8"):
+        out.append(chr(b) if 32 <= b < 127 and chr(b) not in '"\\' else "\\%03o" % b)
+    return '"' + "".join(out) + '"'
+
+
 def _build_launcher(src: Path, out: Path, script: Path) -> bool:
-    """Compile the launcher for ``script`` to ``out``; False when no C compiler is there or it fails."""
+    """Compile the launcher for ``script`` to ``out``. False only when no C compiler is on the machine (the caller falls back
+    to the script itself and the cases that need the native shape skip); a compiler that is there and fails is an error
+    carrying its output, never a silent skip, and so is a missing compiler where ``CI`` is set."""
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
+        if os.environ.get("CI"):
+            raise RuntimeError("no C compiler on a CI runner: the p10a stub's native launcher cannot be built")
         return False
-    src.write_text(_LAUNCHER.replace("{script}", json.dumps(str(script))), encoding="utf-8")
-    try:
-        done = subprocess.run([cc, "-o", str(out), str(src)], capture_output=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0 and out.is_file()
+    src.write_text(_LAUNCHER.replace("{script}", _c_string(str(script))), encoding="utf-8")
+    done = subprocess.run([cc, "-o", str(out), str(src)], capture_output=True, timeout=120)
+    if done.returncode != 0 or not out.is_file():
+        raise RuntimeError(f"the p10a stub launcher failed to compile with {cc}: {done.stderr.decode(errors='replace')[-600:]}")
+    return True
 
 
 def success_doc(text: str = "stub", cost: float | None = 0.01, model: str = "claude-opus-5-5") -> dict:
@@ -97,7 +115,7 @@ def success_doc(text: str = "stub", cost: float | None = 0.01, model: str = "cla
 
 
 class StubClaude:
-    """``StubClaude(root)`` writes ``root/claude`` (executable) and ``root/calls/``. ``path`` is the value for ``claude_bin``.
+    """``StubClaude(root)`` writes ``root/claude`` (executable; the launcher, with ``claude.sh`` and ``launcher.c`` beside it) and ``root/calls/``. ``path`` is the value for ``claude_bin``.
 
     ``native`` is True when ``path`` is a compiled launcher (the shape the real ``claude`` has to ``ps``: its command line
     is the recorded argv). With no C compiler ``path`` is the ``sh`` script itself and ``ps`` shows ``/bin/sh <path> ...``

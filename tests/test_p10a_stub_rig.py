@@ -81,3 +81,21 @@ def test_the_stub_looks_to_ps_the_way_the_real_claude_does(tmp_path):
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(timeout=10)
+
+
+def test_the_launcher_runs_a_script_whose_path_has_a_quote_a_backslash_and_non_ascii(tmp_path):
+    """The script path is written into the launcher as a C string literal: every byte outside plain ASCII, and the quote
+    and the backslash, must survive it (json.dumps wrote non-BMP characters as a pair of escapes C rejects)."""
+    import stat
+    import subprocess
+
+    from tests._p10a_stub import _build_launcher
+
+    odd = tmp_path / 'd"q\\b é\U0001F600'
+    odd.mkdir()
+    script = odd / "claude.sh"
+    script.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    if not _build_launcher(tmp_path / "launcher.c", tmp_path / "launcher", script):
+        pytest.skip("no C compiler")
+    assert subprocess.run([str(tmp_path / "launcher")], timeout=30).returncode == 3
