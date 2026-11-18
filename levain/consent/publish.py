@@ -188,7 +188,7 @@ def _showable(name: str, text: str) -> None:
     found = unshowable.first_hidden(text, allow="", selectors=False)
     if found is not None:
         raise PublishRefused(f"the {name} carries an invisible or direction-changing character "
-                             f"(U+{ord(found[1]):04X}); the operator could not read what he is asked to allow")
+                             f"(U+{ord(found[1]):04X}); the operator could not read what the operator is asked to allow")
 
 
 def canonical_target(url: str) -> str:

@@ -456,7 +456,7 @@ def standing_order_sheet(card: Mapping[str, Any]) -> str:
     def block(title: str, rows: Any) -> list[str]:
         return [title, *(f"  - {r}" for r in rows)] if rows else [title, "  (none)"]
 
-    out = [f"STANDING ORDER {card['id']}", f"His words (sha256 {card['words_sha256']}):",
+    out = [f"STANDING ORDER {card['id']}", f"The operator's words (sha256 {card['words_sha256']}):",
            *(f"  | {line}" for line in str(card["words"]).split("\n"))]
     out += block("The desk WILL:", card["will"])
     out += block("The desk will NOT:", card["will_not"])

@@ -137,7 +137,7 @@ def _showable(name: str, text: str) -> None:
     found = unshowable.first_hidden(text, allow="", selectors=False)
     if found is not None:
         raise ValueError(f"the {name} carries an invisible or direction-changing character (U+{ord(found[1]):04X}); "
-                         "the operator could not read what he is asked to allow")
+                         "the operator could not read what the operator is asked to allow")
 
 
 def _branch_tip(real: str, branch: str) -> str:

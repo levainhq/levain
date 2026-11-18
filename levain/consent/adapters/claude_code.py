@@ -2087,7 +2087,7 @@ def _limits(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterSett
                                                                  environ=environ, cwd=cwd)) is not None:
             return _pre("deny", limits.retry_text(got.extended))
         return None
-    stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when he "
+    stop = {"continue": False, "stopReason": "levain: stopped by a budget the operator set; it goes on when the operator "
                                              "extends it."} if got.stop else {}
     return _pre("deny", got.text, **stop)
 
