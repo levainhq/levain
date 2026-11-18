@@ -241,6 +241,9 @@ _FAKE_SIG = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n"
 
 
 def test_a_planted_ssh_keygen_on_path_cannot_forge_a_verdict(tmp_path, monkeypatch):
+    # BEFORE the plant: the test key is built once per process by the real ssh-keygen, so this test, run first in its worker (a shard
+    # layout decides that), would otherwise build it with the planted one, which writes no key file.
+    signers = confirm_signers()
     fake = tmp_path / "bin" / "ssh-keygen"
     fake.parent.mkdir()
     fake.write_text('#!/bin/sh\necho \'Good "levain-confirm" signature for operator with ED25519 key SHA256:x\'\nexit 0\n')
@@ -248,7 +251,7 @@ def test_a_planted_ssh_keygen_on_path_cannot_forge_a_verdict(tmp_path, monkeypat
     monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ.get('PATH', '')}")
     assert subprocess.run(["ssh-keygen"], capture_output=True).stdout.startswith(b"Good")   # it is planted
     assert confirm_mod.verify_signature(b"msg", signature=_FAKE_SIG, signer=SIGNER,
-                                        allowed_signers=confirm_signers()) is False
+                                        allowed_signers=signers) is False
 
 
 def test_an_ssh_keygen_the_user_owns_is_refused_even_for_a_real_signature(tmp_path):
