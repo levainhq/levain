@@ -105,7 +105,7 @@ def _build_launcher(src: Path, out: Path, script: Path) -> bool:
     carrying its output, never a silent skip, and so is a missing compiler where ``CI`` is set."""
     cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if cc is None:
-        if os.environ.get("CI"):
+        if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
             raise RuntimeError("no C compiler on a CI runner: the p10a stub's native launcher cannot be built")
         return False
     src.write_text(_LAUNCHER.replace("{script}", _c_string(str(script))), encoding="utf-8")
