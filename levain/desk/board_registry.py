@@ -43,9 +43,9 @@ Known edges, left open under the reachability line (nobody reaches them):
   still pauses it (a hand registration at ANOTHER path makes ``register`` refuse, which stops the import there).
 * a repo already ``aborting`` whose abandon-track is asserted, legacy or no longer valid (or relayed and its row no longer
   says it), or whose anchor (``items_last``) no longer covers an uncut item of its migration (an add by a writer outside
-  the lock, or a repaired store), can never finish its cuts from that abandon, and an ``abandon-track`` re-run never
-  writes a second one (levain 32 ruling): the re-run refuses naming the abandon that stands, and each owed item is cut by a
-  signed or relayed ``decide`` (decision-class on its own, no cause needed), then ``abandon-done``;
+  the lock, or a repaired store), can never finish its cuts from that abandon: re-run ``abandon-track`` signed to recover
+  (it writes a fresh signed abandon re-signing the standing words, and the cuts cite it); an unsigned or relayed re-run
+  never writes one (levain 32 ruling: a re-run never weakens the standing cause) and says so by name;
 * two ``abandon-track`` re-runs at once can each write a cut for the same item (each read the missing cuts before the other
   wrote): both cuts cite a valid abandon and the fold reads the item cut either way;
 * a signing writer holds no lock during the prompt (``board_store._append``): a writer that lands meanwhile makes the
@@ -654,7 +654,8 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     and always None when ``uncut`` is empty: no cut is owed). The judgement is ``board_sign.cut_cause_problem``, the SAME
     predicate ``verify_cause`` applies to each cut (levain 29, fix 3), over the same cause the cuts carry
     (:func:`_latest_abandon_hash`) and the store's lines as written (``raw`` for the registry, the items file read here):
-    so a re-run refuses exactly when a cut citing the latest one would be refused. The predicate's
+    so a signed re-run writes a fresh abandon (and an unsigned or relayed one refuses) exactly when a cut citing the
+    latest one would be refused. The predicate's
     item-independent half (``board_sign.cause_problem``: the line, the registry, the signature, the items fold) is judged
     ONCE for the call, then its per-item half for each owed item (complement 15, fix 4). A torn registry never reaches here
     (the write's reader refuses it, and ``abandon_track`` names the ``ack-torn`` first); a torn items file is a problem
@@ -688,17 +689,13 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     return None, uncut
 
 
-def _standing_refusal(name: str, standing: Mapping[str, Any], problem: str, uncut: Sequence[str]) -> str:
-    """The refusal of an ``abandon-track`` re-run whose standing abandon cannot cause the cuts still owed: it names that
-    abandon and the way to finish, a signed or relayed ``decide`` of ``cut`` per owed item (decision-class on its own, so it
-    needs no cause), never a second abandon (levain 32 ruling)."""
-    from levain.desk import board_sign as sg
-    cmds = "; ".join(f"`levain board decide --id {i} --decision cut --sign`" for i in uncut)
-    problem = problem.replace(f" ({sg.CUT_ANOTHER_WAY})", "")         # said once, with the ids, below
+def _standing_refusal(name: str, standing: Mapping[str, Any], problem: str, relayed: bool) -> str:
+    """The refusal of an UNSIGNED or RELAYED ``abandon-track`` re-run whose standing abandon cannot cause the cuts still owed
+    (levain 32 ruling, P3 fix 5): it names that abandon and the one re-run that writes a fresh abandon, the signed one."""
+    kind = "a relayed" if relayed else "an unsigned"
     return (f"abandon-track {name}: the abandon-track {standing.get('short', '?')} ({standing.get('grade')}) stands and "
-            f"cannot be the cause of the cuts still owed ({problem}). A re-run never writes a second abandon-track: cut each "
-            f"owed item with a signed or relayed decide ({cmds}; or --source <q-id> in place of --sign), then abandon-done; "
-            f"nothing was written")
+            f"cannot be the cause of the cuts still owed ({problem}): re-run abandon-track signed (--sign), which writes a "
+            f"fresh signed abandon the cuts cite; {kind} re-run never writes one; nothing was written")
 
 
 def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
@@ -716,19 +713,20 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     written (``none``: no line), read under the same lock: a cut's cause holds only for an item added before it (L2 M2,
     levain 26). The lock is released during the signing prompt; an add that lands then makes the write refuse ("sign
     again"), so the anchor is never stale for a writer that takes the lock.
-    A RE-RUN on a repo already ``aborting`` the same migration NEVER writes a registry record, signed, relayed or asserted
-    (levain 32 ruling, P3 fix 5): the abandon that stands (the one the cuts carry, :func:`_latest_abandon`) keeps its words
-    and its grade, so a relayed or asserted re-run can never downgrade the cause later cuts cite, and no Touch ID prompt is
-    raised (a build that writes nothing reaches no ceremony). Its one job is design 4.2's: write each cut still owed, citing
-    the STANDING abandon. Words that differ from the standing abandon's are not an error: ``out`` gets a line naming the
-    abandon that stands and the words not recorded. A ``--source`` re-run still reads its row (an agent author, the words
-    verbatim in the answer: ``board_store._relay_read``) though nothing records it. When the standing abandon cannot cause
-    every cut still owed (:func:`_latest_abandon_problem`, which asks ``board_sign.cut_cause_problem``, the predicate every
-    cut's ``verify_cause`` is: not signed or relayed or no longer valid, another store's, not where its prev places it, not
-    applied by the fold, no ``items_last``, its anchor gone, an uncut item of M added after its anchor; a relayed abandon also
-    needs its band row to re-verify), the re-run refuses before anything is written, naming the abandon that stands and the
-    way to finish: a signed or relayed ``decide`` of ``cut`` per owed item, which needs no cause. An unsigned re-run with no
-    authority source skips that judgement and leaves it to each cut's. With no item left uncut it is a no-op that says so.
+    A RE-RUN on a repo already ``aborting`` the same migration never weakens the standing cause (levain 32 ruling, P3 fix
+    5): it writes a registry abandon ONLY when it is SIGNED and the standing abandon (the one the cuts carry,
+    :func:`_latest_abandon`) cannot cause the cuts still owed, as :func:`_latest_abandon_problem` judges it (THE one
+    predicate, ``board_sign.cut_cause_problem``, that every cut's ``verify_cause`` is: not signed or relayed or no longer
+    valid, another store's, not where its prev places it, not applied by the fold, no ``items_last``, its anchor gone, an
+    uncut item of M added after its anchor; a relayed abandon also needs its band row to re-verify). That recovery re-signs
+    the STANDING words (the fold reads it as a retry and changes nothing), and the cuts cite it (rulings 5, a, fix 3). Every
+    other re-run writes no registry record and reaches no ceremony (no Touch ID prompt: the judgement is in the build,
+    before the ceremony): it writes each cut still owed citing the standing abandon (design 4.2), or, with nothing owed, is a
+    no-op; an UNSIGNED or RELAYED re-run whose standing abandon cannot cause the owed cuts refuses by name, naming the signed
+    re-run, before anything is written. Words that differ from the standing abandon's are never an error and never the
+    repo's: ``out`` gets a line naming the abandon that stands (or the recovery written) and the words not recorded. A
+    ``--source`` re-run still reads its row (an agent author, the words verbatim in the answer: ``board_store._relay_read``)
+    though nothing records it. An unsigned re-run with no authority source skips the judgement and leaves it to each cut's.
     A TORN registry or items file is not something a fresh abandon repairs: it refuses naming the ``ack-torn`` to run first
     (deepseek 71, fix 4). Returns ``(repo, ids cut by this call)``."""
     from levain.desk import board_sign as sg
@@ -766,27 +764,33 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
         items_torn()                                        # again under the lock: before any judgement or prompt
         c = _need_repo(fold, name)
         if c.mode == "aborting" and c.migration == cur.migration:
-            # a RE-RUN: the standing abandon stands and nothing is written to the registry (levain 32 ruling), so the build
-            # returns no record and no ceremony is reached; the --source is still read, never recorded
+            # a RE-RUN (levain 32 ruling): never a weaker cause. Only a SIGNED re-run whose standing abandon cannot cause
+            # the owed cuts writes one (re-signing the standing words); every other re-run returns no record, so no
+            # ceremony is reached. The --source is still read, never recorded.
             sha, rec = _latest_abandon(bs._split_written(raw)[0], name, c.migration)
             standing.clear()
-            standing.update(short=(sha or "?")[:12], grade=(rec or {}).get("grade"), words=c.words)
+            standing.update(short=(sha or "?")[:12], grade=(rec or {}).get("grade"), words=c.words, recovered=None)
             bs._relay_read(relay, words, author)
             held = seal.authority if seal is not None else authority
-            if seal is not None or relay is not None or held is not None:
-                problem, uncut = _latest_abandon_problem(raw, sid, name, c.migration, None, target.store_dir, band,
-                                                         authority=held)
-                if problem is not None:
-                    raise BoardError(_standing_refusal(name, standing, problem, uncut))
-            return None, False
-        if c.mode != "tracking" or c.migration != cur.migration:
+            if seal is None and relay is None and held is None:
+                return None, False                          # no authority: each cut's own check speaks
+            problem, _ = _latest_abandon_problem(raw, sid, name, c.migration, None, target.store_dir, band, authority=held)
+            if problem is None:                             # nothing owed, or every owed cut holds: cut-only or a no-op
+                return None, False
+            if seal is None:
+                raise BoardError(_standing_refusal(name, standing, problem, relay is not None))
+            standing["recovered"] = problem                 # the signed recovery: an upgrade, never a downgrade
+            body_words = c.words
+        elif c.mode != "tracking" or c.migration != cur.migration:
             raise BoardError(f"{name} changed under the abandon ({c.mode}); run it again")
+        else:
+            body_words = words
         items = _items_raw(target.store_dir)
         _fold_items(items)                                  # a torn item store refuses here too, under the lock
         tail = [ln for ln in items.split(b"\n") if ln]
         last = hashlib.sha256(tail[-1]).hexdigest() if tail else sg.ITEMS_NONE
-        return _record("abandon-track", name, by, sid, {"words": words, "migration": c.migration, "items_last": last},
-                       author, now, bs._read_relay(relay, words)), True
+        return _record("abandon-track", name, by, sid, {"words": body_words, "migration": c.migration, "items_last": last},
+                       author, now, bs._read_relay(relay, body_words)), True
 
     _reg_write(target, build, seal=seal, author=author)
     authority = authority if authority is not None else getattr(seal, "authority", None)
@@ -805,6 +809,9 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
             cut.append(iid)
     if standing and out is not None:
         said = f"the abandon-track {standing['short']} ({standing['grade']}) stands"
+        if standing["recovered"] is not None:
+            said = (f"the abandon-track {standing['short']} ({standing['grade']}) could not cause the cuts still owed "
+                    f"({standing['recovered']}): a signed abandon-track {cause[:12]} re-signing its words was written")
         if words != standing["words"]:
             said += f": the words {words!r} not recorded (the repo's words stay {standing['words']!r})"
         if relay is not None:
