@@ -1535,13 +1535,13 @@ def test_n3_an_acknowledged_torn_pause_or_resume_line_is_not_a_decision_of_the_r
              json.dumps({"v": 1, "store": SID, "op": "ack-torn", "line": 2, "sha256": hashlib.sha256(torn.encode()).hexdigest(),
                          "why": "w", "at": "2026-11-17T10:00:05Z", "by": "d"})]
     f = rf.fold_repos(lines, store_id=SID)
-    assert not f.torn and f.acked == (2,)
+    assert not f.torn and f.acked == (2,) and f.applied == (1,)              # the dropped line is never applied
     x = f.repos["x"]
     assert x.via == "import-focus" and x.history == 0
     f = rf.fold_repos(lines[:1] + [rec("pause", n=2)], store_id=SID)
-    assert f.repos["x"].history == 1
+    assert f.repos["x"].history == 1 and f.applied == (1, 2)
     f = rf.fold_repos(lines[:1] + [rec("resume", n=2, repo="ghost")], store_id=SID)      # a soft problem: not accepted
-    assert f.repos["x"].history == 0
+    assert f.repos["x"].history == 0 and f.applied == (1,)                   # a record, but not applied
 
 
 def test_n3_a_repo_registered_by_hand_with_no_pause_record_is_not_paused_by_an_import_rerun(home, tmp_path, mkrepo, capsys):

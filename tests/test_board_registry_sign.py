@@ -822,6 +822,37 @@ def test_a_signed_abandon_the_registry_fold_rejected_causes_no_cut_codex_42(tgt,
     assert items_raw(store) == before
 
 
+def test_a_soft_rejected_abandon_is_caught_by_the_folds_structure_not_its_problem_text(tgt, store, tmp_path, mkrepo, rig,
+                                                                                      monkeypatch):
+    """P2 fix 5: the check reads ``RepoFold.applied``, not the problem strings. The fold is made to word its soft rejection
+    in a form fix 4's string match did not know (no ``line n: `` prefix). The cut is still refused as NOT APPLIED, the
+    message the structure gives, not the later "not aborting" one a string-reading check would have fallen through to."""
+    from dataclasses import replace
+
+    from levain.desk import repos_fold as rf
+    repo, m, iid = tracked(tgt, tmp_path, mkrepo, rig)
+    br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())
+    line = _abandon_for(store, rig, m)
+    _append_reg(store, line)
+    n = len(raw(store).splitlines())
+    real = rf.fold_repos
+
+    def reworded(*a, **kw):
+        f = real(*a, **kw)
+        return replace(f, problems=tuple(p.replace(f"line {n}: ", f"repos.jsonl#{n} refused, ") for p in f.problems))
+
+    monkeypatch.setattr(rf, "fold_repos", reworded)
+    view = br.read_registry(tgt)
+    assert view.fold.repos["alpha"].mode == "tracked" and not view.fold.torn
+    assert n not in view.fold.applied and n in {ln for ln, _ in view.fold.records}
+    assert not any(p.startswith(f"line {n}: ") for p in view.fold.problems) and view.fold.problems   # old pattern: no match
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="decision-class write.*the registry did not apply"):
+        bs.decide(tgt, iid, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=hashlib.sha256(line).hexdigest(),
+                  authority=rig.source())
+    assert items_raw(store) == before
+
+
 def test_an_acknowledged_torn_abandon_causes_no_cut_gemini_102_case_3(tgt, store, tmp_path, mkrepo, rig):
     """gemini 102 case 3, reproduced on 664f72209: a signed abandon line malformed for itself (words not a string) and
     acknowledged as torn: the fold DROPS it (alpha stays tracking) and the registry is not torn. A cut citing it was ACCEPTED."""
