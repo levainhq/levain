@@ -58,7 +58,7 @@ static pid_t kid;
 static void fwd(int sig) { if (kid > 0) kill(kid, sig); }
 
 int main(int argc, char **argv) {
-    char **a = calloc((size_t)argc + 2, sizeof *a);
+    char **a = calloc((argc > 0 ? (size_t)argc : 1) + 2, sizeof *a);
     int st;
     sigset_t block, old;
     a[0] = "/bin/sh";
@@ -72,19 +72,30 @@ int main(int argc, char **argv) {
     signal(SIGINT, fwd);
     kid = fork();
     if (kid < 0) return 127;
-    if (kid == 0) { sigprocmask(SIG_SETMASK, &old, NULL); execv("/bin/sh", a); _exit(127); }
+    if (kid == 0) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        execv("/bin/sh", a);
+        _exit(127);
+    }
     sigprocmask(SIG_SETMASK, &old, NULL);
     while (waitpid(kid, &st, 0) < 0) if (errno != EINTR) return 127;
-    return WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
+    kid = 0;                       /* reaped: its number may be anyone's now, so fwd must not signal it */
+    if (WIFSIGNALED(st)) {         /* die the way the child died, as a signalled native program does */
+        signal(WTERMSIG(st), SIG_DFL);
+        raise(WTERMSIG(st));
+    }
+    return WEXITSTATUS(st);
 }
 """
 
 
 def _c_string(text: str) -> str:
-    """``text`` as a C string literal: printable ASCII as is, every other byte (and the quote and backslash) as an octal escape."""
+    """``text`` as a C string literal: printable ASCII as is, every other byte (and the quote, the backslash and the question mark, which can open a trigraph) as an octal escape."""
     out = []
     for b in text.encode("utf-8"):
-        out.append(chr(b) if 32 <= b < 127 and chr(b) not in '"\\' else "\\%03o" % b)
+        out.append(chr(b) if 32 <= b < 127 and chr(b) not in '"\\?' else "\\%03o" % b)
     return '"' + "".join(out) + '"'
 
 

@@ -65,7 +65,7 @@ def test_the_stub_looks_to_ps_the_way_the_real_claude_does(tmp_path):
     occ = tmp_path / "occ"
     occ.mkdir()
     argv = [str(stub.path), "-p", "--model", "m", "--add-dir", str(occ)]
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
     try:
         deadline = time.monotonic() + 30
         while stub.calls() == 0 and time.monotonic() < deadline:
@@ -99,3 +99,30 @@ def test_the_launcher_runs_a_script_whose_path_has_a_quote_a_backslash_and_non_a
     if not _build_launcher(tmp_path / "launcher.c", tmp_path / "launcher", script):
         pytest.skip("no C compiler")
     assert subprocess.run([str(tmp_path / "launcher")], timeout=30).returncode == 3
+
+
+def test_a_launcher_ended_by_a_group_sigterm_dies_by_that_signal(tmp_path):
+    """A signalled native program reports the signal to its parent (``returncode`` -15), not a 128+n exit: the stub must too."""
+    import os
+    import signal
+    import subprocess
+
+    from tests._p10a_stub import StubClaude
+
+    stub = StubClaude(tmp_path / "stubclaude")
+    if not stub.native:
+        pytest.skip("no C compiler: the stub is an sh script")
+    stub.sleep(30)
+    proc = subprocess.Popen([str(stub.path), "-p"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        deadline = time.monotonic() + 30
+        while stub.calls() == 0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert stub.calls() == 1
+        os.killpg(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=20) == -signal.SIGTERM
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
