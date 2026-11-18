@@ -847,3 +847,26 @@ def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
     assert [r.out for r in racers] == ["", "", ""]
     assert [r["state"] for r in rows] == ["skipped-no-input", "skipped-no-input"]       # every branch: both slots ended, none launched
     assert inst.rows("SELECT * FROM agent_slots") == [] and inst.spawned() == []
+
+
+# ------------------------------------------------------------------------------- facts named after the enable
+
+def test_p10a_facts_named_after_the_enable_are_refused_until_revised_and_resigned(tmp_path):
+    """A live spec binds the install's first-run facts file, so a file named only after the enable is a change the
+    signed link does not cover: a hand start is refused until `dream enable --revise` registers the new spec and a link
+    is signed for it."""
+    inst = Install(tmp_path)
+    inst.facts_first = False
+    assert inst.enable("--time", "00:00").rc == 0
+    assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+    inst.name_facts()
+    refused = inst.cli("dream", "start")
+    assert refused.rc == 1 and refused.out == "", refused.text
+    assert "the input check failed: InstallRefused" in refused.err, refused.err
+    assert [(r["state"], r["reason"]) for r in inst.rows()] == [("stopped", "hand_start_unclassified")]
+    assert inst.spawned() == []
+    assert inst.enable("--time", "00:00", "--revise").rc == 0
+    assert inst.cli("dream", "start").rc == 1                       # the new spec has no link yet
+    assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+    started = inst.cli("dream", "start")
+    assert started.rc == 0 and "claimed and launched oc-" in started.out, started.text

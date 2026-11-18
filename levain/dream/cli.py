@@ -292,7 +292,6 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         try:
             facts = da.current_install_doc(store.directory)
             binding = None if facts is None else da.install_binding(facts)
-            live = None if facts is None else da.install_live_binding(facts)
         except (KeyError, TypeError) as exc:
             print(f"levain dream enable: the shadow install facts lack {exc}; nothing was registered or written (pass "
                   "--store-dir to write the facts again)", file=sys.stderr)
@@ -300,6 +299,13 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         except da.InstallRefused as exc:
             print(f"levain dream enable: {exc}; nothing was registered or written (pass --store-dir to write the "
                   "facts again)", file=sys.stderr)
+            return 1
+        try:
+            # a facts_path that cannot be bound is the stored file's own fact, which --store-dir merges unchanged: no
+            # flag rewrites it, so this refusal carries no such advice
+            live = None if facts is None else da.install_live_binding(facts)
+        except da.InstallRefused as exc:
+            print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
     else:
         try:
