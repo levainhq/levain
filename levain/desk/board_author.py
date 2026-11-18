@@ -116,7 +116,7 @@ def describe(c: Closer | Mapping[str, Any]) -> str:
     elif tier == "trailer":
         line = f"{who}, {how}"
     else:
-        line = f"{how} {who}" + (f" <{d['email']}>" if d.get("email") else "")
+        line = f"{how} {who}" + (f" <{d['email']}>" if d.get("email") is not None else "")
     if d.get("committer"):
         line += f", committed by {d['committer']}"
     return line + (f" ({d['note']})" if d.get("note") else "")
@@ -389,7 +389,7 @@ class _Reader:
         elif len(f.seats) > 1:
             notes.append("the commit carries several different Board-Seat trailers, so none is read")
         return Closer("git", f.author or "(no author name)", "asserted by git author", sha, "; ".join(notes),
-                      email=f.email or None, committer=f.committer)
+                      email=f.email, committer=f.committer)
 
 
 # ------------------------------------------------------------------------------------------------ where the close comes from
@@ -427,11 +427,20 @@ def _note_writer(repo: Path, close_sha: str, item_id: str) -> str | None:
 def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
     """``(the first-parent commit on main that first added the path, "")`` or ``(None, the unattributed text)``. The path
     is :func:`levain.desk.board_evidence.done_path`'s; whether it is in the repo's work tree, and its name there, are git's
-    answers from inside the path's own directory (nothing is resolved here)."""
+    answers from inside the path's PARENT directory (nothing is resolved, followed or entered here)."""
     path = be.done_path(key, repo)
-    probe = path if path.is_dir() else path.parent
+    # The LITERAL tracked path: probed from its parent directory by its own name, so a symlink is never followed and a
+    # submodule directory is never entered (git then names it as the superproject's own path).
+    probe = path.parent
     if not probe.is_dir():
         return None, "unattributed: the path cannot be found now"
+    if not path.is_symlink() and path.exists():
+        top0 = Path(be._git(repo, "rev-parse", "--show-toplevel").strip())
+        try:
+            if path.samefile(top0):
+                return None, "unattributed: the path is the repo's whole work tree"
+        except OSError:
+            pass
     here = be._run(probe, "rev-parse", "--show-toplevel", "--show-prefix")
     if here.returncode != 0:
         return None, OUTSIDE
@@ -439,8 +448,7 @@ def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
     top = be._git(repo, "rev-parse", "--show-toplevel").strip()
     if len(lines) < 2 or lines[0] != top:
         return None, OUTSIDE
-    rel = lines[1] + ("" if path.is_dir() else path.name)
-    rel = rel.rstrip("/")
+    rel = (lines[1] + path.name).rstrip("/")
     if not rel:
         return None, "unattributed: the path is the repo's whole work tree"
     out = be._git(repo, "log", "--first-parent", "--no-renames", "--diff-filter=A", "--format=%H", "--reverse", main_ref, "--",
