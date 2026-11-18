@@ -772,5 +772,7 @@ def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
     new = rows[1]["occurrence_id"]
     assert all(f"levain agents tick: {new} did not launch: " in r.err for r in racers if r.err)
     assert sum("skipped-no-input (no_input)" in r.err for r in racers) == 1
-    assert all(("skipped-no-input (no_input)" in r.err or "not-admitted (the occurrence ended while its input was checked)" in r.err)
+    # a racer that checks after the claimed occurrence already ended says so (measured, levain 40, 11-18)
+    assert all(("skipped-no-input (no_input)" in r.err or "not-admitted (the occurrence ended while its input was checked)" in r.err
+                or "not-admitted (the occurrence is skipped-no-input)" in r.err)
                for r in racers if r.err)

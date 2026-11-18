@@ -957,8 +957,8 @@ def _run_abandon(args: argparse.Namespace) -> int:
 
 def _abandon_landed(args: argparse.Namespace, store, autonomic, bar) -> tuple[object | None, bool]:
     """R1 alone for ``--abandon``: ``(step, True)`` when the bar's own link is already in the verified log (``step`` is
-    the ``RevokeStep`` ``_landed`` returned), ``(None, True)`` when the check ran and the log does not hold it, and ``(None, False)`` when it
-    could not run (a cockpit that cannot be reached, or a log that cannot be replayed): the abandon goes on, and the
+    the ``RevokeStep`` ``_landed`` returned), ``(None, True)`` when the check ran and the log does not hold it, and
+    ``(None, False)`` when it could not run (a cockpit that cannot be reached, or a log that cannot be replayed): the abandon goes on, and the
     caller tells the two Nones apart. Never R2 or a full recovery: that would append the revoke the operator is
     abandoning."""
     from levain.agents import tick_driver
