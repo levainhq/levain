@@ -328,7 +328,8 @@ def where_refusal(real_cwd: str, scope: Mapping[str, Any]) -> str | None:
 def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str | None = None,
                  inline: Mapping[str, Any] | None = None, slots: Mapping[str, Any] | None = None,
                  agent_store: Any = None, harness: str | None = None, model: str | None = None,
-                 parent_launch: str | None = None, done: str | None = None, item: str | None = None) -> Any:
+                 parent_launch: str | None = None, done: str | None = None, item: str | None = None,
+                 migration: str | None = None) -> Any:
     """Ask for a worker on ``thread_id`` under the lease holder's ``token``. ``parent_launch`` names the ACTIVE spawned
     worker that is spawning this one, and the store derives the depth from its record. A worker holds no lease token
     and no door verb, so the only spawner is the lease holder: the depth is the LINEAGE THE LEASE HOLDER DECLARES (a
@@ -336,7 +337,7 @@ def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str |
     cap on live spawns (:data:`MAX_SPAWNS_LIVE`). ``harness`` and ``model`` default
     to the role's own, and one that names another is refused. Returns the pending launch; the watcher or ``levain
     coord launch`` starts it. ``item`` is the board item (NAME#N) the worker is for: its claim is written on the
-    launch record in the request's own transaction (T7), and a malformed id refuses the whole request. Every refusal is a :class:`SpawnRefused` and leaves nothing written."""
+    launch record in the request's own transaction (T7), and a malformed id refuses the whole request. ``migration`` is the ceremony id of a seat on a repository being tracked or aborted (a worker on one without it is refused). Every refusal is a :class:`SpawnRefused` and leaves nothing written."""
     role, digest, is_inline = resolve_role(agent_store, ref=ref, inline=inline)
     harness = role["harness"] if harness is None else harness
     model = role["model"] if model is None else model
@@ -349,6 +350,8 @@ def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str |
     render_brief(role, values)            # refused now, never at the worker's start
     text = make_draft(role, digest, inline=is_inline, slots=values, done=done, parent_launch_id=parent_launch)
     extra = {} if item is None else {"attach_item": item}
+    if migration is not None:
+        extra["migration"] = migration
     try:
         return store.launch_request(token, harness=harness, role="worker", threads=[thread_id], model=model,
                                     cwd=cwd, role_ref=text, **extra)

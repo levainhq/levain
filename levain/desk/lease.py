@@ -185,9 +185,19 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # transaction that asks for it. The board's seats producer reads it as the launch's ``board_items``
     "CREATE TABLE IF NOT EXISTS launch_board_items (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
     "gseq INTEGER NOT NULL UNIQUE, items TEXT NOT NULL, at TEXT NOT NULL)",
+    # the close protocol a launch was started under (T10, levain#102), written once in the request's own transaction when
+    # it is not the default: a launch with no row here (every launch made before T10 too) reads as ``legacy``. ``migration``
+    # is the ceremony id a ``ceremony`` launch carries
+    "CREATE TABLE IF NOT EXISTS launch_protocol (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, protocol TEXT NOT NULL CHECK (protocol IN ('tracked', 'legacy', 'ceremony')), "
+    "migration TEXT, at TEXT NOT NULL)",
     *_append_only("launch_threads", "a launch thread"),
     *_append_only("launch_sweeps", "a launch sweep"),
     *_append_only("launch_board_items", "a launch board claim"),
+    *_append_only("launch_protocol", "a launch protocol"),
+    "CREATE TRIGGER IF NOT EXISTS launch_protocol_no_replace BEFORE INSERT ON launch_protocol WHEN EXISTS (SELECT 1 "
+    "FROM launch_protocol WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a launch takes its close protocol once'); END",
     "CREATE TRIGGER IF NOT EXISTS launch_board_items_no_replace BEFORE INSERT ON launch_board_items WHEN EXISTS (SELECT 1 "
     "FROM launch_board_items WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a launch claims its board items once'); END",
@@ -277,6 +287,14 @@ class Launch:
     role_ref: str | None = None  # a spawned worker's spawn record (:func:`spawn_record`); None for every other launch
     board_items: tuple[str, ...] | None = None   # the board items it was started for (T7's claim); None: it claimed none
     board_items_why: str | None = None           # set when the claim's cell could not be read: it is then an unknown claim
+    protocol: str = "legacy"     # tracked | legacy | ceremony: how its close is judged (T10); a record with no row reads legacy
+    migration: str | None = None   # the ceremony id a ``ceremony`` launch carries
+
+    @property
+    def durable_key(self) -> str:
+        """The key a seat's closing commits name as ``Board-Seat`` and a record's ``source`` carries: the slot key
+        allocated before any process starts, one per launch and never reused."""
+        return self.session_key
 
 
 @dataclass(frozen=True)
@@ -491,6 +509,20 @@ def claim_board_items(conn: sqlite3.Connection, now: str, launch_id: str, items:
                  (launch_id, next_gseq(conn, now), cell, now))
 
 
+PROTOCOLS = ("tracked", "legacy", "ceremony")
+
+
+def record_protocol(conn: sqlite3.Connection, now: str, launch_id: str, protocol: str, migration: str | None = None) -> None:
+    """Record, in the caller's transaction, the close protocol ``launch_id`` was started under. ``legacy`` is the reading
+    of no row, so it is never written."""
+    if protocol not in PROTOCOLS or protocol == "legacy":
+        raise _refused(f"a launch's recorded protocol is tracked or ceremony (got {str(protocol)[:20]!r})")
+    if (protocol == "ceremony") != (migration is not None):
+        raise _refused("a ceremony launch carries its migration id, and no other launch does")
+    conn.execute("INSERT INTO launch_protocol (launch_id, gseq, protocol, migration, at) VALUES (?, ?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), protocol, migration, now))
+
+
 def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:
     """A store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF."""
     return _has_column(conn, table, "user_scope")
@@ -683,8 +715,13 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
             except (LeaseRefused, TypeError, ValueError, RecursionError):
                 # a damaged cell is this launch's unknown claim, never a failure of every launch read
                 claimed, why = None, "its claim cell in launch_board_items is damaged"
+    protocol, migration = "legacy", None
+    if _has_table(conn, "launch_protocol"):
+        got = conn.execute("SELECT protocol, migration FROM launch_protocol WHERE launch_id = ?", (r[0],)).fetchone()
+        if got is not None:
+            protocol, migration = got
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed, why)
+                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed, why, protocol, migration)
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:

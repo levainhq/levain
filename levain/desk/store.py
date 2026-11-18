@@ -1236,11 +1236,13 @@ class CoordStore:
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
                        model: str | None = None, cwd: str | None = None, role_ref: str | None = None,
-                       attach_item: str | None = None) -> Any:
+                       attach_item: str | None = None, migration: str | None = None) -> Any:
         """Ask for a launch under ``token``. ``attach_item`` is the v2 claim (T7): the board item id the launch is
         started for is written on the launch record (``launch_board_items``, read as ``Launch.board_items``), in this
         same transaction, so a malformed id refuses the whole request and leaves no launch. The v1 ready queue is
-        not read or written."""
+        not read or written. A worker's close protocol (T10) is taken from its repository's mode in the registry at this
+        moment and written on the record when it is not ``legacy`` (:func:`levain.desk.board_registry.launch_protocol`):
+        a worker on a ``tracking`` or ``aborting`` repository is refused unless it carries that ceremony's ``migration`` id."""
         from levain.desk import board_registry, lease
 
         # a malformed claim is refused first, before the board registry is written to (W4): the check reads no store
@@ -1256,9 +1258,18 @@ class CoordStore:
                 board_registry.register_for_launch(cwd)
             except board_registry.BoardError as exc:
                 raise CoordError(f"launch refused: {cwd} could not be registered on the board registry: {exc}") from None
+        protocol, carried = "legacy", None
+        if role == "worker" and cwd and len(threads) <= 1:
+            try:
+                protocol, carried = board_registry.launch_protocol(cwd, migration)
+            except board_registry.BoardError as exc:
+                raise CoordError(f"launch refused: {exc}") from None
         with self._write() as (conn, now):
             ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
                                       cwd=cwd, role_ref=role_ref)
+            if protocol != "legacy":
+                lease.record_protocol(conn, now, ln.launch_id, protocol, carried)
+                ln = lease.launch(conn, ln.launch_id)
             if attach_item is not None:
                 lease.claim_board_items(conn, now, ln.launch_id, [attach_item])
                 ln = lease.launch(conn, ln.launch_id)       # the record as it now stands, claim included

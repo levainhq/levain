@@ -2260,7 +2260,7 @@ def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         raise CoordError(f"the role registry cannot be opened ({exc})") from None
     ln = instantiate.spawn_worker(store, args.token, thread_id=args.thread, cwd=cwd, ref=args.role, inline=inline,
                                   slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done,
-                                  item=args.item)
+                                  item=args.item, migration=args.migration)
     rec = instantiate.verified_record(ln.role_ref)
     again = _again(args, store)
     _emit(out, args.json, {"launch_id": ln.launch_id, "state": ln.state, "spawn": rec["spawn"],
@@ -2812,6 +2812,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="The board item (NAME#N) this worker is for: written on the launch record as its board "
                           "claim in the request's own transaction, or the request is refused. The v1 ready "
                           "queue is not read.")
+    csp.add_argument("--migration", default=None, metavar="M",
+                     help="The migration id of the ceremony this worker belongs to: a worker on a repository that is "
+                          "tracking or aborting is refused without it.")
     csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
                      help="The role registry's store (default: this Levain home's).")
     csp.add_argument("--token", type=int, required=True, help="Your desk lease token.")

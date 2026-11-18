@@ -556,6 +556,58 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
     ]
 
 
+def _board_modes_section() -> list[str]:
+    """The desk brief's section on the work board: the two modes of a repository, the verbs, and the ceremony in the
+    order the design fixes (5). Fixed text; it names no count and no repository."""
+    return [
+        "## The work board: two modes",
+        "",
+        "A repository is untracked or tracked. An untracked one keeps its own memory files (`next.md`, `brief.md`, the "
+        "pickup file) and its seats close by rewriting the `## ▶ CURRENT STATE` block. A tracked one keeps its intent in "
+        "`CHARTER.md` and its work as items on the board: a seat there loads `board context`, not a file, and closes by an "
+        "episode and a trailer per item. Two more states exist only inside a ceremony: `tracking` and `aborting`. "
+        "A repository in either is locked to new work, and a worker launch on it is refused unless it carries the "
+        "ceremony's migration id (`coord spawn --migration M`).",
+        "",
+        "These are `board` and `charter` verbs, not `coord` verbs: the desk's own door does not open them, so "
+        "they run at the operator's terminal or in a seat that may run them. Where a verb is named below it is by its "
+        "name.",
+        "",
+        "- read: `board state`, `board repos`, `board context NAME#N`;",
+        "- an item: `board add --key M:K ...`, `board amend`, `board decide`;",
+        "- a charter: `charter init NAME`, `charter check`;",
+        "- the mode: `board register|begin-track|track|abandon-track|abandon-done|untrack`.",
+        "",
+        "Tracking a repository starts when the operator says so, in conversation. Never begin it on your own reading, and "
+        "write nothing before his yes. In this order:",
+        "",
+        "1. If this install has no item store, run `board use DIR` with him first. Then `board register` the "
+        "repository if it is not known.",
+        "2. Read its existing memory, read-only: `next.md`, `brief.md`, `project_memory/`, status pages, TODO files, the "
+        "README and the conventions files.",
+        "3. Draft ONE review page (the review-page rule: HTML beside the markdown, with its URL). It holds the charter "
+        "filled from the old memory; the proposed items, each with his words verbatim where the old files carry them, a "
+        "DONE line and a `done_kind`; what is not carried, each with its reason; which old paths will be retired; and any "
+        "build, test or deploy convention, routed to the repository's conventions file instead of the charter.",
+        "4. He answers in conversation, and edits go back to step 3. His yes, in his words, is what `--words` carries on "
+        "`begin-track` and later `track`.",
+        "5. Execute, in this order: `board begin-track` (it writes the migration id M and locks the repository); `board add "
+        "--key M:K` for each item; land `CHARTER.md` on the repository's main by its own landing path, so that `charter "
+        "check` passes there; `board track` (the one record that moves the source of truth); then each old file is "
+        "copied to the record directory's `pre-track-<date>/` and replaced by the stub, landed by the repository's own "
+        "path. Before `track` the old files are the source of truth, and after it the board is. To stop before `track`: "
+        "`board abandon-track`, finish any compensation, then `board abandon-done`. After `track` there is no abort, and "
+        "leaving tracked mode is `untrack`.",
+        "6. Write one `decision` episode tagged `repo:NAME`, naming the charter blob, the item count and the record "
+        "directory.",
+        "",
+        "A worker you launch for an item gets the five rules of the board in its own brief: run `board context` first, "
+        "`Board-Item` on every commit, `Board-Closes` on the commit that meets the DONE line, `Board-Seat` with its key on "
+        "every closing commit, and episodes tagged `repo:NAME` and `item:NAME#N`.",
+        "",
+    ]
+
+
 def record_brief_delivery(store: CoordStore, launch_id: str) -> None:
     """Record that the launch's own open was handed to it as its brief (``launch_brief``), once the harness session
     that was given the file has been read back. Silent when it cannot: a missing row only leaves the open one the
@@ -580,6 +632,46 @@ def desk_command(install: Path | str | None) -> str:
 
     found = None if install is None else installed_desk_levain(Path(install), sys.executable)
     return found or desk_levain(sys.executable)
+
+
+def _board_item_section(launch: Any) -> list[str]:
+    """The worker brief's section for a launch started for board items (``launch.board_items``): the five rules of the
+    brief (design 6, "The brief (T10)"). Empty for a launch that claimed none. The brief carries no copy of an item's
+    context: ``levain board context`` is the one source. The ids are checked against the board's id shape at the claim, and are
+    marked here all the same."""
+    items = launch.board_items
+    if not items:
+        return []
+    key = unshowable.mark(launch.session_key, allow="")
+    lv = desk_command(launch.cwd)
+    ids = [unshowable.mark(i, allow="") for i in items]
+    many = len(ids) > 1
+    each = " (for each item you touch)" if many else ""
+    first = ids[0] if not many else "NAME#N"
+    repo = ids[0].partition("#")[0] if not many else "NAME"
+    lines = [
+        "## Your board item" + ("s" if many else ""),
+        "",
+        f"Levain started you for {', '.join(f'`{i}`' for i in ids)} on the work board. Five rules, in this order:",
+        "",
+        *([f"- Run `{lv} board context {i}` before anything else." for i in ids] if not many else
+          [f"- Run `{lv} board context NAME#N` for each of {', '.join(f'`{i}`' for i in ids)} before anything else."]),
+        "  That command is the one source of the item's context: its charter, the operator's words, its DONE line, its "
+        "record. This brief carries no copy of it.",
+        f"- Every commit you make carries the trailer `Board-Item: {first}`{each}.",
+        f"- The commit that meets the item's DONE line also carries `Board-Closes: {first}`.",
+        f"- Every closing commit also carries `Board-Seat: {key}`, your durable key.",
+        f"- Write each decision and each handoff as an episode tagged `repo:{repo}` and `item:{first}`, with source `{key}`.",
+        "",
+        f"Your launch is recorded as `{launch.protocol}`: " + (
+            "a tracked repository has no `## ▶ CURRENT STATE` block to rewrite, so your close is an episode for each item "
+            "you touched, written after you started, plus a closing trailer or `levain board amend --done` naming what "
+            "remains." if launch.protocol == "tracked" else
+            "you close the way the repository's old memory does, and when the repository has since become tracked, the "
+            "tracked close is accepted too."),
+        "",
+    ]
+    return lines
 
 
 def _worker_brief_text(launch: Any, ctx: Any) -> str:
@@ -608,6 +700,7 @@ def _worker_brief_text(launch: Any, ctx: Any) -> str:
         f"`{mark(launch.session_key)}`). Your directory is {quoted(launch.cwd)}. You hold one thread, "
         f"`{ctx.thread.thread_id}`: {quoted(ctx.thread.title)}.",
         "",
+        *_board_item_section(launch),
         "## Your role",
         "",
         ("This role is REGISTERED (its text is the one the registry holds under that name and hash)." if not
@@ -744,6 +837,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "the Desk panel as `no reply yet`.",
         "",
         *_arrival_section(lv, tail),
+        *_board_modes_section(),
         "## How your turn ends",
         "",
         "Your words are the last thing in a session the operator may see in his agent view, where a question or "
