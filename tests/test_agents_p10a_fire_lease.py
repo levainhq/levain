@@ -257,13 +257,9 @@ def _alive(pid: int) -> bool:
     return subprocess.run(["/bin/ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout.strip() != ""
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="PRODUCT BUG (levain/dream/executor.py, observed on the real fire): FireStopRequested "
-                   "escapes ClaudeMind.compose before ctx.composes.append, so _write_usage sees composes == [] and writes "
-                   "readable: true, actual_usd_micros: 0, and the reservation settles 'actual' with a 0 debit: a stop "
-                   "mid-compose is a readable zero, against the module's rule that an unread count is None, never 0")
 def test_a_stop_mid_compose_does_not_settle_a_readable_zero(live):
     """The invariant: a run stopped while its ``claude -p`` child was live spent an UNKNOWN amount, so its usage is not a
-    readable zero and the reservation is not settled at a 0 debit."""
+    readable zero: it is unreadable and the whole reservation is debited, with no breach."""
     f = live(expires_in_min=10)
     assert f.inst.cli("agents", "tick", now=_at(15)).rc == 0
     assert f.now_row()["state"] == "stopped"
@@ -271,3 +267,6 @@ def test_a_stop_mid_compose_does_not_settle_a_readable_zero(live):
     _say("usage", usage, res)
     assert not (usage["readable"] is True and usage["actual_usd_micros"] == 0)
     assert res["debited_usd_micros"] == res["reserved_usd_micros"]
+    assert usage["readable"] is False and usage["actual_usd_micros"] is None
+    assert (res["state"], res["settled_reason"], res["debited_usd_micros"]) == ("settled", "unreadable", 20_000_000)
+    assert not res.get("breach") and res["settled_reason"] != "breach"

@@ -1337,6 +1337,14 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 if not cancelled:
                     print(_cancel_failed())
                 return _fail("compose-failed", 1, f"{type(exc).__name__}: {exc}")
+            except BaseException as exc:
+                # A stop (FireStopRequested, a SIGTERM) landed while the model call was live: what it spent is
+                # unknown, so the usage is an UNREADABLE compose (settles the whole reservation), never a zero.
+                ctx.composes.append({"n": attempt, "usd_micros": None, "input_tokens": None,
+                                     "output_tokens": None, "cache_read": None, "cache_creation": None,
+                                     "turns": None, "seconds": None, "model": None, "models_charged": None,
+                                     "error": f"stopped mid-compose ({type(exc).__name__})", "warnings": []})
+                raise
             ctx.composes.append(_compose_row(attempt, res))
             if cap is not None:
                 ctx.spent += charged_after(cap, budget.m_usd_micros if budget else None, res.usd_micros)
