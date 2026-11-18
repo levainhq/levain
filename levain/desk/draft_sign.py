@@ -176,6 +176,37 @@ def _shared(store: Any, thread_id: str) -> dict[str, Any] | None:
                             for t in ids]}
 
 
+def _head_id(store: Any, thread_id: str) -> str | None:
+    """The id of the thread's head envelope now, or None (no head, or no envelope tables yet)."""
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk.envelopes import EnvelopeStore
+
+    with drafts._reading(store) as conn:
+        if not drafts._has(conn, "envelope_binds"):
+            return None
+        head = EnvelopeStore._head(conn, thread_id)
+        return None if head is None else head.envelope_id
+
+
+def _cards_and_shared(store: Any, thread_id: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """A thread's cards and its :func:`_shared` line, read so the two describe the same head. They are separate reads,
+    so the head id is read before and after both: the head is the thread's newest bind and binds are append-only with a
+    rising ``gseq``, so the same id at both ends means no head was bound between. A head that moved is read once more; one
+    that moved again answers the cards with no ``shared``, never a line about another head. ``_shared`` is only a line
+    beside the cards: a fault in it answers no ``shared`` and leaves the cards (and their extend and replace) readable."""
+    cards: list[dict[str, Any]] = []
+    for _attempt in range(2):
+        before = _head_id(store, thread_id)
+        try:
+            shared = _shared(store, thread_id)
+        except Exception:  # noqa: BLE001  (a line beside the cards: its fault must not hide them)
+            shared = None
+        cards = _cards(store, thread_id)
+        if _head_id(store, thread_id) == before:
+            return cards, shared
+    return cards, None
+
+
 def _sheet_lines(store: Any, body_text: str) -> list[str]:
     """The plain words a signature over SEVERAL threads adds to the sheet, or nothing for a one-thread draft (whose sheet
     is exactly what it was). That this one signature covers exactly these threads, what the budget does across them
@@ -217,13 +248,12 @@ def _cards_after(store: Any, thread_id: Callable[[], str | list[str] | None]) ->
         if tid is None:
             return {}
         tids = [tid] if isinstance(tid, str) else list(tid)
-        by_thread = [(t, _cards(store, t)) for t in tids]
-        out: dict[str, Any] = {"cards": [c for _t, cs in by_thread for c in cs]}
-        if len(tids) > 1:
-            out["groups"] = [{"thread_id": t, "title": _title_of(store, t), "cards": cs,
-                              **({"shared": sh} if (sh := _shared(store, t)) is not None else {})}
-                             for t, cs in by_thread]
-        return out
+        if len(tids) == 1:
+            return {"cards": _cards(store, tids[0])}
+        by_thread = [(t, *_cards_and_shared(store, t)) for t in tids]
+        return {"cards": [c for _t, cs, _sh in by_thread for c in cs],
+                "groups": [{"thread_id": t, "title": _title_of(store, t), "cards": cs,
+                            **({"shared": sh} if sh is not None else {})} for t, cs, sh in by_thread]}
     except Exception as exc:  # noqa: BLE001  (any fault here is after the commit; the reply must still report it)
         return {"cards": None, "cards_note": f"the cards could not be read just now ({type(exc).__name__}): "
                                               "read the cards again"}
@@ -242,8 +272,8 @@ def handle(phone: Any, action: str, req: dict[str, Any], device: str) -> dict[st
     if action == "draft-cards":
         _text(req, "thread_id")
         store = _store(phone, req["store_id"])
-        shared = _shared(store, req["thread_id"])
-        return {"cards": _cards(store, req["thread_id"]), "store_id": store.store_id(),
+        cards, shared = _cards_and_shared(store, req["thread_id"])
+        return {"cards": cards, "store_id": store.store_id(),
                 **({} if shared is None else {"shared": shared})}
     if action == "draft-rule":
         return _rule(phone, req)
@@ -334,8 +364,8 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             "signer_fp": key.fingerprint, "store_id": store.store_id(), "until": now + REVIEW_TTL, "minted": None}
     # the builder IS the check: it raises DraftStale before any verifier call or byte when the draft is not signable
     body_text, _payload, since, against = _built(phone, store, kept, key, now)
-    view = _view_lines(against)          # before the review is kept: a head the sheet cannot describe keeps nothing
-    view += _sheet_lines(store, body_text)
+    # before the review is kept: a head the sheet cannot describe keeps nothing. A new list, never the one returned
+    view = [*_view_lines(against), *_sheet_lines(store, body_text)]
     kept["against"] = _against(against)
     kept["body_text"] = body_text
     review_id = "dv-" + secrets.token_hex(16)

@@ -335,7 +335,10 @@ def detach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "ope
     A detach also ends the mission envelope's grant for that child (Q4): a per-thread ``kill`` by the service for each
     envelope signed from a draft of this mission that binds the thread, written on this transaction's connection, so
     the revision and the kills land together or not at all. It only takes authority away. A thread this mission once
-    held and no longer does is a no-op, not an error. What ends is the grant of THIS mission's signatures only: an
+    held and no longer does writes no revision, not an error, but its kills are still made sure of: a child detached
+    when a detach wrote no kill is killed now. A kill is written once: ``EnvelopeStore._attenuate`` writes no second
+    kill for an envelope and thread that already hold one, so detach, re-attach, detach again adds no row and refuses
+    nothing. What ends is the grant of THIS mission's signatures only: an
     envelope signed for the thread on its own (a renewal of a lapsed mission envelope binds one thread and comes from a
     thread draft, not a mission draft) is that signature's own grant and is not killed here."""
     by, token = _by(store, by, token)
@@ -343,13 +346,13 @@ def detach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "ope
         _must_mission(conn, mission_id)
         _, children, _ = _latest(conn, mission_id)
         if thread_id not in children:
-            if any(thread_id in json.loads(r[0]) for r in conn.execute(
+            if not any(thread_id in json.loads(r[0]) for r in conn.execute(
                     "SELECT children FROM mission_revisions WHERE mission_id = ?", (mission_id,))):
-                return _view(conn, mission_id)
-            raise CoordError(f"thread {thread_id} is not in mission {mission_id}")
-        if len(children) == 1:
+                raise CoordError(f"thread {thread_id} is not in mission {mission_id}")
+        elif len(children) == 1:
             raise CoordError("a mission is never left with no thread")
-        _revise(conn, mission_id, [c for c in children if c != thread_id], "detach", by, now)
+        else:
+            _revise(conn, mission_id, [c for c in children if c != thread_id], "detach", by, now)
         for envelope_id in _signed_from(conn, mission_id, thread_id):
             EnvelopeStore._attenuate(conn, now, envelope_id, "kill", "", thread_id, "service")
         return _view(conn, mission_id)

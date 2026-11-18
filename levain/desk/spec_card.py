@@ -136,8 +136,9 @@ def _released(conn: sqlite3.Connection, thread_ids: Sequence[str]) -> str | None
             "SELECT 1 FROM mission_drafts m WHERE m.mission_id = ? AND (NOT EXISTS (SELECT 1 FROM "
             "envelope_draft_withdrawals w WHERE w.draft_id = m.draft_id) OR EXISTS (SELECT 1 FROM envelopes e WHERE "
             "json_extract(e.body, '$.draft.draft_id') = m.draft_id)) LIMIT 1", (mid,)).fetchone()
-        return mid if tapped is not None and held is None else None
-    return None
+        if tapped is not None and held is None:
+            return mid
+    return None              # every mission over that set was read: none of them is released
 
 
 _METER_WORDS = {"tool_calls": "tool calls", "tokens": "tokens", "hours": "hours of active work"}

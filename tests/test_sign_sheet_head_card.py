@@ -782,6 +782,64 @@ def test_a_one_thread_reply_is_drawn_and_acted_on_as_before(tmp_path: Path) -> N
     assert [r["thread_id"] for a, r in stub.posts if a == "draft-rule"] == [THREAD]
 
 
+def _draft(draft_id: str) -> dict[str, Any]:
+    return _card("ENVELOPE", "draft " + draft_id, ["sign", "withdraw"],
+                 {**ENVELOPE["detail"], "draft_id": draft_id, "digest": "sha256:" + draft_id[-1] * 64})
+
+
+def _review_of_the_posted_draft(s: Stub) -> tuple[int, dict[str, Any]]:
+    """The review of whichever draft the page just asked for: its own review id and its own body."""
+    draft_id = [r for a, r in s.posts if a == "draft-review"][-1]["draft_id"]
+    return 200, {"review_id": "dv-" + draft_id[-1] * 32, "body_text": "THE BODY OF " + draft_id, "rp_id": RP,
+                 "since_parent": [], "against": _against("none", False, EMPTY_DIFF), "view": ["no head"], "store_id": "st-1"}
+
+
+def _group(i: int, sel: str) -> str:
+    return f"document.querySelectorAll('#head-card .head-group')[{i}].querySelector('{sel}')"
+
+
+@needs_browser
+def test_a_sign_button_signs_only_the_review_it_was_drawn_for(tmp_path: Path) -> None:
+    """Failure (L3 h15 r3 codex HIGH, reproduced on 2f641ff3a): two children each hold their own draft (A, B) after a shared
+    envelope lapsed. Review A, then review B: A's "Sign this draft" button stayed, and every button signed the LAST review,
+    so tapping A's button minted the challenge for B. Now a new review takes every earlier review's button and sheet away,
+    and each button signs only the review it was drawn for."""
+    groups = [{"thread_id": "th-head-1", "title": "part 0", "cards": [], "shared": SHARED},
+              {"thread_id": "th-head-2", "title": "part 1", "cards": [_draft("dr-a")]},
+              {"thread_id": "th-head-3", "title": "part 2", "cards": [_draft("dr-b")]}]
+    stub = Stub([LAPSED])
+    stub.script["draft-rule"] = [lambda s: (200, {"draft": {"draft_id": "dr-a", "revision": 1, "digest": "sha256:" + "a" * 64,
+                                                            "thread_id": "th-head-2"},
+                                                  "cards": [c for g in groups for c in g["cards"]], "groups": groups, "store_id": "st-1"})]
+    stub.script["draft-review"] = [_review_of_the_posted_draft, _review_of_the_posted_draft]
+    sign_a, sign_b = _group(1, "[data-head-sign]"), _group(2, "[data-head-sign]")
+    v = _run(tmp_path, stub, [
+        _click("head-extend"), _until("document.querySelectorAll('#head-card .head-group').length === 3"),
+        {"tap": _group(1, "#head-review"), "ms": 5000}, _until(f"!!{sign_a}"),
+        {"tap": _group(2, "#head-review"), "ms": 5000}, _until(f"!!{sign_b}"),
+        _tag("a_sign", f"!!{sign_a}"), _tag("a_sheet", f"!!{_group(1, '.head-diffs')}"),
+        _tag("b_sheet", f"({_group(2, '.head-diffs')} || {{}}).textContent || ''"),
+        # A's button if it is still drawn; when it is not, the press lands on the note line, which does nothing
+        {"tap": f"{sign_a} || document.getElementById('head-note')", "ms": 5000},
+        _until("new Promise((r) => setTimeout(() => r(true), 1500))"),
+        {"eval": "fetch('/__posts').then(r => r.json()).then(a => 'after_a|' + a.includes('draft-challenge'))"},
+        {"tap": f"{sign_b} || document.getElementById('head-note')", "ms": 5000}, _until("/^Signed/.test(" + NOTE + ")"),
+    ])
+    assert v["after_a"] == "false", v                 # nothing is minted from a button whose review is gone
+    assert v["a_sign"] == "false" and v["a_sheet"] == "false", v
+    assert "THE BODY OF dr-b" in v["b_sheet"], v
+    challenges = [r["review_id"] for a, r in stub.posts if a == "draft-challenge"]
+    accepts = [r["body_text"] for a, r in stub.posts if a == "draft-accept"]
+    assert challenges == ["dv-" + "b" * 32] and accepts == ["THE BODY OF dr-b"], stub.posts
+    assert stub.bad == []
+
+
+def test_each_sign_button_carries_the_review_it_was_drawn_for() -> None:
+    """String-level: the button passes its own review, and the signer refuses one that is no longer the current review."""
+    assert 'hbtn("Sign this draft", "head-sign", () => hsign(rv), true)' in HEAD
+    assert "const hsign = (r) => {" in HEAD and "r !== hreview" in HEAD
+
+
 def test_the_page_names_no_thread_but_the_group_it_draws_under() -> None:
     """String-level: a rule's thread is the argument of the card's own group, never the page's head thread."""
     assert 'hcall("draft-rule", { thread_id: tid,' in HEAD and 'hcall("draft-rule", { thread_id: headThread' not in HEAD

@@ -312,6 +312,27 @@ def test_a_card_over_another_set_after_a_withdrawal_is_still_refused_and_a_signe
         c.close()
 
 
+def test_released_reads_every_mission_over_the_set_not_only_the_first(card):
+    """Failure (L3 h15 r3 deepseek MED 1, reproduced on 2f641ff3a): ``_released`` answered at the FIRST mission over the
+    set, so an earlier unreleased one hid a later released one. The store is hand-built (one thread, one mission keeps
+    two missions off one set): a desk-grouped mission, older by rowid, is revised onto a tapped and withdrawn one's
+    threads. Each thread is still in the older mission, so the door refuses the set anyway, naming it."""
+    ctx = card.ctx
+    _d0, other = family(ctx, 2, words="an older grouping")
+    older = ms.create_mission(ctx.store, [t.thread_id for t in other], by="operator")
+    ts, first = _withdrawn_tap(card)
+    ids = sorted(t.thread_id for t in ts)
+    with ctx.store._write("operator") as (conn, now):
+        ms._revise(conn, older.mission_id, ids, "attach", "operator", now)
+    c = card.store._connect()
+    try:
+        assert spec_card._released(c, ids) == first.mission_id
+        with pytest.raises(ms.InMission, match=f"is already in mission {older.mission_id}"):
+            spec_card.check_mission_threads(card.store, c, ids)
+    finally:
+        c.close()
+
+
 def test_a_mission_the_desk_grouped_is_never_reused_by_a_card(card, door):
     """Q1: a mission comes into being only by his tap. A mission no tap made (create_mission, by the desk) whose draft was
     withdrawn is not released to a card: the door still refuses."""

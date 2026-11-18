@@ -15,6 +15,7 @@ from levain.desk import draft_sign as ds
 from levain.desk import envelope_drafts as drafts
 from levain.desk import missions, spec_card
 from levain.desk.envelope import utc_stamp
+from levain.desk.envelopes import EnvelopeStore
 from levain.desk.store import Part, Source
 from tests.test_desk_draft_sign import Rig
 from tests.test_desk_envelope import BUDGET
@@ -143,3 +144,120 @@ def test_after_a_detach_the_shared_head_marks_the_detached_child_ended_on_every_
     for t in (ts[0], ts[1]):
         shared = rig.call("draft-cards", thread_id=t.thread_id)["shared"]
         assert [x["ended"] for x in shared["threads"]] == [False, True, False], shared
+
+
+# --- fix 4 (L3 h15 r3) ---------------------------------------------------------------------------------------------------
+def _signed(world, n=3):
+    rig, ts, m, dr = mission_rig(world, n)
+    r = rig.review({"draft_id": dr.draft_id, "revision": dr.revision, "digest": dr.digest})
+    _c, req = rig.sign(r)
+    got = rig.accept(req)
+    assert got["created"] is True
+    return rig, ts, m, got["envelope"]["envelope_id"]
+
+
+def _kills(rig, eid, tid):
+    return rig.rows(f"SELECT COUNT(*) FROM envelope_attenuations WHERE envelope_id = '{eid}' AND thread_id = '{tid}' "
+                    "AND kind = 'kill'")[0]
+
+
+def _refusal(rig, eid, tid):
+    with drafts._reading(rig.store) as conn:
+        return EnvelopeStore._store_refusal(conn, rig.store._stamp(), eid, tid)
+
+
+def test_detach_reattach_detach_again_writes_one_kill_and_refuses_nothing(world):
+    """L3 h15 r3 (complement MED, deepseek LOW): a second detach after a re-attach was said to double-kill or refuse.
+    NOT reproduced on 2f641ff3a (``_attenuate`` writes no second kill for an envelope and thread that hold one); pinned."""
+    rig, ts, m, eid = _signed(world)
+    t = ts[1].thread_id
+    missions.detach(rig.store, m.mission_id, t)
+    missions.attach(rig.store, m.mission_id, t)
+    assert "killed" in _refusal(rig, eid, t)            # Q4: the re-attach does not restore the grant
+    missions.detach(rig.store, m.mission_id, t)          # the second detach goes through
+    assert t not in missions.get_mission(rig.store, m.mission_id).children
+    assert _kills(rig, eid, t) == 1
+    missions.detach(rig.store, m.mission_id, t)          # and a detach of a thread already out is a no-op
+    assert _kills(rig, eid, t) == 1
+
+
+def test_a_child_detached_when_detach_wrote_no_kill_is_killed_by_the_next_detach(world):
+    """Failure (L3 h15 r3 codex HIGH, reproduced on 2f641ff3a): a child detached by a detach that wrote no kill (the
+    revision alone, as before fix 3) kept a live grant, and detaching it again was a no-op that left it live."""
+    rig, ts, m, eid = _signed(world)
+    t = ts[1].thread_id
+    with rig.store._write("operator") as (conn, now):          # the revision alone, as detach wrote it before fix 3
+        missions._revise(conn, m.mission_id, [x.thread_id for x in ts if x.thread_id != t], "detach", "operator", now)
+    assert _refusal(rig, eid, t) is None                       # the grant still runs for a thread out of the mission
+    revs = rig.rows(f"SELECT COUNT(*) FROM mission_revisions WHERE mission_id = '{m.mission_id}'")
+    missions.detach(rig.store, m.mission_id, t)
+    assert "killed" in _refusal(rig, eid, t) and _kills(rig, eid, t) == 1
+    assert rig.rows(f"SELECT COUNT(*) FROM mission_revisions WHERE mission_id = '{m.mission_id}'") == revs
+    assert all(_refusal(rig, eid, x.thread_id) is None for x in ts if x.thread_id != t)      # only that child's grant
+
+
+def test_a_detach_after_the_tap_refuses_the_review_and_the_challenge(world):
+    """L3 h15 r3 (deepseek MED 2): a detach between the tap and the review was said to leave a sheet (and a signature)
+    over a thread no longer in the mission. NOT reproduced on 2f641ff3a: the builder's L4 lapse (the mission moved since
+    the series was written) refuses the review as stale, and a detach after the review refuses the challenge; pinned."""
+    from levain.desk.phone import CoordRefused
+
+    rig, ts, m, dr = mission_rig(world, 3)
+    req = {"draft_id": dr.draft_id, "revision": dr.revision, "digest": dr.digest}
+    r = rig.review(req)                                         # reviewed before the detach
+    missions.detach(rig.store, m.mission_id, ts[2].thread_id)
+    with pytest.raises(CoordRefused) as exc:
+        rig.review(req)
+    assert (exc.value.status, exc.value.error) == (409, "draft_stale") and "has lapsed" in str(exc.value)
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(r)
+    assert (exc.value.status, exc.value.error) == (409, "draft_stale")
+    assert rig.envelopes() == []
+
+
+def test_a_fault_in_the_shared_line_leaves_the_cards_readable(world, monkeypatch):
+    """Failure (L3 h15 r3 complement MED, reproduced on 2f641ff3a): a fault in ``_shared`` failed the whole draft-cards
+    read, hiding the cards and their extend and replace."""
+    rig, ts, _m, _eid = _signed(world)
+    want = rig.call("draft-cards", thread_id=ts[0].thread_id)["cards"]
+
+    def boom(store, tid):
+        raise RuntimeError("the shared line broke")
+
+    monkeypatch.setattr(ds, "_shared", boom)
+    got = rig.call("draft-cards", thread_id=ts[0].thread_id)
+    assert got["cards"] == want and "shared" not in got
+    assert all("shared" not in g for g in ds._cards_after(rig.store, lambda: [t.thread_id for t in ts])["groups"])
+
+
+def test_a_head_bound_between_the_two_reads_is_read_again(world, monkeypatch):
+    """Failure (L3 h15 r3 codex MED, reproduced on 2f641ff3a): ``shared`` and ``cards`` were separate reads, so a mission
+    envelope signed between them answered the new head's cards with no shared line (the head as it was before)."""
+    rig, ts, _m, dr = mission_rig(world, 3)
+    r = rig.review({"draft_id": dr.draft_id, "revision": dr.revision, "digest": dr.digest})
+    _c, req = rig.sign(r)
+    real = ds._cards
+    fired = []
+
+    def cards(store, tid):
+        if not fired:
+            fired.append(True)
+            rig.accept(req)                                     # the signature lands between the reads
+        return real(store, tid)
+
+    monkeypatch.setattr(ds, "_cards", cards)
+    got = rig.call("draft-cards", thread_id=ts[1].thread_id)
+    assert fired and rig.envelopes() != []
+    assert got["shared"]["envelope_id"] == rig.envelopes()[0], got
+    assert got["cards"] == real(rig.store, ts[1].thread_id)
+
+
+def test_the_review_builds_a_new_view_list(world, monkeypatch):
+    """Failure (L3 h15 r3 complement LOW 3, reproduced on 2f641ff3a): ``view += _sheet_lines(...)`` extended the list
+    ``_view_lines`` returned, so a shared list carried one review's sheet into the next."""
+    held = ["no head"]
+    monkeypatch.setattr(ds, "_view_lines", lambda against: held)
+    rig, _ts, _m, dr = mission_rig(world, 3)
+    req = {"draft_id": dr.draft_id, "revision": dr.revision, "digest": dr.digest}
+    first = rig.review(req)["view"]
+    assert rig.review(req)["view"] == first and held == ["no head"]

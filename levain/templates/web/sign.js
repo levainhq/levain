@@ -1538,9 +1538,11 @@
         const k = keyNow();
         return hcall("draft-review", { draft_id: d.draft_id, revision: d.revision, digest: d.digest, signer_fp: k.fp }, (b) => {
           if (!b.review_id || typeof b.body_text !== "string") return hsay("The cockpit sent no review to sign; nothing was signed.", true);
-          hreview = { id: b.review_id, body_text: b.body_text, fp: k.fp, draft_id: d.draft_id, revision: d.revision };
-          const old = box.querySelector(".head-diffs");
-          if (old) old.remove();
+          // one review at a time on the whole card: every earlier review's sheet and Sign button go (a group's included), and
+          // this button signs THIS review only, never whichever review is newest when it is tapped
+          const rv = { id: b.review_id, body_text: b.body_text, fp: k.fp, draft_id: d.draft_id, revision: d.revision };
+          hreview = rv;
+          for (const n of document.querySelectorAll("#head-card [data-head-sign], #head-card .head-diffs")) n.remove();
           const dbox = el("div", "env-opt head-diffs");
           dbox.id = "head-diffs";
           const t = el("div", "env-opt-t");
@@ -1560,10 +1562,8 @@
           t.appendChild(det);
           dbox.appendChild(t);
           acts.before(dbox);
-          const sg = hbtn("Sign this draft", "head-sign", hsign, true);
+          const sg = hbtn("Sign this draft", "head-sign", () => hsign(rv), true);
           sg.dataset.headSign = "1";
-          const prior = acts.querySelector("[data-head-sign]");
-          if (prior) prior.remove();
           acts.prepend(sg);
           hsay("Read the changes above, then sign this draft with your passkey. The challenge is made when you tap.");
         });
@@ -1580,9 +1580,10 @@
         hsay("The signing key changed; review the changes again to sign with it. Nothing was signed.", true);
       };
       if (ksel) sec.insertBefore(keyBox, cardsBox);     // the key picker lives on the card: the drop form leaves the page below
-      const hsign = () => {
-        const r = hreview;
-        if (!r || hbusy) return;
+      // ``r`` is the review the tapped button was drawn for; one that is no longer the card's current review signs nothing
+      const hsign = (r) => {
+        if (hbusy) return;
+        if (!r || r !== hreview) return hsay("This review is no longer the one on the card; review the draft again to sign it. Nothing was signed.", true);
         const k = keyNow();
         if (k.fp !== r.fp) return hsay("The signing key changed since this review; review again. Nothing was signed.", true);
         const s = hstop();
