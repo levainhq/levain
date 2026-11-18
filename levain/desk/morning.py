@@ -95,7 +95,7 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
     try:
         item, _reply = review.file_know(store, threads[0] if threads else None, text, by=ROLE_DESK, token=token)
     except CoordError as exc:
-        raise CoordError(f"away was set ON for {', '.join(marked)}, but the KNOW telling him was not filed: {exc}") \
+        raise CoordError(f"away was set ON for {', '.join(marked)}, but the KNOW telling the operator was not filed: {exc}") \
             from exc
     return {"marked": marked, "skipped": skipped, "item_id": item.item_id}
 

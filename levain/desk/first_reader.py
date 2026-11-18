@@ -236,7 +236,7 @@ def _already_read(q: Any, outcome: str) -> CoordError:
     if outcome == "escalated":
         return CoordError(f"question #{q.n} was escalated to the operator (by the desk, or unread "
                           f"{int(UNREAD_AFTER.total_seconds() // 60)} minutes after it was filed): it was already read first, "
-                          "and it is his now")
+                          "and it is the operator's now")
     return CoordError(f"question #{q.n} was already read first ({outcome})")
 
 

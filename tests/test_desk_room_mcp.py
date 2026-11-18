@@ -195,7 +195,7 @@ def test_a_wrong_shape_is_the_callers_protocol_error(qdir, world, args, text):
 def test_the_rooms_own_refusals_come_back_as_the_tools_error(qdir, store, world):
     refused(call(world["launch"], {"quote_ids": ["cm-" + "0" * 32], "summary": "s"}), text="no message")
     own = say(store, world["thread"], "the room's own words", n=3, author=ROLE_DESK)
-    refused(call(world["launch"], {"quote_ids": [own], "summary": "s"}), text="only his words")
+    refused(call(world["launch"], {"quote_ids": [own], "summary": "s"}), text="only the operator's words")
     refused(call(world["launch"], {"quote_ids": [world["m1"], world["m1"]], "summary": "s"}), text="distinct")
     refused(call(world["launch"], {"quote_ids": [world["m1"]], "summary": "   "}), text="summary")
     refused(call(world["launch"], {"quote_ids": [world["m1"]], "summary": "s", "about": "th-" + "0" * 32}), text="names no thread")

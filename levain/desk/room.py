@@ -293,7 +293,7 @@ def quoted_words(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str])
         raise CoordError(f"launch {launch_id} is not a launch of the open room")
     if isinstance(quote, (str, bytes)) or not isinstance(quote, Sequence) or not 1 <= len(quote) <= QUOTE_MAX \
             or not all(isinstance(q, str) for q in quote) or len(set(quote)) != len(quote):
-        raise CoordError(f"a proposal quotes 1 to {QUOTE_MAX} distinct messages of his")
+        raise CoordError(f"a proposal quotes 1 to {QUOTE_MAX} distinct messages of the operator's")
     bodies = []
     for mid in quote:
         found = conn.execute("SELECT body, thread_id, author_kind FROM chat_messages WHERE message_id = ?", (mid,)).fetchone() \
@@ -302,7 +302,7 @@ def quoted_words(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str])
             raise CoordError(f"no message {str(mid)[:40]!r}")
         if found[1] != room or found[2] != "operator":
             raise CoordError(f"message {mid} is not the operator's own message in the open room; the room quotes "
-                             "only his words")
+                             "only the operator's words")
         bodies.append(found[0])
     words = _check_words(bodies[0] if len(bodies) == 1 else "\n\n".join(bodies))
     return room, words

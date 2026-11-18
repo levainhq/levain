@@ -973,7 +973,7 @@ def test_a_quote_may_name_his_message_to_an_earlier_launch_of_this_room_but_neve
     with cs._write() as (conn, _now):
         _room, words = room.quoted_words(conn, new, [first.message_id])
         assert words == "to the first launch"
-        with pytest.raises(CoordError, match="only his words"):
+        with pytest.raises(CoordError, match="only the operator's words"):
             room.quoted_words(conn, new, [stranger.message_id])
 
 

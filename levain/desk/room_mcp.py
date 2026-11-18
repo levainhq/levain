@@ -77,8 +77,8 @@ _DESCRIPTION = (
     "Propose a drop to the operator as a card in the room. Name the operator's OWN messages in this room, by id "
     "(quote_ids, in order), that are the words to drop, and give a short summary of why (the room's own words, shown "
     "beside the drop as a labelled note, never as the drop's words). about is an optional work-thread id the "
-    "conversation was about. You cannot supply the drop's words: they are his quoted messages, copied by id. "
-    "Nothing is sent until he taps the card; this authorises nothing.")
+    "conversation was about. You cannot supply the drop's words: they are the operator's quoted messages, copied by id. "
+    "Nothing is sent until the operator taps the card; this authorises nothing.")
 TOOL: dict[str, Any] = {
     "name": _NAME,
     "description": _DESCRIPTION,
@@ -87,7 +87,7 @@ TOOL: dict[str, Any] = {
         "properties": {
             "quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
                           "description": "Ids (cm-...) of the operator's own messages in this room, in order. Each of "
-                                         "his messages reaches you with its id in the <room-context> block ahead of it."},
+                                         "the operator's messages reaches you with its id in the <room-context> block ahead of it."},
             "summary": {"type": "string", "description": "Why this is being proposed, in your own words."},
             "about": {"type": "string", "description": "Optional: a work thread id (th-...) it concerns."},
         },
@@ -100,16 +100,16 @@ TOOL: dict[str, Any] = {
 RELAY_TOOL: dict[str, Any] = {
     "name": room_host.RELAY_TOOL,
     "description": (
-        "File the operator's own words with the desk, now, because he asked you to. Name his messages in this room, by "
+        "File the operator's own words with the desk, now, because the operator asked you to. Name the operator's messages in this room, by "
         "id (quote_ids, in order), that are the words to send; they are copied from the store and sent exactly. You "
-        "cannot supply words, a note or a destination. Each of his messages goes once per room: one already relayed, or "
+        "cannot supply words, a note or a destination. Each of the operator's messages goes once per room: one already relayed, or "
         "whose delivery is unknown, is refused. The reply says whether the desk took them and the thread id to read the "
-        "desk's answer by (desk_replies). Use it only when he has asked for it."),
+        "desk's answer by (desk_replies). Use it only when the operator has asked for it."),
     "inputSchema": {
         "type": "object",
         "properties": {"quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
                                      "description": "Ids (cm-...) of the operator's own messages in this room, in order. "
-                                                    "Each of his messages reaches you with its id in the "
+                                                    "Each of the operator's messages reaches you with its id in the "
                                                     "<room-context> block ahead of it."}},
         "required": ["quote_ids"],
         "additionalProperties": False,
@@ -131,7 +131,7 @@ NOTE_TOOL: dict[str, Any] = {
     "name": room_host.NOTE_TOOL,
     "description": (
         "File YOUR OWN note with the desk: analysis, context, what you saw, attributed to the Room seat and kept apart from "
-        "his words. Information only; it never carries his direction. Use it with relay_to_desk, not instead of it. One "
+        "the operator's words. Information only; it never carries the operator's direction. Use it with relay_to_desk, not instead of it. One "
         f"line of plain text, at most {_NOTE_ARG_MAX} characters; the desk is told it came from the Room."),
     "inputSchema": {
         "type": "object",
@@ -148,26 +148,26 @@ _ENVELOPE_ARGS = frozenset({"quote_ids", "thread", "spec", "summary"})
 ENVELOPE_TOOL: dict[str, Any] = {
     "name": room_host.ENVELOPE_TOOL,
     "description": (
-        "Propose an ENVELOPE DRAFT for a work thread, as a card in the room, when he has told you in this room what he "
-        "wants a worker allowed to do (where, how long, what it may land). Name his OWN messages that say so (quote_ids, "
-        "in order), the open work thread (th-...) it is for, and the spec you read from his words. He sees his words, the "
-        "thread, YOUR spec in an editable field, a plain-words reading of it and your summary; he taps to make an "
+        "Propose an ENVELOPE DRAFT for a work thread, as a card in the room, when the operator has told you in this room what "
+        "they want a worker allowed to do (where, how long, what it may land). Name the operator's OWN messages that say so (quote_ids, "
+        "in order), the open work thread (th-...) it is for, and the spec you read from the operator's words. The operator sees their words, the "
+        "thread, YOUR spec in an editable field, a plain-words reading of it and your summary; they tap to make an "
         "UNSIGNED draft on that thread, and signs it separately. This authorises nothing and signs nothing. The spec is an "
         "OBJECT (never text) with keys among where [{repo: ABSOLUTE_PATH, paths: [...]}], lands [{repo, onto}], pushes, "
         "publishes, budget {tool_calls, tokens, dollars_cents, hours} and stop (a duration such as \"2h\"): name only "
-        "what he said. A launch grant is never part of a draft. Name the repo and branch explicitly."),
+        "what the operator said. A launch grant is never part of a draft. Name the repo and branch explicitly."),
     "inputSchema": {
         "type": "object",
         "properties": {
             "quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
                           "description": "Ids (cm-...) of the operator's own messages in this room that ask for it, in order. "
-                                         "Each of his messages reaches you with its id in the <room-context> block ahead of it."},
+                                         "Each of the operator's messages reaches you with its id in the <room-context> block ahead of it."},
             "thread": {"type": "string", "description": "The open work thread (th-...) this draft is for."},
-            "spec": {"type": "object", "description": "The envelope spec you read from his words: an object, not text.",
+            "spec": {"type": "object", "description": "The envelope spec you read from the operator's words: an object, not text.",
                      "properties": {"where": {"type": "array"}, "lands": {"type": "array"}, "pushes": {"type": "array"},
                                     "publishes": {"type": "array"}, "budget": {"type": "object"}, "stop": {"type": "string"}},
                      "additionalProperties": False},
-            "summary": {"type": "string", "description": "Why this spec follows from his words, in your own words."},
+            "summary": {"type": "string", "description": "Why this spec follows from the operator's words, in your own words."},
         },
         "required": ["quote_ids", "thread", "spec", "summary"],
         "additionalProperties": False,
