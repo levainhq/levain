@@ -521,6 +521,12 @@ A consent request keeps its own kind and its own rung; the desk cannot raise it.
 
 **Envelopes: what the desk may do for a thread.** An envelope is the one authority the desk adds: where work may happen, which merges, pushes and publishes are granted, a budget and a stop time (at most 24 hours). You sign the envelope, not the plan. `levain envelope echo THREAD... --where REPO[=PATH,PATH]` writes the worded envelope you are about to sign (`--land`, `--stop` and `--budget` add to it; it has no flag for a push or a publish, and the body it writes grants none), `levain envelope sign FILE` shows you the whole thing and signs and accepts it, and `accept` takes one signed elsewhere. `show` and `list` read them back, `extend` writes the envelope that raises a thread's budget (only your signature extends it), `narrow` stops one earlier or drops an effect, and `kill` ends one with no signature. An envelope can also grant `launches`: a count from 1 to 12 of seats the desk may start in a repo the envelope already covers, without asking again. It is off unless you grant it; the cockpit's envelope form offers it as a "Launching seats" switch, off by default, only where the page's credential may use it, and the phone cockpit can sign it. `levain dispatch config` holds the signed configuration a dispatch job runs under (templates, verifiers, the provider policy, the route map and the adoption rules): `init` pins your laptop key as its trust root, `show` prints it, and `sign`, `accept`, `request` and `accept-approved` change it, each item shown before it is signed.
 
+## Projects: tracked and untracked
+
+A repo in Levain is untracked or tracked. **Untracked** is the default: the repo keeps its own state in its own files, and a seat reads them. **Tracked** moves the repo's state onto Levain's work board, and its `CHARTER.md` becomes the one file that says what the repo is for. Both modes are supported, and a tracked repo still builds and tests the same way.
+
+Moving a repo to tracked is a conversation with the desk, then a ceremony in a fixed order. Nothing is written before you say yes. `levain board state` shows the derived state of the items, and `levain board repos` shows what is in play and what is wrong. The modes, the ceremony, the grades a record can carry and the known edges are in [docs/projects.md](docs/projects.md).
+
 ## Keep it running (macOS and Linux)
 
 ```
@@ -594,6 +600,8 @@ Every verb `levain --help` lists, each with the one line it gives. `levain <verb
 | `levain drops` | Your drops: list, show, and split (the desk's door). |
 | `levain thread` | The threads your drops became. |
 | `levain desk` | The desk lease: who holds the desk role, and the sessions launched for it. |
+| `levain board` | The work board: items, repos in play, and the tracking ceremony (docs/projects.md). |
+| `levain charter` | A repo's CHARTER.md: init writes the skeleton, check reads it (warn mode). |
 | `levain envelope` | Thread envelopes: what the desk may do for a thread, signed by you. |
 | `levain observe` | Observe-mode PermissionRequest logger: aggregate counts only, answers nothing. |
 | `levain agents` | Named agents on the autonomic store (the store check, then one verb per act; see `levain agents --help`). |
