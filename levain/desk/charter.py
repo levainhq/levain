@@ -7,7 +7,8 @@ carries intent only: purpose, checkable criteria, constraints, and the plan as b
 SHAPE, never vocabulary, so an ordinary English word is never refused.
 
 :func:`check_text` is pure over the file text (no git, no network, no model). In Levain 1.0 the verb WARNS: it prints the
-refusal text behind a ``levain: warning (charter not yet enforced):`` prefix and exits 0 whatever it found. Only an
+refusal text behind a ``levain: warning (charter not yet enforced):`` prefix and exits 0 whatever it found. Only a wrong-repo
+refusal (``--repo-name`` of a registered repo, run against another repository; a worktree of it is the same repo) and an
 unusable command line (argparse) exits 2.
 
 ``init`` writes a skeleton whose every blank is a ``<fill: what goes here>`` token (the Plan is prefilled from the store).
@@ -416,10 +417,27 @@ def _toplevel(path: Path) -> Path | None:
     return Path(out) if cp.returncode == 0 and out else None
 
 
+def _common_dir(path: Path) -> Path | None:
+    """The resolved ``git rev-parse --git-common-dir`` of PATH (every worktree of one repository shares it), or None when
+    PATH cannot be read as a git repository."""
+    from levain.desk.board_evidence import _env
+    try:
+        cp = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+                            capture_output=True, text=True, timeout=30, env=_env())
+        out = cp.stdout.removesuffix("\n")
+        if cp.returncode != 0 or not out:
+            return None
+        d = Path(out)
+        return (d if d.is_absolute() else Path(path) / d).resolve()      # relative output is relative to the dir git ran in
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+
 def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> str | None:
     """The refusal text when NAME is registered in the board registry and ``top`` (the git top-level the verb is about to act
-    on) is not the registered path; None otherwise. An unregistered NAME, no registry, a store that cannot be read and a
-    ``top`` that is not a repository all return None: the verb behaves as it always did."""
+    on) belongs to a different repository than the registered path; None otherwise. The comparison is of the REPOSITORY
+    (the git common dir), so any worktree of the registered repo is allowed. An unregistered NAME, no registry, a store
+    that cannot be read and a ``top`` that is not a repository all return None: the verb behaves as it always did."""
     if top is None:
         return None
     try:
@@ -435,6 +453,11 @@ def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> s
     except (OSError, RuntimeError):
         return None
     if registered == here:
+        return None
+    reg_common = _common_dir(registered)
+    if reg_common is None:      # a registered path that is not readable as a git repo: no refusal, as before this guard compared repositories
+        return None
+    if reg_common == _common_dir(here):
         return None
     return (f"{name} is registered at {registered}, but this would write CHARTER.md in {here}. "
             f"Pass --repo {registered}.") if verb == "init" else (
@@ -510,9 +533,12 @@ def register(subparsers: Any) -> None:
     charter = subparsers.add_parser("charter", description="The repository charter: purpose, criteria, constraints, plan.")
     sub = charter.add_subparsers(dest="charter_cmd", required=True)
     p = sub.add_parser(
-        "check", help="Check a repository's CHARTER.md (warn mode: always exits 0).",
+        "check", help="Check a repository's CHARTER.md (warn mode: exits 0, or 2 on --repo-name of another repository).",
         description=("Check that CHARTER.md holds the prescribed shape. Reads it from origin/main by default. In this "
-                     "release it only WARNS: it prints what a valid charter needs and exits 0 either way."))
+                     "release it only WARNS: it prints what a valid charter needs and exits 0 either way. It exits "
+                     "non-zero in exactly one case: --repo-name names a repo registered in the board registry and --repo "
+                     "is a different repository from the registered one (a worktree of it is fine); it then refuses with "
+                     "exit 2 and reads nothing. An unusable command line also exits 2."))
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids (default: the directory that holds the repository's .git).")
