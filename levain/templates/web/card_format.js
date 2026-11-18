@@ -571,7 +571,7 @@
     const pieces = root.document.createDocumentFragment(), groups = [];
     const chunk = parts.map(([t], i) => {
       if (i % CHUNK_GROUP === 0) groups.push(pieces.appendChild(node("span", "long-group")));
-      return groups[groups.length - 1].appendChild(node("span", "", t));
+      return groups[groups.length - 1].appendChild(node("span", "ns", t));
     });
     full.appendChild(pieces);
     full.tabIndex = 0;                                   // its own scroll: reachable by keyboard
@@ -587,11 +587,27 @@
     box.longState = () => ({ seen: seen, unseen: seen ? 0 : left, total: total });
     // the chunks not yet shown, by index into the block's spans (for a page or a test to point at them)
     box.longUnshown = () => (seen ? [] : parts.map((_, i) => i).filter((i) => !shown[i]));
+    // FLING (1118-12): a touch fling moves the block by more than its height between two rendering updates, and the chunks it
+    // passed are never reported shown (the rule above, and right: a part nobody saw stays unshown). The marks (class ns, a tint
+    // the stylesheet draws on a chunk not yet shown) say WHERE the skipped parts are, and this button scrolls the block so the
+    // first one sits a quarter of a view down: a short step from where the person was, so that part is shown whole, and a tap
+    // again goes to the next. It opens no gate itself: only a chunk the browser reports inside the view counts.
+    const jump = node("button", "long-jump", "");
+    jump.type = "button";
+    whole.insertBefore(jump, full);
+    jump.addEventListener("click", () => {
+      const i = shown.indexOf(0);
+      if (i < 0) return;
+      const d = chunk[i].getBoundingClientRect().top - full.getBoundingClientRect().top;
+      full.scrollTop += d - full.clientHeight / 4;
+    });
     const publish = () => {
       seen = todo === 0;
       left = seen ? 0 : unshown;
       box.dataset.seen = seen ? "1" : "0";
       box.dataset.unseen = String(left);
+      jump.hidden = seen;
+      jump.textContent = "Jump to the first part not yet shown (" + count(left) + " characters left)";
       box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
     };
     // the top page's visual viewport, whose own scroll and resize (pinch-zoom panning, an iOS keyboard) fire on it, not
@@ -622,6 +638,7 @@
         for (const i of inside) {
           if (shown[i] || !onScreen(chunk[i], s) || !uncovered(chunk[i], full)) continue;
           shown[i] = 1; todo -= 1; unshown -= parts[i][1]; grew = true;
+          chunk[i].classList.remove("ns");
           inside.delete(i);
           if (io) io.unobserve(chunk[i]);
         }

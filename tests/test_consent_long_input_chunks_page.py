@@ -204,7 +204,8 @@ def test_a_block_partly_below_the_fold_shows_only_its_visible_part(tmp_path, mon
     with rig.serving():
         out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
-            {"eval": "(document.body.style.paddingTop = '620px', 1)"},                                   # 2
+            # 568, not 620: the open box's jump button (1118-12) stands above the block and takes about 52 px of it
+            {"eval": "(document.body.style.paddingTop = '568px', 1)"},                                   # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
             {"eval": first_view_counted(INPUT)},                                                          # 5
