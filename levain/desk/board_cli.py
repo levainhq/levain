@@ -781,6 +781,12 @@ def only_repo(doc: dict[str, Any], repo_name: str | None) -> dict[str, Any]:
             "repo_filter": repo_name, "reader_scope": "board"}
 
 
+def problem_lines(doc: dict[str, Any]) -> list[str]:
+    """One line per entry of the board's ``problems`` (a line of the items file that did not read): what a reader of the
+    board must not lose when there are no items to show beside them."""
+    return [f"  problem: {p}" for p in doc.get("problems", [])]
+
+
 def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     """The table :func:`_print_table` prints, as lines. ``repo_name`` keeps only the items (and audit entries) of the
     repo whose ids read ``NAME#N`` (:func:`only_repo`); the header counts what it keeps, and on a filtered doc the

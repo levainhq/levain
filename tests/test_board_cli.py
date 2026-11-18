@@ -644,3 +644,19 @@ def test_attach_producers_copies_the_blocks_already_in_the_evidence_too():
     assert first["seats"][0] is not second["seats"][0] and first["seats"][0] is not shared
     first["seats"][0]["rows"].append("x")
     assert second["seats"][0]["rows"] == [] and shared["rows"] == []
+
+
+def test_run_state_keeps_what_the_real_read_said_when_a_later_step_raises(world, tmp_path, capsys, monkeypatch):
+    # T7 fix 7: the REAL state_doc says the no-id line, then a step after it raises; run_state lets the raise through and the
+    # line already said stands on stderr (nothing the read collected is held back or lost), with nothing on stdout.
+    _producer_file(tmp_path, "acme", store_id="theirs")
+
+    def boom(*a, **kw):
+        raise RuntimeError("partway")
+
+    monkeypatch.setattr("levain.desk.board_cli._attach_producers", boom)
+    with pytest.raises(RuntimeError, match="partway"):
+        main(["board", "state", "--json", "--items", str(write_items(tmp_path, item(3))), "--repo", str(world.w),
+              "--since", "2026-11-12T00:00:00Z", "--no-land-waiter", "--producer", "acme"])
+    out = capsys.readouterr()
+    assert "has no id" in out.err and out.out == ""

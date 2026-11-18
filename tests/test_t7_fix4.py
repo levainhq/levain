@@ -148,20 +148,6 @@ def test_table_lines_labels_the_reader_whole_board_under_a_repo_filter_and_count
     assert "reader (whole board)" not in plain and "diverged: a:main" in plain
 
 
-# --- 5: what the read said before an exception is not lost ----------------------------------------------------------
-def test_run_state_keeps_what_the_read_said_when_the_read_raises(monkeypatch, capsys):
-    # state_doc writes a refusal to stderr as it goes (nothing is buffered to lose), so the line said before the raise stands.
-    def boom(args, say=None, *a, **kw):
-        say("earlier stderr line")
-        raise RuntimeError("partway")
-
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, *a, **kw: boom(args, lambda t: print(t, file=sys.stderr)))
-    with pytest.raises(RuntimeError):
-        board_cli.run_state(object())
-    cap = capsys.readouterr()
-    assert cap.out == "" and cap.err == "earlier stderr line\n"
-
-
 def test_table_lines_takes_the_label_from_the_docs_scope_and_marks_idless_audit_lines():
     # L3 r4 (deepseek LOW, complement LOW): a doc filtered by only_repo and printed without repo_name keeps its labels;
     # an id-less audit line under a filter says it is the whole board's, an item's audit line does not.
