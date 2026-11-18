@@ -97,6 +97,15 @@ def test_the_replay_keeps_a_stopped_grant_stopped_under_a_planted_renew(world):
     assert auth.grant_stop_reason(after, CG) == auth.STOPPED_CURRENT
 
 
+def test_the_refusal_shows_a_hostile_grant_id_through_markers(world):
+    hostile = "cg-\x1b[2Jx"
+    world.link({"op": "create_grant", "grant": consent(world, hostile)}, "a")
+    world.link(_renew(world, hostile, 2), "b")
+    world.revoke("b")
+    said = world.refused(_renew(world, hostile, 4), "a")
+    assert "\x1b" not in said and "grant cg-⟨U+001B⟩[2Jx stopped when" in said
+
+
 def test_control_a_loosen_that_extends_a_live_grant_still_moves_its_current_link(world):
     """The bound touches only a grant stopped in the predecessor: with every signer active the same loosen makes A's
     link the grant's current one, as before."""

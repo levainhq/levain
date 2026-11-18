@@ -2999,10 +2999,13 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 # a link already in the log is taken (refusing it would wedge the log) and the grant stays stopped
                 held = {gid for gid in changed if grant_stop_reason(state, gid) is not None}
                 if held and new_link:
+                    from levain import unshowable
+
                     gid = min(held)
                     held_grant = policy.grants[gid]         # the kind names the way back (stopped_way_with)
                     held_kind = held_grant.get("kind") if isinstance(held_grant, Mapping) else None
-                    raise AuthorityError(f"grant {gid[:80]} stopped when {grant_stop_reason(state, gid)}; a {op} does "
+                    shown = unshowable.mark(gid[:80], allow="")      # a creator string: no control sequence printed
+                    raise AuthorityError(f"grant {shown} stopped when {grant_stop_reason(state, gid)}; a {op} does "
                                          f"not bring it back: {stopped_way_with(held_kind, 'with a key you hold')}")
                 grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and (gid not in changed
                                                                                          or gid in held) else seq)
