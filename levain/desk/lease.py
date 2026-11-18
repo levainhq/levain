@@ -59,14 +59,13 @@ from levain.desk.store import CoordError, _append_only, next_gseq
 from levain.desk.legacy import CAUSE_CODEX_REMOVED, ROLE_DESK, SQL_ROLE_DESK, cause_word, role_word
 
 __all__ = [
-    "BACKOFF", "CODEX_REMOVED", "CODEX_REMOVED_WHY", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
+    "BACKOFF", "BOARD_ITEM_MAX", "CODEX_REMOVED", "CODEX_REMOVED_WHY", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
     "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "activate_room", "beat",
-    "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
+    "check_board_items", "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "move_cwd", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
     "removed_desks", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
-    "SERVICE_HOLDER", "SERVICE_TTL", "service_claim", "service_release",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -115,10 +114,6 @@ IDLE_GRACE = LEASE_TTL
 # ruled (C3b fix 1, 1020+50): the watcher's service beat goes only to a holder that wrote as desk (a lease row
 # of its own, or a thread or drop write under its token) this recently; a holder silent longer lapses
 SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
-# ruled (row 156 L2 F8, levain 78): the service's claim for one apply pass. Short, so a pass killed between its claim
-# and its release holds the lease this long at most; and yieldable, so a desk's claim takes it (:func:`claim`)
-SERVICE_TTL = timedelta(seconds=120)
-SERVICE_HOLDER = "service"
 # a model name as the harness takes it: never a leading dash (argv would read it as a flag)
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
@@ -277,6 +272,7 @@ class Launch:
     user_scope: bool = False     # the user-layer choice it was asked under: the spawn reads this, never the setting
     role_ref: str | None = None  # a spawned worker's spawn record (:func:`spawn_record`); None for every other launch
     board_items: tuple[str, ...] | None = None   # the board items it was started for (T7's claim); None: it claimed none
+    board_items_why: str | None = None           # set when the claim's cell could not be read: it is then an unknown claim
 
 
 @dataclass(frozen=True)
@@ -369,11 +365,6 @@ def claim(conn: sqlite3.Connection, now: str, launch_id: str, session_key: str) 
     if held is not None and held.holder == session_key:
         beat(conn, now, held.token, by=ROLE_DESK)
         return held.token
-    if held is not None and held.holder == SERVICE_HOLDER:
-        # the service's claim is for bookkeeping and always yields: its pass then fails its own check and applies
-        # nothing more (row 156 L2 F8)
-        _yield_service(conn, now, held, cause="service yields to a desk claim", by=ROLE_DESK)
-        held = None
     holder = None if held is None or held.holder == "operator" else _launch_by_key(conn, held.holder)
     if holder is not None and holder.state != "active":
         # a holder whose launch is not running holds nothing a claimant must wait out (wake reads it the same way)
@@ -438,37 +429,6 @@ def release(conn: sqlite3.Connection, now: str, token: int | None, *, by: str) -
     return held
 
 
-def _yield_service(conn: sqlite3.Connection, now: str, held: Lease, *, cause: str, by: str) -> None:
-    """End the service's live claim so a desk can hold the lease: one ``release`` row naming the service."""
-    _event(conn, now, "release", SERVICE_HOLDER, token=held.token, until=None, cause=cause, by=by)
-
-
-def service_claim(conn: sqlite3.Connection, now: str, *, cause: str) -> tuple[int | None, Lease | None]:
-    """The service takes a free lease for one short job. Returns ``(token, None)`` once claimed (holder ``service``,
-    held for :data:`SERVICE_TTL`), or ``(None, held)`` when anyone else's claim stands, live or past its until: a lease
-    is never taken from its holder, and the lapse of someone else's is never the service's to record (recording it
-    also expires pending launches, a decision; the service skips the pass instead). A stale claim of the service's
-    own is recorded as lapsed, and nothing else is written for it. Runs in the caller's write transaction."""
-    held = lease(conn, now)
-    if held is not None and not held.live and held.holder == SERVICE_HOLDER:
-        _event(conn, now, "lapse", SERVICE_HOLDER, token=held.token, until=None, cause="past until", by="service")
-        held = None
-    if held is not None:
-        return None, held
-    return _event(conn, now, "claim", SERVICE_HOLDER, token=None, until=_plus(now, SERVICE_TTL), cause=cause,
-                  by="service"), None
-
-
-def service_release(conn: sqlite3.Connection, now: str, token: int, *, cause: str) -> bool:
-    """Give back the lease the service claimed with ``token``. Writes nothing and returns False unless the standing
-    lease is that claim, held by ``service``; a lease someone else holds is never released here."""
-    held = lease(conn, now)
-    if held is None or held.holder != "service" or held.token != token:
-        return False
-    _event(conn, now, "release", "service", token=token, until=None, cause=cause, by="service")
-    return True
-
-
 def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> int:
     """You take the desk role (writer 2): a ``takeover`` ends whatever was held, every pending launch is
     voided, every running desk launch is ended (so none claims again when your hold runs out), and you hold
@@ -494,16 +454,26 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
 
 
-def claim_board_items(conn: sqlite3.Connection, now: str, launch_id: str, items: Sequence[str]) -> None:
-    """Record, in the caller's transaction, the board items ``launch_id`` was started for (the v2 claim). Each is a
-    board item id (:data:`levain.desk.board_store.ID_RE`); whether the board holds it is the board's to say, never
-    this write's: a launch is claimed for an id and the board's reader judges the claim."""
+BOARD_ITEM_MAX = 200     # the longest board item id a claim holds (the v1 item id's own bound)
+
+
+def check_board_items(items: Sequence[object]) -> list[str]:
+    """The claim's ids, or a refusal: distinct board item ids (:data:`levain.desk.board_store.ID_RE`) of at most
+    :data:`BOARD_ITEM_MAX` characters. Pure: it reads no store, so a caller checks it BEFORE any side effect."""
     from levain.desk import board_store
 
     got = list(items)
     if not got or len(set(got)) != len(got) or any(
-            not isinstance(i, str) or board_store.ID_RE.fullmatch(i) is None for i in got):
-        raise _refused("a launch's board items are distinct board item ids (NAME#N)")
+            not isinstance(i, str) or len(i) > BOARD_ITEM_MAX or board_store.ID_RE.fullmatch(i) is None for i in got):
+        raise _refused(f"a launch's board items are distinct board item ids (NAME#N, at most {BOARD_ITEM_MAX} characters)")
+    return got
+
+
+def claim_board_items(conn: sqlite3.Connection, now: str, launch_id: str, items: Sequence[str]) -> None:
+    """Record, in the caller's transaction, the board items ``launch_id`` was started for (the v2 claim). Each is a
+    board item id (:func:`check_board_items`); whether the board holds it is the board's to say, never
+    this write's: a launch is claimed for an id and the board's reader judges the claim."""
+    got = check_board_items(items)
     conn.execute("INSERT INTO launch_board_items (launch_id, gseq, items, at) VALUES (?, ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), json.dumps(got), now))
 
@@ -688,12 +658,20 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
                           "WHERE launch_id = ? ORDER BY seq", (r[0],)).fetchall()
     until = next((e[1] for e in events if e[0] == "pending"), None)
     hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
-    claimed = None
+    claimed, why = None, None
     if _has_table(conn, "launch_board_items"):
         got = conn.execute("SELECT items FROM launch_board_items WHERE launch_id = ?", (r[0],)).fetchone()
-        claimed = None if got is None else tuple(json.loads(got[0]))
+        if got is not None:
+            try:
+                parsed = json.loads(got[0])
+                if not isinstance(parsed, list) or not parsed or not all(isinstance(i, str) for i in parsed):
+                    raise ValueError("not a list of ids")
+                claimed = tuple(parsed)
+            except (TypeError, ValueError):
+                # a damaged cell is this launch's unknown claim, never a failure of every launch read
+                why = "its claim cell in launch_board_items is damaged"
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed)
+                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed, why)
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:
@@ -1611,7 +1589,7 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     ``unset`` (no desk setting, agent none, or a codex setting written before the Codex desk's removal:
     a drop only queues), ``backoff``, ``stopped`` (you look), or ``wake``."""
     held = lease(conn, now)
-    if held is not None and held.live and held.holder != SERVICE_HOLDER:   # the service's claim yields (F10)
+    if held is not None and held.live:
         holder = None if held.holder == "operator" else _launch_by_key(conn, held.holder)
         if holder is not None and holder.state == "pending":
             # a bootstrap claim: its launch has not started yet
@@ -1660,9 +1638,6 @@ def wake(conn: sqlite3.Connection, now: str, *, night: bool = False) -> Launch |
             _launch_event(conn, now, ln.launch_id, "ended", "lost the lease")
     if wake_state(conn, now)[0] != "wake":
         return None
-    held = lease(conn, now)
-    if held is not None and held.live and held.holder == SERVICE_HOLDER:
-        _yield_service(conn, now, held, cause="service yields to a wake", by="service")
     # the slot session_key is allocated first, so the claim can name its holder and the launch can carry the
     # claim's seq as the token it is activated against
     session_key = "s-" + secrets.token_hex(8)

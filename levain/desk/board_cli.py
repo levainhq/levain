@@ -692,7 +692,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     no_land_waiter = config["no_land_waiter"] if land_waiter is None else not land_waiter
     if bp.NATIVE_PRODUCER in producers:
         return _sfail(say, f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
-    native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=no_land_waiter)
+    native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=no_land_waiter,
+                              consent_dir=getattr(args, "consent_dir", None))
     external, failures = bp.read_external(store_dir, producers)
     if store_id is None and any(isinstance(b, dict) and b.get("store_id") for bl in external.values() for b in bl):
         say(f"levain board state: the store {store_dir} has no id, so an external block naming one is taken as this store's")
@@ -788,13 +789,15 @@ def _print_table(doc: dict[str, Any]) -> None:
         print(line)
 
 
-def read_board(items: str | None = None) -> tuple[int, dict[str, Any] | None, str]:
+def read_board(items: str | None = None, *, consent_dir: Path | str | None = None) -> tuple[int, dict[str, Any] | None, str]:
     """``levain board state --json`` as a Python call: ``(exit code, the Board's JSON as a dict or None, what it said on
     stderr)``. The same read as the CLI (the whole board of the store ``items`` names, else the one ``board use`` set), never a
     second derivation: it runs :func:`state_doc` and keeps its refusal text. A read; it writes nothing. T7 reads the board
-    through it in the desk's open and in ``levain desk ready show``."""
+    through it in the desk's open and in ``levain desk ready show``. ``consent_dir`` is the desk store directory whose seats
+    and band the native producer reads (default: this process's home); the open passes the store it is rendering."""
     args = argparse.Namespace(json=True, items=items, evidence_extra=None, producers=[], land_waiter=None, repo=None,
-                              repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=None)
+                              repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=None,
+                              consent_dir=None if consent_dir is None else Path(consent_dir))
     said: list[str] = []
     err = io.StringIO()
     with contextlib.redirect_stderr(err):

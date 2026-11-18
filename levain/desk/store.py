@@ -223,36 +223,6 @@ SEAM_SCHEMA: tuple[str, ...] = (
 )
 
 
-# The service role's writes (row 156 L2 F1): the fact tables, the item and journal rows a landed sha writes (the ready
-# triggers refuse a service row that changes anything else), its own lease rows and the store-wide sequence. Only
-# ``sessions_seen`` is ever updated (its last sighting moves forward) or deleted from (a long-unseen session pruned,
-# row 156 L3 C4). Everything else, and every other delete or schema change, is refused.
-_SERVICE_INSERTS = frozenset({"worker_attach", "report_refusals", "sessions_seen", "ready_items", "ready_journal",
-                              "lease_events", "gseq"})
-_SERVICE_UPDATES = frozenset({"sessions_seen"})
-_SERVICE_DELETES = frozenset({"sessions_seen"})
-_SERVICE_NEVER = frozenset(getattr(sqlite3, name) for name in (
-    "SQLITE_DELETE", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
-    "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER",
-    "SQLITE_CREATE_VIEW", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX", "SQLITE_DROP_TEMP_TABLE",
-    "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_ATTACH",
-    "SQLITE_DETACH", "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_CREATE_VTABLE", "SQLITE_DROP_VTABLE")
-    if hasattr(sqlite3, name))
-
-
-def _service_authorizer(action: int, arg1: str | None, _arg2: str | None, database: str | None,
-                        _source: str | None) -> int:
-    if action == sqlite3.SQLITE_INSERT:
-        ok = arg1 in _SERVICE_INSERTS and database == "main"
-    elif action == sqlite3.SQLITE_UPDATE:
-        ok = arg1 in _SERVICE_UPDATES and database == "main"
-    elif action == sqlite3.SQLITE_DELETE:
-        ok = arg1 in _SERVICE_DELETES and database == "main"
-    else:
-        ok = action not in _SERVICE_NEVER
-    return sqlite3.SQLITE_OK if ok else sqlite3.SQLITE_DENY
-
-
 def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
@@ -524,13 +494,7 @@ class CoordStore:
     _SCHEMA: tuple[str, ...] = SCHEMA
 
     def __init__(self, directory: Path | str | None = None, *,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 role: str = ROLE_DESK) -> None:
-        # ``role="service"`` (the board store's applier, :mod:`levain.desk.work_attach`) records facts only: every
-        # write that is not its own is refused in :meth:`_write`, the one door each of them goes through
-        if role not in (ROLE_DESK, "service"):
-            raise CoordError(f"a store's role is desk or service, not {str(role)[:20]!r}")
-        self.role = role
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         # the file, its format marker, its store_id and its directory rule are the dispatch store's: one owner
         self._jobs = JobStore(directory, clock=clock)
         self.directory = self._jobs.directory
@@ -824,12 +788,6 @@ class CoordStore:
         write moved (a thread's state, a detach, a beat of either kind). A write that rolls back reconciles nothing."""
         if by != ROLE_DESK and token is not None:
             raise CoordError("a lease token is the desk's; your own writes carry none")
-        # THE ROLE SPLIT (ruled 11-08): a service-role store records facts, never decides. Every decide-class write
-        # (a ready add/move/correct, a thread's state, a lease claim, a review clear) goes through here under its own
-        # ``by``, so the check is at the point of use, before the lease is looked at
-        if self.role == "service" and by != "service":
-            raise CoordError("the service records facts only: a write that decides (assign, move, close, claim) is "
-                             "the desk's, and no state was written")
         with write_transaction(lambda: self._connect(create=create)) as conn:
             if not create and not self._schema_current(conn, base=True):
                 raise StoreAbsent(f"{self.path} does not hold the desk's current tables")
@@ -839,19 +797,7 @@ class CoordStore:
 
                 # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
                 record_write(conn, now, fence(conn, now, token))
-            if self.role != "service":
-                yield conn, now
-            else:
-                # the role split keyed on WHAT a statement writes, not on the ``by`` it was called with (row 156 L2
-                # F1): SQLite asks before it prepares each statement, so any write but a fact's is refused
-                conn.set_authorizer(_service_authorizer)
-                try:
-                    yield conn, now
-                except sqlite3.DatabaseError as exc:
-                    if "not authorized" not in str(exc):
-                        raise
-                    raise CoordError("the service records facts only: that statement writes something a fact never "
-                                     "does, and no state was written") from exc
+            yield conn, now
         self._keep_awake()
 
     def _keep_awake(self) -> None:
@@ -1297,6 +1243,9 @@ class CoordStore:
         not read or written."""
         from levain.desk import board_registry, lease
 
+        # a malformed claim is refused first, before the board registry is written to (W4): the check reads no store
+        if attach_item is not None:
+            lease.check_board_items([attach_item])
         # I5: once the board registry is active, a seat is never launched in a repo it does not list. A launch the lease will
         # refuse for its shape alone (a worker asking for several threads) registers nothing: the refusal below is side-effect free.
         threads = tuple(threads)                    # one pass over a one-shot iterable: the count below and the lease read the same threads

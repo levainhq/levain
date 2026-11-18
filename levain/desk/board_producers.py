@@ -169,7 +169,9 @@ def _seats(consent_dir: Path | None) -> tuple[list[dict[str, Any]], str | None]:
             continue                                # a finished launch holds nothing: it is neither a seat nor a gap
         items = _launch_items(ln)
         if items is None:
-            whys.append(f"launch {ln.launch_id} carries no board_items (T7 writes it)")
+            whys.append(f"launch {ln.launch_id} claims board items unreadably ({ln.board_items_why})"
+                        if getattr(ln, "board_items_why", None)
+                        else f"launch {ln.launch_id} carries no board_items (it was started without --item)")
         if not ln.harness_session_id:
             whys.append(f"launch {ln.launch_id} has no session yet")
         elif read_ok and ln.harness_session_id not in listed:
