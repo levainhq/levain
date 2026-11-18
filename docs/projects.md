@@ -73,7 +73,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan and the manifest name the same items. A stalled landing only means the switch has not happened, and X stays locked.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut. A stalled landing only means the switch has not happened, and X stays locked.
 
    - **(d) Switch.** This is the one record that moves the source of truth from the old files to the board:
 
@@ -93,7 +93,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
 ## Charter
 
-`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name, the Export and the Plan filled in. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
+`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name and the Export filled in. Its Plan is prefilled with one line per live item when `--items` names a store; otherwise the Plan is a placeholder line. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
 
 `levain charter check` reads the charter, from origin/main by default. In this release it only warns: it prints what a valid charter needs and exits 0 either way.
 
