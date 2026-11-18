@@ -58,11 +58,14 @@ class SignBand(FakeBand):
         return self.signs.get(np_id)
 
 
-def answer_sig(rig: Rig, np_id: str, *, tamper: bool = False, other: str | None = None) -> dict:
-    """A real answer signature over a terminal-answer message naming ``np_id`` (``other``: names that item instead)."""
+def answer_sig(rig: Rig, np_id: str, *, tamper: bool = False, other: str | None = None, asked: str = "Cut alpha#3?",
+               text: str | None = ANSWER, pick: str | None = None) -> dict:
+    """A real answer signature over a terminal-answer message naming ``np_id`` (``other``: names that item instead), asking
+    ``asked`` and answering ``text`` (his free words) or ``pick`` (an option, ``(a) label``)."""
+    said = {"answer": pick} if pick is not None else {"text": text}
     msg = ts.build_message(store="levain-questions:abc", install="abc", session="s1", view="1", typed="yes", nonce="0123456789abcdef",
                            at=datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc),
-                           entries=[ts.Entry(other or np_id, "rv-1", "Cut it?", "information", answer="(a) yes")])
+                           entries=[ts.Entry(other or np_id, "rv-1", asked, "information", **said)])
     sig = ckeys.ssh_signer(rig.path, namespace=ts.NAMESPACE)[1](msg)
     if tamper:                                          # alter signature bytes inside the armored body
         head, body, tail = sig.partition("\n")[0], sig.splitlines()[1:-1], sig.splitlines()[-1]
@@ -198,7 +201,10 @@ def test_the_anchor_and_tail_lines_are_per_file_and_never_hidden(world):
                                             "anyone who can write this file could have rewritten them")
     assert r["repos.jsonl"].anchor.startswith("repos.jsonl: anchored through line 3 ")
     assert r["repos.jsonl"].tail.startswith("repos.jsonl: 1 records after the last signed record ")
-    assert "relayed record(s) are anchored to his words by the band row's signature" in r["repos.jsonl"].relayed
+    # the repos relay rests on an UNSIGNED answer: never summarised as anchored; the items relay rests on a signed one
+    assert r["repos.jsonl"].relayed == ("repos.jsonl: 1 relayed record(s) rest on an answer no signature of a key you hold binds: "
+                                        "nothing anchors his words")
+    assert r["items.jsonl"].relayed.startswith("items.jsonl: 1 relayed record(s) rest on a signed answer")
 
 
 def test_a_store_with_no_signed_record_says_nothing_is_anchored(tmp_path, monkeypatch):
@@ -236,6 +242,10 @@ def test_export_writes_a_bundle_prints_the_two_heads_and_verify_reads_it_back(wo
     rc, out, err = run(capsys, "verify", str(files[0]), "--head", f"items={items_head}", "--head", f"repos={repos_head}")
     assert rc == 0, out + err
     assert f"kept head {items_head[:12]} is the current head: nothing was removed" in out
+    # with no authority of the verifier's own, the bundle's keys are claims: said as unchecked, and no anchor is claimed
+    assert f"items.jsonl:4 decide alpha#3: {bt.BUNDLE_KEY_WORDS}" in out and SIGNED not in out
+    assert "items.jsonl: NOT ANCHORED: the signatures were checked only against keys the bundle itself names" in out
+    assert "NOT checked against an authority you hold" in out and "(signed answer)" not in out
 
 
 def test_export_defaults_under_the_levain_home_and_never_overwrites(world, capsys):
@@ -437,10 +447,30 @@ def _relay_report(world):
 
 
 def test_a_relayed_record_on_an_answer_with_no_signature_reads_unsigned_never_promoted(world, capsys):
-    world.band.signs.clear()                            # the row's grade still CLAIMS signed-phone; there is nothing to verify
+    world.band.signs.clear()
+    world.band.rows[Q1] = rel.BandRow("Cut alpha#3?", ANSWER, "unsigned-terminal", "native")
     r = _relay_report(world)
     assert r.ok and r.verdict == f"agent desk 24, relaying {Q1} (unsigned answer)"
     assert run(capsys, "verify")[0] == 0
+
+
+def test_a_row_that_claims_a_signed_answer_with_no_signature_to_check_is_a_break_never_unsigned(world, capsys):
+    world.band.signs.clear()                            # the row's grade still CLAIMS signed-phone; there is nothing to verify
+    r = _relay_report(world)
+    assert not r.ok and "the band row says the answer is signed-phone, and no signature is there to check" in r.verdict
+    assert run(capsys, "verify")[0] == 3
+
+
+@pytest.mark.parametrize("sign, said", [
+    ({"sign_state": "signed", "sig": "", "message": "m", "signer_fp": "f"}, "says signed and does not carry a complete signature"),
+    ({"sign_state": "signed", "sig": "s", "message": "m"}, "says signed and does not carry a complete signature"),
+    ({"sign_state": "unsigned", "sig": "s", "message": None}, "carries signature material under sign_state 'unsigned'"),
+    (["not", "a", "mapping"], "malformed"),
+])
+def test_a_signing_record_with_missing_or_stray_material_is_a_break(world, sign, said):
+    world.band.signs[Q1] = sign
+    r = _relay_report(world)
+    assert not r.ok and said in r.verdict
 
 
 def test_a_relayed_record_on_an_answer_whose_signature_bytes_are_altered_is_a_break(world, capsys):
@@ -549,3 +579,288 @@ def test_a_cut_of_an_item_the_cited_abandon_does_not_cover_is_a_break(world, cap
 def test_close_verdicts_is_the_part_b_seam_and_prints_nothing_yet(world):
     t = trail_of(world)
     assert bt.close_verdicts(t, bt.verify_trail(t)) == []
+
+
+# --------------------------------------------------------------------- P6 fix 2: never a verdict stronger than the evidence
+
+
+def rechain(lines: list[bytes], start: int) -> list[bytes]:
+    """Recompute every ``prev`` from line ``start`` (0-based) down: what a forger who can write the file does."""
+    for i in range(start, len(lines)):
+        r = bc.record_of(lines[i])
+        if r is not None and "prev" in r:
+            r["prev"] = bc.line_hash(lines[i - 1])
+            lines[i] = json.dumps(r, separators=(",", ":")).encode()
+    return lines
+
+
+def export_bundle(world: World, capsys) -> Path:
+    rc, out, err = run(capsys, "export", "--out", str(world.out) + os.sep)
+    assert rc == 0, err
+    return next(world.out.glob("trail-*.json"))
+
+
+def test_an_unsigned_ack_of_a_break_before_the_last_signed_record_never_reads_the_prefix_anchored(world, capsys):
+    """L1 F1, run: line 3 rewritten, line 4 (signed) chain-broken, the break acknowledged by an unsigned ack-torn at the tail."""
+    lines = world.lines("items.jsonl")
+    lines[2] = lines[2].replace(b"third", b"thirD")
+    world.write("items.jsonl", lines)
+    assert main(["board", "ack-torn", "--file", "items.jsonl", "--line", "4", "--why", "x", "--by", "phill",
+                 "--author-kind", "operator"]) == 0
+    rc, out, err = run(capsys, "verify")
+    assert ("items.jsonl: anchored from line 4 through line 4 only (signed at 2026-11-17T12:00:00Z): the signature commits the "
+            "chain back to the acknowledged line 4, by the operator's key; lines 1-3 are committed by NOTHING but the "
+            "acknowledgement of line 4 by phill (asserted, line 10)") in out
+    assert "every record up to it is committed" not in out.split("repos.jsonl (")[0]
+
+
+def test_an_acknowledged_tear_before_the_last_signed_record_bounds_the_anchor(world):
+    """A tear at line t severs the chain: line t+1 hashes the torn bytes, and nothing links line t to what precedes it."""
+    # the clean world: the acked tear (line 7) is AFTER the last signed record (line 4), so the anchor is whole
+    assert report(world)["items.jsonl"].anchor.startswith("items.jsonl: anchored through line 4 ")
+    bs.decide(world.target, "alpha#5", "parked", "later", "phill", author=OP, now=NOW, seal=world.rig.seal())   # signed, line 10
+    assert report(world)["items.jsonl"].anchor == (
+        "items.jsonl: anchored from line 7 through line 10 only (signed at 2026-11-17T12:00:00Z): the signature commits the chain "
+        "back to the acknowledged line 7, by the operator's key; lines 1-6 are committed by NOTHING but the acknowledgement of "
+        "line 7 by phill (asserted, line 8)")
+
+
+def test_a_relayed_answer_signature_binds_this_question_and_these_words(world, capsys):
+    """L1 F2 / codex HIGH 3: an old signature, valid, over words the row no longer holds, never reads "(signed answer)"."""
+    forged = "yes, cut it. Forged words he never typed."
+    world.band.rows[Q1] = rel.BandRow("Cut alpha#3?", forged, "signed-phone", "native")
+    lines = world.lines("items.jsonl")
+    i = next(k for k, x in enumerate(lines) if b'"relayed"' in x)
+    rec = json.loads(lines[i])
+    rec["words"] = "Forged words he never typed"
+    rec["source"]["answer_sha256"] = rel.digest(forged)
+    lines[i] = json.dumps(rec, separators=(",", ":")).encode()
+    world.write("items.jsonl", rechain(lines, i + 1))
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "the answer's signature is over other words than the row's answer: it does not bind this answer" in out
+    world.band.signs[Q1] = answer_sig(world.rig, Q1, asked="Cut it?", text=forged)
+    assert "it does not bind this question" in _relay_report(world).verdict
+
+
+def test_an_answer_signed_as_an_option_pick_says_what_the_signature_covers_and_no_more(world, capsys):
+    world.band.signs[Q1] = answer_sig(world.rig, Q1, pick="(a) yes")
+    r = _relay_report(world)
+    assert r.ok and "(answer signed as the pick '(a) yes'; the signature does not cover the option key" in r.verdict
+    assert "(signed answer)" not in r.verdict
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0 and "items.jsonl: 1 relayed record(s) rest on an answer no signature of a key you hold binds" in out
+
+
+def test_an_answer_signed_by_a_key_of_another_class_is_a_break(world, monkeypatch):
+    """codex MED 5: the band's badge trusts the laptop's terminal key; a display-phone key's terminal signature is not his answer."""
+    phone = Rig(world.out.parent / "phone", key_class="display-phone")
+    world.band.signs[Q1] = answer_sig(phone, Q1)
+    both = {**world.rig.snapshot().keys, **phone.snapshot().keys}
+    snap = world.rig.snapshot()
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: lambda: type(snap)(store_id="s", seq=2, head_hash="h", keys=both,
+                                                                                 policy=snap.policy))
+    r = _relay_report(world)
+    assert not r.ok and "is a display-phone key; an answer is signed with the laptop's terminal key (laptop-presence)" in r.verdict
+
+
+def forge_bundle_key(world: World, capsys, tmp: Path) -> Path:
+    """A bundle whose records, answer and keys were all re-signed with a forger's own laptop-class key, chain recomputed."""
+    bundle = export_bundle(world, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    other = Rig(tmp / "forger")
+    for name in ("items.jsonl", "repos.jsonl"):
+        lines = [x.encode() for x in doc["files"][name]["lines"]]
+        for i, x in enumerate(lines):
+            r = bc.record_of(x)
+            if r is not None and r.get("grade") in sg.SIGNED_GRADES:
+                r["sig"]["fingerprint"] = other.fp
+                r["sig"]["sshsig"] = other.sign(sg.signing_bytes(r))
+                lines[i] = json.dumps(r, separators=(",", ":")).encode()
+                lines = rechain(lines, i + 1)
+        doc["files"][name]["lines"] = [x.decode() for x in lines]
+    k = dict(doc["authority"]["keys"][0])
+    k.update(fingerprint=other.fp, public_key=other.public)
+    doc["authority"]["keys"] = [k]
+    doc["answers"][Q1]["sign"] = answer_sig(other, Q1)
+    bundle.write_text(json.dumps(doc))
+    return bundle
+
+
+def test_a_bundle_never_supplies_its_own_trust_root(world, capsys, tmp_path, monkeypatch):
+    """L1 F3 / codex HIGH 2: the verifier's own authority log is the trust root; the bundle's keys are claims compared to it."""
+    bundle = forge_bundle_key(world, capsys, tmp_path)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and "which the authority log you hold does not" in out and "is not a key in the authority log" in out
+    assert SIGNED not in out and "(signed answer)" not in out and "anchored through" not in out
+
+    def gone(**kw):
+        raise bs.BoardError("holds no cockpit.db")
+    monkeypatch.setattr(sg, "resolve_authority", gone)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0 and SIGNED not in out and bt.BUNDLE_KEY_WORDS in out
+    assert "NOT ANCHORED: the signatures were checked only against keys the bundle itself names" in out
+
+
+def test_a_bundle_and_the_live_store_give_the_same_verdicts_under_the_same_trust_root(world, capsys):
+    bundle = export_bundle(world, capsys)
+    live = run(capsys, "verify")[1]
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0
+    body = lambda text: [x for x in text.splitlines() if not x.startswith("authority:")]   # noqa: E731
+    assert body(out) == body(live)
+
+
+def test_a_signed_record_in_a_store_with_no_id_is_a_break(world, capsys):
+    """L1 F8 / codex HIGH 4: an empty store id is never a skipped comparison."""
+    bundle = export_bundle(world, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    doc["store"] = ""
+    bundle.write_text(json.dumps(doc))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and "this store has no id: the store it was signed for cannot be compared" in out
+
+
+def test_a_well_chained_record_its_fold_rejects_is_a_break(world, capsys):
+    """codex HIGH 1: the file's own fold judges every record; v: 2 is not a record this store reads."""
+    lines = world.lines("items.jsonl")
+    rec = json.loads(lines[-1])
+    rec.update(v=2, id="alpha#99", prev=bc.line_hash(lines[-1]))
+    world.write("items.jsonl", lines + [json.dumps(rec, separators=(",", ":")).encode()])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "items.jsonl:10 add alpha#99: asserted by desk 24, unsigned, but: the fold rejects this record" in out
+    world.write("repos.jsonl", world.lines("repos.jsonl") + [b'{"v":1,"op":"pause","repo":"zeta","prev":"'
+                                                             + bc.line_hash(world.lines("repos.jsonl")[-1]).encode() + b'"}'])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and "repos.jsonl:5 pause zeta" in out and "the fold rejects this record" in out
+
+
+def test_a_signed_begin_track_binds_a_later_relayed_track(world, capsys):
+    """gemini HIGH 1 / complement MED 2 / codex MED 7: a signed begin-track records its manifest like any other."""
+    lines = world.lines("repos.jsonl")
+    begin = next(json.loads(x) for x in lines if b'"begin-track"' in x and b'"signed-' in x)
+    relayed = json.loads(next(x for x in lines if b'"relayed"' in x))
+    q3 = "q-" + "0000000c" * 3
+    question = f"Track alpha? manifest sha256 {begin['manifest_sha256']}"
+    world.band.rows[q3] = rel.BandRow(question, "yes, track alpha", "unsigned-terminal", "native")
+    rec = {"v": relayed["v"], "store": relayed["store"], "op": "track", "repo": "alpha", "at": NOW, "by": "desk 24",
+           "words": "track alpha", "migration": begin["migration"], "charter_blob": "c" * 40, "retire": [], "author": DESK, "grade": "relayed",
+           "source": {"np": q3, "producer": "native", "question_sha256": rel.digest(question),
+                      "answer_sha256": rel.digest("yes, track alpha")},
+           "prev": bc.line_hash(lines[-1])}
+    world.write("repos.jsonl", lines + [json.dumps(rec, separators=(",", ":")).encode()])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    assert f"repos.jsonl:5 track alpha: agent desk 24, relaying {q3} (unsigned answer)" in out
+
+
+def test_the_empty_file_head_is_on_every_chain_and_a_file_with_no_head_says_so(world, capsys):
+    """L1 F7: a head kept while a file was empty is still on its chain once it grew; one head given reports the other unchecked."""
+    empty = hashlib.sha256(b"").hexdigest()
+    rc, out, err = run(capsys, "verify", "--head", f"items={empty}")
+    assert rc == 0, out + err
+    assert f"items.jsonl: kept head {empty[:12]} is the empty file's; 9 lines were written after it (the file grew" in out
+    assert "repos.jsonl: no kept head given: a truncation of this file is not checked" in out
+    assert run(capsys, "verify", "--head", f"items={empty}", "--head", f"items={empty}")[0] == 2
+
+
+def test_a_revoked_signer_is_named_on_the_anchor_line(world, monkeypatch):
+    """L1 F5: the anchor never says "committed by the operator's key" of a key revoked since."""
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: world.rig.source(revoked_seq=9))
+    anchor = report(world)["items.jsonl"].anchor
+    assert "committed by a key revoked since (seq 9): a forgery signed with it after the revocation would read the same" in anchor
+    assert "the operator's key" not in anchor
+
+
+def test_a_legacy_grade_after_the_cutover_and_an_asserted_decision_are_breaks(world, capsys):
+    """L1 F6 / complement MED 4: the writer's policy, held by the reader."""
+    lines = world.lines("items.jsonl")
+    rec = json.loads(lines[-1])
+    legacy = {**rec, "grade": "legacy", "id": "alpha#6", "prev": bc.line_hash(lines[-1])}
+    lines.append(json.dumps(legacy, separators=(",", ":")).encode())
+    parked = {"v": 1, "op": "decide", "id": "alpha#5", "at": NOW, "by": "desk 24", "decision": "parked", "date": "2026-12-01",
+              "words": "later", "author": DESK, "grade": "asserted", "prev": bc.line_hash(lines[-1])}
+    lines.append(json.dumps(parked, separators=(",", ":")).encode())
+    world.write("items.jsonl", lines)
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3
+    assert "items.jsonl:10 add alpha#6: legacy, but: graded legacy after the cutover" in out
+    assert "items.jsonl:11 decide alpha#5: asserted by desk 24, unsigned, but: a decision-class decide recorded asserted" in out
+
+
+def test_every_record_gets_exactly_one_verdict_line(world, capsys):
+    """complement LOW 9 / codex LOW 13 / gemini MED 3: a bad cause is part of the record's one verdict, and one break."""
+    abandon_world(world)
+    reg = next(x for x in world.lines("repos.jsonl") if (bc.record_of(x) or {}).get("op") == "register")
+    forge_cut(world, hashlib.sha256(reg).hexdigest())
+    rep = report(world)["items.jsonl"]
+    ns = [r.n for r in rep.records]
+    assert len(ns) == len(set(ns))
+    n = len(world.lines("items.jsonl"))
+    assert sum(1 for b in rep.breaks if b.startswith(f"line {n}:")) == 1
+
+
+def test_control_characters_in_a_record_are_escaped_in_every_printed_line(world, capsys):
+    """L1 F9."""
+    lines = world.lines("items.jsonl")
+    rec = json.loads(lines[-1])
+    rec["author"]["name"] = "x\x1b[2K\x1b[1Aevil "
+    lines[-1] = json.dumps(rec, separators=(",", ":")).encode()
+    world.write("items.jsonl", lines)
+    rc, out, err = run(capsys, "verify")
+    assert "\x1b" not in out and " " not in out and "x\\x1b[2K\\x1b[1Aevil\\u2028" in out
+
+
+def test_a_bundle_with_a_malformed_answer_is_refused_not_a_traceback(world, capsys):
+    """complement MED 6 / gemini MED 7."""
+    bundle = export_bundle(world, capsys)
+    for bad in ({}, None, {"question": "q", "answer": 1, "answer_grade": "unknown", "producer": "native"}):
+        doc = json.loads(bundle.read_text("utf-8"))
+        doc["answers"][Q1] = bad
+        bundle.write_text(json.dumps(doc))
+        rc, out, err = run(capsys, "verify", str(bundle))
+        assert rc == 2 and "damaged bundle" in err
+    doc["answers"][Q1] = {"question": "q", "answer": "a", "answer_grade": "unknown", "producer": "native"}
+    doc["files"]["items.jsonl"]["lines"] = "abc"
+    bundle.write_text(json.dumps(doc))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 2 and "damaged bundle" in err
+
+
+def test_export_carries_an_unreadable_signing_record_and_never_crashes(world, capsys):
+    """codex MED 10 / L1 F12: a sidecar that raises is carried as unreadable; verifying the bundle is a break for that record."""
+    def boom(np_id):
+        raise RuntimeError("sidecar")
+    world.band.sign = boom
+    bundle = export_bundle(world, capsys)
+    assert "signing record could not be read" in json.loads(bundle.read_text("utf-8"))["answers"][Q1]["unreadable"]
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and "could not be read when the bundle was made" in out
+
+
+def test_a_failed_export_write_removes_its_own_partial_file_and_exits_2(world, capsys, monkeypatch):
+    """codex MED 12 / L1 F13: a failed fsync leaves nothing behind; a directory that cannot be made is a clean refusal."""
+    def no_fsync(fd):
+        raise OSError(28, "No space left on device")
+    with monkeypatch.context() as m:
+        m.setattr(bt.os, "fsync", no_fsync)
+        rc, out, err = run(capsys, "export", "--out", str(world.out / "b.json"))
+    assert rc == 2 and "the partial file was removed" in err and not (world.out / "b.json").exists()
+    blocker = world.out.parent / "afile"
+    blocker.write_text("x")
+    rc, out, err = run(capsys, "export", "--out", str(blocker / "sub" / "b.json"))
+    assert rc == 2 and "cannot be made" in err
+
+
+def test_export_refuses_a_git_work_tree_reached_through_a_symlink(world, tmp_path, capsys):
+    """codex MED 11 / gemini LOW 8 / complement LOW-MED 8."""
+    repo = make_repo(tmp_path, "delta")
+    (repo / "sub").mkdir()
+    link = tmp_path / "outside-link"
+    link.symlink_to(repo / "sub")
+    rc, out, err = run(capsys, "export", "--out", str(link / "t.json"))
+    assert rc == 2 and "inside a git work tree" in err and not (repo / "sub" / "t.json").exists()
+
+
+def test_a_store_id_never_steers_the_bundle_name_out_of_its_directory():
+    """L1 F14."""
+    assert bt.destination("/tmp/x" + os.sep, "../../e").name.startswith("trail-______e-")

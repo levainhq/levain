@@ -1,52 +1,71 @@
 """levain.desk.board_trail: ``levain board trail export|verify`` (levain#104, design 7.4, P6 part A): the records of both board
 files, checked by someone who does not trust the machine that wrote them.
 
+THE RULE every line this module prints holds: a verdict is the WEAKEST claim the evidence supports. What the verifier cannot
+check is said as unchecked; what is malformed, missing or contradictory is a break (exit 3). Material that CLAIMS a signature
+(a signed grade, a ``sig``, a band row graded signed, a sidecar saying ``signed``) is never read as "unsigned" when the
+signature is missing or bad: that is a break.
+
 ``verify`` re-checks, per file (``items.jsonl`` and ``repos.jsonl`` are two chains, two anchors, two tails, two heads):
 
 * the chain (:func:`levain.desk.board_chain.check_chain`: the cutover over the legacy prefix, an unchained record after it as a
   NAMED problem, a torn line, ``ack-torn`` re-anchoring), reading an acknowledged tear or break as acknowledged and every other
   one as a break;
+* every record through its file's OWN fold (``board_state.fold`` for items, ``repos_fold.fold_repos`` for the registry): a
+  record the fold rejects is a break, whatever its chain and signature say; after the cutover a record the fold does not apply
+  (the state does not allow it) is a break too;
 * every signature, through ``board_sign.verify_record`` (the P2 verifier: ``ssh-keygen -Y verify`` in namespace ``levain-board``
-  over the canonical bytes, against the authority log's keys), and that a signed record names THIS store;
+  over the canonical bytes, against the authority log's keys), and that a signed record names THIS store (a store with no id
+  cannot be compared: a break);
+* the writer's policy (``board_sign.POLICY``): after the cutover a decision-class record that is neither signed nor relayed
+  (save a cut whose ``cause`` holds) and a record graded ``legacy`` are breaks;
 * every ``relayed`` citation, through ``board_relay.verify_relayed`` (both digests, the words verbatim in the answer, the row's
   own grade, never promoted) and, for ``begin-track`` and ``track``, ``board_relay.check_manifest`` against the manifest digest
-  the ceremony's ``begin-track`` recorded.
+  the ceremony's ``begin-track`` (signed or relayed, once it verified) recorded.
 
-It prints one verdict per record in the design's honest vocabulary (``operator, signed with a ceremony`` / ``agent NAME,
+It prints one verdict line per record in the design's honest vocabulary (``operator, signed with a ceremony`` / ``agent NAME,
 relaying np-x (signed answer|unsigned answer)`` / ``asserted by NAME, unsigned`` / ``legacy``), then per file the anchor line
-(every record up to the last signed one is committed by the operator's key), the unanchored-tail line (never hidden), and, when
-``--head items=H --head repos=H`` is given, whether each kept head is still on its file's chain (a head that is gone is a
-truncation or a rewrite). It exits 3 on any break, 2 when it cannot run.
+(the span of records the last signed one commits), the unanchored-tail line (never hidden), the relayed lines (signed and
+unsigned answers counted apart), and whether each kept head (``--head items=H --head repos=H``) is still on its file's chain (a
+head that is gone is a truncation or a rewrite; a file with no head given says truncation was not checked). Every field taken
+from a record is printed with its control characters escaped. It exits 3 on any break, 2 when it cannot run.
+
+The trust root is never the bundle. ``verify BUNDLE`` replays the authority log of the verifier's OWN install (``--data-root``,
+default the install's) and reads the bundle's keys as claims compared against it (a key the bundle names that the log does not
+hold the same way is a break). With no authority log of his own, a signature that verifies under a key the bundle names reads
+"signature valid under a key the bundle names; not checked against an authority you hold", and no anchor is claimed. Given the
+same trust root, a bundle and the live store give the same verdicts.
 
 ``export`` writes a bundle (one JSON file): the records as written, the public keys the authority log holds, every cited band
-answer, and prints ``items=<hash> repos=<hash>``, the two heads to keep. ``verify`` takes that bundle (``verify BUNDLE``) or reads
-the live store (the store ``board state`` resolves; the authority log and the band as ``board add --sign`` / ``--source`` read them).
+answer, and prints ``items=<hash> repos=<hash>``, the two heads to keep.
 
 Where the bundle goes. Levain keeps no operator record directory of its own (``record_dir`` is a repo's field, and a repo is
 what a bundle must never land in), so the default is ``<levain home>/board-trail/`` and ``--out`` names another file or
-directory. A destination inside a git work tree is refused; so is overwriting a file. The bundle carries his words.
+directory. A destination inside a git work tree (judged on the path with every symlink resolved) is refused; so is overwriting
+a file, and a failed write removes the file it created.
 
 Known edges, stated rather than hidden:
 
-* A signature is checked against the authority log as it is NOW. Whether it was valid AT THE RECORD'S TIME arrives with part B
-  (P4's authority reader knows when a key's links were written; every signature check, records and closes, will go through that
-  one reader). A key revoked since is reported ("revoked since (seq N)"), never silently valid and never a break by itself; a
-  key that was never enrolled, quarantined or of the wrong class is a break.
-* A relayed record's band answer is re-read as the band holds it (or as the bundle carried it, with the answer's own signature,
-  ``sig`` and ``message``, as the band store holds them). That signature is re-verified here with the consent code the answer was
-  made with (``levain.consent.terminal_sign.verify``, in the namespace its message names, against the authority log's keys): the
-  record reads "(signed answer)" only when it verifies; an answer with no signature reads "(unsigned answer)" and is never
-  promoted; a signature that does not verify is a break, because it claims what it is not.
-* A cut's ``cause`` is judged AS OF THE CUT'S OWN POSITION, never against today's fold (see :func:`cause_problem_at`): the items
-  file up to the line before the cut, the registry up to and including the cited abandon (the two files share no clock, so the
-  registry is read to the last line the cut could not predate), through the ONE predicate the writer uses
-  (``board_sign.cut_cause_problem``).
+* A signature is checked against the authority log as it is NOW. Whether it was valid AT THE RECORD'S TIME arrives with part B.
+  A key revoked since is reported ("revoked since (seq N)", and the anchor line says so), never silently valid and never a break
+  by itself; a key that was never enrolled, quarantined or of the wrong class is a break.
+* An answer's own signature (``sig`` and ``message``, as the band store holds them or the bundle carried them) is re-verified
+  with the consent code the answer was made with (``levain.consent.terminal_sign``), under a key of the class the band's badge
+  trusts (the laptop's terminal key, ``laptop-presence``). "(signed answer)" means the signed message names THIS question
+  (``asked`` equals the row's question and the record's ``question_sha256``) and THIS answer (its free text equals the row's
+  answer and the record's ``answer_sha256``). An option pick is signed as ``(letter) label`` while the row holds the option's
+  key: the verdict says the signature covers the pick and not the words the record quotes. The entry's ``row_version`` is not
+  checked (the band row as a relay reads it carries none).
+* A ``move`` that ``board_sign.move_is_decision`` makes decision-class depends on the repo's state; the policy check here
+  covers the ops :data:`levain.desk.board_sign.POLICY` names decision-class and not that case.
+* A cut's ``cause`` is judged AS OF THE CUT'S OWN POSITION, never against today's fold (see :func:`cause_problem_at`).
 * Per-close author verdicts (P4's tiers) are part B: :func:`close_verdicts` is the seam and returns nothing.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import fcntl
 import hashlib
@@ -65,8 +84,8 @@ from levain.desk import board_relay as rel
 from levain.desk import board_sign as sg
 from levain.desk import board_store as bs
 
-__all__ = ["BUNDLE_FORMAT", "EXIT_BREAK", "EXIT_USAGE", "FileReport", "Trail", "close_verdicts", "register", "run_export",
-           "run_verify", "verify_trail"]
+__all__ = ["BUNDLE_FORMAT", "EXIT_BREAK", "EXIT_USAGE", "FileReport", "Trail", "adopt_trust_root", "close_verdicts", "register",
+           "run_export", "run_verify", "verify_trail"]
 
 BUNDLE_FORMAT = "levain-board-trail/1"
 FILES = ("items.jsonl", "repos.jsonl")
@@ -76,12 +95,24 @@ EXIT_USAGE = 2
 READ_WAIT = 2.0
 TRAIL_DIR = "board-trail"
 SIGNED_WORDS = "operator, signed with a ceremony"
+BUNDLE_KEY_WORDS = "signature valid under a key the bundle names; not checked against an authority you hold"
 NO_AUTHORITY_FOR = "cannot be checked: no authority log to verify a signature against ({why})"
+TRUST_LIVE = "live"
+TRUST_BUNDLE = "bundle"
 _HEAD_RE = re.compile(r"[0-9a-f]{64}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+_SIGNED_ROW_GRADES = ("signed", "signed-phone", "signed-terminal")
+_ANSWER_KEY_CLASS = "laptop-presence"          # levain.authority.LAPTOP: the badge's trust root is the laptop's terminal key
 
 
 class TrailError(Exception):
     """The trail cannot be built or read at all (exit 2), as opposed to a break in what it holds (exit 3)."""
+
+
+def safe(text: Any) -> str:
+    """``text`` with every control character (C0, DEL, C1, the two Unicode line separators) escaped, so a field a record
+    carries can never move the cursor or erase a line of the report."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}" if ord(m.group()) < 0x100 else f"\\u{ord(m.group()):04x}", str(text))
 
 
 # ------------------------------------------------------------------------------------------------------------- the input
@@ -90,15 +121,19 @@ class TrailError(Exception):
 @dataclass
 class Trail:
     """What a verification stands on: each file's lines AS WRITTEN (``bytes``, split on ``\\n`` only), whether a file ends in an
-    unterminated line, the store id, the authority snapshot (None: none could be read, ``why_no_authority`` says why) and the
-    band rows the relayed records cite (np id -> :class:`~levain.desk.board_relay.BandRow` or a refusal string)."""
+    unterminated line, the store id, the authority snapshot (None: none could be read, ``why_no_authority`` says why), the band
+    the relayed records cite, and the trust root: ``trust`` is :data:`TRUST_LIVE` (the snapshot is an authority log this
+    install replayed) or :data:`TRUST_BUNDLE` (the snapshot is the keys a bundle names, checked against nothing); ``trust_line``
+    says which, and ``breaks`` holds what is broken in the trail as a whole (a bundle key the trust root contradicts)."""
     store_id: str
     lines: dict[str, list[bytes]]
     unterminated: dict[str, bool]
     snapshot: Any
     why_no_authority: str = ""
     band: Any = None                                    # a BandSource, built from the live band or from the bundle
-    rows: dict[str, Any] = field(default_factory=dict)  # live reading only: filled by :func:`collect_answers`
+    trust: str = TRUST_LIVE
+    trust_line: str = ""
+    breaks: list[str] = field(default_factory=list)
 
 
 def _split(raw: bytes) -> tuple[list[bytes], bool]:
@@ -109,34 +144,43 @@ def _split(raw: bytes) -> tuple[list[bytes], bool]:
     return parts, tail
 
 
+def _authority_line(snapshot: Any, why: str, where: str) -> str:
+    if snapshot is None:
+        return f"authority: none could be read ({why}): no signature can be checked"
+    return f"authority: {where}, replayed now (seq {snapshot.seq}, head {str(snapshot.head_hash)[:12]})"
+
+
+def _read_authority(data_root: str | None) -> tuple[Any, str]:
+    try:
+        return sg.read_authority(sg.resolve_authority(data_root=data_root)), ""
+    except bs.BoardError as exc:
+        return None, str(exc)
+    except Exception as exc:                            # noqa: BLE001 - an authority log that cannot be read is none to trust
+        return None, f"the authority log cannot be read ({type(exc).__name__}: {exc})"
+
+
 def read_live(target: bs.Target, *, data_root: str | None, band_dir: str | None) -> Trail:
-    """The live store under one shared hold (the same bounded wait ``board state`` makes), the authority log replayed now and
-    the band opened lazily. A store with no ``repos.jsonl`` has an empty registry file."""
+    """The live store under one shared hold (the same bounded wait ``board state`` makes; taken for a pointered store and for any
+    store directory a writer ever locked, i.e. one holding ``store.lock``), the authority log replayed now and the band opened
+    lazily. A store with no ``repos.jsonl`` has an empty registry file."""
     deadline = time.monotonic() + READ_WAIT
     raws: dict[str, bytes] = {}
     try:
-        hold = bs.store_lock(target.store_dir, exclusive=False, deadline=deadline) if target.pointered else None
-        if hold is not None:
-            hold.__enter__()
-        try:
+        with contextlib.ExitStack() as stack:
+            if target.pointered or os.path.lexists(target.store_dir / bs.LOCK_NAME):
+                stack.enter_context(bs.store_lock(target.store_dir, exclusive=False, deadline=deadline))
             for name in FILES:
                 path = target.items_path if name == bs.ITEMS_NAME else target.store_dir / name
                 raws[name] = bs._read_stable(path, fcntl.LOCK_SH, deadline) if os.path.lexists(path) else b""
             sid = bs.read_store_id(target.store_dir) if target.pointered or os.path.lexists(target.store_dir / bs.STORE_ID_NAME) else ""
-        finally:
-            if hold is not None:
-                hold.__exit__(None, None, None)
     except (bs.BoardError, OSError) as exc:
         raise TrailError(f"the store cannot be read: {exc}") from None
     lines, unterminated = {}, {}
     for name in FILES:
         lines[name], unterminated[name] = _split(raws[name])
-    snapshot, why = None, ""
-    try:
-        snapshot = sg.read_authority(sg.resolve_authority(data_root=data_root))
-    except bs.BoardError as exc:
-        why = str(exc)
-    return Trail(sid, lines, unterminated, snapshot, why, _LiveBand(band_dir))
+    snapshot, why = _read_authority(data_root)
+    return Trail(sid, lines, unterminated, snapshot, why, _LiveBand(band_dir), TRUST_LIVE,
+                 _authority_line(snapshot, why, "the log this install holds"))
 
 
 class _LiveBand:
@@ -167,7 +211,7 @@ class _LiveBand:
 
 
 class _BundleBand:
-    """The cited answers a bundle carries, as a band source."""
+    """The cited answers a bundle carries, as a band source (their shape is checked by :func:`load_bundle`)."""
 
     def __init__(self, answers: Mapping[str, Any]) -> None:
         self._answers = answers
@@ -183,6 +227,39 @@ class _BundleBand:
     def sign(self, np_id: str) -> Any:
         got = self._answers.get(np_id)
         return got.get("sign") if isinstance(got, Mapping) else None
+
+
+class _ReadOnce:
+    """One verification's view of the band: each row and each signing record is read ONCE and every check (the citation, the
+    answer's signature, the manifest, a cut's cause) judges that same reading. A read that fails is a refusal, never a crash."""
+
+    def __init__(self, band: Any) -> None:
+        self._band = band
+        self._rows: dict[str, tuple[Any, Exception | None]] = {}
+        self._signs: dict[str, tuple[Any, Exception | None]] = {}
+
+    def row(self, np_id: str) -> rel.BandRow:
+        if np_id not in self._rows:
+            try:
+                self._rows[np_id] = (rel._row_of(self._band, np_id), None)
+            except rel.BandRefusal as exc:
+                self._rows[np_id] = (None, exc)
+        row, exc = self._rows[np_id]
+        if exc is not None:
+            raise rel.BandRefusal(str(exc))
+        return row
+
+    def sign(self, np_id: str) -> Any:
+        if np_id not in self._signs:
+            reader = getattr(self._band, "sign", None)
+            try:
+                self._signs[np_id] = (reader(np_id) if reader is not None else None, None)
+            except Exception as exc:                    # noqa: BLE001 - re-raised to the one caller that words it
+                self._signs[np_id] = (None, exc)
+        got, exc = self._signs[np_id]
+        if exc is not None:
+            raise exc
+        return got
 
 
 # ------------------------------------------------------------------------------------------------------------ the verdicts
@@ -245,6 +322,54 @@ def _acks(lines: Sequence[bytes], chain: bc.Chain) -> dict[int, tuple[int, bc.Ac
     return out
 
 
+@dataclass(frozen=True)
+class _FoldSaid:
+    """What a file's own fold says of each line: ``rejected`` (line -> why: the fold will not read it as a record),
+    ``dropped`` (lines a torn-style ack removed), ``unapplied`` (line -> why: a well-formed record the state does not allow)."""
+    rejected: Mapping[int, str]
+    dropped: frozenset[int]
+    unapplied: Mapping[int, str]
+
+
+def _problem_of(problems: Sequence[str], n: int) -> str:
+    prefix = f"line {n}: "
+    return next((p[len(prefix):] for p in problems if p.startswith(prefix)), "rejected")
+
+
+def _fold_said(name: str, trail: Trail) -> _FoldSaid:
+    """Each record judged by its file's OWN fold (no second schema here): the item fold for ``items.jsonl``, the registry fold
+    (with this store's id) for ``repos.jsonl``."""
+    lines = trail.lines[name]
+    if name == "items.jsonl":
+        from levain.desk.board_state import fold
+        texts: list[Any] = []
+        for x in lines:
+            try:
+                texts.append(x.decode("utf-8"))
+            except UnicodeDecodeError:
+                texts.append(x)                         # not text: the fold says so
+        got = fold(texts)
+        applied_or_ack = None
+    else:
+        from levain.desk.repos_fold import fold_repos
+        got = fold_repos(lines, store_id=trail.store_id or None, unterminated_tail=bool(trail.unterminated.get(name)))
+        applied_or_ack = set(got.applied)
+    dropped = frozenset(n for n, _ in got.dropped)
+    rejected = {n: _problem_of(got.problems, n) for n in got.malformed if n not in dropped}
+    unapplied: dict[int, str] = {}
+    for p in got.problems:
+        m = re.match(r"line (\d+): (.*)", p)
+        if not m:
+            continue
+        n, why = int(m.group(1)), m.group(2)
+        if n in rejected or n in dropped or why.startswith("torn") or why.startswith("ack-torn names this line"):
+            continue
+        if applied_or_ack is not None and n in applied_or_ack:
+            continue
+        unapplied.setdefault(n, why)
+    return _FoldSaid(rejected, dropped, unapplied)
+
+
 def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> list[str]:
     """PART B'S SEAM. One verdict per close, in P4's three tiers (signed commit / asserted by trailer / asserted by git author,
     and "unattributed"), filled from P4's ``closed_by`` once the restack onto P4 lands. Part A prints nothing for closes."""
@@ -252,11 +377,15 @@ def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> list[str]:
 
 
 def _signed_problem(rec: Mapping[str, Any], trail: Trail) -> tuple[sg.Verdict | None, str | None]:
-    """``(verdict, problem)`` for a signed-grade record: the P2 verifier's verdict, or why none could be had."""
+    """``(verdict, problem)`` for a signed-grade record: the P2 verifier's verdict, or why none could be had. A store with no id
+    cannot be compared with the store a signed record names: that is a break, never a skipped check."""
     from levain.authority_sig import VerifierUnavailable
     if trail.snapshot is None:
         return None, NO_AUTHORITY_FOR.format(why=trail.why_no_authority or "none was given")
-    if trail.store_id and rec.get("store") != trail.store_id:
+    if not trail.store_id:
+        return None, (f"the signed record names store {rec.get('store')!r}, and this store has no id: the store it was signed for "
+                      f"cannot be compared")
+    if rec.get("store") != trail.store_id:
         return None, f"the signed record names store {rec.get('store')!r}, and this store is {trail.store_id!r}"
     try:
         return sg.verify_record(rec, trail.snapshot), None
@@ -286,10 +415,38 @@ def cause_problem_at(rec: Mapping[str, Any], n: int, trail: Trail) -> str | None
         return f"the cause cannot be checked here ({exc})"
 
 
-def answer_signature(np_id: str, trail: Trail) -> tuple[bool, str, str]:
-    """``(signed, problem, note)`` for the band answer ``np_id``'s OWN signature. ``signed`` is True only when it verifies. No
-    signature material (the band holds none, or the bundle carries none) is ``(False, "", "")``: unsigned, never promoted. A
-    signature that is there and does not verify is a ``problem``. ``note`` says a key revoked since."""
+@dataclass(frozen=True)
+class AnswerSig:
+    """The verdict on a cited answer's OWN signature. ``anchored``: a signature that verifies under a key of the trust root and
+    binds this question and these words; ``word``: what the record's verdict says of the answer; ``problem``: a break."""
+    anchored: bool = False
+    word: str = "unsigned answer"
+    problem: str = ""
+
+
+def _material(sign: Any) -> AnswerSig | tuple[str, str, str]:
+    """The signing record's material ``(sig, message, signer_fp)``, or the verdict when there is none to check: absent, or a
+    record that states unsigned and carries nothing, is unsigned; a record that says ``signed`` without complete material, or
+    carries signature material under another state, is a break (it claims what it cannot show)."""
+    if sign is None:
+        return AnswerSig()
+    if not isinstance(sign, Mapping):
+        return AnswerSig(problem="the answer's signature record is malformed (not a mapping)")
+    state = sign.get("sign_state")
+    sig, message, fp = sign.get("sig"), sign.get("message"), sign.get("signer_fp")
+    if state == "signed":
+        if not (isinstance(sig, str) and sig and isinstance(message, str) and message and isinstance(fp, str) and fp):
+            return AnswerSig(problem="the answer's signature record says signed and does not carry a complete signature "
+                                     "(sig, message and signer_fp)")
+        return sig, message, fp
+    if sig or message:
+        return AnswerSig(problem=f"the answer's signature record carries signature material under sign_state {state!r}")
+    return AnswerSig()
+
+
+def answer_signature(np_id: str, trail: Trail, row: rel.BandRow | None = None, src: Mapping[str, Any] | None = None) -> AnswerSig:
+    """The band answer ``np_id``'s OWN signature, judged against ``row`` (the row as this verification read it) and ``src`` (the
+    relayed record's citation). See the module docstring for what "(signed answer)" binds."""
     from levain.authority import quarantined
     from levain.authority_sig import VerifierUnavailable
     from levain.consent import terminal_sign as ts
@@ -297,34 +454,56 @@ def answer_signature(np_id: str, trail: Trail) -> tuple[bool, str, str]:
     try:
         sign = reader(np_id) if reader is not None else None
     except Exception as exc:                            # noqa: BLE001 - a sidecar that cannot be read is no signature to check
-        return False, f"the answer's signature record cannot be read ({type(exc).__name__})", ""
-    if not isinstance(sign, Mapping) or sign.get("sign_state") != "signed" or not sign.get("sig") or not sign.get("message"):
-        return False, "", ""
-    sig, message, fp = sign["sig"], sign["message"], sign.get("signer_fp")
-    if not isinstance(sig, str) or not isinstance(message, str) or not isinstance(fp, str):
-        return False, "the answer's signature record is malformed", ""
+        return AnswerSig(problem=f"the answer's signature record cannot be read ({type(exc).__name__})")
+    got = _material(sign)
+    if isinstance(got, AnswerSig):
+        if not got.problem and row is not None and row.answer_grade in _SIGNED_ROW_GRADES:
+            return AnswerSig(problem=f"the band row says the answer is {row.answer_grade}, and no signature is there to check")
+        return got
+    sig, message, fp = got
     if trail.snapshot is None:
-        return False, NO_AUTHORITY_FOR.format(why=trail.why_no_authority or "none was given"), ""
+        return AnswerSig(problem=NO_AUTHORITY_FOR.format(why=trail.why_no_authority or "none was given"))
     key = trail.snapshot.keys.get(fp)
     if key is None:
-        return False, f"the answer's signer {fp} is not a key in the authority log", ""
+        return AnswerSig(problem=f"the answer's signer {fp} is not a key in the authority log")
     if key.compromised_since is not None or quarantined([key]):
-        return False, f"the answer's signer {fp} is {'compromised' if key.compromised_since is not None else 'quarantined'}", ""
+        return AnswerSig(problem=f"the answer's signer {fp} is {'compromised' if key.compromised_since is not None else 'quarantined'}")
+    if key.key_class != _ANSWER_KEY_CLASS:
+        return AnswerSig(problem=f"the answer's signer {fp} is a {key.key_class} key; an answer is signed with the laptop's "
+                                 f"terminal key ({_ANSWER_KEY_CLASS}), the only key the band's badge trusts")
     desk = message.startswith(ts.DESK_FORMAT + "\n")
     try:
-        parsed = (ts.parse_desk_verified if desk else ts.parse_verified)(message.encode("utf-8"))
+        raw = message.encode("utf-8")
+        parsed = (ts.parse_desk_verified if desk else ts.parse_verified)(raw)
     except (ts.MessageError, ValueError) as exc:
-        return False, f"the answer's signed message cannot be read ({exc})", ""
-    if np_id not in {e.item for e in parsed.entries}:
-        return False, f"the answer's signed message does not name {np_id}", ""
+        return AnswerSig(problem=f"the answer's signed message cannot be read ({exc})")
+    mine = [e for e in parsed.entries if e.item == np_id]
+    if not mine:
+        return AnswerSig(problem=f"the answer's signed message does not name {np_id}")
+    if len(mine) > 1:
+        return AnswerSig(problem=f"the answer's signed message names {np_id} more than once")
     try:
-        got = ts.verify(message.encode("utf-8"), sig, f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "phill",
+        res = ts.verify(raw, sig, f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "phill",
                         namespace=ts.DESK_NAMESPACE if desk else ts.NAMESPACE, ctk=lambda _fp: (None, ""))
     except VerifierUnavailable as exc:
-        return False, f"the answer's signature cannot be checked here ({exc})", ""
-    if not got.ok or got.fingerprint != fp:
-        return False, f"the answer's signature does not verify ({got.problem or 'it names another key'})", ""
-    return True, "", ("by a key revoked since" if key.revoked_seq is not None else "")
+        return AnswerSig(problem=f"the answer's signature cannot be checked here ({exc})")
+    if not res.ok or res.fingerprint != fp:
+        return AnswerSig(problem=f"the answer's signature does not verify ({res.problem or 'it names another key'})")
+    entry = mine[0]
+    if row is not None:
+        if entry.asked != row.question or (src is not None and rel.digest(entry.asked) != src.get("question_sha256")):
+            return AnswerSig(problem=f"the answer's signature is over another question (it asked {entry.asked!r}): it does not "
+                                     f"bind this question")
+        if entry.text is not None and (entry.text != row.answer
+                                       or (src is not None and rel.digest(entry.text) != src.get("answer_sha256"))):
+            return AnswerSig(problem="the answer's signature is over other words than the row's answer: it does not bind this answer")
+    revoked = f", by a key revoked since (seq {key.revoked_seq})" if key.revoked_seq is not None else ""
+    if trail.trust != TRUST_LIVE:
+        return AnswerSig(False, "answer signature valid under a key the bundle names; not checked against an authority you hold")
+    if entry.text is None:
+        return AnswerSig(False, f"answer signed as the pick {entry.answer!r}{revoked}; the signature does not cover the option key "
+                                f"{row.answer if row is not None else '?'!r} the row holds, which the record's words quote")
+    return AnswerSig(True, f"signed answer{revoked}")
 
 
 def _manifest_sha(rec: Mapping[str, Any], begins: Mapping[tuple[Any, Any], str]) -> str | None:
@@ -333,25 +512,48 @@ def _manifest_sha(rec: Mapping[str, Any], begins: Mapping[tuple[Any, Any], str])
     return begins.get((rec.get("repo"), rec.get("migration")))
 
 
-def _relayed(rec: Mapping[str, Any], trail: Trail, begins: Mapping[tuple[Any, Any], str]) -> tuple[bool, str]:
-    kind, name = _author_of(rec)
+def _relayed(rec: Mapping[str, Any], trail: Trail, begins: Mapping[tuple[Any, Any], str]) -> tuple[bool, bool, str]:
+    """``(ok, anchored, text)`` for a relayed record: the citation, the answer's own signature bound to this row, the manifest."""
+    _, name = _author_of(rec)
     got = rel.verify_relayed(rec, trail.band)
     if not got.ok:
-        return False, f"relayed citation does not hold: {got.text}"
-    src = rec["source"]
-    signed, problem, note = answer_signature(src["np"], trail)
-    if problem:
-        return False, f"relayed citation does not hold: {problem}"
+        return False, False, f"relayed citation does not hold: {got.text}"
+    src = rec["source"]                                 # verify_relayed held its shape: a mapping of four strings
+    try:
+        row = rel._row_of(trail.band, src["np"])
+    except rel.BandRefusal as exc:
+        return False, False, f"relayed citation does not hold: {src['np']} unreadable: {exc}"
+    sig = answer_signature(src["np"], trail, row, src)
+    if sig.problem:
+        return False, False, f"relayed citation does not hold: {sig.problem}"
     if rec.get("op") in ("begin-track", "track"):
         manifest = _manifest_sha(rec, begins)
         if manifest is None:
-            return False, "relayed citation does not hold: no begin-track of this migration records a manifest digest to bind"
-        row = rel._row_of(trail.band, src["np"])
+            return False, False, "relayed citation does not hold: no begin-track of this migration records a manifest digest to bind"
         said = rel.check_manifest(rec, row, manifest)
         if not said.ok:
-            return False, f"relayed citation does not hold: {said.text}"
-    word = ("signed answer" + (f", {note}" if note else "")) if signed else "unsigned answer"
-    return True, f"agent {name}, relaying {src['np']} ({word})"
+            return False, False, f"relayed citation does not hold: {said.text}"
+    return True, sig.anchored, f"agent {name}, relaying {src['np']} ({sig.word})"
+
+
+def _anchor_line(name: str, n: int, rec: Mapping[str, Any], verdict: sg.Verdict | None, trail: Trail, broken: list[int],
+                 cuts: list[int], acked_by: Any) -> str:
+    at = rec.get("at", "?")
+    if trail.trust != TRUST_LIVE:
+        return (f"{name}: NOT ANCHORED: the signatures were checked only against keys the bundle itself names "
+                f"({trail.why_no_authority or 'no authority log of yours was read'}): nothing here is committed by a key you hold")
+    if broken:
+        return (f"{name}: NOT ANCHORED: the file breaks at line {broken[0]}, at or before the last signed record (line {n}); "
+                f"nothing up to it can be called committed by the operator's key")
+    by = ("the operator's key" if verdict is None or verdict.state != "revoked" else
+          f"a key revoked since (seq {verdict.revoked_seq}): a forgery signed with it after the revocation would read the same")
+    if cuts:
+        t = max(cuts)
+        before = (f"lines 1-{t - 1} are committed by NOTHING but the acknowledgement of line {t} by {acked_by(t)}" if t > 1
+                  else "nothing precedes it")
+        return (f"{name}: anchored from line {t} through line {n} only (signed at {at}): the signature commits the chain back to "
+                f"the acknowledged line {t}, by {by}; {before}")
+    return f"{name}: anchored through line {n} (signed at {at}): every record up to it is committed by {by}"
 
 
 def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport:
@@ -360,101 +562,144 @@ def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport
     chain = bc.check_chain(lines)
     breaks = chain.by_line()
     acks = _acks(lines, chain)
+    folded = _fold_said(name, trail)
     begins: dict[tuple[Any, Any], str] = {}
-    last_signed: tuple[int, Mapping[str, Any]] | None = None
-    relayed = 0
+    last_signed: tuple[int, Mapping[str, Any], sg.Verdict | None] | None = None
+    signed_relays = unsigned_relays = 0
+    claimed_signed = False
     unterminated_at = len(lines) if trail.unterminated.get(name) else 0
+    broken_lines: list[int] = []                        # lines that carry a break (the anchor reads them)
+    cuts: list[int] = []                                # acknowledged tears and chain breaks: where a signed record's reach stops
 
     def acked_by(n: int) -> str:
         m, _ = acks[n]
         who = bc.record_of(lines[m - 1]) or {}
-        kind, aname = _author_of(who)
+        _, aname = _author_of(who)
         return f"{aname} ({who.get('grade', '?')}, line {m})"
+
+    def brk(n: int, text: str) -> None:
+        rep.breaks.append(f"line {n}: {text}")
+        broken_lines.append(n)
 
     for n, line in enumerate(lines, 1):
         rec = bc.record_of(line)
-        if n == unterminated_at:
-            rep.breaks.append(f"line {n}: no terminating newline (a write in flight, or a torn tail)")
         if rec is None:
+            if n == unterminated_at:
+                brk(n, "no terminating newline (a write in flight, or a torn tail)")
             if n in acks:
                 rep.notes.append(f"line {n} torn, acknowledged by {acked_by(n)}")
+                cuts.append(n)
             else:
-                rep.breaks.append(f"line {n}: torn (not a JSON object); `levain board ack-torn --file {name} --line {n}` after repairing or accepting it")
+                brk(n, f"torn (not a JSON object); `levain board ack-torn --file {name} --line {n}` after repairing or accepting it")
             continue
+        what = _what(rec)
+        if n in folded.dropped:                         # a record the fold rejects, acknowledged as a torn line: dropped
+            rep.records.append(RecordLine(n, what, f"not read: torn for itself and acknowledged by {acked_by(n)}"
+                                          if n in acks else "not read: dropped by the fold as an acknowledged torn line"))
+            rep.notes.append(f"line {n} torn for itself, acknowledged" + (f" by {acked_by(n)}" if n in acks else ""))
+            cuts.append(n)
+            continue
+        problems: list[str] = []
+        if n == unterminated_at:
+            problems.append("no terminating newline (a write in flight, or a torn tail)")
         if n in breaks:
-            brk = breaks[n]
             if n in acks and acks[n][1].chain:
-                rep.notes.append(f"line {n} chain break, acknowledged by {acked_by(n)}: {brk.problem}")
+                rep.notes.append(f"line {n} chain break, acknowledged by {acked_by(n)}: {breaks[n].problem}")
+                cuts.append(n)
             else:
-                rep.breaks.append(f"line {n}: {brk.problem}")
+                problems.append(breaks[n].problem)
+        if n in folded.rejected and n != unterminated_at:
+            problems.append(f"the fold rejects this record ({folded.rejected[n]})")
+        grade = rec.get("grade")
+        pre_cutover = chain.cutover is None or n < chain.cutover
+        if n in folded.unapplied:
+            if pre_cutover:
+                rep.notes.append(f"line {n}: the fold does not apply it ({folded.unapplied[n]})")
+            else:
+                problems.append(f"the fold does not apply it ({folded.unapplied[n]}): the writer refuses such a record")
+        cause_holds = False
         if "cause" in rec and name == "items.jsonl":
             why_cause = cause_problem_at(rec, n, trail)
             if why_cause is not None:
-                rep.breaks.append(f"line {n}: {_what(rec)}: the cause does not hold as of this cut: {why_cause}")
-                rep.records.append(RecordLine(n, _what(rec), f"the cause does not hold as of this cut: {why_cause}", False))
-        grade = rec.get("grade")
-        pre_cutover = chain.cutover is None or n < chain.cutover
-        what = _what(rec)
-        if pre_cutover and "grade" not in rec:
-            rep.records.append(RecordLine(n, what, "legacy"))
-            continue
-        if grade == sg.GRADE_LEGACY:
-            rep.records.append(RecordLine(n, what, "legacy"))
-            continue
+                problems.append(f"the cause does not hold as of this cut: {why_cause}")
+            else:
+                cause_holds = True
         kind, who = _author_of(rec)
-        if grade in sg.SIGNED_GRADES or "sig" in rec:
+        verdict_text: str | None
+        if pre_cutover and "grade" not in rec:
+            verdict_text = "legacy"
+        elif grade == sg.GRADE_LEGACY:
+            verdict_text = "legacy"
+            if not pre_cutover:
+                problems.append("graded legacy after the cutover: no writer writes a legacy record once the file is chained")
+        elif grade in sg.SIGNED_GRADES or "sig" in rec:
+            claimed_signed = True
             verdict, problem = _signed_problem(rec, trail)
             if problem is not None or verdict is None or verdict.state == "bad":
-                why = problem if problem is not None else (verdict.text if verdict else "signature does not verify")
-                rep.records.append(RecordLine(n, what, why, False))
-                rep.breaks.append(f"line {n}: {what}: {why}")
-                continue
-            if verdict.state == "revoked":
-                rep.records.append(RecordLine(n, what, f"{SIGNED_WORDS}, by a key revoked since (seq {verdict.revoked_seq})"))
-                rep.notes.append(f"line {n}: signed by {verdict.fingerprint}, revoked at seq {verdict.revoked_seq}; the record's own time is the signer's claim")
+                verdict_text = None
+                problems.insert(0, problem if problem is not None else (verdict.text if verdict else "signature does not verify"))
             else:
-                rep.records.append(RecordLine(n, what, SIGNED_WORDS))
-            last_signed = (n, rec)
-            continue
-        if grade == sg.GRADE_RELAYED:
-            ok, text = _relayed(rec, trail, begins)
-            rep.records.append(RecordLine(n, what, text, ok))
+                base = SIGNED_WORDS if trail.trust == TRUST_LIVE else BUNDLE_KEY_WORDS
+                if verdict.state == "revoked":
+                    verdict_text = f"{base}, by a key revoked since (seq {verdict.revoked_seq})"
+                    rep.notes.append(f"line {n}: signed by {verdict.fingerprint}, revoked at seq {verdict.revoked_seq}; the record's "
+                                     f"own time is the signer's claim")
+                else:
+                    verdict_text = base
+                last_signed = (n, rec, verdict)
+                if rec.get("op") == "begin-track" and isinstance(rec.get("manifest_sha256"), str):
+                    begins[(rec.get("repo"), rec.get("migration"))] = rec["manifest_sha256"]
+        elif grade == sg.GRADE_RELAYED:
+            ok, anchored, text = _relayed(rec, trail, begins)
             if ok:
-                relayed += 1
+                verdict_text = text
+                signed_relays, unsigned_relays = signed_relays + anchored, unsigned_relays + (not anchored)
+                if rec.get("op") == "begin-track" and isinstance(rec.get("manifest_sha256"), str):
+                    begins[(rec.get("repo"), rec.get("migration"))] = rec["manifest_sha256"]
             else:
-                rep.breaks.append(f"line {n}: {what}: {text}")
+                verdict_text = None
+                problems.insert(0, text)
         elif grade == bs.GRADE_ASSERTED:
             if kind == "?":
-                text = "asserted, but the record names no author"
-                rep.records.append(RecordLine(n, what, text, False))
-                rep.breaks.append(f"line {n}: {what}: {text}")
+                verdict_text = None
+                problems.insert(0, "asserted, but the record names no author")
             else:
-                rep.records.append(RecordLine(n, what, f"asserted by {who}, unsigned"))
+                verdict_text = f"asserted by {who}, unsigned"
+                if sg.POLICY.get(rec.get("op")) == sg.DECISION_CLASS and not cause_holds:
+                    problems.append(f"a decision-class {rec.get('op')} recorded asserted: the writer refuses this (it needs a "
+                                    f"signature or a relayed answer)")
         else:
-            text = f"{grade!r} is not a grade" if "grade" in rec else "a record after the cutover carries no grade"
+            verdict_text = None
+            problems.insert(0, f"{grade!r} is not a grade" if "grade" in rec else "a record after the cutover carries no grade")
+        if problems:
+            text = "; ".join(problems) if verdict_text is None else f"{verdict_text}, but: {'; '.join(problems)}"
             rep.records.append(RecordLine(n, what, text, False))
-            rep.breaks.append(f"line {n}: {what}: {text}")
-        if rec.get("op") == "begin-track" and isinstance(rec.get("manifest_sha256"), str):
-            begins[(rec.get("repo"), rec.get("migration"))] = rec["manifest_sha256"]
+            brk(n, f"{what}: {'; '.join(problems)}")
+        else:
+            rep.records.append(RecordLine(n, what, verdict_text or "?"))
     # the anchor, the tail
     records_after = lambda n0: sum(1 for k in range(n0, len(lines)) if bc.record_of(lines[k]) is not None)   # noqa: E731
     if last_signed is None:
-        rep.anchor = f"{name}: no signed record: nothing in this file is anchored by the operator's key"
+        rep.anchor = (f"{name}: no signed record verifies: nothing in this file is anchored by the operator's key" if claimed_signed
+                      else f"{name}: no signed record: nothing in this file is anchored by the operator's key")
         rep.tail = (f"{name}: {records_after(0)} records, none after a signed record: all are unanchored: "
                     "anyone who can write this file could have rewritten them")
     else:
-        n, rec = last_signed
-        at_or_before = sorted(int(m.group(1)) for m in (re.match(r"line (\d+)[:\s]", b) for b in rep.breaks) if m and int(m.group(1)) <= n)
-        rep.anchor = (f"{name}: NOT ANCHORED: the file breaks at line {at_or_before[0]}, at or before the last signed record (line {n}); "
-                      f"nothing up to it can be called committed by the operator's key" if at_or_before else
-                      f"{name}: anchored through line {n} (signed at {rec.get('at', '?')}): every record up to it is committed by the "
-                      f"operator's key")
+        n, rec, verdict = last_signed
+        rep.anchor = _anchor_line(name, n, rec, verdict, trail, sorted(m for m in broken_lines if m <= n),
+                                  [t for t in cuts if t <= n], acked_by)
         after = records_after(n)
         rep.tail = (f"{name}: {after} records after the last signed record (at {rec.get('at', '?')}) are unanchored: anyone who can "
                     f"write this file could have rewritten them" if after else
                     f"{name}: 0 records after the last signed record (at {rec.get('at', '?')}): the tail is anchored")
-    rep.relayed = (f"{name}: {relayed} relayed record(s) are anchored to his words by the band row's signature, which does not cover "
-                   f"the chain" if relayed else "")
+    said = []
+    if signed_relays:
+        said.append(f"{name}: {signed_relays} relayed record(s) rest on a signed answer: his words are anchored by the answer's own "
+                    f"signature, which does not cover the chain")
+    if unsigned_relays:
+        said.append(f"{name}: {unsigned_relays} relayed record(s) rest on an answer no signature of a key you hold binds: nothing "
+                    f"anchors his words")
+    rep.relayed = "\n".join(said)
     if name in heads:
         h = heads[name]
         hashes = [bc.line_hash(x) for x in lines]
@@ -464,17 +709,23 @@ def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport
             later = len(lines) - 1 - j
             rep.truncation = (f"{name}: kept head {h[:12]} is the current head: nothing was removed" if later == 0 else
                               f"{name}: kept head {h[:12]} is line {j + 1}; {later} lines were written after it (the file grew)")
-        elif h == empty and not lines:
-            rep.truncation = f"{name}: kept head {h[:12]} is the empty file's, and the file is empty"
+        elif h == empty:
+            rep.truncation = (f"{name}: kept head {h[:12]} is the empty file's, and the file is empty" if not lines else
+                              f"{name}: kept head {h[:12]} is the empty file's; {len(lines)} lines were written after it (the file "
+                              f"grew: an empty file had nothing to remove)")
         else:
             rep.truncation = (f"{name}: TRUNCATION OR REWRITE: kept head {h[:12]} is not on this chain (the file now ends at "
                               f"{rep.head[:12]}): records were removed or rewritten")
             rep.breaks.append(rep.truncation)
+    else:
+        rep.truncation = (f"{name}: no kept head given: a truncation of this file is not checked "
+                          f"(`--head {SHORT[name]}=<hash>` from an earlier export)")
     return rep
 
 
 def verify_trail(trail: Trail, heads: Mapping[str, str] | None = None) -> list[FileReport]:
-    return [verify_file(name, trail, heads or {}) for name in FILES]
+    once = dataclasses.replace(trail, band=_ReadOnce(trail.band))
+    return [verify_file(name, once, heads or {}) for name in FILES]
 
 
 # ----------------------------------------------------------------------------------------------------------------- bundle
@@ -502,7 +753,8 @@ def _line_back(x: Any) -> bytes:
 
 
 def collect_answers(trail: Trail) -> dict[str, Any]:
-    """Every band answer a relayed record cites, as the band holds it now (or why it could not be read)."""
+    """Every band answer a relayed record cites, as the band holds it now (or why it, or its signing record, could not be read:
+    the bundle then carries the reason, and verifying it is a break for that record)."""
     out: dict[str, Any] = {}
     for name in FILES:
         for line in trail.lines[name]:
@@ -512,11 +764,15 @@ def collect_answers(trail: Trail) -> dict[str, Any]:
                 continue
             try:
                 row = rel._row_of(trail.band, src["np"])
-                out[src["np"]] = {"producer": row.producer, "question": row.question, "answer": row.answer,
-                                  "answer_grade": row.answer_grade}
-                sign = trail.band.sign(src["np"]) if hasattr(trail.band, "sign") else None
+                got: dict[str, Any] = {"producer": row.producer, "question": row.question, "answer": row.answer,
+                                       "answer_grade": row.answer_grade}
+                try:
+                    sign = trail.band.sign(src["np"]) if hasattr(trail.band, "sign") else None
+                except Exception as exc:                # noqa: BLE001 - a sidecar that cannot be read is carried as unreadable
+                    raise rel.BandRefusal(f"its signing record could not be read ({type(exc).__name__})") from None
                 if isinstance(sign, Mapping):
-                    out[src["np"]]["sign"] = {k: sign.get(k) for k in ("sig", "message", "signer_fp", "sign_state", "sign_reason")}
+                    got["sign"] = {k: sign.get(k) for k in ("sig", "message", "signer_fp", "sign_state", "sign_reason")}
+                out[src["np"]] = got
             except rel.BandRefusal as exc:
                 out[src["np"]] = {"unreadable": str(exc)}
     return out
@@ -539,16 +795,37 @@ def bundle_of(trail: Trail) -> dict:
     }
 
 
+_ANSWER_FIELDS = ("question", "answer", "answer_grade", "producer")
+
+
+def _check_answer(np_id: Any, got: Any) -> None:
+    if not isinstance(np_id, str) or not isinstance(got, dict):
+        raise TypeError(f"answer {np_id!r} is not an object")
+    if "unreadable" in got:
+        if not isinstance(got["unreadable"], str):
+            raise TypeError(f"answer {np_id}: unreadable is not text")
+        return
+    if not all(isinstance(got.get(k), str) for k in _ANSWER_FIELDS):
+        raise TypeError(f"answer {np_id}: {', '.join(_ANSWER_FIELDS)} must each be text")
+    if got.get("sign") is not None and not isinstance(got["sign"], dict):
+        raise TypeError(f"answer {np_id}: sign is not an object")
+
+
 def load_bundle(path: Path) -> Trail:
+    """A bundle as a :class:`Trail` whose snapshot is the keys the bundle NAMES (``trust`` :data:`TRUST_BUNDLE`): claims, until
+    :func:`adopt_trust_root` compares them with an authority log the verifier holds."""
     from levain.authority import AuthorityKey, AuthoritySnapshot, StandingPolicy
     try:
         doc = json.loads(Path(path).read_bytes())
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise TrailError(f"{path} cannot be read as a trail bundle ({type(exc).__name__})") from None
     if not isinstance(doc, dict) or doc.get("format") != BUNDLE_FORMAT:
         raise TrailError(f"{path} is not a {BUNDLE_FORMAT} bundle")
     try:
         files = doc["files"]
+        for name in FILES:
+            if not isinstance(files[name], dict) or not isinstance(files[name]["lines"], list):
+                raise TypeError(f"{name} lines is not a list")
         lines = {name: [_line_back(x) for x in files[name]["lines"]] for name in FILES}
         unterminated = {name: bool(files[name].get("unterminated")) for name in FILES}
         store = doc["store"]
@@ -556,9 +833,11 @@ def load_bundle(path: Path) -> Trail:
         auth = doc["authority"]
         if not isinstance(store, str) or not isinstance(answers, dict) or not isinstance(auth, dict):
             raise KeyError("shape")
+        for np_id, got in answers.items():
+            _check_answer(np_id, got)
         snapshot, why = None, ""
         if "unavailable" in auth:
-            why = str(auth["unavailable"])
+            why = f"the bundle carries no keys: {auth['unavailable']}"
         else:
             known = {f.name for f in dataclasses.fields(AuthorityKey)}
             keys = {}
@@ -569,7 +848,34 @@ def load_bundle(path: Path) -> Trail:
                                          policy=StandingPolicy())
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         raise TrailError(f"{path} is a damaged bundle ({type(exc).__name__}: {exc})") from None
-    return Trail(store, lines, unterminated, snapshot, why, _BundleBand(answers))
+    return Trail(store, lines, unterminated, snapshot, why, _BundleBand(answers), TRUST_BUNDLE, "")
+
+
+def adopt_trust_root(trail: Trail, data_root: str | None) -> None:
+    """Make the verifier's OWN authority log the trust root of a bundle ``trail``: replay it (``data_root``, default the
+    install's), compare every key the bundle names against it (a key it does not hold, or holds as another key or class, is a
+    break), and verify against it. With no log to replay, the bundle's keys stay claims: ``trust`` stays :data:`TRUST_BUNDLE`
+    and every verdict that rests on them says so."""
+    claimed = trail.snapshot
+    live, why = _read_authority(data_root)
+    if live is None:
+        trail.why_no_authority = (f"no authority log of yours could be read ({why})" if claimed is not None else
+                                  f"{trail.why_no_authority}; no authority log of yours could be read ({why})")
+        trail.trust_line = (f"authority: the keys the bundle names (seq {claimed.seq}, head {str(claimed.head_hash)[:12]}), NOT "
+                            f"checked against an authority you hold: {why}" if claimed is not None else
+                            _authority_line(None, trail.why_no_authority, ""))
+        return
+    for fp, k in sorted((claimed.keys if claimed is not None else {}).items()):
+        mine = live.keys.get(fp)
+        if mine is None:
+            trail.breaks.append(f"the bundle names key {fp} ({k.key_class}), which the authority log you hold does not")
+        elif mine.public_key != k.public_key or mine.key_class != k.key_class:
+            trail.breaks.append(f"the bundle names key {fp} as a {k.key_class} key {k.public_key[:24]}..., and the authority log "
+                                f"you hold has it as a {mine.key_class} key {mine.public_key[:24]}...")
+    trail.snapshot, trail.why_no_authority, trail.trust = live, "", TRUST_LIVE
+    trail.trust_line = (_authority_line(live, "", "the log this install holds")
+                        + (f"; the bundle's {len(claimed.keys)} key(s) were compared to it" if claimed is not None else
+                           "; the bundle carried no keys"))
 
 
 def _inside_git(path: Path) -> Path | None:
@@ -586,7 +892,7 @@ def default_dir() -> Path:
 
 def destination(out: str | None, store_id: str) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    fname = f"trail-{(store_id or 'store')[:8]}-{stamp}.json"
+    fname = f"trail-{re.sub(r'[^0-9A-Za-z_-]', '_', (store_id or 'store')[:8])}-{stamp}.json"
     if out is None:
         try:
             base = default_dir()
@@ -597,7 +903,7 @@ def destination(out: str | None, store_id: str) -> Path:
         given = Path(out).expanduser()
         dest = given / fname if (given.is_dir() or str(out).endswith(os.sep)) else given
     dest = Path(os.path.abspath(dest))
-    repo = _inside_git(dest.parent)
+    repo = _inside_git(dest.parent) or _inside_git(Path(os.path.realpath(dest.parent)))
     if repo is not None:
         raise TrailError(f"{dest} is inside a git work tree ({repo}): the bundle carries his words and never goes into a repo; "
                          f"name a place outside one with --out")
@@ -605,7 +911,12 @@ def destination(out: str | None, store_id: str) -> Path:
 
 
 def _write_new(dest: Path, data: bytes) -> None:
-    dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    """Write ``data`` to a NEW file at ``dest`` (0600, O_EXCL). Any failure is a :class:`TrailError`; a failure after the file
+    was created removes it (this call made it, and it was never published)."""
+    try:
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise TrailError(f"{dest.parent} cannot be made ({exc})") from None
     try:
         fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -614,11 +925,18 @@ def _write_new(dest: Path, data: bytes) -> None:
         raise TrailError(f"{dest} cannot be written ({exc})") from None
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(data)
+            view = memoryview(data)
+            while view:
+                wrote = f.write(view)
+                if not wrote:
+                    raise OSError("a write made no progress")
+                view = view[wrote:]
             f.flush()
             os.fsync(f.fileno())
     except OSError as exc:
-        raise TrailError(f"{dest} cannot be written ({exc})") from None
+        with contextlib.suppress(OSError):
+            os.unlink(dest)
+        raise TrailError(f"{dest} cannot be written ({exc}); the partial file was removed") from None
 
 
 # --------------------------------------------------------------------------------------------------------------------- CLI
@@ -626,23 +944,28 @@ def _write_new(dest: Path, data: bytes) -> None:
 
 def _print_report(reports: Sequence[FileReport], trail: Trail) -> int:
     broken = 0
+    if trail.trust_line:
+        print(safe(trail.trust_line))
+    for b in trail.breaks:
+        print(f"BREAK {safe(b)}")
+    broken += len(trail.breaks)
     for rep in reports:
         print(f"{rep.name} ({rep.lines} lines, head {rep.head})")
         for r in rep.records:
-            print(f"  {rep.name}:{r.n} {r.text}: {r.verdict}" + ("" if r.ok else "  [BREAK]"))
+            print(safe(f"  {rep.name}:{r.n} {r.text}: {r.verdict}" + ("" if r.ok else "  [BREAK]")))
         for note in rep.notes:
-            print(f"  note: {note}")
-        print(rep.anchor)
-        print(rep.tail)
-        if rep.relayed:
-            print(rep.relayed)
+            print(safe(f"  note: {note}"))
+        print(safe(rep.anchor))
+        print(safe(rep.tail))
+        for line in rep.relayed.splitlines():
+            print(safe(line))
         if rep.truncation:
-            print(rep.truncation)
+            print(safe(rep.truncation))
         for b in rep.breaks:
-            print(f"BREAK {rep.name}: {b}")
+            print(safe(f"BREAK {rep.name}: {b}"))
         broken += len(rep.breaks)
     for line in close_verdicts(trail, reports):
-        print(line)
+        print(safe(line))
     return broken
 
 
@@ -653,6 +976,8 @@ def _parse_heads(raw: Sequence[str]) -> dict[str, str]:
         key, _, val = item.partition("=")
         if key not in long or not _HEAD_RE.fullmatch(val):
             raise TrailError(f"--head {item!r}: use items=<64 hex> or repos=<64 hex>")
+        if long[key] in out:
+            raise TrailError(f"--head {key}= is given twice: give each file's kept head once")
         out[long[key]] = val
     return out
 
@@ -673,26 +998,30 @@ def run_export(args: argparse.Namespace) -> int:
         dest = destination(args.out, trail.store_id)
         _write_new(dest, data)
     except TrailError as exc:
-        print(f"levain board trail export: refused: {exc}", file=sys.stderr)
+        print(safe(f"levain board trail export: refused: {exc}"), file=sys.stderr)
         return EXIT_USAGE
-    print(f"bundle: {dest}")
+    print(safe(f"bundle: {dest}"))
     print(f"items={bundle['heads']['items']} repos={bundle['heads']['repos']}")
-    broke = sum(len(r.breaks) for r in verify_trail(trail))
+    broke = sum(len(r.breaks) for r in verify_trail(trail)) + len(trail.breaks)
     if broke:
         print(f"levain board trail export: note: this store does not verify ({broke} breaks); the bundle holds it as it is: "
               f"run `levain board trail verify`", file=sys.stderr)
     if trail.snapshot is None:
-        print(f"levain board trail export: note: no authority log was read ({trail.why_no_authority}); the bundle carries no keys, "
-              f"so its signatures cannot be checked from it", file=sys.stderr)
+        print(safe(f"levain board trail export: note: no authority log was read ({trail.why_no_authority}); the bundle carries no "
+                   f"keys, so its signatures can be checked only against an authority log the verifier holds"), file=sys.stderr)
     return 0
 
 
 def run_verify(args: argparse.Namespace) -> int:
     try:
         heads = _parse_heads(args.head)
-        trail = load_bundle(Path(args.bundle)) if args.bundle else _live(args)
+        if args.bundle:
+            trail = load_bundle(Path(args.bundle))
+            adopt_trust_root(trail, args.data_root)
+        else:
+            trail = _live(args)
     except TrailError as exc:
-        print(f"levain board trail verify: refused: {exc}", file=sys.stderr)
+        print(safe(f"levain board trail verify: refused: {exc}"), file=sys.stderr)
         return EXIT_USAGE
     broken = _print_report(verify_trail(trail, heads), trail)
     if broken:
@@ -711,7 +1040,8 @@ def register(sub: Any) -> None:
         p.add_argument("--items", type=str, metavar="PATH",
                        help=f"The store directory or its items.jsonl (default: the pointer, else ${bs.ITEMS_ENV}).")
         p.add_argument("--data-root", dest="data_root", default=None, metavar="DIR",
-                       help="The cockpit data root whose authority log holds the operator's keys (default: the one the consent hooks name).")
+                       help=("The cockpit data root whose authority log holds the operator's keys (default: the one the consent "
+                             "hooks name). With a BUNDLE it is the trust root the bundle's keys are checked against."))
         p.add_argument("--band-dir", dest="band_dir", default=None, metavar="DIR",
                        help="The band store the relayed records cite (default: this install's consent directory).")
 
@@ -727,11 +1057,13 @@ def register(sub: Any) -> None:
     v = tsub.add_parser(
         "verify", help="Re-check the chain, every signature and every relayed citation; one verdict per record.",
         description=("Reads a bundle (BUNDLE) or the live store. Prints one verdict per record, then per file the anchor line, the "
-                     "unanchored-tail line and, with --head, whether the kept head is still on the chain. Exits 0 with no break, "
-                     "3 on any break (a chain break, a signature that does not verify, a relayed citation that does not hold, a "
-                     "head that is gone), 2 when it cannot run."))
+                     "unanchored-tail line and whether the kept head is still on the chain. A bundle's keys are claims: they are "
+                     "checked against the authority log of THIS install (--data-root); with none, no anchor is claimed. Exits 0 "
+                     "with no break, 3 on any break (a chain break, a record its fold rejects, a signature that does not verify, a "
+                     "relayed citation that does not hold, a head that is gone), 2 when it cannot run."))
     v.add_argument("bundle", nargs="?", default=None, metavar="BUNDLE")
     common(v)
     v.add_argument("--head", action="append", default=[], metavar="FILE=HASH",
-                   help="A head `export` printed (items=<hash> or repos=<hash>), repeatable: checked to still be on that file's chain.")
+                   help="A head `export` printed (items=<hash> or repos=<hash>), each file at most once: checked to still be on "
+                        "that file's chain.")
     v.set_defaults(func=run_verify)
