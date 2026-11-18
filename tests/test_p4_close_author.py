@@ -771,3 +771,43 @@ def test_a_repo_reached_through_a_symlinked_path_with_key_dot_is_the_whole_work_
     assert (c.tier, c.how) == ("unattributed", "unattributed: the path is the repo's whole work tree")
     d = ba.closer_of_item(via, item(6, "document", "docs/a.md"), "x", FULL(sc))
     assert (d.who, d.commit) == ("Doc Person", sc.c["doc"])
+
+
+def test_a_relative_repo_with_the_cwd_inside_it_reads_the_document_it_is_not_outside(sc, monkeypatch):
+    """``levain board state`` with no ``--repo`` passes ``Path(".")``: the path and the repo are both made absolute from the
+    cwd, lexically, so neither base misses (levain#103, L3 p4 r3)."""
+    monkeypatch.chdir(sc.repo)
+    d = ba.closer_of_item(Path("."), item(6, "document", "docs/a.md"), "x", FULL(sc))
+    assert (d.who, d.commit) == ("Doc Person", sc.c["doc"])
+    r = ba.closer_of_item(Path("."), item(7, "run", "outdir"), "x", FULL(sc))
+    assert (r.who, r.commit) == ("Dir One", sc.c["dir1"])
+    whole = ba.closer_of_item(Path("."), item(8, "document", "."), "x", FULL(sc))
+    assert whole.how == "unattributed: the path is the repo's whole work tree"
+    assert ba.closer_of_item(Path("."), item(8, "document", "../outside_it"), "x", FULL(sc)).how == OUTSIDE_TEXT
+
+
+def test_a_tracked_link_to_dot_given_as_the_repo_with_key_dot_is_the_whole_work_tree_not_the_commit_that_added_the_link(sc):
+    """``/r/via`` (``via`` a tracked symlink to ``.``) given as the repo, key ``.``: the repo as given is tried before the
+    toplevel, so the answer is the whole work tree, not "first added via" (levain#103, L3 p4 r3)."""
+    link = sc.repo / "via"
+    link.symlink_to(".")
+    try:
+        sc.commit("adds via", "Link Person", T1)
+        _republish(sc)
+        c = ba.closer_of_item(link, item(8, "document", "."), "x", FULL(sc))
+    finally:
+        link.unlink()
+        sc.commit("removes via", "Link Person", T1)
+        _republish(sc)
+    assert (c.tier, c.who, c.how) == ("unattributed", None, "unattributed: the path is the repo's whole work tree")
+
+
+def test_a_file_added_then_removed_on_main_is_still_credited_to_the_commit_that_added_it(sc):
+    """Pins the fix-3 behaviour (``--diff-filter=A`` over the first-parent log, no ``--follow``-style presence test)."""
+    added = sc.commit("adds gone", "Gone Adder", T1, files={"docs/gone.md": "g"})
+    sc.git("rm", "-q", "docs/gone.md")
+    sc.commit("removes gone", "Gone Remover", T1)
+    _republish(sc)
+    c = verdict(sc, item(8, "document", "docs/gone.md"), "docs/gone.md")
+    assert (c.who, c.commit) == ("Gone Adder", added)
+    assert c.how == "first added docs/gone.md, asserted by git author"
