@@ -500,11 +500,45 @@ def items_last(target: bs.Target) -> str:
     return hashlib.sha256(tail[-1]).hexdigest() if tail else sg.ITEMS_NONE
 
 
+def _raw_reg(target: bs.Target, rec: dict) -> None:
+    """An asserted registry record written raw, chained and naming this store, as T2's writer would write it."""
+    reg = target.store_dir / "repos.jsonl"
+    rec = {"v": 1, "store": bs.read_store_id(target.store_dir), **rec, "at": NOW,
+           "prev": bs.chain_prev(reg.read_bytes() if reg.exists() else b""), "by": "phill", "words": "w",
+           "author": OPERATOR, "grade": "asserted"}
+    with open(reg, "ab") as f:
+        f.write(bs.canonical_bytes(rec) + b"\n")
+
+
+def abandon_ready(target: bs.Target, repo: str, migration: str) -> None:
+    """The registry state an abandon of ``(repo, migration)`` APPLIES to: ``repo`` registered and tracking (or already
+    aborting) ``migration``. Since fix 4 a cause must be an abandon the registry fold applied, of a repo aborting its
+    migration now; these tests write their abandons raw, so they write the records before it raw too (register,
+    begin-track; abandon-done of another migration it is aborting)."""
+    from levain.desk import repos_fold as rf
+    reg = target.store_dir / "repos.jsonl"
+    lines = (reg.read_bytes() if reg.exists() else b"").split(b"\n")[:-1]
+    cur = rf.fold_repos(lines, store_id=bs.read_store_id(target.store_dir)).repos.get(repo)
+    if cur is not None and cur.mode in ("tracking", "aborting") and cur.migration == migration:
+        return
+    if cur is None:
+        _raw_reg(target, {"op": "register", "repo": repo, "path": f"/repos/{repo}", "origin": "", "root": ["0" * 40]})
+    elif cur.mode == "aborting":
+        _raw_reg(target, {"op": "abandon-done", "repo": repo, "migration": cur.migration})
+    elif cur.mode != "untracked":
+        raise AssertionError(f"{repo} is {cur.mode} {cur.migration}: abandon_ready does not leave that state")
+    _raw_reg(target, {"op": "begin-track", "repo": repo, "migration": migration, "charter_before": "none",
+                      "manifest": {"plan_items": [], "contract_items": []}, "manifest_sha256": "0" * 64})
+
+
 def signed_abandon(target: bs.Target, signer: Rig, *, migration="M1", grade="signed-terminal", op="abandon-track",
-                   sign=True, junk=False, repo="levain", last: str | None = "now") -> str:
+                   sign=True, junk=False, repo="levain", last: str | None = "now", ready: bool = True) -> str:
     """An abandon-track line written raw into repos.jsonl (the verb is T2's), signed by ``signer``; returns its cause.
     ``last`` is its ``items_last``: ``"now"`` (default) names the items file's last line as of this call; None omits it.
-    It names this store and chains onto the registry's bytes, as the writer's record does."""
+    It names this store and chains onto the registry's bytes, as the writer's record does. ``ready`` (default) first puts
+    the registry in the state the abandon applies to (:func:`abandon_ready`); without it the abandon is as the state finds it."""
+    if ready and op == "abandon-track":
+        abandon_ready(target, repo, migration)
     reg = target.store_dir / "repos.jsonl"
     rec = {"v": 1, "store": bs.read_store_id(target.store_dir), "op": op, "repo": repo, "at": NOW,
            "prev": bs.chain_prev(reg.read_bytes() if reg.exists() else b""), "by": "phill", "migration": migration,
@@ -548,7 +582,7 @@ def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
         (item, signed_abandon(target, rig, grade="asserted", sign=False), rig.source(), "graded 'asserted'"),
         (item, signed_abandon(target, rig, sign=False), rig.source(), "claims a signature it does not carry"),
         (item, signed_abandon(target, rig, junk=True), rig.source(), "signature does not verify"),
-        (item, signed_abandon(target, rig, migration="M2"), rig.source(), "is not keyed to it"),
+        (item, signed_abandon(target, rig, migration="M2", ready=False), rig.source(), "the registry did not apply"),
         (other_m, good, rig.source(), "is not keyed to it"),
         (unkeyed, good, rig.source(), "is not keyed to it"),
         (item, signed_abandon(target, rig, op="pause"), rig.source(), "not an abandon-track"),
@@ -598,7 +632,7 @@ def test_a_cause_is_refused_on_anything_but_a_cut(target, rig):
 def test_the_cause_check_reads_the_hash_of_the_line_as_written(target, rig):
     item = keyed_item(target, "M1:plan-1")
     signed_abandon(target, rig)
-    line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
+    line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[-2]           # the abandon: the last line
     with pytest.raises(bs.BoardError):
         cut(target, item, hashlib.sha256(line + b"\n").hexdigest(), rig.source())     # the newline is not in the range
     cut(target, item, hashlib.sha256(line).hexdigest(), rig.source())
@@ -608,7 +642,7 @@ def test_the_cli_checks_an_unsigned_cause_against_the_authority_log(target, rig,
     item = keyed_item(target, "M1:plan-1")
     cause = signed_abandon(target, rig)
     argv = ["board", "decide", "--id", item, "--decision", "cut", "--words", "w", "--by", "seat-1", "--cause", cause]
-    assert main(argv) == 2 and "nobody can verify" in capsys.readouterr().err          # this install has no authority log
+    assert main(argv) == 2 and "no authority log to verify it against" in capsys.readouterr().err   # no log: the decide's own refusal (gemini 124)
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     assert main(argv) == 0, capsys.readouterr().err
     assert items(target)[-1]["cause"] == cause
@@ -748,7 +782,7 @@ def test_items_last_is_found_only_in_the_items_file_ruling_b(target, rig):
     repos.jsonl line placed its anchor after every item line, so an item added after the abandon passed the order check."""
     (target.store_dir / "repos.jsonl").write_bytes(b"")
     first = signed_abandon(target, rig, last=sg.ITEMS_NONE, migration="M0")          # a registry line to point at
-    reg_line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
+    reg_line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[-2]   # the abandon: the last line
     assert hashlib.sha256(reg_line).hexdigest() == first
     cause = signed_abandon(target, rig, last=first)
     _raw_add(target, "levain#1", "M1:late")                                         # added AFTER the abandon
@@ -772,7 +806,7 @@ def test_an_abandon_copied_from_another_store_is_refused_codex_high_52(home, tmp
     a = bs.resolve_store()
     ia = keyed_item(a, "M1:x")
     signed_abandon(a, rig)
-    line = (a.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
+    line = (a.store_dir / "repos.jsonl").read_bytes().split(b"\n")[-2]           # the abandon: the last line
     assert main(["board", "use", str(tmp_path / "B")]) == 0
     b = bs.resolve_store()
     ib = keyed_item(b, "M1:x")
@@ -789,11 +823,11 @@ def test_an_abandon_moved_off_its_signed_chain_position_is_refused_ruling_b(targ
     signed_abandon(target, rig, migration="M0")
     cause = signed_abandon(target, rig)
     reg = target.store_dir / "repos.jsonl"
-    first, second = reg.read_bytes().split(b"\n")[:2]
-    reg.write_bytes(second + b"\n" + first + b"\n")                  # the same signed bytes, swapped
+    *head, first, second = reg.read_bytes().split(b"\n")[:-1]     # begin-track M1, then its abandon
+    reg.write_bytes(b"".join(ln + b"\n" for ln in head) + second + b"\n" + first + b"\n")   # the same signed bytes, swapped
     with pytest.raises(bs.BoardError, match="does not stand where its signed prev places it"):
         cut(target, item, cause, rig.source())
-    reg.write_bytes(first + b"\n" + second + b"\n")
+    reg.write_bytes(b"".join(ln + b"\n" for ln in head) + first + b"\n" + second + b"\n")
     cut(target, item, cause, rig.source())                           # in place again: it holds
 
 
