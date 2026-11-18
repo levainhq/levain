@@ -1,7 +1,7 @@
 """levain.desk.board_relay — relayed provenance (levain#97, P3): a board record whose authority is a band answer.
 
 The desk relays most of the operator's decisions: the answer is in the band, the record is written by the desk. A
-``--source <np-id>`` record is therefore ``grade: relayed`` (the writer's, never a caller's), ``author.kind: agent``, and
+``--source <q-id>`` record is therefore ``grade: relayed`` (the writer's, never a caller's), ``author.kind: agent``, and
 carries ``source: {np, producer, question_sha256, answer_sha256}``. The one rule the page names: his sentence travels,
 never the rule read into it, so the record's ``words`` must be a VERBATIM substring of the answer (an item quotes an
 excerpt; the whole answer is not required). The digests are sha256 of the question and answer text as the band store

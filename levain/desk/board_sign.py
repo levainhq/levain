@@ -152,8 +152,8 @@ POLICY: dict[str, str] = {
 
 
 def _refusal(op: str, why: str = "") -> str:
-    return (f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <np-id> relaying "
-            f"his answer; an asserted record is refused")
+    return (f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <q-id> (the band's "
+            f"question id, q-<24 hex>) relaying his answer; an asserted record is refused")
 
 
 MOVE_DECISION = " of a tracking, tracked or aborting repo that changes its origin or root set"
