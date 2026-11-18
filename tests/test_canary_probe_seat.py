@@ -143,3 +143,20 @@ def test_the_flipper_ends_when_its_directory_is_gone(tmp_path):
     os.rename(parent, tmp_path / "moved")                            # atomic: the race cannot refill it
     t.join(5)
     assert not t.is_alive() and counter.read_text().split()[1] == "gone"
+
+
+def test_standalone_probe_starts_where_levain_is_not_importable(tmp_path):
+    """The slot runs a copy of the probe with no levain package on its path (-S: no site-packages, so an editable
+    install cannot supply it); the script must still start (it fails
+    on the bad nonce, past the import, rather than on a missing module)."""
+    import shutil
+    import sys
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    shutil.copyfile(cp.__file__, alone / "canary_probe.py")
+    r = subprocess.run([sys.executable, "-I", "-S", str(alone / "canary_probe.py"), "--nonce", "NOT-HEX",
+                        "--home", str(alone), "--port", "1", "--cockpit", str(alone), "--hookdir", str(alone)],
+                       cwd=alone, capture_output=True, text=True, timeout=60,
+                       env={"PATH": os.environ["PATH"], "HOME": str(alone)})
+    assert "ModuleNotFoundError" not in r.stderr, r.stderr
+    assert "--nonce must be" in r.stderr, r.stderr

@@ -388,6 +388,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    from levain.home_guard import mark_live
-    mark_live()
+    try:
+        from levain.home_guard import mark_live
+    except ImportError:
+        # A copy run inside a slot has no levain package; there it resolves no levain home, so there is nothing to mark.
+        pass
+    else:
+        mark_live()
     sys.exit(main())
