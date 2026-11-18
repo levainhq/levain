@@ -965,15 +965,6 @@ def test_a_refused_signed_write_on_a_fresh_store_leaves_no_file_codex_46(bare_st
     assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]            # the legacy add an inactive registry allows
 
 
-def test_a_refused_write_keeps_a_file_it_did_not_create_fix4_3(tgt, store, tmp_path, mkrepo, rig):
-    """The unlink is only of the file THIS write created: an existing empty repos.jsonl stays."""
-    assert (store / "repos.jsonl").read_bytes() == b""
-    repo = mkrepo("alpha")
-    with pytest.raises(bs.BoardError, match="cancelled"):
-        br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=_Cancelled(rig))
-    assert (store / "repos.jsonl").exists()
-
-
 def test_decide_cause_with_no_authority_log_reports_its_own_refusal_gemini_124(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
     """gemini MED 124, reproduced on 664f72209: ``decide --cause`` on an install with no authority log refused with
     NO_AUTHORITY before the decide judged anything (a cause on a non-cut, an unsigned cut)."""
@@ -1124,3 +1115,144 @@ def test_abandon_track_on_a_torn_registry_says_ack_torn_first_deepseek_71(tgt, s
     with pytest.raises(bs.BoardError, match=f"registry is torn.*ack-torn first.*--file repos.jsonl --line {n}"):
         br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
     assert (raw(store), items_raw(store)) == before
+
+
+# ------------------------------------------- fix 6 (L3 round 2, l3_p2_r2): each case reproduced first on 0193c6b61
+
+
+def test_a_writer_never_opens_a_store_file_with_o_creat_before_its_record_codex_116(bare_store, mkrepo, rig, monkeypatch):
+    """codex HIGH 116 / OPEN 98 / complement 40: fix 4 opened the store file with ``O_CREAT`` before the ceremony and then
+    unlinked the empty file a refused write left, by pathname. A refused, cancelled or captured write now never creates the
+    file at all: no open of a store file carries ``O_CREAT`` unless the record is being appended."""
+    tgt = bs.resolve_store(None)
+    repo = mkrepo("alpha")
+    real, creates = os.open, []
+
+    def spy(path, flags, *a, **k):
+        if Path(str(path)).name in bs.APPEND_FILES and flags & os.O_CREAT:
+            creates.append(Path(str(path)).name)
+        return real(path, flags, *a, **k)
+    monkeypatch.setattr(bs.os, "open", spy)
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=_Cancelled(rig))
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=_Cancelled(rig))
+    sg.prepare(tgt, "add", repo="alpha", title="t", origin="o", by="desk 1", author=OP, authority=rig.source())
+    assert creates == [] and not (bare_store / "repos.jsonl").exists() and not (bare_store / "items.jsonl").exists()
+    assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]            # the write that appends creates the file
+    assert creates == ["items.jsonl"]
+
+
+def test_a_file_another_writer_creates_before_the_open_survives_a_cancelled_write_codex_116(bare_store, mkrepo, rig, monkeypatch):
+    """codex HIGH 116, reproduced on 0193c6b61: ``exists()`` then the ``O_CREAT`` open claimed a file a lock-free writer
+    created in between as this write's own, and the cancelled write unlinked it while that writer was about to append."""
+    tgt = bs.resolve_store(None)
+    real, done = bs._open_checked, []
+
+    def racing(path, flags, *a, **k):
+        if Path(path).name == "items.jsonl" and not done:
+            done.append(1)
+            Path(path).touch()                          # a writer that takes no lock creates the file, about to append
+        return real(path, flags, *a, **k)
+    monkeypatch.setattr(bs, "_open_checked", racing)
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=_Cancelled(rig))
+    assert done and (bare_store / "items.jsonl").exists()
+
+
+@pytest.mark.parametrize("replacement", [b"", b"a line a checkout wrote\n"])
+def test_a_checkout_replacing_a_fresh_store_file_during_the_ceremony_is_never_lost_codex_116(bare_store, mkrepo, rig, monkeypatch,
+                                                                                             replacement):
+    """A git checkout that puts a file at the store path while a signed write on a fresh store is at its prompt: the write
+    refuses (the store moved) and the file the checkout wrote is left exactly as it wrote it."""
+    tgt = bs.resolve_store(None)
+    path = bare_store / "items.jsonl"
+    real = sg.ceremony
+
+    def checkout(seal, record):
+        tmp = bare_store / ".checkout.tmp"
+        tmp.write_bytes(replacement)
+        os.replace(tmp, path)
+        return real(seal, record)
+    monkeypatch.setattr(sg, "ceremony", checkout)
+    with pytest.raises(bs.BoardError, match="changed while you signed"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=rig.seal())
+    assert path.read_bytes() == replacement
+
+
+def test_a_signed_write_on_a_fresh_store_creates_the_file_after_the_ceremony(bare_store, mkrepo, rig):
+    """Absent when the record was built and absent after the ceremony is unchanged: the signed record lands, and is the
+    file's first line."""
+    tgt = bs.resolve_store(None)
+    repo = mkrepo("alpha")
+    br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=rig.seal())
+    lines = raw(bare_store).splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["op"] == "register" and json.loads(lines[0])["grade"] == "signed-terminal"
+
+
+@pytest.mark.parametrize("signed", [True, False])
+def test_abandon_track_refuses_a_torn_items_store_up_front_gemini_162(tgt, store, tmp_path, mkrepo, rig, monkeypatch, signed):
+    """gemini MED 162-166, reproduced on 0193c6b61: an items file whose last line lost its newline (a crash mid-append) is
+    torn for the cut check but not for the item fold, so a SIGNED re-run on an aborting repo wrote a fresh abandon anchored
+    to the torn line, and an UNSIGNED one told the operator to sign one. No abandon repairs a tear: both refuse naming the
+    ``ack-torn``, nothing is written and no prompt is shown."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    items = store / "items.jsonl"
+    items.write_bytes(items.read_bytes().rstrip(b"\n"))
+    n = len(items.read_bytes().split(b"\n"))
+    before = raw(store), items_raw(store)
+    prompts: list[int] = []
+    kw = {"seal": _signer_doing(rig, lambda: prompts.append(1))} if signed else {"authority": rig.source()}
+    with pytest.raises(bs.BoardError, match=f"abandon-track alpha: the items store is torn.*ack-torn --file items.jsonl --line {n}"
+                                            f".*nothing was written"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, **kw)
+    assert (raw(store), items_raw(store)) == before and prompts == []
+
+
+def test_abandon_track_refuses_a_torn_items_store_found_under_the_lock_gemini_162(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """The same refusal from inside the locked build, when the tear lands after the up-front check."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    items = store / "items.jsonl"
+    real = br._reg_write
+
+    def tear_then_write(*a, **k):
+        items.write_bytes(items.read_bytes().rstrip(b"\n"))
+        return real(*a, **k)
+    monkeypatch.setattr(br, "_reg_write", tear_then_write)
+    before = raw(store)
+    prompts: list[int] = []
+    with pytest.raises(bs.BoardError, match="abandon-track alpha: the items store is torn.*ack-torn.*nothing was written"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=_signer_doing(rig, lambda: prompts.append(1)))
+    assert raw(store) == before and prompts == []
+
+
+def test_a_sealed_write_with_no_author_refuses_up_front_gemini_168(tgt, store, tmp_path, mkrepo, rig):
+    """gemini LOW 168-170, reproduced on 0193c6b61: ``_preflight`` skipped the operator check when no author was passed, so
+    a sealed write that builds nothing took no author without refusing (``prepare`` refuses it)."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=())
+    before = raw(store)
+    with pytest.raises(bs.BoardError, match="author"):
+        br.register(tgt, "alpha", str(repo), "first", "desk 1", author=None, seal=rig.seal())
+    assert raw(store) == before
+
+
+def test_a_file_made_between_the_last_check_and_the_create_sends_the_write_back_not_onto_it(bare_store, mkrepo, rig, monkeypatch):
+    """The create is ``O_CREAT|O_EXCL``: a file a lock-free writer makes after the last check is never taken as this write's
+    own. An unsigned write re-reads it and appends after it; a signed one refuses (the store moved; never two prompts)."""
+    tgt = bs.resolve_store(None)
+    path = bare_store / "items.jsonl"
+    real, raced = os.open, []
+
+    def racing(p, flags, *a, **k):
+        if Path(str(p)) == path and flags & os.O_EXCL and len(raced) < 1:
+            raced.append(1)
+            path.write_bytes(b"")                       # made in the window, empty: a writer about to append
+        return real(p, flags, *a, **k)
+    monkeypatch.setattr(bs.os, "open", racing)
+    assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]
+    assert raced and len(path.read_bytes().splitlines()) == 1
+    path.unlink()
+    raced.clear()
+    with pytest.raises(bs.BoardError, match="changed while you signed"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=rig.seal())
+    assert raced and path.read_bytes() == b""
