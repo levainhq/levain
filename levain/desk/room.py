@@ -126,6 +126,16 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS spec_card_taps_no_replace BEFORE INSERT ON spec_card_taps WHEN EXISTS (SELECT 1 FROM "
     "spec_card_taps WHERE proposal_id = NEW.proposal_id OR drop_id = NEW.drop_id OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'a spec card is tapped once'); END",
+    # H1-5 lane 2: a card that names SEVERAL threads. The spec_proposals row stays (its thread_id is the card's anchor, the
+    # first thread sorted, so the commit trigger and the replaced-card rule read it unchanged); this row beside it holds
+    # the whole set the card was made for. Append-only.
+    "CREATE TABLE IF NOT EXISTS mission_spec_proposals (proposal_id TEXT PRIMARY KEY REFERENCES spec_proposals(proposal_id), "
+    "threads_json TEXT NOT NULL CHECK (json_valid(threads_json) AND json_type(threads_json) = 'array'), "
+    "threads_sha256 TEXT NOT NULL)",
+    *_append_only("mission_spec_proposals", "a mission spec proposal"),
+    "CREATE TRIGGER IF NOT EXISTS mission_spec_proposals_no_replace BEFORE INSERT ON mission_spec_proposals WHEN EXISTS "
+    "(SELECT 1 FROM mission_spec_proposals WHERE proposal_id = NEW.proposal_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a mission spec proposal is never replaced'); END",
     # the tap is the proposal's commit: its drop is the drop the committed event names, and its thread is the card's
     "CREATE TRIGGER IF NOT EXISTS spec_card_taps_is_the_commit BEFORE INSERT ON spec_card_taps WHEN NOT EXISTS (SELECT 1 "
     "FROM proposal_events e JOIN spec_proposals s ON s.proposal_id = e.proposal_id WHERE e.proposal_id = NEW.proposal_id "
@@ -401,16 +411,39 @@ def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summ
     return _proposal(conn, proposal_id)
 
 
-def propose_spec(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], thread: str, spec_text: str,
-                 summary: str, *, now: str | None = None) -> Proposal:
+MISSION_THREADS_MAX = 12        # a mission card names at most this many threads: a list he reads one by one before he taps
+
+
+def propose_spec(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], thread: str | None, spec_text: str,
+                 summary: str, *, now: str | None = None, threads: Sequence[str] | None = None) -> Proposal:
     """An ENVELOPE card: a proposal (:func:`propose`, quoting his messages, ``about`` the thread) plus the room's spec
     text for ``thread``, an open work thread. Information only: no drop, no draft. The text is a prefill he reads and
-    edits; whether it parses is the caller's dry run (the door's), and a tap parses the bytes he posts."""
+    edits; whether it parses is the caller's dry run (the door's), and a tap parses the bytes he posts.
+
+    With ``threads`` (and no ``thread``) the card is a MISSION card: several distinct open work threads under one
+    signature. The card's anchor is the first of them sorted by id, the one thread ``spec_proposals`` names, and
+    ``mission_spec_proposals`` holds the whole set. Whether those threads can be drafted together (a shared drop, no
+    head, no draft of their own) is the caller's check, as the spec's parse is. The room never makes the mission: his
+    tap does."""
     ensure(conn)
-    _thread_id(conn, thread, "the card")
-    t = CoordStore._thread(conn, thread)
-    if t.kind != "work" or t.state != "open":
-        raise CoordError(f"an envelope card is for an open work thread; {thread} is a {t.state} {t.kind} thread")
+    if (thread is None) == (threads is None):
+        raise CoordError("an envelope card names one thread or a set of threads, not both and not neither")
+    if threads is not None:
+        if isinstance(threads, (str, bytes)) or not all(isinstance(t, str) for t in threads):
+            raise CoordError("threads is a list of thread ids")
+        names = sorted(set(threads))
+        if len(names) != len(threads):
+            raise CoordError("a mission card names each thread once")
+        if not 2 <= len(names) <= MISSION_THREADS_MAX:
+            raise CoordError(f"a mission card names 2 to {MISSION_THREADS_MAX} threads; one thread is a thread card")
+    else:
+        names = [str(thread)]
+    for name in names:
+        _thread_id(conn, name, "the card")
+        t = CoordStore._thread(conn, name)
+        if t.kind != "work" or t.state != "open":
+            raise CoordError(f"an envelope card is for an open work thread; {name} is a {t.state} {t.kind} thread")
+    thread = names[0]
     if not isinstance(spec_text, str) or not spec_text.strip() or len(spec_text) > WORDS_MAX:
         raise CoordError(f"a spec is 1 to {WORDS_MAX} characters of text")
     try:
@@ -421,9 +454,20 @@ def propose_spec(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str],
     try:
         conn.execute("INSERT INTO spec_proposals (proposal_id, thread_id, spec_text, spec_sha256) VALUES (?, ?, ?, ?)",
                      (p.proposal_id, thread, spec_text, words_sha256(spec_text)))
+        if threads is not None:
+            blob = json.dumps(names)
+            conn.execute("INSERT INTO mission_spec_proposals (proposal_id, threads_json, threads_sha256) VALUES (?, ?, ?)",
+                         (p.proposal_id, blob, words_sha256(blob)))
     except sqlite3.IntegrityError as exc:
         raise CoordError(str(exc)) from None
     return p
+
+
+def mission_threads(conn: sqlite3.Connection, proposal_id: str) -> tuple[str, ...] | None:
+    """The thread set of a MISSION card, sorted by id, or None for a thread card (or no such card)."""
+    ensure(conn)
+    row = conn.execute("SELECT threads_json FROM mission_spec_proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    return None if row is None else tuple(json.loads(row[0]))
 
 
 def spec_of(conn: sqlite3.Connection, proposal_id: str) -> SpecProposal | None:

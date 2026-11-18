@@ -298,11 +298,17 @@ def create_mission(store: CoordStore, thread_ids: Sequence[str], *, by: str = "o
     if not ids:
         raise CoordError("a mission names at least one thread")
     with store._write(by, token) as (conn, now):
-        _member_check(conn, ids, mission_id=None)
-        mission_id = "ms-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO missions (mission_id, created_at) VALUES (?, ?)", (mission_id, now))
-        _revise(conn, mission_id, ids, "create", by, now)
-        return _view(conn, mission_id)
+        return _create(conn, now, ids, by)
+
+
+def _create(conn: sqlite3.Connection, now: str, ids: Sequence[str], by: str) -> Mission:
+    """:func:`create_mission`'s writes on the caller's connection and inside the caller's write transaction, so another
+    writer (an envelope card's tap) can make a mission in the same transaction as its own rows."""
+    _member_check(conn, ids, mission_id=None)
+    mission_id = "ms-" + secrets.token_hex(16)
+    conn.execute("INSERT INTO missions (mission_id, created_at) VALUES (?, ?)", (mission_id, now))
+    _revise(conn, mission_id, ids, "create", by, now)
+    return _view(conn, mission_id)
 
 
 def attach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "operator", token: object = None) -> Mission:

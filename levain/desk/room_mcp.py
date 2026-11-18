@@ -144,7 +144,7 @@ NOTE_TOOL: dict[str, Any] = {
 
 
 _WORK_THREAD = re.compile(r"th-[0-9a-f]{32}")
-_ENVELOPE_ARGS = frozenset({"quote_ids", "thread", "spec", "summary"})
+_ENVELOPE_ARGS = frozenset({"quote_ids", "thread", "threads", "spec", "summary"})
 ENVELOPE_TOOL: dict[str, Any] = {
     "name": room_host.ENVELOPE_TOOL,
     "description": (
@@ -155,7 +155,10 @@ ENVELOPE_TOOL: dict[str, Any] = {
         "UNSIGNED draft on that thread, and sign it separately. This authorises nothing and signs nothing. The spec is an "
         "OBJECT (never text) with keys among where [{repo: ABSOLUTE_PATH, paths: [...]}], lands [{repo, onto}], pushes, "
         "publishes, budget {tool_calls, tokens, dollars_cents, hours} and stop (a duration such as \"2h\"): name only "
-        "what the operator said. A launch grant is never part of a draft. Name the repo and branch explicitly."),
+        "what the operator said. A launch grant is never part of a draft. Name the repo and branch explicitly. For ONE "
+        "envelope over SEVERAL work threads that hold a drop in common, pass threads (a list of 2 or more) INSTEAD of "
+        "thread: one tap then makes the mission and its draft, and one signature covers exactly those threads (each up to "
+        "the budget, so up to N times the budget together; a thread attached later is not covered). Never both."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -163,13 +166,15 @@ ENVELOPE_TOOL: dict[str, Any] = {
                           "description": "Ids (cm-...) of the operator's own messages in this room that ask for it, in order. "
                                          "Each of the operator's messages reaches you with its id in the <room-context> block ahead of it."},
             "thread": {"type": "string", "description": "The open work thread (th-...) this draft is for."},
+            "threads": {"type": "array", "minItems": 2, "items": {"type": "string"},
+                        "description": "Instead of thread: the open work threads (th-...) one mission envelope covers."},
             "spec": {"type": "object", "description": "The envelope spec you read from the operator's words: an object, not text.",
                      "properties": {"where": {"type": "array"}, "lands": {"type": "array"}, "pushes": {"type": "array"},
                                     "publishes": {"type": "array"}, "budget": {"type": "object"}, "stop": {"type": "string"}},
                      "additionalProperties": False},
             "summary": {"type": "string", "description": "Why this spec follows from the operator's words, in your own words."},
         },
-        "required": ["quote_ids", "thread", "spec", "summary"],
+        "required": ["quote_ids", "spec", "summary"],
         "additionalProperties": False,
     },
 }
@@ -254,8 +259,9 @@ def _relay_arguments(raw: Any) -> list[str]:
     return list(ids)
 
 
-def _envelope_arguments(raw: Any) -> tuple[list[str], str, dict[str, Any], str]:
-    """``(quote_ids, thread, spec, summary)``, shape-checked. The door takes no words and no launch grant: a ``launches``
+def _envelope_arguments(raw: Any) -> tuple[list[str], str | list[str], dict[str, Any], str]:
+    """``(quote_ids, thread, spec, summary)``, shape-checked; ``thread`` is a list of ids when the call named ``threads``
+    (a mission card), never both. The door takes no words and no launch grant: a ``launches``
     key (top level or in the spec) is refused by name, the spec is an OBJECT whose keys are the draft's, and whether it
     parses is the dry run's (:func:`_propose_envelope`), so a card is never made for a spec a tap could only refuse."""
     from levain.desk import envelope_drafts as drafts
@@ -264,13 +270,26 @@ def _envelope_arguments(raw: Any) -> tuple[list[str], str, dict[str, Any], str]:
     if isinstance(raw, dict) and "launches" in raw:
         raise _RpcError(INVALID_PARAMS, "a draft never carries a launch grant: launches is not an argument")
     raw = _reject_spoofs_and_extras(raw, _ENVELOPE_ARGS)
-    missing = [k for k in ("quote_ids", "thread", "spec", "summary") if k not in raw]
+    missing = [k for k in ("quote_ids", "spec", "summary") if k not in raw]
     if missing:
         raise _RpcError(INVALID_PARAMS, f"missing arguments: {', '.join(missing)}")
+    if ("thread" in raw) == ("threads" in raw):
+        raise _RpcError(INVALID_PARAMS, "name thread (one work thread) or threads (several for one mission), not both and not neither")
     ids = _relay_arguments({"quote_ids": raw["quote_ids"]})
-    thread = raw["thread"]
-    if not isinstance(thread, str) or _WORK_THREAD.fullmatch(thread) is None:
-        raise _RpcError(INVALID_PARAMS, "thread must be a work thread id (th- and 32 hex digits)")
+    thread: Any
+    if "threads" in raw:
+        thread = raw["threads"]
+        if not isinstance(thread, list) or not 2 <= len(thread) <= room.MISSION_THREADS_MAX:
+            raise _RpcError(INVALID_PARAMS, f"threads is a list of 2 to {room.MISSION_THREADS_MAX} work thread ids; "
+                                            "one thread is named by thread")
+        if not all(isinstance(t, str) and _WORK_THREAD.fullmatch(t) is not None for t in thread):
+            raise _RpcError(INVALID_PARAMS, "every thread must be a work thread id (th- and 32 hex digits)")
+        if len(set(thread)) != len(thread):
+            raise _RpcError(INVALID_PARAMS, "threads names each thread once")
+    else:
+        thread = raw["thread"]
+        if not isinstance(thread, str) or _WORK_THREAD.fullmatch(thread) is None:
+            raise _RpcError(INVALID_PARAMS, "thread must be a work thread id (th- and 32 hex digits)")
     spec = raw["spec"]
     if isinstance(spec, str):
         raise _RpcError(INVALID_PARAMS, "spec is an object, not text: this door takes no words of its own")
@@ -484,7 +503,7 @@ def _propose_envelope(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
     and literal unshowable characters, size), and only then a proposal and its spec row are written: no drop, no draft."""
     from levain.consent.queue import default_queue_dir
     from levain.desk import envelope_drafts as drafts
-    from levain.desk import lease, room
+    from levain.desk import lease, room, spec_card
     from levain.desk.envelopes import EnvelopeStore
     from levain.desk.store import WORDS_MAX, CoordError, Source, StoreAbsent
     from levain.dispatch.jobs import JobStoreError
@@ -509,11 +528,21 @@ def _propose_envelope(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
                 return _refused("this door's launch is not a room launch; only the room proposes")
             if ln.state != "active":
                 return _refused(f"the room launch is {ln.state}, not active")
-            proposal = room.propose_spec(conn, ln.launch_id, ids, thread, text, summary, now=now)
+            if isinstance(thread, list):
+                # a mission card: the set is checked as a tap would read it (under this lock, writing nothing), so a card
+                # is never made for threads that share no drop, hold a signed envelope, or hold a draft of their own
+                spec_card.check_mission_threads(store, conn, thread)
+                proposal = room.propose_spec(conn, ln.launch_id, ids, None, text, summary, now=now, threads=thread)
+            else:
+                proposal = room.propose_spec(conn, ln.launch_id, ids, thread, text, summary, now=now)
     except (CoordError, StoreAbsent) as exc:
         return _refused(str(exc))
     except (sqlite3.Error, JobStoreError, OSError) as exc:
         return _text(f"levain room: a machine fault, nothing was proposed ({type(exc).__name__}: {exc}); try again", True)
+    if isinstance(thread, list):
+        return _text(f"levain room: mission envelope card {proposal.proposal_id} made for {len(thread)} threads. A card is "
+                     "waiting for your tap; nothing is grouped or drafted until you tap, and nothing is signed until you "
+                     "sign it separately.", False)
     return _text(f"levain room: envelope card {proposal.proposal_id} made for {thread}. A card is waiting for your tap; "
                  "nothing is drafted until you tap, and nothing is signed until you sign it separately.", False)
 

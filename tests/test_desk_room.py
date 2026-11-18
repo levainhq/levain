@@ -291,8 +291,9 @@ def test_ensure_is_idempotent_and_adds_only_its_own_objects(store, qdir):
     after = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
     assert before < after and {"room_events", "drop_proposals", "proposal_events", "drop_notes", "spec_proposals",
                                "spec_card_taps"} <= after - before
-    # "spec": the envelope card's two tables (H1-4 shape A), the one prefix this module's objects gained
-    assert all(n.split("_")[0] in ("room", "drop", "proposal", "spec", "sqlite") for n in after - before
+    # "spec": the envelope card's two tables (H1-4 shape A); "mission": the table naming a mission card's thread set
+    # (H1-5 lane 2), the two prefixes this module's objects gained
+    assert all(n.split("_")[0] in ("room", "drop", "proposal", "spec", "mission", "sqlite") for n in after - before
                if not n.startswith("sqlite_"))
 
 

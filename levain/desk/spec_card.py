@@ -15,22 +15,30 @@ The tap is ONE write transaction, all of it or none of it:
   5. the link row (``spec_card_taps``): proposal, drop, the bytes' hash, draft and revision.
 
 A failure anywhere rolls back everything, so there is no half-written tap to retry and no second revision N+1. The
-proposal's ``proposal_events`` row and the link's UNIQUE keys make the tap exactly-once across two devices."""
+proposal's ``proposal_events`` row and the link's UNIQUE keys make the tap exactly-once across two devices.
+
+A MISSION card (H1-5 lane 2) names several threads. Its tap is the same one transaction with two more writes at the
+front: the mission is created from the card's thread set (his tap is what makes it; the room never does, and neither
+does the door), then the mission's draft series is opened over every child (:func:`drafts._write_mission_revision`, which
+reads the children under the lock and refuses what a mission envelope cannot cover), and only then the drop and the spec
+revision. The tap still signs nothing and writes no envelope."""
 from __future__ import annotations
 
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from levain.autonomic.durable_sqlite import read_transaction
+from levain.desk import envelope as env
 from levain.desk import envelope_drafts as drafts
+from levain.desk import missions as ms
 from levain.desk import room
 from levain.desk.envelopes import EnvelopeStore
 from levain.desk.store import (SURFACES, CoordError, CoordStore, DropConflict, Source, _check_words, _OUTBOX_ID,
                                words_sha256)
 
-__all__ = ["TapRefused", "Tapped", "leaves_grant_running", "preview", "standing", "tap"]
+__all__ = ["TapRefused", "Tapped", "check_mission_threads", "leaves_grant_running", "preview", "standing", "tap"]
 
 
 class TapRefused(CoordError):
@@ -53,6 +61,7 @@ class Tapped:
     revision: int
     created: bool
     thread_id: str
+    mission_id: str | None = None       # set for a mission card's tap: the mission this tap made (or, on a resend, made)
 
 
 def leaves_grant_running() -> bool:
@@ -78,15 +87,69 @@ def standing(conn: sqlite3.Connection, thread_id: str, now: str) -> dict[str, An
         return None
 
 
-def preview(store: EnvelopeStore, thread_id: str, words: str) -> dict[str, Any]:
+def check_mission_threads(store: EnvelopeStore, conn: sqlite3.Connection, thread_ids: Sequence[str]) -> None:
+    """Why ``thread_ids`` cannot be drafted together under one signature, as a :class:`CoordError` in plain words, or
+    nothing. Read-only, on the caller's connection: the door runs it under its write lock so a card is never made for a
+    set a tap could only refuse, and the tap's own writer (:func:`drafts._write_mission_revision`) holds the same
+    rules again under the tap's lock. Each thread must be an open work thread outside any mission, hold at least one
+    drop, hold no signed envelope yet, and have no draft series of its own open; and the threads must share a drop."""
+    ids = sorted(set(thread_ids))
+    if len(ids) != len(thread_ids) or len(ids) < 2:
+        raise CoordError("a mission names two or more different threads")
+    ms._member_check(conn, ids, mission_id=None)
+    threads = [store._must_thread(conn, t) for t in ids]
+    for t in threads:
+        if t.kind != "work" or t.state != "open":
+            raise CoordError(f"thread {t.thread_id} is {t.state}; a mission envelope covers open work threads")
+        head = store._head(conn, t.thread_id)
+        if head is not None:
+            raise CoordError(f"thread {t.thread_id} already has envelope {head.envelope_id}: a mission envelope "
+                             "covers threads that hold none yet")
+        if not t.members:
+            raise CoordError(f"thread {t.thread_id} holds no drops; nothing to bind")
+        own = drafts._unclosed(conn, t.thread_id)
+        if own is not None:
+            raise CoordError(f"thread {t.thread_id} already holds its own unclosed draft ({own.draft_id}), and one "
+                             "signature for a mission cannot be drafted beside it; sign or withdraw that draft first")
+    drafts._shared_drop(conn, threads)
+
+
+def _mission_lines(conn: sqlite3.Connection, store: EnvelopeStore, thread_ids: Sequence[str],
+                   fields: dict[str, Any]) -> list[dict[str, Any]]:
+    """What a mission card says in plain words beyond the spec's own lines: every child thread by title, that ONE
+    signature covers exactly these threads, the budget each may use and what they may use together, and that a thread
+    attached to the mission later is not covered. Pure over what it reads."""
+    titles = [f"{store._must_thread(conn, t).title} ({t})" for t in thread_ids]
+    n = len(titles)
+    lines = [{"field": "mission", "wider": False,
+              "text": f"one signature covers these {n} threads: " + "; ".join(titles)}]
+    budget = fields.get("budget")
+    if budget:
+        each = ", ".join(f"{k} {budget[k]}" for k in env.BUDGET_KEYS if k in budget)
+        total = ", ".join(f"{k} {budget[k] * n}" for k in env.BUDGET_KEYS if k in budget)
+        lines.append({"field": "budget_together", "wider": False,
+                      "text": f"each up to {each}, up to {n} x ({each}) together: {total}"})
+    lines.append({"field": "mission_later", "wider": False,
+                  "text": "a thread attached to this mission later is NOT covered: it needs a signature of its own"})
+    return lines
+
+
+def preview(store: EnvelopeStore, thread_id: str, words: str, *, threads: Sequence[str] | None = None) -> dict[str, Any]:
     """The plain-words reading of ``words`` as a tap would read them, for the card's thread: ``{"input_sha256", "lines",
     "signed_head"}``. The hash is the one :func:`tap` demands back. Writes nothing. Refused (CoordError) with the grammar's
-    own sentence, the same one a tap would refuse with."""
+    own sentence, the same one a tap would refuse with. For a MISSION card (``threads``, the card's whole set) the lines
+    are the spec's own then the mission's (:func:`_mission_lines`), and ``signed_head`` is False: a mission is drafted
+    only over threads that hold no envelope."""
     words = _check_words(words)
     fields, _named, stop_span = drafts.parse_spec(words, Source(), store)
     with read_transaction(store._connect) as conn:
-        base = standing(conn, thread_id, store._stamp())
-    return {"input_sha256": words_sha256(words), "lines": drafts.render_spec(fields, stop_span, base),
+        if threads is None:
+            base = standing(conn, thread_id, store._stamp())
+            extra: list[dict[str, Any]] = []
+        else:
+            base = None
+            extra = _mission_lines(conn, store, threads, fields)
+    return {"input_sha256": words_sha256(words), "lines": [*drafts.render_spec(fields, stop_span, base), *extra],
             "signed_head": base is not None}
 
 
@@ -108,6 +171,18 @@ def _stored(store: CoordStore, proposal_id: str) -> tuple[str, str, int, str] | 
     finally:
         conn.close()
     return None if row is None else (row[0], row[1], row[2], row[3])
+
+
+def _mission_of(store: CoordStore, draft_id: str) -> str | None:
+    """The mission a tapped draft's series was written for (its ``mission_drafts`` row), or None for a thread's draft."""
+    conn = store._connect()
+    try:
+        row = conn.execute("SELECT mission_id FROM mission_drafts WHERE draft_id = ?", (draft_id,)).fetchone()
+    except sqlite3.OperationalError:          # a store that never held a mission draft has no such table
+        return None
+    finally:
+        conn.close()
+    return None if row is None else row[0]
 
 
 def tap(store: EnvelopeStore, proposal_id: str, words: str, outbox_id: str, surface: str, *, thread_echo: str,
@@ -143,17 +218,28 @@ def tap(store: EnvelopeStore, proposal_id: str, words: str, outbox_id: str, surf
             raise TapRefused("replaced", f"proposal {proposal_id} was replaced by the newer card {newer}")
         if thread_echo != spec.thread_id:
             raise TapRefused("thread_mismatch", f"card {proposal_id} is for another thread than the one shown")
-        thread = store._must_thread(conn, spec.thread_id)
-        if thread.kind != "work" or thread.state != "open":
-            raise TapRefused("thread_closed", f"thread {spec.thread_id} is {thread.state}; nothing to draft for")
-        series = drafts._unclosed(conn, spec.thread_id)
-        if series is None:
-            series = drafts._write_revision(store, conn, now, thread_id=spec.thread_id, draft_id=None, fields={},
-                                            cites=[], parent=None, by="operator")
+        children = room.mission_threads(conn, proposal_id)
+        for name in (spec.thread_id,) if children is None else children:
+            thread = store._must_thread(conn, name)
+            if thread.kind != "work" or thread.state != "open":
+                raise TapRefused("thread_closed", f"thread {name} is {thread.state}; nothing to draft for")
+        if children is None:
+            series = drafts._unclosed(conn, spec.thread_id)
+            if series is None:
+                series = drafts._write_revision(store, conn, now, thread_id=spec.thread_id, draft_id=None, fields={},
+                                                cites=[], parent=None, by="operator")
+            write = lambda **kw: drafts._write_revision(store, conn, now, thread_id=spec.thread_id, **kw)   # noqa: E731
+        else:
+            # his tap makes the mission, here and nowhere else, inside this transaction: a fault anywhere below takes the
+            # mission row back with the rest. The series is opened over the children as the lock reads them now
+            box["mission_id"] = ms._create(conn, now, list(children), "operator").mission_id
+            series = drafts._write_mission_revision(store, conn, now, box["mission_id"], draft_id=None, fields={},
+                                                    cites=[], parent=None, by="operator")
+            write = lambda **kw: drafts._write_mission_revision(store, conn, now, box["mission_id"], **kw)  # noqa: E731
         made = room._commit_rows(conn, now, store, proposal_id, wake=False, **drop)
         cites = [{"field": k, "kind": "drop", "ref": made.drop_id, "digest": made.words_sha256} for k in named]
-        d = drafts._write_revision(store, conn, now, thread_id=spec.thread_id, draft_id=series.draft_id, fields=fields,
-                                   cites=cites, parent=series.digest, by="operator", carry=True, stop_span=stop_span)
+        d = write(draft_id=series.draft_id, fields=fields, cites=cites, parent=series.digest, by="operator",
+                  carry=True, stop_span=stop_span)
         store.note_in(conn, now, made.drop_id,
                       f"an envelope spec from room card {proposal_id}, drafted as {d.draft_id}#{d.revision}")
         _link(conn, now, proposal_id, spec.thread_id, made.words_sha256, made.drop_id, d.draft_id, d.revision)
@@ -164,10 +250,10 @@ def tap(store: EnvelopeStore, proposal_id: str, words: str, outbox_id: str, surf
     drop, created = CoordStore.accept_drop(store, words, surface=surface, outbox_id=outbox_id, _carry=carry)
     if created:
         d = box["draft"]
-        return Tapped(drop, d.draft_id, d.revision, True, d.thread_id)
+        return Tapped(drop, d.draft_id, d.revision, True, d.thread_id, box.get("mission_id"))
     stored = _stored(store, proposal_id)
     if stored is None or stored[0] != drop.drop_id:
         raise DropConflict(f"outbox_id {outbox_id} is the drop {drop.drop_id}, not this card's; nothing was written")
     if thread_echo != stored[3]:          # a resend is held to the thread check a first tap is (L3 r1 codex LOW)
         raise TapRefused("thread_mismatch", f"card {proposal_id} is for another thread than the one shown")
-    return Tapped(drop, stored[1], stored[2], False, stored[3])
+    return Tapped(drop, stored[1], stored[2], False, stored[3], _mission_of(store, stored[1]))

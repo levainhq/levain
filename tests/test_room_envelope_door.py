@@ -288,3 +288,51 @@ def test_a_spec_nested_too_deeply_is_a_named_refusal(w):
     reply = envelope(w, spec={"where": deep, "stop": "2h"})
     assert refused(reply) and "error" not in reply, reply
     assert counts(w) == before
+
+
+# --- H1-5 lane 2: a mission card (``threads`` instead of ``thread``) ---------------------------------------------------
+def _parts(w, n=2):
+    d = w["store"].accept_drop("land it in parts", surface="cli")[0]
+    return sorted(t.thread_id for t in w["store"].split(d.drop_id, [Part("work", f"part {i}") for i in range(n)]))
+
+
+def _mission_counts(w):
+    c = raw(w["qdir"])
+    try:
+        return {t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                for t in ("missions", "mission_spec_proposals", "spec_proposals", "drops", "envelope_drafts")}
+    finally:
+        c.close()
+
+
+def test_a_mission_card_is_a_proposal_a_spec_row_and_a_thread_set_and_no_mission(w):
+    ids = _parts(w, 3)
+    before = _mission_counts(w)
+    reply = call(w["launch"], {k: v for k, v in args(w).items() if k != "thread"} | {"threads": ids[::-1]},
+                 name="propose_envelope")
+    assert not refused(reply) and "nothing is grouped" in why(reply), why(reply)
+    after = _mission_counts(w)
+    assert {k: after[k] - before[k] for k in after} == {"missions": 0, "mission_spec_proposals": 1, "spec_proposals": 1,
+                                                        "drops": 0, "envelope_drafts": 0}
+    c = raw(w["qdir"])
+    try:
+        (anchor,) = c.execute("SELECT thread_id FROM spec_proposals").fetchone()
+        (blob,) = c.execute("SELECT threads_json FROM mission_spec_proposals").fetchone()
+    finally:
+        c.close()
+    assert anchor == ids[0] and json.loads(blob) == ids
+
+
+@pytest.mark.parametrize("make,said", [
+    (lambda w, ids: {"threads": [ids[0], w["work"]]}, "share no drop"),
+    (lambda w, ids: {"threads": ids, "launches": []}, "launch grant"),
+    (lambda w, ids: {"threads": ids, "thread": ids[0]}, "not both and not neither"),
+    (lambda w, ids: {"threads": ids[:1]}, "2 to"),
+])
+def test_a_mission_card_the_door_refuses_writes_nothing(w, make, said):
+    ids = _parts(w)
+    before = _mission_counts(w)
+    a = {k: v for k, v in args(w).items() if k != "thread"} | make(w, ids)
+    reply = call(w["launch"], a, name="propose_envelope")
+    assert refused(reply) and said in why(reply), why(reply)
+    assert _mission_counts(w) == before
