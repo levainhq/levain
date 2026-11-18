@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from levain.desk import board_author as ba
 from levain.desk import board_evidence as be
 from levain.desk import board_registry as br
 from levain.desk import board_store as bs
@@ -111,6 +112,7 @@ def register(subparsers: Any) -> None:
     p.add_argument("--since", default=be.BOARD_EPOCH, metavar="ISO",
                    help=f"Commits and branches older than this are out of the attribution scan (default {be.BOARD_EPOCH}).")
     p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
+    ba.add_resolver_args(p)
     p.set_defaults(func=run_state)
 
     def source_args(parser: Any) -> None:
@@ -714,6 +716,7 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     _attach_producers(evidence, native, external, failures)
     primary = Evidence.from_dict(evidence, now=now, store_id=store_id)
     repo_evidence: dict[str, Evidence] | None = None
+    read_paths: dict[str | None, Path] = {}
     also: list[dict[str, Any]] = []
     if cross:
         if empty_store:
@@ -722,9 +725,11 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             return _sfail(say, f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
         else:
             repo_evidence = {summary["repo"]: primary}
+            read_paths[summary["repo"]] = repo
         for given, other in reads[1:]:
             ev2, sum2 = read_git(other, repo_name=given, since=args.since)
             name = sum2["repo"]
+            read_paths[name] = Path(other).expanduser()
             if not name or name in repo_evidence:
                 return _sfail(say, f"--also-repo {other}: its repo name ({name!r}) is empty or already read; say it with NAME=PATH")
             ev2["documents"] = be.read_documents({i: it for i, it in folded.items.items() if it.repo == name}, other)
@@ -749,6 +754,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     doc = board.to_dict()
     if unreadable is not None:         # a source the board named unreadable: an audit ``unknown`` with no item id (stale_evidence is its own line)
         unreadable.extend(a.why for a in board.audit if a.kind == "unknown" and a.id is None and not a.why.startswith("stale_evidence:"))
+    # P4 (levain#103): who authored each git close; a verdict on every close, no close refused for it
+    ba.annotate(doc, folded.items, read_paths, ba.resolvers_from_args(args), default_repo=repo)
     # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read under the one hold)
     try:
         registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)
@@ -799,7 +806,8 @@ def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     items, audit = doc["items"], doc["audit"]
     lines = [f"board {doc['schema']} as of {doc['as_of'] or 'unknown'}: {len(items)} items, {len(audit)} audit entries"]
     for s in items:
-        lines.append(f"  {s['id']:<14} {s['state']:<18} {s['reason']}")
+        by = f" [{ba.describe(s['closed_by'])}]" if s.get("closed_by") else ""
+        lines.append(f"  {s['id']:<14} {s['state']:<18} {s['reason']}{by}")
     whole = doc.get("reader_scope") == "board"          # a filtered doc: say which lines are the whole board's
     for a in audit:
         tag = "(whole board) " if whole and a["id"] is None else ""

@@ -97,7 +97,9 @@ def test_a_clean_board_prints_the_contract_and_exits_zero(world, tmp_path, capsy
     assert doc["schema"] == "ready-v3" and doc["audit"] == [] and doc["problems"] == []
     assert states(doc) == {"levain#1": "done", "levain#2": "in_flight", "levain#3": "ready"}
     for s in doc["items"]:
-        assert set(s) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"}
+        # P4: a done item whose close is git's also carries `closed_by` ({tier, who, how, commit}); no other item does
+        assert set(s) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"} | (
+            {"closed_by"} if s["state"] == "done" else set())
         assert s["state"] in STATES and s["column"] in COLUMNS and s["reason"]
     assert doc["reader"]["repo"] == "levain" and doc["reader"]["main_ref"] == "origin/main"
     assert doc["reader"]["branches"] == 1 and doc["reader"]["main_records"] == 1
