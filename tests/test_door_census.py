@@ -3,6 +3,7 @@
 import argparse
 
 from levain.cli import build_parser, main
+from levain.install import DESK_BOARD_VERBS
 from levain.desk import door
 from levain.desk.legacy import JSON_ROLE_DESK, LEGACY_HOME_NAME
 
@@ -24,6 +25,8 @@ _EXPECTED = frozenset({
     ("thread", "add"), ("thread", "set"),
     ("team", "draft", "add"), ("team", "draft", "list"), ("team", "draft", "show"),
     ("team", "status"), ("team", "verify"), ("team", "export"), ("team", "doctor"),
+    # T10 fix 1: the tracking ceremony's board and charter verbs, each by name (the rest of those trees stays closed)
+    *(tuple(v.split()) for v in DESK_BOARD_VERBS),
 })
 
 
@@ -35,7 +38,7 @@ def test_every_verb_of_the_desks_trees_declares_its_door():
 
 def test_no_verb_outside_the_desks_trees_is_open():
     outside = sorted(" ".join(p) for p, mark in door.declared_leaves(build_parser()).items()
-                     if p[0] not in _TREES and mark is True)
+                     if p[0] not in _TREES and mark is True and " ".join(p) not in DESK_BOARD_VERBS)
     assert not outside, f"a verb of another tree is marked door_ok: {outside}"
 
 

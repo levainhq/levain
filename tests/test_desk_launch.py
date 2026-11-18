@@ -249,7 +249,7 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     commands = [c for c in re.findall(r"`([^`]+)`", "\n".join(given)) if "-m levain" in c or c.startswith("levain")]
     assert len(commands) >= 8 and "levain desk" not in "\n".join(given).replace(f"{lv} coord", "")
     for command in commands:
-        assert any(command.startswith(p + " ") for p in prefixes), command
+        assert any(command == p or command.startswith(p + " ") for p in prefixes), command
     # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says
     assert store.coord_claim(launch_id, ln.session_key) == store.coord_status()["lease"]["token"]
 
@@ -543,7 +543,8 @@ def test_the_desk_install_pre_approves_its_own_three_verbs_and_a_reused_install_
     bash = [r for r in allow(target) if r.startswith("Bash(")]
     lv = inst.desk_levain(sys.executable)
     assert lv == f"{shlex.quote(sys.executable)} -P -m levain"
-    assert bash == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
+    assert bash == [f"Bash({lv} {v}:*)" for v in (*inst.DESK_VERBS, *inst.DESK_BOARD_VERBS)]
+    assert bash[:3] == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
     # the brief reads the spelling back from the install itself (a launch from another interpreter tells the session
     # what THIS install allows), and an install from before the interpreter was named keeps its bare levain
     assert inst.installed_desk_levain(target, sys.executable) == lv

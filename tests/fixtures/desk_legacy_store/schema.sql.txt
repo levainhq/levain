@@ -94,6 +94,8 @@ table launch_events
 CREATE TABLE launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('pending', 'active', 'failed', 'expired', 'ended')), until TEXT, harness_session_id TEXT, argv_sha256 TEXT, pinned_envelope_id TEXT, cause TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (launch_id, seq));
 table launch_handoffs
 CREATE TABLE launch_handoffs (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, handoff TEXT, why TEXT, at TEXT NOT NULL, CHECK (handoff IS NOT NULL OR why IS NOT NULL));
+table launch_protocol
+CREATE TABLE launch_protocol (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, protocol TEXT NOT NULL CHECK (protocol IN ('tracked', 'legacy', 'ceremony')), migration TEXT, at TEXT NOT NULL);
 table launch_spawns
 CREATE TABLE launch_spawns (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, pid INTEGER NOT NULL, at TEXT NOT NULL);
 table launch_sweeps
@@ -372,6 +374,12 @@ trigger launch_handoffs_kept
 CREATE TRIGGER launch_handoffs_kept BEFORE DELETE ON launch_handoffs BEGIN SELECT RAISE(ABORT, 'a worker handoff is append-only'); END;
 trigger launch_handoffs_no_replace
 CREATE TRIGGER launch_handoffs_no_replace BEFORE INSERT ON launch_handoffs WHEN EXISTS (SELECT 1 FROM launch_handoffs WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a worker handoff is written once'); END;
+trigger launch_protocol_frozen
+CREATE TRIGGER launch_protocol_frozen BEFORE UPDATE ON launch_protocol BEGIN SELECT RAISE(ABORT, 'a launch protocol is append-only'); END;
+trigger launch_protocol_kept
+CREATE TRIGGER launch_protocol_kept BEFORE DELETE ON launch_protocol BEGIN SELECT RAISE(ABORT, 'a launch protocol is append-only'); END;
+trigger launch_protocol_no_replace
+CREATE TRIGGER launch_protocol_no_replace BEFORE INSERT ON launch_protocol WHEN EXISTS (SELECT 1 FROM launch_protocol WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a launch takes its close protocol once'); END;
 trigger launch_spawns_frozen
 CREATE TRIGGER launch_spawns_frozen BEFORE UPDATE ON launch_spawns BEGIN SELECT RAISE(ABORT, 'a launch spawn is append-only'); END;
 trigger launch_spawns_kept
