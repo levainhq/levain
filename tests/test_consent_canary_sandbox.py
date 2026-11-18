@@ -475,6 +475,8 @@ if mode == "deaf":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 tty.setraw(0)
 os.write(1, b"ready> ")
+if mode == "late":
+    time.sleep(1.5)     # a receiver that is not reading (a loaded CI box): what the driver wrote is waiting when it does
 while True:
     if mode == "spinner":
         os.write(1, b"\\r|")
@@ -485,7 +487,7 @@ while True:
 """
 
 
-def _drive(tmp_path, monkeypatch, mode, started=None, **timing):
+def _drive(tmp_path, monkeypatch, mode, started=None, session_s=4.0, **timing):
     script, log = tmp_path / "fake_tui.py", tmp_path / "typed.log"
     script.write_text(_FAKE_TUI)
     monkeypatch.setattr(canary, "_levain_argv", lambda *w: [sys.executable, "-I", str(script), mode, str(log)])
@@ -495,19 +497,52 @@ def _drive(tmp_path, monkeypatch, mode, started=None, **timing):
     repo = tmp_path / "repo"
     repo.mkdir()
     t0 = time.monotonic()
-    outcome = canary.real_session("claude", repo, "run the probe", "0123456789abcdef", 4.0,
+    outcome = canary.real_session("claude", repo, "run the probe", "0123456789abcdef", session_s,
                                   started or (lambda: calls.append(1)))
     rows = [ln.split(" ", 1) for ln in log.read_text().splitlines()] if log.exists() else []
     return outcome, calls, [(float(t), eval(d)) for t, d in rows], time.monotonic() - t0  # noqa: S307 - our repr
 
 
-def test_the_driver_types_through_a_spinner_by_the_deadline_and_sends_enter_apart(tmp_path, monkeypatch):
+def _driver_events(monkeypatch):
+    """What the DRIVER did, in order, as a list: its write of the instruction, its sleep of ENTER_GAP_S, its write of the Enter.
+    The real os.write and time.sleep still run; only these three calls are noted. The driver's own spacing is the guarantee
+    (time.sleep does not return early), so it is asserted as an order and an argument, never as a measured gap: a receiver
+    sees the two writes when IT reads, which a loaded box delays (0.057 s apart on CI py3.13, levain#114)."""
+    events: list = []
+    real_write, real_sleep = os.write, time.sleep
+
+    def write(fd, data):
+        if data in (b"run the probe", b"\r"):
+            events.append(("write", bytes(data)))
+        return real_write(fd, data)
+
+    def sleep(secs):
+        if secs == canary.ENTER_GAP_S and events and events[-1] == ("write", b"run the probe"):   # the one between the two writes
+            events.append(("sleep", secs))
+        return real_sleep(secs)
+    monkeypatch.setattr(os, "write", write)
+    monkeypatch.setattr(time, "sleep", sleep)
+    return events
+
+
+_ENTER_APART = [("write", b"run the probe"), ("sleep", canary.ENTER_GAP_S), ("write", b"\r")]
+
+
+@pytest.mark.parametrize("mode", ["spinner", "late"])
+def test_the_driver_types_through_a_spinner_by_the_deadline_and_sends_enter_apart(tmp_path, monkeypatch, mode):
     """complement MED 3 + MED 4: a screen that never goes quiet still gets the instruction by the hard deadline,
-    and the Enter is its own write after the text (HEAD 6d9029c6 never typed here, and sent text and CR together)."""
-    outcome, calls, chunks, _ = _drive(tmp_path, monkeypatch, "spinner")
+    and the Enter is its own write after the text, ENTER_GAP_S later (HEAD 6d9029c6 never typed here, and sent text and CR
+    together). The spacing is the driver's own: the receiver-side read times are not asserted, because a receiver that reads
+    late (``late``: it does not read for 1.5 s) gets both writes in ONE chunk whatever the driver did; the old assertion of a
+    0.2 s gap between two reads failed on a loaded CI box for that reason."""
+    events = _driver_events(monkeypatch)
+    outcome, calls, chunks, _ = _drive(tmp_path, monkeypatch, mode, session_s=6.0 if mode == "late" else 4.0)   # a late receiver gets slack for a slow start
     assert calls == [1] and outcome.problem is None
     assert b"".join(d for _, d in chunks) == b"run the probe\r"
-    assert chunks[-1][1] == b"\r" and chunks[-1][0] - chunks[-2][0] >= 0.2
+    assert events == _ENTER_APART, events
+    # the expected sleep is the driver's own constant, so the floor is pinned apart from it: a gap shrunk to nothing would
+    # otherwise match itself (the old test's 0.2 s was this floor)
+    assert canary.ENTER_GAP_S >= 0.2, canary.ENTER_GAP_S
 
 
 def test_the_driver_reports_never_typed(tmp_path, monkeypatch):
