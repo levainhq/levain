@@ -439,8 +439,9 @@ def test_a_store_that_moved_during_the_prompt_is_refused_without_a_second_prompt
             def signing(message):
                 out = sign(message)
                 if move == "append":                    # a lock-free writer appends while the prompt is up
-                    with open(path, "ab") as f:
-                        f.write(first)
+                    chained = bs.canonical_bytes(bs._with_prev(json.loads(first), bs.chain_prev(path.read_bytes()))) + b"\n"
+                    with open(path, "ab") as f:         # chained as written (P1b: an unchained copy reads as a torn line)
+                        f.write(chained)
                 else:                                   # the file is replaced (a git operation)
                     tmp = path.with_suffix(".tmp")
                     tmp.write_bytes(path.read_bytes())
