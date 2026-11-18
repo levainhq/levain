@@ -36,9 +36,10 @@ its transport (ssh exit 255, a timeout) is ERROR. The credential is removed on t
 threec10; an install whose result is uncertain is never replaced or removed by this script (the run says so).
 Not proven by the fake guest (the sitting is the first time): that the guest's ``levain dispatch`` verbs, the ticket-facts
 reader and the run-record reader as ``_levain_dispatch`` run as written below; that OpenRouter answers
-``data.usage`` (threec10's assumption too); that a verifier slot starts (R3's ``VerifierRuntime`` default refuses
-``verifier-start-unbuilt``, so W6/W7 cannot pass on a build without root-side verifier start: that is a product finding, not a
-harness one).
+``data.usage`` (threec10's assumption too); that a verifier slot starts (the runner's default
+verify runtime is ``HelperVerifierRuntime``, and the root side is the ordinary helper ``start`` verb, which runs
+``verifier_session`` for a verifier slot; W6/W7 have never run on a VM, being blocked only by W5, so a failure there is a
+product finding, not a harness one).
 """
 from __future__ import annotations
 
