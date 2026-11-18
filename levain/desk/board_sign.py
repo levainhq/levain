@@ -218,9 +218,9 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) ->
         from levain.desk import board_relay
         said = board_relay.verify_relayed(held, band)
         if not said.ok:
-            return f"the cited relayed abandon-track does not verify: {said.text} (re-run `abandon-track` with --source or --sign)"
+            return f"the cited relayed abandon-track does not verify: {said.text} (re-run `abandon-track` with --sign)"
     elif grade not in SIGNED_GRADES:
-        return f"cause names an abandon-track graded {grade!r}: it must be signed or relayed (re-run `abandon-track` with --sign or --source)"
+        return f"cause names an abandon-track graded {grade!r}: it must be signed or relayed (re-run `abandon-track` with --sign)"
     else:
         if snapshot is None:
             return "cause names a signed abandon-track and there is no authority log to verify it against"
