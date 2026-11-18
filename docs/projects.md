@@ -5,7 +5,7 @@ Levain knows each repo in one of two modes. Both are supported. The mode decides
 - **Untracked** is the default. The repo keeps its own state (its own files, issues or status page), and a seat reads those files.
 - **Tracked** moves the repo's state onto Levain's work board. The repo keeps one file that says what it is for, `CHARTER.md`, on its main branch.
 
-Every command here is a `levain board` or `levain charter` verb. `levain board <verb> --help` and `levain charter <verb> --help` print every flag.
+Every command here is a `levain board` or `levain charter` verb. `levain board <verb> --help` and `levain charter <verb> --help` print every flag. For `trail`, the flags are on `levain board trail export --help` and `levain board trail verify --help`.
 
 ## The two modes
 
@@ -51,7 +51,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
 2. **The desk reads X's existing memory, read-only.** That is `next.md` or `brief.md`, any project memory, status pages, TODO files, the README and the conventions files.
 
-3. **The desk drafts one review page.** It drafts the charter with `levain charter init X --stdout`, which prints the skeleton and writes nothing. The file reaches the repo only when step (c) lands it. The page holds the charter, the proposed items (a title, the operator's words verbatim where the old files carry them, a DONE line and a `done_kind` for each), what is not carried and why, which old files will be retired, and which conventions belong in the repo's conventions file rather than the charter.
+3. **The desk drafts one review page.** It drafts the charter with `levain charter init X --stdout`, which prints the skeleton and writes nothing. It does not look at a `CHARTER.md` already in the repo, so it works there too. The file reaches the repo only when step (c) lands it. The page holds the charter, the proposed items (a title, the operator's words verbatim where the old files carry them, a DONE line and a `done_kind` for each), what is not carried and why, which old files will be retired, and which conventions belong in the repo's conventions file rather than the charter.
 
 4. **The operator reads it and answers in conversation.** Edits go back to step 3.
 
@@ -63,7 +63,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
      levain board begin-track X --words "<a verbatim excerpt of the operator's answer>" --by <desk> --manifest <file.json> --source <q-id> [--owner <desk>] [--migration M]
      ```
 
-     The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old memory files to copy and stub, each as a `{repo, path}` object (a bare path string is refused: `a retire entry is exactly {repo, path}`), and `record_dir` (optional) names where the copies go. A complete manifest:
+     The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. Each of those repos gets a stubs item keyed `M:stubs:<repo>`, and `add` refuses that key while X is `tracking` ("add the ... item only after `levain board track`"), so the desk adds it after (d). `retire` (optional) names the old memory files to copy and stub, each as a `{repo, path}` object (a bare path string is refused: `a retire entry is exactly {repo, path}`), and `record_dir` (optional) names where the copies go. A complete manifest:
 
      ```json
      {
@@ -84,7 +84,24 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --repo <X's directory> --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --repo <X's directory> --ref origin/main --repo-name X --items <store>` reports `X's CHARTER.md (origin/main) is a valid charter.` once it is. The charter's title must name the registered repo X. Both verbs act on the git work tree they run in unless `--repo` names another (outside any work tree `init` exits 1 with `. is not inside a git work tree.`). When X is registered, a verb that would write or read a repository other than the registered one refuses with exit 2 and touches nothing: `levain charter init: alpha is registered at <registered path>, but this would write CHARTER.md in <here>. Pass --repo <registered path>.` (`check` says `... but this would read <here>. ...`). A worktree of the registered repository is the same repository and is fine. The guard stays open only when there is no store anywhere, or X is not registered. It also refuses with exit 2 when the registry, the store pointer or the registered checkout cannot be read, so it cannot tell. `check` is guarded only when `--repo-name` names X, and `check --file` and `init --stdout` are not guarded: neither touches the repo. A desk therefore no longer has to pass `--repo` to be safe from the wrong repository; the commands here keep it because the ceremony names X's directory. `check` takes the repo's name from the directory that holds the repository's `.git`, so when the directory is named otherwise (a clone called `clone-dir` for repo `alpha`) the title reads `names 'alpha', not this repository's name 'clone-dir'` until `--repo-name X` is passed. `check` only reports and exits 0 on the charter's content (the wrong-repository refusal above is the one exception); `track` is the gate. It runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --repo <X's directory> --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --repo <X's directory> --ref origin/main --repo-name X --items <store>` reports `X's CHARTER.md (origin/main) is a valid charter.` once it is. The charter's title must name the registered repo X.
+
+     **When X already has a `CHARTER.md`** (an untracked repo that kept the one this page recommends), `init` without `--stdout` refuses, exits 1 and writes nothing. A run on a scratch repo that held a `CHARTER.md`:
+
+     ```
+     $ levain charter init alpha --repo <alpha> --items <store>
+     levain charter init: <alpha>/CHARTER.md already exists; it is never overwritten.
+     $ levain charter init alpha --repo <alpha> --items <store> --stdout
+     ## Plan
+     - alpha#1
+     - alpha#2
+     ```
+
+     (abridged to the Plan; the first command exited 1 and the second 0.) The desk has two ways. It can edit the existing file into the charter's shape, with the Plan lines `--stdout --items` printed, and check it with `levain charter check --worktree --repo <X's directory> --repo-name X --items <store>` before it lands. Or it can move the old file aside (name it in `retire` if it is state to retire), run `init` and land the new file. A cut item is left out of the Plan that `init` prints.
+
+     Both verbs act on the git work tree they run in unless `--repo` names another (outside any work tree `init` exits 1 with `. is not inside a git work tree.`). When X is registered, `init`, and `check` with `--repo-name X`, refuse with exit 2 and touch nothing when they would write or read a repository other than the registered one: `levain charter init: alpha is registered at <registered path>, but this would write CHARTER.md in <here>. Pass --repo <registered path>.` (`check` says `... but this would read <here>. ...`). A worktree of the registered repository is the same repository and is fine. A clone is a different repository, so it is refused: `levain charter check --repo <clone> --ref HEAD --repo-name alpha` printed `levain charter check: alpha is registered at <alpha>, but this would read <clone>. Pass --repo <alpha>.` and exited 2. The guard stays open only when there is no store anywhere, or X is not registered. It also refuses with exit 2 when the registry, the store pointer or the registered checkout cannot be read, so it cannot tell. `check` is guarded only when `--repo-name` names X, and `check --file` is never guarded. `init --stdout` writes nothing and skips the wrong-repository guard; given `--repo`, it still needs that path to be a git work tree (`levain charter init alpha --stdout --repo <not a repo>` exited 1 with `... is not inside a git work tree.`). Without `--repo-name`, `check` takes the repo's name from the directory that holds the repository's `.git`, so when the directory is named otherwise (a clone called `clone-dir` for repo `alpha`) the title reads `names 'alpha', not this repository's name 'clone-dir'`. To check a clone's charter under X's name, check the registered checkout, or use `--file`.
+
+     `check` only reports and exits 0 on the charter's content (the wrong-repository refusal above is the one exception); `track` is the gate. `check --items <store>` also warns about X's own items that the Plan does not name and that are not cut, parked or out of 1.0 (`alpha#2 is in the store and in no plan group`). It does not warn about another repo's items, and the Plan must not name them (`alpha#1 belongs to another repo; list only alpha#<n> ids in the Plan`). A warning is not a reason to add an id to the Plan: `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut.
 
      To cut an item: `levain board decide --id X#<n> --decision cut --words "<a verbatim excerpt of the operator's answer>" --by <desk> --source <q-id>` (it prints `decided X#<n>`; `decide` is decision-class, so `--sign` is the other way to carry it). A cut item must also leave the landed Plan: `charter init --items` leaves a cut item out of a Plan it writes, but a Plan already landed is edited by hand and landed again before `track` will pass. A stalled landing only means the switch has not happened, and X stays locked.
 
@@ -96,11 +113,11 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      It refuses unless (b) and (c) hold. From here the board is the source, and the lock lifts. `add --key` does not check the key's `<k>` against the manifest; `track` does (see Known edges).
 
-   - **(e) Contract: the stubs.** There is no verb for this step; the desk does it by hand. It copies each file named in `retire` to `<record dir>/pre-track-<date>/` with a sha256 line (a file such as `SHA256` holding `<hash>  status.md`; the name is the desk's choice and nothing checks it), then replaces the file at its old path with a stub, commits and pushes. The stub's first line must be the marker `<!-- levain: tracked stub -->`; the rest is free text (the run used `This file is retired; state lives on the Levain board (levain board state).`). The one thing checked is that marker, in the file in the repo's working tree, not on origin/main. Until a stub is in place, `levain board repos` reports `stale: <path> still holds pre-track content`. No seat acts on the old content in that gap.
+   - **(e) Contract: the stubs.** There is no verb for this step; the desk does it by hand. It copies each file named in `retire` to `<record dir>/pre-track-<date>/` with a sha256 line (a file such as `SHA256` holding `<hash>  status.md`; the name is the desk's choice and nothing checks it), then replaces the file at its old path with a stub, commits and pushes. The stub's first line must be the marker `<!-- levain: tracked stub -->`; the rest is free text (the run used `This file is retired; state lives on the Levain board (levain board state).`). The one thing checked is that marker, in the file in the repo's working tree, not on origin/main. Until a stub is in place, `levain board repos` reports `stale: <path> still holds pre-track content`. A retired path that is deleted rather than stubbed is not reported as stale, so silence does not show that the stub landed. No seat acts on the old content in that gap.
 
 6. **The desk writes one decision episode** tagged `repo:X`, naming the charter, the item count and the record directory.
 
-**Aborting.** Before the switch only. `levain board abandon-track X --words "<a verbatim excerpt of the operator's answer>" --by <desk> --source <q-id>` makes X `aborting` and cuts its items. It is decision-class, so it carries `--source` or `--sign`. Run it again to finish the cuts. `levain board abandon-done X --by <desk>` returns X to untracked once every item is cut and any compensation, such as a reverted charter, has landed; it is not decision-class and takes no provenance. After the switch there is no abort. Leaving tracked mode is `levain board untrack X --words "<the operator's words>" --by <operator> --sign --author-kind operator`, which refuses while any item is not done, cut, parked or out of 1.0. `untrack` takes `--sign` only: it has no `--source`, so the desk cannot relay it. The operator runs it at the laptop.
+**Aborting.** Before the switch only. `levain board abandon-track X --words "<a verbatim excerpt of the operator's answer>" --by <desk> --source <q-id>` makes X `aborting` and cuts its items. It is decision-class, so it carries `--source` or `--sign`. Run it again to finish the cuts. The same `--source` is accepted on the retry: the repo is already `aborting`, so the row is read and nothing new is recorded, and each cut still owed is written. A run on a scratch store: the first call printed `aborting alpha; cut 2 items: alpha#1, alpha#2`, and the same call again printed `aborting alpha; nothing to cut` and `the abandon-track <sha> (relayed) stands; --source <q-id> read, not recorded`, exit 0. Different `--words` on a retry are not recorded either, and the line says so. A retry that is relayed or unsigned is refused when the abandon that stands cannot be the cause of the cuts still owed; the message then names the signed re-run (`--sign`) that fixes it. `levain board abandon-done X --by <desk>` returns X to untracked once every item is cut and any compensation, such as a reverted charter, has landed; it is not decision-class and takes no provenance. After the switch there is no abort. Leaving tracked mode is `levain board untrack X --words "<the operator's words>" --by <operator> --sign --author-kind operator`, which refuses while any item is not done, cut, parked or out of 1.0. `untrack` takes `--sign` only: it has no `--source`, so the desk cannot relay it. The operator runs it at the laptop.
 
 **The desk's own door.** A desk seat's brief opens the board verbs except `move`, `pause`, `resume` and `ack-torn`, and the charter verbs `init` and `check`. Those four board verbs run from a terminal.
 
@@ -116,9 +133,9 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
 `levain charter init NAME` writes `CHARTER.md` at the repository root, with the name and the Export filled in. Its Plan is prefilled with one line per item of that name not decided cut, parked or out of 1.0 when `--items` names a store; otherwise the Plan is a placeholder line. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced; `check` reports it and still exits 0. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
 
-`levain charter check` reads the charter, from origin/main by default. It only warns: it prints what a valid charter needs and exits 0 either way on the charter's content, so it is not a gate. It exits 2, and reads nothing, only in these cases: `--repo-name` names a repo registered at a different repository than `--repo` (a worktree of it is fine); a wrong repository, or a store, registry or registered checkout that cannot be read; or an unusable command line. `--file` is never guarded. With `--json` the refusal is still one JSON document with the same keys (`valid` false, `why` `refused: ...`), and the message is also on stderr.
+`levain charter check` reads the charter, from origin/main by default. It only warns: it prints what a valid charter needs and exits 0 either way on the charter's content, so it is not a gate. It exits 2, and reads nothing, when the wrong-repository guard runs and refuses, which for `check` means a `--repo-name` that names a registered repo: `--repo` is a different repository from the registered one (a worktree of it is fine, a clone is not); the registry, the store pointer or the registered checkout cannot be read; or `--items` names something that is not a store, or a second store (`levain charter check --help` lists each case). Without `--repo-name`, those `--items` faults do not make it exit 2. An unusable command line exits 2 too. `--file` is never guarded. With `--json` the refusal is still one JSON document with the same keys (`valid` false, `why` `refused: ...`), and the message is also on stderr.
 
-`init` exits 2, and writes nothing, in the same wrong-repository cases (a worktree of the registered repo is fine, and `--stdout` is not guarded) and on an unusable command line. The charter's own name and its item ids (`NAME#N`) are not scanned for a sha-shaped token or a date; prose still is.
+`init` exits 2, and writes nothing, in the same wrong-repository cases whenever it would write into a repository (a worktree of the registered repo is fine; `--stdout` is not guarded) and on an unusable command line. `init` exits 1 on a name outside the rule, on a path that is not a git work tree and on a `CHARTER.md` that already exists. The charter's own name and its item ids (`NAME#N`) are not scanned for a sha-shaped token or a date; prose still is.
 
 ## A seat on a tracked item
 
@@ -130,7 +147,7 @@ A worker launched for a tracked item is told to:
 - put `Board-Seat: <durable key>` on every closing commit;
 - write decisions and handoffs as episodes tagged `repo:NAME` and `item:NAME#N`.
 
-The desk's brief teaches these five rules. The close check a tracked seat must pass is `check_close` in `levain/desk/seat_close.py`; see Known edges.
+The desk's brief teaches these rules. The close check a tracked seat is meant to pass is `check_close` in `levain/desk/seat_close.py`; see Known edges.
 
 ## Signing and relaying: decision-class writes
 
@@ -177,7 +194,7 @@ A relayed write that does not hold is refused too, and nothing is written:
 
 ## Authorship and grades
 
-Every record in the store and the registry carries three fields:
+Every record the writer produces since the cutover to the chain carries three fields. A line from before it (the `legacy` row below) has no `prev` and is not the writer's own, so a missing `prev` there is not tampering:
 
 - `author`: `kind` (`operator` or `agent`) and `name`. The writer refuses a record without one. `--author-kind` defaults to `agent`, so an operator writing at a terminal says `--author-kind operator`. An agent's launch is named with `--launch-key`, which is refused for an operator.
 - `grade`: how strongly the record was signed. The writer sets it; a caller's record that carries a `grade` or a `sig` is refused.
@@ -212,7 +229,7 @@ When a stronger tier is not credited, `note` says why: a key the rule refuses, a
 
 - A `merged` close carried by a commit's own `Board-Closes` trailer is read from that commit: the one the board state names, which is the latest by committer date, ties by sha.
 - A close written as a note (`refs/notes/board`) is read from the commit on that ref that wrote the line, never from the commit it annotates: a note is not covered by the annotated commit's signature. When several note commits wrote the line, the latest addition counts. `commit` is then the note's commit and `close_commit` the annotated one. The note is read as it stands now.
-- A `document` or `run` close is the file existing, and nobody performs that. The verdict is the tier of the first-parent commit on main that first added the path (for a directory, the first that added a file under it), and the line begins `first added <path>`, so it never reads as the closer. Later edits are not read.
+- A `document` or `run` close is the file having been added to main, and nobody performs that. Its later removal does not undo it. The verdict is the tier of the first-parent commit on main that first added the path (for a directory, the first that added a file under it), and the line begins `first added <path>`, so it never reads as the closer. Later edits are not read.
 
 **Two rules for the document and run path, and for the email.**
 
@@ -263,7 +280,7 @@ The store (`items.jsonl`) and the registry (`repos.jsonl`) are two append-only f
 - the chain (`prev` on every line, the cutover over a legacy prefix, a torn line and its `ack-torn`);
 - every record through its file's own fold: a record the fold rejects is a break, whatever its chain and signature say;
 - every signature, against the authority log of the machine running `verify` (and that a signed record names this store);
-- the writer's policy: after the cutover, a decision-class record that is neither signed nor relayed, and a record graded `legacy`, are breaks;
+- the writer's policy: after the cutover, a decision-class record that is neither signed nor relayed, and a record graded `legacy` that appears after the cutover, are breaks (a `legacy` line before the cutover is not);
 - every relayed citation: both digests, the words verbatim in the answer, the row's own grade. For `begin-track` and `track` it also checks the manifest digest the ceremony recorded.
 
 **Verifying a store.** One verdict per record, then per file the anchor line, the tail line, the relayed line and the kept-head line. A run on a scratch store (items abridged):
@@ -287,7 +304,7 @@ repos.jsonl: 1 relayed record(s) rest on an answer no signature of a key you hol
 levain board trail verify: no breaks
 ```
 
-The words, as the code prints them:
+The sample's `items.jsonl:1 ... legacy` line is before the cutover, which is why `verify` still ends in `no breaks`. The words, as the code prints them:
 
 - `legacy`: a line from before the chain began. `asserted by NAME, unsigned`: a named author with no signature. `operator, signed with a ceremony`: the operator's signature verified against your authority log.
 - `agent NAME, relaying q-... (signed answer)` and `(unsigned answer)`: the desk relayed a band answer, and the answer's own signature does or does not bind the operator's words. A relayed record is never promoted past its answer.
@@ -377,7 +394,7 @@ Exit `0` there means nothing is broken, not that anything is anchored.
 - **`--source` takes native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) is refused: levain's relay reads this install's own q- ids, and an np- row belongs to flow's band and is not read here.
 - **The phone route is not on this page's ceremony.** The writer takes a phone signature (`signed-phone`), but this page's ceremony uses only `--sign` (Touch ID) and `--source`.
 - **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
-- **A tracked seat's close is checked by a function that Levain's own code does not call.** `check_close` in `levain/desk/seat_close.py` is a pure function over facts its caller reads; in this tree only tests call it.
+- **A tracked seat's close check is meant, not enforced.** `check_close` in `levain/desk/seat_close.py` is a pure function over facts its caller reads. It is the close check a seat is meant to pass; no Levain flow calls it, so a seat can close an item without the trailers and nothing refuses. Run `git grep check_close` to see its callers.
 - **Before a store's first registration, `add` takes items for any repo.** The registry is inactive until the store has a `repos.jsonl`, and the mode check starts with it.
 - **An aborted repo that holds cut items keeps one audit line.** After `abandon-done`, `board state` carries `unknown: -: X: the repo is untracked, not tracked: not read` for as long as the repo has cut items.
 - **`add --key` does not check the key against the manifest.** `board add --key M:k3` succeeds for a `k3` that is not in `plan_items` and gets an id; `track` is what refuses it, when the Plan and the manifest differ.

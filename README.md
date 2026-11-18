@@ -523,9 +523,9 @@ A consent request keeps its own kind and its own rung; the desk cannot raise it.
 
 ## Projects: tracked and untracked
 
-A repo in Levain is untracked or tracked. **Untracked** is the default: the repo keeps its own state in its own files, and a seat reads them. **Tracked** moves the repo's state onto Levain's work board, and its `CHARTER.md` becomes the one file that says what the repo is for. Both modes are supported. Tracking changes where the repo's state lives. It leaves the build and test commands alone, as long as the retire list does not name a conventions file.
+A repo in Levain is untracked or tracked. (`levain board repos` also shows `tracking` and `aborting`, the transitional states while a ceremony is open or being abandoned.) **Untracked** is the default: the repo keeps its own state in its own files, and a seat reads them. **Tracked** moves the repo's state onto Levain's work board, and its `CHARTER.md` becomes the one file that says what the repo is for. Both modes are supported. Tracking changes where the repo's state lives. It leaves the build and test commands alone, as long as the retire list does not name a conventions file.
 
-Moving a repo to tracked is a conversation with the desk, then a ceremony in a fixed order. Nothing that tracks the repo is written before you say yes. `levain board state` shows the derived state of the items, and `levain board repos` shows what is in play and what is wrong. The modes, the ceremony, the grades a record can carry and the known edges are in [docs/projects.md](docs/projects.md).
+Moving a repo to tracked is a conversation with the desk, then a ceremony in a fixed order. Nothing that tracks the repo is written before you say yes, apart from the registration that puts it in play and, on a fresh install, the store setup. `levain board state` shows the derived state of the items, and `levain board repos` shows what is in play and what is wrong. The modes, the ceremony, the grades a record can carry and the known edges are in [docs/projects.md](docs/projects.md).
 
 ## Keep it running (macOS and Linux)
 
