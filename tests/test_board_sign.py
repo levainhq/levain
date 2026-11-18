@@ -502,8 +502,11 @@ def items_last(target: bs.Target) -> str:
 def signed_abandon(target: bs.Target, signer: Rig, *, migration="M1", grade="signed-terminal", op="abandon-track",
                    sign=True, junk=False, repo="levain", last: str | None = "now") -> str:
     """An abandon-track line written raw into repos.jsonl (the verb is T2's), signed by ``signer``; returns its cause.
-    ``last`` is its ``items_last``: ``"now"`` (default) names the items file's last line as of this call; None omits it."""
-    rec = {"v": 1, "op": op, "repo": repo, "at": NOW, "prev": "0" * 64, "by": "phill", "migration": migration,
+    ``last`` is its ``items_last``: ``"now"`` (default) names the items file's last line as of this call; None omits it.
+    It names this store and chains onto the registry's bytes, as the writer's record does."""
+    reg = target.store_dir / "repos.jsonl"
+    rec = {"v": 1, "store": bs.read_store_id(target.store_dir), "op": op, "repo": repo, "at": NOW,
+           "prev": bs.chain_prev(reg.read_bytes() if reg.exists() else b""), "by": "phill", "migration": migration,
            "words": "abandon", "author": OPERATOR, "grade": grade}
     if last is not None:
         rec["items_last"] = items_last(target) if last == "now" else last
@@ -532,8 +535,7 @@ def test_a_cut_caused_by_a_valid_signed_abandon_of_the_items_migration_is_accept
         cut(target, item, cause, rig.source())
         rec = items(target)[-1]
         assert rec["grade"] == "asserted" and rec["cause"] == cause and rec["id"] == item
-    lines = [ln for name in ("items.jsonl", "repos.jsonl") for ln in (target.store_dir / name).read_bytes().split(b"\n") if ln]
-    assert sg.verify_cause(items(target)[-2], lines, rig.snapshot()) is None            # P6's entry point: both files' lines
+    assert sg.verify_cause(items(target)[-2], bs._store_lines(target), rig.snapshot()) is None     # P6's entry point: the store's lines
 
 
 def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
@@ -548,7 +550,7 @@ def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
         (item, signed_abandon(target, rig, migration="M2"), rig.source(), "is not keyed to it"),
         (other_m, good, rig.source(), "is not keyed to it"),
         (unkeyed, good, rig.source(), "is not keyed to it"),
-        (item, signed_abandon(target, rig, op="register"), rig.source(), "not an abandon-track"),
+        (item, signed_abandon(target, rig, op="pause"), rig.source(), "not an abandon-track"),
         (item, "f" * 64, rig.source(), "no abandon-track record"),
         (item, good, rig.source(revoked_seq=2), "revoked at seq 2"),
         (item, good, Rig(tmp_path / "s", label="s").source(), "not a key in the authority log"),
@@ -625,7 +627,7 @@ def test_a_cause_binds_the_abandons_repo_and_only_items_added_before_it_l2_m2(ta
     after = keyed_item(target, "M1:plan-2")                                     # added AFTER every abandon above
     reg.with_name("aside").rename(reg)
     for item, cause, why in ((before, elsewhere, "was added for 'levain'"), (before, no_last, "items_last"),
-                             (before, empty_then, "was added after"), (before, gone, "is not in the store"),
+                             (before, empty_then, "was added after"), (before, gone, "is not in the items file"),
                              (after, good, "was added after")):
         with pytest.raises(bs.BoardError, match="--sign") as exc:
             cut(target, item, cause, rig.source())
@@ -724,3 +726,237 @@ def test_an_append_between_the_two_post_seal_size_checks_is_refused_without_a_se
     with pytest.raises(bs.BoardError, match="the board changed while you signed: sign again"):
         bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
     assert state["appended"] and state["calls"] == 1
+
+
+# ------------------------------------------------------------------- P2 fix 2 (L3 round 1 on the restack; levain 29 rulings)
+
+
+def _raw_add(target: bs.Target, item_id: str, key: str) -> None:
+    """An add appended raw (a writer outside the lock, or one the registry's I1 check would refuse), chained as written."""
+    p = target.store_dir / "items.jsonl"
+    data = p.read_bytes() if p.exists() else b""
+    rec = bs.build_record("add", item_id, "phill", {"repo": "levain", "title": "t", "words": "", "origin": "o", "done": None,
+                                                    "done_kind": "merged", "tier": None, "depends_on": [], "key": key,
+                                                    "payload_hash": "0" * 64}, NOW, author=OPERATOR)
+    with open(p, "ab") as f:
+        f.write(bs.canonical_bytes(bs._with_prev(rec, bs.chain_prev(data))) + b"\n")
+
+
+def test_items_last_is_found_only_in_the_items_file_ruling_b(target, rig):
+    """deepseek 96 / gemini 163, reproduced on 77bd80ff8 (the cut was ACCEPTED): an abandon whose items_last names a
+    repos.jsonl line placed its anchor after every item line, so an item added after the abandon passed the order check."""
+    (target.store_dir / "repos.jsonl").write_bytes(b"")
+    first = signed_abandon(target, rig, last=sg.ITEMS_NONE, migration="M0")          # a registry line to point at
+    reg_line = (target.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
+    assert hashlib.sha256(reg_line).hexdigest() == first
+    cause = signed_abandon(target, rig, last=first)
+    _raw_add(target, "levain#1", "M1:late")                                         # added AFTER the abandon
+    with pytest.raises(bs.BoardError, match="is not in the items file"):
+        cut(target, "levain#1", cause, rig.source())
+    assert not any(r["op"] == "decide" for r in items(target))
+
+
+def test_a_cause_is_found_only_in_the_registry_ruling_b(target, rig):
+    """The cause names an items line (an add hashes like anything else): it is no abandon in the registry."""
+    item = keyed_item(target, "M1:plan-1")
+    line = (target.store_dir / "items.jsonl").read_bytes().split(b"\n")[0]
+    with pytest.raises(bs.BoardError, match=r"no abandon-track record in the store's registry \(repos.jsonl\)"):
+        cut(target, item, hashlib.sha256(line).hexdigest(), rig.source())
+
+
+def test_an_abandon_copied_from_another_store_is_refused_codex_high_52(home, tmp_path, rig, capsys):
+    """codex HIGH 52, reproduced on 77bd80ff8 (store B ACCEPTED a cut citing store A's abandon): two stores with
+    byte-identical item histories; A's signed abandon line appended to B's registry."""
+    assert main(["board", "use", str(tmp_path / "A")]) == 0
+    a = bs.resolve_store()
+    ia = keyed_item(a, "M1:x")
+    signed_abandon(a, rig)
+    line = (a.store_dir / "repos.jsonl").read_bytes().split(b"\n")[0]
+    assert main(["board", "use", str(tmp_path / "B")]) == 0
+    b = bs.resolve_store()
+    ib = keyed_item(b, "M1:x")
+    assert ia == ib and (a.store_dir / "items.jsonl").read_bytes() == (b.store_dir / "items.jsonl").read_bytes()
+    with open(b.store_dir / "repos.jsonl", "ab") as f:
+        f.write(line + b"\n")
+    with pytest.raises(bs.BoardError, match="an abandon-track of another store"):
+        cut(b, ib, hashlib.sha256(line).hexdigest(), rig.source())
+    assert not any(r["op"] == "decide" for r in items(b))
+
+
+def test_an_abandon_moved_off_its_signed_chain_position_is_refused_ruling_b(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    signed_abandon(target, rig, migration="M0")
+    cause = signed_abandon(target, rig)
+    reg = target.store_dir / "repos.jsonl"
+    first, second = reg.read_bytes().split(b"\n")[:2]
+    reg.write_bytes(second + b"\n" + first + b"\n")                  # the same signed bytes, swapped
+    with pytest.raises(bs.BoardError, match="does not stand where its signed prev places it"):
+        cut(target, item, cause, rig.source())
+    reg.write_bytes(first + b"\n" + second + b"\n")
+    cut(target, item, cause, rig.source())                           # in place again: it holds
+
+
+def test_a_cause_in_a_torn_registry_is_refused_ruling_b(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, rig)
+    with open(target.store_dir / "repos.jsonl", "ab") as f:
+        f.write(b"not json\n")
+    with pytest.raises(bs.BoardError, match="the registry is torn"):
+        cut(target, item, cause, rig.source())
+
+
+def test_a_signed_item_record_names_its_store_and_a_phone_decision_prepared_for_one_store_is_refused_in_another(home, tmp_path, capsys):
+    """codex HIGH 54, reproduced on 77bd80ff8 (an add prepared on empty store A COMMITTED on empty store B: the two empty
+    items files give the same prev). Now the signed bytes name the store and commit refuses another one."""
+    phone = phone_rig(tmp_path)
+    assert main(["board", "use", str(tmp_path / "A")]) == 0
+    a = bs.resolve_store()
+    assert main(["board", "use", str(tmp_path / "B")]) == 0
+    b = bs.resolve_store()
+    kw = dict(repo="levain", title="t", origin="o", by="phill", author=OPERATOR, now=NOW)
+    p = sg.prepare(a, "add", **kw)
+    sid_a = bs.read_store_id(a.store_dir)
+    assert p.store == sid_a and p.record["store"] == sid_a and f'"store":"{sid_a}"'.encode() in p.message
+    sig = phone.sign(p.message)
+    with pytest.raises(bs.BoardError, match="prepared for store"):
+        sg.commit_phone(b, p, sig, phone.source())
+    assert not (b.store_dir / "items.jsonl").exists() or items(b) == []
+    forged = sg.Prepared(p.verb, p.kwargs, p.record, p.message, p.prev, bs.read_store_id(b.store_dir))
+    with pytest.raises(bs.BoardError, match="not the one that was signed"):          # B rebuilds bytes naming B
+        sg.commit_phone(b, forged, sig, phone.source())
+    assert not (b.store_dir / "items.jsonl").exists() or items(b) == []
+    sg.commit_phone(a, p, sig, phone.source())                                       # its own store: written, valid
+    rec = items(a)[-1]
+    assert rec["store"] == sid_a and list(rec)[-2:] == ["store", "sig"]
+    assert sg.verify_record(rec, phone.snapshot()).state == "valid"
+
+
+def test_earn_refuses_a_signed_record_naming_another_store(target, rig):
+    item = add_item(target)
+    rec = bs._with_prev(bs.build_record("decide", item, "phill", {"decision": "cut", "words": "w", "date": "2026-11-17"},
+                                        NOW, author=OPERATOR), "0" * 64)
+    rec = {**rec, "grade": "signed-terminal", "store": "another"}
+    with pytest.raises(bs.BoardError, match="names store 'another'"):
+        sg.earn(target, rig.seal(), {**rec, "sig": {"sshsig": "x", "fingerprint": rig.fp, "via": "terminal"}})
+
+
+def test_an_idempotent_add_that_landed_during_the_phone_ceremony_is_not_a_successful_commit_codex_med_56(target, tmp_path):
+    """codex MED 56, reproduced on 77bd80ff8 (commit_phone with a junk signature RETURNED ('levain#1', False))."""
+    phone = phone_rig(tmp_path)
+    kw = dict(repo="levain", title="t", origin="o", by="phill", author=OPERATOR, now=NOW, key="k1", payload_hash="a" * 64)
+    p = sg.prepare(target, "add", **kw)
+    bs.add(target, **kw)                                              # another writer lands the same key and payload
+    for sig in ("not a signature", phone.sign(p.message)):
+        with pytest.raises(bs.BoardError, match="nothing was signed or written"):
+            sg.commit_phone(target, p, sig, phone.source())
+    assert [r["grade"] for r in items(target)] == ["asserted"]
+
+
+def test_prepare_refuses_a_caused_cut_without_an_authority_source_as_no_authority(target, rig):
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, rig)
+    with pytest.raises(bs.BoardError) as exc:
+        sg.prepare(target, "decide", item_id=item, decision="cut", words="w", by="phill", author=OPERATOR, cause=cause)
+    assert str(exc.value) == sg.NO_AUTHORITY
+    with pytest.raises(bs.BoardError, match="author kind must be operator"):           # gemini 783's other half: refused already
+        sg.prepare(target, "decide", item_id=item, decision="parked", words="w", by="seat-1", author=AGENT)
+
+
+def test_a_consent_hook_read_error_is_a_refusal_not_a_traceback_deepseek_110(monkeypatch, tmp_path):
+    import levain.consent.answering as answering
+
+    def broken(*a, **kw):
+        raise OSError("permission denied")
+    monkeypatch.setattr(answering, "hook_roots", broken)
+    with pytest.raises(bs.BoardError, match="could not be read: permission denied"):
+        sg.resolve_authority(queue_dir=tmp_path)
+
+    def bad_value(*a, **kw):
+        raise ValueError("malformed hook")
+    monkeypatch.setattr(answering, "hook_roots", bad_value)
+    with pytest.raises(bs.BoardError, match="malformed hook"):
+        sg.resolve_authority(queue_dir=tmp_path)
+
+
+def test_the_remote_check_is_made_at_the_prompt_not_before_complement_32(target, rig):
+    """complement 32: the remote verdict was taken in preflight, before the lock, and reused after any wait."""
+    item = add_item(target)
+    said = {"n": 0}
+
+    def remote():
+        said["n"] += 1
+        return None if said["n"] == 1 else "an ssh session attached"
+    seal = sg.terminal_seal(key_dir=rig.dir, signer_factory=lambda path, bound: ckeys.ssh_signer(path, namespace=sg.NAMESPACE, timeout=bound),
+                            remote=remote, in_agent_session=lambda: False, authority=rig.source())
+    seal.preflight()
+    remote()                                                          # the session changed after preflight
+    with pytest.raises(bs.BoardError, match="not signed"):
+        bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=seal)
+    assert not any(r["op"] == "decide" for r in items(target))
+
+
+def _slow_seal(rig: Rig, started, hold: float, **kw) -> sg.Seal:
+    import time
+
+    def factory(path, bound):
+        fp, sign = ckeys.ssh_signer(path, namespace=sg.NAMESPACE, timeout=bound)
+
+        def slow(message):
+            started.set()
+            time.sleep(hold)
+            return sign(message)
+        return fp, slow
+    return sg.terminal_seal(key_dir=rig.dir, signer_factory=factory, remote=lambda: None, in_agent_session=lambda: False,
+                            authority=kw.get("authority", rig.source()))
+
+
+def test_no_reader_or_writer_waits_on_a_signing_prompt_and_a_write_meanwhile_refuses_the_signed_one_gemini_649(target, rig):
+    """gemini 649 (ruling E), reproduced on 77bd80ff8: a reader waited the whole prompt (1.54 s of a 1.5 s signer). Now the
+    lock is released for the ceremony: the reader and an unsigned writer finish at once, and the signed write, finding the
+    store changed, is refused and never prompts twice."""
+    import threading
+    import time
+    item = add_item(target)
+    started, out = threading.Event(), {}
+
+    def signer():
+        try:
+            bs.decide(target, item, "cut", "no", "phill", author=OPERATOR, now=NOW, seal=_slow_seal(rig, started, 1.5))
+        except bs.BoardError as exc:
+            out["err"] = str(exc)
+    th = threading.Thread(target=signer)
+    th.start()
+    assert started.wait(30)
+    t0 = time.monotonic()
+    bs.read_item_lines(target)
+    read_s = time.monotonic() - t0
+    bs.amend(target, item, "why", "phill", {"title": "meanwhile"}, now=NOW, author=OPERATOR)
+    both_s = time.monotonic() - t0
+    th.join()
+    assert read_s < 1.0 and both_s < 1.0, (read_s, both_s)
+    assert "the board changed while you signed: sign again" in out["err"]
+    assert [r["op"] for r in items(target)] == ["add", "amend"]
+
+
+def test_a_registry_replaced_between_an_unsigned_cuts_check_and_its_write_is_re_read_codex_med_58(target, rig, monkeypatch):
+    """codex MED 58: the cut's cause was judged on repos.jsonl, which a lock-free process then replaced before the append;
+    the writer checked only the items file. Now both files' identity, size and mtime are re-checked before the write: the
+    round goes back to the read, and the cause is judged again on the registry as it now is."""
+    import os
+    item = keyed_item(target, "M1:plan-1")
+    cause = signed_abandon(target, rig)
+    reg = target.store_dir / "repos.jsonl"
+    real = sg.require_policy
+    state = {"n": 0}
+
+    def then_replace(*a, **kw):
+        real(*a, **kw)
+        state["n"] += 1
+        if state["n"] == 1:                                          # after the first (passing) check: the registry goes
+            tmp = reg.with_name("repos.new")
+            tmp.write_bytes(b"")
+            os.replace(tmp, reg)
+    monkeypatch.setattr(sg, "require_policy", then_replace)
+    with pytest.raises(bs.BoardError, match="no abandon-track record"):
+        cut(target, item, cause, rig.source())
+    assert state["n"] == 1 and not any(r["op"] == "decide" for r in items(target))
