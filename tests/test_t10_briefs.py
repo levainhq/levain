@@ -2,6 +2,7 @@
 predicate by protocol, and the desk brief's board section. Scratch stores and scratch git repos only; no real ``claude``."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -236,7 +237,7 @@ def _desk_workspace(tmp_path, monkeypatch):
     return ws
 
 
-FILL = {"NAME": "alpha", "NAME#N": "alpha#1", "M": "m1", "M:K": "m1:a", "DECISION": "parked", "SHA256": "a" * 64}
+FILL = {"NAME": "alpha", "NAME#N": "alpha#1", "M": "m1", "M:K": "m1:a", "DECISION": "parked", "SHA256": "a" * 64, "Q-ID": "q-" + "ab" * 12}
 
 
 def _printed_commands(lines, lv):
@@ -283,14 +284,49 @@ def test_every_board_and_charter_line_of_the_brief_parses_and_passes_the_door(ho
     assert seen == set(inst_.DESK_BOARD_VERBS)                 # the brief spells every opened verb, and only those
 
 
-def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(decision_seal, home, mkrepo, tmp_path, monkeypatch, capsys):  # noqa: F811
-    # the brief's own spellings, run in the desk's workspace: `board use DIR` (no --by) and every write `--by desk`
+def _answered_band(words, question="Track alpha?"):
+    """The install's own band (its default consent directory) with one question answered; returns its q-id."""
+    from levain.consent.questions import QuestionStore
+
+    qs = QuestionStore()
+    qs.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    q = qs.file(agent="claude_code", agent_session_id="s", what=question, options=(), rec="", blocks="b", cwd="/tmp",
+                open_ended=True)
+    qs.answer(q.id, text=words, channel="cli")
+    return q.id
+
+
+def _ceremony_line(parser_argv, qid):
+    """The brief's printed line for a verb (placeholders filled), with the printed ``Q-ID`` replaced by the real row's."""
+    return [qid if a == "Q-ID" else a for a in parser_argv]
+
+
+def _printed(verb, lv, **fill):
+    """The brief's one printed line for ``verb`` (a ``_board_forms`` key), as argv, placeholders filled from ``fill``."""
+    import shlex
+
+    return [fill.get(a, a) for a in shlex.split(cl._board_forms(lv)[verb].removeprefix(lv).strip())]
+
+
+def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(home, mkrepo, tmp_path, monkeypatch, capsys):  # noqa: F811
+    # the brief's own spellings, run in the desk's workspace: `board use DIR` (no --by), every write `--by desk`, and each
+    # decision line ending `--source Q-ID` with a REAL answered band row (P2's writer policy accepts it, relayed)
+    from levain import install as inst_
     from levain.cli import main
+    from levain.desk import board_registry as breg
     from tests.test_board_registry import CHARTER, land, manifest
+    from tests.test_board_sign import Rig
 
     _desk_workspace(tmp_path, monkeypatch)
+    lvc = inst_.desk_levain(sys.executable)
+    rig = Rig(tmp_path)
+    real_untrack = breg.untrack                                  # untrack takes no --source: his signed write; sealed here
+    his_signature = {"on": False}                                # off: the line as the desk would run it (no signature)
+    monkeypatch.setattr(breg, "untrack", lambda *a, seal=None, **kw: real_untrack(
+        *a, seal=seal or (rig.seal() if his_signature["on"] else None), **kw))
     a, b = mkrepo("alpha"), mkrepo("beta")
     store_dir = tmp_path / "store"
+    fill = {"NAME": "alpha", "DIR": str(a), "FILE": "", "M": "", "NAME#N": "", "DECISION": "parked"}
 
     def lv(*argv):
         rc = main(list(argv))
@@ -299,25 +335,58 @@ def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(decision_s
         assert rc == 0, (argv, err)
         return out.strip()
 
+    def printed(verb, **kw):
+        argv = _printed(verb, lvc, **{**fill, **kw})
+        assert argv[0] == "board" or argv[0] == "charter", argv
+        return argv
+
     lv("board", "use", str(store_dir))
     lv("board", "register", "alpha", "--path", str(a), "--words", "his words", "--by", "desk")
     lv("board", "repos")
     lv("charter", "init", "alpha", "--repo", str(a), "--stdout")
     man = manifest(tmp_path)
-    lv("board", "begin-track", "alpha", "--manifest", str(man), "--words", "his yes", "--by", "desk")
+    sha = hashlib.sha256(man.read_bytes()).hexdigest()
+    # the band row: the question carries the manifest's sha256 (the ceremony verbs check it), the answer holds his words
+    fill["Q-ID"] = _answered_band("yes, his yes: begin and track it; his words: abandon, park and untrack",
+                                  f"Track alpha? manifest sha256 {sha}")
+
+    def refused_without_a_source(verb, **kw):
+        """The same printed line with its ``--source Q-ID`` taken off (what the brief used to teach): the writer refuses it
+        and writes nothing."""
+        argv = printed(verb, **kw)
+        k = argv.index("--source") if "--source" in argv else None
+        argv = argv[:k] + argv[k + 2:] if k is not None else [x for x in argv if x != "--sign"]
+        before = {f.name: f.read_bytes() for f in store_dir.glob("*.jsonl")}
+        rc = main(argv)
+        err = capsys.readouterr().err
+        assert rc == 2 and "decision-class" in err and "--sign" in err, (verb, rc, err)
+        assert before == {f.name: f.read_bytes() for f in store_dir.glob("*.jsonl")}, verb
+
+    refused_without_a_source("board begin-track", FILE=str(man))
+    lv(*printed("board begin-track", FILE=str(man)))
     m = [json.loads(x) for x in (store_dir / "repos.jsonl").read_text().splitlines() if '"begin-track"' in x][-1]["migration"]
+    assert json.loads([x for x in (store_dir / "repos.jsonl").read_text().splitlines() if '"begin-track"' in x][-1])["grade"] == "relayed"
     iid = lv("board", "add", "--repo", "alpha", "--title", "t", "--origin", "desk 1", "--done", "it works",
              "--key", f"{m}:a", "--payload-hash", "a" * 64, "--by", "desk")
     land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {iid}"))
     lv("charter", "check", "--repo", str(a))
-    assert lv("board", "track", "alpha", "--migration", m, "--words", "his yes", "--by", "desk").startswith("tracked alpha")
+    refused_without_a_source("board track", M=m)
+    assert lv(*printed("board track", M=m)).startswith("tracked alpha")
     lv("board", "context", iid)
     lv("board", "amend", "--id", iid, "--why", "clearer", "--title", "t2", "--by", "desk")
-    lv("board", "decide", "--id", iid, "--decision", "parked", "--words", "his words", "--by", "desk")
-    assert lv("board", "untrack", "alpha", "--words", "his words", "--by", "desk") == "untracked alpha"
+    refused_without_a_source("board decide", **{"NAME#N": iid})
+    lv(*printed("board decide", **{"NAME#N": iid}))
+    refused_without_a_source("board untrack")                       # (its line carries --sign, which the helper drops)
+    his_signature["on"] = True
+    # a Touch ID prompt cannot run in a test: the printed line's `--sign` is dropped and the seam seals it, throwaway key
+    signed_line = [x for x in printed("board untrack") if x != "--sign"]
+    assert lv(*signed_line) == "untracked alpha"
+    his_signature["on"] = False     # his signed line (--author-kind operator --sign): a signed seal here
+    fill["NAME"] = "beta"
     lv("board", "register", "beta", "--path", str(b), "--words", "his words", "--by", "desk")
-    lv("board", "begin-track", "beta", "--manifest", str(man), "--words", "his yes", "--by", "desk")
-    lv("board", "abandon-track", "beta", "--words", "his words", "--by", "desk")
+    lv(*printed("board begin-track", FILE=str(man), NAME="beta"))
+    refused_without_a_source("board abandon-track", NAME="beta")
+    lv(*printed("board abandon-track", NAME="beta"))
     assert lv("board", "abandon-done", "beta", "--by", "desk") == "untracked beta"
     assert main(["board", "move", "beta", "--path", str(b), "--words", "w", "--by", "desk"]) == 1   # not named: still closed
     assert "is the operator's" in capsys.readouterr().err
