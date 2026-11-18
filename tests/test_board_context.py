@@ -591,6 +591,34 @@ def test_f4_4_rows_dropped_for_bad_metadata_do_not_claim_the_scan_bound():
     assert cut
 
 
+def test_f5_flow_bad_stamps_count_in_total_so_the_scan_bound_line_is_exact(tmp_path, monkeypatch):
+    now = datetime.datetime(2026, 11, 17, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+    def build(n_good, n_bad):
+        db = tmp_path / f"f{n_good}.db"
+        c = sqlite3.connect(db)
+        c.executescript(FLOW_SCHEMA)
+        for i in range(n_good):
+            flow_add(c, f"g{i}", f"2026-11-1{i % 5}T01:00:00Z", "observation", f"g{i}")
+        for i in range(n_bad):
+            flow_add(c, f"b{i}", f"2026-11-16T0{i}:00:00-garbage", "observation", f"b{i}")
+        flow_add(c, "far", "2099-01-01T00:00:00-garbage", "observation", "far future bad")     # outside the window
+        c.commit()
+        c.close()
+        return db
+    monkeypatch.setattr(bc, "MAX_SCAN", 2)
+    # 5 good rows, 2 scanned, 3 left unread; 6 bad rows must not mask that.
+    rows, total, bad = bc._read_flow(build(5, 6), now)
+    assert len(rows) == 2 and bad == 6 and total == 11
+    lines, cut = bc._select(rows, total, "alpha#1", "alpha", bad)
+    assert cut and any("scan bound" in ln for ln in lines)
+    # 2 good rows, all scanned: only bad rows remain, so no scan-bound claim.
+    rows, total, bad = bc._read_flow(build(2, 6), now)
+    assert len(rows) == 2 and bad == 6 and total == 8
+    lines, cut = bc._select(rows, total, "alpha#1", "alpha", bad)
+    assert not cut and not any("scan bound" in ln for ln in lines)
+
+
 def test_f4_5_an_artifact_form_needs_a_leading_boundary(tmp_path):
     rec = tmp_path / "rec"
     rec.mkdir()

@@ -405,7 +405,13 @@ def _read_flow(path: Path, now: datetime) -> tuple[list[_Ep], int, int]:
         lo, hi = _window(now), now.strftime(_STAMP)
         in_window = "timestamp >= ? AND julianday(timestamp) >= julianday(?) AND julianday(timestamp) <= julianday(?)"
         total = conn.execute(f"SELECT COUNT(*) FROM episodes WHERE {in_window}", (wide, lo, hi)).fetchone()[0]
-        bad = conn.execute("SELECT COUNT(*) FROM episodes WHERE timestamp >= ? AND julianday(timestamp) IS NULL", (wide,)).fetchone()[0]
+        # Unparseable stamps cannot be placed by instant, so the same string prefilter bounds them to the window (widened at
+        # both ends by the largest UTC offset). ``total`` INCLUDES them, as anneal's does, so ``_select``'s one formula
+        # (``total > len(rows) + unreadable``) is right for both sources.
+        wide_hi = (now + timedelta(hours=14)).strftime(_STAMP)
+        bad = conn.execute("SELECT COUNT(*) FROM episodes WHERE timestamp >= ? AND timestamp <= ? AND julianday(timestamp) IS NULL",
+                           (wide, wide_hi)).fetchone()[0]
+        total += bad
         got = conn.execute(f"SELECT id, timestamp, type, source, content FROM episodes WHERE {in_window}"
                            " ORDER BY julianday(timestamp) DESC LIMIT ?", (wide, lo, hi, MAX_SCAN)).fetchall()
         tags: dict[str, list[str]] = {}
