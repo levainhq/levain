@@ -220,6 +220,63 @@ def test_k4_a_track_record_with_a_malformed_adopted_is_torn(bare_store):
     assert rf.fold_repos(lines, store_id=sid).torn
 
 
+def _fold_track(manifest_extra, **track_extra):
+    """Fold a hand-written registry: register, begin-track (manifest = plan_items/contract_items + ``manifest_extra``), track."""
+    from levain.desk import repos_fold as rf
+    sid = "s"
+    base = {"v": 1, "store": sid, "at": "2026-11-18T10:00:00Z", "by": "d", "repo": "alpha", "words": ""}
+    man_ = {"plan_items": [], "contract_items": [], **manifest_extra}
+    lines = [json.dumps({**base, "op": "register", "path": "/p", "origin": "", "root": ["a"]}),
+             json.dumps({**base, "op": "begin-track", "migration": "m", "manifest": man_, "manifest_sha256": "a" * 64,
+                         "charter_before": "c"}),
+             json.dumps({**base, "op": "track", "migration": "m", "charter_blob": "b", "retire": [], **track_extra})]
+    return rf.fold_repos(lines, store_id=sid)
+
+
+def test_f1_a_track_record_without_adopted_is_a_problem_when_the_manifest_adopts():
+    f = _fold_track({"adopt_items": ["alpha#1", "alpha#2"]})
+    assert f.problems and "alpha#1" in " ".join(f.problems) and f.repos["alpha"].mode == "tracking"
+
+
+def test_f1_a_track_record_with_a_duplicate_adopted_is_refused():
+    f = _fold_track({"adopt_items": ["alpha#1", "alpha#2"]}, adopted=["alpha#1", "alpha#1"])
+    assert f.torn or f.problems
+    assert f.repos["alpha"].mode == "tracking"
+
+
+def test_f1_a_track_record_naming_an_id_the_manifest_never_adopted_is_a_problem():
+    f = _fold_track({"adopt_items": ["alpha#1"]}, adopted=["alpha#1", "beta#9"])
+    assert f.problems and "beta#9" in " ".join(f.problems) and f.repos["alpha"].mode == "tracking"
+
+
+def test_f1_a_strict_subset_of_the_manifest_adopt_items_folds_clean():
+    f = _fold_track({"adopt_items": ["alpha#1", "alpha#2"]}, adopted=["alpha#2"])
+    assert not f.problems and not f.torn and f.repos["alpha"].mode == "tracked"
+
+
+def test_f1_a_record_from_before_rev_8_folds_clean():
+    f = _fold_track({})
+    assert not f.problems and not f.torn and f.repos["alpha"].mode == "tracked"
+
+
+def test_f2_a_repeated_adopt_items_id_is_named():
+    from levain.desk import repos_fold as rf
+    why = rf.check_manifest({"plan_items": [], "contract_items": [], "adopt_items": ["alpha#99", "alpha#3", "alpha#99"]})
+    assert why and "distinct existing item ids (X#N)" in why and why.endswith("repeated alpha#99")
+
+
+def test_f3_next_step_reads_the_items_once(decision_seal, bare_store, tmp_path, mkrepo, capsys, monkeypatch):
+    from levain.desk import board_registry as br
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids[:1])
+    calls = []
+    real = br._items_facts
+    monkeypatch.setattr(br, "_items_facts", lambda *x, **k: (calls.append(1), real(*x, **k))[1])
+    out = run(capsys, "repos")[1]
+    assert "neither adopted nor keyed" in out and len(calls) == 1
+
+
 def test_k6_the_reporter_names_the_live_items_neither_adopted_nor_keyed(decision_seal, bare_store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
     ids = seeded(capsys, bare_store, ["alpha"], per=26)["alpha"]

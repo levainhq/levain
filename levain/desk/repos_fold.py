@@ -153,7 +153,13 @@ def _manifest(value: Any) -> dict:
         adopt = value["adopt_items"]
         if not isinstance(adopt, list) or len(set(map(str, adopt))) != len(adopt) \
                 or not all(isinstance(i, str) and _ITEM_ID_RE.fullmatch(i) for i in adopt):
-            raise _Bad("manifest adopt_items must be a list of distinct existing item ids (X#N)")
+            why = "manifest adopt_items must be a list of distinct existing item ids (X#N)"
+            if isinstance(adopt, list):
+                seen: set = set()
+                repeated = sorted({str(i) for i in adopt if str(i) in seen or seen.add(str(i))})
+                if repeated:
+                    why += ": repeated " + ", ".join(repeated)
+            raise _Bad(why)
     if "retire" in value:
         _retire(value["retire"])
     if "record_dir" in value and not (isinstance(value["record_dir"], str) and value["record_dir"]):
@@ -209,8 +215,9 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
         _str(rec, "migration")
         _str(rec, "charter_blob")
         _retire(rec.get("retire"))
-        if "adopted" in rec and not (isinstance(rec["adopted"], list) and all(isinstance(i, str) and _ITEM_ID_RE.fullmatch(i) for i in rec["adopted"])):
-            raise _Bad("adopted must be a list of item ids")
+        if "adopted" in rec and not (isinstance(rec["adopted"], list) and all(isinstance(i, str) and _ITEM_ID_RE.fullmatch(i) for i in rec["adopted"])
+                                     and len(set(rec["adopted"])) == len(rec["adopted"])):
+            raise _Bad("adopted must be a list of distinct item ids")
     elif op == "abandon-track":
         _str(rec, "migration")
     elif op == "abandon-done" and rec.get("migration") is not None:
@@ -258,6 +265,13 @@ def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
             return
         if cur.mode != "tracking" or cur.migration != rec["migration"]:
             raise _Soft(f"track {name}: the repo is {cur.mode} (migration {cur.migration}), not tracking {rec['migration']}")
+        want = (cur.manifest or {}).get("adopt_items") or []
+        if want:
+            if "adopted" not in rec:
+                raise _Soft(f"track {name}: the record carries no adopted list, but the manifest adopts {', '.join(want)}")
+            foreign = [i for i in rec["adopted"] if i not in want]
+            if foreign:
+                raise _Soft(f"track {name}: adopted {', '.join(foreign)}, which the manifest's adopt_items does not name")
         repos[name] = replace(cur, mode="tracked", since=at, words=rec["words"], track_at=at,
                               charter_blob=rec["charter_blob"], retire=_retire(rec["retire"]))
     elif op == "abandon-track":
