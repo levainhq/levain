@@ -1291,10 +1291,11 @@ class CoordStore:
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
                        model: str | None = None, cwd: str | None = None, role_ref: str | None = None,
                        attach_item: str | None = None) -> Any:
-        """Ask for a launch under ``token``. ``attach_item`` also records the launch as the worker on that ready item
-        (:func:`levain.desk.work_attach.attach_launch`), in this same transaction: an item this store does not
-        hold refuses the whole request and leaves no launch."""
-        from levain.desk import board_registry, lease, work_attach
+        """Ask for a launch under ``token``. ``attach_item`` is the v2 claim (T7): the board item id the launch is
+        started for is written on the launch record (``launch_board_items``, read as ``Launch.board_items``), in this
+        same transaction, so a malformed id refuses the whole request and leaves no launch. The v1 ready queue is
+        not read or written."""
+        from levain.desk import board_registry, lease
 
         # I5: once the board registry is active, a seat is never launched in a repo it does not list. A launch the lease will
         # refuse for its shape alone (a worker asking for several threads) registers nothing: the refusal below is side-effect free.
@@ -1310,7 +1311,8 @@ class CoordStore:
             ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
                                       cwd=cwd, role_ref=role_ref)
             if attach_item is not None:
-                work_attach.attach_launch(conn, now, token, ln.launch_id, attach_item)
+                lease.claim_board_items(conn, now, ln.launch_id, [attach_item])
+                ln = lease.launch(conn, ln.launch_id)       # the record as it now stands, claim included
             return ln
 
     def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:

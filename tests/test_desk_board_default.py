@@ -41,7 +41,6 @@ def test_take_status_ready_release_beat_reach_the_board_store_without_the_flag(h
     token = _json(capsys, "take")["token"]
     assert (board / "dispatch.db").exists() and not consent.exists()
     assert _json(capsys, "status")["lease"]["token"] == token
-    assert _json(capsys, "ready", "show")["store"] == str(board)
     _json(capsys, "beat", "--token", str(token))
     _json(capsys, "release", "--token", str(token), "--by", ROLE_DESK)
     assert not consent.exists()
@@ -121,7 +120,7 @@ def test_a_hint_names_the_store_a_bare_command_would_miss(homes, capsys):
     token = _json(capsys, "take", "--queue-dir", str(board))["token"]      # now the board's lease is the live one
     code, out, err = _run(capsys, "launch", "--queue-dir", str(consent))
     assert code == 1 and f"levain desk status --queue-dir {consent} says why" in err
-    code, out, err = _run(capsys, "import-status", str(board / "absent.md"), "--token", str(token + 1))
+    code, out, err = _run(capsys, "apply-reports", "--token", str(token + 1))
     assert code == 1 and f"levain desk status --queue-dir {board} shows the live one" in err
 
 

@@ -18,6 +18,7 @@ import pytest
 from anneal_memory.spores import IntentionStore
 
 from levain import band_view
+from tests import v1_seed
 from levain.cockpit import list_panel
 from levain.cockpit.install import REPORTED as INSTALL_CLASS
 from levain.cockpit.providers import build_default_cockpit
@@ -62,9 +63,9 @@ class Rig:
             st = CoordStore(self.qdir)
             tok = st.coord_take()
             kw = dict(repo="levain", who="desk", why="queued it.")
-            ready.add(st, tok, "levain:a", title="Land A", to="ready", tier="sonnet", done_line="green", **kw)
-            ready.add(st, tok, "levain:b", title="Land B", to="ready", tier="opus", done_line="green", **kw)
-            ready.add(st, tok, "levain:c", title="Later C", to="backlog", **kw)
+            v1_seed.add(st, tok, "levain:a", title="Land A", to="ready", tier="sonnet", done_line="green", **kw)
+            v1_seed.add(st, tok, "levain:b", title="Land B", to="ready", tier="opus", done_line="green", **kw)
+            v1_seed.add(st, tok, "levain:c", title="Later C", to="backlog", **kw)
         self.ck = build_default_cockpit(self.src, clock=lambda: NOW)
 
         def reader(_now: Any) -> Any:                      # the consent reader: only its directory is the List's business

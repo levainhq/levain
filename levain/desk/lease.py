@@ -182,8 +182,16 @@ LEASE_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS launch_handoffs (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
     "gseq INTEGER NOT NULL UNIQUE, handoff TEXT, why TEXT, at TEXT NOT NULL, "
     "CHECK (handoff IS NOT NULL OR why IS NOT NULL))",
+    # the v2 claim (T7, levain#101): the board item ids a launch was started for, one row per launch, written in the
+    # transaction that asks for it. The board's seats producer reads it as the launch's ``board_items``
+    "CREATE TABLE IF NOT EXISTS launch_board_items (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, items TEXT NOT NULL, at TEXT NOT NULL)",
     *_append_only("launch_threads", "a launch thread"),
     *_append_only("launch_sweeps", "a launch sweep"),
+    *_append_only("launch_board_items", "a launch board claim"),
+    "CREATE TRIGGER IF NOT EXISTS launch_board_items_no_replace BEFORE INSERT ON launch_board_items WHEN EXISTS (SELECT 1 "
+    "FROM launch_board_items WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a launch claims its board items once'); END",
     *_append_only("launch_handoffs", "a worker handoff"),
     "CREATE TRIGGER IF NOT EXISTS launch_handoffs_no_replace BEFORE INSERT ON launch_handoffs WHEN EXISTS (SELECT 1 "
     "FROM launch_handoffs WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
@@ -268,6 +276,7 @@ class Launch:
     pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
     user_scope: bool = False     # the user-layer choice it was asked under: the spawn reads this, never the setting
     role_ref: str | None = None  # a spawned worker's spawn record (:func:`spawn_record`); None for every other launch
+    board_items: tuple[str, ...] | None = None   # the board items it was started for (T7's claim); None: it claimed none
 
 
 @dataclass(frozen=True)
@@ -480,6 +489,25 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return column in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    """A store made before a table has none until a writer's opener creates it (a read-only open never does)."""
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
+
+
+def claim_board_items(conn: sqlite3.Connection, now: str, launch_id: str, items: Sequence[str]) -> None:
+    """Record, in the caller's transaction, the board items ``launch_id`` was started for (the v2 claim). Each is a
+    board item id (:data:`levain.desk.board_store.ID_RE`); whether the board holds it is the board's to say, never
+    this write's: a launch is claimed for an id and the board's reader judges the claim."""
+    from levain.desk import board_store
+
+    got = list(items)
+    if not got or len(set(got)) != len(got) or any(
+            not isinstance(i, str) or board_store.ID_RE.fullmatch(i) is None for i in got):
+        raise _refused("a launch's board items are distinct board item ids (NAME#N)")
+    conn.execute("INSERT INTO launch_board_items (launch_id, gseq, items, at) VALUES (?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), json.dumps(got), now))
+
+
 def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:
     """A store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF."""
     return _has_column(conn, table, "user_scope")
@@ -660,8 +688,12 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
                           "WHERE launch_id = ? ORDER BY seq", (r[0],)).fetchall()
     until = next((e[1] for e in events if e[0] == "pending"), None)
     hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
+    claimed = None
+    if _has_table(conn, "launch_board_items"):
+        got = conn.execute("SELECT items FROM launch_board_items WHERE launch_id = ?", (r[0],)).fetchone()
+        claimed = None if got is None else tuple(json.loads(got[0]))
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11])
+                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed)
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:

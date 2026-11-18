@@ -419,7 +419,6 @@ _REPLY_TEXT = ("CASE WHEN json_valid(body) AND json_type(body, '$.text') = 'text
 DETAIL_FIELDS: dict[str, tuple[str, str, str, str]] = {
     "drops": ("drop_id", "surface", "words", "NULL"),
     "replies": ("reply_id", "kind", _REPLY_TEXT, "ref_id"),
-    "ready_journal": ("id", "who", "COALESCE(from_status, 'new') || ' -> ' || to_status", "NULL"),
     "launch_events": ("launch_id", "NULL", "cause", "NULL"),
     "lease_events": ("'token ' || COALESCE(token, '-')", "holder", "cause", "NULL"),
 }
@@ -532,17 +531,28 @@ def _missing_close(conn: sqlite3.Connection, present: set[str], qdir: Path) -> l
 
 
 def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[str]:
-    if not ready._lifecycle_present(conn):
-        return ["Board: no lifecycle tables"]
-    out = ready.list_ready(store, all=True, generated=read_at, conn=conn)
-    items = out["items"]
-    lines = [f"Board: {len(items)} item(s)" if items else "Board: 0 items"]
+    """The one board block (T7, levain#101): ``levain board state``'s own read (:func:`levain.desk.board_cli.read_board`,
+    T3), never the v1 ready queue, which is retired and takes no more rows. A board that cannot be read raises, so the
+    brief's guard says ``Board: cannot-derive`` and never an empty board. Board changes are not in the ordered ``gseq``
+    stream the Since section reads (the board is a JSONL store, which no SQLite snapshot can join), so this block is the
+    open's one account of the board."""
+    from levain.desk import board_cli
+
+    code, doc, err = board_cli.read_board()
+    if doc is None:
+        raise CoordError(err or f"levain board state exited {code} with no board")
+    items = doc["items"]
+    audit = doc["audit"]
+    if not items and not audit:
+        return ["Board: 0 items"]
+    lines = [f"Board: {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
+             f"(levain board state, as of {doc.get('as_of') or 'unknown'})"]
     for it in items[:_LIST_LINES]:
-        lines.append(_cap(f"  {it['id']} [{it['status_category']}] {it['repo']}: {it['title']}"))
+        lines.append(_cap(f"  {it['id']} [{it['state']}] {it['reason']}"))
     if len(items) > _LIST_LINES:
         lines.append(f"  ... {len(items) - _LIST_LINES} more not listed")
-    if out["unreadable"]:
-        lines.append("  unreadable: " + _cap(", ".join(map(str, out["unreadable"])), 200))
+    for a in audit[:_LIST_LINES]:
+        lines.append(_cap(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}"))
     return lines
 
 

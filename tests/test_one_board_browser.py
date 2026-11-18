@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from levain.consent.questions import QuestionStore
+from tests import v1_seed
 from levain.desk import ready
 from levain.desk.store import CoordStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
@@ -35,14 +36,14 @@ def _seed(lh: Path) -> None:
     st = CoordStore(lh)
     tok = st.coord_take()
     kw = dict(repo="levain", who="desk", why="queued it.")
-    ready.add(st, tok, "levain:a", title="Land the board follow-up", to="ready", tier="sonnet", done_line="green", **kw)
-    ready.add(st, tok, "levain:b", title="Cut the release after A", to="ready", tier="sonnet", done_line="green",
+    v1_seed.add(st, tok, "levain:a", title="Land the board follow-up", to="ready", tier="sonnet", done_line="green", **kw)
+    v1_seed.add(st, tok, "levain:b", title="Cut the release after A", to="ready", tier="sonnet", done_line="green",
               depends_on=["levain:a"], **kw)
-    ready.add(st, tok, "levain:c", title="Review the outbox", to="ready", tier="sonnet", done_line="green", **kw)
-    ready.add(st, tok, "levain:d", title="Later D", to="backlog", tier="sonnet", done_line="green", **kw)
-    ready.add(st, tok, "levain:e", title="Shipped E", to="ready", tier="sonnet", done_line="green", **kw)
-    ready.move(st, tok, "levain:c", to="running", who="seat-9", why="the seat took it.")
-    ready.move(st, tok, "levain:e", to="done", who="seat-3", why="merged.")
+    v1_seed.add(st, tok, "levain:c", title="Review the outbox", to="ready", tier="sonnet", done_line="green", **kw)
+    v1_seed.add(st, tok, "levain:d", title="Later D", to="backlog", tier="sonnet", done_line="green", **kw)
+    v1_seed.add(st, tok, "levain:e", title="Shipped E", to="ready", tier="sonnet", done_line="green", **kw)
+    v1_seed.move(st, tok, "levain:c", to="running", who="seat-9", why="the seat took it.")
+    v1_seed.move(st, tok, "levain:e", to="done", who="seat-3", why="merged.")
     _file(QuestionStore(lh))
 
 

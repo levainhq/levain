@@ -11,7 +11,7 @@ import sqlite3
 import pytest
 
 from levain import band_view
-from levain.desk import ready, work_delta
+from levain.desk import lease, ready, work_delta
 from levain.desk.store import CoordStore
 from tests.test_desk_wake_silent import SID, WORK_HEAD, Rig, block_of
 from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
@@ -70,8 +70,9 @@ def _cursor_to_now(store) -> int:
 
 
 def _moves(store, token, n, start=0):
-    for i in range(start, start + n):
-        ready.add(store, token, f"levain:item{i}", repo="levain", title=f"Item {i}", who="desk", why="queued.", to="ready")
+    """``n`` records of news: a launch asked for each. (Board changes are no longer in the ordered stream, T7: the v1
+    ``ready_journal`` takes no more rows, and the board is a JSONL store no SQLite snapshot can join.)"""
+    return [store.launch_request(token, harness="claude", role=ROLE_DESK).launch_id for _ in range(n)]
 
 
 class _Busy(CoordStore):
@@ -85,23 +86,24 @@ def _read(store) -> work_delta.WorkBlock:
 
 def test_four_records_after_the_cursor_are_four_lines_in_gseq_order(store, token):
     _cursor_to_now(store)
-    _moves(store, token, 4)
+    ids = _moves(store, token, 4)
     b = _read(store)
     lines = b.text.splitlines()
     assert lines[0] == "since your last message (Levain's record, 4 of 4):"
-    assert [ln.strip().split(": ")[0] for ln in lines[1:]] == [f"levain:item{i}" for i in range(4)]
+    assert [ln.strip().split(" ")[2] for ln in lines[1:]] == [".." + i[-4:] for i in ids]
     assert len(lines) == 5 and "more" not in b.text
     assert b.through == _gmax(store)
 
 
 def test_seven_records_are_five_lines_plus_two_more_and_the_command(store, token):
     _cursor_to_now(store)
-    _moves(store, token, 7)
+    ids = _moves(store, token, 7)
     b = _read(store)
     lines = b.text.splitlines()
     assert lines[0] == "since your last message (Levain's record, 5 of 7):"
-    assert [ln.strip().split(": ")[0] for ln in lines[1:6]] == [f"levain:item{i}" for i in range(5)]
-    first_gseq = sqlite3.connect(store.path).execute("SELECT gseq FROM ready_journal WHERE id = 'levain:item4'").fetchone()[0]
+    assert [ln.strip().split(" ")[2] for ln in lines[1:6]] == [".." + i[-4:] for i in ids[:5]]
+    first_gseq = sqlite3.connect(store.path).execute(
+        "SELECT gseq FROM launch_events WHERE launch_id = ?", (ids[4],)).fetchone()[0]
     assert lines[6] == f"  +2 more: levain desk log --since {first_gseq}"
     assert len(lines) == 7
     assert b.through == _gmax(store)           # the cursor covers the +2: they are reachable by the command, not re-listed
@@ -210,9 +212,11 @@ def test_an_advance_into_another_store_writes_nothing(store, token, tmp_path):
 
 def test_the_text_of_a_record_is_one_bounded_line(store, token):
     _cursor_to_now(store)
-    ready.add(store, token, "levain:x", repo="levain", title="t", who="desk " + "w" * 150, why="queued.", to="ready")
-    line = _read(store).text.splitlines()[1]
-    assert len(line) < 140 and line.endswith("…)")
+    ln = store.launch_request(token, harness="claude", role=ROLE_DESK)
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, ln.launch_id, "failed", "c" * 150)
+    line = _read(store).text.splitlines()[-1]
+    assert len(line) < 140 and line.endswith("…")
     cleaned = work_delta._clean("a\n\x1b[31m  b\t" + "c" * 100, 20)
     assert "\n" not in cleaned and "\x1b" not in cleaned and len(cleaned) == 20
 
@@ -220,12 +224,11 @@ def test_the_text_of_a_record_is_one_bounded_line(store, token):
 def test_coord_log_lists_what_more_points_at(store, token, tmp_path, capsys):
     from levain.cli import main
 
-    _moves(store, token, 3)
+    ids = _moves(store, token, 3)
     qd = ["--queue-dir", str(store.directory)]
     assert main(["coord", "log", "--since", "0", *qd]) == 0
     out = capsys.readouterr().out
-    assert [ln.split("  ", 1)[1].split(": ")[0] for ln in out.splitlines() if "levain:item" in ln] == [
-        "levain:item0", "levain:item1", "levain:item2"]
+    assert [".." + i[-4:] for i in ids] == [ln.split(" ")[4] for ln in out.splitlines() if " launch .." in ln]
     assert main(["coord", "log", "--since", str(_gmax(store)), "--json", *qd]) == 0
     assert json.loads(capsys.readouterr().out) == {"records": [], "total": 0, "through": _gmax(store)}
 

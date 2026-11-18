@@ -24,7 +24,7 @@ class SeamClassError(Exception):
 
 #: whole tables the brief counts (``lease_events`` and ``launch_events`` by kind: :data:`KIND_CLASSES`)
 COUNTED: frozenset[str] = frozenset({
-    "drops", "threads", "thread_revisions", "thread_events", "replies", "ready_journal",
+    "drops", "threads", "thread_revisions", "thread_events", "replies",
     "envelopes", "envelope_binds", "envelope_attenuations", "coord_settings", "envelope_drafts", "envelope_draft_withdrawals",
     "lease_events", "launch_events",
     "review_items", "review_events", "first_reads", "team_drafts", "team_draft_events",
@@ -44,7 +44,7 @@ COUNTED: frozenset[str] = frozenset({
 #: bookkeeping the brief never reports (``lease_events`` kinds claim, beat, release and ``launch_events`` kinds pending,
 #: active are INFRASTRUCTURE too, by kind)
 INFRASTRUCTURE: frozenset[str] = frozenset({
-    "launches", "launch_spawns", "launch_threads", "launch_sweeps", "launch_handoffs",
+    "launches", "launch_spawns", "launch_threads", "launch_sweeps", "launch_handoffs", "launch_board_items",
     "review_marks", "know_deliveries", "held_pings", "held_ping_releases",
     "chat_events", "chat_outbox_events", "chat_cursors", "chat_echoes", "chat_launch_checks",
     "turn_lease_events", "chat_egress_events",
@@ -89,6 +89,9 @@ EXEMPT: dict[str, str] = {
     "operator_views": "its gseq column holds the viewer's read cursor, copied from an existing gseq, NOT allocated by "
                       "next_gseq (work_delta.py); never an allocator-fed table",
     "ready_items": "a DERIVED state row; ready_journal is the record",
+    "ready_journal": "the v1 ready queue is retired (T7, levain#101): it takes no more rows, and board changes are not in "
+                     "the ordered stream (the board is a JSONL store no SQLite snapshot can join); the open's one board "
+                     "block reads the board itself",
     "sqlite_sequence": "SQLite's own",
     "gseq_migration_bounds": "C15's own table (S0): the largest rowid each migrated table held when it was first "
                              "migrated; it records the migration, it is not a record of the work",

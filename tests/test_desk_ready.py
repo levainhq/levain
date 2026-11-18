@@ -1,5 +1,6 @@
-"""C13: the ready queue's pure reader against flow's shared conformance fixture, and the desk store's ONE writer
-of lifecycle state + its append-only transition journal (READY_SCHEMA v1). Synthetic item names; a scratch store."""
+"""C13: the ready queue's pure reader against flow's shared conformance fixture, and the reads of the desk store's lifecycle
+tables (READ-ONLY since T7, levain#101: the v1 queue is retired and its writer raises; rows are seeded by tests/v1_seed.py).
+Synthetic item names; a scratch store."""
 from __future__ import annotations
 
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.desk import ready, review
+from tests import v1_seed
 from levain.desk.lease import LeaseRefused
 from levain.desk.store import CoordError, CoordStore
 
@@ -169,7 +171,7 @@ def _add(store, token, id="levain:gate", **kw):
     kw.setdefault("title", "Land the gate")
     kw.setdefault("who", "desk")
     kw.setdefault("why", "the gate is the next thing to land.")
-    return ready.add(store, token, id, **kw)
+    return v1_seed.add(store, token, id, **kw)
 
 
 def test_add_move_correct_each_write_one_record(store, token):
@@ -177,10 +179,10 @@ def test_add_move_correct_each_write_one_record(store, token):
     assert (r1["source"], r1["from_category"], r1["to_category"], r1["applied_by"]) == ("add", None, "ready", None)
     assert set(r1) == set(ready._JOURNAL_FIELDS) and isinstance(r1["ts"], float)
     assert _counts(store) == (1, 1)
-    r2 = ready.move(store, token, "levain:gate", to="running", who="1028+15 levain-seat", why="the seat took it.")
+    r2 = v1_seed.move(store, token, "levain:gate", to="running", who="1028+15 levain-seat", why="the seat took it.")
     assert (r2["from_category"], r2["to_category"], r2["from_status"], r2["to_status"]) == \
         ("ready", "running", "ready", "running")
-    r3 = ready.correct(store, token, "levain:gate", to="ready", who="desk", why="the seat never started it.")
+    r3 = v1_seed.correct(store, token, "levain:gate", to="ready", who="desk", why="the seat never started it.")
     assert r3["source"] == "correction" and r3["from_category"] == "running"
     assert _counts(store) == (3, 3)
     recs = ready.journal(store)
@@ -201,7 +203,7 @@ def test_list_reads_the_store_and_filters_ready(store, token):
     assert [i["id"] for i in every] == ["levain:held", "levain:later", "levain:gate"]
     assert every[0]["held_reason"] == "depends on levain:gate"
     assert ready.list(store, all=True, repo="flow")["items"] == []
-    ready.move(store, token, "levain:gate", to="done", who="desk", why="landed on main.")
+    v1_seed.move(store, token, "levain:gate", to="done", who="desk", why="landed on main.")
     assert [i["id"] for i in ready.list(store)["items"]] == ["levain:held"]
     assert ready.list is ready.list_ready
 
@@ -230,7 +232,7 @@ def test_reads_need_no_desk_and_no_lock(store, token):
         blocker.execute("ROLLBACK")
         blocker.close()
     with pytest.raises(LeaseRefused):                    # but a write does need one
-        ready.move(store, token, "levain:gate", to="running", who="desk", why="go.")
+        v1_seed.move(store, token, "levain:gate", to="running", who="desk", why="go.")
 
 
 def test_list_with_no_store_is_empty_and_unreadable_store_is_named(tmp_path):
@@ -243,40 +245,6 @@ def test_list_with_no_store_is_empty_and_unreadable_store_is_named(tmp_path):
     assert out["items"] == [] and out["unreadable"] == ["desk"]
 
 
-@pytest.mark.parametrize("why", ["", "   ", None, "two\nlines"])
-def test_empty_or_multiline_why_is_refused(store, token, why):
-    with pytest.raises(CoordError, match="why"):
-        _add(store, token, why=why)
-    assert _counts(store) == (0, 0)
-
-
-def test_empty_who_is_refused(store, token):
-    with pytest.raises(CoordError, match="who"):
-        _add(store, token, who=" ")
-
-
-def test_no_desk_identity_is_refused(store, token):
-    with pytest.raises(CoordError, match="desk's identity"):
-        _add(store, None)
-    with pytest.raises(CoordError, match="lease token"):
-        _add(store, "1")
-    with pytest.raises(LeaseRefused):                    # a token that is not the live lease's: the fence refuses
-        _add(store, token + 1000)
-    assert _counts(store) == (0, 0)
-
-
-@pytest.mark.parametrize("who", ["1028+15 levain-seat", "desk", "phill"])
-def test_move_into_needs_you_is_refused_for_every_actor(store, token, who):
-    _add(store, token, to="ready")
-    with pytest.raises(CoordError, match="projection of the band"):
-        ready.move(store, token, "levain:gate", to="needs-you", who=who, why="blocked on the operator.")
-    with pytest.raises(CoordError, match="projection of the band"):
-        ready.correct(store, token, "levain:gate", to="needs-you", who=who, why="blocked on the operator.")
-    with pytest.raises(CoordError, match="projection of the band"):
-        _add(store, token, "levain:other", to="needs-you", who=who)
-    assert _counts(store) == (1, 1)
-
-
 def test_needs_you_is_refused_by_the_table_too(store, token):
     _add(store, token, to="ready")
     c = _raw(store)
@@ -285,50 +253,6 @@ def test_needs_you_is_refused_by_the_table_too(store, token):
                   "from_category, to_category, who, why, source, applied_by, lease_token) VALUES ('levain:gate', 2, "
                   "99999, 0, 'i', 'a', 'levain', 'ready', 'needs-you', 'ready', 'needs-you', 'x', 'y', 'move', NULL, 1)")
     c.close()
-
-
-@pytest.mark.parametrize("to", ["frozen", "Ready", "", None])
-def test_unknown_category_is_refused(store, token, to):
-    with pytest.raises(CoordError, match="unknown category"):
-        _add(store, token, to=to)
-
-
-@pytest.mark.parametrize("bad", ["seat:1028+15", "ci:levain-02da", "np-aaaa1111", "", "has space", "x" * 201])
-def test_projection_and_malformed_ids_are_never_writable(store, token, bad):
-    with pytest.raises(CoordError):
-        _add(store, token, bad)
-
-
-def test_add_refuses_an_existing_id_and_move_refuses_a_missing_one(store, token):
-    _add(store, token)
-    with pytest.raises(CoordError, match="already exists"):
-        _add(store, token)
-    with pytest.raises(CoordError, match="add it first"):
-        ready.move(store, token, "levain:nope", to="ready", who="desk", why="go.")
-    assert _counts(store) == (1, 1)
-
-
-def test_a_write_that_changes_nothing_is_refused(store, token):
-    _add(store, token, to="ready")
-    with pytest.raises(CoordError, match="nothing to write"):
-        ready.move(store, token, "levain:gate", to="ready", who="desk", why="again.")
-    r = ready.move(store, token, "levain:gate", to="ready", who="desk", why="bump it up.", rank=0)
-    assert r["from_category"] == r["to_category"] == "ready"
-
-
-def test_field_checks(store, token):
-    with pytest.raises(CoordError, match="tier"):
-        _add(store, token, tier="gpt")
-    with pytest.raises(CoordError, match="itself"):
-        _add(store, token, depends_on=["levain:gate"])
-    with pytest.raises(CoordError, match="list"):
-        _add(store, token, depends_on="levain:x")
-    with pytest.raises(CoordError, match="repo"):
-        _add(store, token, repo="")
-    with pytest.raises(CoordError, match="rank"):
-        _add(store, token, rank=-1)
-    with pytest.raises(CoordError, match="title"):
-        _add(store, token, title="")
 
 
 def test_default_rank_is_next_in_repo(store, token):
@@ -343,35 +267,21 @@ def test_default_rank_is_next_in_repo(store, token):
 def test_replay_reproduces_declared_category(store, token):
     _add(store, token, "levain:a", to="ready")
     _add(store, token, "levain:b")
-    ready.move(store, token, "levain:a", to="running", who="seat", why="took it.")
-    ready.move(store, token, "levain:b", to="ready", who="desk", why="cleared.")
-    ready.correct(store, token, "levain:a", to="waiting", who="desk", why="it is in CI, not running.")
+    v1_seed.move(store, token, "levain:a", to="running", who="seat", why="took it.")
+    v1_seed.move(store, token, "levain:b", to="ready", who="desk", why="cleared.")
+    v1_seed.correct(store, token, "levain:a", to="waiting", who="desk", why="it is in CI, not running.")
     declared = {i["id"]: i["declared_category"] for i in ready.list(store, all=True)["items"]}
     assert ready.replay(ready.journal(store)) == declared == {"levain:a": "waiting", "levain:b": "ready"}
 
 
 # ------------------------------------------------------------------------------------------------ adversarial
-def test_failing_second_insert_rolls_back_the_journal_record(store, token, monkeypatch):
-    _add(store, token, to="ready")
-
-    def boom(*a, **kw):
-        raise sqlite3.OperationalError("disk gone between statements")
-
-    monkeypatch.setattr(ready, "_insert_state", boom)
-    with pytest.raises(sqlite3.OperationalError):
-        ready.move(store, token, "levain:gate", to="running", who="desk", why="go.")
-    assert _counts(store) == (1, 1)
-    monkeypatch.undo()
-    assert ready.move(store, token, "levain:gate", to="running", who="desk", why="go.")["from_category"] == "ready"
-
-
 def test_failing_state_insert_at_the_database_rolls_back_too(store, token):
     _add(store, token, to="ready")
     c = _raw(store)
     c.execute("CREATE TRIGGER t_fail BEFORE INSERT ON ready_items BEGIN SELECT RAISE(ABORT, 'boom'); END")
     c.commit()
     with pytest.raises(sqlite3.IntegrityError, match="boom"):
-        ready.move(store, token, "levain:gate", to="running", who="desk", why="go.")
+        v1_seed.move(store, token, "levain:gate", to="running", who="desk", why="go.")
     assert _counts(store) == (1, 1)
     c.execute("DROP TRIGGER t_fail")
     c.commit()
@@ -388,18 +298,8 @@ def journal_then_die(*a, **kw):
     real(*a, **kw)
     os._exit(9)          # killed between the journal insert and the state insert, mid-transaction
 ready._insert_journal = journal_then_die
-ready.move(CoordStore(sys.argv[2]), int(sys.argv[3]), "levain:gate", to="running", who="desk", why="go.")
+v1_seed.move(CoordStore(sys.argv[2]), int(sys.argv[3]), "levain:gate", to="running", who="desk", why="go.")
 """
-
-
-def test_a_killed_writer_leaves_neither_row(store, token):
-    _add(store, token, to="ready")
-    cp = subprocess.run([sys.executable, "-c", _CHILD, str(REPO), str(store.directory), str(token)],
-                        capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": str(REPO)})
-    assert cp.returncode == 9, cp.stderr
-    assert _counts(store) == (1, 1)
-    assert ready.replay(ready.journal(store)) == {"levain:gate": "ready"}
-    assert ready.move(store, token, "levain:gate", to="running", who="desk", why="go.")["from_category"] == "ready"
 
 
 def test_a_state_row_without_its_journal_record_is_refused_by_the_table(store, token):
@@ -448,9 +348,9 @@ def test_two_concurrent_writers_serialize(store, token):
         s = CoordStore(store.directory)          # its own store object, its own connections
         try:
             for i in range(n):
-                ready.add(s, token, f"levain:{prefix}-{i}", repo="levain", title=f"{prefix} {i}", who=prefix,
+                v1_seed.add(s, token, f"levain:{prefix}-{i}", repo="levain", title=f"{prefix} {i}", who=prefix,
                           why="parallel add.", to="ready")
-                ready.move(s, token, f"levain:{prefix}-{i}", to="running", who=prefix, why="parallel move.")
+                v1_seed.move(s, token, f"levain:{prefix}-{i}", to="running", who=prefix, why="parallel move.")
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -477,7 +377,7 @@ def test_two_writers_racing_one_item_both_journal_in_order(store, token):
     def mover(to: str) -> None:
         barrier.wait()
         try:
-            results.append(ready.move(CoordStore(store.directory), token, "levain:gate", to=to, who=to,
+            results.append(v1_seed.move(CoordStore(store.directory), token, "levain:gate", to=to, who=to,
                                       why="racing."))
         except BaseException as exc:  # noqa: BLE001 - a thread that died (a busy timeout) is named below
             results.append(exc)
@@ -620,22 +520,6 @@ def _journal_only_v2(store):
     c.close()
 
 
-def test_a_journal_ahead_of_state_is_named_and_every_move_fails_loud(store, token):
-    _add(store, token, to="ready")
-    _add(store, token, "levain:fine", title="Fine", to="ready")
-    _journal_only_v2(store)
-    out = ready.list(CoordStore(store.directory), all=True)
-    assert out["unreadable"] == ["desk:levain:gate (journal v2, state v1)"]
-    assert {i["id"] for i in out["items"]} == {"levain:gate", "levain:fine"}         # shown at its state, and named
-    for verb in (ready.move, ready.correct):
-        with pytest.raises(ready.JournalAhead, match=r"levain:gate: its journal is at version 2 but its state is at "
-                                                     r"version 1") as e:
-            verb(store, token, "levain:gate", to="done", who="desk", why="landed.")
-        assert (e.value.item_id, e.value.journal_ver, e.value.state_ver) == ("levain:gate", 2, 1)
-    assert _counts(store) == (3, 2)                                              # nothing written, nothing healed
-    ready.move(store, token, "levain:fine", to="running", who="desk", why="another item still moves.")
-
-
 def test_a_state_row_with_a_wrong_shaped_depends_on_is_unreadable(store, token):
     _add(store, token, to="ready", tier="sonnet", done_line="green")
     c = _raw(store)
@@ -649,35 +533,6 @@ def test_a_state_row_with_a_wrong_shaped_depends_on_is_unreadable(store, token):
     c.close()
     out = ready.list(CoordStore(store.directory))
     assert out["items"] == [] and out["unreadable"] == ["desk"]          # never "independently ready"
-
-
-def test_a_projection_dependency_and_a_cycle_are_refused(store, token):
-    with pytest.raises(CoordError, match="projection id"):
-        _add(store, token, depends_on=["seat:1028+15"])
-    _add(store, token, "levain:a", title="A", depends_on=["levain:b"])
-    _add(store, token, "levain:b", title="B", depends_on=["levain:c"])
-    with pytest.raises(CoordError, match="cycle"):
-        _add(store, token, "levain:c", title="C", depends_on=["levain:a"])
-    _add(store, token, "levain:c", title="C")
-    with pytest.raises(CoordError, match="cycle"):
-        ready.move(store, token, "levain:c", to="backlog", who="desk", why="hold it.", depends_on=["levain:a"])
-    ready.move(store, token, "levain:c", to="backlog", who="desk", why="hold it.", depends_on=["levain:x"])
-    assert _counts(store) == (4, 4)
-
-
-@pytest.mark.parametrize("bad", ["a\x0bb", "a\x0cb", "a\x1cb", "a\x85b", "a b", "a\x1b[31mb", "a\tb"])
-def test_a_line_with_a_break_or_a_control_character_is_refused(store, token, bad):
-    for field in ("why", "who", "title", "done_line"):
-        with pytest.raises(CoordError, match=field):
-            _add(store, token, **{field: bad})
-    assert _counts(store) == (0, 0)
-
-
-def test_a_title_is_written_no_longer_than_it_is_read(store, token):
-    with pytest.raises(CoordError, match="title"):
-        _add(store, token, title="t" * 121)
-    _add(store, token, title="t" * 120, to="ready")
-    assert ready.list(store)["items"][0]["title"] == "t" * 120
 
 
 def test_a_caller_unreadable_string_is_one_entry(store):
