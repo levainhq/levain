@@ -5,6 +5,7 @@ re-derived from a file pytest wrote, not from a hand-typed one.  Nothing here to
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -451,7 +452,7 @@ def test_terminate_children_kills_the_whole_group(tmp_path):
 
 
 def test_the_leader_exit_is_seen_without_os_waitid_and_without_reaping(monkeypatch):
-    """macOS has no os.waitid: the exit is read from a kqueue watch, and the leader stays an unreaped zombie."""
+    """Without os.waitid (absent on some macOS builds, e.g. 3.12): the exit is read from a kqueue watch, and the leader stays an unreaped zombie."""
     import select
     if getattr(select, "kqueue", None) is None:
         pytest.skip("kqueue is the BSD/macOS path")
@@ -472,6 +473,58 @@ def test_the_leader_exit_is_seen_without_os_waitid_and_without_reaping(monkeypat
         if p.returncode is None:
             p.kill()
             p.wait()
+
+
+def test_the_runs_tmpdir_is_short_enough_for_a_unix_socket(tmp_path):
+    """Derivation: macOS sun_path is 104 bytes, 103 usable.  The longest socket a test puts under TMPDIR is
+    <mkdtemp lvh+8>/run/<12 hex>/agent.sock = 1+11+4+13+11 = 40 bytes, so TMPDIR must stay under 103 - 40 = 63."""
+    run = tmp_path / ("deep" * 20) / "runs" / "abcdef123456"
+    (run / "tmp").mkdir(parents=True)
+    d = verify.make_short_tmp(run)
+    try:
+        assert len(verify.clean_env(run)["TMPDIR"]) < 63
+        assert verify.clean_env(run)["TMPDIR"] == str(d)
+    finally:
+        assert verify.remove_short_tmp(d)
+    assert not d.exists()
+
+
+def test_a_kqueue_error_other_than_esrch_raises_never_reads_as_exited(monkeypatch):
+    import select
+    if getattr(select, "kqueue", None) is None:
+        pytest.skip("kqueue is the BSD/macOS path")
+    monkeypatch.delattr(os, "waitid", raising=False)
+
+    class Boom:
+        def control(self, *a):
+            raise OSError(errno.EMFILE, "too many open files")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(select, "kqueue", lambda: Boom())
+    with pytest.raises(OSError) as ei:
+        verify._exited_kqueue(os.getpid())
+    assert ei.value.errno == errno.EMFILE
+    p = types.SimpleNamespace(returncode=None, pid=os.getpid())
+    with pytest.raises(OSError):
+        verify._leader_exited(p)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the kqueue branch is the macOS path")
+def test_the_kqueue_branch_sees_a_real_zombie_child_without_reaping(monkeypatch):
+    monkeypatch.delattr(os, "waitid", raising=False)      # force the kqueue branch whatever the interpreter has
+    p = subprocess.Popen(["true"])
+    try:
+        for _ in range(100):
+            if verify._leader_exited(p):
+                break
+            time.sleep(0.05)
+        assert verify._leader_exited(p) is True           # already a zombie: the registration answers ESRCH
+        assert p.returncode is None
+        assert os.waitpid(p.pid, os.WNOHANG)[0] == p.pid
+    finally:
+        p.poll()
 
 
 def test_a_leg_that_raises_keeps_its_traceback_in_status_and_stderr(repo, tmp_path, monkeypatch, capsys):

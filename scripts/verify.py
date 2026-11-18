@@ -429,9 +429,11 @@ def write_receipt(receipt: dict, receipts_dir: Path, path: Path | None = None) -
 
 def clean_env(run: Path) -> dict:
     """env -i plus only PATH, LANG, the wait scale, CI=1 (as on the cloud runner) and a private HOME / TMPDIR.  Nothing of
-    the operator's ANTHROPIC_*, OPENAI_*, LEVAIN_* passes through."""
+    the operator's ANTHROPIC_*, OPENAI_*, LEVAIN_* passes through.  TMPDIR is the run's short dir under SHORT_TMP_ROOT
+    once make_short_tmp has made it (a test's unix socket under tempfile.gettempdir() must fit sun_path); run/tmp before."""
+    short = recorded_short_tmp(run)
     return {"PATH": CLEAN_PATH, "LANG": "en_US.UTF-8", "LEVAIN_TEST_WAIT_SCALE": WAIT_SCALE, "CI": "1",
-            "HOME": str(run / "home"), "TMPDIR": str(run / "tmp")}
+            "HOME": str(run / "home"), "TMPDIR": str(short if short is not None else run / "tmp")}
 
 
 _CHILDREN: set = set()
@@ -454,9 +456,10 @@ def _leader_exited(p: subprocess.Popen) -> bool:
 
 
 def _exited_kqueue(pid: int) -> bool:
-    """The macOS path (CPython leaves os.waitid out there): a one-shot kqueue NOTE_EXIT watch, polled without waiting.
-    kqueue never reaps.  On a child that is already a zombie the registration itself answers ESRCH, which is also
-    the answer for a pid that is gone, so both read as exited."""
+    """The path where os.waitid is missing (some macOS builds have it, e.g. CPython 3.13+, others do not, e.g. 3.12): a
+    one-shot kqueue NOTE_EXIT watch, polled without waiting.  kqueue never reaps.  On a child that is already a zombie
+    the registration itself answers ESRCH, which is also the answer for a pid that is gone, so both read as exited.
+    Any other OSError is raised, never read as "exited": a false True could let a killpg reach a reused group."""
     try:
         kq = select.kqueue()
         try:
@@ -466,10 +469,14 @@ def _exited_kqueue(pid: int) -> bool:
         finally:
             kq.close()
     except OSError as e:
-        return e.errno == errno.ESRCH
+        if e.errno == errno.ESRCH:
+            return True
+        raise
     for g in got:
         if g.flags & select.KQ_EV_ERROR:
-            return g.data == errno.ESRCH
+            if g.data == errno.ESRCH:
+                return True
+            raise OSError(g.data, os.strerror(g.data))
         if g.fflags & select.KQ_NOTE_EXIT:
             return True
     return False
@@ -1284,6 +1291,7 @@ class Ctx:
         for d in (self.run / "home", self.run / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
         self.tmp = make_short_tmp(self.run)
+        self.env = clean_env(self.run)             # now TMPDIR is the short dir
         # the land base is the sha the run pinned before any leg started (cmd_run passes it); only a caller that pinned
         # nothing has it read here, once.  Every classification and baseline of this leg uses this one value.
         if not self.base_sha:
