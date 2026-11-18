@@ -1701,3 +1701,72 @@ def test_charter_guard_stays_open_with_no_store_or_an_unregistered_name(home, tm
     monkeypatch.chdir(b)                                                # no store configured at all
     rc, _, err = _charter(capsys, "init", "alpha")
     assert rc == 0 and (b / "CHARTER.md").exists(), err
+
+
+def _drop_pointer(home):
+    """The store stays on disk (store.id, repos.jsonl); only the pointer to it goes: a store reached by --items or the environment."""
+    (bs._home_dir(None) / bs.POINTER_NAME).unlink()
+
+
+def test_charter_guard_holds_for_a_store_reached_by_items_or_the_environment_with_no_pointer(store, home, tmp_path, mkrepo, capsys, monkeypatch):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    _drop_pointer(home)
+    monkeypatch.chdir(b)
+    rc, _, err = _charter(capsys, "init", "alpha", "--items", str(store))              # the ceremony's own command, from the wrong repo
+    assert rc == 2 and f"Pass --repo {os.path.realpath(a)}" in err and not (b / "CHARTER.md").exists()
+    rc, _, err = _charter(capsys, "check", "--repo-name", "alpha", "--worktree", "--items", str(store))
+    assert rc == 2 and f"Pass --repo {os.path.realpath(a)}" in err
+    monkeypatch.setenv("LEVAIN_BOARD_ITEMS", str(store))                               # the environment alone, no --items
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and not (b / "CHARTER.md").exists()
+    rc, out, err = _charter(capsys, "init", "alpha", "--repo", str(a))                 # the registered repository: written
+    assert rc == 0 and (a / "CHARTER.md").exists(), err
+
+
+def test_charter_guard_refuses_when_a_path_or_the_pointer_cannot_be_resolved(store, home, tmp_path, mkrepo, capsys, monkeypatch):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    monkeypatch.chdir(b)
+    real = Path.resolve
+    for exc in (OSError("Permission denied"), RuntimeError("Symlink loop")):
+        for bad_path in (os.path.realpath(a), os.path.realpath(b)):                    # the REGISTERED path, then the target
+            def resolve(self, *a_, _exc=exc, _bad=bad_path, **k):
+                if str(self) == _bad:
+                    raise _exc
+                return real(self, *a_, **k)
+            monkeypatch.setattr(Path, "resolve", resolve)
+            rc, _, err = _charter(capsys, "init", "alpha")
+            assert rc == 2 and "cannot tell" in err and str(exc) in err and not (b / "CHARTER.md").exists(), (exc, bad_path, err)
+            monkeypatch.setattr(Path, "resolve", real)
+
+    def denied():
+        raise PermissionError("denied")
+    monkeypatch.setattr(bs, "read_pointer", denied)                                    # a pointer failure that is not a BoardError
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and "cannot tell" in err and "denied" in err and not (b / "CHARTER.md").exists()
+
+
+def test_charter_guard_returns_none_only_for_no_store_an_unregistered_name_and_the_same_repository(home, tmp_path, mkrepo, capsys, monkeypatch):
+    """Every open (None) path of ``_wrong_repo``, enumerated; every other reading of the world is a refusal text."""
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    top = Path(os.path.realpath(b))
+    assert charter._wrong_repo("init", "alpha", top, None) is None                     # 1. no store anywhere (no items, no env, no pointer, no home store)
+    ok(capsys, "use", str(tmp_path / "store"))
+    sdir = Path(os.path.realpath(tmp_path / "store"))
+    (sdir / "repos.jsonl").touch()
+    assert charter._wrong_repo("init", "alpha", top, None) is None                     # 2. a store, NAME not registered
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    assert charter._wrong_repo("init", "alpha", Path(os.path.realpath(a)), None) is None     # 3. the registered repository itself
+    assert charter._wrong_repo("init", "alpha", top, None) is not None                 # ... and the wrong one is a text
+    assert charter._wrong_repo("init", "alpha", None, None) is None                    # (a target that is no repository: out of scope, as before)
+    refusals = {
+        "torn registry": lambda: (sdir / "repos.jsonl").write_bytes((sdir / "repos.jsonl").read_bytes() + b'{"torn'),
+        "pointer names no store": lambda: (sdir / "store.id").unlink(),
+    }
+    for label, break_it in refusals.items():
+        break_it()
+        assert isinstance(charter._wrong_repo("init", "alpha", Path(os.path.realpath(a)), None), str), label
+    (sdir / "store.id").write_text("x")
+    monkeypatch.setenv("LEVAIN_BOARD_ITEMS", str(tmp_path / "elsewhere"))              # env names a store other than the pointer's: two stores
+    assert isinstance(charter._wrong_repo("init", "alpha", top, None), str)

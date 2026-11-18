@@ -413,7 +413,8 @@ def test_init_stdout_prints_and_writes_nothing_and_a_torn_store_writes_nothing(t
     assert main(["charter", "init", "levain", "--repo", str(repo), "--stdout"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("# Charter: levain\n") and not (repo / "CHARTER.md").exists()
-    bad = tmp_path / "bad.jsonl"
+    (tmp_path / "torn").mkdir()
+    bad = tmp_path / "torn" / "items.jsonl"             # a legacy items file with no store.id beside it: no registry, so the Plan read is what fails
     bad.write_text("not json\n", encoding="utf-8")
     assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(bad)]) == 1
     assert not (repo / "CHARTER.md").exists()
@@ -468,3 +469,19 @@ def test_check_file_reads_only_that_file_and_the_json_refusal_is_one_document(tm
     cap = capsys.readouterr()
     doc = json.loads(cap.out)                                   # exactly one document
     assert rc == 2 and set(doc) == _KEYS and doc["valid"] is False and "registered at" in doc["why"] and "registered at" in cap.err
+
+
+def test_the_own_id_strip_has_token_boundaries_and_a_line_before_the_title_is_refused(tmp_path):
+    name = "2026-11-18"
+    repo = _git_repo(tmp_path / "r")
+    store = _store_file(tmp_path / "items.jsonl", [(f"{name}#1", None)])
+    assert main(["charter", "init", name, "--repo", str(repo), "--items", str(store)]) == 0
+    text = _fill((repo / "CHARTER.md").read_text(encoding="utf-8")).replace("[judged: filled]", f"[item: {name}#1]")
+    assert [p for p in charter.check_text(text, repo_name=name)[0] if p.rule == "status"] == []
+    # `NAME#1st` is no item id: the strip must not hide the date inside it
+    glued = text.replace("filled\n\n## Criteria", f"shipped {name}#1st\n\n## Criteria", 1)
+    assert any(p.rule == "status" for p in charter.check_text(glued, repo_name=name)[0])
+    # the title is line 1 by the structure rule (`lines[0]` is matched against _TITLE), so a line before it is a `title`
+    # problem, not an exempt-title case: the exemption by index 0 can never skip a title that sits lower
+    probs = charter.check_text("\n" + text, repo_name=name)[0]
+    assert any(p.rule == "title" for p in probs)

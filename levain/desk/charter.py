@@ -17,6 +17,7 @@ unusable command line (argparse) exits 2.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -219,7 +220,7 @@ def check_text(text: str, *, repo_name: str | None = None,
     # No status, by structure: shapes a machine can check without refusing an ordinary word. The scan does not see the
     # charter's own NAME (the title) or an item id (`NAME#N`, a Plan row, an `[item: ...]` tag): a repo named `2026-11-18` or
     # `cafe123` is date- or sha-shaped by name, and its charter must still be able to pass. Prose is scanned as ever.
-    own_id = re.compile(re.escape(name) + r"#\d+") if name else None
+    own_id = re.compile(r"(?<![a-z0-9._-])" + re.escape(name) + r"#\d+(?![a-z0-9._-])") if name else None
     for i, ln in enumerate(lines):
         n = i + 1
         if i == 0 and title is not None:
@@ -451,31 +452,43 @@ def _common_dir(path: Path) -> Path | None:
 def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> str | None:
     """The refusal text when NAME is registered in the board registry and ``top`` (the git top-level the verb is about to act
     on) belongs to a different repository than the registered path; None otherwise. The comparison is of the REPOSITORY
-    (the git common dir), so any worktree of the registered repo is allowed. Open (None, the verb behaves as it always did):
-    no store configured or found, an unregistered NAME, and a ``top`` that is not a repository. Refused: a store that IS found
-    but whose pointer or registry cannot be read, and a registered path that cannot be read as a git repository.
+    (the git common dir), so any worktree of the registered repo is allowed. Open (None, the verb behaves as it always did)
+    in exactly three cases: there is no store anywhere (the lookup ``resolve_store`` does: no pointer, and the ``--items``,
+    ``$LEVAIN_BOARD_ITEMS`` or home-default path it lands on holds no ``store.id``, which is ``is_store``), NAME is not
+    registered, and the registered path is the same repository as ``top`` (or ``top`` is not a repository at all). Every
+    other reading of the world is a refusal text: a store that IS found (by the pointer, ``--items``, the environment or the
+    home) whose registry or pointer cannot be read, and a
+    registered path or target that cannot be resolved or read as a git repository.
 
     Known edges, judged and not built: a ``board move`` landing between this read and the write (an operator running both
     at once) is not guarded; a name like ``a..b`` or ``a.`` is accepted, the one rule ``register`` already applies."""
     if top is None:
         return None
     from levain.desk import board_registry as br, board_store as bs
+    cannot = f"cannot tell where {name} is registered: "
     try:
-        if bs.read_pointer() is None:       # no pointer: no store is configured (an explicit --items alone is no registry)
-            return None
-    except bs.BoardError as exc:            # a pointer that exists but cannot be read: a store is configured and broken
-        return f"cannot tell where {name} is registered: {exc}. Fix the store pointer, then run this again."
-    try:
-        reg = br.read_registry(bs.resolve_store(items), allow_inactive=True).fold.repos.get(name)
-    except (bs.BoardError, OSError, ValueError, RuntimeError) as exc:   # a pointer with no store, two stores, a torn or unreadable registry
-        return f"cannot tell where {name} is registered: {exc}. Fix the store, then run this again."
+        pointer = bs.read_pointer()
+        try:
+            target = bs.resolve_store(items)
+        except bs.BoardError:
+            if pointer is None and not ((items is not None and str(items) != "") or os.environ.get(bs.ITEMS_ENV)):
+                return None                 # no pointer, nothing explicit and no levain home: `resolve_store` found no store
+            raise
+        if pointer is None and not bs.is_store(target):
+            return None                     # reached by --items, the environment or the home with no store.id beside it: no registry
+        if not target.pointered:            # a real store reached without a pointer: `read_registry` reads only a pointered one; this read is read-only
+            target = dataclasses.replace(target, pointered=True)
+        reg = br.read_registry(target, allow_inactive=True).fold.repos.get(name)
+    except (bs.BoardError, OSError, ValueError, RuntimeError) as exc:   # a broken pointer, no store at the pointer, two stores, a torn registry
+        return f"{cannot}{exc}. Fix the store, then run this again."
     if reg is None:
         return None
     try:
         registered = Path(reg.path).expanduser().resolve()
         here = top.expanduser().resolve()
-    except (OSError, RuntimeError):
-        return None
+    except (OSError, RuntimeError, ValueError) as exc:      # an unreadable parent, a symlink loop: a path that cannot be told is no match
+        return (f"{cannot}{name}'s registered path {reg.path} or {top} cannot be resolved ({type(exc).__name__}: {exc}). "
+                f"Fix the path, `levain board move` updates the registered one, or pass --repo to name the registered checkout.")
     if registered == here:
         return None
     reg_common = _common_dir(registered)
@@ -559,12 +572,13 @@ def register(subparsers: Any) -> None:
     charter = subparsers.add_parser("charter", description="The repository charter: purpose, criteria, constraints, plan.")
     sub = charter.add_subparsers(dest="charter_cmd", required=True)
     p = sub.add_parser(
-        "check", help="Check a repository's CHARTER.md (warn mode: exits 0, or 2 on --repo-name of another repository).",
+        "check", help="Check a repository's CHARTER.md (warn mode: exits 0; 2 on another repository's name, an unreadable registry, or a bad command line).",
         description=("Check that CHARTER.md holds the prescribed shape. Reads it from origin/main by default. In this "
                      "release it only WARNS: it prints what a valid charter needs and exits 0 either way. It exits "
-                     "non-zero in exactly one case: --repo-name names a repo registered in the board registry and --repo "
-                     "is a different repository from the registered one (a worktree of it is fine); it then refuses with "
-                     "exit 2 and reads nothing. An unusable command line also exits 2."))
+                     "non-zero in these cases, all exit 2, and it reads nothing then: --repo-name names a repo registered in "
+                     "the board registry and --repo is a different repository from the registered one (a worktree of it is "
+                     "fine); the registry, the store pointer or the registered checkout cannot be read, so that cannot be "
+                     "told; or the command line is unusable."))
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids (default: the directory that holds the repository's .git).")
@@ -581,9 +595,10 @@ def register(subparsers: Any) -> None:
     q = sub.add_parser(
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
-                     "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2 when NAME is "
-                     "registered in the board registry at a different repository than the one it would write to (a worktree "
-                     "of the registered repo is fine), or when that cannot be told; nothing is written then."))
+                     "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2, and writes "
+                     "nothing, when NAME is registered in the board registry at a different repository than the one it would "
+                     "write to (a worktree of the registered repo is fine); when the registry, the store pointer or the "
+                     "registered checkout cannot be read, so that cannot be told; or when the command line is unusable."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
