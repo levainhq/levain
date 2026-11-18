@@ -196,9 +196,6 @@ def _keyed_to(item_key: Any, migration: str) -> bool:
 
 
 ITEMS_NONE = "none"                       # ``items_last`` of an abandon written when the items file had no line
-#: The way out of an abandon that cannot cause a cut (levain 32 ruling: an abandon-track re-run never writes a second abandon).
-CUT_ANOTHER_WAY = ("cut the item with a signed or relayed decide: `decide --id <id> --decision cut --sign` or `--source "
-                   "<q-id>`; an abandon-track re-run never writes a second abandon")
 
 
 def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) -> str | None:
@@ -207,10 +204,11 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) ->
     its band row through ``band`` and finds the digests and the words hold; no ``band`` is a refusal, never a trust), and it
     must name its migration and ``items_last`` (the items file's last line when it was written; an
     abandon from before that field cannot order the items, so it holds no cut). Raises ``VerifierUnavailable`` when
-    ssh-keygen cannot run. It is one step of :func:`cut_cause_problem`, the one judgement of a cut's cause. An abandon that
-    stands is never replaced (levain 32 ruling: an ``abandon-track`` re-run writes no second abandon,
-    ``board_registry.abandon_track``), so the way out of any refusal here but a missing band is :data:`CUT_ANOTHER_WAY`:
-    a signed or relayed ``decide`` of ``cut``, which needs no cause. A TORN store file is acknowledged first (``ack-torn``)."""
+    ssh-keygen cannot run. It is one step of :func:`cut_cause_problem`, the one judgement of a cut's cause; the recovery for
+    any refusal of that is to re-run ``abandon-track`` signed (``--sign``) or relayed (``--source``): on an ``aborting`` repo
+    with a cut still owed whose latest abandon does not hold, that re-run writes a fresh abandon
+    (``board_registry.abandon_track``). A TORN store file is not repaired that way: it is acknowledged first (``ack-torn``),
+    and no abandon is written over it."""
     grade = held.get("grade")
     if grade == GRADE_RELAYED:
         if band is None:
@@ -220,22 +218,22 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) ->
         from levain.desk import board_relay
         said = board_relay.verify_relayed(held, band)
         if not said.ok:
-            return f"the cited relayed abandon-track does not verify: {said.text} ({CUT_ANOTHER_WAY})"
+            return f"the cited relayed abandon-track does not verify: {said.text} (re-run `abandon-track` with --source or --sign)"
     elif grade not in SIGNED_GRADES:
-        return f"cause names an abandon-track graded {grade!r}: it must be signed or relayed ({CUT_ANOTHER_WAY})"
+        return f"cause names an abandon-track graded {grade!r}: it must be signed or relayed (re-run `abandon-track` with --sign or --source)"
     else:
         if snapshot is None:
             return "cause names a signed abandon-track and there is no authority log to verify it against"
         verdict = verify_record(held, snapshot)
         if verdict.state != "valid":
-            return f"the cited abandon-track's signature is not valid: {verdict.text} ({CUT_ANOTHER_WAY})"
+            return f"the cited abandon-track's signature is not valid: {verdict.text} (re-run `abandon-track` with --sign)"
     migration = held.get("migration")
     if not isinstance(migration, str) or not migration:
         return "the cited abandon-track names no migration"
     last = held.get("items_last")
     if not (last == ITEMS_NONE or (isinstance(last, str) and bs.HASH_RE.fullmatch(last))):
         return ("the cited abandon-track does not name the items file's last line (items_last), so no item can be shown to "
-                f"predate it ({CUT_ANOTHER_WAY})")
+                "predate it (re-run `abandon-track` with --sign)")
     return None
 
 
@@ -270,10 +268,9 @@ def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snaps
 
 def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", snapshot: Any, band: Any = None) -> str | None:
     """THE one predicate for "can the abandon-track whose line hashes to ``cause`` be the cause of a cut of ``item_id``":
-    why not, or None when it can. :func:`verify_cause` (every cut's write) and the abandon re-run
-    (``board_registry._latest_abandon_problem``: can the standing abandon cause the cuts still owed) both judge it, so a
-    re-run refuses exactly when a cut citing the standing abandon would be refused (levain 29, fix 3; levain 32: a re-run
-    never writes a second abandon). It is two halves,
+    why not, or None when it can. :func:`verify_cause` (every cut's write) and the abandon recovery
+    (``board_registry._latest_abandon_problem``: must a signed re-run write a fresh abandon) both judge it, so the recovery
+    writes a fresh abandon exactly when a cut citing the latest one would be refused (levain 29, fix 3). It is two halves,
     and nothing else: :func:`cause_problem` (everything that does not depend on the item, judged ONCE for a whole abandon by
     the recovery) then :func:`cut_item_problem` (the item's own place; fix 4, complement 15).
 

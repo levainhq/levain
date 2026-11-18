@@ -234,8 +234,9 @@ def test_a_cut_owed_after_a_relayed_abandon_needs_the_band_to_finish(world, caps
 
 
 def test_a_relayed_abandon_whose_answer_changed_is_not_rewritten_by_a_relayed_rerun(world, capsys, monkeypatch):
-    """levain 32 ruling (P3 fix 5): the standing abandon is never replaced. Its band row no longer says it, so it causes no
-    cut: the relayed re-run refuses by name and writes nothing, and a relayed decide per item finishes."""
+    """levain 32 ruling (P3 fix 5): a relayed re-run never writes an abandon. The standing one's band row no longer says it,
+    so it causes no cut: the relayed re-run refuses by name, naming the signed re-run (the one recovery that writes an
+    abandon), and writes nothing; a relayed decide per item also finishes."""
     from levain.desk import board_store as bs
     store, _, _, band, _ = _begun(world, capsys)
     real = bs.decide
@@ -245,7 +246,8 @@ def test_a_relayed_abandon_whose_answer_changed_is_not_rewritten_by_a_relayed_re
     band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "no, abandon it, and say so twice", "unsigned-terminal", "native")
     before = (store / "repos.jsonl").read_bytes()
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "say so twice", "--source", Q2, *BY)
-    assert rc == 2 and "(relayed) stands" in err and "does not verify" in err and "never writes a second abandon-track" in err
+    assert rc == 2 and "(relayed) stands" in err and "does not verify" in err, err
+    assert "re-run abandon-track signed (--sign)" in err and "a relayed re-run never writes one" in err
     assert (store / "repos.jsonl").read_bytes() == before
     for iid in ("alpha#1", "alpha#2"):
         rc, _, err = run(capsys, "decide", "--id", iid, "--decision", "cut", "--words", "say so twice", "--source", Q2, *BY)
@@ -316,7 +318,7 @@ def test_f4_1_a_relayed_rerun_reads_the_callers_words_and_never_makes_them_the_r
     assert rc == 2 and "not a verbatim excerpt" in err                # the caller's words are checked, not skipped
     before = (store / "repos.jsonl").read_bytes()
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "cancel it instead", "--source", Q2, *BY)
-    assert rc == 2 and "never writes a second abandon-track" in err, err
+    assert rc == 2 and "a relayed re-run never writes one" in err and "re-run abandon-track signed (--sign)" in err, err
     assert (store / "repos.jsonl").read_bytes() == before and sum(r["op"] == "abandon-track" for r in reg(store)) == 1
     assert not [r for r in items(store) if r["op"] == "decide"]
     assert brg.read_registry(bs.resolve_store(str(store))).fold.repos["alpha"].words == "no, abandon it"
