@@ -50,7 +50,7 @@ def levain_bin() -> Path | None:
 
 
 class Install:
-    def __init__(self, tmp: Path, *, episodes: int = 3) -> None:
+    def __init__(self, tmp: Path, *, episodes: int = 3, stub: bool = False) -> None:
         from tests.test_authority_graduation_kind import World
         from levain.cockpit.firejournal import CockpitDB
 
@@ -70,10 +70,17 @@ class Install:
         self.key = tmp / "keys" / "laptop"
         self.store_dir = self.home / "autonomic"
         self._n = 0
+        self.stub = None
+        if stub:                                     # the install fact claude_bin names a stub program (_p10a_stub.py)
+            from tests._p10a_stub import StubClaude
+
+            self.stub = StubClaude(tmp / "stubclaude")
 
     # ------------------------------------------------------------------------------------------------- the CLI
     def env(self, now: str | None = None, spawn_gate: bool = True, kill: str | None = None) -> dict[str, str]:
         env = {k: os.environ[k] for k in _KEEP if k in os.environ}
+        if self.stub is not None:                    # no real `claude` can be found by name
+            env["PATH"] = "/usr/bin:/bin"
         env.update(LEVAIN_HOME=str(self.home), HOME=str(self.uhome), PYTHONPATH=str(REPO),
                    PYTHONDONTWRITEBYTECODE="1")
         if now:
@@ -110,10 +117,20 @@ class Install:
             assert self.cli("agents", "zone", ZONE).rc == 0
         if not self.anneal.exists():
             self.make_anneal()
+        self._bind_stub()                            # before the enable, so the spec the enable registers binds it
         ran = self.cli("dream", "enable", "--store-dir", str(self.anneal), "--cockpit-root", str(self.world.root),
                        "--coord-dir", str(self.desk), *extra)
         self._write_facts()
         return ran
+
+    def _bind_stub(self) -> None:
+        """With a stub: the install fact ``claude_bin`` is written first (``enable`` merges it and keeps it)."""
+        if self.stub is None:
+            return
+        from levain.dream import agent as da
+
+        da.write_install(self.store_dir, store_path=self.anneal / "memory.db", cockpit_root=self.world.root,
+                         coord_dir=self.desk, zone=ZONE, claude_bin=str(self.stub.path))
 
     def _write_facts(self) -> None:
         """The first-run facts file the install names: the operator's own file (no flag writes it)."""
@@ -124,7 +141,8 @@ class Install:
         ex.write_first_run_facts(facts, model=MODEL, models_charged=[MODEL], m_usd_micros=ex.one_call_ceiling(MODEL))
         inst = da.read_install(self.store_dir)
         da.write_install(self.store_dir, store_path=inst.store_path, cockpit_root=inst.cockpit_root,
-                         coord_dir=inst.coord_dir, zone=inst.zone, facts_path=facts)
+                         coord_dir=inst.coord_dir, zone=inst.zone, facts_path=facts,
+                         claude_bin=inst.claude_bin)
 
     def agent(self) -> dict:
         """``levain agents show dream --json``: the ``agent`` object (agent_id, spec_hash, version, ...)."""
