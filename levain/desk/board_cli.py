@@ -755,7 +755,10 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     if unreadable is not None:         # a source the board named unreadable: an audit ``unknown`` with no item id (stale_evidence is its own line)
         unreadable.extend(a.why for a in board.audit if a.kind == "unknown" and a.id is None and not a.why.startswith("stale_evidence:"))
     # P4 (levain#103): who authored each git close; a verdict on every close, no close refused for it
-    ba.annotate(doc, folded.items, read_paths, ba.resolvers_from_args(args), default_repo=repo)
+    try:       # guarded as board_context's call is: attribution never fails the board read, it is said on each item
+        ba.annotate(doc, folded.items, read_paths, ba.resolvers_from_args(args), default_repo=repo)
+    except Exception as exc:  # noqa: BLE001
+        ba.mark_unread(doc, folded.items, exc)
     # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read under the one hold)
     try:
         registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)

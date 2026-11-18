@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,22 +26,26 @@ T0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
 T1 = "2026-11-05T12:00:00+00:00"
 T2 = datetime(2026, 11, 10, tzinfo=timezone.utc)
 T3 = "2026-11-12T12:00:00+00:00"
-OUTSIDE_TEXT = "unattributed: the path exists outside version control"
+OUTSIDE_TEXT = ba.OUTSIDE
 
 
 class Scratch:
     def __init__(self, root: Path) -> None:
         kd = root / "keys"
         kd.mkdir()
-        self.keys = {n: Key(kd, n) for n in ("laptop", "old", "stranger")}
+        self.keys = {n: Key(kd, n) for n in ("laptop", "old", "stranger", "phone", "late")}
         self.cockpit = root / "cockpit"
         self.cockpit.mkdir()
         Log(self.cockpit, self.keys)                       # the cockpit journal; the links below are anchored, as a real one is
         self._link({"op": "enrol", "fingerprint": self.keys["laptop"].fp, "public_key": self.keys["laptop"].public_key,
                     "class": "laptop-presence", "custody": "passphrase"}, T0)
         self._link({"op": "enrol", "fingerprint": self.keys["old"].fp, "public_key": self.keys["old"].public_key,
+                    "class": "laptop-presence", "custody": "passphrase"}, T0)
+        self._link({"op": "enrol", "fingerprint": self.keys["phone"].fp, "public_key": self.keys["phone"].public_key,
                     "class": "display-phone", "custody": "unstated"}, T0)
         self._link({"op": "revoke_key", "fingerprint": self.keys["old"].fp}, T2)
+        self._link({"op": "enrol", "fingerprint": self.keys["late"].fp, "public_key": self.keys["late"].public_key,
+                    "class": "laptop-presence", "custody": "passphrase"}, T2)
         self.repo = root / "repo"
         self.repo.mkdir()
         self.outside = root / "elsewhere.md"
@@ -68,14 +72,19 @@ class Scratch:
         assert cp.returncode == 0, cp.stderr
         return cp.stdout.strip()
 
-    def commit(self, msg, who, when, key=None, files=None) -> str:
+    def commit(self, msg, who, when, key=None, files=None, *, author_date=None, committer=None) -> str:
+        """``when`` is the COMMITTER date; the author date defaults to an hour before it, so a reader that took the author
+        date for the committer date would be graded wrong (``author_date`` sets it). ``committer`` (name, email) differs
+        from the author when given (a rebase by another person)."""
         for name, text in (files or {}).items():
             p = self.repo / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
         self.git("add", "-A")
-        env = {"GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": "x@x", "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": "x@x",
-               "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        adate = author_date or (datetime.fromisoformat(when) - timedelta(hours=1)).isoformat()
+        cname, cmail = committer or (who, "x@x")
+        env = {"GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": "x@x", "GIT_COMMITTER_NAME": cname, "GIT_COMMITTER_EMAIL": cmail,
+               "GIT_AUTHOR_DATE": adate, "GIT_COMMITTER_DATE": when}
         pre = ["-c", "gpg.format=ssh", "-c", f"user.signingkey={key.path}", "-c", "commit.gpgsign=true"] if key else []
         self.git(*pre, "commit", "--allow-empty", "-q", "-m", msg, env=env)
         return self.git("rev-parse", "HEAD")
@@ -108,20 +117,41 @@ def sc(tmp_path_factory):
     s.c["dir1"] = s.commit("adds dir file 1", "Dir One", T1, files={"outdir/one.txt": "1"})
     s.c["dir2"] = s.commit("adds dir file 2", "Dir Two", T1, files={"outdir/two.txt": "2"})
     s.c["doc_edit"] = s.commit("edits the doc", "Editor", T1, files={"docs/a.md": "doc v2"})
+    s.c["phone"] = s.commit("phone\n\nBoard-Closes: scratch#40", "Phone Person", T1, key=s.keys["phone"], files={"m": "1"})
+    s.c["late"] = s.commit("late key\n\nBoard-Closes: scratch#41", "Late Person", T1, key=s.keys["late"], files={"n": "1"})
+    # author date BEFORE the laptop key's enrolment (T0), committer date after it: the committer date is the one read
+    s.c["adate_early"] = s.commit("author date early\n\nBoard-Closes: scratch#42", "Op Person", T1, key=s.keys["laptop"],
+                                  author_date="2026-10-20T12:00:00+00:00", files={"o": "1"})
+    # author date AFTER the late key's enrolment (T2), committer date before it: not tier 1
+    s.c["adate_late"] = s.commit("author date late\n\nBoard-Closes: scratch#43", "Late Person", T1, key=s.keys["late"],
+                                 author_date=T3, files={"p": "1"})
+    s.c["rebased"] = s.commit("rebased\n\nBoard-Closes: scratch#44", "Agent Author", T1, committer=("Re Baser", "r@r"),
+                              files={"q": "1"})
+    s.c["noted2"] = s.commit("annotated twice, no trailer", "Annotated Author", T1, files={"r": "1"})
     s.git("update-ref", "refs/remotes/origin/main", "HEAD")
     # the note on c["noted"], written LATER by another commit on refs/notes/board by another person
     note_env = {"GIT_AUTHOR_NAME": "Note Writer", "GIT_AUTHOR_EMAIL": "n@n", "GIT_COMMITTER_NAME": "Note Writer",
                 "GIT_COMMITTER_EMAIL": "n@n"}
     s.git("notes", "--ref=refs/notes/board", "add", "-m", "Board-Closes: scratch#5", s.c["noted"], env=note_env)
+    # the note on c["noted2"]: written by one person, removed by another, written again by a third (latest addition wins)
+    for who, text in (("First Writer", "Board-Closes: scratch#30"), ("Remover", "Board-Item: scratch#30"),
+                      ("Second Writer", "Board-Closes: scratch#30")):
+        env = {"GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": "w@w", "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": "w@w"}
+        s.git("notes", "--ref=refs/notes/board", "add", "-f", "-m", text, s.c["noted2"], env=env)
     return s
 
 
-SEATS = {"slot-key-77": "worker L-77"}
-FULL = lambda sc: ba.Resolvers(sc.authority(), SEATS.get)          # noqa: E731
+def seats(sc, items=("scratch#3", "scratch#11", "scratch#12", "scratch#13", "scratch#14"), cwd=None):
+    """A stand-in launch lookup: slot-key-77 is launch L-77, which claimed ``items`` in ``cwd`` (default: the scratch repo)."""
+    table = {"slot-key-77": ba.Seat("worker L-77", None if items is None else tuple(items), str(cwd or sc.repo))}
+    return table.get
+
+
+FULL = lambda sc: ba.Resolvers(sc.authority(), seats(sc))          # noqa: E731
 
 
 def item(n: int, kind: str = "merged", done: str | None = None):
-    return SimpleNamespace(id=f"scratch#{n}", done_kind=kind, done=done)
+    return SimpleNamespace(id=f"scratch#{n}", repo="scratch", done_kind=kind, done=done)
 
 
 def verdict(sc, it, ref, res=None):
@@ -131,18 +161,19 @@ def verdict(sc, it, ref, res=None):
 # ------------------------------------------------------------------------------------------------ tier 1
 def test_tier1_a_valid_signature_by_a_key_in_the_log_is_the_operator(sc):
     c = verdict(sc, item(1), sc.c["signed"])
-    assert (c.tier, c.how, c.commit) == ("signed", "signed commit", sc.c["signed"])
-    assert c.who.startswith("operator k") and c.note == ""
-    assert ba.describe(c) == f"{c.who}, signed commit"
+    assert (c.tier, c.how, c.commit) == ("signed", "signed by an operator key", sc.c["signed"])
+    assert c.who.startswith("k") and " " not in c.who and c.note == ""
+    assert ba.describe(c) == f"signed by an operator key {c.who}"
+    assert set(c.to_dict()) == {"tier", "who", "how", "commit"}
 
 
 def test_tier1_the_same_key_not_in_the_log_falls_to_the_git_author_and_says_why(sc):
     c = verdict(sc, item(2), sc.c["stranger"])
-    assert (c.tier, c.who) == ("git", "Stranger Person") and "not in the authority log" in c.note
+    assert (c.tier, c.who) == ("git", "Stranger Person") and "is not a key in the authority log" in c.note
 
 
 def test_tier1_a_signed_commit_with_no_authority_named_is_not_tier1(sc):
-    c = verdict(sc, item(1), sc.c["signed"], ba.Resolvers(None, SEATS.get))
+    c = verdict(sc, item(1), sc.c["signed"], ba.Resolvers(None, seats(sc)))
     assert (c.tier, c.who) == ("git", "Op Person") and "no authority log is consulted" in c.note
 
 
@@ -156,18 +187,101 @@ def test_tier1_a_revoked_key_is_never_credited_the_snapshot_carries_no_revocatio
     not tier 1 either way, and the note names the key's revocation (a verdict never stronger than the evidence)."""
     c = verdict(sc, item(9), sc.c["old_before"])
     assert (c.tier, c.who) == ("git", "Old Person")
-    assert "revoked (seq 3)" in c.note and "no revocation time" in c.note
+    fp = sc.keys["old"].fp
+    assert f"signed by {fp}, revoked at seq 4" in c.note and "no revocation time" in c.note
 
 
-def test_tier1_a_key_revoked_before_the_commit_date_is_not_tier1(sc):
+def test_tier1_a_revoked_key_is_not_tier1_whatever_the_commit_date(sc):
     c = verdict(sc, item(10), sc.c["old_after"])
-    assert (c.tier, c.who) == ("git", "Old Person")
+    assert (c.tier, c.who) == ("git", "Old Person") and "revoked at seq 4" in c.note
+
+
+def test_tier1_a_key_of_the_wrong_class_is_refused_by_the_boards_key_rule(sc):
+    """A git commit is signed at a terminal: board_sign's key rule takes a laptop-presence key only (verify_record's)."""
+    c = verdict(sc, item(40), sc.c["phone"])
+    assert (c.tier, c.who) == ("git", "Phone Person")
+    assert f"{sc.keys['phone'].fp} is not a terminal key" in c.note and "key rule refuses" in c.note
+
+
+def test_tier1_a_quarantined_key_is_refused_by_the_boards_key_rule(sc):
+    """The log's laptop key with its stored custody made ``passkey`` (an ed25519 key is not a passkey's material): the
+    one quarantine definition holds it, so board_sign refuses it and so does tier 1."""
+    import dataclasses
+
+    from levain import authority as auth
+
+    a = sc.authority()
+    snap = a._load()
+    fp = sc.keys["laptop"].fp
+    held = dataclasses.replace(snap.keys[fp], custody=auth.PASSKEY)
+    assert auth.quarantined([held])
+    a._snap = SimpleNamespace(keys={**snap.keys, fp: held})
+    c = verdict(sc, item(1), sc.c["signed"], ba.Resolvers(a, seats(sc)))
+    assert (c.tier, c.who) == ("git", "Op Person") and f"{fp} is quarantined" in c.note
+
+
+def test_tier1_a_key_enrolled_after_the_commit_date_is_not_tier1(sc):
+    c = verdict(sc, item(41), sc.c["late"])
+    assert (c.tier, c.who) == ("git", "Late Person")
+    assert f"signed by {sc.keys['late'].fp}, enrolled 2026-11-10" in c.note and "after the commit's own date" in c.note
+
+
+def test_tier1_reads_the_committer_date_never_the_author_date(sc):
+    """Author date before the key's enrolment, committer date after it: signed. And the reverse: not signed. A switch to
+    the author date fails both."""
+    assert verdict(sc, item(42), sc.c["adate_early"]).tier == "signed"
+    c = verdict(sc, item(43), sc.c["adate_late"])
+    assert c.tier == "git" and "after the commit's own date 2026-11-05" in c.note
+
+
+def test_tier1_a_key_with_no_enrol_time_says_so_never_enrolled_after(sc):
+    import dataclasses
+
+    a = sc.authority()
+    snap = a._load()
+    fp = sc.keys["laptop"].fp
+    a._snap = SimpleNamespace(keys={**snap.keys, fp: dataclasses.replace(snap.keys[fp], enrolled_at=None,
+                                                                         legacy_enrolled_at=None)})
+    c = verdict(sc, item(1), sc.c["signed"], ba.Resolvers(a, seats(sc)))
+    assert c.tier == "git" and "carries no readable time" in c.note and "enrolled after" not in c.note
+
+
+def test_tier1_a_failed_authority_load_is_read_once_per_board_read(sc, tmp_path, monkeypatch):
+    from levain.desk import board_sign as bsign
+
+    calls = []
+    real = bsign.resolve_authority
+    monkeypatch.setattr(bsign, "resolve_authority", lambda **kw: (calls.append(1), real(**kw))[1])
+    a = ba.CockpitAuthority(tmp_path / "no-cockpit")
+    for _ in range(3):
+        with pytest.raises(ba.NotChecked):
+            a.credit(sc.keys["laptop"].fp, T2)
+    assert len(calls) == 1
+
+
+def test_tier1_a_signature_that_cannot_be_judged_is_said(sc, monkeypatch):
+    from levain.team import signing
+
+    monkeypatch.setattr(signing, "verify_commit", lambda repo, sha: signing.Verdict("indeterminate", None, "ssh-keygen gone"))
+    c = verdict(sc, item(4), sc.c["plain"])
+    assert c.tier == "git" and "signature could not be checked (ssh-keygen gone)" in c.note
 
 
 def test_tier1_an_unreadable_authority_log_is_said_and_never_refuses(sc, tmp_path):
-    res = ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit"), SEATS.get)
+    res = ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit"), seats(sc))
     c = verdict(sc, item(1), sc.c["signed"], res)
     assert c.tier == "git" and "authority log was not checked" in c.note
+    assert "holds no cockpit.db" in c.note and "nothing was written" not in c.note      # the reason, never board_sign's prefix
+
+
+def test_tier1_a_refusal_text_with_no_well_formed_parentheses_is_kept_whole(monkeypatch):
+    from levain.desk import board_sign as bsign
+
+    def refuse(**kw):
+        raise bsign.bs.BoardError("odd) refusal (with no close")
+    monkeypatch.setattr(bsign, "resolve_authority", refuse)
+    with pytest.raises(ba.NotChecked, match=r"^odd\) refusal \(with no close$"):
+        ba.CockpitAuthority("/nonexistent").credit("SHA256:x", T2)
 
 
 # ------------------------------------------------------------------------------------------------ tier 2
@@ -177,9 +291,31 @@ def test_tier2_a_board_seat_trailer_a_launch_record_maps_is_the_agent_asserted(s
     assert ba.describe(c) == "agent worker L-77, asserted (trailer)"
 
 
+def test_tier2_a_board_seat_copied_from_another_items_launch_is_not_read(sc):
+    """The launch L-77 claimed scratch#99 only: its trailer on scratch#3's close names a seat that never claimed it."""
+    c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, items=("scratch#99",))))
+    assert (c.tier, c.who) == ("git", "Seat Person")
+    assert "maps to launch worker L-77, but the launch claimed scratch#99, not scratch#3" in c.note
+
+
+def test_tier2_a_launch_that_claimed_no_items_is_not_read(sc):
+    c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, items=None)))
+    assert c.tier == "git" and "the launch claimed no board items" in c.note
+
+
+def test_tier2_a_launch_that_ran_in_another_repo_is_not_read(sc, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, cwd=other)))
+    assert c.tier == "git" and "the launch ran in another repo" in c.note
+    gone = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, cwd=tmp_path / "gone")))
+    assert gone.tier == "git" and "is not a git repo this reader can read" in gone.note
+
+
 def test_tier2_a_signature_by_a_key_outside_the_log_still_reads_the_trailer(sc):
     c = verdict(sc, item(11), sc.c["stranger_seat"])
-    assert c.tier == "trailer" and "not in the authority log" in c.note
+    assert c.tier == "trailer" and "is not a key in the authority log" in c.note
 
 
 def test_tier2_a_trailer_no_launch_record_maps_falls_to_git(sc):
@@ -200,16 +336,31 @@ def test_tier2_two_different_trailers_read_none(sc):
 # ------------------------------------------------------------------------------------------------ tier 3
 def test_tier3_a_plain_commit_is_the_git_author(sc):
     c = verdict(sc, item(4), sc.c["plain"])
-    assert (c.tier, c.who, c.how, c.note) == ("git", "Plain Person", "asserted by git author", "")
-    assert ba.describe(c) == "asserted by git author Plain Person"
+    assert (c.tier, c.who, c.how, c.note, c.email, c.committer) == ("git", "Plain Person", "asserted by git author", "",
+                                                                    "x@x", None)
+    assert ba.describe(c) == "asserted by git author Plain Person <x@x>"
+
+
+def test_a_commit_rebased_by_another_person_names_the_committer(sc):
+    c = verdict(sc, item(44), sc.c["rebased"])
+    assert (c.tier, c.who, c.committer) == ("git", "Agent Author", "Re Baser <r@r>")
+    assert ba.describe(c) == "asserted by git author Agent Author <x@x>, committed by Re Baser <r@r>"
+    assert c.to_dict()["committer"] == "Re Baser <r@r>"
 
 
 # ------------------------------------------------------------------------------------------------ where the close comes from
 def test_a_note_injected_close_takes_the_author_of_the_note_commit_not_the_annotated_commit(sc):
     c = verdict(sc, item(5), sc.c["noted"])
-    notes_tip = sc.git("rev-parse", "refs/notes/board")
-    assert (c.tier, c.who, c.commit) == ("git", "Note Writer", notes_tip)
+    first_note = sc.git("log", "--reverse", "--format=%H", "refs/notes/board").split()[0]
+    assert (c.tier, c.who, c.commit, c.close_commit) == ("git", "Note Writer", first_note, sc.c["noted"])
     assert c.who != "Annotated Author"
+
+
+def test_a_note_line_written_removed_and_written_again_is_the_latest_writers(sc):
+    """The board's close rule takes the latest close; the note's writer is the latest commit that ADDED the line."""
+    c = verdict(sc, item(30), sc.c["noted2"])
+    assert (c.who, c.close_commit) == ("Second Writer", sc.c["noted2"])
+    assert c.commit == sc.git("rev-parse", "refs/notes/board")
 
 
 def test_a_note_close_whose_writer_cannot_be_found_is_unattributed_never_the_annotated_author(sc):
@@ -220,6 +371,8 @@ def test_a_note_close_whose_writer_cannot_be_found_is_unattributed_never_the_ann
 def test_a_document_close_takes_the_first_first_parent_commit_that_added_the_path(sc):
     c = verdict(sc, item(6, "document", "docs/a.md"), "docs/a.md")
     assert (c.tier, c.who, c.commit) == ("git", "Doc Person", sc.c["doc"])      # not "Editor", who edited it later
+    assert c.how == "first added docs/a.md, asserted by git author"
+    assert ba.describe(c) == "first added docs/a.md, asserted by git author Doc Person <x@x>"
 
 
 def test_a_directory_close_takes_the_first_commit_that_added_a_file_under_it(sc):
@@ -233,13 +386,39 @@ def test_a_done_path_outside_git_is_unattributed_and_reported_never_refused(sc):
     assert ba.describe(c) == OUTSIDE_TEXT
 
 
-def test_a_path_in_the_tree_that_main_never_added_is_outside_version_control(sc):
+def test_a_path_in_the_tree_that_main_never_added_says_exactly_that(sc):
     (sc.repo / "untracked.md").write_text("x")
     try:
         c = verdict(sc, item(8, "document", "untracked.md"), "untracked.md")
     finally:
         (sc.repo / "untracked.md").unlink()
-    assert c.tier == "unattributed" and c.how == OUTSIDE_TEXT
+    assert c.tier == "unattributed" and c.how == ba.NOT_ON_MAIN and "outside version control" not in c.how
+
+
+def test_a_path_in_another_repos_tree_is_outside_this_repos_work_tree(sc, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    (other / "x.md").write_text("x")
+    c = verdict(sc, item(8, "document", str(other / "x.md")), str(other / "x.md"))
+    assert (c.tier, c.how) == ("unattributed", OUTSIDE_TEXT)
+
+
+def test_a_symlink_in_the_tree_is_read_where_read_documents_reads_it(sc, tmp_path):
+    """read_documents follows ``done`` as written (no realpath): a tracked symlink in the tree is the tree's path."""
+    target = tmp_path / "real.md"
+    target.write_text("x")
+    link = sc.repo / "linked.md"
+    link.symlink_to(target)
+    try:
+        sha = sc.commit("adds a link", "Link Person", T1)
+        sc.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        c = verdict(sc, item(8, "document", "linked.md"), "linked.md")
+    finally:
+        link.unlink()
+        sc.commit("removes the link", "Link Person", T1)
+        sc.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    assert (c.who, c.commit) == ("Link Person", sha)
 
 
 # ------------------------------------------------------------------------------------------------ the surface
@@ -265,10 +444,27 @@ def test_annotate_never_raises_for_a_git_trouble_it_says_it_on_the_item(sc, tmp_
     assert c["tier"] == "unattributed" and "could not be read" in c["how"]
 
 
+def test_annotate_says_any_failure_on_the_item_not_only_a_git_one(sc, monkeypatch):
+    items = {"scratch#1": item(1), "scratch#4": item(4)}
+    doc = {"items": [{"id": "scratch#1", "repo": "scratch", "state": "done", "refs": [sc.c["signed"]]},
+                     {"id": "scratch#4", "repo": "scratch", "state": "done", "refs": [sc.c["plain"]]}]}
+    real = ba.closer_of_item
+
+    def flaky(repo, it, *a, **kw):
+        if it.id == "scratch#1":
+            raise ValueError("odd record")
+        return real(repo, it, *a, **kw)
+    monkeypatch.setattr(ba, "closer_of_item", flaky)
+    assert ba.annotate(doc, items, {"scratch": sc.repo}, FULL(sc)) == 2
+    by = {s["id"]: s["closed_by"] for s in doc["items"]}
+    assert by["scratch#1"]["tier"] == "unattributed" and "ValueError: odd record" in by["scratch#1"]["how"]
+    assert by["scratch#4"]["tier"] == "git"
+
+
 def test_the_context_line_and_the_state_part(sc):
     st = SimpleNamespace(state="done", refs=(sc.c["plain"],), column="done", reason="closed")
     line = ba.closer_line(sc.repo, item(4), st, FULL(sc))
-    assert line == "closed by: asserted by git author Plain Person"
+    assert line == "closed by: asserted by git author Plain Person <x@x>"
     assert ba.closer_line(sc.repo, item(4), SimpleNamespace(state="ready", refs=()), FULL(sc)) is None
     derived = bc.Derived({"scratch#4": SimpleNamespace(state="done", column="done", reason="closed by x")}, None)
     part = bc._state_part("scratch#4", derived, "", line)
@@ -320,20 +516,49 @@ def test_board_state_json_carries_closed_by_for_a_done_item_and_the_table_shows_
     assert by["levain#1"]["state"] == "done" and by["levain#1"]["closed_by"]["who"] == "t"
     assert by["levain#1"]["closed_by"]["tier"] == "git" and by["levain#1"]["closed_by"]["commit"] == by["levain#1"]["refs"][0]
     assert by["levain#2"]["closed_by"]["tier"] == "git" and by["levain#3"].get("closed_by") is None
+    assert by["levain#2"]["closed_by"]["how"] == "first added docs/r.md, asserted by git author"
     rc2 = main(["board", "state", *argv])
     table = capsys.readouterr().out
     assert rc == rc2 and "asserted by git author t" in table
 
 
+def test_board_state_survives_an_attribution_that_raises_and_says_it_per_item(tmp_path, capsys, monkeypatch):
+    """M-5: state_doc's call is guarded as board_context's is: the board still reads, each git close says why."""
+    w = World(tmp_path)
+    w.commit("root", date="2026-10-01T12:00:00Z")
+    w.push_main()
+    w.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    w.push_main()
+    items = _items_file(tmp_path, (1, "merged", "the work lands"), (3, "merged", "not yet"))
+    monkeypatch.setattr(ba, "annotate", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    argv = ["--items", str(items), "--evidence-extra", str(_extra(tmp_path)), "--repo", str(w.w), "--since", "2026-11-12T00:00:00Z"]
+    main(["board", "state", "--json", *argv])
+    by = {s["id"]: s for s in json.loads(capsys.readouterr().out)["items"]}
+    assert by["levain#1"]["state"] == "done" and by["levain#1"]["closed_by"]["tier"] == "unattributed"
+    assert "RuntimeError: boom" in by["levain#1"]["closed_by"]["how"] and by["levain#3"].get("closed_by") is None
+
+
 def test_board_state_with_the_two_flags_reads_tier1_and_tier2(sc, tmp_path, monkeypatch):
     """The flags override the defaults: --data-root an authority log, --desk-dir launch records (a stand-in lookup here: the
     launch store has its own tests)."""
-    monkeypatch.setattr(ba, "_desk_seat_of", lambda directory: SEATS.get)
+    monkeypatch.setattr(ba, "_desk_seat_of", lambda directory: seats(sc))
     args = SimpleNamespace(data_root=sc.cockpit, desk_dir=tmp_path)
     res = ba.resolvers_from_args(args)
-    assert res.authority is not None and res.seat_of("slot-key-77") == "worker L-77"
+    assert res.authority is not None and res.seat_of("slot-key-77").name == "worker L-77"
     assert verdict(sc, item(1), sc.c["signed"], res).tier == "signed"
     assert verdict(sc, item(3), sc.c["seat"], res).tier == "trailer"
+
+
+def _claimed_launch(store, cwd, item_id):
+    """A real launch record in ``store``, run in ``cwd``, that claimed ``item_id`` (the T7 claim, as ``--item`` writes it)."""
+    from levain.desk import lease
+
+    store.coord_set_agent("claude", cwd=str(cwd))
+    store.accept_drop("fix the build", surface="cli")
+    ln = store.coord_status()["launches"][0]
+    with store._write() as (conn, now):
+        lease.claim_board_items(conn, now, ln["launch_id"], [item_id])
+    return ln
 
 
 def _home(tmp_path, monkeypatch, *, cockpit=None):
@@ -353,14 +578,12 @@ def test_no_flags_the_install_defaults_find_the_launch_record_and_the_key(sc, tm
 
     home = _home(tmp_path, monkeypatch, cockpit=sc.cockpit)
     store = CoordStore(home / "consent")
-    store.coord_set_agent("claude", cwd=str(tmp_path))
-    store.accept_drop("fix the build", surface="cli")
-    ln = store.coord_status()["launches"][0]
+    ln = _claimed_launch(store, sc.repo, "scratch#20")
     seated = sc.commit(f"by seat\n\nBoard-Closes: scratch#20\nBoard-Seat: {ln['session_key']}", "Seat Person", T1, files={"l": "1"})
     sc.git("update-ref", "refs/remotes/origin/main", "HEAD")
     res = ba.resolvers_from_args(SimpleNamespace(data_root=None, desk_dir=None))
     signed = verdict(sc, item(1), sc.c["signed"], res)
-    assert (signed.tier, signed.how) == ("signed", "signed commit") and signed.who.startswith("operator k")
+    assert (signed.tier, signed.how) == ("signed", "signed by an operator key") and signed.who.startswith("k")
     seat = verdict(sc, item(20), seated, res)
     assert (seat.tier, seat.who) == ("trailer", f"agent {ln['role']} {ln['launch_id']}")
 
@@ -389,10 +612,16 @@ def test_the_flags_override_the_defaults(sc, tmp_path, monkeypatch):
 
 
 def test_one_authority_reader_board_author_reads_no_authority_log_directly():
-    """(b): every authority read goes through board_sign's reader."""
-    src = Path(ba.__file__).read_text(encoding="utf-8")
-    assert "authority_source" not in src and "authority_log" not in src
-    assert "read_authority" in src
+    """(b): every authority read goes through board_sign's reader, and every key judgement through its key rule: the
+    module imports nothing that reads or judges the log itself, and calls the two board_sign functions."""
+    import ast
+
+    tree = ast.parse(Path(ba.__file__).read_text(encoding="utf-8"))
+    imported = {a.name if isinstance(n, ast.Import) else f"{n.module}.{a.name}"
+                for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+    assert not {m for m in imported if m.startswith(("levain.authority", "levain.consent"))}, imported
+    called = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert {"read_authority", "resolve_authority", "key_standing"} <= called
 
 
 def test_a_real_launch_record_in_a_scratch_desk_store_maps_the_durable_key_to_a_seat(sc, tmp_path):
@@ -401,12 +630,11 @@ def test_a_real_launch_record_in_a_scratch_desk_store_maps_the_durable_key_to_a_
     qdir = tmp_path / "desk"
     qdir.mkdir(mode=0o700)
     store = CoordStore(qdir)
-    store.coord_set_agent("claude", cwd=str(tmp_path))
-    store.accept_drop("fix the build", surface="cli")
-    ln = store.coord_status()["launches"][0]
+    ln = _claimed_launch(store, sc.repo, "scratch#3")
     seat_of = ba._desk_seat_of(qdir)
-    key = store.coord_status()["launches"][0]["session_key"]
-    assert seat_of(key) == f"{ln['role']} {ln['launch_id']}"
+    key = ln["session_key"]
+    got = seat_of(key)
+    assert (got.name, got.items) == (f"{ln['role']} {ln['launch_id']}", ("scratch#3",))
     assert seat_of("no-such-key") is None
     with pytest.raises(ba.NotChecked):
         ba._desk_seat_of(tmp_path / "absent")(key)                  # a store that cannot be read is "not checked", said

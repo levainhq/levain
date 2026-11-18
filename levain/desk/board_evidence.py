@@ -62,7 +62,7 @@ from typing import Any
 from levain.desk.board_state import EVIDENCE_V, parse_timestamp
 
 __all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_NOTES_BYTES", "MAX_NOTES_ENTRIES", "MAX_OWN_COMMITS",
-           "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S", "read_documents", "read_git_evidence", "repo_name_of"]
+           "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S", "done_path", "read_documents", "read_git_evidence", "repo_name_of"]
 
 REMOTE = "origin"
 MAIN_BRANCH = "main"
@@ -954,18 +954,24 @@ def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot,
 
 
 # ------------------------------------------------------------------------------------------------ documents
+def done_path(key: str, repo: Path) -> Path:
+    """The path a ``document``/``run`` item's ``done`` text names: ``~`` expanded, a relative path read from ``repo``,
+    nothing resolved. The one rule: :func:`read_documents` (whether it exists) and the close's author
+    (``board_author``: which commit added it) both read the path through it."""
+    path = Path(os.path.expanduser(key))
+    return path if path.is_absolute() else Path(repo) / path
+
+
 def read_documents(items: Mapping[str, Any], repo: Path) -> dict[str, bool]:
     """``{path: bool}`` for the ``done`` path of every ``document``/``run`` item: True when it exists and is not empty
-    (a non-empty file or directory). A relative path is read from ``repo``; ``~`` is expanded. A path that cannot be
+    (a non-empty file or directory). The path is :func:`done_path`'s. A path that cannot be
     examined for any reason but being absent (a permission) is left out, so the item reads unknown, not not-done."""
     out: dict[str, bool] = {}
     for item in items.values():
         if getattr(item, "done_kind", None) not in ("document", "run") or not getattr(item, "done", None):
             continue
         key = item.done.strip()
-        path = Path(os.path.expanduser(key))
-        if not path.is_absolute():
-            path = Path(repo) / path
+        path = done_path(key, repo)
         try:
             if path.is_dir():
                 out[key] = any(True for _ in path.iterdir())
