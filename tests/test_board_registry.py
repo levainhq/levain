@@ -506,14 +506,27 @@ def test_track_checks_the_plan_against_the_manifest_both_ways(store, tmp_path, m
     land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {one}"))
     rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
     assert rc == 2 and f"the manifest's items not in the charter's Plan: {two}" in err
-    ok(capsys, "add", "--repo", "alpha", "--title", "extra", "--origin", "d", "--key", f"{m}:c", "--payload-hash", HASH_A, *A)
-    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {one}\n- {two}\n- alpha#3"))
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {one}\n- {two}\n- alpha#3"))     # a stray id: no item exists for it (levain#93)
     rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
-    assert rc == 2 and "the charter's Plan ids not in the manifest: alpha#3" in err
+    assert rc == 2 and "alpha#3 is not in" in err
     ok(capsys, "decide", "--id", two, "--decision", "cut", "--words", "dropped", *A)       # cut during the ceremony: out of the comparison
-    ok(capsys, "decide", "--id", "alpha#3", "--decision", "cut", "--words", "dropped", *A)
     land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {one}"))
     ok(capsys, "track", "alpha", "--words", "go", *A)
+
+
+def test_add_refuses_a_key_the_manifest_does_not_list_levain93(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, plan_items=["a", "b"])), "--words", "y", *A)
+    m = migration_of(store, "alpha")
+    first = add_item(capsys, "alpha", m, "a")
+    before = (store / "items.jsonl").read_text()
+    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "extra", "--origin", "d", "--key", f"{m}:c", "--payload-hash", HASH_A, *A)
+    assert rc == 2 and f"{m}:c" in err and "not one of the manifest's plan_items (a, b)" in err
+    assert (store / "items.jsonl").read_text() == before                       # nothing written
+    assert add_item(capsys, "alpha", m, "a") == first                          # the same key and hash stays idempotent
+    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "x", "--origin", "d", "--key", "mother:a", "--payload-hash", HASH_A, *A)
+    assert rc == 2 and f"--key {m}:<k>" in err                                 # the wrong-migration refusal is unchanged
 
 
 def test_track_refuses_a_manifest_item_that_was_never_added(store, tmp_path, mkrepo, capsys):

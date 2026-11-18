@@ -491,7 +491,8 @@ def run_state(args: argparse.Namespace) -> int:
     if whole:
         assert view is not None
         reads = []
-        held = {it.repo for it in folded.items.values()}
+        # An item the fold decided cut is settled (an abandon cut it): it needs no evidence, so it never makes its repo "not read".
+        held = {it.repo for it in folded.items.values() if it.decision is None or it.decision.decision != "cut"}
         for name, r in sorted(view.fold.repos.items()):
             if r.mode != "tracked":                    # tracking is mid-ceremony, aborting is an abort, untracked is not on the board
                 if name in held:                       # ... but its items are never dropped: they read unknown, and this says why

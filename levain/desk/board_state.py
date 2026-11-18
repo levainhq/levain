@@ -1476,6 +1476,8 @@ def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, 
         return set(items)
     for iid in list(seen):
         seen.update(dep for dep in ctx._deps(iid) if dep in items)
+    # A cut item is settled whatever its repo's evidence: it stays listed, reads cut, and says nothing about a repo not read.
+    seen.update(i for i, it in items.items() if it.decision is not None and it.decision.decision == "cut")
     return seen
 
 

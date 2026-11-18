@@ -11,7 +11,8 @@ import time
 from levain.desk import board_cli as bc
 from levain.desk import board_evidence as be
 from levain.desk import board_store as bs
-from tests.test_board_registry import A, bare_store, git, home, mkrepo, ok, run, store, track_ready  # noqa: F401
+from tests.test_board_registry import (A, add_item, bare_store, git, home, manifest, migration_of, mkrepo, ok, run, store,  # noqa: F401
+                                       track_ready)
 
 
 def _two_tracked(capsys, tmp_path, store, mkrepo):
@@ -126,6 +127,23 @@ def test_a_tracking_repo_and_an_untracked_repo_holding_items_are_not_read_and_sa
     assert any(w.startswith("gamma: the repo is tracking, not tracked: not read") for w in reasons)
     assert any(w.startswith("delta: the repo is untracked, not tracked: not read") for w in reasons)
     assert [x["repo"] for x in doc["reader"]["repos"]] == ["alpha", "beta"]                   # neither was read
+
+
+def test_an_aborted_repos_cut_items_are_settled_not_unknown_and_make_no_audit_line_levain93(store, tmp_path, mkrepo, capsys):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    c, d = mkrepo("gamma"), mkrepo("delta")
+    ok(capsys, "register", "gamma", "--path", str(c), "--words", "w", *A)
+    ok(capsys, "begin-track", "gamma", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
+    add_item(capsys, "gamma", migration_of(store, "gamma"), "a")
+    ok(capsys, "abandon-track", "gamma", "--words", "never mind", *A)
+    ok(capsys, "abandon-done", "gamma", *A)
+    _, did = track_ready(capsys, tmp_path, store, d, "delta")                                 # an undecided item of a repo not read stays unknown
+    rc, doc, err = _state(capsys)
+    assert rc == 3, err
+    assert _states(doc)["gamma#1"] == "cut" and _states(doc)["delta#1"] == "unknown"
+    reasons = [e["why"] for e in doc["audit"] if e["id"] is None]
+    assert not any(w.startswith("gamma:") for w in reasons) and not any(p.startswith("gamma:") for p in doc["problems"])
+    assert any(w.startswith("delta: the repo is tracking, not tracked: not read") for w in reasons)
 
 
 def test_one_freshness_and_one_labeling_across_repos(store, tmp_path, mkrepo, capsys, monkeypatch):
