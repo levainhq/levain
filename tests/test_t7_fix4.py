@@ -161,3 +161,15 @@ def test_run_state_writes_the_collected_streams_when_the_read_raises(monkeypatch
     cap = capsys.readouterr()
     assert cap.out == "partial out\n" and cap.err == "earlier stderr line\n"
     assert sys.stdout is not None
+
+
+def test_table_lines_takes_the_label_from_the_docs_scope_and_marks_idless_audit_lines():
+    # L3 r4 (deepseek LOW, complement LOW): a doc filtered by only_repo and printed without repo_name keeps its labels;
+    # an id-less audit line under a filter says it is the whole board's, an item's audit line does not.
+    doc = {**_whole(), "reader": {"diverged": ["b:dev"]}}
+    doc["audit"].append({"kind": "k", "id": "a#1", "why": "w"})
+    text = "\n".join(board_cli.table_lines(board_cli.only_repo(doc, "a")))
+    assert "reader (whole board): diverged: b:dev" in text
+    assert "audit (whole board) " in text and "audit k: a#1: w" in text
+    plain = "\n".join(board_cli.table_lines(doc))
+    assert "(whole board)" not in plain

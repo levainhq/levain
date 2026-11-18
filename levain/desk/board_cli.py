@@ -784,16 +784,18 @@ def only_repo(doc: dict[str, Any], repo_name: str | None) -> dict[str, Any]:
 
 def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     """The table :func:`_print_table` prints, as lines. ``repo_name`` keeps only the items (and audit entries) of the
-    repo whose ids read ``NAME#N`` (:func:`only_repo`); the header counts what it keeps, and the reader lines say they
-    describe the whole board."""
+    repo whose ids read ``NAME#N`` (:func:`only_repo`); the header counts what it keeps, and on a filtered doc the
+    reader lines and the id-less audit lines say they are the whole board's."""
     doc = only_repo(doc, repo_name)
     items, audit = doc["items"], doc["audit"]
     lines = [f"board {doc['schema']} as of {doc['as_of'] or 'unknown'}: {len(items)} items, {len(audit)} audit entries"]
     for s in items:
         lines.append(f"  {s['id']:<14} {s['state']:<18} {s['reason']}")
+    whole = doc.get("reader_scope") == "board"          # a filtered doc: say which lines are the whole board's
     for a in audit:
-        lines.append(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}")
-    label = "reader (whole board): " if repo_name is not None else ""
+        tag = "(whole board) " if whole and a["id"] is None else ""
+        lines.append(f"  audit {tag}{a['kind']}: {a['id'] or '-'}: {a['why']}")
+    label = "reader (whole board): " if whole else ""
     for name in doc.get("reader", {}).get("diverged", []):
         lines.append(f"  {label}diverged: {name}: the local head and origin's copy each hold commits the other lacks (ahead is the union)")
     return lines
