@@ -50,7 +50,7 @@ def _empty_board(monkeypatch):
     board reads as an empty one. The board block itself is tested in tests/test_t7_v1_retire.py."""
     from levain.desk import board_cli
 
-    monkeypatch.setattr(board_cli, "state_doc", lambda items=None, **kw: (0, {"schema": 3, "as_of": None, "items": [], "audit": []}, ""))
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (0, {"schema": 3, "as_of": None, "items": [], "audit": []}, ""))
 
 
 @pytest.fixture

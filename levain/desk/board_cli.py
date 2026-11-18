@@ -44,6 +44,7 @@ import errno
 import io
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -58,7 +59,7 @@ from levain.desk import board_producers as bp
 from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "read_board", "register", "run_state", "state_doc", "table_lines"]
+__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "only_repo", "read_board", "register", "run_state", "state_doc", "table_lines"]
 
 ITEMS_ENV = bs.ITEMS_ENV
 #: Read when ``--launch-key`` is not given. Nothing in Levain's launch path exports it yet; the flag is the sure way.
@@ -766,12 +767,36 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     return (EXIT_AUDIT if board.audit or registry_audit else 0), doc
 
 
+def only_repo(doc: dict[str, Any], repo_name: str | None) -> dict[str, Any]:
+    """``doc`` with only the items, audit entries, ``reader.diverged`` entries and problems of the repo whose ids read
+    ``NAME#N``; every store-wide entry (no repo named) stays. ``None`` keeps the whole board."""
+    if repo_name is None:
+        return doc
+
+    def mine(i: Any) -> bool:
+        return isinstance(i, str) and i.startswith(repo_name + "#")
+
+    def other_problem(p: Any) -> bool:      # "repo X not read: ..." names one repo; any other problem is the store's
+        m = re.match(r"repo (\S+) ", p) if isinstance(p, str) else None
+        return m is not None and m.group(1) != repo_name
+
+    out = {**doc, "items": [i for i in doc["items"] if mine(i["id"])],
+           "audit": [a for a in doc["audit"] if a["id"] is None or mine(a["id"])],
+           "problems": [p for p in doc.get("problems", []) if not other_problem(p)]}
+    reader = doc.get("reader")
+    if isinstance(reader, dict) and isinstance(reader.get("diverged"), list):
+        out["reader"] = {**reader, "diverged": [d for d in reader["diverged"]
+                                                if ":" not in str(d) or str(d).startswith(repo_name + ":")]}
+    return out
+
+
 def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     """The table :func:`_print_table` prints, as lines. ``repo_name`` keeps only the items (and audit entries) of the
     repo whose ids read ``NAME#N``; the header counts what it keeps."""
     def mine(i: Any) -> bool:
         return repo_name is None or (isinstance(i, str) and i.startswith(repo_name + "#"))
 
+    doc = only_repo(doc, repo_name)
     items = [s for s in doc["items"] if mine(s["id"])]
     audit = [a for a in doc["audit"] if repo_name is None or a["id"] is None or mine(a["id"])]
     lines = [f"board {doc['schema']} as of {doc['as_of'] or 'unknown'}: {len(items)} items, {len(audit)} audit entries"]

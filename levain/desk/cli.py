@@ -2118,19 +2118,18 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore | None
     ``move`` and ``correct`` never get here (:func:`_retired_v1_verb`)."""
     from levain.desk import board_cli, ready
 
-    code, doc, err = board_cli.read_board()
+    if getattr(args, "all", False):
+        print("levain desk ready show: --all is ignored; the board is always shown whole", file=sys.stderr)
+    qdir = getattr(args, "queue_dir", None)       # the desk store whose seats and band the board's native producer reads
+    code, doc, err = board_cli.read_board(consent_dir=qdir)
     retired = "the v1 ready queue is retired; this is `levain board state`, the board"
     if doc is None:
         _emit(out, args.json, {"retired": True, "board": None, "why": err, "exit": code},
               f"{retired}\nthe board could not be read: {err or 'no reason given'}")
-        return 0 if code in (0, board_cli.EXIT_AUDIT) else 1
+        return 0 if code in (0, board_cli.EXIT_AUDIT) else 1     # as before T7, a readable board exits 0 (a show is a read)
     name = args.repo
     if args.json:
-        def mine(i: Any) -> bool:
-            return name is None or str(i).startswith(name + "#")
-
-        shown = {**doc, "items": [i for i in doc["items"] if mine(i["id"])],
-                 "audit": [a for a in doc["audit"] if a["id"] is None or mine(a["id"])]}
+        shown = board_cli.only_repo(doc, name)
         _emit(out, True, {"retired": True, "board": shown, "exit": code}, "")
     else:
         _emit(out, False, None, "\n".join([retired, *board_cli.table_lines(doc, name)]))

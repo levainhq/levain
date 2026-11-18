@@ -454,6 +454,7 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
 
 
+BOARD_ITEMS_CELL_MAX = 64 * 1024     # the longest claim cell the read parses (a bound before json.loads)
 BOARD_ITEM_MAX = 200     # the longest board item id a claim holds (the v1 item id's own bound)
 
 
@@ -462,10 +463,14 @@ def check_board_items(items: Sequence[object]) -> list[str]:
     :data:`BOARD_ITEM_MAX` characters. Pure: it reads no store, so a caller checks it BEFORE any side effect."""
     from levain.desk import board_store
 
+    msg = f"a launch's board items are distinct board item ids (NAME#N, at most {BOARD_ITEM_MAX} characters)"
+    if not isinstance(items, (list, tuple)):
+        raise _refused(msg)
     got = list(items)
-    if not got or len(set(got)) != len(got) or any(
-            not isinstance(i, str) or len(i) > BOARD_ITEM_MAX or board_store.ID_RE.fullmatch(i) is None for i in got):
-        raise _refused(f"a launch's board items are distinct board item ids (NAME#N, at most {BOARD_ITEM_MAX} characters)")
+    if not got or any(not isinstance(i, str) or len(i) > BOARD_ITEM_MAX or board_store.ID_RE.fullmatch(i) is None for i in got):
+        raise _refused(msg)         # types are judged BEFORE a set is built: an unhashable item is a refusal, never a TypeError
+    if len(set(got)) != len(got):
+        raise _refused(msg)
     return got
 
 
@@ -663,13 +668,13 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
         got = conn.execute("SELECT items FROM launch_board_items WHERE launch_id = ?", (r[0],)).fetchone()
         if got is not None:
             try:
-                parsed = json.loads(got[0])
-                if not isinstance(parsed, list) or not parsed or not all(isinstance(i, str) for i in parsed):
-                    raise ValueError("not a list of ids")
-                claimed = tuple(parsed)
-            except (TypeError, ValueError):
+                cell = got[0]
+                if not isinstance(cell, str) or len(cell) > BOARD_ITEMS_CELL_MAX:
+                    raise ValueError("cell too long or not text")
+                claimed = tuple(check_board_items(json.loads(cell)))      # the write's own validator: a cell the write would refuse is damaged
+            except (LeaseRefused, TypeError, ValueError, RecursionError):
                 # a damaged cell is this launch's unknown claim, never a failure of every launch read
-                why = "its claim cell in launch_board_items is damaged"
+                claimed, why = None, "its claim cell in launch_board_items is damaged"
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
                   hsid, events[-1][3], r[9], pin, bool(r[10]), r[11], claimed, why)
 
