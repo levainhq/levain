@@ -138,7 +138,7 @@ def stored_time(store: Any) -> str | None:
 
 def stored_live_bound(store: Any) -> str | None:
     """The :func:`live_binding` the dream spec registered in ``store`` carries (None: none registered, or it binds no
-    program or model)."""
+    program, model or facts file)."""
     from levain.agents import spec as _spec
 
     held = _spec.stored_specs(store).get(NAME)
@@ -182,9 +182,11 @@ LIVE_SOURCE = "the install's anneal store: episodes since its last wrap"
 #: ``input.source`` of a shadow install's spec starts with this; the rest is :func:`shadow_binding` of its facts
 SHADOW_SOURCE = ("a SHADOW of flow's dream, bound to these install facts (a change is a new spec, which needs a new "
                  "signed link): ")
-#: ``input.source`` of a live install's spec whose program or model is not the default is :data:`LIVE_SOURCE` + this +
-#: :func:`live_binding` of its facts; with the defaults it is :data:`LIVE_SOURCE` alone
-LIVE_BOUND = (", bound to this dream program and model (a change is a new spec, which needs a new signed link): ")
+#: ``input.source`` of a live install's spec whose program or model is not the default, or that names a first-run
+#: facts file, is :data:`LIVE_SOURCE` + this + :func:`live_binding` of its facts; with the defaults and no facts file
+#: it is :data:`LIVE_SOURCE` alone
+LIVE_BOUND = (", bound to this dream program, model and first-run facts file (a change is a new spec, which needs a "
+              "new signed link): ")
 
 
 def live_source(live: str | None) -> str:
@@ -206,6 +208,14 @@ def bound_pair(live: str | None) -> tuple[str, str]:
     return str(doc["claude_bin"]), str(doc["model"])
 
 
+def bound_facts_path(live: str | None) -> str | None:
+    """The first-run facts file a :func:`live_binding` ``live`` binds (None: it binds none, or ``live`` is None)."""
+    if live is None:
+        return None
+    v = json.loads(live).get("facts_path")
+    return None if v is None else str(v)
+
+
 def dream_spec(role_hash: str, binding: str | None = None, time: str = DEFAULT_TIME, *,
                live: str | None = None) -> dict[str, Any]:
     """The AgentSpec template (§1.2). The zone is left unset: the install's default zone fills it (rule 6), and an
@@ -214,8 +224,8 @@ def dream_spec(role_hash: str, binding: str | None = None, time: str = DEFAULT_T
 
     ``binding`` (:func:`shadow_binding`) makes it a SHADOW install's spec: the install facts are part of the signed
     object, so a link signed for one shadow install never covers another, nor a live one (and the reverse).
-    ``live`` (:func:`live_binding`) binds a LIVE install's compose program and model the same way; passing both is a
-    ``ValueError``.
+    ``live`` (:func:`live_binding`) binds a LIVE install's compose program and model and its first-run facts file the
+    same way; passing both is a ``ValueError``.
 
     ``time`` (:func:`validate_time`) is the dream's time of night, an install setting; it is written into the spec as the
     trigger's cron (:func:`cron_for`), so it is part of the signed object too: the link names the spec's hash, and the
@@ -308,20 +318,25 @@ def _when_text(zone: str, time: str) -> str:
 
 def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expires: str,
                       store_dir: Path | str | None, time: str = DEFAULT_TIME,
-                      bound: tuple[str, str] | None = None) -> str:
+                      bound: tuple[str, str] | None = None, bound_facts: str | None = None) -> str:
     """The words the link's signing card carries (§6), with the numbers the caller computed from §2.4's ``R``. ``time``
     is the install's time setting; it is part of the spec the link signs, so the card says it and a changed time is a
     new card to sign. ``store_dir`` is the directory holding the install's ``memory.db`` and has NO default: the Undo
     command needs it (``levain dream rollback`` requires ``--store-dir``), so the caller says it. ``None`` is the
     caller saying the install's facts are not written yet; the card then names the verb and no command line, so it
     never prints a stand-in for a path. A blank string is refused. ``bound`` is ``(claude_bin, model)`` when the spec
-    binds a program or model that is not the default (:func:`live_binding`), so the card says what the link covers:
-    the program's name, never the file it leads to."""
+    binds a program, model or facts file (:func:`live_binding`), so the card says what the link covers: the program's
+    name, never the file it leads to. ``bound_facts`` is the first-run facts file that binding names (None: none); the
+    card says its path is signed and its contents are not."""
     program = "" if bound is None else (
         f"The dream program and the model are part of what you sign: the program by its name, {bound[0]}, and the "
         f"model {bound[1]}. A fire whose install facts name another program or model refuses, and a change needs a new "
         "signed link. The program is bound by its name only: whatever file that name leads to when the dream runs (the "
         "file at that path, or the first one found on PATH for a bare name) is what runs. ")
+    if bound is not None and bound_facts is not None:
+        program += (f"It reads its first-run facts from {bound_facts}, a file whose contents set what the executor will "
+                    "run; the path is part of what you sign, the contents are not: a fire whose install facts name "
+                    "another file refuses. ")
     if store_dir is None:
         undo = ("`levain dream rollback` (each morning card names the exact command, with this install's store in it)")
     else:
@@ -1520,32 +1535,47 @@ def shadow_binding(*, shadow_flow_root: Path | str, store_path: Path | str, coor
     would bind a spec the install can change without a new signed link.
     The instructions are bound by path, not by content: each seed re-copies flow's file so the night composes with
     what flow's own dream read, and the card names the sha256 each night composed with."""
-    def p(v: Path | str) -> str:
-        return str(Path(v).expanduser())
-
+    p = _bound_path
     return json.dumps({"flow_root": p(shadow_flow_root), "scratch_store": p(store_path), "coord_dir": p(coord_dir),
                        "cockpit_root": p(cockpit_root), "flow_instructions": p(flow_instructions),
-                       "zone": str(zone), "facts_path": None if facts_path is None else p(facts_path),
+                       "zone": str(zone), "facts_path": _bound_facts_path(facts_path),
                        "instructions_policy": "re-copied read-only at each seed",
                        "model": model or DEFAULT_CLAUDE_MODEL, "claude_bin": claude_bin or DEFAULT_CLAUDE_BIN},
                       sort_keys=True)
 
 
-def live_binding(*, model: str | None, claude_bin: str | None) -> str | None:
+def _bound_path(v: Path | str) -> str:
+    """A path as a spec binds it, shadow and live alike: ``~`` expanded, never resolved."""
+    return str(Path(v).expanduser())
+
+
+def _bound_facts_path(facts_path: Path | str | None) -> str | None:
+    """The first-run facts file as a spec binds it, shadow and live alike (None: the install names none)."""
+    return None if facts_path is None else _bound_path(facts_path)
+
+
+def live_binding(*, model: str | None, claude_bin: str | None, facts_path: Path | str | None = None) -> str | None:
     """The facts a LIVE install's spec binds (:func:`live_source`): the compose's program, exactly the string the fire
-    runs as its argv[0], and its model, canonical JSON. None when both are the defaults, so the default install's spec
-    keeps the bytes it had before this binding existed. The program is bound by name, not by content."""
-    m, b = model or DEFAULT_CLAUDE_MODEL, claude_bin or DEFAULT_CLAUDE_BIN
-    if m == DEFAULT_CLAUDE_MODEL and b == DEFAULT_CLAUDE_BIN:
+    runs as its argv[0], its model, and the first-run facts file the exposure check reads (``facts_path``, by path,
+    as :func:`shadow_binding` binds it), canonical JSON. None when the program and model are the defaults and no facts
+    file is named, so the default install's spec keeps the bytes it had before this binding existed; the
+    ``facts_path`` key is written only when a file is named. The program is bound by name and the facts file by path,
+    neither by content. Every caller in this build passes ``facts_path``; its default is "the install names none"."""
+    m, b, f = model or DEFAULT_CLAUDE_MODEL, claude_bin or DEFAULT_CLAUDE_BIN, _bound_facts_path(facts_path)
+    if m == DEFAULT_CLAUDE_MODEL and b == DEFAULT_CLAUDE_BIN and f is None:
         return None
-    return json.dumps({"claude_bin": b, "model": m}, sort_keys=True)
+    return json.dumps({"claude_bin": b, "model": m} | ({} if f is None else {"facts_path": f}), sort_keys=True)
 
 
 def install_live_binding(doc: Mapping[str, Any]) -> str | None:
     """:func:`live_binding` of an :func:`install_doc` document (None for a shadow one, or a live one with the defaults)."""
     if doc.get("shadow_flow_root") is not None:
         return None
-    return live_binding(model=doc.get("model"), claude_bin=doc.get("claude_bin"))
+    try:
+        return live_binding(model=doc.get("model"), claude_bin=doc.get("claude_bin"), facts_path=doc.get("facts_path"))
+    except (RuntimeError, TypeError) as exc:     # Path.expanduser of "~nouser/...", or a facts_path that is not a path
+        raise InstallRefused(f"the install's facts_path {doc.get('facts_path')!r} cannot be read as a path "
+                             f"({type(exc).__name__}: {exc}), so it cannot be bound into the spec") from exc
 
 
 def check_program_facts(doc: Mapping[str, Any], path: Path | str) -> None:
@@ -1638,11 +1668,11 @@ def _spec_source(agent_dir: Path | str, spec_hash: object) -> str:
 
 def _well_formed_bound(signed: str) -> bool:
     """True when ``signed`` (the rest of a source after :data:`LIVE_SOURCE` + :data:`LIVE_BOUND`) is exactly what
-    :func:`live_binding` writes for some non-default program and model."""
+    :func:`live_binding` writes for some program, model and facts file other than the defaults with none."""
     try:
         b, m = bound_pair(signed)
-        return live_binding(model=m, claude_bin=b) == signed
-    except (ValueError, KeyError, TypeError):
+        return live_binding(model=m, claude_bin=b, facts_path=bound_facts_path(signed)) == signed
+    except (ValueError, KeyError, TypeError, AttributeError, RuntimeError):
         return False
 
 
@@ -1670,7 +1700,8 @@ def _version_for_facts(agent_dir: Path | str, inst: DreamInstall) -> tuple[str, 
         time = time_from_cron(json.loads(cur[0])["trigger"]["cron"])
         role_hash = _role.role_hash(_role.parse_role(dream_role()))
         want = _spec.canonical_spec(_spec.finalize_spec(
-            dream_spec(role_hash, time=time, live=live_binding(model=inst.model, claude_bin=inst.claude_bin)),
+            dream_spec(role_hash, time=time, live=live_binding(model=inst.model, claude_bin=inst.claude_bin,
+                                                                facts_path=inst.facts_path)),
             None if zone is None else zone[0]))
         version = _spec.earlier_version(conn, held[0], want)
     finally:
@@ -1710,23 +1741,31 @@ def _revise_advice(agent_dir: Path | str, inst: DreamInstall) -> str:
 
 def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str | None, *,
                         unknown: str | None = None) -> str:
-    """The words of :func:`check_bound`'s refusal of a live install whose program or model is not what its spec binds
-    (``signed``: the spec's :func:`live_binding`, None when it binds none; ``unknown``: the spec's source when it is
-    none this build writes for a live install)."""
-    facts = f"this install's facts name the program {inst.claude_bin!r} and the model {inst.model!r}"
+    """The words of :func:`check_bound`'s refusal of a live install whose program, model or first-run facts file is
+    not what its spec binds (``signed``: the spec's :func:`live_binding`, None when it binds none; ``unknown``: the
+    spec's source when it is none this build writes for a live install). The lead names the program and model when
+    either differs (or the source is unknown), and the facts file when only it does."""
+    def facts_file(p: Path | str | None) -> str:
+        return "no first-run facts file" if p is None else f"the first-run facts file {str(p)!r}"
+
+    facts = (f"this install's facts name the program {inst.claude_bin!r}, the model {inst.model!r} and "
+             f"{facts_file(inst.facts_path)}")
     if unknown is not None:
         spec_side = (f"the occurrence's spec has the input source {unknown[:200]!r}, which is not one this build "
-                     "writes for a live install, so its link covers no live install's program and model")
+                     "writes for a live install, so its link covers no live install's program, model and facts file")
     elif signed is None:
-        spec_side = (f"the occurrence's spec binds no dream program or model, so its link covers only the defaults "
-                     f"({DEFAULT_CLAUDE_BIN!r} and {DEFAULT_CLAUDE_MODEL!r}): it was registered with the defaults, or "
-                     "before the dream program and model were bound into the spec")
+        spec_side = (f"the occurrence's spec binds no dream program or model, nor a first-run facts file, so its link "
+                     f"covers only the defaults ({DEFAULT_CLAUDE_BIN!r} and {DEFAULT_CLAUDE_MODEL!r}) with no facts "
+                     "file named: it was registered with the defaults, or before the dream program, model and facts "
+                     "file were bound into the spec")
     else:
         sb, sm = bound_pair(signed)
-        spec_side = (f"the occurrence's spec binds the program {sb!r} and the model {sm!r}: the facts changed after "
-                     "that spec was registered")
-    return (f"the dream program and model are not what the occurrence's spec binds: {facts}, but {spec_side}. Every "
-            f"fire of that spec refuses. {_revise_advice(agent_dir, inst)}")
+        spec_side = (f"the occurrence's spec binds the program {sb!r}, the model {sm!r} and "
+                     f"{facts_file(bound_facts_path(signed))}: the facts changed after that spec was registered")
+    pair_differs = unknown is not None or bound_pair(signed) != (inst.claude_bin, inst.model)
+    lead = ("the dream program and model are not what the occurrence's spec binds" if pair_differs else
+            "the dream's first-run facts file is not what the occurrence's spec binds")
+    return f"{lead}: {facts}, but {spec_side}. Every fire of that spec refuses. {_revise_advice(agent_dir, inst)}"
 
 
 def bound_refusal_now(agent_dir: Path | str, spec_hash: object) -> str | None:
@@ -1753,8 +1792,9 @@ def bound_refusal_now(agent_dir: Path | str, spec_hash: object) -> str | None:
 def check_bound(agent_dir: Path | str, row: Mapping[str, Any], inst: DreamInstall) -> None:
     """Refuse (:class:`InstallRefused`) an occurrence whose spec does not bind ``inst``: a shadow install runs only
     under the spec whose source is :data:`SHADOW_SOURCE` + its own :func:`shadow_binding`, and a live install never
-    runs under a shadow spec. A live install runs only under a spec that binds its own :func:`live_binding`: the one
-    :func:`live_source` writes, or, for the default program and model, the exact :data:`LIVE_SOURCE` alone. Any other
+    runs under a shadow spec. A live install runs only under a spec that binds its own :func:`live_binding` (program,
+    model and first-run facts file): the one :func:`live_source` writes, or, for the default program and model with no
+    facts file, the exact :data:`LIVE_SOURCE` alone. Any other
     source is refused, never read as "binds nothing". The link signs the spec, so this is what makes a signature
     cover these facts only. A live refusal names both sides and the command that registers a spec for these facts
     (:func:`_revise_advice`)."""
@@ -1766,7 +1806,7 @@ def check_bound(agent_dir: Path | str, row: Mapping[str, Any], inst: DreamInstal
         signed = live_bound_of(source)
         if source != LIVE_SOURCE and (signed is None or not _well_formed_bound(signed)):
             raise InstallRefused(_live_bound_refusal(agent_dir, inst, signed, unknown=source))
-        if signed != live_binding(model=inst.model, claude_bin=inst.claude_bin):
+        if signed != live_binding(model=inst.model, claude_bin=inst.claude_bin, facts_path=inst.facts_path):
             raise InstallRefused(_live_bound_refusal(agent_dir, inst, signed))
         return
     want = SHADOW_SOURCE + shadow_binding(shadow_flow_root=inst.shadow_flow_root, store_path=inst.store_path,

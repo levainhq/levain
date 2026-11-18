@@ -47,8 +47,8 @@ def nightly(monkeypatch):
     night it belongs to (``w:<date>T22:00``)."""
     real = launch_tests._spec
 
-    def spec(cron="0 * * * *", name=None):
-        d = real(cron="0 * * * *", name=name)
+    def spec(cron="0 * * * *", name=None, source=None):
+        d = real(cron="0 * * * *", name=name, source=source)
         d["trigger"]["window"] = dict(NIGHT)
         return d
 
