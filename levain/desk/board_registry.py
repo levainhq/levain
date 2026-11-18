@@ -28,7 +28,9 @@ Known edges, left open under the reachability line (nobody reaches them):
 * a multi-GB ``CHARTER.md`` blob is read whole by git before the 1 MiB check refuses it;
 * I1 runs before ``add``'s idempotent-key hit, so a lost-response retry after the repo moved to ``aborting`` is refused (the repo is being aborted);
 * a torn registry refuses every launch (fail-closed by design, I5);
-* a launch refused AFTER registration (a stale lease token, an unknown thread, a bad model) leaves a ``register`` record for the repo in cwd: the record is true, only earlier than its first launch (the lease and thread checks need the coordination db's transaction);
+* a launch refused AFTER registration leaves a ``register`` record for the repo in cwd: the lease and request checks run first in a rolled-back dry run, so only a lease that changed between that dry run and the final request reaches it; the record was judged true (idempotent, only earlier than the repo's first launch);
+* a registry ``track`` or abort that lands between the launch's stamp check and its commit is not seen by that launch: the check refuses every change it sees, and the window was judged too narrow to reach in real use (a lock spanning both stores would invert the lock order);
+* an unrelated registry write (another repo's launch registration or ``register``) moves the stamp, so a launch deciding at that moment is refused with "ask again": judged a spurious refusal only, and the desk retries;
 * a replayed ``abandon-done`` on an already ``untracked`` repo is accepted with no migration check: a no-op there, and only a hand-written line produces it;
 * ``untrack`` refuses on any change to the items file between its check and its write: retryable, it says "run it again".
 * ``begin-track`` replayed AFTER ``track`` refuses ("tracked, not untracked"): T2-a's idempotence covers a lost-response
@@ -1166,10 +1168,11 @@ def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = 
                     environ: Mapping[str, str] | None = None, *, item: str | None = None) -> tuple[str, str | None]:
     """``(protocol, migration)``: the close protocol a worker launched in ``cwd`` for board item ``item`` runs under, from the
     mode its repository has in the registry now (design 6, "The close, chosen by the LAUNCH protocol"). The repository is the
-    item's (its ``NAME#`` prefix, when NAME is registered), else the one ``cwd`` is in. No registry, or an untracked or
-    unregistered repository, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a
+    item's (its ``NAME#`` prefix) when there is an item, else the one ``cwd`` is in. No registry, or an untracked
+    repository, or (with no item) a ``cwd`` in no registered repository, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a
     ``tracking`` or ``aborting`` repository gives ``ceremony`` and keeps that id. Raises BoardError (the launch is refused) for:
     any other launch on a ``tracking`` or ``aborting`` repository (locked to new work until ``track`` or ``abandon-done``);
+    an item whose prefix is not a registered repository, whatever the ``cwd`` (no item of it can be on the board);
     a launch on a ``tracked`` repository with no item (a worker there is launched for its item); a ``cwd`` outside the
     item's repository when either is not untracked; a ``cwd`` git cannot place that lies inside a registered repository;
     and an unreadable registry. A migration id on a launch whose repository is not in a ceremony is ignored, as is one on a
@@ -1185,13 +1188,18 @@ def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = 
         return "legacy", None
     repos = view.fold.repos
     here = _launch_repo(cwd, repos)
-    named = repos.get(item.partition("#")[0]) if item else None
-    if named is not None and (here is None or here.name != named.name) and \
-            (named.mode != "untracked" or (here is not None and here.mode != "untracked")):
-        where = f"{here.name} ({here.mode})" if here is not None else "no registered repository"
-        raise BoardError(f"{item} is an item of {named.name} ({named.mode}), and the launch's directory is in {where}: a "
-                         f"worker for it is launched in {named.name}'s own directory, {named.path}")
-    cur = named if named is not None else here
+    cur = here
+    if item:
+        prefix = item.partition("#")[0]
+        cur = repos.get(prefix)
+        if cur is None:
+            raise BoardError(f"{item} names {prefix!r}, which is not a registered repository (`levain board repos` lists "
+                             f"them): no item of it can be on the board")
+        if (here is None or here.name != cur.name) and \
+                (cur.mode != "untracked" or (here is not None and here.mode != "untracked")):
+            where = f"{here.name} ({here.mode})" if here is not None else "no registered repository"
+            raise BoardError(f"{item} is an item of {cur.name} ({cur.mode}), and the launch's directory is in {where}: a "
+                             f"worker for it is launched in {cur.name}'s own directory, {cur.path}")
     if cur is None or cur.mode == "untracked":
         return "legacy", None
     if cur.mode == "tracked":

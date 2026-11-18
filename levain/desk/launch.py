@@ -556,10 +556,39 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
     ]
 
 
+def _board_forms(lv: str) -> dict[str, str]:
+    """The complete form of each board and charter verb the desk runs, keyed by verb, with ``lv`` the install's own
+    command. This is the ONE place a verb's spelling lives: the verb list and every ceremony step of
+    :func:`_board_modes_section` print these strings, so a flag a verb comes to need (a decision's ``--source`` or
+    ``--sign``, say) is added here once. Each parses as written once its placeholders (NAME, NAME#N, DIR, FILE, M, K,
+    DECISION, SHA256) are filled (tests/test_t10_briefs.py)."""
+    return {
+        "board state": f"{lv} board state",
+        "board repos": f"{lv} board repos",
+        "board context": f"{lv} board context NAME#N",
+        "board add": f"{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --by desk",
+        "board add --key": f"{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --key M:K "
+                           "--payload-hash SHA256 --by desk",
+        "board amend": f"{lv} board amend --id NAME#N --why \"...\" --by desk",
+        "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk",
+        "board use": f"{lv} board use DIR",
+        "board register": f"{lv} board register NAME --path DIR --words \"his words\" --by desk",
+        "charter init": f"{lv} charter init NAME --repo DIR",
+        "charter check": f"{lv} charter check --repo DIR",
+        "board begin-track": f"{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk",
+        "board track": f"{lv} board track NAME --migration M --words \"his yes\" --by desk",
+        "board abandon-track": f"{lv} board abandon-track NAME --words \"his words\" --by desk",
+        "board abandon-done": f"{lv} board abandon-done NAME --by desk",
+        "board untrack": f"{lv} board untrack NAME --words \"his words\" --by desk",
+    }
+
+
 def _board_modes_section(lv: str) -> list[str]:
     """The desk brief's section on the work board: the two modes of a repository, the verbs, and the ceremony in the
     order the design fixes (5). ``lv`` is the install's own command, spelled as the other verbs are, so each verb here
-    is one the desk's door allows as written. Fixed text; it names no count and no repository."""
+    is one the desk's door allows as written. Every command it prints is a complete form from :func:`_board_forms`.
+    Fixed text; it names no count and no repository."""
+    f = _board_forms(lv)
     return [
         "## The work board: two modes",
         "",
@@ -567,31 +596,26 @@ def _board_modes_section(lv: str) -> list[str]:
         "pickup file) and its seats close by rewriting the `## ▶ CURRENT STATE` block. A tracked one keeps its intent in "
         "`CHARTER.md` and its work as items on the board: a seat there loads `board context`, not a file, and closes by an "
         "episode and a trailer per item. Two more states exist only inside a ceremony: `tracking` and `aborting`. "
-        "A repository in either is locked to new work, and a worker launch on it is refused unless it carries the "
-        f"ceremony's migration id (`{lv} coord spawn --migration M`).",
+        "A repository in either is locked to new work, and a worker launch on it is refused unless its `coord spawn` "
+        "carries the ceremony's migration id as `--migration M`.",
         "",
         "These are `board` and `charter` verbs, not `coord` verbs, and you run them yourself: your door opens exactly "
         "the ones named below, and no other. On them `--by` names the record's author (you write `--by desk`) and "
         "they take no `--token`. A write's authority is checked by the writer, not by the door: a decision needs the "
         "operator's signature or a relayed answer of his.",
         "",
-        f"- read: `{lv} board state`, `{lv} board repos`, `{lv} board context NAME#N`;",
-        f"- an item: `{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --by desk`, "
-        f"`{lv} board amend --id NAME#N --why \"...\" --by desk`, "
-        f"`{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk`;",
-        f"- the store and a repository: `{lv} board use DIR`, `{lv} board register NAME --path DIR --words \"his words\" "
-        "--by desk`;",
-        f"- a charter: `{lv} charter init NAME --repo DIR`, `{lv} charter check --repo DIR`;",
-        f"- the mode: `{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk`, "
-        f"`{lv} board track NAME --migration M --words \"his yes\" --by desk`, "
-        f"`{lv} board abandon-track NAME --words \"his words\" --by desk`, `{lv} board abandon-done NAME --by desk`, "
-        f"`{lv} board untrack NAME --words \"his words\" --by desk`.",
+        f"- read: `{f['board state']}`, `{f['board repos']}`, `{f['board context']}`;",
+        f"- an item: `{f['board add']}`, `{f['board amend']}`, `{f['board decide']}`;",
+        f"- the store and a repository: `{f['board use']}`, `{f['board register']}`;",
+        f"- a charter: `{f['charter init']}`, `{f['charter check']}`;",
+        f"- the mode: `{f['board begin-track']}`, `{f['board track']}`, `{f['board abandon-track']}`, "
+        f"`{f['board abandon-done']}`, `{f['board untrack']}`.",
         "",
         "Tracking a repository starts when the operator says so, in conversation. Never begin it on your own reading, and "
         "write nothing before his yes. In this order:",
         "",
-        f"1. If this install has no item store, run `{lv} board use DIR` with him first. Then `{lv} board register` the "
-        "repository if it is not known.",
+        f"1. If this install has no item store, run `{f['board use']}` with him first. Then register the repository if "
+        f"it is not known: `{f['board register']}`.",
         "2. Read its existing memory, read-only: `next.md`, `brief.md`, `project_memory/`, status pages, TODO files, the "
         "README and the conventions files.",
         "3. Draft ONE review page (the review-page rule: HTML beside the markdown, with its URL). It holds the charter "
@@ -600,19 +624,21 @@ def _board_modes_section(lv: str) -> list[str]:
         "build, test or deploy convention, routed to the repository's conventions file instead of the charter.",
         "4. He answers in conversation, and edits go back to step 3. His yes, in his words, is what `--words` carries on "
         "`begin-track` and later `track`.",
-        f"5. Execute, in this order: `{lv} board begin-track` (it writes the migration id M and locks the repository); "
-        f"`{lv} board add --key M:K` for each item; land `CHARTER.md` on the repository's main by its own landing path, "
-        f"where `{lv} charter check` reports on it and exits 0 in this release, while `{lv} board track` (the one record that moves the source of truth) is the gate that refuses; "
-        "then each old file is copied to the record directory's `pre-track-<date>/` and replaced by the stub, landed by "
-        "the repository's own path. Before `track` the old files are the source of truth, and after it the board is. "
-        f"To stop before `track`: `{lv} board abandon-track`, finish any compensation, then `{lv} board abandon-done`. "
-        f"After `track` there is no abort, and leaving tracked mode is `{lv} board untrack`.",
+        f"5. Execute, in this order: `{f['board begin-track']}` (it writes the migration id M and locks the repository); "
+        f"for each item, `{f['board add --key']}` (K names the item within the migration, SHA256 is its payload's "
+        f"hash); land `CHARTER.md` on the repository's main by its own landing path, where `{f['charter check']}` "
+        f"reports on it and exits 0 in this release, while `{f['board track']}` (the one record that moves the source "
+        "of truth) is the gate that refuses; then each old file is copied to the record directory's "
+        "`pre-track-<date>/` and replaced by the stub, landed by the repository's own path. Before `track` the old "
+        f"files are the source of truth, and after it the board is. To stop before `track`: "
+        f"`{f['board abandon-track']}`, finish any compensation, then `{f['board abandon-done']}`. After `track` there "
+        f"is no abort, and leaving tracked mode is `{f['board untrack']}`.",
         "6. Write one `decision` episode tagged `repo:NAME`, naming the charter blob, the item count and the record "
         "directory.",
         "",
-        f"A worker for an item is launched with `{lv} coord spawn ... --item NAME#N`; a worker on a tracked repository is "
-        "refused without it. It gets the five rules of the board in its own brief: run `board context` first, "
-        "`Board-Item` on every commit, `Board-Closes` on the commit that meets the DONE line, `Board-Seat` with its key on "
+        "A worker for an item is launched with `--item NAME#N` on its `coord spawn` (the complete spawn form is under "
+        "\"Your writes\"); a worker on a tracked repository is refused without it. It gets the five rules of the board in "
+        "its own brief: run `board context` first, `Board-Item` on every commit, `Board-Closes` on the commit that meets the DONE line, `Board-Seat` with its key on "
         "every closing commit, and episodes tagged `repo:NAME` and `item:NAME#N`.",
         "",
     ]
@@ -686,8 +712,9 @@ def _board_item_section(launch: Any) -> list[str]:
     lines += [
         f"Your launch is recorded as `{launch.protocol}`: " + (
             "a tracked repository has no `## ▶ CURRENT STATE` block to rewrite, so your close is an episode for each item "
-            f"you touched, written after you started, plus a closing trailer or `{lv} board amend --done` naming what "
-            "remains." if launch.protocol == "tracked" else
+            "you touched, written at or after your launch's whole second, plus a closing trailer or "
+            f"`{lv} board amend --id {first} --why \"...\" --done \"what remains\" --by worker --launch-key {key}` "
+            "naming what remains." if launch.protocol == "tracked" else
             "you close the way the repository's old memory does, and when the repository has since become tracked, the "
             "tracked close is accepted too."),
         "",
@@ -808,7 +835,10 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "",
         "## Your writes",
         "",
-        f"Every write goes `--by desk --token N {tail}`. Prefer the forms that need no shell quoting: write the "
+        f"Every `drops`, `thread` and `coord` write takes your token, `--token N {tail}`, as each line below spells "
+        "it (with `--by desk` where it is shown). The `board` and `charter` verbs are not these writes: "
+        "they take no token, and their complete forms are in \"The work board\" section. Prefer the forms that need "
+        "no shell quoting: write the "
         "text to a file with your Write tool (inside your workspace) or pipe it on stdin, then run ONE short command. "
         "Type each flag out in full on the command; never keep flags in a shell variable (zsh does not split it).",
         "",
