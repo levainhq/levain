@@ -2773,8 +2773,9 @@ def persisted_consent_hook(install: Path) -> str:
 ROLE_CHOICES = (ROLE_DESK,)
 ROLE_ADAPTERS = ("claude-code", "codex")
 DESK_VERBS = ("coord", "drops", "thread")
-# The board and charter verbs the desk runs itself in the tracking ceremony (design 5), each by name: the door has
-# per-verb granularity (a rule is a command prefix), so no other `board` or `charter` verb is opened. Authority on a
+# The board and charter verbs the desk runs itself in the tracking ceremony (design 5), each by name: an allow rule is a
+# command prefix, so no other `board` or `charter` verb is allowed. The code door marks the same leaves where each is
+# defined (door.door_ok_author); tests/test_door_census.py holds the two equal. Authority on a
 # board write is enforced in the writer (a decision needs a signature or a relayed answer), never by this door.
 DESK_BOARD_VERBS = (
     "board state", "board repos", "board context", "board use", "board register", "board add", "board amend",
@@ -2803,7 +2804,7 @@ def desk_allow(python_path: str) -> tuple[str, ...]:
 
 # A bare `Read` (np-5396be49 "5b", 1030-42): the desk starts without the user layer, so the user's own `Read`
 # allow is not loaded and a Read outside the workspace stopped at a prompt nobody answers. Read only: Write, Edit,
-# WebFetch and Bash outside the three verbs above still ask. Held apart from desk_allow, which is the Bash
+# WebFetch and Bash outside the verbs desk_allow names still ask. Held apart from desk_allow, which is the Bash
 # rules the brief and the Codex rule file spell.
 DESK_READ_ALLOW = ("Read",)
 
@@ -2833,9 +2834,19 @@ def _desk_settings(install: Path) -> tuple[str, Any, str]:
     return text, doc, ""
 
 
+def desk_merge_rules(install: Path) -> tuple[str, ...]:
+    """The allow rules an upgrade merges into a desk install an earlier release made: :data:`DESK_READ_ALLOW`, and one
+    rule per :data:`DESK_BOARD_VERBS` verb spelled as the install's own coord rule is (:func:`installed_desk_levain`), so
+    an install from before T10 (its three coord/drops/thread rules) gains the ceremony's verbs. An install whose
+    spelling is not found gets the read rule only: no rule is invented in a spelling the install does not use."""
+    command = installed_desk_levain(install, sys.executable)
+    board = () if command is None else tuple(f"Bash({command} {verb}:*)" for verb in DESK_BOARD_VERBS)
+    return (*DESK_READ_ALLOW, *board)
+
+
 def desk_read_rule_state(install: Path) -> tuple[bool, str]:
     """``(pending, problem)`` for ``install``. ``pending`` is True when it is a Claude Code desk install whose
-    project settings do not carry every rule :data:`DESK_READ_ALLOW` names (an install an earlier release
+    project settings do not carry every rule :func:`desk_merge_rules` names (an install an earlier release
     made, a settings file with no ``permissions.allow``, or one that cannot be read). ``problem`` is non-empty when
     the rule cannot be merged in (:func:`add_desk_read_rule` refuses): the file wants a hand fix. Any other
     install is ``(False, "")``."""
@@ -2845,7 +2856,7 @@ def desk_read_rule_state(install: Path) -> tuple[bool, str]:
     if problem:
         return True, problem
     allow = doc.get("permissions", {}).get("allow", [])
-    return any(rule not in allow for rule in DESK_READ_ALLOW), ""
+    return any(rule not in allow for rule in desk_merge_rules(install)), ""
 
 
 def desk_read_rule_pending(install: Path) -> bool:
@@ -2901,7 +2912,7 @@ def _json_member_value(s: str, start: int, key: str) -> int | None:
 
 
 def add_desk_read_rule(install: Path) -> bool:
-    """Merge the missing :data:`DESK_READ_ALLOW` rules into a desk install's ``.claude/settings.json``
+    """Merge the missing :func:`desk_merge_rules` rules into a desk install's ``.claude/settings.json``
     ``permissions.allow`` (made when absent), under the install lock, with an atomic write that keeps every other
     byte of the file: an operator's own rules, keys and formatting stay. Nothing else of the install is touched, so a
     hand-edited or receipt-less settings file gets the rule too. Returns whether it wrote; a second run is a no-op.
@@ -2910,10 +2921,10 @@ def add_desk_read_rule(install: Path) -> bool:
     with install_lock(install, create=False):
         text, doc, problem = _desk_settings(install)
         if problem:
-            raise InitError(f"{problem}; add {', '.join(DESK_READ_ALLOW)} to permissions.allow by hand")
+            raise InitError(f"{problem}; add {', '.join(desk_merge_rules(install))} to permissions.allow by hand")
         perms = doc.get("permissions")
         allow = perms.get("allow", []) if perms is not None else []
-        missing = [rule for rule in DESK_READ_ALLOW if rule not in allow]
+        missing = [rule for rule in desk_merge_rules(install) if rule not in allow]
         if not missing:
             return False
         root = _json_scan_ws(text, 0)
@@ -2964,7 +2975,7 @@ def installed_desk_levain(install: Path, python_path: str) -> str | None:
         return None              # a reused live install: its rules are the operator's, never read as Levain's
     try:
         allow = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["allow"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return None
     if not isinstance(allow, list):
         return None

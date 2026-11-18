@@ -219,3 +219,232 @@ def test_the_door_in_code_opens_exactly_the_named_board_and_charter_leaves():
     assert opened == set(inst_.DESK_BOARD_VERBS)
     closed = {" ".join(p) for p, mark in leaves.items() if p[0] in ("board", "charter") and mark is not True}
     assert closed and not closed & opened and "board move" in closed and "board ack-torn" in closed
+
+
+# --- T10 fix 2 ---------------------------------------------------------------------------------------------------------
+def _desk_workspace(tmp_path, monkeypatch):
+    from levain.desk import door
+    from levain.desk.legacy import JSON_ROLE_DESK, LEGACY_HOME_NAME
+
+    ws = tmp_path / LEGACY_HOME_NAME
+    (ws / ".levain").mkdir(parents=True)
+    (ws / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
+    door.record(ws)
+    monkeypatch.chdir(ws)
+    return ws
+
+
+def _verb_lines(lv):
+    """Every board or charter command the desk brief's verb list spells, as argv after the install's prefix."""
+    import shlex
+
+    lines = [x for x in cl._board_modes_section(lv) if x.startswith("- ")]
+    cmds = [c for x in lines for c in re.findall(r"`([^`]+)`", x) if c.startswith(lv + " ")]
+    return [shlex.split(c.removeprefix(lv + " ")) for c in cmds]
+
+
+def test_every_board_and_charter_line_of_the_brief_parses_and_passes_the_door(home, tmp_path, monkeypatch):  # noqa: F811
+    # L1 CRITICAL: the door judged --by on verbs whose --by is the record's author; each line the brief spells now parses
+    # as written (placeholders filled) and the door lets it run in the desk's workspace
+    from levain import install as inst_
+    from levain.cli import build_parser
+    from levain.desk import door
+
+    _desk_workspace(tmp_path, monkeypatch)
+    lv = inst_.desk_levain(sys.executable)
+    fill = {"NAME": "alpha", "NAME#N": "alpha#1", "DIR": str(tmp_path), "FILE": str(tmp_path / "m.json"), "M": "m1",
+            "DECISION": "parked"}
+    parser = build_parser()
+    seen = set()
+    for argv in _verb_lines(lv):
+        argv = [fill.get(a, a) for a in argv]
+        args = parser.parse_args(argv)
+        assert door.refusal(parser, args) is None, argv
+        seen.add(" ".join(argv[:2]))
+    assert seen == set(inst_.DESK_BOARD_VERBS)                 # the brief spells every opened verb, and only those
+
+
+def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(home, mkrepo, tmp_path, monkeypatch, capsys):  # noqa: F811
+    # the brief's own spellings, run in the desk's workspace: `board use DIR` (no --by) and every write `--by desk`
+    from levain.cli import main
+    from tests.test_board_registry import CHARTER, land, manifest
+
+    _desk_workspace(tmp_path, monkeypatch)
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    store_dir = tmp_path / "store"
+
+    def lv(*argv):
+        rc = main(list(argv))
+        out, err = capsys.readouterr()
+        assert "desk's workspace" not in err, (argv, err)          # never the door's refusal
+        assert rc == 0, (argv, err)
+        return out.strip()
+
+    lv("board", "use", str(store_dir))
+    lv("board", "register", "alpha", "--path", str(a), "--words", "his words", "--by", "desk")
+    lv("board", "repos")
+    lv("charter", "init", "alpha", "--repo", str(a), "--stdout")
+    man = manifest(tmp_path)
+    lv("board", "begin-track", "alpha", "--manifest", str(man), "--words", "his yes", "--by", "desk")
+    m = [json.loads(x) for x in (store_dir / "repos.jsonl").read_text().splitlines() if '"begin-track"' in x][-1]["migration"]
+    iid = lv("board", "add", "--repo", "alpha", "--title", "t", "--origin", "desk 1", "--done", "it works",
+             "--key", f"{m}:a", "--payload-hash", "a" * 64, "--by", "desk")
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {iid}"))
+    lv("charter", "check", "--repo", str(a))
+    assert lv("board", "track", "alpha", "--migration", m, "--words", "his yes", "--by", "desk").startswith("tracked alpha")
+    lv("board", "context", iid)
+    lv("board", "amend", "--id", iid, "--why", "clearer", "--title", "t2", "--by", "desk")
+    lv("board", "decide", "--id", iid, "--decision", "parked", "--words", "his words", "--by", "desk")
+    assert lv("board", "untrack", "alpha", "--words", "his words", "--by", "desk") == "untracked alpha"
+    lv("board", "register", "beta", "--path", str(b), "--words", "his words", "--by", "desk")
+    lv("board", "begin-track", "beta", "--manifest", str(man), "--words", "his yes", "--by", "desk")
+    lv("board", "abandon-track", "beta", "--words", "his words", "--by", "desk")
+    assert lv("board", "abandon-done", "beta", "--by", "desk") == "untracked beta"
+    assert main(["board", "move", "beta", "--path", str(b), "--words", "w", "--by", "desk"]) == 1   # not named: still closed
+    assert "is the operator's" in capsys.readouterr().err
+
+
+def test_the_board_leaves_are_opened_where_defined_and_parse_imports_no_install():
+    # W7: the marks ride on the leaves; build_parser no longer reads install.DESK_BOARD_VERBS
+    import inspect
+
+    from levain import cli as cli_mod
+    from levain import install as inst_
+    from levain.cli import build_parser
+    from levain.desk import door
+
+    assert "DESK_BOARD_VERBS" not in inspect.getsource(cli_mod)
+    parser = build_parser()
+    marks = door.declared_leaves(parser)
+    for verb in inst_.DESK_BOARD_VERBS:
+        assert marks[tuple(verb.split())] is True, verb
+
+
+def test_a_worker_on_a_tracked_repo_without_an_item_is_refused_with_the_spelling(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    store, token = desk
+    b = mkrepo("beta")
+    track_ready(capsys, tmp_path, board_store_dir, b, "beta")
+    ok(capsys, "track", "beta", "--words", "yes", *A)
+    with pytest.raises(inst.SpawnRefused, match=r"--item beta#N"):
+        _spawn(store, token, registry, b)
+    assert "--item NAME#N" in "\n".join(cl._board_modes_section("lv"))
+
+
+def test_a_ceremony_launch_with_no_item_is_told_its_close(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    store, token = desk
+    a = mkrepo("alpha")
+    m, _ = track_ready(capsys, tmp_path, board_store_dir, a, "alpha")
+    text = cl._brief_text(store, _spawn(store, token, registry, a, migration=m))
+    assert "recorded as `ceremony`" in text and "no board item" in text and "Board-Item" not in text
+
+
+def test_the_items_repo_decides_and_a_directory_outside_it_is_refused(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    store, token = desk
+    a = mkrepo("alpha")
+    track_ready(capsys, tmp_path, board_store_dir, a, "alpha")                 # tracking: locked
+    elsewhere = mkrepo("gamma")                                                  # not registered yet
+    before = (board_store_dir / "repos.jsonl").read_bytes()
+    with pytest.raises(inst.SpawnRefused, match="item of alpha"):
+        _spawn(store, token, registry, elsewhere, item="alpha#1")
+    with pytest.raises(inst.SpawnRefused, match="item of alpha"):
+        _spawn(store, token, registry, tmp_path, item="alpha#1")               # not a repository at all
+    assert (board_store_dir / "repos.jsonl").read_bytes() == before            # a refused spawn wrote nothing
+
+
+def test_a_lease_refusal_registers_nothing(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    store, token = desk
+    g = mkrepo("gamma")
+    before = (board_store_dir / "repos.jsonl").read_bytes()
+    with pytest.raises(inst.SpawnRefused, match="lease token"):
+        _spawn(store, token + 1, registry, g)
+    assert (board_store_dir / "repos.jsonl").read_bytes() == before
+    _spawn(store, token, registry, g)                                            # the same request, passing: registers
+    assert (board_store_dir / "repos.jsonl").read_bytes() != before
+
+
+def test_git_failing_inside_a_registered_repo_refuses_and_outside_every_one_is_legacy(desk, registry, mkrepo, board_store_dir, tmp_path, capsys, monkeypatch):  # noqa: F811
+    from levain.desk import board_registry as br
+
+    store, token = desk
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    (a / "sub").mkdir()
+    monkeypatch.setattr(br, "_git", lambda *_a, **_k: (127, "git: TimeoutExpired"))
+    with pytest.raises(inst.SpawnRefused, match="git cannot say"):
+        _spawn(store, token, registry, a / "sub")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    assert _spawn(store, token, registry, outside).protocol == "legacy"
+
+
+def test_a_registry_that_moves_between_the_decision_and_the_record_refuses(desk, registry, mkrepo, board_store_dir, tmp_path, capsys, monkeypatch):  # noqa: F811
+    from levain.desk import board_registry as br
+
+    store, token = desk
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    real, calls = br.registry_stamp, []
+
+    def stamp(*args, **kw):
+        calls.append(1)
+        got = real(*args, **kw)
+        return got if len(calls) < 3 else (*got, "moved")                     # the third read is the in-transaction one
+    monkeypatch.setattr(br, "registry_stamp", stamp)
+    conn = sqlite3.connect(store.path)
+    before = conn.execute("SELECT COUNT(*) FROM launches").fetchone()[0]
+    with pytest.raises(inst.SpawnRefused, match="registry changed"):
+        _spawn(store, token, registry, a)
+    assert conn.execute("SELECT COUNT(*) FROM launches").fetchone()[0] == before
+    conn.close()
+
+
+def test_an_exact_path_match_wins_over_a_clone_of_another_mode(mkrepo, tmp_path):  # noqa: F811
+    from levain.desk import board_registry as br
+    from levain.desk import repos_fold as rf
+
+    a = mkrepo("alpha")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(a), str(clone))
+    ia, ic = br.identity(a), br.identity(clone)
+    git(clone, "remote", "set-url", "origin", ia["origin"] or "")
+    ic = br.identity(clone)
+    locked = rf.Repo("alpha", ia["path"], ia["origin"], tuple(ia["root"]), mode="tracking", migration="m1")
+    mine = rf.Repo("clone", ic["path"], ic["origin"], tuple(ic["root"]))
+    assert br._launch_repo(clone, {"alpha": locked, "clone": mine}) is mine
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(a), str(other))
+    git(other, "remote", "set-url", "origin", ia["origin"] or "")
+    with pytest.raises(br.BoardError, match="different modes"):
+        br._launch_repo(other, {"alpha": locked, "clone": mine})
+
+
+def test_a_tracked_launch_with_no_readable_claim_is_not_closed():
+    got = seat_close.check_close("tracked", [], key=KEY, launched_at=T0, episodes=[], closed_items=[], old_close_ok=False,
+                                 repo_tracked_now=True)
+    assert not got.ok and "no readable board item claim" in got.missing[0]
+
+
+def test_a_legacy_seat_with_no_item_on_a_repo_that_became_tracked_is_not_stranded():
+    got = seat_close.check_close("legacy", [], key=KEY, launched_at=T0, episodes=[], closed_items=[], old_close_ok=False,
+                                 repo_tracked_now=True)
+    assert got.ok and got.via == "tracked" and "dual-accept" in got.reason
+    assert not seat_close.check_close("legacy", [], key=KEY, launched_at=T0, episodes=[], closed_items=[],
+                                      old_close_ok=False, repo_tracked_now=False).ok
+
+
+@pytest.mark.parametrize("launched, at, counts", [
+    ("2026-11-17T10:00:00Z", "2026-11-17T14:00:00+05:30", False),           # 08:30Z: before, though it sorts after
+    ("2026-11-17T10:00:00Z", "2026-11-17T06:00:00-05:00", True),            # 11:00Z: after, though it sorts before
+    ("2026-11-17T10:00:00.500000Z", "2026-11-17T10:00:00Z", True),          # whole seconds: the launch's own second counts
+    ("2026-11-17T10:00:00.500000Z", "2026-11-17T09:59:59Z", False),
+    ("2026-11-17T10:00:00.500000Z", "2026-11-17T10:00:00.400000Z", False),  # the same precision: compared exactly
+    ("2026-11-17T10:00:00Z", "2026-11-17T11:00:00", False),                 # no offset: unknown zone, never counts
+])
+def test_times_are_compared_as_instants(launched, at, counts):
+    got = _close("tracked", launched_at=launched, episodes=[_ep("levain#1", at=at)], closed_items=["levain#1"])
+    assert got.ok is counts
+
+
+def test_an_empty_top_level_tag_list_reads_the_metadata_tags():
+    ep = {"source": KEY, "at": "2026-11-17T11:00:00Z", "tags": [], "metadata": {"tags": ["item:levain#1"]}}
+    assert _close("tracked", episodes=[ep], closed_items=["levain#1"]).ok

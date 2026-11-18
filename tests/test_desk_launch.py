@@ -1902,6 +1902,29 @@ def _older_desk(qdir, capsys, monkeypatch, tmp_home):
     return target
 
 
+def test_a_three_rule_desk_install_gains_the_board_rules_on_upgrade(tmp_home, qdir, monkeypatch, capsys):
+    # T10 fix 2 (codex MED): an install made before T10 carries the three coord/drops/thread rules and Read; the
+    # upgrade path that brings Read brings the board and charter verbs too, in the install's own spelling
+    from levain import install as inst
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "DESK_BOARD_VERBS", ())                         # the install as the release before T10 made it
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
+    f = target / ".claude" / "settings.json"
+    bash = [r for r in json.loads(f.read_text())["permissions"]["allow"] if r.startswith("Bash(")]
+    assert len(bash) == 3 and "Read" in json.loads(f.read_text())["permissions"]["allow"]
+    lv = inst.installed_desk_levain(target, sys.executable)
+    assert lv is not None                                                # the old 3-rule install is still recognised
+    assert inst.desk_read_rule_pending(target) is True
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    _main(qdir, capsys, "coord", "agent", "claude")                      # the path a desk launch setup takes
+    got = json.loads(f.read_text())["permissions"]["allow"]
+    assert all(f"Bash({lv} {v}:*)" in got for v in inst.DESK_BOARD_VERBS) and got.count("Read") == 1
+    assert inst.desk_read_rule_pending(target) is False
+    assert inst.add_desk_read_rule(target) is False                     # nothing left to add
+
+
 def _only_inserted(old: str, new: str) -> str:
     """What ``new`` adds to ``old`` when it is ``old`` with one span inserted (every other byte kept), else fail."""
     i = 0

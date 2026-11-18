@@ -76,7 +76,7 @@ from levain.desk import repos_fold as rf
 from levain.desk.board_store import BoardError
 
 __all__ = ["REPOS_NAME", "STUB_MARKER", "TRACKING_AUDIT_HOURS", "ack_torn", "abandon_done", "abandon_track", "begin_track",
-           "check_add", "import_focus_use", "launch_protocol", "move", "pause", "read_registry", "register", "register_for_launch", "report",
+           "check_add", "import_focus_use", "launch_protocol", "move", "pause", "read_registry", "register", "register_for_launch", "registry_stamp", "report",
            "resume", "stale_audit", "track", "untrack"]
 
 REPOS_NAME = "repos.jsonl"
@@ -1117,32 +1117,87 @@ def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] 
     return written
 
 
+def registry_stamp(environ: Mapping[str, str] | None = None) -> tuple[Any, ...] | None:
+    """What identifies the registry as it stands, read with no lock: the pointer's store and ``repos.jsonl``'s inode, size
+    and mtime (the file is append-only, so any write moves it). None with no pointer. A launch compares the stamp it decided
+    under with the one inside its own transaction and refuses on any change (:meth:`levain.desk.store.CoordStore.launch_request`)."""
+    store_dir = bs.read_pointer(environ)
+    if store_dir is None:
+        return None
+    try:
+        st = os.stat(store_dir / REPOS_NAME)
+    except FileNotFoundError:
+        return (str(store_dir), None)
+    except OSError as exc:
+        raise BoardError(f"the registry {store_dir / REPOS_NAME} cannot be read ({type(exc).__name__})") from None
+    return (str(store_dir), st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _launch_repo(cwd: str | os.PathLike[str], repos: Mapping[str, rf.Repo]) -> rf.Repo | None:
+    """The registered repo a launch in ``cwd`` works in, else None. An exact path match first, then a clone or worktree by
+    (root, origin); several such that disagree on mode refuse. When git cannot say which repository ``cwd`` is (any failure,
+    a timeout included), the answer is None only when ``cwd`` lies outside every registered repo's path: an unknown is never
+    the permissive answer."""
+    real = os.path.realpath(os.path.expanduser(str(cwd)))
+    rc, top = _git(real, "rev-parse", "--show-toplevel")
+    ident = None
+    if rc == 0:
+        try:
+            ident = identity(top)
+        except NoCommit:
+            ident = None
+    if ident is not None:
+        exact = next((r for r in repos.values() if r.path == ident["path"]), None)
+        if exact is not None:
+            return exact
+        same = [r for r in repos.values() if tuple(ident["root"]) == r.root and ident["origin"] == r.origin]
+        if len({(r.mode, r.migration) for r in same}) > 1:
+            raise BoardError(f"{ident['path']} is a clone of {', '.join(r.name for r in same)}, which are in different modes; "
+                             f"register this path itself (`levain board register NAME --path {ident['path']}`)")
+        return same[0] if same else None
+    inside = [r for r in repos.values() if r.path and (real == r.path or real.startswith(r.path.rstrip(os.sep) + os.sep))]
+    if inside:
+        raise BoardError(f"git cannot say which repository {real} is ({top[:200] or 'no output'}), and it lies inside "
+                         f"{inside[0].name} at {inside[0].path}: the launch's close protocol is unknown")
+    return None
+
+
 def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = None,
-                    environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
-    """``(protocol, migration)``: the close protocol a worker launched in ``cwd`` runs under, from its repository's mode in the
-    registry now (design 6, "The close, chosen by the LAUNCH protocol"). An untracked or unknown repository, a directory with no
-    registry or no commit, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a ``tracking`` or
-    ``aborting`` repository gives ``ceremony`` and keeps that id. Any other launch on a ``tracking`` or ``aborting`` repository
-    raises BoardError: the repository is locked to new work until ``track`` or ``abandon-done``. A migration id on a launch whose
-    repository is not in a ceremony is ignored, as is one on a ``tracked`` repository (the ceremony's stub seat, after ``track``)."""
+                    environ: Mapping[str, str] | None = None, *, item: str | None = None) -> tuple[str, str | None]:
+    """``(protocol, migration)``: the close protocol a worker launched in ``cwd`` for board item ``item`` runs under, from the
+    mode its repository has in the registry now (design 6, "The close, chosen by the LAUNCH protocol"). The repository is the
+    item's (its ``NAME#`` prefix, when NAME is registered), else the one ``cwd`` is in. No registry, or an untracked or
+    unregistered repository, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a
+    ``tracking`` or ``aborting`` repository gives ``ceremony`` and keeps that id. Raises BoardError (the launch is refused) for:
+    any other launch on a ``tracking`` or ``aborting`` repository (locked to new work until ``track`` or ``abandon-done``);
+    a launch on a ``tracked`` repository with no item (a worker there is launched for its item); a ``cwd`` outside the
+    item's repository when either is not untracked; a ``cwd`` git cannot place that lies inside a registered repository;
+    and an unreadable registry. A migration id on a launch whose repository is not in a ceremony is ignored, as is one on a
+    ``tracked`` repository (the ceremony's stub seat, after ``track``)."""
     store_dir = bs.read_pointer(environ)
     if store_dir is None or not cwd:
         return "legacy", None
-    rc, top = _git(os.path.expanduser(str(cwd)), "rev-parse", "--show-toplevel")
-    if rc != 0:
-        return "legacy", None
     try:
-        ident = identity(top)
-    except NoCommit:
-        return "legacy", None
-    view = read_registry(bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True), allow_inactive=True)
+        view = read_registry(bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True), allow_inactive=True)
+    except (OSError, ValueError) as exc:
+        raise BoardError(f"the registry cannot be read ({type(exc).__name__})") from None
     if not view.active:
         return "legacy", None
-    cur = next((r for r in view.fold.repos.values()
-                if r.path == ident["path"] or (tuple(ident["root"]) == r.root and ident["origin"] == r.origin)), None)
+    repos = view.fold.repos
+    here = _launch_repo(cwd, repos)
+    named = repos.get(item.partition("#")[0]) if item else None
+    if named is not None and (here is None or here.name != named.name) and \
+            (named.mode != "untracked" or (here is not None and here.mode != "untracked")):
+        where = f"{here.name} ({here.mode})" if here is not None else "no registered repository"
+        raise BoardError(f"{item} is an item of {named.name} ({named.mode}), and the launch's directory is in {where}: a "
+                         f"worker for it is launched in {named.name}'s own directory, {named.path}")
+    cur = named if named is not None else here
     if cur is None or cur.mode == "untracked":
         return "legacy", None
     if cur.mode == "tracked":
+        if not item:
+            raise BoardError(f"{cur.name} is tracked: a worker on it is launched for its board item, "
+                             f"`levain coord spawn ... --item {cur.name}#N` (the id from `levain board state`)")
         return "tracked", None
     if migration is not None and migration == cur.migration:
         return "ceremony", migration
@@ -1442,7 +1497,10 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
 def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callable[[Any], dict], items_help: str,
                  seal_of: Callable[[Any, dict], Any] | None = None, source_args: Callable[[Any], None] | None = None,
                  relay_of: Callable[[Any], Any] | None = None) -> None:
-    """Add the registry's verbs under ``levain board``."""
+    """Add the registry's verbs under ``levain board``. The desk's door opens ``repos`` and the mode verbs the desk brief
+    names (``door_ok_author``, where each is defined); ``move``, ``pause``, ``resume`` and ``ack-torn`` stay the operator's."""
+    from levain.desk.door import door_ok_author
+
     def common(p: Any, *, words: bool | str = True) -> None:
         p.add_argument("name", metavar="NAME")
         if words:
@@ -1524,11 +1582,13 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
             print("\n".join(format_report(doc)))
         return 3 if doc["audit"] or doc["problems"] or any(d["problems"] for d in doc["repos"]) else 0
     p.set_defaults(func=run_repos)
+    door_ok_author(p)
 
     p = sub.add_parser("register", description="Put a repo in play (untracked). Idempotent for the same path.")
     common(p)
     p.add_argument("--path", required=True)
     p.set_defaults(func=run(lambda a, t: said(a, *register(t, a.name, a.path, a.words, a.by, author=author_of(a), seal=seal(a)), "registered", "already registered")))
+    door_ok_author(p)
 
     p = sub.add_parser("move", description="Re-base a registered repo onto a new path (the same repository).")
     common(p)
@@ -1542,12 +1602,14 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p.add_argument("--migration", default=None, metavar="M", help="The migration id (default: derived, so a retry derives the same one).")
     with_source(p)
     p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, relay=relay(a), seal=seal(a)), "tracking", "already tracking")))
+    door_ok_author(p)
 
     p = sub.add_parser("track", description="The switchover record: the board becomes the repo's source of truth.")
     common(p)
     p.add_argument("--migration", default=None, metavar="M")
     with_source(p)
     p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, relay=relay(a), seal=seal(a)), "tracked", "already tracked")))
+    door_ok_author(p)
 
     def lazy_authority(a: Any) -> Any:
         """The authority source a RELAYED abandon-track's cuts get: ``_source(a)``, the ONE rule every abandon-track resolves
@@ -1573,14 +1635,18 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     common(p)
     with_source(p)
     p.set_defaults(func=run(run_abandon))
+    door_ok_author(p)
 
     p = sub.add_parser("abandon-done", description="Finish an abort: aborting becomes untracked once every item is cut and the compensation holds.")
     common(p, words=False)
     p.set_defaults(func=run(lambda a, t: said(a, *abandon_done(t, a.name, "", a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
 
+    door_ok_author(p)
+
     p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut, parked or out of 1.0.")
     common(p)
     p.set_defaults(func=run(lambda a, t: said(a, *untrack(t, a.name, a.words, a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
+    door_ok_author(p)
 
     for verb, fn in (("pause", pause), ("resume", resume)):
         p = sub.add_parser(verb, description=f"{verb.capitalize()} a repo's attention. Repeating it is a no-op.")

@@ -1917,8 +1917,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 lines.append(f"desk install: settings unreadable ({problem}), so its Read allow rule cannot be "
                              "added and a read outside its workspace waits on a prompt; fix that file by hand")
             elif pending:
-                lines.append(f"desk install: upgrade pending (no Read allow rule, so a read outside its "
-                             f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
+                lines.append(f"desk install: upgrade pending (an allow rule is missing: Read, so a read outside "
+                             f"its workspace waits on a prompt, or a board verb the desk brief names); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
         spawn = f"  {ln['spawn']}" if ln.get("spawn") else ""
         lines.append(f"  {ln['launch_id']}  {role_word(ln['role'])}{spawn}  {ln['harness']}  {ln['state']} ({cause_word(ln['cause'])})  "
