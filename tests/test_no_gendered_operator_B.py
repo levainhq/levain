@@ -34,7 +34,6 @@ FILES = [
     "levain/dream/card.py",
     "levain/dream/cli.py",
     "levain/dream/recover.py",
-    "levain/keep_migrate.py",
     "levain/slot/adopt_take.py",
     "levain/slot/adopt_view.py",
     "levain/webpush/intent.py",
@@ -44,8 +43,8 @@ FILES = [
 
 # (file, quoted phrase): why it is kept.
 KEPT = [
-    ("levain/keep_migrate.py", "the a an and or of to in on for with is are was were be been it this that",
-     "a stopword list for text matching: the pronoun is a word being skipped, not text said to anyone"),
+    # levain/keep_migrate.py is not in FILES: its literals are rewritten by the levain#88 T11 link (levain 37's seat/1118-6-t11code),
+    # which lands that file; add it here, with its stopword list as a KEPT entry, once that link is on main.
 ]
 
 # (file, the whole literal): a stored dict key or field name, read by other code and by old data; never shown as text.
