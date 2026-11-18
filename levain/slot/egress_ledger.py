@@ -18,7 +18,7 @@ verb), with its two locks and the install's own ``store_id``.
     open of ``.`` below the directory fd), not on a file in it, so taking it creates nothing and a request whose
     signature fails leaves no file behind. Every contender locks the same directory inode. Lock order: verify lock
     (taken and released before any other), then the session lock, then the ledger lock. Nothing takes the ledger lock
-    and then another. A filesystem that cannot flock a directory fd (EBADF, ENOLCK, EOPNOTSUPP, ENOTSUP) is ``not-ready``.
+    and then another. A filesystem that cannot flock a directory fd (an errno in ``_NO_DIR_LOCK``) is ``not-ready``.
     Known edges: a stale empty ``verify.lock`` from an earlier release stays as an orphan (nothing reads it); the lock's
     exclusivity holds while no other code flocks the grants directory; revocation latency is bounded by one in-flight
     verify; during a live upgrade an old process holding the legacy ``verify.lock`` file and a new process holding the
