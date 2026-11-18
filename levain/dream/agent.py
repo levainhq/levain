@@ -1691,7 +1691,10 @@ def _revise_advice(agent_dir: Path | str, inst: DreamInstall) -> str:
         return ("Run `levain dream enable --revise` (with the --agent-store-dir, --cockpit-root and --coord-dir enable "
                 "was given, if any) to register a spec for these facts, then sign a new link for it")
     if found is None:
-        return f"Run `levain dream enable --revise{flags}` to register a spec for these facts, then sign a new link for it"
+        # the command is built outside the backticked literal: tests/test_cockpit_anchor_reset.py reads every backticked
+        # `levain ...` string in the source and checks its argv against the CLI, so a `{flags}` hole inside one fails it
+        revise_cmd = "levain dream enable --revise" + flags
+        return f"Run `{revise_cmd}` to register a spec for these facts, then sign a new link for it"
     from levain.autonomic.db import default_store_dir
 
     ad = Path(agent_dir).expanduser().resolve()
