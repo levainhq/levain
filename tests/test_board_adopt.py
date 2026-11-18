@@ -249,6 +249,21 @@ def test_f1_a_track_record_naming_an_id_the_manifest_never_adopted_is_a_problem(
     assert f.problems and "beta#9" in " ".join(f.problems) and f.repos["alpha"].mode == "tracking"
 
 
+def test_f1_adopted_ids_against_a_manifest_with_no_adopt_items_are_a_problem():
+    f = _fold_track({}, adopted=["beta#9"])
+    assert f.problems and "beta#9" in " ".join(f.problems) and f.repos["alpha"].mode == "tracking"
+
+
+def test_f1_adopted_ids_against_an_empty_adopt_items_are_a_problem():
+    f = _fold_track({"adopt_items": []}, adopted=["beta#9"])
+    assert f.problems and "beta#9" in " ".join(f.problems) and f.repos["alpha"].mode == "tracking"
+
+
+def test_f1_an_empty_adopted_against_a_manifest_with_no_adopt_items_folds_clean():
+    f = _fold_track({}, adopted=[])
+    assert not f.problems and not f.torn and f.repos["alpha"].mode == "tracked"
+
+
 def test_f1_a_strict_subset_of_the_manifest_adopt_items_folds_clean():
     f = _fold_track({"adopt_items": ["alpha#1", "alpha#2"]}, adopted=["alpha#2"])
     assert not f.problems and not f.torn and f.repos["alpha"].mode == "tracked"
