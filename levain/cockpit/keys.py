@@ -932,7 +932,9 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             if flags is not None and _authority.presence_missing(signature, public_key):
                 raise KeyError_(f"ssh-keygen returned a signature for {fp} without the user-presence flag ({carried}), "
                                 "so nothing was signed")
-            raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}), "
+            detail = _authority_sig.verify_failure_detail(message, signature, public_key=public_key,
+                                                          namespace=namespace, ssh_keygen=ssh_keygen)
+            raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
                             "so nothing was signed")
         return signature
 

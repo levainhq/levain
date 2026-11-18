@@ -264,3 +264,46 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
     out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
     found = [m.group(1) for line in out.splitlines() if (m := good.match(line.strip()))]
     return found == [fingerprint]
+
+
+def verify_failure_detail(message: bytes, signature: str, *, public_key: str, namespace: str = NAMESPACE,
+                          ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, timeout: float = 10.0) -> str:
+    """Words for a signature :func:`verify_link_sig` refused, for an error message only (never a verdict; nothing
+    reads it back): what ``ssh-keygen -Y verify`` says about it against the key, and whether the signature is
+    consistent over ``message`` at all (``-Y check-novalidate``, which takes the key out of the question). Told apart,
+    they say whether the signer made a signature over other bytes than these (the second fails) or the key was the
+    question (the second holds), the one fact a touched-but-refused sign leaves open (1118-12: a Touch ID sign
+    that ssh-keygen made in 0.9 s and the check refused). Never raises: any trouble is said in its place."""
+    try:
+        sig_bytes = (signature.strip() + "\n").encode("ascii")
+        problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
+        if problem is not None:
+            return f"detail unavailable ({problem})"
+        signers = _signers_line("authority-signer", namespace, public_key).encode("ascii")
+    except Exception as exc:  # noqa: BLE001
+        return f"detail unavailable ({type(exc).__name__})"
+
+    def first(cp: "subprocess.CompletedProcess[bytes]") -> str:
+        text = ((cp.stderr or b"") + b"\n" + (cp.stdout or b"")).decode("utf-8", "replace")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return (lines[0][:160] if lines else "no output") + f" (exit {cp.returncode})"
+
+    out: list[str] = []
+    for label, build in (
+            ("verify", lambda fds: [str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", "authority-signer",
+                                    "-n", namespace, "-s", f"/dev/fd/{fds[1]}"]),
+            ("check-novalidate", lambda fds: [str(keygen), "-Y", "check-novalidate", "-n", namespace,
+                                              "-s", f"/dev/fd/{fds[1]}"])):
+        fds: list[int] = []
+        try:
+            fds.append(_pipe_reading(signers))
+            fds.append(_pipe_reading(sig_bytes))
+            cp = subprocess.run(build(fds), input=message, capture_output=True, timeout=timeout,
+                                env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
+            out.append(f"{label}: {first(cp)}")
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"{label}: unavailable ({type(exc).__name__})")
+        finally:
+            for fd in fds:
+                os.close(fd)
+    return "; ".join(out) + f"; message {len(message)} bytes, sha256 {hashlib.sha256(message).hexdigest()[:12]}"
