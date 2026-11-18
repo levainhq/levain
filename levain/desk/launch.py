@@ -559,9 +559,11 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
 def _board_forms(lv: str) -> dict[str, str]:
     """The complete form of each board and charter verb the desk runs, keyed by verb, with ``lv`` the install's own
     command. This is the ONE place a verb's spelling lives: the verb list and every ceremony step of
-    :func:`_board_modes_section` print these strings, so a flag a verb comes to need (a decision's ``--source`` or
-    ``--sign``, say) is added here once. Each parses as written once its placeholders (NAME, NAME#N, DIR, FILE, M, K,
-    DECISION, SHA256) are filled (tests/test_t10_briefs.py)."""
+    :func:`_board_modes_section` print these strings, so a flag a verb comes to need is added here once. The decision-class
+    verbs (decide, begin-track, track, abandon-track) end ``--source Q-ID``, the band row carrying his answer, which is
+    the one authority the desk can give; untrack takes no ``--source``, so it is the operator's own signed write
+    (``--author-kind operator --sign``). Each parses as written once its placeholders (NAME, NAME#N, DIR, FILE, M, K,
+    DECISION, SHA256, Q-ID) are filled (tests/test_t10_briefs.py)."""
     return {
         "board state": f"{lv} board state",
         "board repos": f"{lv} board repos",
@@ -570,16 +572,16 @@ def _board_forms(lv: str) -> dict[str, str]:
         "board add --key": f"{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --key M:K "
                            "--payload-hash SHA256 --by desk",
         "board amend": f"{lv} board amend --id NAME#N --why \"...\" --by desk",
-        "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk",
+        "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk --source Q-ID",
         "board use": f"{lv} board use DIR",
         "board register": f"{lv} board register NAME --path DIR --words \"his words\" --by desk",
         "charter init": f"{lv} charter init NAME --repo DIR",
         "charter check": f"{lv} charter check --repo DIR",
-        "board begin-track": f"{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk",
-        "board track": f"{lv} board track NAME --migration M --words \"his yes\" --by desk",
-        "board abandon-track": f"{lv} board abandon-track NAME --words \"his words\" --by desk",
+        "board begin-track": f"{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk --source Q-ID",
+        "board track": f"{lv} board track NAME --migration M --words \"his yes\" --by desk --source Q-ID",
+        "board abandon-track": f"{lv} board abandon-track NAME --words \"his words\" --by desk --source Q-ID",
         "board abandon-done": f"{lv} board abandon-done NAME --by desk",
-        "board untrack": f"{lv} board untrack NAME --words \"his words\" --by desk",
+        "board untrack": f"{lv} board untrack NAME --words \"his words\" --by operator --author-kind operator --sign",
     }
 
 
@@ -601,8 +603,13 @@ def _board_modes_section(lv: str) -> list[str]:
         "",
         "These are `board` and `charter` verbs, not `coord` verbs, and you run them yourself: your door opens exactly "
         "the ones named below, and no other. On them `--by` names the record's author (you write `--by desk`) and "
-        "they take no `--token`. A write's authority is checked by the writer, not by the door: a decision needs the "
-        "operator's signature or a relayed answer of his.",
+        "they take no `--token`. A write's authority is checked by the writer, not by the door, and `decide`, `begin-track`, "
+        "`track`, `abandon-track` and `untrack` are refused without it: use `--source Q-ID` (the id of the band row "
+        "carrying his answer) when you relay an answer he gave on the band, with `--words` an exact excerpt of it (for "
+        "the three ceremony verbs the question you put to him must also carry the manifest's sha256, the sha256 of the "
+        "manifest file's bytes); when he "
+        "signs at the laptop, he runs the same line himself with `--author-kind operator --sign` in place of `--source "
+        "Q-ID`. `untrack` takes no `--source`: it is his signed write only.",
         "",
         f"- read: `{f['board state']}`, `{f['board repos']}`, `{f['board context']}`;",
         f"- an item: `{f['board add']}`, `{f['board amend']}`, `{f['board decide']}`;",
