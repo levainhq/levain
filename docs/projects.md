@@ -35,13 +35,13 @@ An operator with no method of their own can keep the three things apart inside t
 - one status file for STATE, which only one writer touches;
 - one append-only log for RECORD.
 
-Tracking then becomes a short conversation. The desk reads those files, drafts the charter and the items, and the operator says yes.
+Tracking then starts from a conversation: the desk reads those files, drafts the charter and the items, and the operator says yes.
 
 ## Tracking a repo
 
 Tracking is a conversation first and a ceremony second. Only the registration in step 1 is written before the yes. It puts the repo in play without tracking it. Everything else waits for the yes.
 
-1. **The operator says "track X".** The desk puts X in play if it is not already there:
+1. **The operator says "track X".** If this install has no item store yet, the desk runs `levain board use <dir>` first. Then it puts X in play if X is not already there:
 
    ```
    levain board register X --words "<his words>" --by <desk> --path <repo directory>
@@ -51,11 +51,11 @@ Tracking is a conversation first and a ceremony second. Only the registration in
 
 2. **The desk reads X's existing memory, read-only.** That is `next.md` or `brief.md`, any project memory, status pages, TODO files, the README and the conventions files.
 
-3. **The desk drafts one review page.** It holds the charter (`levain charter init X`, filled from the old memory), the proposed items (a title, the operator's words verbatim where the old files carry them, a DONE line and a `done_kind` for each), what is not carried and why, which old paths will be retired, and which conventions belong in the repo's conventions file rather than the charter.
+3. **The desk drafts one review page.** It drafts the charter with `levain charter init X --stdout`, which prints the skeleton and writes nothing. The file reaches the repo only when step (c) lands it. The page holds the charter, the proposed items (a title, the operator's words verbatim where the old files carry them, a DONE line and a `done_kind` for each), what is not carried and why, which old files will be retired, and which conventions belong in the repo's conventions file rather than the charter.
 
 4. **The operator reads it and answers in conversation.** Edits go back to step 3.
 
-5. **The desk runs the ceremony in this order.** Each step repeats safely.
+5. **The desk runs the ceremony in this order.** A keyed `add` repeats safely (see (b)), and `begin-track` derives its migration id, so a retry derives the same one.
 
    - **(a) Begin.** Writes the migration id and locks X to new work:
 
@@ -63,7 +63,7 @@ Tracking is a conversation first and a ceremony second. Only the registration in
      levain board begin-track X --words "<his yes>" --by <desk> --manifest <file.json> [--owner <desk>] [--migration M]
      ```
 
-     The manifest is JSON. `plan_items` names the item keys the charter's Plan lists. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old paths to copy and stub, and `record_dir` (optional) names where the copies go. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
+     The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old memory files to copy and stub, and `record_dir` (optional) names where the copies go. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
 
    - **(b) Expand: the items.** Each item is added with its key and a hash of its fields:
 
@@ -83,7 +83,7 @@ Tracking is a conversation first and a ceremony second. Only the registration in
 
      It refuses unless (b) and (c) hold. From here the board is the source, and the lock lifts.
 
-   - **(e) Contract: the stubs.** Each old file is copied to `<record dir>/pre-track-<date>/` with a sha256 line, then replaced at its old path by a stub. The stub's first line is the marker `<!-- levain: tracked stub -->`. Until a stub lands, `levain board repos` reports `stale: <path> still holds pre-track content`. No seat acts on the old content in that gap.
+   - **(e) Contract: the stubs.** Each file named in `retire` is copied to `<record dir>/pre-track-<date>/` with a sha256 line, then replaced at its old path by a stub. The stub's first line is the marker `<!-- levain: tracked stub -->`. Until a stub lands, `levain board repos` reports `stale: <path> still holds pre-track content`. No seat acts on the old content in that gap.
 
 6. **The desk writes one decision episode** tagged `repo:X`, naming the charter, the item count and the record directory.
 
@@ -93,7 +93,7 @@ Tracking is a conversation first and a ceremony second. Only the registration in
 
 ## Charter
 
-`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name, the Export and the Plan filled in. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced. `init` never overwrites a file.
+`levain charter init NAME` writes `CHARTER.md` at the repository root, with the name, the Export and the Plan filled in. Every other section is a `<fill: ...>` placeholder that `check` reports until it is replaced. `init` never overwrites a file. With `--stdout` it prints the skeleton and writes nothing.
 
 `levain charter check` reads the charter, from origin/main by default. In this release it only warns: it prints what a valid charter needs and exits 0 either way.
 
@@ -129,10 +129,11 @@ Until a signed grade exists, `kind: operator` is a claim, and so is every author
 
 - **The signing slice is not in this tree.** It adds `--sign` (a Touch ID signature at a terminal, with `--author-kind operator`), `--source <q-id>` (relaying one of his band answers), the `signed-terminal` and `relayed` grades, and the rule that the decision-class verbs (`decide`, `begin-track`, `track`, `abandon-track`, `untrack`) refuse an unsigned record. `move` joins that rule while its repo is tracking or tracked. Until the slice lands, every record is `asserted`.
 - **`--source` will take native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) needs flow's reader first.
-- **The passkey route has no door yet.** The writer accepts a phone signature (`signed-phone`), but the cockpit door that signs with the passkey is not built in the signing slice either.
+- **The phone route arrives with the signing slice.** That slice's writer takes a phone signature (`signed-phone`), and the cockpit door that signs with the passkey is not in it either.
+- **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
 - **Closing a tracked seat is not checked yet.** `levain/desk/seat_close.py` holds the check, and nothing in Levain calls it. Flow's seat close is the caller, and that side is not written.
 - **Before a store's first registration, `add` takes items for any repo.** The registry is inactive until the store has a `repos.jsonl`, and the mode check starts with it.
 - **Agent names are asserted, not key-bound.** Binding an agent to a key is 1.1.
 - **The registry and the store belong to one install.** A second machine needs the same store.
-- **The stub check reads only the paths named at tracking.** A status file added later is not caught.
+- **The stub check reads only the paths named in `retire` at tracking.** A status file added later is not caught.
 - **Git operations are outside the store's lock.** A `checkout`, `stash` or `merge` can replace a store file. Levain re-checks each file it opens by inode and refuses a replacement it cannot read past.
