@@ -2773,6 +2773,14 @@ def persisted_consent_hook(install: Path) -> str:
 ROLE_CHOICES = (ROLE_DESK,)
 ROLE_ADAPTERS = ("claude-code", "codex")
 DESK_VERBS = ("coord", "drops", "thread")
+# The board and charter verbs the desk runs itself in the tracking ceremony (design 5), each by name: the door has
+# per-verb granularity (a rule is a command prefix), so no other `board` or `charter` verb is opened. Authority on a
+# board write is enforced in the writer (a decision needs a signature or a relayed answer), never by this door.
+DESK_BOARD_VERBS = (
+    "board state", "board repos", "board context", "board use", "board register", "board add", "board amend",
+    "board decide", "board begin-track", "board track", "board abandon-track", "board abandon-done", "board untrack",
+    "charter init", "charter check",
+)
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
 # defined with that render; the test pins this tuple against a real desk install's .mcp.json keys)
 DESK_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
@@ -2790,7 +2798,7 @@ def desk_levain(python_path: str) -> str:
 def desk_allow(python_path: str) -> tuple[str, ...]:
     """The desk's allow rules, one per verb, each naming :func:`desk_levain`."""
     command = desk_levain(python_path)
-    return tuple(f"Bash({command} {verb}:*)" for verb in DESK_VERBS)
+    return tuple(f"Bash({command} {verb}:*)" for verb in (*DESK_VERBS, *DESK_BOARD_VERBS))
 
 
 # A bare `Read` (np-5396be49 "5b", 1030-42): the desk starts without the user layer, so the user's own `Read`

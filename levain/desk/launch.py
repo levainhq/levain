@@ -556,9 +556,10 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
     ]
 
 
-def _board_modes_section() -> list[str]:
+def _board_modes_section(lv: str) -> list[str]:
     """The desk brief's section on the work board: the two modes of a repository, the verbs, and the ceremony in the
-    order the design fixes (5). Fixed text; it names no count and no repository."""
+    order the design fixes (5). ``lv`` is the install's own command, spelled as the other verbs are, so each verb here
+    is one the desk's door allows as written. Fixed text; it names no count and no repository."""
     return [
         "## The work board: two modes",
         "",
@@ -567,21 +568,23 @@ def _board_modes_section() -> list[str]:
         "`CHARTER.md` and its work as items on the board: a seat there loads `board context`, not a file, and closes by an "
         "episode and a trailer per item. Two more states exist only inside a ceremony: `tracking` and `aborting`. "
         "A repository in either is locked to new work, and a worker launch on it is refused unless it carries the "
-        "ceremony's migration id (`coord spawn --migration M`).",
+        f"ceremony's migration id (`{lv} coord spawn --migration M`).",
         "",
-        "These are `board` and `charter` verbs, not `coord` verbs: the desk's own door does not open them, so "
-        "they run at the operator's terminal or in a seat that may run them. Where a verb is named below it is by its "
-        "name.",
+        "These are `board` and `charter` verbs, not `coord` verbs, and you run them yourself: your door opens exactly "
+        "the ones named below, each in its full form, and no other. A write's authority is checked by the writer, not "
+        "by the door: a decision needs the operator's signature or a relayed answer of his.",
         "",
-        "- read: `board state`, `board repos`, `board context NAME#N`;",
-        "- an item: `board add --key M:K ...`, `board amend`, `board decide`;",
-        "- a charter: `charter init NAME`, `charter check`;",
-        "- the mode: `board register|begin-track|track|abandon-track|abandon-done|untrack`.",
+        f"- read: `{lv} board state`, `{lv} board repos`, `{lv} board context NAME#N`;",
+        f"- an item: `{lv} board add --key M:K ...`, `{lv} board amend`, `{lv} board decide`;",
+        f"- the store and a repository: `{lv} board use DIR`, `{lv} board register`;",
+        f"- a charter: `{lv} charter init NAME`, `{lv} charter check`;",
+        f"- the mode: `{lv} board begin-track`, `{lv} board track`, `{lv} board abandon-track`, "
+        f"`{lv} board abandon-done`, `{lv} board untrack`.",
         "",
         "Tracking a repository starts when the operator says so, in conversation. Never begin it on your own reading, and "
         "write nothing before his yes. In this order:",
         "",
-        "1. If this install has no item store, run `board use DIR` with him first. Then `board register` the "
+        f"1. If this install has no item store, run `{lv} board use DIR` with him first. Then `{lv} board register` the "
         "repository if it is not known.",
         "2. Read its existing memory, read-only: `next.md`, `brief.md`, `project_memory/`, status pages, TODO files, the "
         "README and the conventions files.",
@@ -591,13 +594,13 @@ def _board_modes_section() -> list[str]:
         "build, test or deploy convention, routed to the repository's conventions file instead of the charter.",
         "4. He answers in conversation, and edits go back to step 3. His yes, in his words, is what `--words` carries on "
         "`begin-track` and later `track`.",
-        "5. Execute, in this order: `board begin-track` (it writes the migration id M and locks the repository); `board add "
-        "--key M:K` for each item; land `CHARTER.md` on the repository's main by its own landing path, so that `charter "
-        "check` passes there; `board track` (the one record that moves the source of truth); then each old file is "
-        "copied to the record directory's `pre-track-<date>/` and replaced by the stub, landed by the repository's own "
-        "path. Before `track` the old files are the source of truth, and after it the board is. To stop before `track`: "
-        "`board abandon-track`, finish any compensation, then `board abandon-done`. After `track` there is no abort, and "
-        "leaving tracked mode is `untrack`.",
+        f"5. Execute, in this order: `{lv} board begin-track` (it writes the migration id M and locks the repository); "
+        f"`{lv} board add --key M:K` for each item; land `CHARTER.md` on the repository's main by its own landing path, "
+        f"so that `{lv} charter check` passes there; `{lv} board track` (the one record that moves the source of truth); "
+        "then each old file is copied to the record directory's `pre-track-<date>/` and replaced by the stub, landed by "
+        "the repository's own path. Before `track` the old files are the source of truth, and after it the board is. "
+        f"To stop before `track`: `{lv} board abandon-track`, finish any compensation, then `{lv} board abandon-done`. "
+        f"After `track` there is no abort, and leaving tracked mode is `{lv} board untrack`.",
         "6. Write one `decision` episode tagged `repo:NAME`, naming the charter blob, the item count and the record "
         "directory.",
         "",
@@ -837,7 +840,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "the Desk panel as `no reply yet`.",
         "",
         *_arrival_section(lv, tail),
-        *_board_modes_section(),
+        *_board_modes_section(lv),
         "## How your turn ends",
         "",
         "Your words are the last thing in a session the operator may see in his agent view, where a question or "

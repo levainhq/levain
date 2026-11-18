@@ -1751,7 +1751,24 @@ def build_parser() -> argparse.ArgumentParser:
     from levain.desk.charter import register as _register_charter
 
     _register_charter(subparsers)
+    _open_desk_board_door(subparsers)
     return parser
+
+
+def _open_desk_board_door(subparsers) -> None:
+    """The desk's door opens the board and charter verbs the desk brief names (install.DESK_BOARD_VERBS, the same list
+    its allow rules are made from), each leaf by name, and no other: a verb of these trees not in the list stays
+    unmarked and so refused there (default-deny). Authority on a board write is the writer's, not the door's."""
+    from levain.desk.door import door_ok
+    from levain.install import DESK_BOARD_VERBS
+
+    def leaves(parser) -> dict:
+        found = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+        return dict(found[0].choices) if found else {}
+
+    for verb in DESK_BOARD_VERBS:
+        group, leaf = verb.split()
+        door_ok(leaves(subparsers.choices[group])[leaf])
 
 
 def main(argv: list[str] | None = None) -> int:

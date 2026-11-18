@@ -3,7 +3,9 @@ predicate by protocol, and the desk brief's board section. Scratch stores and sc
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import sys
 
 import pytest
 
@@ -172,12 +174,48 @@ def test_a_legacy_seat_closes_the_old_way_and_a_tracked_repo_accepts_either():
 # --- 4: the desk brief's section ---------------------------------------------------------------------------------------
 def test_the_desk_brief_teaches_the_two_modes_and_the_ceremony_in_order(desk):
     store, _ = desk
-    text = "\n".join(cl._board_modes_section())
+    from levain import install as inst_
+    lv = inst_.desk_levain(sys.executable)
+    text = "\n".join(cl._board_modes_section(lv))
     assert "## The work board: two modes" in text and "untracked or tracked" in text
+    assert "does not open" not in text
     order = ["\n1. If this install has no item store", "\n2. Read its existing memory", "\n3. Draft ONE review page",
-             "\n4. He answers in conversation", "\n5. Execute, in this order: `board begin-track`", "`board add --key M:K`",
-             "`charter check` passes there", "`board track`", "pre-track-<date>/", "`board abandon-track`", "`board abandon-done`",
-             "leaving tracked mode is `untrack`", "\n6. Write one `decision` episode"]
+             "\n4. He answers in conversation", f"\n5. Execute, in this order: `{lv} board begin-track`",
+             f"`{lv} board add --key M:K` for each item", f"`{lv} charter check` passes there", f"`{lv} board track` (the one record",
+             "pre-track-<date>/", f"`{lv} board abandon-track`, finish", f"then `{lv} board abandon-done`",
+             f"leaving tracked mode is `{lv} board untrack`", "\n6. Write one `decision` episode"]
     at = [text.index(x) for x in order]
     assert at == sorted(at), dict(zip(order, at))
     assert "--migration M" in text and "Board-Seat" in text
+
+
+def test_the_desks_door_opens_the_named_board_and_charter_verbs_and_no_other(desk):
+    # the door is per-verb (a rule is a command prefix): the ceremony's verbs are opened one by one, in the install's
+    # own spelling, and a board or charter verb the brief does not name stays closed
+    from levain import install as inst_
+    lv = inst_.desk_levain(sys.executable)
+    rules = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst_.desk_allow(sys.executable)]
+    assert not {f"{lv} board", f"{lv} charter"} & set(rules)           # never the whole command
+    opened = {r.removeprefix(lv + " ") for r in rules if r.startswith(lv + " ")}
+    assert opened == {*inst_.DESK_VERBS, *inst_.DESK_BOARD_VERBS}
+    extra = {v for v in opened if v.split()[0] in ("board", "charter")}
+    assert extra == set(inst_.DESK_BOARD_VERBS) and len(extra) == 15
+    text = "\n".join(cl._board_modes_section(lv))
+    named = {c.removeprefix(lv + " ") for c in re.findall(r"`([^`]+)`", text) if c.startswith(lv + " ")}
+    for c in named:                                                    # each verb the brief names is opened
+        assert any(c == v or c.startswith(v + " ") for v in opened), c
+    for closed in ("board forget", "board export", "charter rewrite", "board"):
+        assert not any(closed == v or closed.startswith(v + " ") for v in opened), closed
+
+
+def test_the_door_in_code_opens_exactly_the_named_board_and_charter_leaves():
+    # the code door is default-deny per leaf: only the verbs in DESK_BOARD_VERBS are marked, every other board or
+    # charter leaf stays unmarked and so refused inside the desk's workspace
+    from levain import install as inst_
+    from levain.cli import build_parser
+    from levain.desk import door
+    leaves = door.declared_leaves(build_parser())
+    opened = {" ".join(p) for p, mark in leaves.items() if mark is True and p[0] in ("board", "charter")}
+    assert opened == set(inst_.DESK_BOARD_VERBS)
+    closed = {" ".join(p) for p, mark in leaves.items() if p[0] in ("board", "charter") and mark is not True}
+    assert closed and not closed & opened and "board move" in closed and "board ack-torn" in closed
