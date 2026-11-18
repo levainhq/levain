@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from levain.cockpit.consent import parse_stamp
 from levain.desk import ready
 from levain.desk.legacy import ROLE_DESK
 from levain.desk.store import CoordStore, next_gseq
@@ -44,7 +45,7 @@ def write(store: CoordStore, token: int, item_id: str, *, to: str, who: str, why
             top = conn.execute(f"SELECT MAX(rank) FROM ({ready._CURRENT}) WHERE repo = ?", (state["repo"],)).fetchone()[0]
             state["rank"] = 1 if top is None else top + 1
         ver = 1 if prior is None else prior["ver"] + 1
-        when = ready.parse_stamp(now)
+        when = parse_stamp(now)
         rec = {"ts": when.timestamp(), "iso": when.astimezone().isoformat(timespec="seconds"), "id": item_id,
                "repo": state["repo"], "from_status": None if prior is None else prior["status"],
                "to_status": to, "from_category": None if prior is None else prior["category"], "to_category": to,
