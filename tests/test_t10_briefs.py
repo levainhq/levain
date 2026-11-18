@@ -15,7 +15,7 @@ from levain.desk import lease, seat_close
 from levain.desk.store import CoordError, CoordStore
 from tests.test_agents_spawn import a_thread, registry, role  # noqa: F401
 from tests.test_board_registry import (  # noqa: F401
-    A, bare_store, begin, git, home, mkrepo, ok, run, store as board_store_dir, track_ready)
+    A, bare_store, begin, decision_seal, git, home, mkrepo, ok, run, store as board_store_dir, track_ready)
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ def test_a_launch_with_no_registry_is_legacy_and_writes_no_protocol_row(desk, re
     conn.close()
 
 
-def test_every_mode_derives_its_protocol_and_the_lock_refuses_the_rest(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_every_mode_derives_its_protocol_and_the_lock_refuses_the_rest(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     store, token = desk
     a = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
@@ -81,7 +81,7 @@ def test_every_mode_derives_its_protocol_and_the_lock_refuses_the_rest(desk, reg
     assert store.launch(ln.launch_id).protocol == "tracked"                           # read back from the record
 
 
-def test_a_refused_launch_leaves_no_launch(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_a_refused_launch_leaves_no_launch(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     store, token = desk
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, board_store_dir, a, "alpha")
@@ -283,7 +283,7 @@ def test_every_board_and_charter_line_of_the_brief_parses_and_passes_the_door(ho
     assert seen == set(inst_.DESK_BOARD_VERBS)                 # the brief spells every opened verb, and only those
 
 
-def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(home, mkrepo, tmp_path, monkeypatch, capsys):  # noqa: F811
+def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(decision_seal, home, mkrepo, tmp_path, monkeypatch, capsys):  # noqa: F811
     # the brief's own spellings, run in the desk's workspace: `board use DIR` (no --by) and every write `--by desk`
     from levain.cli import main
     from tests.test_board_registry import CHARTER, land, manifest
@@ -339,7 +339,7 @@ def test_the_board_leaves_are_opened_where_defined_and_parse_imports_no_install(
         assert marks[tuple(verb.split())] is True, verb
 
 
-def test_a_worker_on_a_tracked_repo_without_an_item_is_refused_with_the_spelling(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_a_worker_on_a_tracked_repo_without_an_item_is_refused_with_the_spelling(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     store, token = desk
     b = mkrepo("beta")
     track_ready(capsys, tmp_path, board_store_dir, b, "beta")
@@ -349,7 +349,7 @@ def test_a_worker_on_a_tracked_repo_without_an_item_is_refused_with_the_spelling
     assert "--item NAME#N" in "\n".join(cl._board_modes_section("lv"))
 
 
-def test_a_ceremony_launch_with_no_item_is_told_its_close(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_a_ceremony_launch_with_no_item_is_told_its_close(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     store, token = desk
     a = mkrepo("alpha")
     m, _ = track_ready(capsys, tmp_path, board_store_dir, a, "alpha")
@@ -357,7 +357,7 @@ def test_a_ceremony_launch_with_no_item_is_told_its_close(desk, registry, mkrepo
     assert "recorded as `ceremony`" in text and "no board item" in text and "Board-Item" not in text
 
 
-def test_the_items_repo_decides_and_a_directory_outside_it_is_refused(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_the_items_repo_decides_and_a_directory_outside_it_is_refused(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     store, token = desk
     a = mkrepo("alpha")
     track_ready(capsys, tmp_path, board_store_dir, a, "alpha")                 # tracking: locked
@@ -496,7 +496,7 @@ def test_the_desk_brief_scopes_the_token_to_coord_drops_and_thread_writes():
     assert "`lv coord spawn" not in text                        # a spawn shape is never printed as a command here
 
 
-def test_an_item_of_an_unregistered_repo_is_refused_wherever_the_launch_runs(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+def test_an_item_of_an_unregistered_repo_is_refused_wherever_the_launch_runs(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
     # codex OPEN 6 / gemini MED 1: `--item typo#1` names no registered repository, so it cannot be a board item
     store, token = desk
     a, b = mkrepo("alpha"), mkrepo("beta")
