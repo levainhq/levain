@@ -45,7 +45,7 @@ def group_alive(pgid: int) -> bool:
 
 
 # A native program has no interpreter in its command line, which is what ``ps`` reads for the real ``claude`` (a native
-# executable: levain#131 measured it). So the stub's entry point is this launcher: it is started with the argv the fire
+# executable on the one install measured: claude 2.1.327, 11-18, levain#131). So the stub's entry point is this launcher: it is started with the argv the fire
 # records, and runs the ``sh`` script as its child.
 _LAUNCHER = r"""#include <errno.h>
 #include <signal.h>

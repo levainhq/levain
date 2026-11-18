@@ -48,7 +48,7 @@ def test_default_install_has_no_stub(tmp_path):
 
 
 def test_the_stub_looks_to_ps_the_way_the_real_claude_does(tmp_path):
-    """A native ``claude`` shows ``ps`` its own path as argv[0] (levain#131 measured it), so the recorded compose argv
+    """A native ``claude`` shows ``ps`` its own path as argv[0] (measured on claude 2.1.327, 11-18, levain#131), so the recorded compose argv
     equals the live command line and recovery's identity check holds. The stub must show the same, never ``/bin/sh <stub>``."""
     import os
     import signal
