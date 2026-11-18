@@ -234,7 +234,7 @@ def classify_note(text: str) -> tuple[str, str]:
     """``(destination, why)`` for a Keep note: ``decision`` | ``someday`` | ``observation``. Ruling beats
     intention; anything the cues do not place is an ``observation`` (nothing is lost, T3 (b))."""
     if _RULING.search(text):
-        return "decision", "wording of a ruling (ruled/decided/approved/...): kept as a decision episode, his words as written"
+        return "decision", "wording of a ruling (ruled/decided/approved/...): kept as a decision episode, the operator's words as written"
     if _INTENT.search(text):
         return "someday", "reads as an intention (starts with a to-do verb): re-planted as a someday"
     if _FACT_HINT.search(text):
@@ -271,7 +271,7 @@ def _episode_body(item: Mapping[str, Any], etype: str) -> str:
     notes = item.get("notes") or []
     tail = ("\n\nnotes on the item:\n" + "\n".join(f"- {n}" for n in notes)) if notes else ""
     if etype == "decision":
-        return (f"Decision carried out of the Keep (migrated {when or 'undated'}; his words as written):\n"
+        return (f"Decision carried out of the Keep (migrated {when or 'undated'}; the operator's words as written):\n"
                 f"{text}{tail}\n\nPremise: as written in the note above.")
     return f"{durable_fact_line(text)}{tail}"
 

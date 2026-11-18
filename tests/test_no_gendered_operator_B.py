@@ -30,6 +30,7 @@ FILES = [
     "levain/desk/standing_orders.py",
     "levain/desk_click.py",
     "levain/dispatch/calibration.py",
+    "levain/keep_migrate.py",
     "levain/dream/agent.py",
     "levain/dream/card.py",
     "levain/dream/cli.py",
@@ -43,8 +44,8 @@ FILES = [
 
 # (file, quoted phrase): why it is kept.
 KEPT = [
-    # levain/keep_migrate.py is not in FILES: its literals are rewritten by the levain#88 T11 code link, which lands that file;
-    # add it here, with its stopword list as a KEPT entry, once that link is on main.
+    ("levain/keep_migrate.py", "the a an and or of to in on for with is are was were be been it this that",
+     "an English stopword list the keyword matcher compares words against: he, his and him must stay in it, it is never printed as a sentence"),
 ]
 
 # (file, the whole literal): a stored dict key or field name, read by other code and by old data. It is a compatibility schema key: it may appear in serialized output (dream rollback prints the card), it is not a sentence said to anyone.
