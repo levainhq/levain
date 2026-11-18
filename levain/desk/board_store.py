@@ -621,28 +621,64 @@ def _seen_changed(before: tuple, after: tuple) -> str:
 
 def _open_existing(path: Path) -> int:
     """The store file at ``path`` opened for append under its own LOCK_EX with the inode re-check, WITHOUT ``O_CREAT``; -1
-    when it is not there. A write never creates a store file until it appends its record (:func:`_create_for_record`), so
-    a write that ends without one (refused, cancelled, nothing to write, ``prepare``'s capture) leaves nothing behind
-    (codex 116, fix 6: the file's existence activates the registry)."""
+    when it is not there. A write never creates a store file except by publishing its first record whole
+    (:func:`_publish_first`), so a write that ends without one (refused, cancelled, nothing to write, ``prepare``'s capture)
+    leaves nothing behind (codex 116, fix 6: the file's existence activates the registry)."""
     return _open_checked(path, os.O_RDWR | os.O_APPEND, fcntl.LOCK_EX, missing_ok=True)
 
 
-def _create_for_record(path: Path) -> int | None:
-    """Create the store file at ``path`` to append the first record to it: ``O_CREAT|O_EXCL``, so the file is this write's
-    own; None when a file is there now (a writer that takes no lock made one since the check: the store moved). The caller
-    holds the exclusive store lock and has just checked that the file is absent, as it was when the record was built."""
+FIRST_TEMP_PREFIX = ".first."          # a dot name that is never one of APPEND_FILES: no store reader opens it
+
+
+def _seen_entry(seen: tuple, name: str) -> tuple:
+    """``name``'s entry in a :func:`_store_seen` reading: ``(name,)`` when the file was absent."""
+    return next(e for e in seen if e[0] == name)
+
+
+def _entry_of(name: str, fd: int, raw: bytes) -> tuple:
+    """The :func:`_store_seen` entry for the file held at ``fd`` whose bytes ``raw`` were just read from it."""
     try:
-        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        return None
+        st = os.fstat(fd)
     except OSError as exc:
-        raise BoardError(f"cannot create {path}: {exc}") from None
+        raise BoardError(f"the board store could not be checked ({exc})") from None
+    return (name, st.st_dev, st.st_ino, len(raw), hashlib.sha256(raw).hexdigest())
+
+
+def _publish_first(target: Target, path: Path, rec: dict) -> bool:
+    """Make ``rec`` the first record of a store file that does not exist: written and fsynced into a unique temp name in the
+    store directory, published at ``path`` by ``link`` (atomic, and never replaces a file there), the temp name unlinked,
+    the directory fsynced. A failure before the link (write, fsync, an interrupt) leaves NO file at ``path``: an empty store
+    file is never published (an empty ``repos.jsonl`` would activate the registry), and a published path is never cleaned
+    up by this writer. Returns False when a file is at ``path`` now (another writer published first; nothing of this write
+    is there). The caller holds the exclusive store lock and found the file absent when the record was built (fix 7)."""
+    label = rec.get("id") or rec.get("repo") or rec.get("op")
+    tmp = target.store_dir / f"{FIRST_TEMP_PREFIX}{path.name}.{os.getpid()}.{secrets.token_hex(8)}"
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        raise BoardError(f"cannot create the first record of {path} ({exc}); nothing was written") from None
+    try:
+        try:
+            _write_bytes(fd, canonical_bytes(rec) + b"\n")
+        except OSError as exc:
+            raise BoardError(f"the first record of {path} could not be written ({exc}); nothing was written") from None
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            raise BoardError(f"the first record of {path} could not be published ({exc}); nothing was written") from None
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"board: the temp file {tmp} could not be removed ({exc}); no store reader reads it, delete it", file=sys.stderr)
+    _fsync_dir_or_warn(target.store_dir, label)
+    return True
 
 
 def _write_record(target: Target, fd: int, path: Path, raw: bytes, rec: dict, empty: bool) -> None:
@@ -678,11 +714,12 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     prompt is never shown for one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed
     record must verify, or BoardError is raised and nothing is written.
 
-    No open before the append creates the file: a missing file reads as no bytes, and only the final locked step, the one
-    that appends the record, creates it (``O_CREAT|O_EXCL``, after the last re-check found it still absent). A write that
-    ends without writing a record (refused, cancelled, nothing to write, ``prepare``'s capture) therefore leaves nothing it
-    has to clean up, and never unlinks anything (codex 116, fix 6). Absent when built and absent now is unchanged; absent
-    then and present now (or the reverse) is the store moving."""
+    No open creates a store file: a missing file reads as no bytes (absent is taken from the same :func:`_store_seen`
+    reading the write is checked against, fix 7), and a first record is published whole by :func:`_publish_first` (written
+    and fsynced under a temp name, then ``link``ed into place, which never replaces a file). A write that ends without a
+    record, or fails or is interrupted before the link, leaves no store file and never unlinks a store path (codex 116, fix
+    6, fix 7). Absent when built and absent now is unchanged; absent then and present now (or the reverse) is the store
+    moving: a file published by another writer first sends an unsigned write back to the read, and refuses a signed one."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
@@ -690,14 +727,17 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     with store_lock(target.store_dir, exclusive=True):
         changed = ""
         for _ in range(OPEN_RETRIES):
+            seen = _store_seen(target.store_dir)    # FIRST: absent is this reading's word, and the bytes read must be it
+            absent = len(_seen_entry(seen, filename)) == 1      # (gemini, fix 7: never a build on b"" over a file it saw)
             fd = _open_existing(path)               # -1: absent (no O_CREAT: nothing is created before the record)
             try:
-                absent = fd < 0
-                raw = b"" if absent else _read_fd(fd)
-                if (path.exists() if absent else not _same_file(fd, path)):
-                    changed = f"{path} was {'created' if absent else 'replaced'} (a git operation?)"
-                    continue                # moved before anything was written: open, read and build again
-                seen = _store_seen(target.store_dir)
+                raw = b"" if fd < 0 else _read_fd(fd)
+                if (fd < 0) != absent or (not absent and (not _same_file(fd, path)
+                                                          or _entry_of(filename, fd, raw) != _seen_entry(seen, filename))):
+                    changed = (f"{filename} was created" if absent else f"{filename} was removed" if fd < 0
+                               else f"{filename} was replaced (a git operation?)" if not _same_file(fd, path)
+                               else f"{filename} changed under a writer that takes no lock")
+                    continue                # moved before anything was written: read, open and build again
                 rec, write = build(parse(raw))
                 if not write:
                     return rec, False
@@ -711,12 +751,11 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                 if seal is not None:        # (bounded); checked BEFORE a sealed write leaves for its one prompt (gemini 130)
                     break                   # the ceremony runs with no lock held (below)
                 if absent:
-                    fd = _create_for_record(path)
-                    if fd is None:
-                        fd = -1
-                        changed = f"{path} was created under a writer that takes no lock"
-                        continue
-                _write_record(target, fd, path, raw, rec, absent or not raw)
+                    if not _publish_first(target, path, rec):
+                        changed = f"{filename} was created under a writer that takes no lock"
+                        continue            # re-read the file that appeared and append after it
+                    return rec, True
+                _write_record(target, fd, path, raw, rec, not raw)
                 return rec, True
             finally:
                 if fd >= 0:
@@ -739,11 +778,10 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                     path.exists() if absent else (not _same_file(fd, path) or os.fstat(fd).st_size != len(raw))):
                 raise BoardError(SIGNED_CHAIN_MOVED)        # every post-seal mismatch refuses: a re-build would seal again
             if absent:
-                fd = _create_for_record(path)
-                if fd is None:
-                    fd = -1
-                    raise BoardError(SIGNED_CHAIN_MOVED)    # a file appeared since the check: the store moved
-            _write_record(target, fd, path, raw, sealed, absent or not raw)
+                if not _publish_first(target, path, sealed):
+                    raise BoardError(SIGNED_CHAIN_MOVED)    # a file appeared since the check: built against none, refused
+                return sealed, True
+            _write_record(target, fd, path, raw, sealed, not raw)
             return sealed, True
         finally:
             if fd >= 0:

@@ -1139,8 +1139,8 @@ def test_a_writer_never_opens_a_store_file_with_o_creat_before_its_record_codex_
         bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=_Cancelled(rig))
     sg.prepare(tgt, "add", repo="alpha", title="t", origin="o", by="desk 1", author=OP, authority=rig.source())
     assert creates == [] and not (bare_store / "repos.jsonl").exists() and not (bare_store / "items.jsonl").exists()
-    assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]            # the write that appends creates the file
-    assert creates == ["items.jsonl"]
+    assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]            # the write that appends publishes the file
+    assert creates == [] and len((bare_store / "items.jsonl").read_bytes().splitlines()) == 1     # by link (fix 7), no O_CREAT
 
 
 def test_a_file_another_writer_creates_before_the_open_survives_a_cancelled_write_codex_116(bare_store, mkrepo, rig, monkeypatch):
@@ -1236,23 +1236,172 @@ def test_a_sealed_write_with_no_author_refuses_up_front_gemini_168(tgt, store, t
     assert raw(store) == before
 
 
-def test_a_file_made_between_the_last_check_and_the_create_sends_the_write_back_not_onto_it(bare_store, mkrepo, rig, monkeypatch):
-    """The create is ``O_CREAT|O_EXCL``: a file a lock-free writer makes after the last check is never taken as this write's
-    own. An unsigned write re-reads it and appends after it; a signed one refuses (the store moved; never two prompts)."""
+# ------------------------------------------- fix 7 (L3 round 3, l3_p2_r3): each case reproduced first on 1ff2f68b2
+
+
+def _temps(store) -> list[str]:
+    return sorted(n for n in os.listdir(store) if n.startswith(getattr(bs, "FIRST_TEMP_PREFIX", ".first.")))
+
+
+def _first_write(which, tgt, mkrepo):
+    if which == "repos.jsonl":
+        return br.register(tgt, "alpha", str(mkrepo("alpha")), "first", "desk 1", author=OP)
+    return bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)
+
+
+def _failing(monkeypatch, where, exc):
+    """``os.write`` of a record's bytes, or the first ``os.fsync`` of a regular file, raises ``exc`` once armed."""
+    import stat
+    real_write, real_fsync, hit = os.write, os.fsync, []
+
+    def write(fd, data):
+        if not hit and b'"prev"' in bytes(data):
+            hit.append(1)
+            raise exc
+        return real_write(fd, data)
+
+    def fsync(fd):
+        if not hit and stat.S_ISREG(os.fstat(fd).st_mode):
+            hit.append(1)
+            raise exc
+        return real_fsync(fd)
+    monkeypatch.setattr(bs.os, where, write if where == "write" else fsync)
+    return hit
+
+
+@pytest.mark.parametrize("which", ["repos.jsonl", "items.jsonl"])
+@pytest.mark.parametrize("where", ["write", "fsync"])
+def test_a_failed_first_write_leaves_no_store_file_codex_r3(bare_store, mkrepo, monkeypatch, which, where):
+    """codex MED / complement LOW / deepseek LOW (l3_p2_r3), reproduced on 1ff2f68b2: the first write on a fresh store
+    created the file (O_CREAT|O_EXCL), then a write or fsync failure cut it back to zero bytes and left it: an empty
+    repos.jsonl activated the registry. The first record is now published whole by link: a failure leaves no store file
+    and no temp name, and the registry stays inactive."""
+    tgt = bs.resolve_store(None)
+    hit = _failing(monkeypatch, where, OSError(28, "No space left on device"))
+    with pytest.raises(bs.BoardError) as got:
+        _first_write(which, tgt, mkrepo)
+    assert hit and not (bare_store / which).exists() and _temps(bare_store) == []
+    assert not br.read_registry(tgt, allow_inactive=True).active and "nothing was written" in str(got.value)
+
+
+@pytest.mark.parametrize("which", ["repos.jsonl", "items.jsonl"])
+@pytest.mark.parametrize("where", ["write", "fsync"])
+def test_an_interrupted_first_write_leaves_no_store_file_codex_r3(bare_store, mkrepo, monkeypatch, which, where):
+    """The same with an interrupt (KeyboardInterrupt) before the record's bytes are durable, reproduced on 1ff2f68b2 (an
+    empty file stayed): no store file, no temp name."""
+    tgt = bs.resolve_store(None)
+    hit = _failing(monkeypatch, where, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        _first_write(which, tgt, mkrepo)
+    assert hit and not (bare_store / which).exists() and _temps(bare_store) == []
+    assert not br.read_registry(tgt, allow_inactive=True).active
+
+
+def test_an_interrupt_in_a_flock_on_the_new_store_file_never_leaves_it_empty_complement_r3(bare_store, mkrepo, monkeypatch):
+    """complement LOW (l3_p2_r3), reproduced on 1ff2f68b2: a KeyboardInterrupt from the flock taken on the just-created
+    store file left it at zero bytes. No lock is taken on a store file that is being published: there is no empty file at
+    any point, so the path is either absent or holds the whole record."""
+    import fcntl
+    tgt = bs.resolve_store(None)
+    path = bare_store / "repos.jsonl"
+    real = fcntl.flock
+
+    fired: list[int] = []
+
+    def flock(fd, op):
+        if not fired and path.exists() and (os.fstat(fd).st_ino == path.stat().st_ino):
+            fired.append(1)
+            raise KeyboardInterrupt
+        return real(fd, op)
+    monkeypatch.setattr(bs.fcntl, "flock", flock)
+    try:
+        _first_write("repos.jsonl", tgt, mkrepo)
+    except KeyboardInterrupt:
+        pass
+    assert _temps(bare_store) == []
+    assert not path.exists() or [json.loads(ln)["op"] for ln in path.read_bytes().splitlines()] == ["register"]
+
+
+def _racing_link(monkeypatch, path, data):
+    real, raced = os.link, []
+
+    def link(src, dst, *a, **k):
+        if Path(str(dst)) == path and not raced:
+            raced.append(Path(str(src)).name)
+            path.write_bytes(data)                  # another writer published first, between the build and the link
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(bs.os, "link", link)
+    return raced
+
+
+def test_a_racing_publish_sends_an_unsigned_first_write_back_to_append_after_it_deepseek_r3(bare_store, monkeypatch):
+    """deepseek MED (l3_p2_r3) / head ruling: a file another writer publishes between the build and the publish is never
+    replaced and never written into blind: the link refuses (EEXIST), the unsigned write re-reads and appends after it."""
     tgt = bs.resolve_store(None)
     path = bare_store / "items.jsonl"
-    real, raced = os.open, []
-
-    def racing(p, flags, *a, **k):
-        if Path(str(p)) == path and flags & os.O_EXCL and len(raced) < 1:
-            raced.append(1)
-            path.write_bytes(b"")                       # made in the window, empty: a writer about to append
-        return real(p, flags, *a, **k)
-    monkeypatch.setattr(bs.os, "open", racing)
+    raced = _racing_link(monkeypatch, path, b"")
     assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]
-    assert raced and len(path.read_bytes().splitlines()) == 1
-    path.unlink()
-    raced.clear()
+    assert raced and len(path.read_bytes().splitlines()) == 1 and _temps(bare_store) == []
+
+
+@pytest.mark.parametrize("racing", [b"", b"a line another writer wrote\n"])
+def test_a_racing_publish_refuses_a_signed_first_write_and_keeps_the_other_file_deepseek_r3(bare_store, rig, monkeypatch, racing):
+    """deepseek MED (l3_p2_r3): the signed record was built against an absent file: a file published first refuses it
+    (SIGNED_CHAIN_MOVED, never a second prompt), and the racing file's bytes are untouched; no temp name is left."""
+    tgt = bs.resolve_store(None)
+    path = bare_store / "items.jsonl"
+    raced = _racing_link(monkeypatch, path, racing)
     with pytest.raises(bs.BoardError, match="changed while you signed"):
         bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=rig.seal())
-    assert raced and path.read_bytes() == b""
+    assert raced and path.read_bytes() == racing and _temps(bare_store) == []
+
+
+@pytest.mark.parametrize("which", ["repos.jsonl", "items.jsonl"])
+def test_the_temp_name_is_invisible_to_every_store_reader(bare_store, mkrepo, monkeypatch, which):
+    """A first record left under a temp name (a crash before the link, or between the link and the unlink): no store reader
+    sees it. The link is made to fail after the record is whole under its temp name, and a copy of that temp file is kept
+    under another temp name: the registry stays inactive, the items read empty, ``_store_seen`` finds both files absent,
+    the next first write publishes its own record, and the temp name can never be a store file name."""
+    tgt = bs.resolve_store(None)
+    keep = bare_store / f"{bs.FIRST_TEMP_PREFIX}{which}.1.deadbeefdeadbeef"
+    real, seen = os.link, []
+
+    def link(src, dst, *a, **k):
+        if not seen:
+            seen.append(Path(str(src)).name)
+            shutil.copyfile(src, keep)              # a whole, fsynced first record, under a temp name
+            raise OSError(5, "Input/output error")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(bs.os, "link", link)
+    with pytest.raises(bs.BoardError, match="could not be published.*nothing was written"):
+        _first_write(which, tgt, mkrepo)
+    assert len(seen) == 1 and seen[0].startswith(bs.FIRST_TEMP_PREFIX) and seen[0] not in bs.APPEND_FILES
+    assert keep.read_bytes().count(b"\n") == 1 and _temps(bare_store) == [keep.name]
+    assert not br.read_registry(tgt, allow_inactive=True).active and bs.read_item_lines(tgt) == []
+    assert bs._store_seen(bare_store) == (("items.jsonl",), ("repos.jsonl",))
+    if which == "repos.jsonl":
+        br.register(tgt, "beta", str(mkrepo("beta")), "first", "desk 1", author=OP)
+    else:
+        _first_write(which, tgt, mkrepo)
+    assert len((bare_store / which).read_bytes().splitlines()) == 1 and _temps(bare_store) == [keep.name]
+
+
+def test_a_file_made_before_the_snapshot_is_read_and_built_on_not_signed_over_b_empty_gemini_r3(bare_store, rig, monkeypatch):
+    """gemini LOW (l3_p2_r3), reproduced on 1ff2f68b2: absent was checked BEFORE the baseline snapshot, so a file made in
+    between was in the snapshot while the record was built against b"": the sealed write went to the prompt and was then
+    refused. Absent is now the snapshot's own word: the file is read and built on, and the one prompt lands."""
+    tgt = bs.resolve_store(None)
+    path = bare_store / "items.jsonl"
+    real, made, prompts = bs._store_seen, [], []
+
+    def seen(d):
+        if not made:
+            made.append(1)
+            _lockfree_add(bare_store, "alpha#7", "k7")      # a writer that takes no lock, right before the first reading
+        return real(d)
+    monkeypatch.setattr(bs, "_store_seen", seen)
+    racing = path.read_bytes() if path.exists() else None
+    bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=_signer_doing(rig, lambda: prompts.append(1)))
+    lines = path.read_bytes().splitlines()
+    assert racing is None and made and prompts == [1] and len(lines) == 2
+    assert json.loads(lines[1])["prev"] == bs.chain_prev(lines[0] + b"\n")
