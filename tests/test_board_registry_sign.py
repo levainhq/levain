@@ -706,6 +706,8 @@ def _foreign_store_line(tgt, store, rig, m, held):
 def _prev_mismatch_line(tgt, store, rig, m, held):
     """A signed abandon of alpha's migration whose signed prev places it where the first abandon stands (a line copied)."""
     _append_reg(store, _signed_line(rig, {**held, "at": "2026-11-17T13:00:00Z"}))
+    n = len(raw(store).splitlines())                    # the hash chain (P1b) now reads the copied line as a break: acknowledge it,
+    br.ack_torn(tgt, "repos.jsonl", n, "a copied line, kept", "desk 1", author=OP)    # as the foreign-store line above is
     return "does not stand where its signed prev places it"
 
 

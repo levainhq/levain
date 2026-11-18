@@ -17,6 +17,7 @@ import pytest
 
 from levain.cli import main
 from levain.desk import board_context as bc
+from tests.test_board_registry import decision_seal  # noqa: F401  (the P2 test seam: begin-track is decision-class)
 
 A = ["--by", "desk 1", "--author-kind", "operator"]
 CHARTER = """# Charter: alpha
@@ -109,7 +110,7 @@ def make_flow_db(path: Path, tags_for: str = "alpha#1") -> None:
 
 
 @pytest.fixture
-def world(tmp_path, monkeypatch):
+def world(decision_seal, tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lhome"))
     for k in ("LEVAIN_BOARD_ITEMS", "LEVAIN_ANNEAL_DB", "LEVAIN_FLOW_EPISODES", "LEVAIN_LAUNCH_KEY"):
         monkeypatch.delenv(k, raising=False)
