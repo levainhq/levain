@@ -1,9 +1,10 @@
-"""levain.desk.ready — the ready queue's reader and the ONE writer of lifecycle state (C13).
+"""levain.desk.ready — the v1 ready queue's reader; its writer is RETIRED (T7, levain#101).
 
 Contract: READY_SCHEMA v1 (flow's ``READY_SCHEMA.md``, implemented unchanged), conformance fixture
-``tests/fixtures/ready_schema/ready_v1.json`` (flow's, byte for byte). Ruled (Phill 10-28): lifecycle is the AI's job;
-the desk is the SINGLE WRITER; every transition goes to an append-only journal (who, when, why); reads go direct,
-so a seat reads the queue with no desk live; only writes need one.
+``tests/fixtures/ready_schema/ready_v1.json`` (flow's, byte for byte). The queue took no more rows from T7 on: lifecycle
+state is the board's (``levain board``), and :func:`add` / :func:`move` / :func:`correct` raise :class:`V1Retired`. What
+follows is the design as it was, for the reader and the tables it still reads: the tables and their append triggers
+stay, so what they hold stays readable and immutable. Reads go direct, so a seat reads the queue with no desk live.
 
 Three parts:
 
@@ -19,11 +20,9 @@ Three parts:
   is refused unless it is the NEXT transition of its item (its version, and its ``from_category`` equal to the
   item's current category), so a state change with no record cannot be written, two records for one change cannot be
   written, and a replay of the journal reproduces every item's ``declared_category``.
-* the ONE write path, :func:`add` / :func:`move` / :func:`correct`: each runs in ONE desk write transaction
-  fenced by the live lease token (the desk identity, :func:`levain.desk.lease.fence`), and writes the
-  journal record then the state row; anything that raises rolls both back. Refused before anything is opened: no
-  token, an empty ``why`` or ``who``, an unknown category, a move INTO ``needs-you`` (a projection: the band owns it),
-  a projection id (``seat:``, ``ci:``, ``np-``).
+* the write path, :func:`add` / :func:`move` / :func:`correct` (RETIRED): each raises :class:`V1Retired` and writes
+  nothing, through the one function :func:`_transition`. Before the retirement each ran in ONE desk write transaction
+  fenced by the live lease token and wrote the journal record then the state row.
 
 :func:`list_ready` (exported as ``list``, the contract's verb) reads the store through the ONE read-only connection
 (:meth:`CoordStore.open_readonly`: ``mode=ro``, ``query_only``, no write lock) inside one read transaction, so it is
@@ -50,15 +49,14 @@ from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
-from levain.cockpit.consent import parse_stamp
-from levain.desk.store import _OID, CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
+from levain.desk.store import CoordError, CoordStore, StoreAbsent, _append_only
 from levain.dispatch import DispatchError
 from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
 from levain.intention_legacy import READY_SOURCE_KEY
 
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
-    "JournalAhead", "RETIRED", "V1Retired", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
+    "JournalAhead", "RETIRED", "RETIRED_TAILS", "V1Retired", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
     "FACT_COLS", "item_facts", "live_seat_launches", "migrate_item_facts", "ready_counts", "replay", "slug",
 ]
 
@@ -703,7 +701,11 @@ def replay(records: Iterable[Mapping[str, Any]]) -> dict[str, str]:
 RETIRED = ("the v1 ready queue is retired (levain#101): no more rows are written to it. The board is "
            "`levain board add` / `levain board amend` / `levain board decide`, and its state is `levain board state`")
 
-_UNSET = object()
+# what a refusal adds for the verbs whose old job is not `board add` (L2 F1)
+RETIRED_TAILS = {
+    "report": ". A landed fact is read from git now (the Board-Item trailer on main): there is nothing to send",
+    "import-status": ". Make items with `levain board add`; a status file is no longer imported",
+}
 
 
 class V1Retired(CoordError):

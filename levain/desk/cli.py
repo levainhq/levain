@@ -94,9 +94,9 @@ def _store(args: argparse.Namespace) -> EnvelopeStore:
 
 
 def _board_store(args: argparse.Namespace) -> EnvelopeStore:
-    """The store a board verb opens (``coord import-status``, ``coord spawn --item``): ``--queue-dir`` when given, else
-    :func:`levain.desk.work_attach.board_store_dir`, the directory ``coord report`` queues into. Never the
-    consent directory by default: board rows do not go into the live ``dispatch.db``."""
+    """The store ``coord apply-reports`` opens (the only verb left that does, T7): ``--queue-dir`` when given, else
+    :func:`levain.desk.work_attach.board_store_dir`, the directory the retired v1 queue sat in. Never the consent
+    directory by default."""
     from levain.desk import work_attach
 
     d = args.queue_dir.expanduser() if args.queue_dir is not None else work_attach.board_store_dir()
@@ -1771,7 +1771,10 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
     if retired is not None:
         from levain.desk import ready
 
-        print(f"levain desk {retired}: {ready.RETIRED}; nothing was written", file=sys.stderr)
+        why = ready.RETIRED + ready.RETIRED_TAILS.get(retired, "")
+        if getattr(args, "json", False):
+            out.write(json.dumps({"retired": True, "verb": retired, "why": why, "written": False}, ensure_ascii=False) + "\n")
+        print(f"levain desk {retired}: {why}; nothing was written", file=sys.stderr)
         return 2
     try:
         if cmd == "ready":           # show reads the board (T3), never a desk store: no store is opened, no lease read
@@ -2166,10 +2169,10 @@ def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) 
 
 
 def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain desk apply-reports --token N``: the lease holder applies the board's queued worker reports itself, as
-    the desk, facts only (:func:`levain.desk.work_attach.desk_apply`). Without the live lease token
-    nothing is read or written and the exit is 1. Prints the pass's line, or says none was waiting. Any fault of the
-    pass, and a store that is the live consent store, is one line on stderr and the exit is 2."""
+    """``levain desk apply-reports --token N``: the lease holder drains the board's queued v1 reports once, read-only,
+    into one line (:func:`levain.desk.work_attach.desk_apply`); it applies nothing (T7). Without the live lease token
+    of the store it opens nothing is read or written and the exit is 1. Prints the pass's line, or says none was
+    waiting. Any fault of the pass, and a store that is the live consent store, is one line on stderr and the exit is 2."""
     from levain.desk import work_attach
 
     if work_attach.is_live_consent(Path(store.directory)):
@@ -2194,8 +2197,8 @@ _SLOTS_FILE_MAX = 64 * 1024
 
 
 def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
-    """``levain desk reports REPORT_ID`` (row 156 L2 F16): what became of one report, read-only (queued, applied,
-    refused with its reason, or unknown). Opens no store for writing and takes no token. Exit 1 when the id is unknown."""
+    """``levain desk reports REPORT_ID`` (row 156 L2 F16): what became of one report, read-only (queued, drained,
+    applied or refused with its reason before the retirement, or unknown). Opens no store for writing and takes no token. Exit 1 when the id is unknown."""
     from levain.desk import work_attach
 
     out = out or sys.stdout
@@ -2205,7 +2208,8 @@ def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
     except (CoordError, sqlite3.Error, OSError) as exc:
         print(f"levain desk reports: {exc}", file=sys.stderr)
         return 2
-    words = {"queued": "queued before the v1 queue retired; it is drained once into the watch's log and never applied",
+    words = {"queued": "queued before the v1 queue retired; the next watch pass drains it once into its log, never applied",
+             "drained": "queued before the v1 queue retired; it was drained into the watch's log and was never applied",
              "applied": f"applied ({st['kind']}, {st['attach_id']})",
              "refused": f"refused ({st['reason']}: {st['detail']})",
              "unknown": f"not in the queue at {directory}"}[st["state"]]
@@ -2833,7 +2837,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     crt.add_argument("--json", action="store_true", help="Machine-readable output.")
     crt.set_defaults(func=run_coord)
     crs = c_sub.add_parser(
-        "reports", help="What became of a report you queued: queued, applied, or refused and why (read-only).",
+        "reports", help="What became of a report you queued: queued, drained, applied, or refused and why (read-only).",
         description="Reads the board store's queue and its records for one report id. Writes nothing; no token.")
     crs.add_argument("report_id", metavar="REPORT_ID", help="The id `levain desk report` printed.")
     crs.add_argument("--board-store", dest="board_store", type=Path, default=None, metavar="DIR",
