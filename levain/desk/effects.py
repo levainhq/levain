@@ -112,10 +112,10 @@ _ACK_CHARS_MAX = 600
 _ACK_LINES_MAX = 3
 #: the fixed disclosure line the send tool appends for each VOICE (ND-4); the drafter names a voice, never the wording
 DISCLOSURES: Mapping[str, str] = MappingProxyType({
-    "stand_in": "This acknowledgement was written automatically on his behalf by an AI assistant. He has been alerted "
-                "to your message.",
-    "flow": "This acknowledgement was written automatically by flow, an AI assistant. He has been alerted to your "
-            "message.",
+    "stand_in": "This acknowledgement was written automatically on behalf of the operator by an AI assistant. The operator has been "
+                "alerted to your message.",
+    "flow": "This acknowledgement was written automatically by flow, an AI assistant. The operator has been alerted "
+            "to your message.",
 })
 VOICES = tuple(DISCLOSURES)
 _REMOTE_TIMEOUT = 60

@@ -709,7 +709,7 @@ def test_the_draft_text_bound_matches_the_send_tools_own():
     assert sealed.DRAFT_TEXT_MAX == fx._ACK_CHARS_MAX
 
 
-@pytest.mark.parametrize("voice,phrase", [("stand_in", "on his behalf by an AI assistant"),
+@pytest.mark.parametrize("voice,phrase", [("stand_in", "on behalf of the operator by an AI assistant"),
                                           ("flow", "written automatically by flow, an AI assistant")])
 def test_each_voice_appends_its_fixed_disclosure_once_after_the_text(world, voice, phrase):
     line = {"verb": "send_ack", "args": {"voice": [voice], "known_from": [FROM]}, "per_incident": 1, "per_night": 1}

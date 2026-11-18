@@ -409,7 +409,7 @@ def test_send_ack_sends_one_message_to_the_derived_from_and_nobody_else(world):
     assert res.ok and res.text == "send_ack: sent"
     [msg] = rig.sent
     assert msg.recipient == FROM and msg.sender == "thirdmind@levain.example" and msg.subject == fx.ACK_SUBJECT
-    assert msg.body.startswith(GOOD_DRAFT) and "written automatically on his behalf" in msg.body
+    assert msg.body.startswith(GOOD_DRAFT) and "written automatically on behalf of the operator" in msg.body
     assert dict(msg.headers) == {"Auto-Submitted": "auto-replied"}
     assert {f.name for f in __import__("dataclasses").fields(fx.AckMessage)} == \
         {"sender", "recipient", "subject", "body", "headers"}                          # one recipient field, no Cc/Bcc
