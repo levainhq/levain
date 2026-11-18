@@ -24,7 +24,7 @@ def store(tmp_path_factory):
     mp = pytest.MonkeyPatch()
     mp.setenv("LEVAIN_HOME", str(root / "lhome"))
     mp.delenv("LEVAIN_LAUNCH_KEY", raising=False)
-    ids = seed.seed(root)
+    ids = seed.seed(root, mp)
     mp.setenv("LEVAIN_BOARD_ITEMS", str(root / "store"))
     yield ids
     mp.undo()
