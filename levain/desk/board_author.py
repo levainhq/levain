@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -424,31 +425,34 @@ def _note_writer(repo: Path, close_sha: str, item_id: str) -> str | None:
     return writer if had else None
 
 
+def _lexical_rel(path: str, base: str, base_prefix: str) -> str | None:
+    """``path`` relative to the repo's toplevel, when it lies under ``base`` (a lexical prefix naming the toplevel plus
+    ``base_prefix``, a ``/``-terminated repo-relative prefix or ""): the repo-relative path ("" for the toplevel itself), or
+    None when ``path`` is not under ``base``."""
+    if path == base:
+        return base_prefix.rstrip("/")
+    if not path.startswith(base.rstrip("/") + "/"):
+        return None
+    return (base_prefix + path[len(base.rstrip("/")) + 1:]).rstrip("/")
+
+
 def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
     """``(the first-parent commit on main that first added the path, "")`` or ``(None, the unattributed text)``. The path
-    is :func:`levain.desk.board_evidence.done_path`'s; whether it is in the repo's work tree, and its name there, are git's
-    answers from inside the path's PARENT directory (nothing is resolved, followed or entered here)."""
-    path = be.done_path(key, repo)
-    # The LITERAL tracked path: probed from its parent directory by its own name, so a symlink is never followed and a
-    # submodule directory is never entered (git then names it as the superproject's own path).
-    probe = path.parent
-    if not probe.is_dir():
-        return None, "unattributed: the path cannot be found now"
-    if not path.is_symlink() and path.exists():
-        top0 = Path(be._git(repo, "rev-parse", "--show-toplevel").strip())
-        try:
-            if path.samefile(top0):
-                return None, "unattributed: the path is the repo's whole work tree"
-        except OSError:
-            pass
-    here = be._run(probe, "rev-parse", "--show-toplevel", "--show-prefix")
-    if here.returncode != 0:
-        return None, OUTSIDE
-    lines = here.stdout.decode("utf-8", "replace").split("\n")
+    is :func:`levain.desk.board_evidence.done_path`'s, normalised LEXICALLY (``os.path.normpath``: no symlink followed, no
+    ``..`` resolved through the disk) and expressed relative to the repo's toplevel, against the repo as given and against
+    git's ``--show-toplevel``. EVERY git call runs from the repo itself, never from inside the named path, so an ancestor
+    symlink is not followed and a submodule is not entered: ``dirlink/f.txt`` (``dirlink`` a tracked link) and a file under
+    a submodule were added by no superproject commit (git tracks the link, the gitlink). The literal path is the answer."""
+    path = os.path.normpath(str(be.done_path(key, repo)))
+    given = os.path.normpath(str(repo))
     top = be._git(repo, "rev-parse", "--show-toplevel").strip()
-    if len(lines) < 2 or lines[0] != top:
+    prefix = be._git(repo, "rev-parse", "--show-prefix").strip()
+    # the toplevel as git names it, and the repo as given (a subdirectory of the toplevel when ``prefix`` is not empty)
+    rel = _lexical_rel(path, os.path.normpath(top), "")
+    if rel is None:
+        rel = _lexical_rel(path, given, prefix)
+    if rel is None:
         return None, OUTSIDE
-    rel = (lines[1] + path.name).rstrip("/")
     if not rel:
         return None, "unattributed: the path is the repo's whole work tree"
     out = be._git(repo, "log", "--first-parent", "--no-renames", "--diff-filter=A", "--format=%H", "--reverse", main_ref, "--",
