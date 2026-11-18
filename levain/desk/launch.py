@@ -77,7 +77,9 @@ winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
 session is yours to look at. The desk's directory under the levain home is one the hands floor denies by name
 (``levain.firing.confinement.LEVAIN_HOME_STATE_DIRS``) when it cannot deny the home whole, so a firing OF the
-desk's own install there refuses its floor (fail-closed).
+desk's own install there refuses its floor (fail-closed). The desk brief's ``untrack`` line ends ``--sign``: that line
+runs end to end only at the laptop (a Touch ID prompt cannot run in a test), so the tests pin that it parses and that
+the same line with a test seal is accepted, and the real signed run was judged a manual check.
 """
 from __future__ import annotations
 
@@ -562,8 +564,11 @@ def _board_forms(lv: str) -> dict[str, str]:
     :func:`_board_modes_section` print these strings, so a flag a verb comes to need is added here once. The decision-class
     verbs (decide, begin-track, track, abandon-track) end ``--source Q-ID``, the band row carrying his answer, which is
     the one authority the desk can give; untrack takes no ``--source``, so it is the operator's own signed write
-    (``--author-kind operator --sign``). Each parses as written once its placeholders (NAME, NAME#N, DIR, FILE, M, K,
-    DECISION, SHA256, Q-ID) are filled (tests/test_t10_briefs.py)."""
+    (``--author-kind operator --sign``). ``board amend --done`` is the WORKER's form, not the desk's: the one amend a
+    tracked close reads (an amend whose ``done`` is set, written with the seat's launch key), which REPLACES the item's DONE
+    line; the worker brief (:func:`_board_item_section`) prints it with the item and key filled. Each parses as written
+    once its placeholders (NAME, NAME#N, N, DIR, FILE, M, K, DECISION, SHA256, Q-ID, KEY) are filled
+    (tests/test_t10_briefs.py)."""
     return {
         "board state": f"{lv} board state",
         "board repos": f"{lv} board repos",
@@ -572,6 +577,8 @@ def _board_forms(lv: str) -> dict[str, str]:
         "board add --key": f"{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --key M:K "
                            "--payload-hash SHA256 --by desk",
         "board amend": f"{lv} board amend --id NAME#N --why \"...\" --by desk",
+        "board amend --done": f"{lv} board amend --id NAME#N --why \"...\" --done \"what remains\" --by worker "
+                              "--launch-key KEY",
         "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk --source Q-ID",
         "board use": f"{lv} board use DIR",
         "board register": f"{lv} board register NAME --path DIR --words \"his words\" --by desk",
@@ -589,7 +596,7 @@ def _board_modes_section(lv: str) -> list[str]:
     """The desk brief's section on the work board: the two modes of a repository, the verbs, and the ceremony in the
     order the design fixes (5). ``lv`` is the install's own command, spelled as the other verbs are, so each verb here
     is one the desk's door allows as written. Every command it prints is a complete form from :func:`_board_forms`.
-    Fixed text; it names no count and no repository."""
+    Fixed text, the same for every desk: it names no repository and no item."""
     f = _board_forms(lv)
     return [
         "## The work board: two modes",
@@ -601,15 +608,17 @@ def _board_modes_section(lv: str) -> list[str]:
         "A repository in either is locked to new work, and a worker launch on it is refused unless its `coord spawn` "
         "carries the ceremony's migration id as `--migration M`.",
         "",
-        "These are `board` and `charter` verbs, not `coord` verbs, and you run them yourself: your door opens exactly "
-        "the ones named below, and no other. On them `--by` names the record's author (you write `--by desk`) and "
+        "These are `board` and `charter` verbs, not `coord` verbs. Your door opens exactly the ones named below, and no "
+        "other, and you run them yourself, all but `untrack`: he runs that one at the laptop, and you give him its line. "
+        "On them `--by` names the record's author (you write `--by desk`) and "
         "they take no `--token`. A write's authority is checked by the writer, not by the door, and `decide`, `begin-track`, "
         "`track`, `abandon-track` and `untrack` are refused without it: use `--source Q-ID` (the id of the band row "
-        "carrying his answer) when you relay an answer he gave on the band, with `--words` an exact excerpt of it (for "
-        "the three ceremony verbs the question you put to him must also carry the manifest's sha256, the sha256 of the "
-        "manifest file's bytes); when he "
-        "signs at the laptop, he runs the same line himself with `--author-kind operator --sign` in place of `--source "
-        "Q-ID`. `untrack` takes no `--source`: it is his signed write only.",
+        "carrying his answer) when you relay an answer he gave on the band, with `--words` an exact excerpt of it. For "
+        "`begin-track` and `track` the question you put to him must also carry the manifest's sha256 (the sha256 of the "
+        "manifest file's bytes): the SAME sha256 for both, since `track` holds his yes to the manifest `begin-track` "
+        "recorded; `decide` and `abandon-track` carry none. When he "
+        "signs at the laptop, he runs the same line himself with `--by operator --author-kind operator --sign` in place "
+        "of `--by desk ... --source Q-ID`. `untrack` takes no `--source`: it is his signed write only.",
         "",
         f"- read: `{f['board state']}`, `{f['board repos']}`, `{f['board context']}`;",
         f"- an item: `{f['board add']}`, `{f['board amend']}`, `{f['board decide']}`;",
@@ -631,12 +640,14 @@ def _board_modes_section(lv: str) -> list[str]:
         "build, test or deploy convention, routed to the repository's conventions file instead of the charter.",
         "4. He answers in conversation, and edits go back to step 3. His yes, in his words, is what `--words` carries on "
         "`begin-track` and later `track`.",
-        f"5. Execute, in this order: `{f['board begin-track']}` (it writes the migration id M and locks the repository); "
-        f"for each item, `{f['board add --key']}` (K names the item within the migration, SHA256 is its payload's "
-        f"hash); land `CHARTER.md` on the repository's main by its own landing path, where `{f['charter check']}` "
-        f"reports on it and exits 0 in this release, while `{f['board track']}` (the one record that moves the source "
-        "of truth) is the gate that refuses; then each old file is copied to the record directory's "
-        "`pre-track-<date>/` and replaced by the stub, landed by the repository's own path. Before `track` the old "
+        f"5. Execute, in this order: first `{f['board begin-track']}`, which locks the repository and prints "
+        "`tracking NAME (migration M)`: M is that migration id; then, for each item, "
+        f"`{f['board add --key']}` (K names the item within the migration, SHA256 is its payload's hash); then land "
+        "`CHARTER.md` on the repository's main by its own landing path; then "
+        f"`{f['board track']}`, the one record that moves the source of truth; last, copy each old file to the record "
+        "directory's `pre-track-<date>/` and land the stub in its place, by the repository's own path. "
+        f"`{f['charter check']}` reports on the landed charter and exits 0 in this release; `track` is the gate that "
+        "refuses a charter that does not hold. Before `track` the old "
         f"files are the source of truth, and after it the board is. To stop before `track`: "
         f"`{f['board abandon-track']}`, finish any compensation, then `{f['board abandon-done']}`. After `track` there "
         f"is no abort, and leaving tracked mode is `{f['board untrack']}`.",
@@ -678,12 +689,20 @@ def desk_command(install: Path | str | None) -> str:
 
 
 def _board_item_section(launch: Any) -> list[str]:
-    """The worker brief's board section: for a launch started for board items (``launch.board_items``) the five rules of
-    the brief (design 6, "The brief (T10)"), and for any launch whose protocol is not ``legacy`` the close it is judged
-    by. Empty for a legacy launch that claimed none. The brief carries no copy of an item's context: ``levain board
-    context`` is the one source. The commands are spelled with this interpreter (:func:`levain.install.desk_levain`): a
-    worker runs in its own repository, not in a desk install. The ids are checked against the board's id shape at the
-    claim, and are marked here all the same."""
+    """The worker brief's board section. Empty for a ``legacy`` launch that claimed no item. For a launch started for
+    board items (``launch.board_items``): the five rules of the brief (design 6, "The brief (T10)"), every command and
+    trailer printed with each item's own id (never a placeholder), then the close the launch's protocol judges it by:
+
+    * ``tracked``: per item, an episode at or after the launch's whole second, and either the ``Board-Closes`` trailer
+      or the worker's ``board amend --done`` (:func:`_board_forms`), which replaces the item's DONE line with what remains;
+    * ``legacy`` and ``ceremony``: the old memory's close, with the tracked close accepted too once the repository is
+      tracked (:func:`levain.desk.seat_close.check_close`'s dual-accept).
+
+    A launch with no readable item claim is told so, and then: a ``tracked`` one that it cannot close by the board (the
+    tracked close is judged per claimed item) and must ask the desk; any other protocol the old close above. The brief
+    carries no copy of an item's context: ``levain board context`` is the one source. The commands are spelled with this
+    interpreter (:func:`levain.install.desk_levain`): a worker runs in its own repository, not in a desk install. The
+    ids are checked against the board's id shape at the claim, and are marked here all the same."""
     from levain.install import desk_levain
 
     items = launch.board_items or ()
@@ -691,11 +710,18 @@ def _board_item_section(launch: Any) -> list[str]:
         return []
     key = unshowable.mark(launch.session_key, allow="")
     lv = desk_levain(sys.executable)
+    forms = _board_forms(lv)
     ids = [unshowable.mark(i, allow="") for i in items]
     many = len(ids) > 1
-    each = " (for each item you touch)" if many else ""
-    first = ids[0] if len(ids) == 1 else "NAME#N"
-    repo = ids[0].partition("#")[0] if len(ids) == 1 else "NAME"
+
+    def form(verb: str, item: str) -> str:
+        return forms[verb].replace("NAME#N", item).replace("KEY", key)
+
+    def each(span) -> str:
+        """``span(item)`` for every item: one span, or ``a``, ``b`` and ``c``."""
+        got = [span(i) for i in ids]
+        return got[0] if len(got) == 1 else ", ".join(got[:-1]) + " and " + got[-1]
+
     lines = [
         "## Your board item" + ("s" if many else ""),
         "",
@@ -704,28 +730,38 @@ def _board_item_section(launch: Any) -> list[str]:
         lines += [
             f"Levain started you for {', '.join(f'`{i}`' for i in ids)} on the work board. Five rules, in this order:",
             "",
-            *([f"- Run `{lv} board context {i}` before anything else." for i in ids] if not many else
-              [f"- Run `{lv} board context NAME#N` for each of {', '.join(f'`{i}`' for i in ids)} before anything else."]),
+            *[f"- Run `{form('board context', i)}` before anything else." for i in ids],
             "  That command is the one source of the item's context: its charter, the operator's words, its DONE line, its "
             "record. This brief carries no copy of it.",
-            f"- Every commit you make carries the trailer `Board-Item: {first}`{each}.",
-            f"- The commit that meets the item's DONE line also carries `Board-Closes: {first}`.",
+            (f"- Every commit you make carries the trailer `Board-Item: {ids[0]}`." if not many else
+             "- Every commit you make carries the `Board-Item` trailer of each item it touches: "
+             + each(lambda i: f"`Board-Item: {i}`") + "."),
+            (f"- The commit that meets the item's DONE line also carries `Board-Closes: {ids[0]}`." if not many else
+             "- The commit that meets an item's DONE line also carries that item's trailer: "
+             + each(lambda i: f"`Board-Closes: {i}`") + "."),
             f"- Every closing commit also carries `Board-Seat: {key}`, your durable key.",
-            f"- Write each decision and each handoff as an episode tagged `repo:{repo}` and `item:{first}`, with source `{key}`.",
+            "- Write each decision and each handoff as an episode tagged "
+            + " or ".join(f"`repo:{i.partition('#')[0]}` and `item:{i}`" for i in ids)
+            + (" (the tags of the item it is about)" if many else "") + f", with source `{key}`.",
             "",
         ]
     else:
         lines += ["Levain started you for no board item (none was claimed on your launch, or its claim cannot be read).", ""]
-    lines += [
-        f"Your launch is recorded as `{launch.protocol}`: " + (
-            "a tracked repository has no `## ▶ CURRENT STATE` block to rewrite, so your close is an episode for each item "
-            "you touched, written at or after your launch's whole second, plus a closing trailer or "
-            f"`{lv} board amend --id {first} --why \"...\" --done \"what remains\" --by worker --launch-key {key}` "
-            "naming what remains." if launch.protocol == "tracked" else
-            "you close the way the repository's old memory does, and when the repository has since become tracked, the "
-            "tracked close is accepted too."),
-        "",
-    ]
+    if launch.protocol == "tracked" and not ids:
+        close = ("your close is judged for each board item the launch claimed, and with none this launch cannot close by "
+                 "the board. Say so in your handoff and ask the desk what to do before you do any work.")
+    elif launch.protocol == "tracked":
+        close = ("a tracked repository has no `## ▶ CURRENT STATE` block to rewrite, so your close is, for each item "
+                 "above, an episode tagged with it and written at or after your launch's whole second, plus either its "
+                 "`Board-Closes` trailer on a commit carrying your `Board-Seat`, or, when you end with its DONE line not "
+                 "met, " + ("its own line of " if many else "")
+                 + "; ".join(f"`{form('board amend --done', i)}`" for i in ids) + ". That amend REPLACES the item's DONE "
+                 "line with the text you give, so give the whole of what remains, written as the new DONE line; the close "
+                 "reads that `done` field, set by a record carrying your launch key, and no other amend.")
+    else:
+        close = ("you close the way the repository's old memory does, and when the repository has since become tracked, "
+                 "the tracked close is accepted too.")
+    lines += [f"Your launch is recorded as `{launch.protocol}`: " + close, ""]
     return lines
 
 

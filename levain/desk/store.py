@@ -1246,7 +1246,9 @@ class CoordStore:
         same transaction, so a malformed id refuses the whole request and leaves no launch. The v1 ready queue is
         not read or written. A worker's close protocol (T10) is taken from its repository's mode in the registry
         (:func:`levain.desk.board_registry.launch_protocol`, which also refuses a locked repository, a tracked one with no
-        item and a directory outside the item's repository) and written on the record when it is not ``legacy``. That read
+        item, a directory outside the item's repository, an item of an unregistered repository whatever the registry's
+        state, and an item with no ``cwd``) and written on the record when it is not ``legacy``; a worker launch carrying
+        an item always takes that decision, and one naming several threads is left to ``request_launch``'s refusal. That read
         and the launch record are one decision: the registry's stamp it was read under is compared again inside the launch's
         own transaction, and any change refuses the launch (ask again). A refused request writes nothing anywhere: the lease
         and request checks run first, in a transaction rolled back, before ``register_for_launch`` may write the registry."""
@@ -1257,7 +1259,10 @@ class CoordStore:
             lease.check_board_items([attach_item])
         threads = tuple(threads)                    # one pass over a one-shot iterable: every check below reads the same threads
 
-        judged = role == "worker" and bool(cwd)     # only a worker's launch takes a close protocol from the registry
+        # only a worker's launch takes a close protocol from the registry, and one carrying an item claim always does (no
+        # cwd is then refused by name there); a worker naming several threads is refused by request_launch first, and its
+        # message stays the first one it sees
+        judged = role == "worker" and len(threads) <= 1 and (bool(cwd) or attach_item is not None)
 
         def decide() -> tuple[str, str | None, Any]:
             if not judged:
