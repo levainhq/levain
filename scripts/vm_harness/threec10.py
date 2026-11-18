@@ -10,7 +10,7 @@ a FAKE guest and a FAKE provider, no VM and no vendor.
 
 The steps, each with ONE expected verdict (:data:`EXPECTED`), written to ``EXPECTED.txt`` before the first guest call:
   T1  install the limited key as the keys credential (stdin; the secret is never in an argv)   -> ``cred-installed <cred>``
-  T2  ``levain doctor`` as root: the ``invoice ceiling (<cred>)`` row reads the limit            -> ``key limit $X total, $Y remaining ...``
+  T2  ``levain doctor`` as root: the ``invoice ceiling (<cred>)`` row reads the limit            -> ``key limit $X[ total], $Y remaining ...``
   T3  one real call: the provider's ``usage`` delta equals the lineage's settled dollars, within a stated tolerance -> ``AGREE ...``
   T4  an overrun: a lineage row with ``overrun`` set (the session stopped)                        -> ``overrun-row ...``
   T5  install the unlimited key                                                                   -> ``cred-installed <cred>``
@@ -104,7 +104,7 @@ REMOVE_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json" "$1/keys/cred/$2.json.new"
 EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
     ("T1", "install the limited key", 0, r"cred-installed <cred>", r"^cred-installed "),
     ("T2", "doctor, key with a limit", None,
-     r"\s*\S+ invoice ceiling \(<cred>(?: at [^)]+)?\): key limit " + USD + r" total, " + USD + r" remaining.*",
+     r"\s*\S+ invoice ceiling \(<cred>(?: at [^)]+)?\): key limit " + USD + r"(?: total)?, " + USD + r" remaining.*",
      r"invoice ceiling \(<cred>"),
     ("T3", "one real call settles from real usage", None, r"AGREE .*", r"^(AGREE|DISAGREE|NOCALL|NOMOVE) "),
     ("T4", "an overrun stops the session", None, r"overrun-row .*", r"^(overrun-row|no-overrun-row) "),

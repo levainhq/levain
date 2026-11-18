@@ -470,7 +470,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
         row = next((ln for ln in lines if re.search(r"invoice ceiling \(" + re.escape(cfg.cred), ln)), "")
         m = re.search(r"key limit (" + USD + r")(?: total)?, (" + USD + r") remaining", row)
         if not m:
-            raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X total, $Y remaining'", row.strip())
+            raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X[ total], $Y remaining'", row.strip())
         limit, remaining = (float(g.replace("$", "").replace(",", "")) for g in m.groups())
         ps, _ = capture(guest, (cfg.profile.ps_bin, "-Ao", "pid,command"), 60)
         pid = next((ln.split()[0] for ln in ps if RUNNER_MODULE in ln and "grep" not in ln and ln.split()[0].isdigit()), None)

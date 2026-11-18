@@ -12,7 +12,7 @@ import pytest
 from scripts.vm_harness import runbook as RB
 from scripts.vm_harness import wave3_e2e as W
 from scripts.vm_harness.driver import GuestError
-from scripts.vm_harness.host_profile import DARWIN
+from scripts.vm_harness.host_profile import DARWIN, LINUX
 from tests.test_vm_harness_wave3_e2e import CRED, STOP_DIR, World, by_id, go
 
 
@@ -97,3 +97,34 @@ def test_the_guest_error_tail_is_700_chars(tmp_path, monkeypatch):
         run(["x"], "", 5)
     text = str(e.value)
     assert text.count("B") == 700 and "A" not in text
+
+
+# ---- the two siblings the first pass left (threec10 T2, host_profile.dispatch_argv) -------------------------------------
+
+def _t2():
+    from scripts.vm_harness import threec10 as T
+    import re
+    sid, _n, _rc, pat, sel = next(e for e in T.EXPECTED if e[0] == "T2")
+    return re.compile(pat.replace("<cred>", re.escape("or-key"))), sel.replace("<cred>", re.escape("or-key"))
+
+
+@pytest.mark.parametrize("tail", [
+    "key limit $2.00 total, $1.60 remaining",                                            # the old wording
+    "key limit $2.00, $1.60 remaining; BYOK usage is not counted against this limit",    # the doctor's wording with a problem
+])
+def test_threec10_t2_takes_both_key_limit_wordings(tail):
+    rx, _sel = _t2()
+    assert rx.fullmatch(f"  [OK] invoice ceiling (or-key): {tail}")
+
+
+def test_threec10_t2_still_refuses_a_row_with_no_limit():
+    rx, _sel = _t2()
+    assert not rx.fullmatch("  [OK] invoice ceiling (or-key): no credit limit is set on this key: nothing at the provider bounds the invoice")
+
+
+@pytest.mark.parametrize("profile", [DARWIN, LINUX], ids=lambda p: p.name)
+def test_profile_dispatch_argv_sets_home_to_the_dispatch_dir_before_the_interpreter(profile):
+    a = profile.dispatch_argv()
+    assert a[:5] == ("sudo", "-n", "-u", profile.dispatch_user, "/usr/bin/env")
+    assert f"HOME={profile.store}/dispatch" in a
+    assert a.index(f"HOME={profile.store}/dispatch") < a.index(profile.python)

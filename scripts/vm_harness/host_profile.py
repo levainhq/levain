@@ -47,7 +47,7 @@ class HostProfile:
 
     def dispatch_argv(self) -> tuple[str, ...]:
         """The dispatch-user guest_dispatch invocation prefix."""
-        return ("sudo", "-n", "-u", self.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin",
+        return ("sudo", "-n", "-u", self.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={self.store}/dispatch",
                 self.python, "-I", f"{self.tools_dir}/guest_dispatch.py")
 
     def ps_argv(self) -> list[str]:
