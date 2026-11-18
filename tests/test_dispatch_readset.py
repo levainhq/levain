@@ -612,3 +612,66 @@ def test_a_parent_close_error_after_the_verify_returns_the_verified_set(world, t
         os.close(fd)
     assert hit and v.commit == rs.commit
     R.discard(v)
+
+
+def _verify_with_limits(world, tmp_path, monkeypatch, first_limits):
+    """Run verify_readset with the first clone_limits() measurement replaced by ``first_limits(real_limits)``; return
+    ``(VerifiedReadSet, number of measurements)``. The later measurements are the real ones."""
+    from levain.dispatch import readset as R
+    from levain.dispatch.attempt_id import new_attempt_id
+    _root, repo, _base, _old_a, contract = world
+    top = Path(os.path.realpath(tmp_path))
+    cb, d = contract.canonical().encode("utf-8"), contract.digest
+    rs = build_readset(str(repo), contract, dest(top, "scratch"), contract_digest=d)
+    for name in ("handoff", "attempts"):
+        (top / name).mkdir(mode=0o700)
+    ex = R.export_readset(rs, cb, d, str(top / "handoff"))
+    try:
+        fd = R.open_handoff(ex.path, size=ex.size)
+    finally:
+        os.close(ex.fd)
+    real, calls = R.clone_limits, []
+
+    def measured():
+        calls.append(1)
+        got = real()
+        return first_limits(got) if len(calls) == 1 else got
+
+    monkeypatch.setattr(R, "clone_limits", measured)
+    monkeypatch.setattr(R, "CLONE_FORK_PAUSE_S", 0.0)
+    try:
+        return R.verify_readset(cb, d, fd, str(top / "attempts"), new_attempt_id()), len(calls)
+    finally:
+        os.close(fd)
+
+
+def _no_nproc_headroom(limits):
+    """What a burst of the uid's own tasks between the measuring and the fork leaves: a limit the count has passed."""
+    tasks = max(1, dict(limits)["uid_tasks"] - 20)
+    return tuple((n, tasks) if n == "RLIMIT_NPROC" else (n, v) for n, v in limits)
+
+
+def test_a_clone_whose_fork_the_kernel_refused_is_measured_again_and_runs_once_more(world, tmp_path, monkeypatch):
+    """levain#117, reproduced: RLIMIT_NPROC is the count at measuring plus a margin, so tasks the same uid starts in the
+    gap (CI's sibling xdist workers) left git with `cannot fork() for index-pack: Resource temporarily unavailable`.
+    Here the first measurement is already under the uid's count (the real git is refused by the real kernel), the retry measures again."""
+    from levain.dispatch import readset as R
+    v, measured = _verify_with_limits(world, tmp_path, monkeypatch, _no_nproc_headroom)
+    assert measured == 2 and v.commit
+    R.discard(v)
+
+
+def test_a_fork_refusal_that_persists_is_named_after_the_tries(world, tmp_path, monkeypatch):
+    """The retry is bounded: a refusal on every try is still readset-git-failed, with git's own words."""
+    from levain.dispatch import readset as R
+    real = R.clone_limits
+    monkeypatch.setattr(R, "clone_limits", lambda: _no_nproc_headroom(real()))
+    got = refusal(_verify_with_limits, world, tmp_path, monkeypatch, lambda lim: lim)
+    assert got.name == "readset-git-failed" and "cannot fork()" in got.detail
+
+
+def test_only_a_refused_fork_is_retried(monkeypatch):
+    from levain.dispatch import readset as R
+    assert R._fork_refused(b"error: cannot fork() for index-pack: Resource temporarily unavailable\n")
+    assert not R._fork_refused(b"fatal: pack has bad object\n")
+    assert not R._fork_refused(b"error: Resource temporarily unavailable\n")

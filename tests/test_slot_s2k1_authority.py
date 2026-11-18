@@ -493,7 +493,15 @@ def test_connections_over_the_cap_closed_at_accept(senv):
 
 
 def test_server_threads_pruned(senv):
+    """Bounded, not a product change (levain#117): this server's cap is 3 connections, and a closed client is only
+    seen to be closed by its server thread a moment later. On a loaded CI shard that moment outlasted the next
+    connect, the 4th connection met the cap and was closed at accept with its request unread (ConnectionResetError
+    in the client's ask; reproduced by delaying the server thread's EOF by 0.3 s). The cap behaves as designed; this
+    test is about pruning, so each connect waits until the server holds fewer than the cap."""
     for _ in range(6):
+        deadline = time.time() + 5
+        while len(senv.server._conns) >= senv.server.max_connections and time.time() < deadline:
+            time.sleep(0.02)
         c = senv.client("op")
         assert c.ask("STATUS")["ok"]
         c.close()
