@@ -843,6 +843,11 @@ def check_add(store_dir: Path, repo: str, key: str | None) -> None:
         if key.startswith(f"{cur.migration}:stubs:"):
             raise BoardError(f"{repo} is tracking: no stub item is ever on the board while {repo}'s old files are still its source of "
                              f"truth (design 5 (e)); add the {key!r} item only after `levain board track {repo}`")
+        k = key[len(cur.migration or "") + 1:]
+        plan_keys = (cur.manifest or {}).get("plan_items", [])
+        if k not in plan_keys:
+            raise BoardError(f"{repo} is tracking (migration {cur.migration}): key {key!r} is not one of the manifest's plan_items "
+                             f"({', '.join(plan_keys) or 'none'}), so no item is added for it")
         return
     raise BoardError(f"{repo} is {cur.mode}: the board holds items only for a tracking or tracked repo")
 
