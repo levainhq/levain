@@ -1,9 +1,9 @@
 """A stub ``claude`` for the P10a rig: the program the dream's fire runs when the install fact ``claude_bin`` names it.
 
 The fire builds its mind as ``ClaudeMind(inst.model, claude_bin=inst.claude_bin)`` and starts it as a real child
-process, so a file at that path is the whole seam. This file is that program (a POSIX ``sh`` script) and the test-side
-handle on what it did. The script has its directory written into it, because the fire's child carries a scrubbed
-environment and could not read one from a variable.
+process, so a file at that path is the whole seam. This file builds that program (a tiny native launcher that runs a
+POSIX ``sh`` script) and is the test-side handle on what it did. The script has its directory written into it, because
+the fire's child carries a scrubbed environment and could not read one from a variable.
 
 Per call n (1-based) the script records ``argv-n`` (one argument per line), ``stdin-n`` and ``cwd-n`` beside itself,
 then replies from ``result-n.json`` (else ``result.json``, else a minimal success document), sleeps for ``sleep-n`` /
@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 _SCRIPT = """#!/bin/sh
@@ -42,6 +44,48 @@ def group_alive(pgid: int) -> bool:
     return True
 
 
+# A native program has no interpreter in its command line, which is what ``ps`` reads for the real ``claude`` (a native
+# executable: levain#131 measured it). So the stub's entry point is this launcher: it is started with the argv the fire
+# records, and runs the ``sh`` script as its child.
+_LAUNCHER = r"""#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pid_t kid;
+static void fwd(int sig) { if (kid > 0) kill(kid, sig); }
+
+int main(int argc, char **argv) {
+    char **a = calloc((size_t)argc + 2, sizeof *a);
+    int st;
+    a[0] = "/bin/sh";
+    a[1] = {script};
+    for (int i = 1; i < argc; i++) a[i + 1] = argv[i];
+    signal(SIGTERM, fwd);
+    signal(SIGINT, fwd);
+    kid = fork();
+    if (kid < 0) return 127;
+    if (kid == 0) { execv("/bin/sh", a); _exit(127); }
+    while (waitpid(kid, &st, 0) < 0) if (errno != EINTR) return 127;
+    return WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
+}
+"""
+
+
+def _build_launcher(src: Path, out: Path, script: Path) -> bool:
+    """Compile the launcher for ``script`` to ``out``; False when no C compiler is there or it fails."""
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if cc is None:
+        return False
+    src.write_text(_LAUNCHER.replace("{script}", json.dumps(str(script))), encoding="utf-8")
+    try:
+        done = subprocess.run([cc, "-o", str(out), str(src)], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and out.is_file()
+
+
 def success_doc(text: str = "stub", cost: float | None = 0.01, model: str = "claude-opus-5-5") -> dict:
     doc = {"type": "result", "subtype": "success", "is_error": False, "result": text,
            "usage": {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0,
@@ -53,14 +97,23 @@ def success_doc(text: str = "stub", cost: float | None = 0.01, model: str = "cla
 
 
 class StubClaude:
-    """``StubClaude(root)`` writes ``root/claude`` (executable) and ``root/calls/``. ``path`` is the value for ``claude_bin``."""
+    """``StubClaude(root)`` writes ``root/claude`` (executable) and ``root/calls/``. ``path`` is the value for ``claude_bin``.
+
+    ``native`` is True when ``path`` is a compiled launcher (the shape the real ``claude`` has to ``ps``: its command line
+    is the recorded argv). With no C compiler ``path`` is the ``sh`` script itself and ``ps`` shows ``/bin/sh <path> ...``
+    (``native`` False): a case that needs the real shape skips on it."""
 
     def __init__(self, root: Path) -> None:
-        self.dir = Path(root) / "calls"
+        root = Path(root)
+        self.dir = root / "calls"
         self.dir.mkdir(parents=True)
-        self.path = Path(root) / "claude"
-        self.path.write_text(_SCRIPT.format(dir=self.dir), encoding="utf-8")
-        self.path.chmod(self.path.stat().st_mode | stat.S_IXUSR)
+        self.path = root / "claude"
+        script = root / "claude.sh"
+        script.write_text(_SCRIPT.format(dir=self.dir), encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        self.native = _build_launcher(root / "launcher.c", self.path, script)
+        if not self.native:
+            shutil.copy(script, self.path)
         (self.dir / "default.json").write_text(json.dumps(success_doc()), encoding="utf-8")
 
     def reply(self, doc: dict | str, n: int | None = None) -> None:

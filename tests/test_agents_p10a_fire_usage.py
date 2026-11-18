@@ -29,9 +29,12 @@ RESERVED = 20_000_000          # the link's budget_run_usd_micros (link_doc), th
 
 
 # ------------------------------------------------------------------------------------------------------- helpers
-def _start(tmp_path, reply, *, sleep=None) -> Install:
-    """A signed install whose stub answers ``reply``, and a REAL ``dream start`` (the fire is detached)."""
+def _start(tmp_path, reply, *, sleep=None, need_native=False) -> Install:
+    """A signed install whose stub answers ``reply``, and a REAL ``dream start`` (the fire is detached). ``need_native``:
+    the case needs a stub whose command line to ``ps`` is the recorded argv (``StubClaude.native``), else it skips."""
     inst = Install(tmp_path, stub=True)
+    if need_native and not inst.stub.native:
+        pytest.skip("no C compiler: the stub is an sh script, so ps shows /bin/sh <stub> and not the recorded argv")
     assert inst.enable("--time", "00:00").rc == 0
     assert inst.sign(inst.link_doc()).rc == 0
     inst.stub.reply(reply)
@@ -171,8 +174,8 @@ def _gone(pid: int) -> bool:
     return False
 
 
-def _sigkill_mid_compose(tmp_path):
-    inst = _start(tmp_path, success_doc(text=_VALID, cost=0.5), sleep=40)
+def _sigkill_mid_compose(tmp_path, *, need_native=False):
+    inst = _start(tmp_path, success_doc(text=_VALID, cost=0.5), sleep=40, need_native=need_native)
     _wait(inst, "the stub to be running", lambda: inst.stub.calls() >= 1)
     (row,) = inst.rows()
     assert row["state"] == "launched" and row["pid"]                       # claimed by the fire
@@ -216,12 +219,41 @@ def test_unreadable_usage_cause_iii_a_fire_sigkilled_mid_compose_settles_whole_p
     assert pic["stub_calls"] == 1
 
 
-def test_unreadable_usage_cause_iii_with_the_compose_child_still_alive_nothing_is_debited_until_it_is_ended(tmp_path):
-    """The fire is SIGKILLed but the stub (compose child) keeps running. The tick past ``stop_at`` cannot prove the
-    child ended, so it settles NOTHING: the row stays launched holding its slot, the reservation stays open (no zero is
-    debited), and an attention line names the group. Once the group is gone the next tick settles it whole, unreadable."""
+def test_unreadable_usage_cause_iii_b_a_live_compose_child_is_ended_and_settled_whole_by_the_one_tick(tmp_path):
+    """The fire is SIGKILLed but the stub (compose child, a native program whose command line to ``ps`` is the recorded
+    argv, as the real ``claude``'s is) keeps running. The tick past ``stop_at`` verifies it, ends its group, and settles in
+    that one tick: stopped/stop_at, the slot freed, the reservation debited whole as ``unreadable``, no card."""
+    inst, row, child = _sigkill_mid_compose(tmp_path, need_native=True)
+    occ = row["occurrence_id"]
+    try:
+        assert _group_alive(child)
+        tick = _tick(inst, 61)
+        print("\n[ended] tick:", tick.rc, repr(tick.text))
+        _wait(inst, "the compose group to be gone", lambda: not _group_alive(child), timeout=15)
+        pic = _picture(inst, "ended")
+    finally:
+        _kill_group(child)
+    assert tick.rc == 0 and f"attention [agent-stop-unconfirmed:{occ}]" not in tick.text
+    assert pic["row"] == ("stopped", "stop_at")
+    assert pic["res"] == ("settled", RESERVED, RESERVED, "unreadable")
+    assert pic["agent"][0] == "active" and pic["slots"] == [] and pic["usage"] is None
+    assert pic["cards"]["items"] == []
+    assert pic["stub_calls"] == 1
+
+
+def test_unreadable_usage_cause_iii_c_a_child_whose_command_line_differs_is_not_signalled_nor_settled(tmp_path):
+    """The fire is SIGKILLed and ``progress.json`` records a command line that is NOT what the live child shows (one
+    argument differs; the start time and the ``--add-dir`` element still match). The tick refuses to signal what it
+    cannot verify: it settles NOTHING, the row stays launched holding its slot, the reservation stays open (no zero is
+    debited), the child is still alive, and an attention line names the group. Once the group is gone by hand the next
+    tick settles it whole, unreadable."""
     inst, row, child = _sigkill_mid_compose(tmp_path)
     occ = row["occurrence_id"]
+    prog = inst.anneal / "dream" / occ / "progress.json"
+    doc = json.loads(prog.read_text())
+    assert "--max-budget-usd" in doc["child_argv"]
+    doc["child_argv"][doc["child_argv"].index("--max-budget-usd") + 1] = "9.999999"      # a different command line
+    prog.write_text(json.dumps(doc), encoding="utf-8")
     try:
         first = _tick(inst, 61)
         print("\n[alive] tick 1:", first.rc, repr(first.text))
@@ -236,8 +268,9 @@ def test_unreadable_usage_cause_iii_with_the_compose_child_still_alive_nothing_i
         assert (held["state"], held["reason"]) == ("launched", None)
         assert (open_res["state"], open_res["debited_usd_micros"]) == ("open", None)
         assert len(slots) == 1 and _usage(inst, occ) is None
+        assert _group_alive(child)                                         # nothing was signalled
 
-        _kill_group(child)                                                 # the operator ends the group, as told
+        _kill_group(child)                                                # the operator ends the group, as told
         _wait(inst, "the compose group to be gone", lambda: not _group_alive(child))
         second = _tick(inst, 61)
         print("[alive] tick 2:", second.rc, repr(second.text))

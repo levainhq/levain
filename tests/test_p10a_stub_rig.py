@@ -2,6 +2,7 @@
 what the dream's fire runs."""
 from __future__ import annotations
 
+import contextlib
 import shutil
 import time
 
@@ -44,3 +45,39 @@ def test_default_install_has_no_stub(tmp_path):
     assert inst.stub is None
     assert inst.enable("--time", "00:00").rc == 0
     assert da.read_install(inst.store_dir).claude_bin in (None, "claude")
+
+
+def test_the_stub_looks_to_ps_the_way_the_real_claude_does(tmp_path):
+    """A native ``claude`` shows ``ps`` its own path as argv[0] (levain#131 measured it), so the recorded compose argv
+    equals the live command line and recovery's identity check holds. The stub must show the same, never ``/bin/sh <stub>``."""
+    import os
+    import signal
+    import subprocess
+
+    from levain.consent.delivery import process_identity
+    from levain.dream.recover import _identity_matches
+    from tests._p10a_stub import StubClaude
+
+    stub = StubClaude(tmp_path / "stubclaude")
+    if not stub.native:
+        pytest.skip("no C compiler: the stub is an sh script")
+    stub.sleep(30)
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    argv = [str(stub.path), "-p", "--model", "m", "--add-dir", str(occ)]
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 30
+        while stub.calls() == 0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert stub.calls() == 1
+        ident = process_identity(proc.pid)
+        assert ident is not None and ident[1] == " ".join(argv)
+        assert _identity_matches(proc.pid, ident[0], argv, occ) is True
+        other = list(argv)
+        other[3] = "other"                                       # one argument differs: not the recorded command line
+        assert _identity_matches(proc.pid, ident[0], other, occ) is False
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)

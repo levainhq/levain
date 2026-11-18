@@ -193,15 +193,16 @@ def test_a_fire_that_finishes_after_the_lapse_lands_done(live):
     assert f.usage()["readable"] is True and f.usage()["actual_usd_micros"] == 20_000
 
 
-def test_a_stopped_fire_is_killed_but_its_unprovable_child_keeps_the_row_launched(live):
+def test_a_stopped_fire_is_killed_and_its_verified_child_is_ended_and_settled_in_that_tick(live):
     """SIGSTOP the fire, then the stop_at tick. The SIGTERM stays pending; observed, ``stop()`` escalates inside its
-    deadline: SIGKILL to the fire (identity and phase re-checked), so the FIRE ends, but the compose child is
-    'not-confirmed' (the stub is an ``sh`` script: ``ps`` shows ``/bin/sh <stub> ...``, not the recorded argv, so no
-    signal is sent to it). The row therefore stays launched, holding its slot, with an attention line naming how to end
-    the child by hand. Once the child's group is ended, the next tick settles it. (Differs from the design text: the
-    fire is not left alive pending SIGCONT; SIGCONT of a killed fire has nothing to resume.)"""
+    deadline: SIGKILL to the fire (identity and phase re-checked), and the compose child, a native program whose command
+    line to ``ps`` is the recorded argv (as the real ``claude``'s is), is verified and its group ended. The row settles in
+    that one tick: stopped/stop_at, the slot freed, the reservation debited whole as ``unreadable`` (the SIGKILLed fire
+    wrote no usage.json). (Differs from the design text: the fire is not left alive pending SIGCONT; SIGCONT of a killed
+    fire has nothing to resume.)"""
     f = live()
-    held = f.row
+    if not f.inst.stub.native:
+        pytest.skip("no C compiler: the stub is an sh script, so ps shows /bin/sh <stub> and its child cannot be verified")
     os.kill(f.fire_pid, signal.SIGSTOP)
     t0 = time.monotonic()
     cut = f.inst.cli("agents", "tick", now=_at(61))
@@ -209,20 +210,12 @@ def test_a_stopped_fire_is_killed_but_its_unprovable_child_keeps_the_row_launche
     row = f.now_row()
     _say("stopped tick", round(took, 1), cut.rc, repr(cut.err), {k: row.get(k) for k in ("state", "reason", "epoch")})
     assert cut.rc == 0 and took < 60
-    assert f"attention [agent-stop-unconfirmed:{f.oid}]: occurrence {f.oid}: asked to stop; not confirmed ended" in cut.err
-    assert "SIGTERM to fire" in cut.err
-    assert row == held and len(f.slots()) == 1       # still launched, same epoch, the slot held
-    assert f.group_alive()                           # the child is not ended by the product here: we end it by hand
-
-    os.killpg(f.child, signal.SIGKILL)               # what the attention line tells the operator to do
-    _wait(lambda: not f.group_alive(), "the child's group to end", timeout=15)
-    settle = f.inst.cli("agents", "tick", now=_at(62))
-    row = f.now_row()
-    _say("settle tick", settle.rc, repr(settle.err), {k: row.get(k) for k in ("state", "reason", "epoch")}, f.reservation())
+    assert _quiet_of_unconfirmed(cut.err, f.oid)
     assert row["state"] == "stopped" and row["reason"] == "stop_at" and f.slots() == []
+    _wait(lambda: not f.group_alive(), "the child's group to end", timeout=15)
+    _wait(lambda: not _alive(f.fire_pid), "the fire process to exit", timeout=15)
     res = f.reservation()                            # the SIGKILLed fire wrote no usage.json: unreadable, debited whole
     assert (res["state"], res["settled_reason"], res["debited_usd_micros"]) == ("settled", "unreadable", 20_000_000)
-    assert _quiet_of_unconfirmed(settle.err, f.oid)
 
 
 # ------------------------------------------------------------------------ (4) the executor's stop at link expiry
