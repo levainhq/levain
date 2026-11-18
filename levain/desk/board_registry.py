@@ -672,6 +672,15 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     neither writes anything. A TORN registry or items file is not something a fresh abandon repairs: it refuses naming the
     ``ack-torn`` to run first (deepseek 71, fix 4). Returns ``(repo, ids cut by this call)``."""
     from levain.desk import board_sign as sg
+
+    def items_torn() -> None:
+        """A torn items file (judged as the cut check judges it, ``board_sign._items_kept``) refuses naming the
+        ``ack-torn``: no abandon, signed or unsigned, is written or asked to be signed over it (gemini 162, fix 6)."""
+        items, tail = bs._split_written(_items_raw(target.store_dir))
+        problem, _ = sg._items_kept(bs.StoreLines(items, (), "", False, tail))
+        if problem is not None:
+            raise BoardError(f"abandon-track {name}: {problem}; nothing was written")
+
     if seal is not None and authority is not None and authority is not getattr(seal, "authority", None):
         raise BoardError("abandon-track: a signed abandon's cuts are checked against the seal's own authority source; "
                          "another one was given")
@@ -686,9 +695,11 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     if cur.mode not in ("tracking", "aborting"):
         raise BoardError(f"{name} is {cur.mode}: abandon-track needs a tracking repo (after track, leave with `untrack`)")
     with bs.store_lock(target.store_dir, exclusive=False):          # a torn item store refuses BEFORE the registry record lands
+        items_torn()
         _migration_facts(target.store_dir, name, cur.migration or "")
 
     def build(fold, sid, raw):
+        items_torn()                                        # again under the lock: before any judgement or prompt
         c = _need_repo(fold, name)
         if c.mode == "aborting" and c.migration == cur.migration:
             if seal is None:

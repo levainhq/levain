@@ -345,6 +345,7 @@ def test_a_file_replaced_before_the_write_is_reread_and_written_once(home, tmp_p
 
 def test_a_store_replaced_before_every_write_refuses_and_writes_nothing(home, tmp_path, capsys, monkeypatch):
     store = use(capsys, tmp_path / "s")
+    (store / "items.jsonl").touch()             # a file there to replace: since fix 6 a write never creates one before its record
     real = bs._read_fd
     monkeypatch.setattr(bs, "_read_fd", lambda fd: (_replace_with_copy(store / "items.jsonl"), real(fd))[1])
     rc, out, err = run(capsys, *ADD)
@@ -945,7 +946,7 @@ def test_a_record_without_at_is_refused_not_written_unchained(home, tmp_path):
     bs.use(t.store_dir)
     with pytest.raises(bs.BoardError, match="needs an at"):
         bs._append(t, lambda recs: ({"v": 1, "op": "add", "id": "levain#1"}, True), filename="repos.jsonl")
-    assert not (t.store_dir / "repos.jsonl").exists()          # nothing written, and the file the refused write opened is gone (fix 4)
+    assert not (t.store_dir / "repos.jsonl").exists()          # nothing written, and a refused write never creates the file (fix 6)
 
 
 @pytest.mark.parametrize("key", ["author", "grade", "prev", "sig"])
