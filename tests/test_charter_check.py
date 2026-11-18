@@ -512,3 +512,25 @@ def test_a_badly_named_items_exits_two_for_check_and_init(tmp_path, capsys):
     assert main(["charter", "init", "alpha", "--repo", str(repo), "--items", str(bad)]) == 2
     assert not (repo / "CHARTER.md").exists()
     assert "--items must name a store directory" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("before,after", [("", ".Next"), ("API.", ""), ("", " Next"), ("A-", "")])
+def test_the_own_id_boundaries_see_uppercase_neighbours(tmp_path, before, after):
+    name = "2026-11-18"
+    repo = _git_repo(tmp_path / "r")
+    store = _store_file(tmp_path / "items.jsonl", [(f"{name}#1", None)])
+    assert main(["charter", "init", name, "--repo", str(repo), "--items", str(store)]) == 0
+    text = _fill((repo / "CHARTER.md").read_text(encoding="utf-8")).replace("[judged: filled]", f"[item: {name}#1]")
+    t = text.replace("filled\n\n## Criteria", f"shipped {before}{name}#1{after}\n\n## Criteria", 1)
+    found = any(p.rule == "status" for p in charter.check_text(t, repo_name=name)[0])
+    # a glued uppercase neighbour (`#1.Next`, `API.<name>#1`, `A-<name>#1`) is no own id: the date is seen. A space is a boundary: stripped.
+    assert found is (after != " Next"), (before, after)
+
+
+def test_the_check_and_init_help_say_the_rc_two_list_applies_only_when_the_guard_runs(capsys):
+    for sub in ("check", "init"):
+        with pytest.raises(SystemExit):
+            main(["charter", sub, "--help"])
+        out = " ".join(capsys.readouterr().out.split())
+        assert "only when the guard runs" in out, sub
+        assert "not under --file" in out if sub == "check" else "not under --stdout" in out, sub
