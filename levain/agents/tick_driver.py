@@ -329,6 +329,35 @@ def _cockpit_root(store: AgentStore) -> Path:
     return roots[0]
 
 
+def recover_bars(st: AgentStore, auth: Any, clock: Callable[[], datetime],
+                 attention: Callable[[str, str], None] | None) -> list:
+    """Run ``bars.recover`` once over the store's open bars: the one helper the tick and ``levain agents show`` share.
+    It opens and closes its own two connections (the store's, no transaction open, and the cockpit journal's writable
+    one). A stand-in authority (a test's) is skipped, as is anything that is not an ``AgentAuthority``. Raises what
+    opening them raises; the callers catch it."""
+    from levain.agent_authority import AgentAuthority
+    from levain.agents import bars
+    from levain.authority import anchor_path
+    from levain.cockpit.keys import _journal
+
+    if not isinstance(auth, AgentAuthority):
+        return []
+    root = auth.cockpit_root
+    with _journal(root).autocommit() as cockpit:
+        conn = st._db._connect()
+        try:
+            return bars.recover(conn, auth, cockpit, now=clock(), anchor=anchor_path(root), attention=attention)
+        finally:
+            conn.close()
+
+
+def outcome_note(outcome: Any) -> str:
+    """One recovery outcome as the line the tick and ``show`` print (the part after ``levain agents tick: ``)."""
+    if outcome.bar_id:
+        return f"bar {outcome.bar_id} ({outcome.agent_id}): {outcome.row}: {outcome.text}"
+    return f"recovery: {outcome.row}: {outcome.text}"
+
+
 def _install_coord_dir(store: AgentStore, notes: list[str]) -> Path | None:
     """The desk queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else
     None. No install file is a plain None; a file that exists but cannot be read (refused, corrupt, unreadable) is
@@ -692,6 +721,15 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
         binding_of = binding_of_factory(st, auth, clock)
         result = _ctl.tick(st, clock, binding_of, session_alive, launch_over, reaper=reaper)
+        # AFTER the renewals and the claims, so the lease arithmetic above is untouched; a recovery that raises is a note
+        # and never the tick's exit code
+        try:
+            for outcome in recover_bars(st, auth, clock, attention):
+                if outcome.row != "R4":     # R4 said its piece through the attention sink
+                    notes.append(outcome_note(outcome))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("agent tick: bar recovery raised %s: %s", type(exc).__name__, exc)
+            notes.append(f"bar recovery raised {type(exc).__name__}: {exc}")
         # D1-Q fix round: a launched dream row no fire claimed gets its fire again (the pass already took over the ones
         # whose launch lease lapsed); before the launches, so a row this pass launches is never spawned twice here
         _respawn_dream_fires(st, result, clock, spawn or _ctl.spawn_fire, notes, seen)

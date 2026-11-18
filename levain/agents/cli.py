@@ -415,6 +415,7 @@ def run_show(args: argparse.Namespace) -> int:
         return _fail("show", str(exc))
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("show", f"the store refused it: {exc}")
+    _recover_quietly(store)
     if args.json:
         return _show_json(store, a)
     try:
@@ -433,6 +434,22 @@ def run_show(args: argparse.Namespace) -> int:
     except UnicodeEncodeError as exc:
         return _fail("show", f"stdout cannot encode the spec ({exc.encoding}); set PYTHONIOENCODING=utf-8")
     return 0
+
+
+def _recover_quietly(store) -> None:
+    """``show``'s best-effort bar recovery: the tick's helper, its outcome lines on stderr only. No install naming a
+    cockpit, a refused install, or any failure is skipped silently; ``show``'s stdout and exit code never depend on it."""
+    from levain.agent_authority import AgentAuthority
+    from levain.agents import tick_driver
+
+    try:
+        auth = AgentAuthority(tick_driver._cockpit_root(store))
+        attention, _resolve = tick_driver.attention_sink()
+        for outcome in tick_driver.recover_bars(store, auth, _utcnow, attention):
+            if outcome.row != "R4":
+                print(f"levain agents show: {tick_driver.outcome_note(outcome)}", file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _show_json(store, a: dict) -> int:
@@ -783,6 +800,10 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
                 if sid is None:
                     return _fail("revoke", why)
                 anchor = anchor_path(db.data_root)
+                done = _revoke_already_done(autonomic, cockpit, db.data_root, args.agent, sid, clock)
+                if done is not None:
+                    print(done)
+                    return 0
                 begun = True
                 step = aa.revoke_agent_begin(autonomic, cockpit, args.agent, store_id=sid, signer_fp=signer_fp,
                                              clock=clock)
@@ -814,6 +835,44 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
     except (_signing_refusals() + (StoreFormatError,)) as exc:
         return _fail("revoke", f"{exc}" + (_STAYS_BARRED if begun else ""))
     return 0     # landed, landed on an abandoned bar, or abandoned: each is the true outcome (A0 section 2.2)
+
+
+def _landed_in_log(autonomic, cockpit, bar, clock):
+    """The seq this open bar's own pending link holds in the verified replay (and the bar closed signed there through
+    ``_landed``), else None: no bar, a malformed pending link, or a link the log does not hold. A replay that cannot
+    finish raises ``AgentAuthorityError``."""
+    from levain import agent_authority as aa
+
+    if bar is None:
+        return None
+    link = aa._unsigned(bar)
+    if link is None or not aa._in_log(cockpit, link, None):
+        return None
+    aa._landed(autonomic, bar.bar_id, link.seq, now=clock(), warning=None)
+    return link.seq
+
+
+def _revoke_already_done(autonomic, cockpit, data_root, agent_id: str, store_id: str, clock) -> str | None:
+    """What the signed revoke says instead of beginning one, or None to run today's path. (a) The agent's own open bar
+    holds a link the log already has: close it signed. (b) No open bar and no agent-link of the agent in the verified
+    replay: there is nothing to revoke, and no bar is opened. This runs before ``revoke_agent_begin`` so a revoke that
+    landed and was killed before its close never opens a second bar. A replay that raises is not "nothing to revoke"."""
+    from levain import agent_authority as aa
+    from levain import authority as _auth
+    from levain.agents import bars
+
+    bar = bars.open_bar_of(autonomic, agent_id)
+    try:
+        seq = _landed_in_log(autonomic, cockpit, bar, clock)
+        if seq is not None:
+            return f"the revoke had already landed at seq {seq}; the bar is closed"
+        if bar is None:
+            state = aa.AgentAuthority(data_root).replay()
+            if not _auth.agent_links(state, agent_id, store_id):
+                return f"nothing to revoke: no agent-link of {agent_id} is in the authority log"
+    except Exception:  # noqa: BLE001 - an unreadable log is never "already done": today's path decides
+        return None
+    return None
 
 
 _REVOKE_TERMINAL = ("landed", "landed_bar_abandoned", "abandoned")
@@ -861,6 +920,10 @@ def _run_abandon(args: argparse.Namespace) -> int:
             bar = bars.open_bar_of(autonomic, args.agent)
             if bar is None:
                 return _no_open_bar(autonomic, args.agent)
+            landed = _abandon_landed(args, store, autonomic, bar)
+            if landed is not None:
+                print(f"the revoke had already landed at seq {landed}; nothing to abandon")
+                return 0
             if bars.close_bar(autonomic, bar.bar_id, revoke_seq=None, reason="abandoned", now=_utcnow()):
                 _raise_attention(f"agent-abandon:{bar.bar_id}",
                                  f"the revoke of {args.agent} was abandoned; the agent's links stand as signed")
@@ -871,6 +934,21 @@ def _run_abandon(args: argparse.Namespace) -> int:
             autonomic.close()
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("revoke", f"the store refused it: {exc}")
+
+
+def _abandon_landed(args: argparse.Namespace, store, autonomic, bar) -> int | None:
+    """R1 alone for ``--abandon``: the seq at which the bar's own link is already in the verified log (the bar is then
+    closed signed), else None. A cockpit that cannot be reached, or a log that cannot be replayed, is None: the abandon
+    goes on as it always has. Never R2 or a full recovery: that would append the revoke the operator is abandoning."""
+    from levain.agents import tick_driver
+    from levain.cockpit.keys import _journal
+
+    try:
+        root = args.data_root if args.data_root is not None else tick_driver._cockpit_root(store)
+        with _journal(root).autocommit() as cockpit:
+            return _landed_in_log(autonomic, cockpit, bar, _utcnow)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _no_open_bar(autonomic: sqlite3.Connection, agent_id: str, *, bar_id: str | None = None) -> int:

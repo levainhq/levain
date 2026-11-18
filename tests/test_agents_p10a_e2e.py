@@ -528,13 +528,12 @@ def test_p10a_revoke_killed_c1_before_the_bar(tmp_path):
     assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
 
 
-@pytest.mark.parametrize("point, pending, signed", [("c2", None, 0), ("c3", 6, 0), ("c4", 6, 1)])
+@pytest.mark.parametrize("point, pending, signed", [("c2", None, 0), ("c3", 6, 0)])
 def test_p10a_revoke_killed_c2_to_c4_the_agent_stays_barred_and_the_rerun_lands(tmp_path, point, pending, signed):
-    """c2 (bar committed, nothing prepared), c3 (prepared, not signed), c4 (signature recorded, not appended): the bar
+    """c2 (bar committed, nothing prepared), c3 (prepared, not signed): the bar
     is open and the run in flight is fenced (epoch bumped), nothing is in the log; a tick does not move the bar; the
     operator's rerun lands the revoke at seq 6 on the same bar (a new signing gesture: ``Signing data on standard input``
-    again) and the dream is unarmed. (BUILD_PLAN names recovery for c4: ``bars.recover`` has no caller in the installed
-    build, see test_p10a_revoke_killed_c4_c5_recovery_by_the_tick.)"""
+    again) and the dream is unarmed. (c4's recovery is test_p10a_revoke_killed_c4_c5_recovery_by_the_tick.)"""
     inst, agent_id, argv = _killed_revoke(tmp_path, point)
     (open_bar,) = _bar(inst)
     assert open_bar == {"revoke_seq": None, "reason": None, "open": 1, "pending_seq": pending, "signed": signed,
@@ -551,28 +550,35 @@ def test_p10a_revoke_killed_c2_to_c4_the_agent_stays_barred_and_the_rerun_lands(
 
 
 def test_p10a_revoke_killed_c5_after_the_append(tmp_path):
-    """c5: killed after the append, before the bar's close. As the installed build runs it TODAY: the revoke is in the log
-    (seq 6) and the dream is unarmed, but the bar stays open; the tick does not close it; the rerun is refused ('this
-    revoke_agent changes nothing; the agent stays barred'), and ``--abandon`` closes the bar 'abandoned' while saying
-    'nothing was appended' (the revoke stands). The recovery the design names for this point (R1: close it signed) is the
-    xfail below."""
+    """c5: killed after the append, before the bar's close. The revoke is in the log (seq 6) and the dream is unarmed,
+    the bar open. The rerun finds its own link already in the log, closes the bar signed at 6 and opens no second bar;
+    a second rerun has nothing to revoke."""
     inst, agent_id, argv = _killed_revoke(tmp_path, "c5")
     assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
     (bar,) = _bar(inst)
     assert (bar["open"], bar["revoke_seq"], bar["signed"]) == (1, None, 1)
     assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
-    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
-    assert [b["open"] for b in _bar(inst)] == [1], tick
     rerun = inst.cli(*argv, spawn_gate=False)
-    assert (rerun.rc, rerun.out, rerun.err) == (1, "", "levain agents revoke: the revoke cannot be prepared: authority "
-        "log link 7: this revoke_agent changes nothing; the agent stays barred; run revoke again or --abandon\n")
-    abandoned = inst.cli("agents", "revoke", agent_id, "--abandon", spawn_gate=False)
-    assert abandoned.rc == 0 and abandoned.out.endswith("is closed; nothing was appended\n")
-    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]    # and the revoke is still the log's
+    assert (rerun.rc, rerun.out) == (0, "the revoke had already landed at seq 6; the bar is closed\n"), rerun
+    (done,) = _bar(inst)
+    assert (done["open"], done["reason"], done["revoke_seq"]) == (0, "signed", 6)
+    assert inst.rows("SELECT count(*) AS n FROM agent_bars")[0]["n"] == 1
+    again = inst.cli(*argv, spawn_gate=False)
+    assert (again.rc, again.out) == (0, f"nothing to revoke: no agent-link of {agent_id} is in the authority log\n"), again
+    assert inst.rows("SELECT count(*) AS n FROM agent_bars")[0]["n"] == 1
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
 
 
-@pytest.mark.xfail(strict=True, reason="levain#121 finding: levain.agents.bars.recover (A0 section 2.2 rows R1, R2) has no "
-                   "caller in the installed build, so a revoke killed at c4/c5 is never finished by a tick")
+def test_p10a_revoke_killed_c5_then_abandon_says_it_landed(tmp_path):
+    """c5 then ``--abandon`` (no tick): the revoke stands, so the bar closes ``signed`` at 6, never ``abandoned``."""
+    inst, agent_id, argv = _killed_revoke(tmp_path, "c5")
+    got = inst.cli("agents", "revoke", agent_id, "--abandon", spawn_gate=False)
+    assert (got.rc, got.out) == (0, "the revoke had already landed at seq 6; nothing to abandon\n"), got
+    (done,) = _bar(inst)
+    assert (done["open"], done["reason"], done["revoke_seq"]) == (0, "signed", 6)
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
+
+
 @pytest.mark.parametrize("point", ["c4", "c5"])
 def test_p10a_revoke_killed_c4_c5_recovery_by_the_tick(tmp_path, point):
     """The design's recovery for c4 (append the recorded signature, no new gesture) and c5 (close the bar signed): after
@@ -581,6 +587,25 @@ def test_p10a_revoke_killed_c4_c5_recovery_by_the_tick(tmp_path, point):
     inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
     (bar,) = _bar(inst)
     assert (bar["open"], bar["reason"], bar["revoke_seq"]) == (0, "signed", 6)
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
+
+
+def test_p10a_revoke_killed_c4_then_show_recovers_the_bar(tmp_path):
+    """c4 then ``levain agents show``: the stored signature is appended, the bar closes signed at 6, and show's stdout is
+    the bytes it printed before the kill."""
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    agent_id = inst.agent()["agent_id"]
+    assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+    before = inst.cli("agents", "show", agent_id, spawn_gate=False)
+    assert before.rc == 0
+    assert inst.cli(*_revoke_argv(inst, agent_id), kill="c4", spawn_gate=False).rc == -9
+    assert [b["open"] for b in _bar(inst)] == [1]
+    after = inst.cli("agents", "show", agent_id, spawn_gate=False)
+    assert (after.rc, after.out) == (0, before.out), after
+    (done,) = _bar(inst)
+    assert (done["open"], done["reason"], done["revoke_seq"]) == (0, "signed", 6)
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
 
 
 # ------------------------------------------------------- an open reservation at a crash (c9) and the counters' ceilings
