@@ -394,6 +394,9 @@ def test_the_default_grant_is_bound_at_dev_log_from_the_socket_it_resolves_to(rd
 def _spawn(tmp_path, monkeypatch, env, *, hands=None, grants=None):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir(exist_ok=True)
+    monkeypatch.delenv("GNUPGHOME", raising=False)   # nor does an ambient home (levain#120)
+    # /proc/net/unix lists every worker's sockets (one network namespace): a neighbour's dirmngr is not ours.
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [])
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
     monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     monkeypatch.setattr(conf, "_default_grant_ops", lambda: ["--bind", "/run/j/dev-log", "/dev/log"])
@@ -487,6 +490,29 @@ def test_no_grant_reaches_a_hands_users_shell(rd, grants, tmp_path, monkeypatch)
         sh.close()
     finally:
         srv.close()
+
+
+def test_a_dirmngr_bound_by_another_worker_does_not_reach_this_spawn(rd, grants, tmp_path, monkeypatch):
+    """levain#120: CI runs the shards under xdist, and every worker shares one network namespace, so
+    /proc/net/unix lists the S.dirmngr that tests/test_runtime_view.py's ``gh`` fixture has bound in
+    another worker, in a /tmp/lvgh*/a/gh home with a dangling gpg.conf link. The unpatched
+    ``_dirmngr_sockets`` of this file's spawns read it and refused them ("dangling symlink ... Refusing to
+    grant bash hands"), a failure that came and went with which tests ran beside them. ``_spawn`` pins the
+    dirmngr list, so the listing of a neighbour's sockets cannot reach it."""
+    leak = tmp_path / "lvgh" / "a" / "gh"   # the layout the gh fixture leaves, bound by a neighbour
+    leak.mkdir(parents=True, mode=0o700)
+    (leak / "S.dirmngr").write_text("")
+    os.symlink("/nonexistent/gpg.conf", leak / "gpg.conf")
+    listing = tmp_path / "unix"
+    listing.write_text("Num       RefCount Protocol Flags    Type St Inode Path\n"
+                       f"0000000000000000: 00000002 00000000 00010000 0001 01  9621 {leak}/S.dirmngr\n")
+    monkeypatch.setattr(conf, "_ON_LINUX", True)
+    monkeypatch.setattr(conf, "_PROC_NET_UNIX", str(listing))
+    assert conf._dirmngr_sockets() == [leak.resolve() / "S.dirmngr"]   # the leak is real: the listing shows it
+    sh = _spawn(tmp_path, monkeypatch, {"PATH": "/usr/bin"})
+    sh._canary = None
+    assert str(leak) not in sh._argv
+    sh.close()
 
 
 # --- gnupg's programs ----------------------------------------------------------------------------
