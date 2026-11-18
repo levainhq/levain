@@ -191,3 +191,19 @@ class Install:
 
 def utc(*a: int) -> str:
     return datetime(*a, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def prepare_link(inst: Install, doc: dict):
+    """Set-up only: a link PREPARED and signed (not appended) at the log's current head, by the enrolled laptop key. Returns
+    ``(connection, pending, signature)``; the caller appends it later, after the head has moved."""
+    from datetime import timedelta
+    from levain import authority as auth
+    from levain.cockpit.consent import utc_stamp
+
+    inst._n += 1
+    now = datetime.now(timezone.utc)
+    grant = {"id": f"al-{inst._n:012x}", "kind": "agent-link", "expires_at": utc_stamp(now + timedelta(days=29)), **doc}
+    conn = sqlite3.connect(inst.world.db, isolation_level=None)
+    pending = auth.prepare(conn, {"op": "create_grant", "grant": grant}, signer_fp=inst.world.fp("laptop"), now=now,
+                           cache=auth.ReplayCache())
+    return conn, pending, inst.world.keys["laptop"][1](pending.message)

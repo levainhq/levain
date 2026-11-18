@@ -226,3 +226,118 @@ def test_p10a_dst_spring_forward(tmp_path):
     assert len(rows) == 12 and {r["window_key"] for r in rows} == {"w:2027-03-13T22:00"}
     assert {r["state"] for r in rows} == {"skipped-no-input"}
     assert inst.spawned() == []
+
+
+# ------------------------------------------------------------------------------------------ a stale link after a revoke
+
+def test_p10a_stale_link_after_a_revoke(tmp_path):
+    """invariant 7: a stale link inserted after a revoke. A link prepared and signed while the head was seq 5 is held
+    back while ``levain agents revoke`` lands at seq 6 (a real subprocess, real key). Appended through the real append it
+    is refused as stale; put into the log file by hand it breaks the chain and the whole log is refused. Either way the
+    revoked agent is armed by nothing: a hand start claims nothing, a tick launches nothing."""
+    from levain import authority as auth
+    from tests._p10a_rig import prepare_link
+
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    agent_id = inst.agent()["agent_id"]
+    signed = inst.sign(inst.link_doc(run_ceiling=3))
+    assert signed.rc == 0 and "at seq 5, until" in signed.out
+    conn, pending, signature = prepare_link(inst, inst.link_doc(run_ceiling=3))
+    assert pending.seq == 6
+
+    revoked = inst.cli("agents", "revoke", agent_id, "--data-root", str(inst.world.root), "--signing-key", str(inst.key),
+                       spawn_gate=False)
+    assert revoked.rc == 0 and revoked.out == (
+        "the agent is barred; the revoke link waits for a signature\nrevoke landed at seq 6; the bar is closed\n")
+    refusal = ("levain dream start: no live signed link covers the dream's current spec (or the authority log could "
+               "not be replayed), so nothing was claimed; the dream launches only under a live signed link\n")
+    assert inst.cli("dream", "start").err == refusal                     # the revoke alone: the signed link no longer arms
+
+    try:
+        with pytest.raises(auth.StaleHead, match="the authority log's head moved to seq 6 since this link was prepared"):
+            auth.append(conn, pending, signature, now=datetime.now(timezone.utc),
+                        anchor=auth.anchor_path(inst.world.root), cache=auth.ReplayCache())
+        assert conn.execute("SELECT MAX(seq) FROM authority_log").fetchone()[0] == 6
+        # by hand, into the file: the stale link claims seq 7 on the head it was signed against (seq 5's hash)
+        conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (7, pending.prev_hash, pending.record, inst.world.fp("laptop"),
+                                                   signature, auth._link_hash(pending.prev_hash, pending.record)))
+    finally:
+        conn.close()
+    broken = "authority log link 7: prev_hash is not the predecessor's hash (the chain is broken)"
+    start = inst.cli("dream", "start")
+    assert start.rc == 1 and start.out == "" and f"(ReplayError: {broken}); nothing is armed this tick" in start.err \
+        and start.err.endswith(refusal)
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 4, 0, 0))
+    assert tick.rc == 5 and f"the authority refresh failed (ReplayError): {broken}" in tick.err \
+        and "nothing is armed this tick" in tick.err
+    assert inst.rows() == [] and inst.spawned() == []                    # no occurrence claimed, no fire asked for
+    resign = inst.sign(inst.link_doc(run_ceiling=3))
+    assert resign.rc == 1 and resign.err == f"levain agents sign: the authority log is refused: {broken}\n"
+
+
+# ------------------------------------------------------------------------------ expiry and renewal, each mid-run
+
+T0 = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)          # the link is signed into the log here; it lasts 29 days
+
+
+def _mid_run(tmp_path):
+    """A dream whose link (signed at T0, expiring 2026-11-24T12:00Z) has a hand run launched at 11-23 12:00Z: the run is
+    in flight when the link's last day passes."""
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    link = inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=3))
+    started = inst.cli("dream", "start", now=utc(2026, 11, 23, 12, 0, 0))
+    assert started.rc == 0 and "claimed and launched oc-" in started.out
+    (run,) = inst.rows()
+    assert (run["state"], run["link_id"], run["launched_at"]) == ("launched", link, "2026-11-23T12:00:00Z")
+    return inst, link, run
+
+
+def test_p10a_expiry_mid_run(tmp_path):
+    """invariant 7: expiry, mid-run. The link lapses while a run is in flight. The next tick says so (an attention line
+    naming the link and its expiry) and ends the run recovered, and no new run starts: a hand start is refused with the
+    stated text. (A live fire's own stop at expiry needs a model-calling child: UNBUILT, see ret_D2_121_build.md.)"""
+    inst, link, run = _mid_run(tmp_path)
+    inside = inst.cli("agents", "tick", now=utc(2026, 11, 23, 12, 10, 0))                  # before expiry: no notice
+    assert inside.rc == 0 and "dream-link-expired" not in inside.err
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 25, 12, 0, 0))                    # after the 11-24T12:00Z expiry
+    assert tick.rc == 6 and (
+        f"attention [dream-link-expired:{link}]: the dream's link {link} expired at 2026-11-24T12:00:00.000000Z; "
+        "no run launches until it is renewed or a new link is signed\n") in tick.err
+    assert "was ended stopped/crash_recovered (takeover), its slot freed and its reservation settled" in tick.err
+    (ended,) = inst.rows()
+    assert (ended["state"], ended["reason"], ended["link_id"]) == ("stopped", "crash_recovered", link)
+    refused = inst.cli("dream", "start", now=utc(2026, 11, 25, 12, 1, 0))
+    assert refused.rc == 1 and refused.out == "" and refused.err == (
+        "levain dream start: no live signed link covers the dream's current spec (or the authority log could not be "
+        "replayed), so nothing was claimed; the dream launches only under a live signed link\n")
+    assert len(inst.rows()) == 1
+
+
+def test_p10a_renewal_mid_run(tmp_path):
+    """invariant 7: renewal, mid-run. ``levain agents renew`` (a real laptop-key signature) while a run is in flight
+    moves only the link's expiry: the in-flight row is untouched, the next tick past the ORIGINAL expiry raises no expiry
+    notice, and the next run is filed under the same link id and the same incarnation."""
+    inst, link, run = _mid_run(tmp_path)
+    renewed = inst.cli("agents", "renew", link, "--data-root", str(inst.world.root), "--signing-key", str(inst.key),
+                       "--days", "29", spawn_gate=False)
+    assert renewed.rc == 0 and renewed.out.startswith(f"renewed: {link} at seq 6, until 2026-1") and \
+        renewed.err == "Signing data on standard input\n", renewed
+    assert inst.rows() == [run]                                                     # the in-flight row is byte for byte as it was
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 25, 12, 0, 0))
+    assert tick.rc == 6 and "dream-link-expired" not in tick.err and "ended stopped/crash_recovered (takeover)" in tick.err
+    again = inst.cli("dream", "start", now=utc(2026, 11, 25, 12, 1, 0))
+    assert again.rc == 0 and "claimed and launched oc-" in again.out
+    old, new = inst.rows("SELECT * FROM agent_occurrences ORDER BY launched_at")
+    assert (old["state"], new["state"]) == ("stopped", "launched")
+    assert (new["link_id"], new["link_incarnation"]) == (link, run["link_incarnation"])
+    assert (new["spec_hash"], new["binding_id"]) == (run["spec_hash"], run["binding_id"])
+    import json, sqlite3
+    c = sqlite3.connect(inst.world.db)
+    try:
+        ops = [json.loads(r[0])["op"] for r in c.execute("SELECT record FROM authority_log WHERE seq >= 5 ORDER BY seq")]
+    finally:
+        c.close()
+    assert ops == ["create_grant", "renew"]
