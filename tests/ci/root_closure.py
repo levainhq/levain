@@ -297,6 +297,7 @@ LAZY_SITES = {
     'levain/authority.py::_ranks::from levain.cockpit.firejournal import _CLASS_RANK': 'root',
     'levain/authority.py::_agent_text::from levain import unshowable': 'root',
     'levain/authority.py::_so_text::from levain import unshowable': 'root',
+    'levain/authority.py::_step::from levain import unshowable': 'root',
     'levain/authority.py::_stamp::from levain.cockpit.consent import utc_stamp': 'root',
     'levain/autonomic/journal.py::RunJournal._barrier::from levain.autonomic.binding import agent_run_proof, registry_bars, registry_scan_bars': 'root',
     # root: lazy because ``schema3`` imports ``journal`` at module level (a hoist is a cycle); ``schema3`` is already a closure member through ``binding``'s import-time import, so this row adds nothing to the closure
