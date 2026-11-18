@@ -288,3 +288,30 @@ def test_primary_repo_none_with_the_primary_object_in_the_mapping_reads_home_ite
     ev = _evidence()
     board = bs.derive_all(bs.fold(LINES), ev, now=NOW, repo_evidence={"flow": ev, "levain": _evidence(main=[DEP_LANDED_ON_B])})
     assert _by(board)["flow#5"].state == "ready"
+
+
+# ---- levain#93 fix 2: a settled cut item is for an untracked repo of the evaluation only, and scope stays closed under deps ----
+
+def test_a_settled_cut_item_is_listed_only_when_its_repo_is_named_settled_levain93():
+    lines = [_item("flow", 1), _item("levain", 1), _decide("levain#1")]
+    ev = _evidence()
+    off = bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow")
+    assert [s.id for s in off.items] == ["flow#1"]                              # no repos named settled: left off, as before
+    other = bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow", settled_repos={"beta"})
+    assert [s.id for s in other.items] == ["flow#1"]                            # another repo's settledness never lists it
+    on = bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow", settled_repos={"levain"})
+    assert _by(on)["levain#1"].state == "cut"
+
+
+def test_an_undecided_item_of_a_settled_repo_is_not_settled_levain93():
+    lines = [_item("flow", 1), _item("levain", 1)]
+    ev = _evidence()
+    board = bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow", settled_repos={"levain"})
+    assert [s.id for s in board.items] == ["flow#1"]
+
+
+def test_a_settled_cut_items_decided_links_pull_nothing_else_onto_the_board_levain93():
+    lines = [_item("flow", 1), _item("beta", 1), _item("levain", 1, [{"kind": "item", "ref": "beta#1"}]), _decide("levain#1")]
+    ev = _evidence()
+    board = bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow", settled_repos={"levain"})
+    assert {s.id for s in board.items} == {"flow#1", "levain#1"}      # a decided item's links no longer matter: closed under deps

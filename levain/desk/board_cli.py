@@ -54,7 +54,7 @@ from levain.desk import board_evidence as be
 from levain.desk import board_registry as br
 from levain.desk import board_store as bs
 from levain.desk import board_producers as bp
-from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
+from levain.desk.board_state import (EVIDENCE_V, _is_settled, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
 __all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state", "state_doc"]
@@ -577,7 +577,9 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
         assert view is not None
         reads = []
         # An item the fold decided cut is settled (an abandon cut it): it needs no evidence, so it never makes its repo "not read".
-        held = {it.repo for it in folded.items.values() if it.decision is None or it.decision.decision != "cut"}
+        # Only for a repo whose abort is done (registry mode untracked); an aborting repo keeps its audit line, a torn store keeps all.
+        settled = set() if folded.torn else {n for n, r in view.fold.repos.items() if r.mode == "untracked"}
+        held = {it.repo for it in folded.items.values() if not _is_settled(it, settled)}
         for name, r in sorted(view.fold.repos.items()):
             if r.mode != "tracked":                    # tracking is mid-ceremony, aborting is an abort, untracked is not on the board
                 if name in held:                       # ... but its items are never dropped: they read unknown, and this says why
@@ -655,7 +657,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
                 {"evidence_v": EVIDENCE_V, "unreadable": {src: why for src in ("main", "chain", "branches", "refs", "unattributed")}},
                 now=now, store_id=store_id)
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
-                       primary_repo=summary["repo"] if cross else None, label_primary=whole or empty_store, unread_repos=unread_why)
+                       primary_repo=summary["repo"] if cross else None, label_primary=whole or empty_store, unread_repos=unread_why,
+                       settled_repos=settled if whole else None)
     if empty_store:                    # nothing was read, and nothing failed to be: the stand-in primary's sources are not "unreadable"
         mute = {f"{src} unreadable: {why}" for src, why in primary.unreadable.items()      # by source, never by text: only the git sources
                 if src in _GIT_SKIPPED and why == "not supplied"}                          # skipped because no repo was read are quiet

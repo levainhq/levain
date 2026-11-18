@@ -821,9 +821,11 @@ def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Map
 # --------------------------------------------------------------------------------------------------------------- I1, I5
 
 
-def check_add(store_dir: Path, repo: str, key: str | None) -> None:
+def check_add(store_dir: Path, repo: str, key: str | None, *, exact_hit: bool = False) -> None:
     """``board add``'s I1 check, called under the store's exclusive lock: the repo must be ``tracking`` (the add keyed to its
-    migration) or ``tracked``. An ``aborting`` repo, an untracked or unknown one, and an unreadable registry refuse."""
+    migration) or ``tracked``. An ``aborting`` repo, an untracked or unknown one, and an unreadable registry refuse.
+    ``exact_hit``: the add matches an existing keyed record exactly (an idempotent retry); the manifest-membership check
+    applies only to a new record, so the retry returns the stored id."""
     try:
         view = _load(store_dir)
     except BoardError as exc:
@@ -838,16 +840,20 @@ def check_add(store_dir: Path, repo: str, key: str | None) -> None:
     if cur.mode == "tracked":
         return
     if cur.mode == "tracking":
+        if cur.migration is None:
+            raise BoardError(f"{repo} is tracking but its record carries no migration: no item can be added (re-run `levain board begin-track {repo}`)")
         if not (isinstance(key, str) and key.startswith((cur.migration or "") + ":")):
             raise BoardError(f"{repo} is tracking (migration {cur.migration}): an add for it must carry --key {cur.migration}:<k>")
         if key.startswith(f"{cur.migration}:stubs:"):
             raise BoardError(f"{repo} is tracking: no stub item is ever on the board while {repo}'s old files are still its source of "
                              f"truth (design 5 (e)); add the {key!r} item only after `levain board track {repo}`")
+        if cur.manifest is None:
+            raise BoardError(f"{repo} is tracking (migration {cur.migration}) but its record carries no migration manifest: no item can be added")
         k = key[len(cur.migration or "") + 1:]
-        plan_keys = (cur.manifest or {}).get("plan_items", [])
-        if k not in plan_keys:
+        plan_keys = cur.manifest.get("plan_items") or []
+        if not exact_hit and k not in plan_keys:
             raise BoardError(f"{repo} is tracking (migration {cur.migration}): key {key!r} is not one of the manifest's plan_items "
-                             f"({', '.join(plan_keys) or 'none'}), so no item is added for it")
+                             f"({', '.join(map(str, plan_keys)) or 'none'}), so no item is added for it")
         return
     raise BoardError(f"{repo} is {cur.mode}: the board holds items only for a tracking or tracked repo")
 

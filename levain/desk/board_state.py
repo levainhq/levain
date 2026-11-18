@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date as _date, datetime, timezone
 from functools import cached_property
@@ -1492,7 +1492,13 @@ def _trailer_ids(ev: Evidence, git_only: bool = False) -> dict[str, list[str]]:
     return seen
 
 
-def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, Evidence] | None) -> set[str]:
+def _is_settled(it: Item, settled_repos: Collection[str] | None) -> bool:
+    """An item the fold decided cut, of a repo whose abort is done (registry mode ``untracked``): it needs no evidence."""
+    return bool(settled_repos) and it.repo in settled_repos and it.decision is not None and it.decision.decision == "cut"
+
+
+def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, Evidence] | None,
+              settled_repos: Collection[str] | None = None) -> set[str]:
     """The ids the board lists. With cross-repo evidence, an item of a repo that was not read is listed (unknown) only if
     an item of a read repo links it through an undecided link: ONE hop, the dependency the read item waits on (what that
     foreign item waits on is not the board's business, and a decided item's links no longer matter, so a repo only a
@@ -1504,16 +1510,18 @@ def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, 
     seen = {i for i, it in items.items() if it.repo in repo_evidence}
     if not seen:
         return set(items)
+    # A settled cut item (see _is_settled; ``settled_repos`` is passed only by a whole-board evaluation) stays listed and reads cut.
+    # Added BEFORE the dependency closure, so the scope stays closed under deps.
+    seen.update(i for i, it in items.items() if _is_settled(it, settled_repos))
     for iid in list(seen):
         seen.update(dep for dep in ctx._deps(iid) if dep in items)
-    # A cut item is settled whatever its repo's evidence: it stays listed, reads cut, and says nothing about a repo not read.
-    seen.update(i for i, it in items.items() if it.decision is not None and it.decision.decision == "cut")
     return seen
 
 
 def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
                repo_evidence: Mapping[str, Evidence] | None = None, primary_repo: str | None = None,
-               label_primary: bool = False, unread_repos: Mapping[str, str] | None = None) -> Board:
+               label_primary: bool = False, unread_repos: Mapping[str, str] | None = None,
+               settled_repos: Collection[str] | None = None) -> Board:
     """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
     timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
     ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
@@ -1525,6 +1533,9 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     ``unread_repos`` (``{repo: why}``) names repos in ``repo_evidence`` that were NOT read (their evidence holds only
     unreadable sources, so their items read unknown): each says its ``why`` once, an audit entry and a problem line, in
     place of one line per source.
+
+    ``settled_repos`` (a whole-board evaluation's untracked repos, whose abort is done): a cut item of one is settled, listed
+    and reading cut with no evidence of its repo. Left None, no item is settled that way.
 
     ``repo_evidence`` (``{repo: Evidence}``) is the cross-repo board: an item, and each dependency it waits on, is read
     from the evidence of the repo it belongs to, and an item whose repo has no entry reads unknown. ``evidence`` is the
@@ -1539,7 +1550,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     if primary_repo is None:
         primary_repo = next((r for r, e in (repo_evidence or {}).items() if e is evidence), None)
     others = [(r, e) for r, e in sorted((repo_evidence or {}).items()) if r != primary_repo]
-    shown = _in_scope(ctx, folded.items, repo_evidence)
+    shown = _in_scope(ctx, folded.items, repo_evidence, settled_repos)
     states = [ctx.state_of(i) for i in sorted(shown, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
