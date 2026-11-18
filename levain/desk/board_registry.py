@@ -1578,7 +1578,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     common(p, words=False)
     p.set_defaults(func=run(lambda a, t: said(a, *abandon_done(t, a.name, "", a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
 
-    p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut or parked.")
+    p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut, parked or out of 1.0.")
     common(p)
     p.set_defaults(func=run(lambda a, t: said(a, *untrack(t, a.name, a.words, a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
 

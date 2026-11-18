@@ -181,7 +181,7 @@ def test_the_desk_brief_teaches_the_two_modes_and_the_ceremony_in_order(desk):
     assert "does not open" not in text
     order = ["\n1. If this install has no item store", "\n2. Read its existing memory", "\n3. Draft ONE review page",
              "\n4. He answers in conversation", f"\n5. Execute, in this order: `{lv} board begin-track`",
-             f"`{lv} board add --key M:K` for each item", f"`{lv} charter check` passes there", f"`{lv} board track` (the one record",
+             f"`{lv} board add --key M:K` for each item", f"where `{lv} charter check` reports on it", f"`{lv} board track` (the one record",
              "pre-track-<date>/", f"`{lv} board abandon-track`, finish", f"then `{lv} board abandon-done`",
              f"leaving tracked mode is `{lv} board untrack`", "\n6. Write one `decision` episode"]
     at = [text.index(x) for x in order]
