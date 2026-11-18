@@ -181,9 +181,10 @@ def test_the_desk_brief_teaches_the_two_modes_and_the_ceremony_in_order(desk):
     assert "## The work board: two modes" in text and "untracked or tracked" in text
     assert "does not open" not in text
     order = ["\n1. If this install has no item store", "\n2. Read its existing memory", "\n3. Draft ONE review page",
-             "\n4. He answers in conversation", f"\n5. Execute, in this order: `{lv} board begin-track NAME",
-             f"for each item, `{lv} board add --repo NAME", f"where `{lv} charter check --repo DIR` reports on it",
-             f"`{lv} board track NAME --migration M", "pre-track-<date>/", f"`{lv} board abandon-track NAME",
+             "\n4. He answers in conversation", f"\n5. Execute, in this order: first `{lv} board begin-track NAME",
+             f"for each item, `{lv} board add --repo NAME", "then land `CHARTER.md`",
+             f"then `{lv} board track NAME --migration M", "last, copy each old file", "pre-track-<date>/",
+             f"`{lv} charter check --repo DIR` reports on the landed charter", f"`{lv} board abandon-track NAME",
              f"then `{lv} board abandon-done NAME", f"leaving tracked mode is `{lv} board untrack NAME",
              "\n6. Write one `decision` episode"]
     steps = text.index("In this order:")                       # the verb list above spells the same forms
@@ -548,12 +549,12 @@ def test_every_command_the_worker_board_section_prints_parses():
 
     lv = desk_levain(sys.executable)
     parser = build_parser()
-    for items in (("alpha#1",), ()):
+    for items in (("alpha#1",), ("alpha#1", "beta#2")):
         ln = SimpleNamespace(board_items=items, protocol="tracked", session_key=KEY)
         printed = _printed_commands(cl._board_item_section(ln), lv)
-        assert any(a[:2] == ["board", "amend"] for a in printed)
+        assert sum(a[:2] == ["board", "amend"] for a in printed) == len(items)
         for argv in printed:
-            _parses(parser, [FILL.get(a, a) for a in argv])
+            _parses(parser, argv)                                   # concrete: no placeholder left to fill
 
 
 def test_the_desk_brief_scopes_the_token_to_coord_drops_and_thread_writes():
@@ -594,3 +595,128 @@ def test_an_unreadable_launch_time_strands_no_seat_that_has_no_item():
     got = seat_close.check_close("legacy", ["levain#1"], key=KEY, launched_at="2026-11-17 10:00:00", episodes=[],
                                  closed_items=["levain#1"], old_close_ok=False, repo_tracked_now=True)
     assert not got.ok and "unreadable" in got.missing[0]                       # with an item, it still reports it
+
+
+# --- T10 fix 4 ---------------------------------------------------------------------------------------------------------
+def _count_launches(store):
+    conn = sqlite3.connect(store.path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM launches").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_an_item_of_an_unregistered_repo_is_refused_under_an_inactive_registry_and_nothing_is_written(desk, registry, bare_store, mkrepo, tmp_path):  # noqa: F811
+    # codex MED (r4): the item is judged at the FIRST decision whatever the registry's state, before anything is written
+    store, token = desk
+    g = mkrepo("gamma")
+    files = sorted(p.name for p in bare_store.iterdir())
+    n = _count_launches(store)
+    with pytest.raises(inst.SpawnRefused, match="'typo', which is not a registered repository.*not active yet"):
+        _spawn(store, token, registry, g, item="typo#1")
+    assert sorted(p.name for p in bare_store.iterdir()) == files and "repos.jsonl" not in files   # no registry written
+    assert _count_launches(store) == n
+    assert _spawn(store, token, registry, g).protocol == "legacy"               # with no item: as before (W6)
+    assert not (bare_store / "repos.jsonl").exists()
+
+
+def test_an_item_of_an_unregistered_repo_registers_nothing_under_an_active_registry(desk, registry, board_store_dir, mkrepo, tmp_path):  # noqa: F811
+    store, token = desk
+    g = mkrepo("gamma")                                                          # not registered: the launch would register it
+    before = (board_store_dir / "repos.jsonl").read_bytes()
+    with pytest.raises(inst.SpawnRefused, match="'typo', which is not a registered repository"):
+        _spawn(store, token, registry, g, item="typo#1")
+    assert (board_store_dir / "repos.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("pointered", [False, True])
+def test_a_worker_launch_with_an_item_and_no_directory_is_refused_by_name(pointered, desk, home, tmp_path, capsys):  # noqa: F811
+    # codex MED (r4): an item claim always takes the protocol decision; with no cwd it is refused, never `legacy`
+    store, token = desk
+    if pointered:
+        ok(capsys, "use", str(tmp_path / "store"))
+        (tmp_path / "store" / "repos.jsonl").touch()
+    _d, t = a_thread(store)
+    n = _count_launches(store)
+    with pytest.raises(CoordError, match="a worker launch with a board item needs its working directory"):
+        store.launch_request(token, harness="claude", role="worker", threads=[t.thread_id], cwd=None, attach_item="alpha#1")
+    assert _count_launches(store) == n
+    assert store.launch_request(token, harness="claude", role="worker", threads=[t.thread_id], cwd=None).protocol == "legacy"
+
+
+def test_a_worker_naming_several_threads_on_a_locked_repo_hears_the_several_threads_refusal(decision_seal, desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    # deepseek LOW (r4): both refusals write nothing; the several-threads one is the message it gets first
+    store, token = desk
+    a = mkrepo("alpha")
+    track_ready(capsys, tmp_path, board_store_dir, a, "alpha")                  # tracking: locked to new work
+    (_d1, t1), (_d2, t2) = a_thread(store), a_thread(store, "another")
+    n = _count_launches(store)
+    with pytest.raises(lease.LeaseRefused, match="a worker holds one thread"):
+        store.launch_request(token, harness="claude", role="worker", threads=[t1.thread_id, t2.thread_id], cwd=str(a))
+    assert _count_launches(store) == n
+
+
+def _worker_text(items, protocol="tracked"):
+    from types import SimpleNamespace
+    return "\n".join(cl._board_item_section(SimpleNamespace(board_items=items, protocol=protocol, session_key=KEY)))
+
+
+def test_the_worker_amend_close_is_the_one_form_and_sets_the_field_the_close_reads(home, tmp_path, capsys):  # noqa: F811
+    # docs MED/HIGH 1: the close reads an amend whose `done` is set by a record carrying the seat's launch key (flow's
+    # fanin_log._closed_items); the brief prints that form from _board_forms, filled, and says it replaces the DONE line
+    import shlex
+
+    from levain.cli import main
+    from levain.install import desk_levain
+
+    lv = desk_levain(sys.executable)
+    text = _worker_text(("alpha#1",))
+    want = cl._board_forms(lv)["board amend --done"].replace("NAME#N", "alpha#1").replace("KEY", KEY)
+    assert f"`{want}`" in text and "REPLACES the item's DONE line" in text
+    src = __import__("inspect").getsource(cl._board_item_section)
+    assert "--launch-key" not in src and "--by worker" not in src  # no hand-rolled spelling
+    ok(capsys, "use", str(tmp_path / "store"))
+    iid = ok(capsys, "add", "--repo", "alpha", "--title", "t", "--origin", "desk 1", "--done", "it works", "--by", "desk")
+    argv = shlex.split(want.replace("alpha#1", iid).removeprefix(lv).strip())
+    assert main(argv) == 0, capsys.readouterr().err
+    rec = json.loads((tmp_path / "store" / "items.jsonl").read_text().splitlines()[-1])
+    assert rec["op"] == "amend" and rec["fields"]["done"] == "what remains" and rec["author"]["launch_key"] == KEY
+
+
+def test_a_tracked_launch_with_no_item_is_told_it_cannot_close_by_the_board():
+    # docs MED 3: no close it can never meet; and no placeholder id, no amend line
+    text = _worker_text(())
+    assert "cannot close by the board" in text and "ask the desk" in text
+    assert "amend" not in text and "NAME#N" not in text and "Board-Closes" not in text
+    assert "cannot close by the board" not in _worker_text((), "ceremony")
+
+
+def test_a_multi_item_brief_prints_each_item_and_never_a_placeholder():
+    # docs MED 2: every command and trailer carries a real id
+    text = _worker_text(("alpha#1", "beta#2"))
+    assert "NAME#N" not in text and "NAME" not in text.replace("CURRENT", "")
+    for i, r in (("alpha#1", "alpha"), ("beta#2", "beta")):
+        assert f"board context {i}`" in text and f"`Board-Item: {i}`" in text and f"`Board-Closes: {i}`" in text
+        assert f"`repo:{r}` and `item:{i}`" in text and f"amend --id {i} " in text
+
+
+def test_the_desk_brief_names_the_manifest_verbs_and_the_operator_signed_form():
+    # docs MED 1 (anansi) / LOW 2 (complement): begin-track and track check the manifest, the same sha256; abandon-track
+    # does not. LOW 4, 5: the signed form swaps --by too, and untrack is his to run
+    text = " ".join(cl._board_modes_section("lv"))
+    assert "For `begin-track` and `track` the question" in text and "the SAME sha256 for both" in text
+    assert "`decide` and `abandon-track` carry none" in text and "three ceremony verbs" not in text
+    assert "`--by operator --author-kind operator --sign` in place of `--by desk ... --source Q-ID`" in text
+    assert "all but `untrack`: he runs that one at the laptop" in text
+    assert "prints `tracking NAME (migration M)`" in text
+
+
+def test_the_manifest_rule_the_brief_states_is_the_writers():
+    # the brief's verb set for the manifest check, read off the code: begin-track and track pass require_manifest, and
+    # abandon-track reads its relay without one
+    import inspect
+
+    from levain.desk import board_registry as br
+    assert "require_manifest=True" in inspect.getsource(br.begin_track)
+    assert "require_manifest=True" in inspect.getsource(br.track)
+    assert "require_manifest" not in inspect.getsource(br.abandon_track)

@@ -1168,15 +1168,19 @@ def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = 
                     environ: Mapping[str, str] | None = None, *, item: str | None = None) -> tuple[str, str | None]:
     """``(protocol, migration)``: the close protocol a worker launched in ``cwd`` for board item ``item`` runs under, from the
     mode its repository has in the registry now (design 6, "The close, chosen by the LAUNCH protocol"). The repository is the
-    item's (its ``NAME#`` prefix) when there is an item, else the one ``cwd`` is in. No registry, or an untracked
-    repository, or (with no item) a ``cwd`` in no registered repository, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a
+    item's (its ``NAME#`` prefix) when there is an item, else the one ``cwd`` is in. No pointer, an inactive registry with
+    no item, an untracked repository, or (with no item) a ``cwd`` in no registered repository, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a
     ``tracking`` or ``aborting`` repository gives ``ceremony`` and keeps that id. Raises BoardError (the launch is refused) for:
+    an item with no ``cwd`` (checked first, pointer or not); with a pointer, an item whose prefix is not a registered
+    repository, whatever the ``cwd`` and whether or not the registry is active (judged before the ``cwd`` is read, so the
+    caller refuses it before ``register_for_launch`` can write);
     any other launch on a ``tracking`` or ``aborting`` repository (locked to new work until ``track`` or ``abandon-done``);
-    an item whose prefix is not a registered repository, whatever the ``cwd`` (no item of it can be on the board);
     a launch on a ``tracked`` repository with no item (a worker there is launched for its item); a ``cwd`` outside the
     item's repository when either is not untracked; a ``cwd`` git cannot place that lies inside a registered repository;
     and an unreadable registry. A migration id on a launch whose repository is not in a ceremony is ignored, as is one on a
     ``tracked`` repository (the ceremony's stub seat, after ``track``)."""
+    if item and not cwd:
+        raise BoardError("a worker launch with a board item needs its working directory")
     store_dir = bs.read_pointer(environ)
     if store_dir is None or not cwd:
         return "legacy", None
@@ -1184,17 +1188,19 @@ def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = 
         view = read_registry(bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True), allow_inactive=True)
     except (OSError, ValueError) as exc:
         raise BoardError(f"the registry cannot be read ({type(exc).__name__})") from None
+    repos = view.fold.repos if view.active else {}
+    if item:                                    # judged first, before the cwd and before anything is written (any state)
+        prefix = item.partition("#")[0]
+        if prefix not in repos:
+            why = "" if view.active else "; this store's registry is not active yet (no repos.jsonl), so none is"
+            raise BoardError(f"{item} names {prefix!r}, which is not a registered repository (`levain board repos` lists "
+                             f"them{why}): a worker is launched only for an item of a registered repository")
     if not view.active:
         return "legacy", None
-    repos = view.fold.repos
     here = _launch_repo(cwd, repos)
     cur = here
     if item:
-        prefix = item.partition("#")[0]
-        cur = repos.get(prefix)
-        if cur is None:
-            raise BoardError(f"{item} names {prefix!r}, which is not a registered repository (`levain board repos` lists "
-                             f"them): no item of it can be on the board")
+        cur = repos[item.partition("#")[0]]
         if (here is None or here.name != cur.name) and \
                 (cur.mode != "untracked" or (here is not None and here.mode != "untracked")):
             where = f"{here.name} ({here.mode})" if here is not None else "no registered repository"
