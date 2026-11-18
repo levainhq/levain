@@ -220,7 +220,7 @@ def check_text(text: str, *, repo_name: str | None = None,
     # No status, by structure: shapes a machine can check without refusing an ordinary word. The scan does not see the
     # charter's own NAME (the title) or an item id (`NAME#N`, a Plan row, an `[item: ...]` tag): a repo named `2026-11-18` or
     # `cafe123` is date- or sha-shaped by name, and its charter must still be able to pass. Prose is scanned as ever.
-    own_id = re.compile(r"(?<![a-z0-9._-])" + re.escape(name) + r"#\d+(?![a-z0-9._-])") if name else None
+    own_id = re.compile(r"(?<![a-z0-9_-])(?<![a-z0-9]\.)" + re.escape(name) + r"#\d+(?![a-z0-9_-]|\.[a-z0-9])") if name else None
     for i, ln in enumerate(lines):
         n = i + 1
         if i == 0 and title is not None:
@@ -461,7 +461,9 @@ def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> s
     registered path or target that cannot be resolved or read as a git repository.
 
     Known edges, judged and not built: a ``board move`` landing between this read and the write (an operator running both
-    at once) is not guarded; a name like ``a..b`` or ``a.`` is accepted, the one rule ``register`` already applies."""
+    at once) is not guarded; an operator racing their own command can still slip past it: a pointer created or changed
+    between the guard's two reads (the pointer read and the store lookup) is not re-read, and a store directory that becomes
+    unsearchable mid-command (``is_store`` then reads absent, so the guard opens) is not noticed. A name like ``a..b`` or ``a.`` is accepted, the one rule ``register`` already applies."""
     if top is None:
         return None
     from levain.desk import board_registry as br, board_store as bs
@@ -578,7 +580,8 @@ def register(subparsers: Any) -> None:
                      "non-zero in these cases, all exit 2, and it reads nothing then: --repo-name names a repo registered in "
                      "the board registry and --repo is a different repository from the registered one (a worktree of it is "
                      "fine); the registry, the store pointer or the registered checkout cannot be read, so that cannot be "
-                     "told; or the command line is unusable."))
+                     "told; --items names something that is neither a store directory nor a file called items.jsonl; "
+                     "--items names one store while the pointer names another (two stores); or the command line is unusable."))
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids (default: the directory that holds the repository's .git).")
@@ -598,7 +601,9 @@ def register(subparsers: Any) -> None:
                      "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2, and writes "
                      "nothing, when NAME is registered in the board registry at a different repository than the one it would "
                      "write to (a worktree of the registered repo is fine); when the registry, the store pointer or the "
-                     "registered checkout cannot be read, so that cannot be told; or when the command line is unusable."))
+                     "registered checkout cannot be read, so that cannot be told; when --items names something that is neither a store "
+                     "directory nor a file called items.jsonl; when --items names one store while the pointer names another "
+                     "(two stores); or when the command line is unusable."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
