@@ -493,7 +493,7 @@ def register(subparsers: Any) -> None:
     q = sub.add_parser(
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
-                     "<fill: ...> placeholder that `check` refuses until it is replaced. Never overwrites."))
+                     "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")

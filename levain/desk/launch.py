@@ -596,7 +596,7 @@ def _board_modes_section(lv: str) -> list[str]:
         "`begin-track` and later `track`.",
         f"5. Execute, in this order: `{lv} board begin-track` (it writes the migration id M and locks the repository); "
         f"`{lv} board add --key M:K` for each item; land `CHARTER.md` on the repository's main by its own landing path, "
-        f"so that `{lv} charter check` passes there; `{lv} board track` (the one record that moves the source of truth); "
+        f"where `{lv} charter check` reports on it and exits 0 in this release, while `{lv} board track` (the one record that moves the source of truth) is the gate that refuses; "
         "then each old file is copied to the record directory's `pre-track-<date>/` and replaced by the stub, landed by "
         "the repository's own path. Before `track` the old files are the source of truth, and after it the board is. "
         f"To stop before `track`: `{lv} board abandon-track`, finish any compensation, then `{lv} board abandon-done`. "
