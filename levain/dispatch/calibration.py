@@ -53,7 +53,7 @@ __all__ = ["ActionClass", "CAVEAT", "ClassReport", "DEFAULT_SPAN", "Judge", "Jud
            "replay", "report"]
 
 CAVEAT = ("Labels exist only for what was asked: a call the gate never held has no label. They include stamps: a human "
-          "allow can be a rubber stamp. So agreement measures agreement with his record, not correctness.")
+          "allow can be a rubber stamp. So agreement measures agreement with the operator's record, not correctness.")
 
 PREDICTIONS: tuple[str, ...] = ("allow", "deny", "abstain")
 DEFAULT_SPAN = timedelta(days=90)
@@ -340,7 +340,7 @@ def proposal_eligible(report: ClassReport, *, min_n: int, min_agreement: Fractio
         why.append(f"the judge answered {report.n_predicted} of {report.n_labelled} labelled requests, coverage "
                    f"below {coverage_floor}")
     if report.denies and Fraction(report.denies_answered, report.denies) < coverage_floor:
-        why.append(f"the judge answered {report.denies_answered} of {report.denies} of his denies, deny coverage "
+        why.append(f"the judge answered {report.denies_answered} of {report.denies} of the operator's denies, deny coverage "
                    f"below {coverage_floor}")
     got = report.agreement
     if got is None or got < floor:

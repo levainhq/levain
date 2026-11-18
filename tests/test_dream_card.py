@@ -131,7 +131,7 @@ def test_a_retirement_without_his_verified_words_is_his_when_the_source_is_given
                        source={"4b166f5e": "honestly I realize ZERO prompts might not be feasible here, today"})
     assert ok.body["his"] == [] and not ok.authority_relevant
     bad = cd.build_card("consolidated", store_dir=SD, occurrence="b", notes=notes, source={"4b166f5e": "something else entirely"})
-    assert bad.authority_relevant and "without his verified words" in bad.body["his"][0]
+    assert bad.authority_relevant and "without the operator's verified words" in bad.body["his"][0]
     short = cd.build_card("consolidated", store_dir=SD, occurrence="c", source={"e": "yes"},
                           notes={"retired": [{"what": "W", "his_words": "yes", "episodes": ["e"]}]})
     assert short.authority_relevant                      # too few words to tell what they retire

@@ -209,10 +209,10 @@ def split_notes(notes: Mapping[str, Any] | None, source: Mapping[str, str] | Non
     for x in _items(notes, "retired"):
         words = str(x.get("his_words", ""))
         cited = _episode_ids(x)
-        line = f"{x.get('what', '?')} — his words: \"{words or '?'}\"{_eps(x)}"
+        line = f"{x.get('what', '?')} — the operator's words: \"{words or '?'}\"{_eps(x)}"
         if source is not None and not (len(words.split()) >= _SHORT_QUOTE_WORDS
                                        and _words_in_episode(words, cited, source)):
-            his.append(f"retired without his verified words: {line}")
+            his.append(f"retired without the operator's verified words: {line}")
         else:
             own.append(f"retired: {line}")
     return his, own
@@ -380,7 +380,7 @@ def build_card(kind: str, *, occurrence: str, store_dir: Path | str | None, agen
             body["own"] = body["own"][:keep]
         body["own_shown"] = keep
     if size() > limit and his:
-        o = need_out("the his list")
+        o = need_out("the operator's list")
         _write(o / HIS_FILE, json.dumps(his, indent=2))
         artifacts["his"] = str(o / HIS_FILE)
         body["his"] = []                           # never cut: moved whole, with its count and path

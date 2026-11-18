@@ -146,7 +146,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     en = sub.add_parser("enable", allow_abbrev=False, help="Register the dream as a named agent and print its signing card.",
                         description="Register the shipped `dream` role and AgentSpec in the agent store (idempotent) and "
                                     "print the words its link's signing card carries. It signs nothing: the link is "
-                                    "his signature, and the dream launches only under a live signed link.")
+                                    "the operator's signature, and the dream launches only under a live signed link.")
     en.add_argument("--agent-store-dir", type=Path, default=None,
                     help="The autonomic store directory (default: $LEVAIN_HOME/autonomic).")
     en.add_argument("--store-dir", type=Path, default=None,

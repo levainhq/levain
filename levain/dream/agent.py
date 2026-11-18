@@ -892,7 +892,7 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any, 
     from levain.desk import review
 
     body = {"kind": "renewal-due", "link": link_id, "expires_at": str(link["expires_at"]),
-            "reason": f"the dream's link {link_id} expires {link['expires_at']}; its renewal is his signature",
+            "reason": f"the dream's link {link_id} expires {link['expires_at']}; its renewal is the operator's signature",
             "remedy": (f"levain agents renew {link_id} --data-root {shlex.quote(str(data_root))} "
                        "--signing-key <your signing key file> --days 29")}
     try:
