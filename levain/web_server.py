@@ -110,7 +110,7 @@ from levain.cockpit.anneal_effects import (
     section_paths_agree,
 )
 from levain.cockpit.effects import INTENTIONS, DownstreamEffect, IntentionEffectStore
-from levain.cockpit.engine import Cockpit
+from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
@@ -1915,7 +1915,8 @@ def build_job_json(job_runtime: "JobRuntime | None", job_id: str) -> bytes:
 
 
 _BOARD_FLIGHT_LOCK = threading.Lock()
-BOARD_WAIT_S = 10.0      # the longest a board read holds a request slot waiting for a build; past it the last read (stale) or "building" is answered
+BOARD_WAIT_MARGIN_S = 3.0     # headroom under the panel provider's own deadline: the fallback (last read, or "building") must reach it in time
+BOARD_WAIT_S = PANEL_READ_DEADLINE_S -BOARD_WAIT_MARGIN_S    # the longest a board read holds a request slot waiting for a build; past it the last read (stale) or "building" is answered
 
 
 def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
@@ -1934,7 +1935,7 @@ def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
         if flight is None:
             flight = server._board_flight = cockpit_board.Flight()    # one build at a time per server, however many readers
     store = getattr(server, "question_store", None)
-    value = flight.get(lambda: cockpit_board.build(directory, store), BOARD_WAIT_S)
+    value = flight.get(lambda: cockpit_board.build(directory, store), BOARD_WAIT_S, key=(str(directory), cockpit_board.store_key()))
     value["drop_here"] = _drop_files_here(server, directory)
     return value if stamped else {**value, "generated": None}
 

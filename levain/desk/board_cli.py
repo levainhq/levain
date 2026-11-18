@@ -48,7 +48,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from levain.desk import board_evidence as be
 from levain.desk import board_registry as br
@@ -421,29 +421,37 @@ def run_decide(args: argparse.Namespace) -> int:
     return 0
 
 
-def _write_use_config(store_dir: Path, args: argparse.Namespace) -> bool:
-    """The board config, written EXACTLY from the flags (a flag left off is the default). With no flag and no config file there
-    is nothing to write; with no flag and a file, the file is replaced by the default, which clears it."""
-    if not (args.producers or args.no_land_waiter or (Path(store_dir) / bs.CONFIG_NAME).exists()):
-        return False
-    return bs.write_config(store_dir, args.producers, args.no_land_waiter)
+def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
+    """The board config, written EXACTLY from the flags (a flag left off is the default), as the step ``use`` runs BEFORE it
+    publishes the pointer or tombstones focus.json. With no flag and no config file there is nothing to write; with no flag and
+    a file, the file is replaced by the default, which clears it (levain 29: ``use`` writes exactly its flags)."""
+    def write(store_dir: Path) -> bool:
+        if not (args.producers or args.no_land_waiter or (Path(store_dir) / bs.CONFIG_NAME).exists()):
+            return False
+        return bs.write_config(store_dir, args.producers, args.no_land_waiter)
+    return write
+
+
+def _config_said(store_dir: Path) -> str:
+    """What the board config in ``store_dir`` says, in the words ``use`` prints (so a flagless re-run that cleared it says so)."""
+    conf = bs.read_config(store_dir)
+    producers = ", ".join(conf["producers"]) if conf["producers"] else "none"
+    return f"config: producers {producers}; {'no land waiter' if conf['no_land_waiter'] else 'a land waiter assumed'}"
 
 
 def run_use(args: argparse.Namespace) -> int:
     try:
+        write = _write_use_config(args)
         if args.import_focus is not None:
             store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
-                                                           briefcase=args.briefcase)
-            if _write_use_config(store_dir, args):
-                changed = True
-            print(f"{'using' if changed else 'already using'} {store_dir} ({note})")
+                                                           briefcase=args.briefcase, before_pointer=write)
+            print(f"{'using' if changed else 'already using'} {store_dir} ({note}; {_config_said(store_dir)})")
             return 0
-        store_dir, changed = bs.use(args.dir)
-        if _write_use_config(store_dir, args):
-            changed = True
+        store_dir, changed = bs.use(args.dir, before_pointer=write)
+        said = _config_said(store_dir)
     except bs.BoardError as exc:
         return _refused(exc)
-    print(f"{'using' if changed else 'already using'} {store_dir}")
+    print(f"{'using' if changed else 'already using'} {store_dir} ({said})")
     return 0
 
 
@@ -468,10 +476,17 @@ def run_state(args: argparse.Namespace) -> int:
     return rc
 
 
-def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None) -> tuple[int, dict[str, Any] | None]:
+def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None,
+              unreadable: list[str] | None = None) -> tuple[int, dict[str, Any] | None]:
     """``(exit code, the Board document or None)`` of ``levain board state --json``, with no printing of the document: a refusal is
     handed to ``say`` (a line of text; default stderr). ``read_evidence`` replaces :func:`board_evidence.read_git_evidence` (same signature):
-    the cockpit hands it a reader that keeps a repo's evidence while that repo's refs are unchanged. The cockpit board reads the board through this, so it never captures a stream."""
+    the cockpit hands it a reader that keeps a repo's evidence while that repo's refs are unchanged. The cockpit board reads the board through this, so it never captures a stream.
+
+    ``unreadable`` (a list the caller owns) is filled with every SOURCE the read could not read, one line each: the items file torn,
+    a git/producer source of a repo that failed, a tracked repo that cannot be read or is not tracked or registered, the registry.
+    These are the audit entries with no item id; the rest of the audit (a gate, landed-not-closed, an item that reads unknown) is
+    about an item, not a source, and is not here, nor is ``stale_evidence`` (old evidence is not an unread one, and the exit
+    code 3 means any audit entry at all, so it does not tell the two apart)."""
     read_git = read_evidence or be.read_git_evidence
     if say is None:
         say = lambda text: print(text, file=sys.stderr)  # noqa: E731
@@ -528,8 +543,9 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             return _srefused(say, bs.BoardError(br._torn_text(view)))
         if args.repo_name:
             return _sfail(say, "--repo-name names one repo: give --repo with it (a registry names its own repos)")
-    try:
-        config = bs.read_config(target.store_dir)      # before any git read: a config that cannot be read refuses at once
+    try:       # before any git read: a config that cannot be read refuses at once. Only a real store has one: a legacy standalone
+               # --items file (no store.id beside it) is the default, whatever board.json happens to sit next to it
+        config = bs.read_config(target.store_dir) if target.pointered else {"producers": [], "no_land_waiter": False}
     except bs.BoardError as exc:
         return _srefused(say, exc)
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
@@ -615,6 +631,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
                        primary_repo=summary["repo"] if cross else None, label_primary=whole, unread_repos=unread_why)
     doc = board.to_dict()
+    if unreadable is not None:         # a source the board named unreadable: an audit ``unknown`` with no item id (stale_evidence is its own line)
+        unreadable.extend(a.why for a in board.audit if a.kind == "unknown" and a.id is None and not a.why.startswith("stale_evidence:"))
     # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read under the one hold)
     try:
         registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)
@@ -622,6 +640,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
         say(f"levain board state: refused: {exc}")
         return EXIT_LOCKED, None
     doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit]
+    if unreadable is not None:         # the registry lines are two kinds: it could not be read (here), or the 72-hour rule (an ordinary entry)
+        unreadable.extend(w for w in registry_audit if w.startswith("registry: unreadable:") or "the registry is unreadable:" in w)
     doc["reader"] = summary
     if whole:                                           # no repo is privileged: freshness, counts and labels span every repo read
         doc["as_of"] = _oldest_fetch(read_evidence)

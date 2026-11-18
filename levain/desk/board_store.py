@@ -805,9 +805,13 @@ def _write_pointer(home: Path, store_dir: Path) -> None:
 
 
 def _config_doc(producers: Any, no_land_waiter: Any) -> dict[str, Any]:
+    from levain.desk import board_producers as bp
+
     names = list(producers or ())
     if not all(isinstance(n, str) and n and "\n" not in n for n in names):
         raise BoardError("the board config's producers must be non-empty one-line names")
+    if bp.NATIVE_PRODUCER in names:      # Levain's own producer is always read: naming it would fail every read of the board, at write and at read alike
+        raise BoardError(f"the board config's producers name {bp.NATIVE_PRODUCER!r}, Levain's own producer, which is always read; name an external one")
     return {"config_v": 1, "producers": list(dict.fromkeys(names)), "no_land_waiter": bool(no_land_waiter)}
 
 
@@ -824,15 +828,15 @@ def read_config(store_dir: Path | str) -> dict[str, Any]:
         raise BoardError(f"the board config {path} cannot be read: {exc}") from None
     try:
         doc = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):      # a deeply nested file is a refusal, never a traceback
         raise BoardError(f"the board config {path} is not JSON") from None
     if (not isinstance(doc, dict) or doc.get("config_v") != 1 or not isinstance(doc.get("producers"), list)
             or not isinstance(doc.get("no_land_waiter"), bool)):
         raise BoardError(f"the board config {path} is not a v1 config (config_v, producers, no_land_waiter)")
     try:
         clean = _config_doc(doc["producers"], doc["no_land_waiter"])
-    except BoardError:
-        raise BoardError(f"the board config {path} names a producer that is not a one-line name") from None
+    except BoardError as exc:
+        raise BoardError(f"the board config {path} cannot be used: {exc}") from None
     return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"]}
 
 
@@ -870,10 +874,13 @@ def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any) -> 
     return True
 
 
-def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tuple[Path, bool]:
+def use(directory: Path | str, environ: Mapping[str, str] | None = None,
+        before_pointer: Callable[[Path], bool] | None = None) -> tuple[Path, bool]:
     """``levain board use <dir>``: make ``<dir>`` this install's store. Creates it, writes ``store.id`` if absent, and writes
     the pointer LAST. Returns ``(resolved dir, changed)``; the same dir again changes nothing. A pointer that cannot be
-    read counts as a different one and is replaced."""
+    read counts as a different one and is replaced. ``before_pointer(store_dir)`` (the board config write; returns whether it
+    changed anything) runs once the store exists and BEFORE the pointer is published: a reader that sees the new pointer sees
+    the config with it, and a refusal from it leaves the pointer where it was."""
     home = _home_dir(environ)
     if home is None:
         raise BoardError("cannot place the store pointer: no levain home (set LEVAIN_HOME)")
@@ -886,12 +893,13 @@ def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tupl
             _write_store_id_once(held)
     except OSError as exc:
         raise BoardError(f"cannot set up the store at {store_dir}: {exc}") from None
+    configured = before_pointer(store_dir) if before_pointer is not None else False
     try:
         current = read_pointer(environ)
     except BoardError:
         current = None
     if current == store_dir:
-        return store_dir, False
+        return store_dir, configured
     try:
         _write_pointer(home, store_dir)
     except OSError as exc:

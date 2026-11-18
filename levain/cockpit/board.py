@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import stat
 import threading
 import warnings
+from collections import OrderedDict
+from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -31,6 +35,9 @@ TEXT_MAX = 1000        # the kernel's board validator refuses a longer card fiel
 CATEGORIES = ready.CATEGORIES
 COLUMNS = (UNKNOWN, *CATEGORIES)        # the columns a board value can carry, in drawing order: unknown first (v2 draws it above the rest),
                                          # and only while it holds a card: an empty unknown column is left out, so a board with nothing unplaced draws as it did
+# The order the cap cuts columns in once the board is over it: done first (it only grows), then the columns an agent can re-derive, and
+# what needs the operator (unknown, then the band) last: a board is never trimmed of the thing it exists to say.
+TRIM_ORDER = ("done", "backlog", "waiting", "running", "ready", "unknown", "needs-you")
 CARDS_MAX = 2000       # the kernel's board validator refuses a board of more cards (engine.BOARD_CARDS_MAX; one test pins them equal)
 BAND_HINT = "levain band"
 NO_QUEUE = "no queue yet"
@@ -88,9 +95,13 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
 # (any `unreadable`) is never kept: it is retried by the next build. One build per repo at a time (single flight): a build
 # that arrives during another waits for it and takes its result from the cache. How often the panel is read is the panel
 # refresher's own interval (grep `board=` in levain/web_server.py), not stated here.
-_EVIDENCE_CACHE: dict[str, tuple[Any, Any, Any]] = {}
+# Both tables are bounded, least recently used out (a long-lived server cycling through checkouts never grows them without end): at
+# most ``EVIDENCE_MAX`` repos' evidence, ``LOCKS_MAX`` build locks, and a lock that is held (a build running) is never the one evicted.
+_EVIDENCE_CACHE: OrderedDict[str, tuple[Any, Any, Any]] = OrderedDict()
 _EVIDENCE_LOCK = threading.Lock()
-_BUILD_LOCKS: dict[str, threading.Lock] = {}
+_BUILD_LOCKS: OrderedDict[str, threading.Lock] = OrderedDict()
+EVIDENCE_MAX = 64
+LOCKS_MAX = 256
 
 
 def _refs_state(repo: Path) -> Any:
@@ -109,6 +120,8 @@ def _refs_state(repo: Path) -> Any:
 def _hit(key: str, state: Any, arg_key: Any) -> Any:
     with _EVIDENCE_LOCK:
         hit = _EVIDENCE_CACHE.get(key)
+        if hit is not None:
+            _EVIDENCE_CACHE.move_to_end(key)
     if hit is not None and hit[0] == state and hit[1] == arg_key:
         return copy.deepcopy(hit[2])
     return None
@@ -128,7 +141,15 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
     if got is not None:
         return got
     with _EVIDENCE_LOCK:
-        lock = _BUILD_LOCKS.setdefault(key, threading.Lock())
+        lock = _BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = _BUILD_LOCKS[key] = threading.Lock()
+        _BUILD_LOCKS.move_to_end(key)
+        for old in [k for k in _BUILD_LOCKS if k != key]:      # least recently used first; a lock in use stays
+            if len(_BUILD_LOCKS) <= LOCKS_MAX:
+                break
+            if not _BUILD_LOCKS[old].locked():
+                del _BUILD_LOCKS[old]
     with lock:                                   # single flight: a second build waits here, then finds the first one's result
         state = _refs_state(Path(repo))
         if state is None:
@@ -141,12 +162,17 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
         if not out[0].get("unreadable") and _refs_state(Path(repo)) == state:
             with _EVIDENCE_LOCK:
                 _EVIDENCE_CACHE[key] = (state, arg_key, copy.deepcopy(out))
+                _EVIDENCE_CACHE.move_to_end(key)
+                while len(_EVIDENCE_CACHE) > EVIDENCE_MAX:
+                    _EVIDENCE_CACHE.popitem(last=False)
         return out
 
 
 def _v2_target(items: Path | str | None) -> Any:
-    """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read). A store that is
-    named but cannot be resolved raises ``bs.BoardError``: that is an unreadable board, never a quiet fall back."""
+    """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read).
+    A store that is CONFIGURED (a pointer names it, or ``store.id`` is in it, or ``items`` / ``$LEVAIN_BOARD_ITEMS`` names it) and
+    cannot be read (its directory or its ``repos.jsonl`` missing, not a file, or refused) raises ``bs.BoardError``: that is an
+    unreadable board, never a quiet fall back to "no queue yet" or the v1 queue. Only an install with no store at all reads None."""
     from levain.desk import board_store as bs
 
     try:
@@ -155,9 +181,23 @@ def _v2_target(items: Path | str | None) -> Any:
         if str(exc).startswith("no items store"):
             return None
         raise
-    # No registry file: ``levain board state`` would read the repository in ITS working directory, which for a cockpit is
-    # whatever directory the server started in. That is not a board; this install has none yet.
-    return target if (target.store_dir / "repos.jsonl").is_file() else None
+    registry = target.store_dir / "repos.jsonl"
+    configured = bool(target.pointered or (items is not None and str(items) != "") or os.environ.get(bs.ITEMS_ENV)
+                      or os.path.lexists(target.store_dir / bs.STORE_ID_NAME))
+    try:
+        st = os.stat(registry)         # os.stat, not Path.is_file(): is_file() answers False for EACCES too, and a store we cannot read is not an absent one
+    except (FileNotFoundError, NotADirectoryError):
+        if configured:
+            raise bs.BoardError(f"the board store {target.store_dir} holds no {registry.name}") from None
+        return None                    # no registry file: `levain board state` would read the repository in ITS working directory, which for a
+                                       # cockpit is wherever the server started. That is not a board; this install has none yet.
+    except OSError as exc:
+        raise bs.BoardError(f"the board store {registry} cannot be read: {exc}") from None
+    if not stat.S_ISREG(st.st_mode):
+        if configured:
+            raise bs.BoardError(f"the board store's {registry.name} is not a file")
+        return None
+    return target
 
 
 def _v2_card(st: Mapping[str, Any]) -> dict[str, Any]:
@@ -170,23 +210,41 @@ def _v2_card(st: Mapping[str, Any]) -> dict[str, Any]:
     return card
 
 
+UNREAD_LINES = 5          # how many unreadable reasons a board value names (the rest are counted): the list is drawn, so it is bounded
+UNREAD_MAX = 200
+
+
+def _unreadable_names(why: list[str]) -> list[str]:
+    """``desk`` first (the store is what failed), then each distinct reason, display-safe and cut, at most ``UNREAD_LINES`` of them."""
+    seen = list(dict.fromkeys(_text(w)[:UNREAD_MAX] for w in why))
+    out = [UNREADABLE_DESK, *seen[:UNREAD_LINES]]
+    if len(seen) > UNREAD_LINES:
+        out.append(f"(+{len(seen) - UNREAD_LINES} more unreadable)")
+    return out
+
+
 def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
     """``(cards, off_count, unreadable, as_of)`` from the board store, or None when there is none. ``cards`` holds every item
-    the board shows but a needs-you one (the band owns that column) and an off one (counted, not drawn)."""
+    the board shows but a needs-you one (the band owns that column) and an off one (counted, not drawn). ``unreadable`` names every
+    SOURCE the read could not read (see :func:`levain.desk.board_cli.state_doc`'s ``unreadable``): the one rule is that exit 3 and
+    a non-empty ``audit`` alone do NOT make the board unreadable (a gate, landed-not-closed or an unknown item is an ordinary entry
+    about an item), but a source with no item id behind it (a repo that cannot be read, a torn items file, an unread producer, the
+    registry) does: then the board is never drawn as a clean, empty one."""
     from levain.desk import board_cli as bc
     from levain.desk import board_evidence as be
     from levain.desk import board_store as bs
 
     try:
         target = _v2_target(items)
-    except bs.BoardError:
-        return [], 0, [UNREADABLE_DESK], None
+    except bs.BoardError as exc:
+        return [], 0, _unreadable_names([str(exc)]), None
     if target is None:
         return None
     args = argparse.Namespace(json=True, items=str(items) if items else None, evidence_extra=None, producers=[],
                               land_waiter=None, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
+    bad: list[str] = []
     try:
-        rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence)
+        rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence, bad)
     except Exception:  # noqa: BLE001 - never a 500: the board is named unreadable
         rc, doc = bc.EXIT_USAGE, None
     if doc is None:
@@ -199,7 +257,7 @@ def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, An
             off += 1
         elif col != "needs_you":
             cards.append(_v2_card(st))
-    return cards, off, [], doc.get("as_of")
+    return cards, off, _unreadable_names(bad) if bad else [], doc.get("as_of")
 
 
 def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
@@ -253,7 +311,8 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
 def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
           drop_dir: Path | str | None = None, board_items: Path | str | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], off_count, unreadable, band_hint,
-    note, journal_as_of_read}``. With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
+    note, journal_as_of_read, as_of}``: ``generated`` is the time of this build, ``as_of`` the OLDEST fetch time of the repos read
+    (null when a repo has none, or there is no board store). With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
     home's own) the cards are the v2 board's, ``off_count`` counts what is cut, parked or out of 1.0 and ``store_dir`` (the
     dispatch queue) is not read; the producers and the land waiter are the store's board config, read by the same code as
     ``levain board state``. Without a board store this is the dispatch queue as it was and ``off_count`` is 0: its items, the
@@ -271,12 +330,13 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     queue = "none"
     v2cards: list[dict[str, Any]] | None = None
     off_count = 0
+    as_of: str | None = None             # the OLDEST fetch of the repos read (the board's freshness), its own key: ``generated`` stays this build's clock
     v2 = _v2(board_items, now=generated)
     if v2 is not None:
         v2cards, off_count, bad, as_of = v2
         unreadable.extend(bad)
         queue = "unreadable" if bad else "ok"
-        generated = generated or as_of
+        generated = generated or datetime.now(timezone.utc).isoformat(timespec="seconds")      # this build's own clock, never a repo's fetch time
     elif store_dir is not None:
         try:
             out = ready.snapshot(store_dir, generated=generated)
@@ -306,60 +366,104 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
         unreadable.append(band_bad)
     by_cat["needs-you"] = band
     note = NO_QUEUE if queue == "none" else None
-    room = max(0, CARDS_MAX - sum(len(v) for c, v in by_cat.items() if c != "done"))
-    more = max(0, len(by_cat["done"]) - room)
-    if more:             # the whole board is refused past CARDS_MAX: the done column, which only grows, is what is cut
-        by_cat["done"] = by_cat["done"][:room]
-        note = (note + "; " if note else "") + f"done: [{more} more] not drawn"
+    more = {c: 0 for c in COLUMNS}
+    over = sum(len(v) for v in by_cat.values()) - CARDS_MAX
+    for c in TRIM_ORDER:        # the whole board is refused past CARDS_MAX: the cards past it are cut from the end of a column, in this order
+        if over <= 0:
+            break
+        cut = min(over, len(by_cat[c]))
+        if cut:
+            by_cat[c] = by_cat[c][:len(by_cat[c]) - cut]
+            more[c] = cut
+            over -= cut
+    for c in TRIM_ORDER:
+        if more[c]:
+            note = (note + "; " if note else "") + f"{c}: [{more[c]} more] not drawn"
     if band_bad:
         note = (note + "; " if note else "") + f"the needs-you band could not be read here; run `{BAND_HINT}`"
-    return {"schema": 1, "generated": generated, "queue": queue, "unreadable": unreadable, "note": note,
+    return {"schema": 1, "generated": generated, "as_of": as_of, "queue": queue, "unreadable": unreadable, "note": note,
             "band_hint": BAND_HINT, "journal_as_of_read": True, "off_count": off_count,
-            "columns": [{"category": c, "count": len(by_cat[c]) + (more if c == "done" else 0), "cards": by_cat[c]}
+            "columns": [{"category": c, "count": len(by_cat[c]) + more[c], "cards": by_cat[c]}
                         for c in COLUMNS if c != UNKNOWN or by_cat[c]]}
 
 
+def store_key(items: Path | str | None = None) -> Any:
+    """What a board build is OF: the resolved store directory, its ``store.id``, the stamp of its board config and the registry, so
+    two reads of two stores (a ``levain board use`` between them, a config rewritten) never share a flight or an answer. A store
+    that cannot be resolved is a key of its own, naming why. Cheap (a few stats and a small read) and never raises."""
+    from levain.desk import board_evidence as be
+    from levain.desk import board_store as bs
+
+    try:
+        target = bs.resolve_store(items)
+    except bs.BoardError as exc:
+        return ("unresolved", str(exc)[:200])
+    except Exception as exc:  # noqa: BLE001 - a key is never a reason for a 500
+        return ("unresolved", type(exc).__name__)
+    d = target.store_dir
+    try:
+        sid = (d / bs.STORE_ID_NAME).read_text("utf-8").strip()
+    except (OSError, ValueError):
+        sid = None
+    return (str(d), sid, be.stat_stamp(d / bs.CONFIG_NAME), be.stat_stamp(d / "repos.jsonl"))
+
+
 class Flight:
-    """One board build at a time for a host, and a bounded wait for it. ``get(fn, wait_s)`` starts ``fn`` on its own thread unless
-    one is already running, and waits at most ``wait_s`` for that build. A caller that does not get it in time is answered from
-    the last build that finished (marked ``stale``), or, with none yet, a board that says it is still being built: a request
-    never holds a slot of the host's gate for an unbounded cold read, and the build itself runs on."""
+    """One board build at a time PER KEY (the store the build is of, :func:`store_key`) for a host, and a bounded wait for it.
+    ``get(fn, wait_s, key=)`` starts ``fn`` on its own thread unless one is already running for that key, and waits at most
+    ``wait_s`` for that build. A caller that does not get it in time is answered from the last build of ITS key that finished
+    (marked ``stale``), or, with none yet, a board that says it is still being built: a request never holds a slot of the host's
+    gate for an unbounded cold read, and the build itself runs on. A changed key is its own flight and is never answered with
+    another key's board, fresh or stale."""
+
+    KEPT = 4              # the last boards kept (one per key, the most recent keys): a host with one store keeps one
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._run: tuple[threading.Event, list[Any]] | None = None
-        self._last: dict[str, Any] | None = None
+        self._runs: dict[Any, tuple[threading.Event, list[Any]]] = {}
+        self._last: OrderedDict[Any, dict[str, Any]] = OrderedDict()
 
-    def get(self, fn: Callable[[], dict[str, Any]], wait_s: float) -> dict[str, Any]:
+    def get(self, fn: Callable[[], dict[str, Any]], wait_s: float, key: Any = None) -> dict[str, Any]:
         with self._lock:
-            if self._run is None:
+            run = self._runs.get(key)
+            if run is None:
                 done, slot = threading.Event(), []
-                self._run = (done, slot)
-                threading.Thread(target=self._work, args=(fn, done, slot), name="board-build", daemon=True).start()
-            done, slot = self._run
-        if done.wait(wait_s):
-            if isinstance(slot[0], BaseException):
-                raise slot[0]
-            return copy.deepcopy(slot[0])
-        with self._lock:
-            last = copy.deepcopy(self._last)
-        if last is not None:
-            last["stale"] = True
-            last["note"] = (last["note"] + "; " if last.get("note") else "") + "the board is being rebuilt: this is the last read"
-            return last
-        return building_board()
+                self._runs[key] = (done, slot)
+                try:
+                    threading.Thread(target=self._work, args=(fn, done, slot, key), name="board-build", daemon=True).start()
+                except BaseException:
+                    del self._runs[key]       # no thread, so nothing would ever clear it: the next call starts its own
+                    raise
+                run = (done, slot)
+        done, slot = run
+        if not done.wait(wait_s):
+            with self._lock:
+                if not done.is_set():          # still running: the last read of this key, or "building"
+                    last = copy.deepcopy(self._last.get(key))
+                    if last is None:
+                        return building_board()
+                    last["stale"] = True
+                    last["note"] = (last["note"] + "; " if last.get("note") else "") + "the board is being rebuilt: this is the last read"
+                    return last
+            # it finished while this call was giving up: the fresh result beats the stale one
+        if isinstance(slot[0], BaseException):
+            raise slot[0]
+        return copy.deepcopy(slot[0])
 
-    def _work(self, fn: Callable[[], dict[str, Any]], done: threading.Event, slot: list[Any]) -> None:
+    def _work(self, fn: Callable[[], dict[str, Any]], done: threading.Event, slot: list[Any], key: Any) -> None:
         try:
             value = fn()
             with self._lock:
-                self._last = copy.deepcopy(value)
+                self._last[key] = copy.deepcopy(value)
+                self._last.move_to_end(key)
+                while len(self._last) > self.KEPT:
+                    self._last.popitem(last=False)
             slot.append(value)
         except BaseException as exc:  # noqa: BLE001 - handed to the waiters, never lost on a thread
             slot.append(exc)
         finally:
             with self._lock:
-                self._run = None
+                self._runs.pop(key, None)
             done.set()
 
 

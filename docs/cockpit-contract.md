@@ -51,7 +51,7 @@ Notes a provider relies on:
   of `backlog`, `ready`, `running`, `waiting`, `needs-you`, `done` (the desk's six, in column order; a column may be
   left out, never repeated), its `cards` a list of objects with a non-empty string `id` and a string `title`; a card's
   `journal` (who moved it, when, why: `{iso, who, why, source, from_category, to_category, applied_by}`) is an object or
-  null. The whole board holds at most `BOARD_CARDS_MAX` cards. It is `empty` only when the queue is `ok`, nothing is
+  null. The whole board holds at most `BOARD_CARDS_MAX` cards: past it the producer cuts cards from the end of a column (done first, then backlog, waiting, running, ready, unknown, needs-you), each column's `count` stays the true total and `note` says how many more were not drawn. The value carries `generated` (the time of the build; null on the panel's stamped-off read) and `as_of` (the OLDEST fetch time of the repos read, null when none), two keys, never one standing for the other. It is `empty` only when the queue is `ok`, nothing is
   `unreadable` and no column holds a card. **Two draws, one value:** the page draws the panel GROUPED, one heading per
   column in the desk's order with its count and the cards as rows beneath it, and the panel's ⤢ focus modal draws
   the columns side by side (the renderers of `board_view.js`; with that script absent the panel says so in one line).

@@ -1095,12 +1095,14 @@ def _import_identity_clash(fold: rf.RepoFold, name: str, ident: Mapping[str, Any
 
 
 def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, author: Mapping[str, Any],
-                     briefcase: str | Path | None = None, environ: Mapping[str, str] | None = None) -> tuple[Path, bool, str]:
+                     briefcase: str | Path | None = None, environ: Mapping[str, str] | None = None,
+                     before_pointer: Callable[[Path], bool] | None = None) -> tuple[Path, bool, str]:
     """``levain board use DIR --import-focus FILE`` in design 4.2's order: import each entry as ``register`` (plus ``pause``),
     then replace ``FILE`` by the tombstone (atomic rename), then write the pointer LAST. A tombstone whose ``moved_to`` is this
     store's ``repos.jsonl`` is the proof that the import finished: the import is skipped and the pointer written. Returns
     ``(store dir, pointer changed, note)``. The records are written through the one privileged path ``use`` has before the
-    pointer exists; every other writer refuses without it."""
+    pointer exists; every other writer refuses without it. ``before_pointer(store_dir)`` (the board config write; returns whether it
+    changed anything) runs BEFORE the tombstone replaces ``FILE`` and so before the pointer: a refusal from it leaves both alone."""
     focus = Path(focus_file).expanduser()
     store_dir = Path(os.path.realpath(Path(directory).expanduser()))
     moved_to = str(store_dir / REPOS_NAME)
@@ -1117,7 +1119,7 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
         if not store_dir.is_dir() or not (store_dir / bs.STORE_ID_NAME).exists() or not (store_dir / REPOS_NAME).exists():
             raise BoardError(f"{focus} is a tombstone for {moved_to}, but {store_dir} holds no store ({bs.STORE_ID_NAME} or {REPOS_NAME} "
                              f"missing): the imported registry is gone; restore the store (only a first-time use creates one)")
-        dest, changed = bs.use(store_dir, environ)
+        dest, changed = bs.use(store_dir, environ, before_pointer)
         return dest, changed, "already imported; pointer written"
     base = Path(briefcase).expanduser() if briefcase else focus.resolve().parent.parent.parent
     entries = []
@@ -1162,6 +1164,7 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
             pause(target, name, words, by, author=author)
     if focus.read_bytes() != data:
         raise BoardError(f"{focus} changed while it was imported; nothing replaced it (run again)")
+    configured = before_pointer(store_dir) if before_pointer is not None else False
     tmp = focus.with_name(f".{focus.name}.{os.getpid()}.{secrets.token_hex(4)}")
     try:
         tmp.write_text(json.dumps({"moved_to": moved_to}) + "\n", encoding="utf-8")
@@ -1181,7 +1184,7 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
         raise
     bs._fsync_dir_or_warn(focus.parent, f"the tombstone {focus.name}")      # durable BEFORE the pointer (W3); a failure after the replace is a warning
     dest, changed = bs.use(store_dir, environ)
-    return dest, changed, f"imported {len(entries)} repos; {focus} is now a tombstone"
+    return dest, changed or configured, f"imported {len(entries)} repos; {focus} is now a tombstone"
 
 
 # -------------------------------------------------------------------------------------------------------------- CLI
