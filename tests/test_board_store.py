@@ -79,9 +79,9 @@ def lines(d: Path) -> list[str]:
 
 
 def sans_at(line: str) -> dict:
-    """The record without what P1a adds (the stamp, ``prev``, ``author``, ``grade``): what flow's writer also wrote."""
+    """The record without what P1a adds (the stamp, ``prev``, ``author``, ``grade``; P2's ``store`` and ``sig`` on a signed record): what flow's writer also wrote."""
     rec = json.loads(line)
-    for k in ("at", "prev", "author", "grade", "sig"):
+    for k in ("at", "prev", "author", "grade", "store", "sig"):
         rec.pop(k, None)
     return rec
 
