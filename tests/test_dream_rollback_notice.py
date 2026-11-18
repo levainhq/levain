@@ -212,3 +212,16 @@ def test_two_rolled_back_cards_of_one_occurrence_after_the_load_tell_one_line_th
     conn.execute("INSERT INTO seam_handoffs VALUES ('dream-rotation:o')")
     (line,) = dream_status.rollback_notes(conn, recs, "2026-11-15T08:00:00Z")
     assert "rolled back at 2026-11-15T10:00:00Z" in line
+
+
+def test_a_rollback_whose_save_is_not_at_or_before_the_load_is_told_nothing_not_a_cannot_derive():
+    from levain.desk import dream_status
+
+    # the rotation's handoff exists and the rollback is after the load, but the only save of "o" was filed after the load:
+    # this desk's memory did not include it, so there is nothing to tell (and no save to name in a line)
+    recs = [dream_status.DreamRecord("rolled-back", "2026-11-15T10:00:00Z", "o"),
+            dream_status.DreamRecord("consolidated", "2026-11-15T09:00:00Z", "o")]
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE seam_handoffs (close_key TEXT)")
+    conn.execute("INSERT INTO seam_handoffs VALUES ('dream-rotation:o')")
+    assert dream_status.rollback_notes(conn, recs, "2026-11-15T08:00:00Z") == []
