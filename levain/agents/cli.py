@@ -438,7 +438,7 @@ def run_show(args: argparse.Namespace) -> int:
 
 def _recover_quietly(store) -> None:
     """``show``'s best-effort bar recovery: the tick's helper, with a stderr line only for an outcome that changed a bar
-    (rows R1, R2, R3 and R5; R0 and R4 print nothing). No install naming a cockpit, a refused install, or any failure is
+    (rows R1, R2, R3 and R5; R0 prints nothing, and R4 says its piece only through the attention sink). No install naming a cockpit, a refused install, or any failure is
     skipped silently; ``show``'s stdout and exit code never depend on it."""
     from levain.agent_authority import AgentAuthority
     from levain.agents import tick_driver
