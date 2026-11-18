@@ -40,7 +40,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -701,6 +701,7 @@ _UNSET: Any = object()      # attach_server's "board not given", distinct from a
 
 _READ_CACHE_MAX = 64          # live entries; past it a read simply runs uncached
 _READ_CACHE_JOIN_S = 60.0     # how long a joiner waits for the owner before reading for itself
+_MANIFEST_READERS = 16        # panels a manifest reads at once (each read is its own bounded flight; this only bounds the threads)
 
 
 def _read_key(x: Any) -> str:
@@ -2239,10 +2240,15 @@ class Cockpit:
         heads: dict[str, dict[str, Any]] = {}
         snaps: dict[str, _Snap] = {}
         specs_map = self._specs      # one snapshot for the whole manifest
-        for spec in self._ordered_specs(specs_map):
-            snaps[spec.id] = self._snap_for(spec, ctx)
-            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth, ctx.now)
         specs = self._ordered_specs(specs_map)
+        # The panels read side by side: one request pays for its slowest panel, not for the sum of all of them (each read is
+        # already its own bounded single flight over the one ReadContext, so nothing here shares more than a serial pass did).
+        # Results are placed in drawing order; a read that raises propagates as it did when this ran in a loop.
+        def read_head(spec: ProviderSpec) -> tuple[_Snap, dict[str, Any]]:
+            snap = self._snap_for(spec, ctx)
+            return snap, self._head(spec, snap, credential["class"], ctx.today, auth, ctx.now)
+        for spec, (snap, head) in zip(specs, self._parallel(read_head, specs)):
+            snaps[spec.id], heads[spec.id] = snap, head
         regions = self._regions(specs)
         order = [s.id for s in specs]
         # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
@@ -2261,6 +2267,16 @@ class Cockpit:
         if transport is not None:
             out["transport"] = dict(transport)
         return out
+
+    @staticmethod
+    def _parallel(fn: Callable[[Any], Any], items: list[Any]) -> list[Any]:
+        """``fn`` over ``items`` on up to ``_MANIFEST_READERS`` threads, results in ``items`` order; the first failure
+        (in order) is raised after every call has finished."""
+        if len(items) < 2:
+            return [fn(i) for i in items]
+        with ThreadPoolExecutor(max_workers=min(_MANIFEST_READERS, len(items)), thread_name_prefix="manifest-read") as pool:
+            futures = [pool.submit(fn, i) for i in items]
+        return [f.result() for f in futures]
 
     @staticmethod
     def _regions(specs: list[ProviderSpec]) -> dict[str, Any]:
