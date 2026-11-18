@@ -191,6 +191,51 @@ A signed record is a verified fact about who wrote it. A relayed record is the d
 
 **The chain.** Each line carries `prev`, the sha256 of the line before it, bytes as written. The first chained record commits to the unchained prefix that came before it, if there was one. An edit in the middle of a file breaks the chain at the next line. The board then reads the store as torn, and items read `unknown` until `levain board ack-torn --file <items.jsonl|repos.jsonl> --line N --why "<why>" --by <name>` acknowledges the line. A chain shows that lines were not changed in the middle. It does not show who wrote them: whoever can write the file can rewrite its tail and recompute every `prev`. Authorship comes from a signed grade.
 
+## Who closed an item: `closed_by`
+
+`levain board state --json` puts a `closed_by` on a `done` item whose close is git's: a `merged`, `document` or `run` item. A band close has no git author and carries none. `levain board context` prints the same verdict as a `closed by:` line. No close is ever refused for its author: every one gets a verdict, and the worst verdict is `unattributed`.
+
+**The rule.** The line is the weakest claim the evidence supports. It names the strongest tier that holds, in this order:
+
+| tier | the line reads | what it proves | what it does not |
+| --- | --- | --- | --- |
+| `signed` | `signed by an operator key <principal>` | The closing commit's SSH signature verifies, the board's own key rule accepts the key as a terminal (laptop-presence) signer, and the key was live in the operator's authority log and enrolled no later than the commit's date. | That a person acted. A key of the operator's signed. The commit's date is set by its signer, so the enrolment check is a sanity check and not a proof of when. |
+| `trailer` | `agent <role> <launch>, asserted (trailer)` | A `Board-Seat: <durable key>` trailer maps to a launch record that claimed this item and ran in this item's repo. | Anything about who wrote the trailer: anyone can copy one. It is asserted, never proof. |
+| `git` | `asserted by git author <name> <email>` | What the commit's author field says. | That the author is who they say. An unsigned commit of the operator's own lands here and closes. |
+| `unattributed` | `unattributed: ...` and the reason | Nothing. It says no commit could be read. | Anything. It is reported, not refused. |
+
+When a stronger tier is not credited, `note` says why: a key the rule refuses, a key enrolled after the commit's date, a key revoked (the log carries no revocation time, so a revoked key is never credited whatever the commit's date), a signature that does not verify, a trailer that maps to no launch, to a launch that claimed other items or none, or to one that ran in another repo. A commit with several different `Board-Seat` trailers reads none. A commit whose committer is not its author (a rebase, a squash merge) also names the committer: `, committed by <name> <email>`. No `note` means every check that was available ran.
+
+**Where the close is read from.**
+
+- A `merged` close carried by a commit's own `Board-Closes` trailer is read from that commit: the one the board state names, which is the latest by committer date, ties by sha.
+- A close written as a note (`refs/notes/board`) is read from the commit on that ref that wrote the line, never from the commit it annotates: a note is not covered by the annotated commit's signature. When several note commits wrote the line, the latest addition counts. `commit` is then the note's commit and `close_commit` the annotated one. The note is read as it stands now.
+- A `document` or `run` close is the file existing, and nobody performs that. The verdict is the tier of the first-parent commit on main that first added the path (for a directory, the first that added a file under it), and the line begins `first added <path>`, so it never reads as the closer. Later edits are not read.
+
+**Two rules for the document and run path, and for the email.**
+
+1. **The literal tracked path.** A document or run close credits the path exactly as the item's `done` line names it and as git tracks it. A symlink is not followed, and a submodule is not entered: the verdict is read for the tracked path itself, never for what a link points at or for what lies inside a submodule.
+2. **An empty email is kept.** A git author whose email is empty is kept as present-but-empty, never dropped. A commit with no email does not read as a commit that never had one.
+
+**A run on a scratch store.** Two items closed on a scratch repo by unsigned commits, and a third not yet closed (`levain board state --json`, abridged to `closed_by`):
+
+```
+levain#1 done {"tier": "git", "who": "t", "how": "asserted by git author", "commit": "51268ed9...", "email": "t@t"}
+levain#2 done {"tier": "git", "who": "t", "how": "first added docs/r.md, asserted by git author", "commit": "959b63a1...", "email": "t@t"}
+levain#3 ready null
+```
+
+`levain#1` is a `merged` item closed by a `Board-Closes` trailer; `levain#2` is a `document` item whose file was added by a commit with no closing trailer. Neither commit was signed and neither carried a `Board-Seat`, so both read `git`; `levain#2` says it is the commit that added the file. Only the `git` rows were run. The `signed` and `trailer` rows, the note path and the two rules above are from the code and its help.
+
+**`--data-root` and `--desk-dir`.** `levain board state` and `levain board context` read the operator's keys from this install's own cockpit (the one the signed verbs verify against) and the launch records from this install's own desk store. `--data-root DIR` and `--desk-dir DIR` name others. Both are read-only. A default that is absent or unreadable reads "not checked" in `note`; it is never an error and never a silent `git` verdict presented as checked. If attribution itself fails, the board still reads and each git close says `the author could not be read (...)`.
+
+**Known edges of close authorship:**
+
+- **A `signed` verdict says a key signed, not that a person acted.** A key the operator enrolled can sign a commit an agent made.
+- **A `trailer` verdict is a copied-trailer risk by design.** It is bound to a launch that claimed the item, not to a key.
+- **A launch's repo is read from its working directory.** A seat launched from a directory outside the repo it works in, or from a worktree since removed, loses `trailer` and falls to `git`, with the reason in `note`.
+- **A `document` or `run` verdict names the commit that added the file.** Not the commit that finished the work, and not whoever last edited it.
+
 ## The provenance trail: `levain board trail`
 
 The store (`items.jsonl`) and the registry (`repos.jsonl`) are two append-only files, each a hash chain. The trail is both files read by someone who does not trust the machine that wrote them. `levain board trail verify` re-checks them; `levain board trail export` packs them into a bundle that can be checked somewhere else. The commands below were run on a scratch store from the code that carries them (`levain board trail --help`, `export --help` and `verify --help` are the reference).
@@ -232,6 +277,7 @@ The words, as the code prints them:
 - `agent NAME, relaying q-... (signed answer)` and `(unsigned answer)`: the desk relayed a band answer, and the answer's own signature does or does not bind his words. A relayed record is never promoted past its answer.
 - `anchored through line N`: a signed record at line N commits every record up to it, so none of them could have been rewritten without the operator's key. The tail line then counts the records after the last signed one as unanchored: anyone who can write the file could have rewritten them. The tail line is always printed.
 - `NOT ANCHORED`: no signature stands as an anchor. It is printed when the only signatures that verify are under keys a bundle names (below), when no signed record verifies, when the file breaks at or before the last signed record, or when the signing key has since been revoked. A key revoked since is reported (`revoked since (seq N)`), never silently valid and never a break by itself. Only the bundle-keys case was run; the other three are from the code.
+- A line that names who closed an item quotes the words of [Who closed an item: `closed_by`](#who-closed-an-item-closed_by); that section says what each tier proves and does not.
 - `no kept head given`: the file can be cut at its end and still verify. Give `--head items=<hash>` (and `repos=<hash>`), the heads `export` printed. A head that is still on the chain reads `kept head ... is the current head: nothing was removed`. One that is not reads `TRUNCATION OR REWRITE: kept head ... is not on this chain (the file now ends at ...): records were removed or rewritten`, and that is a break.
 
 **Exit codes.** `0`: no break. `3`: any break (a chain break, a record its fold rejects, a signature that does not verify, a relayed citation that does not hold, a head that is gone); `verify` then prints `levain board trail verify: N breaks` and a `BREAK` line per break. `2`: it could not run (the store cannot be read, a bad argument). The `2` case is from the help and the code; it was not run here.
