@@ -442,9 +442,10 @@ _CHILDREN: set = set()
 _CHILD_LOCK = threading.RLock()
 
 
-def _leader_exited(p: subprocess.Popen) -> bool:
-    """True once the group leader has exited, WITHOUT reaping it: while it is an unreaped zombie its pid (the group id)
-    cannot be handed to anyone else, so a killpg of it still reaches only this child's own group."""
+def _leader_state(p: subprocess.Popen) -> bool | None:
+    """True once the group leader has exited, False while it runs, None when the check itself failed (UNKNOWN).  It never
+    reaps: while the leader is an unreaped zombie its pid (the group id) cannot be handed to anyone else, so a killpg of
+    it still reaches only this child's own group.  Unknown is never "exited"."""
     if p.returncode is not None:
         return True
     if hasattr(os, "waitid"):
@@ -452,14 +453,26 @@ def _leader_exited(p: subprocess.Popen) -> bool:
             return os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
         except ChildProcessError:
             return True
-    return _exited_kqueue(p.pid)
+        except OSError:
+            return None
+    try:
+        return _exited_kqueue(p.pid)
+    except OSError:
+        return None
+
+
+def _leader_exited(p: subprocess.Popen) -> bool:
+    """The leader is known to have exited.  An unknown (failed check) is NOT exited, so every caller keeps going down its
+    kill path (TERM, grace, SIGKILL): the Popen is the only reaper of the leader, so its pid cannot be reused before our
+    own wait."""
+    return _leader_state(p) is True
 
 
 def _exited_kqueue(pid: int) -> bool:
     """The path where os.waitid is missing (some macOS builds have it, e.g. CPython 3.13+, others do not, e.g. 3.12): a
     one-shot kqueue NOTE_EXIT watch, polled without waiting.  kqueue never reaps.  On a child that is already a zombie
     the registration itself answers ESRCH, which is also the answer for a pid that is gone, so both read as exited.
-    Any other OSError is raised, never read as "exited": a false True could let a killpg reach a reused group."""
+    Any other OSError is raised here and read as UNKNOWN by _leader_state, never as "exited"."""
     try:
         kq = select.kqueue()
         try:
@@ -664,7 +677,14 @@ def _wait_leader(p: subprocess.Popen, timeout: float | None) -> int:
     test started, a stray worker) BEFORE reaping the leader, so nothing from a finished command outlives it and the
     signal can never reach a group id that was recycled after the reap.  Raises TimeoutExpired like Popen.wait."""
     end = None if timeout is None else time.monotonic() + timeout
-    while not _leader_exited(p):
+    while True:
+        st = _leader_state(p)
+        if st is None:
+            # the exit check fails: no spinning on it.  The blocking Popen wait (the one the kill path reaps with) takes
+            # over, bounded by what is left of the timeout; the group sweep below is skipped, the leader being reaped.
+            return p.wait(timeout=None if end is None else max(0.0, end - time.monotonic()))
+        if st:
+            break
         if end is not None and time.monotonic() >= end:
             raise subprocess.TimeoutExpired(p.args, timeout)
         time.sleep(0.02)

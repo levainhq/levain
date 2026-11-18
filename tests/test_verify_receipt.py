@@ -491,7 +491,7 @@ def test_the_runs_tmpdir_is_short_enough_for_a_unix_socket(tmp_path):
     assert not d.exists()
 
 
-def test_a_kqueue_error_other_than_esrch_raises_never_reads_as_exited(monkeypatch):
+def test_a_kqueue_error_other_than_esrch_is_unknown_never_exited_and_the_kill_path_still_kills(monkeypatch):
     import select
     if getattr(select, "kqueue", None) is None:
         pytest.skip("kqueue is the BSD/macOS path")
@@ -508,9 +508,32 @@ def test_a_kqueue_error_other_than_esrch_raises_never_reads_as_exited(monkeypatc
     with pytest.raises(OSError) as ei:
         verify._exited_kqueue(os.getpid())
     assert ei.value.errno == errno.EMFILE
-    p = types.SimpleNamespace(returncode=None, pid=os.getpid())
-    with pytest.raises(OSError):
-        verify._leader_exited(p)
+    fake = types.SimpleNamespace(returncode=None, pid=os.getpid())
+    assert verify._leader_state(fake) is None              # unknown
+    assert verify._leader_exited(fake) is False            # never "exited"
+    # a child that ignores SIGTERM: the kill path still reaches SIGKILL, and nothing raises or spins
+    p = verify._spawn(["/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"], cwd=None, env=dict(os.environ),
+                      stdout=subprocess.DEVNULL)
+    try:
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        verify._kill_group(p, 0.5)
+        assert p.wait(timeout=10) == -signal.SIGKILL
+        assert time.monotonic() - t0 < 8
+    finally:
+        if p.returncode is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+    # the wait on a leader whose check keeps failing falls back to the blocking wait, not a spin or a raise
+    q = verify._spawn(["/bin/sh", "-c", "exit 3"], cwd=None, env=dict(os.environ), stdout=subprocess.DEVNULL)
+    assert verify._wait_leader(q, 10.0) == 3
+    r = verify._spawn(["sleep", "30"], cwd=None, env=dict(os.environ), stdout=subprocess.DEVNULL)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            verify._wait_leader(r, 0.3)
+    finally:
+        os.killpg(r.pid, signal.SIGKILL)
+        r.wait()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the kqueue branch is the macOS path")
@@ -524,9 +547,16 @@ def test_the_kqueue_branch_sees_a_real_zombie_child_without_reaping(monkeypatch)
             time.sleep(0.05)
         assert verify._leader_exited(p) is True           # already a zombie: the registration answers ESRCH
         assert p.returncode is None
-        assert os.waitpid(p.pid, os.WNOHANG)[0] == p.pid
+        # blocking, not WNOHANG (the same race as the sibling test): a reaped pid would raise ChildProcessError
+        assert os.waitpid(p.pid, 0)[0] == p.pid
     finally:
         p.poll()
+        if p.returncode is None:
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
 
 
 def test_a_leg_that_raises_keeps_its_traceback_in_status_and_stderr(repo, tmp_path, monkeypatch, capsys):
@@ -2020,7 +2050,7 @@ def test_rc3_a_killed_child_that_never_exits_does_not_hang_the_run(tmp_path, mon
             raise subprocess.TimeoutExpired("x", timeout)
 
     monkeypatch.setattr(verify, "_spawn", lambda *a, **k: Stuck())
-    monkeypatch.setattr(verify, "_leader_exited", lambda p: False)       # a leader in uninterruptible sleep never reports an exit
+    monkeypatch.setattr(verify, "_leader_state", lambda p: False)        # a leader in uninterruptible sleep never reports an exit
     monkeypatch.setattr(verify, "_kill_group", lambda p, grace=5.0: None)
     monkeypatch.setattr(verify, "REAP_WAIT", 0.01, raising=False)
     log = tmp_path / "log"
