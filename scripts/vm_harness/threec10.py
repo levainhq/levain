@@ -10,7 +10,7 @@ a FAKE guest and a FAKE provider, no VM and no vendor.
 
 The steps, each with ONE expected verdict (:data:`EXPECTED`), written to ``EXPECTED.txt`` before the first guest call:
   T1  install the limited key as the keys credential (stdin; the secret is never in an argv)   -> ``cred-installed <cred>``
-  T2  ``levain doctor`` as root: the ``invoice ceiling (<cred>)`` row reads the limit            -> ``key limit $X[ total], $Y remaining ...``
+  T2  ``levain doctor`` as root: the ``invoice ceiling (<cred>)`` row reads the limit            -> ``key limit $L total, $Y remaining ...`` (or the BYOK-only wording at exactly L and R)
   T3  one real call: the provider's ``usage`` delta equals the lineage's settled dollars, within a stated tolerance -> ``AGREE ...``
   T4  an overrun: a lineage row with ``overrun`` set (the session stopped)                        -> ``overrun-row ...``
   T5  install the unlimited key                                                                   -> ``cred-installed <cred>``
@@ -104,7 +104,12 @@ REMOVE_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json" "$1/keys/cred/$2.json.new"
 EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
     ("T1", "install the limited key", 0, r"cred-installed <cred>", r"^cred-installed "),
     ("T2", "doctor, key with a limit", None,
-     r"\s*\S+ invoice ceiling \(<cred>(?: at [^)]+)?\): key limit " + USD + r"(?: total)?, " + USD + r" remaining.*",
+     r"\s*\S+ invoice ceiling \(<cred>(?: at [^)]+)?\): key limit (?=\$)"
+     # one pattern, no alternation: two optional wordings, each fullmatching to the end of the row. A total limit (any
+     # figures), or a limit with the BYOK caveat alone at exactly the expected limit and remainder. A reset, an exhausted
+     # key, any other caveat or other figures match neither, so the row is left unconsumed and fails.
+     r"(?:" + USD + r" total, " + USD + r" remaining.*)?"
+     r"(?:<limit>, <remaining> remaining; BYOK usage is not counted against this limit(?: \(as keys read it .*\))?)?",
      r"invoice ceiling \(<cred>"),
     ("T3", "one real call settles from real usage", None, r"AGREE .*", r"^(AGREE|DISAGREE|NOCALL|NOMOVE) "),
     ("T4", "an overrun stops the session", None, r"overrun-row .*", r"^(overrun-row|no-overrun-row) "),
@@ -187,16 +192,24 @@ class Config:
     call: tuple[str, ...] = ()
     overrun_call: tuple[str, ...] = ()
     keys: Mapping[str, str | None] | None = None        # {"limited": ..., "unlimited": ...}
+    limit_usd: float = 2.00                              # the limited key's limit, and what a fresh key has left
+    remaining_usd: float = 2.00
     tolerance_pct: float = 5.0
     tolerance_floor_microdollars: int = 1000             # $0.001: provider rounding on a tiny call
     settle_wait_s: float = 90.0
     settle_poll_s: float = 5.0
 
 
+def _fill(pat: str, cfg: Config) -> str:
+    """The pattern with the credential and the expected figures put in, each as the doctor writes a dollar amount."""
+    return (pat.replace("<cred>", re.escape(cfg.cred)).replace("<limit>", re.escape(f"${cfg.limit_usd:,.2f}"))
+            .replace("<remaining>", re.escape(f"${cfg.remaining_usd:,.2f}")))
+
+
 def expected_text(cfg: Config) -> str:
     out = [f"3c-10: expected verdicts, os={cfg.profile.name}, cred={cfg.cred}", "step | name | rc | expected raw line (regex)"]
     for sid, name, rc, pat, _sel in EXPECTED:
-        out.append(f"{sid} | {name} | {'any' if rc is None else rc} | /{pat.replace('<cred>', re.escape(cfg.cred))}/")
+        out.append(f"{sid} | {name} | {'any' if rc is None else rc} | /{_fill(pat, cfg)}/")
     out.append(f"T3 tolerance: |lineage - provider| <= max({cfg.tolerance_pct}% of the provider delta, "
                f"{cfg.tolerance_floor_microdollars} microdollars)")
     return "\n".join(out)
@@ -228,7 +241,7 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         return text
 
     digest = ev.write_expected(expected_text(cfg))
-    verdicts = {sid: (Verdict(rc, pat.replace("<cred>", re.escape(cfg.cred))), (sel or "").replace("<cred>", re.escape(cfg.cred)) or None)
+    verdicts = {sid: (Verdict(rc, _fill(pat, cfg)), (sel or "").replace("<cred>", re.escape(cfg.cred)) or None)
                 for sid, _n, rc, pat, sel in EXPECTED}
     names = {sid: name for sid, name, *_ in EXPECTED}
     results: dict[str, StepResult] = {}

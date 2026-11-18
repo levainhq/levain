@@ -185,6 +185,7 @@ class Config:
     key: str | None = None
     limit_usd: float = 2.00
     min_remaining_usd: float = 0.40
+    start_remaining_usd: float | None = None           # what a fresh key has left; None: the limit itself
     tolerance_pct: float = 5.0
     tolerance_floor_microdollars: int = 1000
     step_wait_s: float = 900.0                         # how long a job may take to reach a state
@@ -468,10 +469,19 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
                 "--path", cfg.install)
         lines, _rc = capture(guest, argv, 180)           # doctor exits 1 on unrelated rows: the verdict ignores rc
         row = next((ln for ln in lines if re.search(r"invoice ceiling \(" + re.escape(cfg.cred), ln)), "")
-        m = re.search(r"key limit (" + USD + r")(?: total)?, (" + USD + r") remaining", row)
+        m = re.search(r"key limit (" + USD + r")( total)?, (" + USD + r") remaining(; BYOK usage is not counted against this limit)?",
+                      row)
         if not m:
-            raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X[ total], $Y remaining'", row.strip())
-        limit, remaining = (float(g.replace("$", "").replace(",", "")) for g in m.groups())
+            raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X total, $Y remaining'", row.strip())
+        limit, remaining = (float(g.replace("$", "").replace(",", "")) for g in (m.group(1), m.group(3)))
+        if not m.group(2):
+            # No "total": the doctor words a row this way only when it warns. The one such row taken is a fresh key whose
+            # only caveat is BYOK, at exactly the expected limit and the expected remainder; reset, exhausted or any other
+            # caveat, or other figures, fail.
+            start = cfg.limit_usd if cfg.start_remaining_usd is None else cfg.start_remaining_usd
+            if not (m.group(4) and abs(limit - cfg.limit_usd) <= 0.005 and abs(remaining - start) <= 0.005):
+                raise StepFail(f"the row is not a total limit of ${cfg.limit_usd:.2f}: it words a warning, or other figures",
+                               row.strip())
         ps, _ = capture(guest, (cfg.profile.ps_bin, "-Ao", "pid,command"), 60)
         pid = next((ln.split()[0] for ln in ps if RUNNER_MODULE in ln and "grep" not in ln and ln.split()[0].isdigit()), None)
         raw = f"key limit ${limit:.2f}, remaining ${remaining:.2f}, " + (f"runner up pid={pid}" if pid else "runner DOWN")

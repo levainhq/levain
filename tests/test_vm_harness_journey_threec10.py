@@ -153,7 +153,7 @@ def test_the_real_doctor_rows_match_the_expected_verdicts():
     lim = w.doctor_rows()
     w.files[CRED] = T.credential_json(CRED, UNLIMITED)
     none = w.doctor_rows()
-    v = {sid: (re.compile(pat.replace("<cred>", re.escape(CRED))), sel.replace("<cred>", re.escape(CRED)))
+    v = {sid: (re.compile(T._fill(pat, T.Config(DARWIN, "/tmp/install", cred=CRED))), sel.replace("<cred>", re.escape(CRED)))
          for sid, _n, _rc, pat, sel in T.EXPECTED if sid in ("T2", "T6")}
     for sid, lines in (("T2", lim), ("T6", none)):
         raw = RB.pick_line(lines, v[sid][1])

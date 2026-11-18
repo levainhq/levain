@@ -173,11 +173,33 @@ def overall(statuses: Sequence[str], omitted: Sequence[str] = ()) -> str:
 
 # ---- the stdin transport (a secret never goes in an argv) ----------------------------------------------------------
 
+#: A job capability's shape: a long url-safe token that has a digit (a plain identifier or path word does not). A job id
+#: (``dj-`` and hex) is not one. Stdout is redacted of any such run.
+_CAPABILITY_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])(?!dj-)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,128}")
+_TAIL = 350
+
+
+def guest_error_text(argv, r, stdin_text: str = "") -> str:
+    """The text of a nonzero guest exit: each stream's own tail (so a long stderr cannot push a refusal line off stdout),
+    labelled. Stdout is the stream that may echo what was sent on stdin or print a capability, so the stdin text and anything
+    shaped like a capability are removed from it before it is quoted; stderr is quoted as it is."""
+    def no_stdin(s: str) -> str:
+        # the whole text, then each of its lines, since a guest may echo one line of what it read
+        for piece in sorted({stdin_text.strip(), *(ln.strip() for ln in stdin_text.splitlines())}, key=len, reverse=True):
+            if len(piece) >= 6:
+                s = s.replace(piece, "<stdin>")
+        return s
+
+    out = _CAPABILITY_SHAPE.sub("<redacted>", no_stdin((r.stdout or "").strip()))[-_TAIL:]
+    err = no_stdin((r.stderr or "").strip())
+    return f"guest {list(argv)[:4]}: stdout: {out} | stderr: {err[-_TAIL:]}"
+
+
 def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> StdinRunner:
     """``run(argv, stdin_text, timeout) -> stdout`` to the guest over ``transport``, the one ``vm_run.make_transport`` ACTUALLY
     selected (``guest.kind``: ``"ssh"`` or ``"tart_exec"``, so a linux profile whose guest agent did not answer gets ssh, as
     its ``guest`` does), never the static profile. ssh sends one quoted command (as ``vm_run.make_ssh`` does); ``tart_exec``
-    uses ``tart exec -i``. A nonzero exit raises ``GuestError`` with the stderr tail, never the stdin."""
+    uses ``tart exec -i``. A nonzero exit raises ``GuestError`` with each stream's tail (:func:`guest_error_text`), never the stdin."""
     from scripts.vm_harness import vm_run
     from scripts.vm_harness.driver import GuestError
 
@@ -189,7 +211,7 @@ def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> St
             r = subprocess.run(vm_run.tart_exec_argv(vm, argv, stdin=True), input=text, capture_output=True, text=True,
                                timeout=timeout)
             if r.returncode:
-                raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {(r.stdout + r.stderr).strip()[-700:]}")
+                raise GuestError(r.returncode, guest_error_text(argv, r, text))
             return r.stdout
         return run
     askpass = Path(askpass_dir) / "askpass-stdin.sh"
@@ -211,6 +233,6 @@ def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> St
         r = subprocess.run([vm_run.SSH, *vm_run.SSH_OPTS, f"{profile.ssh_user}@{ip}", shlex.join(str(a) for a in argv)],
                            input=text, capture_output=True, text=True, timeout=timeout, env=env)
         if r.returncode:
-            raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {(r.stdout + r.stderr).strip()[-700:]}")
+            raise GuestError(r.returncode, guest_error_text(argv, r, text))
         return r.stdout
     return run
