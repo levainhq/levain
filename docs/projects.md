@@ -191,6 +191,80 @@ A signed record is a verified fact about who wrote it. A relayed record is the d
 
 **The chain.** Each line carries `prev`, the sha256 of the line before it, bytes as written. The first chained record commits to the unchained prefix that came before it, if there was one. An edit in the middle of a file breaks the chain at the next line. The board then reads the store as torn, and items read `unknown` until `levain board ack-torn --file <items.jsonl|repos.jsonl> --line N --why "<why>" --by <name>` acknowledges the line. A chain shows that lines were not changed in the middle. It does not show who wrote them: whoever can write the file can rewrite its tail and recompute every `prev`. Authorship comes from a signed grade.
 
+## The provenance trail: `levain board trail`
+
+The store (`items.jsonl`) and the registry (`repos.jsonl`) are two append-only files, each a hash chain. The trail is both files read by someone who does not trust the machine that wrote them. `levain board trail verify` re-checks them; `levain board trail export` packs them into a bundle that can be checked somewhere else. The commands below were run on a scratch store from the code that carries them (`levain board trail --help`, `export --help` and `verify --help` are the reference).
+
+**The rule.** Every line `verify` prints is the weakest claim the evidence supports. What it cannot check it says it did not check; what is malformed, missing or contradictory is a break. Material that claims a signature is never read as unsigned when the signature is missing or bad: that is a break.
+
+**What `verify` checks**, per file:
+
+- the chain (`prev` on every line, the cutover over a legacy prefix, a torn line and its `ack-torn`);
+- every record through its file's own fold: a record the fold rejects is a break, whatever its chain and signature say;
+- every signature, against the authority log of the machine running `verify` (and that a signed record names this store);
+- the writer's policy: after the cutover, a decision-class record that is neither signed nor relayed, and a record graded `legacy`, are breaks;
+- every relayed citation: both digests, the words verbatim in the answer, the row's own grade. For `begin-track` and `track` it also checks the manifest digest the ceremony recorded.
+
+**Verifying a store.** One verdict per record, then per file the anchor line, the tail line, the relayed line and the kept-head line. A run on a scratch store (items abridged):
+
+```
+$ levain board trail verify
+authority: the log this install holds, replayed now (seq 2, head h)
+items.jsonl (9 lines, head 326f6f82ea03...)
+  items.jsonl:1 add alpha#1: legacy
+  items.jsonl:3 add alpha#3: asserted by desk 24, unsigned
+  items.jsonl:4 decide alpha#3: operator, signed with a ceremony
+  items.jsonl:6 decide alpha#4: agent desk 24, relaying q-1b3dd0881b3dd0881b3dd088 (signed answer)
+  items.jsonl:8 ack-torn: asserted by phill, unsigned
+  note: line 7 torn, acknowledged by phill (asserted, line 8)
+items.jsonl: anchored through line 4 (signed at 2026-11-17T12:00:00Z): every record up to it is committed by the operator's key
+items.jsonl: 4 records after the last signed record (at 2026-11-17T12:00:00Z) are unanchored: anyone who can write this file could have rewritten them
+items.jsonl: 1 relayed record(s) rest on a signed answer: his words are anchored by the answer's own signature, which does not cover the chain
+items.jsonl: no kept head given: a truncation of this file is not checked (`--head items=<hash>` from an earlier export)
+repos.jsonl:4 begin-track beta: agent desk 24, relaying q-0000000a0000000a0000000a (unsigned answer)
+repos.jsonl: 1 relayed record(s) rest on an answer no signature of a key you hold binds: nothing anchors his words
+levain board trail verify: no breaks
+```
+
+The words, as the code prints them:
+
+- `legacy`: a line from before the chain began. `asserted by NAME, unsigned`: a named author with no signature. `operator, signed with a ceremony`: the operator's signature verified against your authority log.
+- `agent NAME, relaying q-... (signed answer)` and `(unsigned answer)`: the desk relayed a band answer, and the answer's own signature does or does not bind his words. A relayed record is never promoted past its answer.
+- `anchored through line N`: a signed record at line N commits every record up to it, so none of them could have been rewritten without the operator's key. The tail line then counts the records after the last signed one as unanchored: anyone who can write the file could have rewritten them. The tail line is always printed.
+- `NOT ANCHORED`: no signature stands as an anchor. It is printed when the only signatures that verify are under keys a bundle names (below), when no signed record verifies, when the file breaks at or before the last signed record, or when the signing key has since been revoked. A key revoked since is reported (`revoked since (seq N)`), never silently valid and never a break by itself. Only the bundle-keys case was run; the other three are from the code.
+- `no kept head given`: the file can be cut at its end and still verify. Give `--head items=<hash>` (and `repos=<hash>`), the heads `export` printed. A head that is still on the chain reads `kept head ... is the current head: nothing was removed`. One that is not reads `TRUNCATION OR REWRITE: kept head ... is not on this chain (the file now ends at ...): records were removed or rewritten`, and that is a break.
+
+**Exit codes.** `0`: no break. `3`: any break (a chain break, a record its fold rejects, a signature that does not verify, a relayed citation that does not hold, a head that is gone); `verify` then prints `levain board trail verify: N breaks` and a `BREAK` line per break. `2`: it could not run (the store cannot be read, a bad argument). The `2` case is from the help and the code; it was not run here.
+
+**A bundle.** `levain board trail export` writes one JSON file (format `levain-board-trail/1`) holding the records as written, the public keys the authority log holds, and every band answer a relayed record cites, and prints the two heads to keep:
+
+```
+$ levain board trail export --out out.json
+bundle: out.json
+items=<hash> repos=<hash>
+```
+
+The bundle carries his words, so a destination inside a git work tree is refused, as is overwriting a file. With no `--out` it goes to `<levain home>/board-trail/`.
+
+**A bundle's own keys are never the trust root.** `verify BUNDLE` replays the authority log of the verifier's own install (`--data-root` names another) and reads the bundle's keys as claims compared against it. On a machine that holds the authority log, a bundle gives the same verdicts as the live store, and the header says so: `authority: the log this install holds, replayed now (seq 2, head h); the bundle's 1 key(s) were compared to it`. A key the bundle names that the log does not hold the same way is a break. On a machine with no authority log of its own the same bundle reads:
+
+```
+authority: the keys the bundle names (seq 2, head h), NOT checked against an authority you hold: no authority log at this data root
+  items.jsonl:4 decide alpha#3: signature valid under a key the bundle names; not checked against an authority you hold
+items.jsonl: NOT ANCHORED: the signatures were checked only against keys the bundle itself names (no authority log of yours could be read (no authority log at this data root)): nothing here is committed by a key you hold
+levain board trail verify: no breaks
+```
+
+Exit `0` there means nothing is broken, not that anything is anchored.
+
+**Known edges of the trail:**
+
+- **The tail is not anchored, and a bundle edit there passes.** A record after the last signed one can be rewritten and its chain recomputed. On the scratch bundle, changing a title in the last (unsigned) item and verifying the result gave `no breaks` and a different head. Only a kept head from an earlier export catches it.
+- **A signature is checked against the authority log as it is now.** Whether it was valid at the record's own time is later work.
+- **An answer's signature binds his words, not the chain.** An option pick is signed as `(letter) label`; the verdict then says the signature covers the pick and not the words the record quotes.
+- **Close-author verdicts are not part of this output yet** (the seam exists and prints nothing).
+- **Asserted `move`s cost O(M squared).** Each asserted `move` is judged on the registry as it stood before it. Measured: about 28 seconds for 2,000 of them. A registry that long is not a real store.
+
 ## Known edges
 
 - **A signed decision rests on the operator's hand.** `--sign` needs a Touch ID prompt in a fresh terminal, a terminal key and an authority log that enrols it. A desk seat cannot sign, so a desk relays with `--source`, and `untrack` and `move` (which take no `--source`) wait for the operator.
