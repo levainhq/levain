@@ -404,6 +404,8 @@ def _seal(args: argparse.Namespace, author: dict[str, str]):
 def _relay(args: argparse.Namespace):
     """``(np id, band source)`` when ``--source`` is given, else None. ``--band-dir`` alone is refused (it would do nothing).
     An operator author is refused by the writer; the kind is also checked here, before any band store is opened."""
+    if args.source is not None and args.sign:
+        raise bs.BoardError(bs.RELAY_AND_SIGN)
     if args.source is None:
         if args.band_dir is not None:
             raise bs.BoardError("--band-dir only means something with --source")
@@ -417,8 +419,8 @@ def _relay(args: argparse.Namespace):
 def run_add(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
-        seal = _seal(args, author)
         relay = _relay(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         for spec in args.depends:               # a malformed link is a refusal, not an advisory
             bs.parse_link(spec)
@@ -436,8 +438,8 @@ def run_add(args: argparse.Namespace) -> int:
 def run_amend(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
-        seal = _seal(args, author)
         relay = _relay(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         fields = {k: v for k, v in (("title", args.title), ("words", args.words), ("done", args.done),
                                     ("done_kind", args.done_kind), ("tier", args.tier)) if v is not None}
@@ -476,8 +478,8 @@ def _cause_authority(args: argparse.Namespace, seal: Any):
 def run_decide(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
-        seal = _seal(args, author)
         relay = _relay(args)
+        seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
                                    cause=args.cause, seal=seal, authority=_cause_authority(args, seal), relay=relay))

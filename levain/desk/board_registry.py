@@ -444,7 +444,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
     (name, manifest bytes, words, how many ceremonies X has had): a repeat with the same manifest and words after a lost
     response derives the same id and is a no-op (T2-a). ``relay`` = ``(q id, band source)`` makes the record relayed
     (P3): the row's question must carry this manifest's sha256 (``board_relay.check_manifest``, P3-b). Returns ``(repo, written)``."""
-    _check_relay_id(relay)
+    _check_relay_id(relay, seal)
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     owner = bs._one_line(owner, "owner") if owner is not None else None
     try:
@@ -535,8 +535,10 @@ def _charter_by_blob(path: str, name: str, items: Mapping | None) -> tuple[str |
     return text, blob, "", problems
 
 
-def _check_relay_id(relay: Any) -> None:
-    """A ``--source`` id is validated before any no-op return can hide it (the same validator ``add`` runs)."""
+def _check_relay_id(relay: Any, seal: Any = None) -> None:
+    """A ``--source`` id is validated before any no-op return can hide it (the same validator ``add`` runs), and a record is
+    relayed or signed, never both."""
+    bs._relay_or_sign(relay, seal)
     if relay is not None:
         from levain.desk import board_relay
         board_relay.check_source_id(relay[0])
@@ -550,7 +552,7 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
     ``relay`` = ``(q id, band source)`` makes the record relayed (P3): the row's question must carry the sha256 of the
     manifest the ceremony's ``begin-track`` recorded (``board_relay.check_manifest``, P3-b)."""
     from levain.desk import charter
-    _check_relay_id(relay)
+    _check_relay_id(relay, seal)
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
@@ -1446,13 +1448,13 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p.add_argument("--owner", default=None, metavar="DESK", help="The desk that owns the ceremony.")
     p.add_argument("--migration", default=None, metavar="M", help="The migration id (default: derived, so a retry derives the same one).")
     with_source(p)
-    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, seal=seal(a), relay=relay(a)), "tracking", "already tracking")))
+    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, relay=relay(a), seal=seal(a)), "tracking", "already tracking")))
 
     p = sub.add_parser("track", description="The switchover record: the board becomes the repo's source of truth.")
     common(p)
     p.add_argument("--migration", default=None, metavar="M")
     with_source(p)
-    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, seal=seal(a), relay=relay(a)), "tracked", "already tracked")))
+    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, relay=relay(a), seal=seal(a)), "tracked", "already tracked")))
 
     def run_abandon(a: Any, t: bs.Target) -> None:
         sl = seal(a)

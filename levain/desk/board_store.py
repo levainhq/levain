@@ -75,6 +75,13 @@ AUTHOR_KINDS = ("operator", "agent")
 GRADE_ASSERTED = "asserted"
 SIGNED_CHAIN_MOVED = "the board changed while you signed: sign again"
 GRADE_RELAYED = "relayed"
+RELAY_AND_SIGN = "--source and --sign cannot be used together: a record is relayed (the desk quotes his answer) or signed (his own key), never both"
+
+
+def _relay_or_sign(relay, seal) -> None:
+    """A record is relayed OR signed: both on one write is refused here, before any band is read or any prompt shown."""
+    if relay is not None and seal is not None:
+        raise BoardError(RELAY_AND_SIGN)
 
 
 class BoardError(RuntimeError):
@@ -905,6 +912,7 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         key=None, payload_hash=None, now=None, *, author, seal=None, relay=None) -> tuple[str, bool]:
     """Append an ``add``; returns ``(id, created)``. With ``key`` and ``payload_hash``: the same key with the same hash
     returns the existing id and writes nothing; the same key with another hash refuses. A key never expires."""
+    _relay_or_sign(relay, seal)
     repo = _one_line(repo, "repo")
     if not REPO_RE.fullmatch(repo):
         raise BoardError(f"repo {repo!r} must match {REPO_RE.pattern}")
@@ -978,6 +986,7 @@ def _current_done(recs: list[dict], item_id: str) -> tuple:
 def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, seal=None, relay=None) -> str:
     """``fields`` replaces those fields: title, words, done, done_kind, tier, depends_on (a list of link specs; None clears
     done/tier). Any other key is refused, so there is no way to store a status."""
+    _relay_or_sign(relay, seal)
     allowed = {"title", "words", "done", "done_kind", "tier", "depends_on"}
     if not fields or set(fields) - allowed:
         raise BoardError(f"amend needs at least one of {sorted(allowed)}; got {sorted(fields)}")
@@ -1024,6 +1033,7 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
     ``abandon-track``'s cuts carry it); it is written after ``date`` only when given. A cut's cause (P2-d) is checked against
     ``authority``, an authority SOURCE read under the lock (``board_sign.resolve_authority``); a sealed decide checks it
     against the seal's source instead."""
+    _relay_or_sign(relay, seal)
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
