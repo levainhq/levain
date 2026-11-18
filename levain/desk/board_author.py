@@ -43,26 +43,21 @@ by the signer), so this is a sanity check, never a proof of when the commit was 
 REVOCATION (only its seq), so a revoked key is never credited as tier 1 whatever the commit's date: the commit falls to its
 next tier and the note names the key's fingerprint and the revoked seq.
 
-DEGRADED: a verdict weaker than a tier that this reader did not CHECK, or that the log revoked, says so in a structured field
-beside the free-text note (the note's words are unchanged), so a reader comparing two verdicts (``levain board trail verify``
-on a bundle) can tell "could not check here" from "a different claim" without reading prose:
-
-* ``{"kind": "revoked", "from_tier": "signed", "key": <fingerprint>, "principal": <the key's principal>, "revoked_seq": N}``:
-  the commit's signature verifies under a key the log revoked;
-* ``{"kind": "unchecked", "from_tier": "signed"|"trailer", "why": <the note's words>}``: the stronger tier could not be
-  checked here. Signed: the signature could not be judged (the verifier raised, or answered indeterminate), no authority log
-  is consulted, the log is absent or unreadable, or the commit's date cannot be read. Trailer: no launch records are
-  consulted, they are absent or unreadable, the launch's board-items claim cannot be read, or the launch's working directory
-  (or this repo's own git dir) cannot be read as a repo. ``from_tier`` names the LOWEST tier left undecided (a trailer that
-  could not be checked overrides a signed-tier marker above it: from here the close is undecided from the trailer up);
-* ``{"kind": "unread", "why": <the how>}``: the author could not be read at all.
-
-A tier that WAS checked and does not hold (no signature, one that does not verify, a key the rule refuses, a trailer that
-maps to no launch or to a launch that claimed other items or ran in another repo) carries no marker.
+EVIDENCE (internal; never in ``closed_by``): beside the verdict, :func:`annotate` hands a caller that asks (``evidence=``) one
+:class:`Evidence` per close, the FACTS each tier rests on, kept apart so a reader judging a claim made elsewhere (``levain
+board trail verify`` on a bundle) judges each predicate on its own and never reads a tier's absence as another tier's
+answer: the close's own commit (and ``close_commit``), or why the author could not be read (``unread``, with the commit the
+board state names for a ``merged`` close); the commit's git author, email (empty kept as None) and committer; the ``how``
+prefix (``first added <path>, ``); the SIGNATURE as two separate facts (:class:`Signature`: whether a signature is present
+and cryptographically valid for a fingerprint, and that fingerprint's principal, which needs no authority log; and the
+key's STANDING in this install's log: active, revoked (seq), refused (why), not-checked (why)); and the TRAILER
+(:class:`SeatClaim`: the Board-Seat text the commit carries, and whether the launch it maps to claimed this item in this
+repo: holds, refuted by a launch record this install holds, or undetermined, with why). Launch records are install-scoped,
+so a trailer that maps to no launch record HERE is undetermined, never refuted. The trailer is judged even when tier 1
+holds (a claim of the weaker tier is judged on its own facts).
 
 The surfaced field is ``closed_by`` on a done item of ``levain board state --json`` (and a ``closed by:`` line of
-``levain board context``): ``{"tier", "who", "how", "commit", "email"?, "committer"?, "close_commit"?, "note"?,
-"degraded"?}``.
+``levain board context``): ``{"tier", "who", "how", "commit", "email"?, "committer"?, "close_commit"?, "note"?}``.
 
 The two lookups DEFAULT to this install's own: the cockpit whose authority log the board's signed verbs verify against
 (:func:`levain.desk.board_sign.resolve_authority`, the one reader: ``read_authority`` over the verified replay, anchor
@@ -85,8 +80,8 @@ from typing import Any
 from levain.desk import board_evidence as be
 from levain.desk.board_state import parse_timestamp
 
-__all__ = ["CockpitAuthority", "Closer", "Resolvers", "Seat", "annotate", "closer_line", "closer_of_item", "describe",
-           "mark_unread", "resolvers_from_args", "add_resolver_args"]
+__all__ = ["CockpitAuthority", "Closer", "Evidence", "Resolvers", "Seat", "SeatClaim", "Signature", "annotate", "closer_line",
+           "closer_of_item", "describe", "mark_unread", "resolvers_from_args", "add_resolver_args"]
 
 MAIN_REF = f"refs/remotes/{be.REMOTE}/{be.MAIN_BRANCH}"     # the evidence reader's own remote and main
 NOTES_REF = be._NOTES_REF
@@ -114,7 +109,6 @@ class Closer:
     email: str | None = None    # git tier: the author's email
     committer: str | None = None       # "name <email>" when the committer is not the author
     close_commit: str | None = None    # a note close: the annotated commit the note closes
-    degraded: Mapping[str, Any] | None = None   # why the verdict is weaker than a tier this reader could not credit (DEGRADED)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"tier": self.tier, "who": self.who, "how": self.how, "commit": self.commit}
@@ -123,9 +117,54 @@ class Closer:
                 d[k] = getattr(self, k)
         if self.note:
             d["note"] = self.note
-        if self.degraded is not None:
-            d["degraded"] = dict(self.degraded)
         return d
+
+
+@dataclass(frozen=True)
+class Signature:
+    """The signature facts of one commit (EVIDENCE). ``state``: ``valid`` (a signature that verifies for ``fingerprint``),
+    ``none`` (no signature), ``bad`` (one that does not verify, ``why``), ``unjudged`` (this machine could not judge it,
+    ``why``). For a valid one, ``principal`` is the fingerprint's own (:func:`levain.cockpit.keys.principal_of`, no log
+    needed) and ``standing`` is the key's in this install's authority log: ``active``, ``revoked`` (``revoked_seq``),
+    ``refused`` (``standing_why``; ``in_log`` False when the log does not hold the key at all) or ``not-checked``
+    (``standing_why``)."""
+    state: str
+    why: str = ""
+    fingerprint: str | None = None
+    principal: str | None = None
+    standing: str = ""
+    standing_why: str = ""
+    revoked_seq: int | None = None
+    in_log: bool = False
+
+
+@dataclass(frozen=True)
+class SeatClaim:
+    """The trailer facts of one commit for one item (EVIDENCE). ``texts``: the Board-Seat trailer values the commit carries.
+    ``claim``: ``holds`` (one trailer, its launch claimed this item in this repo), ``refuted`` (several trailers, or a launch
+    record this install holds that claimed other items, none, or ran in another repo), ``undetermined`` (no launch records
+    consulted or readable, a trailer that maps to no launch record HERE, a launch whose claim or working directory cannot be
+    read), or ``""`` (no trailer); ``why`` says which. ``seat``: the launch's name when a record was found."""
+    texts: tuple[str, ...]
+    claim: str
+    why: str = ""
+    seat: str | None = None
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What this install holds about one close, predicate by predicate (EVIDENCE): the verdict it derived, why the author could
+    not be read (``unread``; ``anchor``: the commit the board state names for a ``merged`` close, else None), the commit's git
+    author, email and committer, the ``how`` prefix of a ``document``/``run`` close, the signature and the trailer facts."""
+    closer: Closer
+    unread: str | None = None
+    anchor: str | None = None
+    author: str | None = None
+    email: str | None = None
+    committer: str | None = None
+    how_prefix: str = ""
+    signature: Signature | None = None
+    trailer: SeatClaim | None = None
 
 
 def describe(c: Closer | Mapping[str, Any]) -> str:
@@ -180,31 +219,30 @@ class CockpitAuthority:
     def credit(self, fingerprint: str, when: datetime) -> tuple[str | None, str]:
         """``(principal, "")`` when the board's key rule accepts ``fingerprint`` as a terminal signer and its enrol time is
         not after ``when``; else ``(None, why)``."""
-        principal, why, _revoked = self.judge(fingerprint, when)
+        principal, why, _standing, _seq, _in_log = self.judge(fingerprint, when)
         return principal, why
 
-    def judge(self, fingerprint: str, when: datetime) -> tuple[str | None, str, Mapping[str, Any] | None]:
-        """:meth:`credit` plus, for a key the log REVOKED, the structured marker (``degraded``, kind ``revoked``) the verdict
-        carries; None otherwise."""
+    def judge(self, fingerprint: str, when: datetime) -> tuple[str | None, str, str, int | None, bool]:
+        """:meth:`credit` plus the key's STANDING in the log (EVIDENCE): ``(principal, why, standing, revoked_seq, in_log)``,
+        standing ``active`` | ``revoked`` | ``refused``; ``in_log`` False when the log does not hold the key."""
         from levain.desk import board_sign as bsign
 
         standing, why, key = bsign.key_standing(self._load(), fingerprint, COMMIT_VIA)
         if standing == "refused":
-            return None, f"the commit is signed, but the board's key rule refuses the key: {why}", None
+            return None, f"the commit is signed, but the board's key rule refuses the key: {why}", "refused", None, key is not None
         if standing == "revoked":
             return None, (f"the commit is signed by {fingerprint}, revoked at seq {key.revoked_seq} in the authority log; "
-                          "the log carries no revocation time, so the signature is not credited"), {
-                "kind": "revoked", "from_tier": "signed", "key": fingerprint, "principal": key.principal,
-                "revoked_seq": key.revoked_seq}
+                          "the log carries no revocation time, so the signature is not credited"), "revoked", key.revoked_seq, True
         raw = key.enrolled_at or key.legacy_enrolled_at
         start = parse_timestamp(raw)
         if start is None:
             return None, (f"the commit is signed by {fingerprint}, whose enrolment carries no readable time"
-                          f"{f' ({_clip(str(raw), 40)})' if raw else ''}, so it cannot be placed before the commit's date"), None
+                          f"{f' ({_clip(str(raw), 40)})' if raw else ''}, so it cannot be placed before the commit's date"), \
+                "refused", None, True
         if when < start:
             return None, (f"the commit is signed by {fingerprint}, enrolled {start.isoformat()}, after the commit's own "
-                          f"date {when.isoformat()}"), None
-        return key.principal, "", None
+                          f"date {when.isoformat()}"), "refused", None, True
+        return key.principal, "", "active", None, True
 
 
 @dataclass(frozen=True)
@@ -312,7 +350,8 @@ class _Reader:
     def __init__(self, repo: Path, res: Resolvers) -> None:
         self.repo, self.res = repo, res
         self._facts: dict[str, _Facts] = {}
-        self._signed: dict[str, tuple[str | None, list[str]]] = {}
+        self._signed: dict[str, tuple[str | None, list[str], Signature]] = {}
+        self._seat: dict[tuple[str, str], tuple[SeatClaim, tuple[str, ...]]] = {}
         self._common: dict[str, str | None] = {}
 
     def prime(self, shas: Iterable[str]) -> None:
@@ -326,55 +365,70 @@ class _Reader:
             raise be.GitFailed(f"commit {sha} cannot be read")
         return self._facts[sha]
 
-    def _signature(self, sha: str, f: _Facts) -> tuple[str | None, list[str], dict[str, Any] | None]:
-        """``(principal, notes, degraded)``: the principal when tier 1 holds, else None and why not, and the DEGRADED marker
-        when tier 1 was not credited because it could not be CHECKED here (kind ``unchecked``) or the log revoked the key
-        (kind ``revoked``); None when tier 1 was checked and does not hold (no signature, a bad one, a refused key).
-        Memoised per commit."""
+    def _signature(self, sha: str, f: _Facts) -> tuple[str | None, list[str], Signature]:
+        """``(principal, notes, facts)``: the principal when tier 1 holds, else None and why not, and the signature's
+        :class:`Signature` facts (EVIDENCE: valid for a fingerprint or not, and the key's standing here). Memoised per commit."""
         if sha in self._signed:
             return self._signed[sha]
+        from levain.cockpit.keys import principal_of
+
         notes: list[str] = []
         principal = None
-        degraded: dict[str, Any] | None = None
+        facts = Signature("unjudged")
         sig = None
-
-        def unchecked(text: str) -> None:
-            nonlocal degraded
-            notes.append(text)
-            degraded = {"kind": "unchecked", "from_tier": "signed", "why": text}
-
         try:
             from levain.team import signing
 
             sig = signing.verify_commit(self.repo, sha)
         except Exception as exc:  # noqa: BLE001 - a signature that cannot be judged is said, never raised
-            unchecked(f"the commit's signature could not be checked ({type(exc).__name__})")
+            text = f"the commit's signature could not be checked ({type(exc).__name__})"
+            notes.append(text)
+            facts = Signature("unjudged", text)
         if sig is not None and sig.kind == "indeterminate":
-            unchecked(f"the commit's signature could not be checked ({_clip(sig.reason, 120)})")
-        elif sig is not None and sig.kind == "unsigned" and sig.reason != "no signature":
-            notes.append(f"the commit carries a signature that does not verify ({_clip(sig.reason, 120)})")
+            text = f"the commit's signature could not be checked ({_clip(sig.reason, 120)})"
+            notes.append(text)
+            facts = Signature("unjudged", text)
+        elif sig is not None and sig.kind == "unsigned":
+            if sig.reason != "no signature":
+                notes.append(f"the commit carries a signature that does not verify ({_clip(sig.reason, 120)})")
+                facts = Signature("bad", _clip(sig.reason, 120))
+            else:
+                facts = Signature("none", "no signature")
         elif sig is not None and sig.kind == "signed":
+            fp = sig.fingerprint or ""
+
+            def standing(kind: str, why: str = "", seq: int | None = None, in_log: bool = False) -> Signature:
+                return Signature("valid", "", fp, principal_of(fp), kind, why, seq, in_log)
+
             if self.res.authority is None:
-                unchecked("the commit is signed but no authority log is consulted, so the signature is not checked")
+                text = "the commit is signed but no authority log is consulted, so the signature is not checked"
+                notes.append(text)
+                facts = standing("not-checked", text)
             elif f.when is None:
-                unchecked("the commit is signed but its date cannot be read, so the key's enrolment cannot be judged")
+                text = "the commit is signed but its date cannot be read, so the key's enrolment cannot be judged"
+                notes.append(text)
+                facts = standing("not-checked", text)
             else:
                 try:
                     judge = getattr(self.res.authority, "judge", None)
                     if judge is not None:
-                        principal, why, degraded = judge(sig.fingerprint or "", f.when)
-                    else:                               # an authority with only ``credit``: no revocation marker to carry
-                        principal, why = self.res.authority.credit(sig.fingerprint or "", f.when)
+                        principal, why, kind, seq, in_log = judge(fp, f.when)
+                    else:                               # an authority with only ``credit``: a refusal is taken as the log's
+                        principal, why = self.res.authority.credit(fp, f.when)
+                        kind, seq, in_log = ("active" if principal is not None else "refused"), None, True
                     if why:
                         notes.append(why)
+                    facts = standing(kind, why, seq, in_log)
                 except NotChecked as exc:  # an authority log that is absent or unreadable: not checked, said, never a refusal
-                    unchecked(f"the commit is signed but the authority log was not checked ({_clip(str(exc))})")
+                    text = f"the commit is signed but the authority log was not checked ({_clip(str(exc))})"
+                    notes.append(text)
+                    facts = standing("not-checked", text)
                 except Exception as exc:  # noqa: BLE001
-                    unchecked(f"the commit is signed but the authority log cannot be read ({type(exc).__name__})")
-        if principal is not None:
-            degraded = None
-        self._signed[sha] = (principal, notes, degraded)
-        return principal, notes, degraded
+                    text = f"the commit is signed but the authority log cannot be read ({type(exc).__name__})"
+                    notes.append(text)
+                    facts = standing("not-checked", text)
+        self._signed[sha] = (principal, notes, facts)
+        return principal, notes, facts
 
     def _git_dir(self, where: str | Path) -> str | None:
         key = str(where)
@@ -388,8 +442,9 @@ class _Reader:
 
     def _seat_refusal(self, seat: Seat, item: Any) -> tuple[str | None, bool]:
         """``(why, could_not_check)``: why the launch ``seat`` is not credited with closing ``item`` (None: it claimed the
-        item, in this repo), and whether the refusal is a check this reader could not MAKE (the launch's claim unreadable, its
-        working directory not a repo readable here, this repo's own git dir unreadable) rather than one it made and failed."""
+        item, in this repo), and whether the refusal is a check this reader could not MAKE (the launch's claim unreadable, no
+        working directory recorded, one that is not a repo readable here, this repo's own git dir unreadable) rather than one
+        it made and failed."""
         if seat.items is None:
             return ((f"the launch's board-items claim cannot be read ({_clip(seat.items_why, 100)})", True) if seat.items_why
                     else ("the launch claimed no board items", False))
@@ -397,7 +452,7 @@ class _Reader:
             shown = ", ".join(seat.items[:4]) + (", ..." if len(seat.items) > 4 else "")
             return f"the launch claimed {shown}, not {item.id}", False
         if not seat.cwd:
-            return "the launch records no working directory, so its repo cannot be read", False
+            return "the launch records no working directory, so its repo cannot be read", True
         theirs = self._git_dir(seat.cwd)
         if theirs is None:
             return f"the launch's working directory {_clip(seat.cwd, 100)} is not a git repo this reader can read", True
@@ -408,50 +463,81 @@ class _Reader:
             return f"the launch ran in another repo ({_clip(seat.cwd, 100)})", False
         return None, False
 
-    def author(self, sha: str, item: Any) -> Closer:
-        """The three-tier verdict for the commit ``sha`` as the close of ``item``."""
-        f = self.facts(sha)
-        principal, sig_notes, degraded = self._signature(sha, f)
-        if principal is not None:
-            return Closer("signed", principal, "signed by an operator key", sha, committer=f.committer)
-        notes = list(sig_notes)
-
-        def unchecked(text: str) -> None:
-            # the trailer tier could not be CHECKED here: it is the lowest tier left undecided, so it names the marker
-            # (an "unchecked" from the signed tier, or a revocation, above it is overridden: the close is undecided from here)
-            nonlocal degraded
+    def _trailer(self, sha: str, f: _Facts, item: Any) -> tuple[SeatClaim, tuple[str, ...]]:
+        """``(facts, notes)``: the commit's Board-Seat trailer judged as the close of ``item`` (:class:`SeatClaim`), and the
+        note texts the verdict carries for it. Memoised per commit and item."""
+        key = (sha, str(getattr(item, "id", "")))
+        if key in self._seat:
+            return self._seat[key]
+        notes: list[str] = []
+        if not f.seats:
+            got = SeatClaim((), "", "the commit carries no Board-Seat trailer")
+        elif len(f.seats) > 1:
+            text = "the commit carries several different Board-Seat trailers, so none is read"
             notes.append(text)
-            degraded = {"kind": "unchecked", "from_tier": "trailer", "why": text}
-
-        if len(f.seats) == 1:
+            got = SeatClaim(f.seats, "refuted", text)
+        else:
+            seat: Seat | None = None
+            got = None
             if self.res.seat_of is None:
-                unchecked("a Board-Seat trailer is present but no launch records are consulted")
+                text = "a Board-Seat trailer is present but no launch records are consulted"
+                notes.append(text)
+                got = SeatClaim(f.seats, "undetermined", text)
             else:
                 try:
                     seat = self.res.seat_of(f.seats[0])
                 except NotChecked as exc:
-                    seat = None
-                    unchecked(f"a Board-Seat trailer is present but the launch records were not checked ({_clip(str(exc))})")
+                    text = f"a Board-Seat trailer is present but the launch records were not checked ({_clip(str(exc))})"
+                    notes.append(text)
+                    got = SeatClaim(f.seats, "undetermined", text)
                 except Exception:  # noqa: BLE001
-                    seat = None
-                    unchecked("a Board-Seat trailer is present but the launch records cannot be read")
+                    text = "a Board-Seat trailer is present but the launch records cannot be read"
+                    notes.append(text)
+                    got = SeatClaim(f.seats, "undetermined", text)
                 else:
-                    if seat is None:
+                    if seat is None:            # launch records are install-scoped: none HERE is no answer, never a refusal
                         notes.append("its Board-Seat trailer maps to no launch record")
-                if seat is not None:
-                    refused, could_not = self._seat_refusal(seat, item)
-                    if refused is None:
-                        return Closer("trailer", f"agent {seat.name}", "asserted (trailer)", sha, "; ".join(notes),
-                                      committer=f.committer, degraded=degraded)
+                        got = SeatClaim(f.seats, "undetermined", "its Board-Seat trailer maps to no launch record in this "
+                                                                 "install's desk store")
+            if seat is not None:
+                refused, could_not = self._seat_refusal(seat, item)
+                if refused is None:
+                    got = SeatClaim(f.seats, "holds", "", seat.name)
+                else:
                     text = f"its Board-Seat trailer maps to launch {seat.name}, but {refused}, so the trailer is not read"
-                    if could_not:
-                        unchecked(text)
-                    else:
-                        notes.append(text)
-        elif len(f.seats) > 1:
-            notes.append("the commit carries several different Board-Seat trailers, so none is read")
+                    notes.append(text)
+                    got = SeatClaim(f.seats, "undetermined" if could_not else "refuted", text, seat.name)
+            assert got is not None
+        self._seat[key] = (got, tuple(notes))
+        return got, tuple(notes)
+
+    def author(self, sha: str, item: Any) -> Closer:
+        """The three-tier verdict for the commit ``sha`` as the close of ``item``."""
+        f = self.facts(sha)
+        principal, sig_notes, _sig = self._signature(sha, f)
+        if principal is not None:
+            return Closer("signed", principal, "signed by an operator key", sha, committer=f.committer)
+        claim, seat_notes = self._trailer(sha, f, item)
+        notes = [*sig_notes, *seat_notes]
+        if claim.claim == "holds":
+            return Closer("trailer", f"agent {claim.seat}", "asserted (trailer)", sha, "; ".join(notes), committer=f.committer)
         return Closer("git", f.author or "(no author name)", "asserted by git author", sha, "; ".join(notes),
-                      email=f.email, committer=f.committer, degraded=degraded)
+                      email=f.email, committer=f.committer)
+
+    def evidence(self, c: Closer, item: Any) -> Evidence:
+        """The :class:`Evidence` of the verdict ``c`` (read from ``c.commit``): the facts every tier rests on, the trailer
+        judged even when tier 1 holds. A read that fails here is ``unread`` (the verdict's commit kept)."""
+        pre = _how_prefix(item)
+        if c.commit is None:
+            return Evidence(c, how_prefix=pre)
+        try:
+            f = self.facts(c.commit)
+            _principal, _notes, sig = self._signature(c.commit, f)
+            claim, _seat_notes = self._trailer(c.commit, f, item)
+        except Exception as exc:  # noqa: BLE001 - the evidence never fails a read either
+            return Evidence(c, unread=_unread(exc).how, how_prefix=pre)
+        return Evidence(c, author=f.author or "(no author name)", email=f.email, committer=f.committer,
+                        how_prefix=pre, signature=sig, trailer=claim)
 
 
 # ------------------------------------------------------------------------------------------------ where the close comes from
@@ -545,8 +631,15 @@ def closer_of_item(repo: Path, item: Any, state_ref: str | None, res: Resolvers,
         if sha is None:
             return Closer("unattributed", None, why)
         c = rd.author(sha, item)
-        return dataclasses.replace(c, how=f"first added {_clip(key, 120)}, {c.how}")
+        return dataclasses.replace(c, how=f"{_how_prefix(item)}{c.how}")
     return Closer("unattributed", None, f"a {kind} close is not a git close")
+
+
+def _how_prefix(item: Any) -> str:
+    """The ``how`` prefix a ``document``/``run`` close carries (``first added <path>, ``); "" for any other close."""
+    if getattr(item, "done_kind", None) not in ("document", "run"):
+        return ""
+    return f"first added {_clip((getattr(item, 'done', None) or '').strip(), 120)}, "
 
 
 # ------------------------------------------------------------------------------------------------ surfacing
@@ -562,24 +655,38 @@ def _git_closes(doc: dict[str, Any], items: Mapping[str, Any]) -> Iterable[tuple
 
 def _unread(exc: BaseException) -> Closer:
     text = str(exc) if isinstance(exc, be.GitFailed) else f"{type(exc).__name__}: {exc}"
-    how = f"the author could not be read ({_clip(text, 160)})"
-    return Closer("unattributed", None, how, degraded={"kind": "unread", "why": how})
+    return Closer("unattributed", None, f"the author could not be read ({_clip(text, 160)})")
 
 
-def mark_unread(doc: dict[str, Any], items: Mapping[str, Any], exc: BaseException) -> None:
+def _unread_evidence(c: Closer, s: Mapping[str, Any], item: Any) -> Evidence:
+    """The :class:`Evidence` of a close whose author could not be read: no facts, and the commit the board state names for a
+    ``merged`` close (``anchor``), so the close's commit is still judged."""
+    refs = s.get("refs") or [None]
+    ref = refs[0] if getattr(item, "done_kind", None) == "merged" and isinstance(refs[0], str) and _SHA.fullmatch(refs[0]) else None
+    return Evidence(c, unread=c.how, anchor=ref, how_prefix=_how_prefix(item))
+
+
+def mark_unread(doc: dict[str, Any], items: Mapping[str, Any], exc: BaseException,
+                evidence: dict[str, Evidence] | None = None) -> None:
     """Every git close of ``doc`` that :func:`annotate` left without a verdict says the author could not be read: the
-    caller's guard when annotate itself fails, so attribution never fails a board read."""
-    for s, _item in _git_closes(doc, items):
-        s.setdefault("closed_by", _unread(exc).to_dict())
+    caller's guard when annotate itself fails, so attribution never fails a board read. ``evidence``: as :func:`annotate`'s."""
+    for s, item in _git_closes(doc, items):
+        if "closed_by" in s:
+            continue
+        c = _unread(exc)
+        s["closed_by"] = c.to_dict()
+        if evidence is not None:
+            evidence[str(s.get("id"))] = _unread_evidence(c, s, item)
 
 
 def annotate(doc: dict[str, Any], items: Mapping[str, Any], repos: Mapping[str | None, Path], res: Resolvers, *,
-             default_repo: Path | None = None, main_ref: str = MAIN_REF) -> int:
+             default_repo: Path | None = None, main_ref: str = MAIN_REF, evidence: dict[str, Evidence] | None = None) -> int:
     """Set ``closed_by`` (:meth:`Closer.to_dict`) on every ``done`` item of the board ``doc`` whose close is git's (a ``merged``,
     ``document`` or ``run`` item; a band row's close is the np row's, with no author to read here). ``repos`` maps an item's
     repo name to its path (``default_repo`` for any other: the single-repo board reads every item from one repo). One memo
     per repo, one git call for every closing commit's facts. Any failure on one item is said on that item
-    (``unattributed``), never raised and never a refusal. Returns how many items it annotated."""
+    (``unattributed``), never raised and never a refusal. Returns how many items it annotated. ``evidence`` (a dict the caller
+    owns; internal, never in ``closed_by``) is filled with each annotated close's :class:`Evidence` by item id."""
     readers: dict[str, _Reader] = {}
     todo: list[tuple[dict[str, Any], Any, Path]] = []
     for s, item in _git_closes(doc, items):
@@ -600,12 +707,15 @@ def annotate(doc: dict[str, Any], items: Mapping[str, Any], repos: Mapping[str |
     n = 0
     for s, item, path in todo:
         refs = s.get("refs") or [None]
+        unread = False
         try:
             c = closer_of_item(path, item, refs[0] if isinstance(refs[0], str) else None, res, main_ref=main_ref,
                                reader=readers[str(path)])
         except Exception as exc:  # noqa: BLE001 - one item's attribution never fails the board read
-            c = _unread(exc)
+            c, unread = _unread(exc), True
         s["closed_by"] = c.to_dict()
+        if evidence is not None:
+            evidence[str(s.get("id"))] = _unread_evidence(c, s, item) if unread else readers[str(path)].evidence(c, item)
         n += 1
     return n
 

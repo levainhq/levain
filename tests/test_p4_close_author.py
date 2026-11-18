@@ -813,46 +813,103 @@ def test_a_file_added_then_removed_on_main_is_still_credited_to_the_commit_that_
     assert c.how == "first added docs/gone.md, asserted by git author"
 
 
-# ------------------------------------------------------------------------------------------------ DEGRADED (P6 fix 4)
-def test_degraded_a_revoked_key_carries_the_structured_revocation_beside_the_unchanged_note(sc):
-    c = verdict(sc, item(9), sc.c["old_before"])
+# ------------------------------------------------------------------------------------------------ EVIDENCE (P6 fix 6)
+def evidence(sc, it, ref, res=None):
+    res = res or FULL(sc)
+    rd = ba._Reader(sc.repo, res)
+    return rd.evidence(ba.closer_of_item(sc.repo, it, ref, res, reader=rd), it)
+
+
+def test_evidence_a_revoked_key_s_signature_is_valid_its_standing_revoked_and_closed_by_carries_none_of_it(sc):
+    from levain.cockpit.keys import principal_of
+    e = evidence(sc, item(9), sc.c["old_before"])
     fp = sc.keys["old"].fp
-    d = c.to_dict()["degraded"]
-    assert d == {"kind": "revoked", "from_tier": "signed", "key": fp, "principal": d["principal"], "revoked_seq": 4}
-    assert d["principal"].startswith("k") and f"signed by {fp}, revoked at seq 4" in c.note       # describe() is unchanged
+    s = e.signature
+    assert (s.state, s.fingerprint, s.principal, s.standing, s.revoked_seq) == ("valid", fp, principal_of(fp), "revoked", 4)
+    assert e.closer.tier == "git" and f"signed by {fp}, revoked at seq 4" in e.closer.note        # describe() is unchanged
+    assert set(e.closer.to_dict()) == {"tier", "who", "how", "commit", "email", "note"}             # no degraded, no evidence
 
 
-def test_degraded_a_signed_tier_this_reader_could_not_check_is_unchecked_from_signed(sc, tmp_path, monkeypatch):
+def test_evidence_a_valid_signature_and_its_principal_need_no_authority_log(sc, tmp_path, monkeypatch):
+    from levain.cockpit.keys import principal_of
+    fp = sc.keys["laptop"].fp
     for res in (ba.Resolvers(None, seats(sc)), ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit"), seats(sc))):
-        d = verdict(sc, item(1), sc.c["signed"], res).to_dict()["degraded"]
-        assert (d["kind"], d["from_tier"]) == ("unchecked", "signed") and "not checked" in d["why"]
+        s = evidence(sc, item(1), sc.c["signed"], res).signature
+        assert (s.state, s.principal, s.standing) == ("valid", principal_of(fp), "not-checked") and "not checked" in s.standing_why
+    s = evidence(sc, item(1), sc.c["signed"]).signature
+    assert (s.state, s.standing, s.in_log) == ("valid", "active", True)
+    assert evidence(sc, item(4), sc.c["plain"]).signature.state == "none"
+    s = evidence(sc, item(2), sc.c["stranger"]).signature
+    assert (s.state, s.standing, s.in_log) == ("valid", "refused", False)          # not in this install's log
+    s = evidence(sc, item(40), sc.c["phone"]).signature
+    assert (s.state, s.standing, s.in_log) == ("valid", "refused", True) and "not a terminal key" in s.standing_why
+    s = evidence(sc, item(41), sc.c["late"]).signature
+    assert (s.state, s.standing, s.in_log) == ("valid", "refused", True) and "after the commit's own date" in s.standing_why
     from levain.team import signing
     monkeypatch.setattr(signing, "verify_commit", lambda repo, sha: signing.Verdict("indeterminate", None, "ssh-keygen gone"))
-    d = verdict(sc, item(4), sc.c["plain"]).to_dict()["degraded"]
-    assert (d["kind"], d["from_tier"]) == ("unchecked", "signed") and "ssh-keygen gone" in d["why"]
+    s = evidence(sc, item(4), sc.c["plain"]).signature
+    assert s.state == "unjudged" and "ssh-keygen gone" in s.why
 
 
-def test_degraded_a_trailer_this_reader_could_not_check_is_unchecked_from_trailer(sc):
-    d = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), None)).to_dict()["degraded"]
-    assert d == {"kind": "unchecked", "from_tier": "trailer", "why": "a Board-Seat trailer is present but no launch records are consulted"}
+def test_evidence_the_trailer_is_judged_on_its_own_even_when_tier1_holds(sc):
+    e = evidence(sc, item(12), sc.c["signed_seat"])
+    assert e.closer.tier == "signed" and (e.trailer.claim, e.trailer.seat) == ("holds", "worker L-77")
+    assert evidence(sc, item(3), sc.c["seat"]).trailer == ba.SeatClaim(("slot-key-77",), "holds", "", "worker L-77")
+    t = evidence(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), None)).trailer
+    assert (t.claim, t.why) == ("undetermined", "a Board-Seat trailer is present but no launch records are consulted")
 
     def unreadable(key):
         raise ba.NotChecked("the desk store is absent")
-    d = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), unreadable)).to_dict()["degraded"]
-    assert (d["kind"], d["from_tier"]) == ("unchecked", "trailer") and "the desk store is absent" in d["why"]
-    gone = ba.Resolvers(sc.authority(), seats(sc, cwd=sc.repo.parent / "worktree-removed"))
-    d = verdict(sc, item(3), sc.c["seat"], gone).to_dict()["degraded"]
-    assert (d["kind"], d["from_tier"]) == ("unchecked", "trailer") and "is not a git repo this reader can read" in d["why"]
+    t = evidence(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), unreadable)).trailer
+    assert t.claim == "undetermined" and "the desk store is absent" in t.why
+    t = evidence(sc, item(14), sc.c["unknown_seat"]).trailer          # launch records are install-scoped (head ruling 7)
+    assert (t.claim, t.seat) == ("undetermined", None) and "maps to no launch record in this install's desk store" in t.why
+    t = evidence(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, items=("scratch#99",)))).trailer
+    assert (t.claim, t.seat) == ("refuted", "worker L-77") and "claimed scratch#99, not scratch#3" in t.why
+    t = evidence(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, cwd=sc.repo.parent / "worktree-removed"))).trailer
+    assert t.claim == "undetermined" and "is not a git repo this reader can read" in t.why
+    assert evidence(sc, item(13), sc.c["two_seats"]).trailer.claim == "refuted"
+    assert evidence(sc, item(4), sc.c["plain"]).trailer == ba.SeatClaim((), "", "the commit carries no Board-Seat trailer")
+    # the verdict's words are what they were: a trailer that maps to no launch record reads as before
+    assert "its Board-Seat trailer maps to no launch record" in evidence(sc, item(14), sc.c["unknown_seat"]).closer.note
 
 
-def test_degraded_a_tier_checked_and_refused_carries_no_marker(sc, tmp_path):
-    assert "degraded" not in verdict(sc, item(2), sc.c["stranger"]).to_dict()                        # key not in the log
-    assert "degraded" not in verdict(sc, item(14), sc.c["unknown_seat"]).to_dict()                   # no launch maps it
-    assert "degraded" not in verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, items=("scratch#99",)))).to_dict()
-    assert "degraded" not in verdict(sc, item(4), sc.c["plain"]).to_dict()
-    assert "degraded" not in verdict(sc, item(1), sc.c["signed"]).to_dict()
+def test_evidence_carries_the_git_facts_and_the_how_prefix(sc):
+    e = evidence(sc, item(44), sc.c["rebased"])
+    assert (e.author, e.email, e.committer, e.how_prefix) == ("Agent Author", "x@x", "Re Baser <r@r>", "")
+    e = evidence(sc, item(6, "document", "docs/a.md"), "docs/a.md")
+    assert e.how_prefix == "first added docs/a.md, " and e.closer.how == "first added docs/a.md, asserted by git author"
+    assert e.author == "Doc Person"
 
 
-def test_degraded_an_author_that_cannot_be_read_is_unread():
-    d = ba._unread(ba.be.GitFailed("git went away")).to_dict()
-    assert d["degraded"] == {"kind": "unread", "why": "the author could not be read (git went away)"} and d["how"] == d["degraded"]["why"]
+def test_annotate_fills_evidence_and_an_unread_close_keeps_the_board_state_s_commit(sc, monkeypatch):
+    items = {"scratch#1": item(1), "scratch#4": item(4), "scratch#6": item(6, "document", "docs/a.md")}
+    doc = {"items": [{"id": "scratch#1", "repo": "scratch", "state": "done", "refs": [sc.c["signed"]]},
+                     {"id": "scratch#4", "repo": "scratch", "state": "done", "refs": [sc.c["plain"]]},
+                     {"id": "scratch#6", "repo": "scratch", "state": "done", "refs": ["docs/a.md"]}]}
+    real = ba.closer_of_item
+
+    def flaky(repo, it, *a, **kw):
+        if it.id in ("scratch#1", "scratch#6"):
+            raise ba.be.GitFailed("git went away")
+        return real(repo, it, *a, **kw)
+    monkeypatch.setattr(ba, "closer_of_item", flaky)
+    got: dict = {}
+    ba.annotate(doc, items, {"scratch": sc.repo}, FULL(sc), evidence=got)
+    assert set(got) == {"scratch#1", "scratch#4", "scratch#6"}
+    assert (got["scratch#1"].unread, got["scratch#1"].anchor) == ("the author could not be read (git went away)", sc.c["signed"])
+    assert (got["scratch#6"].anchor, got["scratch#6"].how_prefix) == (None, "first added docs/a.md, ")
+    assert got["scratch#4"].unread is None and got["scratch#4"].author == "Plain Person"
+    by = {s["id"]: s["closed_by"] for s in doc["items"]}
+    assert set(by["scratch#1"]) == {"tier", "who", "how", "commit"}                 # closed_by: what P4 shipped, no marker
+
+
+def test_mark_unread_fills_evidence_only_for_the_closes_annotate_left(sc):
+    items = {"scratch#1": item(1), "scratch#4": item(4)}
+    doc = {"items": [{"id": "scratch#1", "repo": "scratch", "state": "done", "refs": [sc.c["signed"]],
+                      "closed_by": {"tier": "signed", "who": "k", "how": "signed by an operator key", "commit": sc.c["signed"]}},
+                     {"id": "scratch#4", "repo": "scratch", "state": "done", "refs": [sc.c["plain"]]}]}
+    got: dict = {}
+    ba.mark_unread(doc, items, RuntimeError("boom"), evidence=got)
+    assert set(got) == {"scratch#4"} and got["scratch#4"].anchor == sc.c["plain"]
+    assert doc["items"][0]["closed_by"]["who"] == "k" and "RuntimeError: boom" in doc["items"][1]["closed_by"]["how"]

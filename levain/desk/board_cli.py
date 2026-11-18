@@ -571,7 +571,7 @@ _GIT_SKIPPED = frozenset({"main", "chain", "branches", "refs", "documents", "una
 
 def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None,
               unreadable: list[str] | None = None, strict_store: bool = False,
-              target: bs.Target | None = None) -> tuple[int, dict[str, Any] | None]:
+              target: bs.Target | None = None, close_evidence: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | None]:
     """``(exit code, the Board document or None)`` of ``levain board state --json``, with no printing of the document: a refusal is
     handed to ``say`` (a line of text; default stderr). ``read_evidence`` replaces :func:`board_evidence.read_git_evidence` (same signature):
     the cockpit hands it a reader that keeps a repo's evidence while that repo's refs are unchanged. The cockpit board reads the board through this, so it never captures a stream.
@@ -586,7 +586,9 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     reads the one in its working directory, which for a cockpit is wherever the server started): its items, if any, read unknown as
     items of a repo that is not registered, and none is an empty board. A ``repos.jsonl`` that exists but cannot be reached (a dangling
     symlink) is an unreadable registry in both modes. ``target`` (a resolved :class:`board_store.Target`) is used as given: the cockpit
-    resolves the store once per request and the read does not resolve the pointer again."""
+    resolves the store once per request and the read does not resolve the pointer again. ``close_evidence`` (a dict the caller
+    owns) is filled with each git close's internal :class:`levain.desk.board_author.Evidence` by item id (the trail verifier's
+    per-predicate judgement); never part of the document."""
     read_git = read_evidence or be.read_git_evidence
     if say is None:
         say = lambda text: print(text, file=sys.stderr)  # noqa: E731
@@ -758,9 +760,9 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
         unreadable.extend(a.why for a in board.audit if a.kind == "unknown" and a.id is None and not a.why.startswith("stale_evidence:"))
     # P4 (levain#103): who authored each git close; a verdict on every close, no close refused for it
     try:       # guarded as board_context's call is: attribution never fails the board read, it is said on each item
-        ba.annotate(doc, folded.items, read_paths, ba.resolvers_from_args(args), default_repo=repo)
+        ba.annotate(doc, folded.items, read_paths, ba.resolvers_from_args(args), default_repo=repo, evidence=close_evidence)
     except Exception as exc:  # noqa: BLE001
-        ba.mark_unread(doc, folded.items, exc)
+        ba.mark_unread(doc, folded.items, exc, evidence=close_evidence)
     # T2-b: the 72-hour rule shows on the board's audit list too (from the registry already read under the one hold)
     try:
         registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)

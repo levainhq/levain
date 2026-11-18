@@ -1327,11 +1327,11 @@ def edit_bundle(bundle: Path, change) -> Path:
     return bundle
 
 
-def test_the_real_signed_and_trailer_tiers_re_derive_and_match_with_no_degraded_marker(tw, capsys):
+def test_the_real_signed_and_trailer_tiers_re_derive_and_match_and_the_bundle_carries_no_degraded(tw, capsys):
     bundle = exported(tw.cw, capsys)
     closes = json.loads(bundle.read_text("utf-8"))["closes"]
     assert closes[tw.signed]["tier"] == "signed" and closes[tw.trailer]["tier"] == "trailer"
-    assert "degraded" not in closes[tw.signed] and "degraded" not in closes[tw.trailer]
+    assert not any("degraded" in c for c in closes.values())
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0, out + err
     lines = close_lines(out)
@@ -1339,48 +1339,154 @@ def test_the_real_signed_and_trailer_tiers_re_derive_and_match_with_no_degraded_
     assert lines[tw.trailer].endswith("(re-derived from the repo; matches the bundle)") and "asserted (trailer)" in lines[tw.trailer]
 
 
-def test_a_key_revoked_since_the_export_is_its_own_line_rc_0_never_matches(tw, capsys):
+# --------------------------------------------------------------------- P6 fix 6: each recorded close as independent predicates
+def _no_launch_records(monkeypatch) -> None:
+    import sqlite3
+
+    from levain.desk import lease
+
+    def unreadable(conn, key):
+        raise sqlite3.OperationalError("database disk image is malformed")
+    monkeypatch.setattr(lease, "_launch_by_key", unreadable)
+
+
+def _author_unread(monkeypatch) -> None:
+    from levain.desk import board_author as ba
+
+    def unread(repo, item, *a, **k):
+        raise ba.be.GitFailed("git went away")
+    monkeypatch.setattr(ba, "closer_of_item", unread)
+
+
+def _other_repo(tw: TierWorld, tmp_path: Path) -> None:
+    import shutil
+    elsewhere = make_repo(tmp_path / "other", "alpha")
+    shutil.move(str(tw.cw.repo), str(tmp_path / "alpha.real"))
+    shutil.move(str(elsewhere), str(tw.cw.repo))
+
+
+CAPS = ("full", "no-log", "no-launch-records", "author-unread", "other-repo")
+
+
+def _apply(cap: str, tw: TierWorld, monkeypatch, tmp_path: Path) -> None:
+    if cap == "no-log":
+        no_authority_log(monkeypatch)
+    elif cap == "no-launch-records":
+        _no_launch_records(monkeypatch)
+    elif cap == "author-unread":
+        _author_unread(monkeypatch)
+    elif cap == "other-repo":
+        _other_repo(tw, tmp_path)
+
+
+def _rows(tw: TierWorld, base: dict) -> list[tuple[str, str, Any, set[str]]]:
+    """``(name, item, mutate(record), the capabilities under which rc 0 is RIGHT)``: one field changed per row. rc 0 is right only
+    where that field's predicate depends on the capability the verifier lacks; everywhere else the row is a BREAK."""
+    S, T, G, D = tw.signed, tw.trailer, tw.cw.merged, tw.cw.doc
+    held_other = base[G]["commit"]
+    blind = {"author-unread", "other-repo"}           # no facts of the commit (unread) / a repo that does not hold it
+    return [
+        ("none", S, lambda r: None, set(CAPS)),
+        ("signed: tier -> git, who kept", S, lambda r: r.update(tier="git", how="asserted by git author"), blind),
+        ("signed: who -> kEVIL", S, lambda r: r.update(who="kEVIL"), blind),
+        ("signed: email added", S, lambda r: r.update(email="x@x"), blind),
+        ("signed: committer added", S, lambda r: r.update(committer="Evil <e@e>"), blind),
+        ("signed: how altered", S, lambda r: r.update(how="signed by the operator"), {"other-repo"}),
+        ("signed: commit -> another HELD close", S, lambda r: r.update(commit=held_other), {"other-repo"}),
+        ("signed: commit -> unheld sha", S, lambda r: r.update(commit="ab" * 20), {"other-repo"}),
+        ("signed: close_commit added", S, lambda r: r.update(close_commit=held_other), {"other-repo"}),
+        ("git: tier -> signed (forged, unsigned commit)", G,
+         lambda r: (r.update(tier="signed", who="kEVIL", how="signed by an operator key"), r.pop("email", None)), blind),
+        ("git: who -> Mallory", G, lambda r: r.update(who="Mallory"), blind),
+        ("git: email -> evil", G, lambda r: r.update(email="evil@x"), blind),
+        ("git: committer added", G, lambda r: r.update(committer="Evil <e@e>"), blind),
+        ("trailer: who -> another launch", T, lambda r: r.update(who="agent coordinator ln-other"),
+         {"no-launch-records", "author-unread", "other-repo"}),
+        ("trailer: tier -> signed (forged, unsigned commit)", T,
+         lambda r: r.update(tier="signed", who="kEVIL", how="signed by an operator key"), blind),
+        ("document: how -> another path", D, lambda r: r.update(how="first added docs/other.md, asserted by git author"),
+         {"other-repo"}),
+        ("document: who -> Mallory", D, lambda r: r.update(who="Mallory"), blind),
+    ]
+
+
+_DEGRADED = ({"kind": "unread", "why": "x"}, {"kind": "unchecked", "from_tier": "signed", "why": "x"},
+             {"kind": "unchecked", "from_tier": "trailer", "why": "x"}, {"kind": "revoked", "from_tier": "signed", "key": "SHA256:x",
+                                                                           "principal": "kEVIL", "revoked_seq": 1})
+
+
+_DEGRADED_ROWS = {"none", "signed: who -> kEVIL", "git: tier -> signed (forged, unsigned commit)", "git: who -> Mallory",
+                  "trailer: who -> another launch", "signed: commit -> unheld sha"}
+
+
+@pytest.mark.parametrize("cap", CAPS)
+def test_matrix_single_field_mutations_by_verifier_capability(cap, tw, capsys, monkeypatch, tmp_path):
+    """Every row: rc 0 ONLY where the changed field's predicate depends on the capability this verifier lacks, a BREAK naming
+    the close otherwise; and setting any ``degraded`` on the changed record (deleting it is the plain row) never changes the
+    rc (the bundle never reduces scrutiny)."""
+    import copy
+    bundle = edit_bundle(exported(tw.cw, capsys), lambda d: d["closes"].pop(tw.cw.ghost))   # its open item: see the other-repo test
+    base = json.loads(bundle.read_text("utf-8"))
+    _apply(cap, tw, monkeypatch, tmp_path)
+    work = tmp_path / "mutated.json"
+    wrong = []
+    for name, item_id, mutate, zero in _rows(tw, base["closes"]):
+        variants = [None, *(_DEGRADED if name in _DEGRADED_ROWS else ())]
+        for deg in variants:
+            doc = copy.deepcopy(base)
+            mutate(doc["closes"][item_id])
+            if deg is not None:
+                doc["closes"][item_id]["degraded"] = deg
+            work.write_text(json.dumps(doc), "utf-8")
+            rc, out, err = run(capsys, "verify", str(work))
+            want = 0 if cap in zero else 3
+            line = close_lines(out).get(item_id, "")
+            if rc != want or (want == 3 and not line.startswith(f"BREAK close {item_id}: ")) or (want == 0 and "BREAK" in out):
+                wrong.append(f"[{cap}] {name} degraded={deg}: rc {rc}, want {want}: {line}")
+            if want == 0 and name != "none":
+                assert "matches" not in line, (name, line)
+    assert not wrong, "\n".join(wrong)
+
+
+def test_a_key_revoked_in_this_install_is_undetermined_never_since_never_matches(tw, capsys):
     bundle = exported(tw.cw, capsys)
     who = json.loads(bundle.read_text("utf-8"))["closes"][tw.signed]["who"]
     tw.revoke()
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0, out + err
     line = close_lines(out)[tw.signed]
-    assert line.startswith(f"close {tw.signed}: asserted by git author Op Person <x@x>")
-    assert line.endswith(f"; the bundle records it signed by {who}, and that key is revoked in this install's authority log "
-                         "(seq 4) since")
-    assert "matches" not in line and "BREAK" not in out
+    assert line == (f"close {tw.signed}: signed by an operator key {who} (recorded in the bundle, not re-derived here: signature by "
+                    f"{who} verifies; that key is revoked in this install's authority log (seq 4))")
+    assert "since" not in line and "BREAK" not in out
 
 
-def test_a_revocation_never_excuses_another_commit_or_another_signer(tw, capsys):
+def test_a_revocation_never_covers_another_commit_or_another_signer(tw, capsys):
     bundle = exported(tw.cw, capsys)
-    other = json.loads(bundle.read_text("utf-8"))["closes"][tw.cw.merged]["commit"]      # a commit the repo HOLDS
+    rec = json.loads(bundle.read_text("utf-8"))["closes"]
     tw.revoke()
-    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(commit=other))
+    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(commit=rec[tw.cw.merged]["commit"]))
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 3, out + err
-    assert f"BREAK close {tw.signed}: the bundle records [signed by an operator key" in out and "revoked" not in close_lines(out)[tw.signed].split("derives")[0]
-    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(commit=json.loads(exported_again(tw, capsys))[tw.signed]["commit"],
-                                                                who="kSOMEONEELSE"))
+    line = close_lines(out)[tw.signed]
+    assert line.startswith(f"BREAK close {tw.signed}: the bundle records [signed by an operator key") and "(refuted: commit: " in line
+    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(commit=rec[tw.signed]["commit"], who="kSOMEONEELSE"))
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 3 and f"BREAK close {tw.signed}: the bundle records [signed by an operator key kSOMEONEELSE]" in out
+    assert "signature: the commit is signed by k" in close_lines(out)[tw.signed]
 
 
-def exported_again(tw: TierWorld, capsys) -> str:
-    """The closes ``board state --json`` derives now (the commit of each close)."""
-    return json.dumps(state_closes(capsys))
-
-
-def test_a_revocation_is_one_way_a_bundle_that_records_a_weaker_tier_than_the_repo_derives_is_a_break(tw, capsys):
+def test_a_weaker_true_claim_holds_and_names_the_higher_tier_this_install_derives(tw, capsys):
     bundle = exported(tw.cw, capsys)
-    sha = json.loads(bundle.read_text("utf-8"))["closes"][tw.signed]["commit"]
+    rec = json.loads(bundle.read_text("utf-8"))["closes"][tw.signed]
     edit_bundle(bundle, lambda d: d["closes"].__setitem__(tw.signed, {"tier": "git", "who": "Op Person", "how": "asserted by git author",
-                                                                    "commit": sha, "email": "x@x"}))
+                                                                    "commit": rec["commit"], "email": "x@x"}))
     rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {tw.signed}: the bundle records [asserted by git author Op Person <x@x>] and the repo derives [signed" in out
+    assert rc == 0, out + err
+    assert close_lines(out)[tw.signed] == (f"close {tw.signed}: asserted by git author Op Person <x@x> (holds; this install also "
+                                           f"derives signed by an operator key {rec['who']})")
 
 
-def test_with_no_authority_log_a_signed_close_is_recorded_not_re_derived_here_rc_0(tw, capsys, monkeypatch):
+def test_with_no_authority_log_a_signed_close_is_undetermined_on_the_standing_alone(tw, capsys, monkeypatch):
     bundle = exported(tw.cw, capsys)
     no_authority_log(monkeypatch)
     rc, out, err = run(capsys, "verify", str(bundle))
@@ -1389,56 +1495,38 @@ def test_with_no_authority_log_a_signed_close_is_recorded_not_re_derived_here_rc
     assert line.startswith(f"close {tw.signed}: signed by an operator key k")
     assert line.endswith("(recorded in the bundle, not re-derived here: the commit is signed but the authority log was not checked "
                          "(holds no cockpit.db))")
-    assert "matches" not in line and "BREAK" not in out
+    assert close_lines(out)[tw.trailer].endswith("(re-derived from the repo; matches the bundle)")     # the trailer needs no log
 
 
-def test_with_the_launch_records_unreadable_a_trailer_close_is_recorded_not_re_derived_here_rc_0(tw, capsys, monkeypatch):
-    import sqlite3
-
-    from levain.desk import lease
+def test_with_the_launch_records_unreadable_a_trailer_close_is_undetermined(tw, capsys, monkeypatch):
     bundle = exported(tw.cw, capsys)
-
-    def unreadable(conn, key):
-        raise sqlite3.OperationalError("database disk image is malformed")
-    monkeypatch.setattr(lease, "_launch_by_key", unreadable)
+    _no_launch_records(monkeypatch)
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0, out + err
     line = close_lines(out)[tw.trailer]
     assert line.startswith(f"close {tw.trailer}: agent ") and "asserted (trailer)" in line
     assert line.endswith("(recorded in the bundle, not re-derived here: a Board-Seat trailer is present but the launch records were "
                          "not checked (the launch records cannot be read (OperationalError)))")
-    assert "matches" not in line and "BREAK" not in out
 
 
-def test_a_close_the_exporter_could_not_check_and_this_install_can_is_re_derived_here(tw, capsys, monkeypatch):
-    no_authority_log(monkeypatch)
+def test_a_trailer_that_maps_to_no_launch_record_here_is_undetermined_launch_records_are_install_scoped(tw, capsys, monkeypatch):
+    from levain.desk import lease
     bundle = exported(tw.cw, capsys)
-    rec = json.loads(bundle.read_text("utf-8"))["closes"][tw.signed]
-    assert rec["tier"] == "git" and rec["degraded"]["kind"] == "unchecked" and rec["degraded"]["from_tier"] == "signed"
-    monkeypatch.setattr(sg, "resolve_authority", _REAL_RESOLVE)
+    monkeypatch.setattr(lease, "_launch_by_key", lambda conn, key: None)
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0, out + err
-    line = close_lines(out)[tw.signed]
-    assert line.startswith(f"close {tw.signed}: signed by an operator key k")
-    assert line.endswith("(the bundle could not check this close; re-derived here)")
-    # the exporter's unchecked words cannot carry a forged author: a different git author on the same commit is a break
-    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(tier="git", who="Mallory", how="asserted by git author"))
-    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(degraded={"kind": "unchecked", "from_tier": "git", "why": "x"}))
-    rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {tw.signed}" in out
+    assert close_lines(out)[tw.trailer].endswith("(recorded in the bundle, not re-derived here: its Board-Seat trailer maps to no "
+                                                 "launch record in this install's desk store)")
 
 
-def test_another_repo_at_the_registered_path_is_not_re_derived_never_a_break(tw, tmp_path, capsys):
-    import shutil
+def test_another_repo_at_the_registered_path_is_undetermined_and_a_commitless_close_still_breaks(tw, tmp_path, capsys):
     bundle = exported(tw.cw, capsys)
-    elsewhere = make_repo(tmp_path / "other", "alpha")
-    shutil.move(str(tw.cw.repo), str(tmp_path / "alpha.real"))
-    shutil.move(str(elsewhere), str(tw.cw.repo))
+    _other_repo(tw, tmp_path)
     rc, out, err = run(capsys, "verify", str(bundle))
     lines = close_lines(out)
     for item_id in (tw.signed, tw.trailer, tw.cw.merged, tw.cw.doc):
-        assert f"(recorded in the bundle, not re-derived: the repo at {tw.cw.repo} does not hold commit " in lines[item_id], lines[item_id]
-    # a recorded close with NO commit (the unattributed ghost) has nothing to look for: it keeps the break, as the head ruled
+        assert f"(recorded in the bundle, not re-derived here: the repo at {tw.cw.repo} does not hold commit " in lines[item_id], lines[item_id]
+    # a recorded close with NO commit (the unattributed ghost) has nothing to look for: it keeps the break (head ruling, open)
     assert rc == 3 and lines[tw.cw.ghost].startswith(f"BREAK close {tw.cw.ghost}: ") and out.count("BREAK") == 1
     edit_bundle(bundle, lambda d: d["closes"].pop(tw.cw.ghost))
     rc, out, err = run(capsys, "verify", str(bundle))
@@ -1451,6 +1539,62 @@ def test_a_repo_that_holds_the_recorded_commit_and_does_not_show_the_close_is_a_
     edit_bundle(bundle, lambda d: d["closes"].__setitem__(tw.cw.open, d["closes"][tw.signed]))
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 3 and f"BREAK close {tw.cw.open}: " in out and "does not show the item closed" in out
+
+
+def test_the_bundle_s_note_is_labelled_as_the_bundle_s_and_never_compared(tw, capsys, monkeypatch):
+    bundle = edit_bundle(exported(tw.cw, capsys), lambda d: d["closes"][tw.signed].update(note="trust me"))
+    no_authority_log(monkeypatch)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    assert "(the bundle's note: trust me) (recorded in the bundle, not re-derived here: " in close_lines(out)[tw.signed]
+
+
+def test_a_recorded_close_whose_exporter_could_not_read_the_author_claims_nothing_and_prints_this_install_s(cw, capsys):
+    bundle = edit_bundle(exported(cw, capsys), lambda d: d["closes"].__setitem__(
+        cw.merged, {"tier": "unattributed", "who": None, "how": "the author could not be read (git went away)", "commit": None}))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    assert close_lines(out)[cw.merged] == (f"close {cw.merged}: the author could not be read (git went away) (the bundle records no "
+                                           f"author; this install derives asserted by git author Plain Person <x@x>)")
+
+
+# ---------------------------------------------- the four L3 r1 scenarios that reached rc 0 on c28b0188c: each is a BREAK now
+def test_l3_forged_signed_on_an_unsigned_commit_with_an_unchecked_trailer_is_a_break(tw, capsys, monkeypatch):
+    bundle = edit_bundle(exported(tw.cw, capsys), lambda d: d["closes"][tw.trailer].update(
+        tier="signed", who="kEVIL", how="signed by an operator key"))
+    _no_launch_records(monkeypatch)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3, out + err
+    assert "signature: the commit carries no signature" in close_lines(out)[tw.trailer]
+
+
+def test_l3_an_altered_git_author_under_an_exporter_unchecked_marker_is_a_break(tw, capsys, monkeypatch):
+    no_authority_log(monkeypatch)
+    bundle = exported(tw.cw, capsys)
+    monkeypatch.setattr(sg, "resolve_authority", _REAL_RESOLVE)
+    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(
+        tier="git", who="Mallory", how="asserted by git author",
+        degraded={"kind": "unchecked", "from_tier": "signed", "why": "the commit is signed but the authority log was not checked"}))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3, out + err
+    assert "git author: the commit's git author is Op Person" in close_lines(out)[tw.signed]
+
+
+def test_l3_an_altered_record_under_an_unread_author_is_a_break(tw, capsys, monkeypatch):
+    bundle = exported(tw.cw, capsys)
+    other = json.loads(bundle.read_text("utf-8"))["closes"][tw.cw.merged]["commit"]
+    edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(commit=other, who="kEVIL"))
+    _author_unread(monkeypatch)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3, out + err
+    assert close_lines(out)[tw.signed].startswith(f"BREAK close {tw.signed}: ") and "commit: the board state here names" in out
+
+
+def test_l3_a_swapped_commit_the_repo_does_not_hold_while_it_holds_another_close_is_a_break(tw, capsys):
+    bundle = edit_bundle(exported(tw.cw, capsys), lambda d: d["closes"][tw.signed].update(commit="ab" * 20))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3, out + err
+    assert "commit: the repo derives the close from commit " in close_lines(out)[tw.signed]
 
 
 def test_a_close_for_an_id_the_bundles_own_records_do_not_hold_is_a_break(cw, capsys):
@@ -1470,8 +1614,8 @@ def test_bundle_verify_prints_a_band_close_as_live_verify_does(cw, capsys, monke
     bundle = exported(cw, capsys)
     real = bt.derive_closes
 
-    def with_band(trail):
-        closes, bands, read, why = real(trail)
+    def with_band(trail, *a, **k):
+        closes, bands, read, why = real(trail, *a, **k)
         return closes, {**bands, cw.open: "no git close to read an author from"}, read, why
     monkeypatch.setattr(bt, "derive_closes", with_band)
     live = close_lines(run(capsys, "verify")[1])
@@ -1510,4 +1654,5 @@ def test_an_unread_author_at_verify_is_recorded_not_re_derived_here(cw, capsys, 
     monkeypatch.setattr(ba, "closer_of_item", flaky)
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0, out + err
-    assert close_lines(out)[cw.merged].endswith("(recorded in the bundle, not re-derived here: the author could not be read (git went away))")
+    assert close_lines(out)[cw.merged] == (f"close {cw.merged}: asserted by git author Plain Person <x@x> (recorded in the bundle, "
+                                           "not re-derived here: the author could not be read (git went away))")
