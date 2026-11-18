@@ -112,6 +112,8 @@ table meta
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 table mission_acceptances
 CREATE TABLE mission_acceptances (acceptance_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(mission_id), mission_revision INTEGER NOT NULL, snapshot TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL, sign_request_id TEXT NOT NULL UNIQUE, signature_sha256 TEXT NOT NULL UNIQUE, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
+table mission_drafts
+CREATE TABLE mission_drafts (draft_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(mission_id), mission_revision INTEGER NOT NULL CHECK (mission_revision >= 1), children_sha256 TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL);
 table mission_revisions
 CREATE TABLE mission_revisions (mission_id TEXT NOT NULL REFERENCES missions(mission_id), rev INTEGER NOT NULL, children TEXT NOT NULL, children_sha256 TEXT NOT NULL, cause TEXT NOT NULL CHECK (cause IN ('create', 'attach', 'detach')), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), at TEXT NOT NULL, PRIMARY KEY (mission_id, rev));
 table missions
@@ -428,6 +430,14 @@ trigger mission_acceptances_kept
 CREATE TRIGGER mission_acceptances_kept BEFORE DELETE ON mission_acceptances BEGIN SELECT RAISE(ABORT, 'a mission acceptance is append-only'); END;
 trigger mission_acceptances_no_replace
 CREATE TRIGGER mission_acceptances_no_replace BEFORE INSERT ON mission_acceptances WHEN EXISTS (SELECT 1 FROM mission_acceptances WHERE acceptance_id = NEW.acceptance_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a mission acceptance is never replaced'); END;
+trigger mission_drafts_frozen
+CREATE TRIGGER mission_drafts_frozen BEFORE UPDATE ON mission_drafts BEGIN SELECT RAISE(ABORT, 'a mission draft link is append-only'); END;
+trigger mission_drafts_kept
+CREATE TRIGGER mission_drafts_kept BEFORE DELETE ON mission_drafts BEGIN SELECT RAISE(ABORT, 'a mission draft link is append-only'); END;
+trigger mission_drafts_names_a_series
+CREATE TRIGGER mission_drafts_names_a_series BEFORE INSERT ON mission_drafts WHEN NOT EXISTS (SELECT 1 FROM envelope_drafts WHERE draft_id = NEW.draft_id AND revision = 1) BEGIN SELECT RAISE(ABORT, 'a mission draft link names a draft series that exists'); END;
+trigger mission_drafts_no_replace
+CREATE TRIGGER mission_drafts_no_replace BEFORE INSERT ON mission_drafts WHEN EXISTS (SELECT 1 FROM mission_drafts WHERE draft_id = NEW.draft_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a mission draft link is never replaced'); END;
 trigger mission_revisions_frozen
 CREATE TRIGGER mission_revisions_frozen BEFORE UPDATE ON mission_revisions BEGIN SELECT RAISE(ABORT, 'a mission revision is append-only'); END;
 trigger mission_revisions_kept
