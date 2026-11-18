@@ -583,13 +583,13 @@ def test_a_cut_of_an_item_the_cited_abandon_does_not_cover_is_a_break(world, cap
 # ------------------------------------------------------------------------------------------- part B: one verdict per close
 
 
-def commit_as(repo: Path, who: str, msg: str, *, files: dict[str, str] | None = None) -> str:
+def commit_as(repo: Path, who: str, msg: str, *, files: dict[str, str] | None = None, email: str = "x@x") -> str:
     """A commit by ``who`` (author and committer), pushed to origin/main and fetched, so it is on the main the board reads."""
     for name, text in (files or {}).items():
         (repo / name).parent.mkdir(parents=True, exist_ok=True)
         (repo / name).write_text(text)
     git(repo, "add", "-A")
-    env = {**os.environ, "GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": "x@x", "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": "x@x"}
+    env = {**os.environ, "GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": email}
     subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=repo, check=True, capture_output=True, env=env)
     git(repo, "push", "-q", "origin", "main")
     git(repo, "fetch", "-q")
@@ -609,7 +609,7 @@ class ClosesWorld:
     rig: Rig | None = None
 
 
-def build_closes_world(tmp_path: Path, monkeypatch, who: str = "Plain Person") -> ClosesWorld:
+def build_closes_world(tmp_path: Path, monkeypatch, who: str = "Plain Person", email: str = "x@x") -> ClosesWorld:
     """A scratch store whose repo ``alpha`` is TRACKED (the real ceremony: register, signed begin-track, charter, signed track) with
     three closes in P4's shapes: a ``merged`` item closed by a commit's trailer, a ``document`` item closed by the commit that added
     its file, and a ``document`` item whose file is in the work tree but on no commit of main."""
@@ -635,7 +635,7 @@ def build_closes_world(tmp_path: Path, monkeypatch, who: str = "Plain Person") -
     merged = bs.add(tgt, "alpha", "merged one", "desk 1", "desk 1", author=OPD, now=NOW)[0]
     doc = bs.add(tgt, "alpha", "doc one", "desk 1", "desk 1", done="docs/report.md", done_kind="document", author=OPD, now=NOW)[0]
     ghost = bs.add(tgt, "alpha", "ghost doc", "desk 1", "desk 1", done="docs/ghost.md", done_kind="document", author=OPD, now=NOW)[0]
-    commit_as(repo, who, f"close it\n\nBoard-Item: {merged}\nBoard-Closes: {merged}")
+    commit_as(repo, who, f"close it\n\nBoard-Item: {merged}\nBoard-Closes: {merged}", email=email)
     commit_as(repo, "Doc Person", "adds the report", files={"docs/report.md": "r\n"})
     (repo / "docs").mkdir(exist_ok=True)
     (repo / "docs" / "ghost.md").write_text("never committed\n")
@@ -688,6 +688,15 @@ def test_export_writes_each_closes_derived_closed_by_as_state_emits_it(cw, capsy
     assert rc == 0, err
     bundle = json.loads(next(cw.out.glob("trail-*.json")).read_text("utf-8"))
     assert bundle["closes"] == closes and "closes_unavailable" not in bundle
+
+
+def test_a_close_by_an_author_with_an_empty_email_exports_and_verifies_with_no_break(tmp_path, monkeypatch, capsys):
+    cw = build_closes_world(tmp_path, monkeypatch, who="No Mail", email="")
+    bundle = exported(cw, capsys)
+    assert json.loads(bundle.read_text("utf-8"))["closes"][cw.merged]["email"] == ""      # present-but-empty, not dropped
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    assert "BREAK" not in out and close_lines(out)[cw.merged].endswith("(re-derived from the repo; matches the bundle)")
 
 
 def exported(cw, capsys) -> Path:

@@ -491,6 +491,16 @@ def test_an_empty_git_author_email_is_kept_as_empty_not_dropped(sc):
     assert ba.describe(c) == "asserted by git author No Mail <>"
 
 
+def test_evidence_keeps_an_empty_git_author_email_as_empty_and_the_closer_agrees(sc):
+    env = {"GIT_AUTHOR_NAME": "No Mail", "GIT_AUTHOR_EMAIL": "", "GIT_COMMITTER_NAME": "No Mail", "GIT_COMMITTER_EMAIL": "",
+           "GIT_AUTHOR_DATE": T1, "GIT_COMMITTER_DATE": T1}
+    sc.git("commit", "--allow-empty", "-q", "-m", "nomail\n\nBoard-Closes: scratch#51", env=env)
+    sha = sc.git("rev-parse", "HEAD")
+    _republish(sc)
+    e = evidence(sc, item(51), sha)
+    assert e.email == "" and e.closer.email == ""                 # present-but-empty on both, never None
+
+
 # ------------------------------------------------------------------------------------------------ the surface
 def test_annotate_sets_closed_by_on_every_done_git_close_and_nothing_else(sc):
     items = {"scratch#1": item(1), "scratch#6": item(6, "document", "docs/a.md"), "scratch#20": item(20, "band", "np-x"),

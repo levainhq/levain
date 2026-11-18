@@ -47,7 +47,7 @@ EVIDENCE (internal; never in ``closed_by``): beside the verdict, :func:`annotate
 :class:`Evidence` per close, the FACTS each tier rests on, kept apart so a reader judging a claim made elsewhere (``levain
 board trail verify`` on a bundle) judges each predicate on its own and never reads a tier's absence as another tier's
 answer: the close's own commit (and ``close_commit``), or why the author could not be read (``unread``, with the commit the
-board state names for a ``merged`` close); the commit's git author, email (empty kept as None) and committer; the ``how``
+board state names for a ``merged`` close); the commit's git author, email (an empty one kept present-but-empty, ``""``) and committer; the ``how``
 prefix (``first added <path>, ``); the SIGNATURE as two separate facts (:class:`Signature`: whether a signature is present
 and cryptographically valid for a fingerprint, and that fingerprint's principal, which needs no authority log; and the
 key's STANDING in this install's log: active, revoked (seq), refused (why), not-checked (why)); and the TRAILER
