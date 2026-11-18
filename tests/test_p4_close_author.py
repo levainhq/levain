@@ -36,17 +36,31 @@ class Scratch:
         self.keys = {n: Key(kd, n) for n in ("laptop", "old", "stranger")}
         self.cockpit = root / "cockpit"
         self.cockpit.mkdir()
-        log = Log(self.cockpit, self.keys)
-        log.link({"op": "enrol", "fingerprint": self.keys["laptop"].fp, "public_key": self.keys["laptop"].public_key,
-                  "class": "laptop-presence", "custody": "passphrase"}, at=T0)
-        log.link({"op": "enrol", "fingerprint": self.keys["old"].fp, "public_key": self.keys["old"].public_key,
-                  "class": "display-phone", "custody": "unstated"}, at=T0)
-        log.link({"op": "revoke_key", "fingerprint": self.keys["old"].fp}, at=T2)
+        Log(self.cockpit, self.keys)                       # the cockpit journal; the links below are anchored, as a real one is
+        self._link({"op": "enrol", "fingerprint": self.keys["laptop"].fp, "public_key": self.keys["laptop"].public_key,
+                    "class": "laptop-presence", "custody": "passphrase"}, T0)
+        self._link({"op": "enrol", "fingerprint": self.keys["old"].fp, "public_key": self.keys["old"].public_key,
+                    "class": "display-phone", "custody": "unstated"}, T0)
+        self._link({"op": "revoke_key", "fingerprint": self.keys["old"].fp}, T2)
         self.repo = root / "repo"
         self.repo.mkdir()
         self.outside = root / "elsewhere.md"
         self.outside.write_text("not in git")
         self.git("init", "-q", "-b", "main")
+
+    def _link(self, op, at) -> None:
+        import sqlite3
+
+        from levain import authority as auth
+        from levain.authority import ReplayCache, anchor_path
+
+        signer = self.keys["laptop"]
+        conn = sqlite3.connect(self.cockpit / "cockpit.db", isolation_level=None)
+        try:
+            auth.sign_and_append(conn, op, signer_fp=signer.fp, sign=lambda m: signer.sign(m, auth.NAMESPACE),
+                                 clock=lambda: at, cache=ReplayCache(), anchor=anchor_path(self.cockpit))
+        finally:
+            conn.close()
 
     def git(self, *args, env=None):
         e = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, **(env or {}))
@@ -67,7 +81,7 @@ class Scratch:
         return self.git("rev-parse", "HEAD")
 
     def authority(self) -> ba.CockpitAuthority:
-        return ba.CockpitAuthority(self.cockpit, anchor=None)
+        return ba.CockpitAuthority(self.cockpit)
 
 
 @pytest.fixture(scope="module")
@@ -124,12 +138,12 @@ def test_tier1_a_valid_signature_by_a_key_in_the_log_is_the_operator(sc):
 
 def test_tier1_the_same_key_not_in_the_log_falls_to_the_git_author_and_says_why(sc):
     c = verdict(sc, item(2), sc.c["stranger"])
-    assert (c.tier, c.who) == ("git", "Stranger Person") and "not valid in the authority log" in c.note
+    assert (c.tier, c.who) == ("git", "Stranger Person") and "not in the authority log" in c.note
 
 
 def test_tier1_a_signed_commit_with_no_authority_named_is_not_tier1(sc):
     c = verdict(sc, item(1), sc.c["signed"], ba.Resolvers(None, SEATS.get))
-    assert (c.tier, c.who) == ("git", "Op Person") and "no authority log was named" in c.note
+    assert (c.tier, c.who) == ("git", "Op Person") and "no authority log is consulted" in c.note
 
 
 def test_tier1_beats_a_copied_trailer(sc):
@@ -137,10 +151,12 @@ def test_tier1_beats_a_copied_trailer(sc):
     assert c.tier == "signed"
 
 
-def test_tier1_a_key_revoked_after_the_commit_date_reads_signed_with_the_caveat(sc):
+def test_tier1_a_revoked_key_is_never_credited_the_snapshot_carries_no_revocation_time(sc):
+    """P2's reader gives the revoked seq and no time, so a commit by a now-revoked key cannot be placed before or after it:
+    not tier 1 either way, and the note names the key's revocation (a verdict never stronger than the evidence)."""
     c = verdict(sc, item(9), sc.c["old_before"])
-    assert c.tier == "signed"
-    assert "revoked at 2026-11-10T00:00:00Z" in c.note and "signer's claim" in c.note
+    assert (c.tier, c.who) == ("git", "Old Person")
+    assert "revoked (seq 3)" in c.note and "no revocation time" in c.note
 
 
 def test_tier1_a_key_revoked_before_the_commit_date_is_not_tier1(sc):
@@ -149,9 +165,9 @@ def test_tier1_a_key_revoked_before_the_commit_date_is_not_tier1(sc):
 
 
 def test_tier1_an_unreadable_authority_log_is_said_and_never_refuses(sc, tmp_path):
-    res = ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit", anchor=None), SEATS.get)
+    res = ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit"), SEATS.get)
     c = verdict(sc, item(1), sc.c["signed"], res)
-    assert c.tier == "git" and "authority log cannot be read" in c.note
+    assert c.tier == "git" and "authority log was not checked" in c.note
 
 
 # ------------------------------------------------------------------------------------------------ tier 2
@@ -163,7 +179,7 @@ def test_tier2_a_board_seat_trailer_a_launch_record_maps_is_the_agent_asserted(s
 
 def test_tier2_a_signature_by_a_key_outside_the_log_still_reads_the_trailer(sc):
     c = verdict(sc, item(11), sc.c["stranger_seat"])
-    assert c.tier == "trailer" and "not valid in the authority log" in c.note
+    assert c.tier == "trailer" and "not in the authority log" in c.note
 
 
 def test_tier2_a_trailer_no_launch_record_maps_falls_to_git(sc):
@@ -173,7 +189,7 @@ def test_tier2_a_trailer_no_launch_record_maps_falls_to_git(sc):
 
 def test_tier2_with_no_launch_records_named_the_trailer_is_unresolved(sc):
     c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), None))
-    assert c.tier == "git" and "--desk-dir" in c.note
+    assert c.tier == "git" and "no launch records are consulted" in c.note
 
 
 def test_tier2_two_different_trailers_read_none(sc):
@@ -309,19 +325,74 @@ def test_board_state_json_carries_closed_by_for_a_done_item_and_the_table_shows_
     assert rc == rc2 and "asserted by git author t" in table
 
 
-def test_board_state_with_the_two_flags_reads_tier1_and_tier2(sc, tmp_path, capsys, monkeypatch):
-    """The flags build the resolvers: --data-root an authority log, --desk-dir launch records (a stand-in lookup here: the
+def test_board_state_with_the_two_flags_reads_tier1_and_tier2(sc, tmp_path, monkeypatch):
+    """The flags override the defaults: --data-root an authority log, --desk-dir launch records (a stand-in lookup here: the
     launch store has its own tests)."""
     monkeypatch.setattr(ba, "_desk_seat_of", lambda directory: SEATS.get)
-    scratch_auth = sc.authority()
-    monkeypatch.setattr(ba, "CockpitAuthority", lambda root: scratch_auth)      # a scratch log has no anchor file
     args = SimpleNamespace(data_root=sc.cockpit, desk_dir=tmp_path)
     res = ba.resolvers_from_args(args)
     assert res.authority is not None and res.seat_of("slot-key-77") == "worker L-77"
     assert verdict(sc, item(1), sc.c["signed"], res).tier == "signed"
     assert verdict(sc, item(3), sc.c["seat"], res).tier == "trailer"
-    none = ba.resolvers_from_args(SimpleNamespace())
-    assert none.authority is None and none.seat_of is None
+
+
+def _home(tmp_path, monkeypatch, *, cockpit=None):
+    """A scratch LEVAIN_HOME whose consent hooks name ``cockpit`` (when given): the install's own cockpit, as a real one."""
+    home = tmp_path / "home"
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    if cockpit is not None:
+        (home / "consent" / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(cockpit)}))
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    return home
+
+
+def test_no_flags_the_install_defaults_find_the_launch_record_and_the_key(sc, tmp_path, monkeypatch):
+    """(a): with NO flags, under a scratch LEVAIN_HOME, tier 1 reads the cockpit the consent hooks name and tier 2 the desk
+    store of the same home."""
+    from levain.desk.store import CoordStore
+
+    home = _home(tmp_path, monkeypatch, cockpit=sc.cockpit)
+    store = CoordStore(home / "consent")
+    store.coord_set_agent("claude", cwd=str(tmp_path))
+    store.accept_drop("fix the build", surface="cli")
+    ln = store.coord_status()["launches"][0]
+    seated = sc.commit(f"by seat\n\nBoard-Closes: scratch#20\nBoard-Seat: {ln['session_key']}", "Seat Person", T1, files={"l": "1"})
+    sc.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    res = ba.resolvers_from_args(SimpleNamespace(data_root=None, desk_dir=None))
+    signed = verdict(sc, item(1), sc.c["signed"], res)
+    assert (signed.tier, signed.how) == ("signed", "signed commit") and signed.who.startswith("operator k")
+    seat = verdict(sc, item(20), seated, res)
+    assert (seat.tier, seat.who) == ("trailer", f"agent {ln['role']} {ln['launch_id']}")
+
+
+def test_no_flags_with_the_default_paths_absent_reads_not_checked_with_a_note(sc, tmp_path, monkeypatch):
+    """(a): an install with no cockpit named and no desk store: never an error and never a silent tier-3 claim."""
+    _home(tmp_path, monkeypatch)
+    res = ba.resolvers_from_args(SimpleNamespace(data_root=None, desk_dir=None))
+    signed = verdict(sc, item(1), sc.c["signed"], res)
+    assert (signed.tier, signed.who) == ("git", "Op Person") and "authority log was not checked" in signed.note
+    seat = verdict(sc, item(3), sc.c["seat"], res)
+    assert (seat.tier, seat.who) == ("git", "Seat Person") and "launch records were not checked" in seat.note
+
+
+def test_with_no_levain_home_at_all_the_defaults_read_not_checked_never_the_real_home(sc, monkeypatch):
+    monkeypatch.delenv("LEVAIN_HOME", raising=False)
+    res = ba.resolvers_from_args(SimpleNamespace(data_root=None, desk_dir=None))
+    assert verdict(sc, item(1), sc.c["signed"], res).tier == "git"
+    assert verdict(sc, item(3), sc.c["seat"], res).tier == "git"
+
+
+def test_the_flags_override_the_defaults(sc, tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)                       # defaults absent
+    res = ba.resolvers_from_args(SimpleNamespace(data_root=sc.cockpit, desk_dir=None))
+    assert verdict(sc, item(1), sc.c["signed"], res).tier == "signed"
+
+
+def test_one_authority_reader_board_author_reads_no_authority_log_directly():
+    """(b): every authority read goes through board_sign's reader."""
+    src = Path(ba.__file__).read_text(encoding="utf-8")
+    assert "authority_source" not in src and "authority_log" not in src
+    assert "read_authority" in src
 
 
 def test_a_real_launch_record_in_a_scratch_desk_store_maps_the_durable_key_to_a_seat(sc, tmp_path):
@@ -337,6 +408,7 @@ def test_a_real_launch_record_in_a_scratch_desk_store_maps_the_durable_key_to_a_
     key = store.coord_status()["launches"][0]["session_key"]
     assert seat_of(key) == f"{ln['role']} {ln['launch_id']}"
     assert seat_of("no-such-key") is None
-    assert ba._desk_seat_of(tmp_path / "absent")(key) is None       # a store that cannot be read resolves nothing, never raises
+    with pytest.raises(ba.NotChecked):
+        ba._desk_seat_of(tmp_path / "absent")(key)                  # a store that cannot be read is "not checked", said
     c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(None, ba._desk_seat_of(qdir)))     # Board-Seat slot-key-77: no such launch
     assert c.tier == "git" and "maps to no launch record" in c.note
