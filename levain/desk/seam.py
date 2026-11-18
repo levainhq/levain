@@ -553,6 +553,8 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
         lines.append(f"  ... {len(items) - _LIST_LINES} more not listed")
     for a in audit[:_LIST_LINES]:
         lines.append(_cap(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}"))
+    if len(audit) > _LIST_LINES:
+        lines.append(f"  ... {len(audit) - _LIST_LINES} more audit not listed")
     return lines
 
 

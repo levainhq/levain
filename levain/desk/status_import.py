@@ -7,16 +7,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from levain.desk import ready
-from levain.desk.store import CoordStore
+
+if TYPE_CHECKING:       # an annotation only: this module reads no store
+    from levain.desk.store import CoordStore
 
 __all__ = ["ImportResult", "default_id", "import_status"]
 
 
 @dataclass
 class ImportResult:
-    """What an import would have reported; kept so a caller's annotation still binds. Nothing makes one now."""
+    """The v1 importer's result shape, kept so a caller's annotation still binds. No import produces one: it is never constructed."""
     added: list[str] = field(default_factory=list)
     corrected: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)

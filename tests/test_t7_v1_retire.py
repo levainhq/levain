@@ -280,7 +280,7 @@ def _fake_board(monkeypatch, doc=DOC, code=0, err=""):
     from levain.desk import board_cli
 
     calls = []
-    monkeypatch.setattr(board_cli, "state_doc", lambda items=None, **kw: calls.append(items) or (code, doc, err))
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: calls.append(items) or (code, doc, err))
     return calls
 
 

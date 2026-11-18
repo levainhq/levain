@@ -524,7 +524,7 @@ def test_the_open_reads_the_board_for_the_store_it_renders_not_the_process_home(
         seen.append(kw.get("consent_dir"))
         return 0, {"schema": 3, "as_of": None, "items": [], "audit": []}, ""
 
-    monkeypatch.setattr(board_cli, "state_doc", spy)
+    monkeypatch.setattr(board_cli, "read_board", spy)
     assert seam._board(store, None, "") == ["Board: 0 items"]
     assert seen == [store.directory]
 
@@ -537,7 +537,7 @@ def test_state_doc_hands_consent_dir_to_the_native_producer(tmp_path, monkeypatc
     monkeypatch.setattr(bp, "native_blocks", lambda **kw: seen.append(kw.get("consent_dir")) or real(**kw))
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "nohome"))
     monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
-    board_cli.state_doc(consent_dir=tmp_path / "somewhere")           # no items store: refuses before the producers run
+    board_cli.read_board(consent_dir=tmp_path / "somewhere")           # no items store: refuses before the producers run
     assert seen in ([], [tmp_path / "somewhere"])
 
 

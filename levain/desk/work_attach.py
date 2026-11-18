@@ -72,6 +72,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
@@ -263,8 +264,12 @@ def _unresolved(directory: Path | str) -> list[dict[str, Any]]:
         conn.close()
 
 
+_BAD_SEQ = re.compile(r"bad-seq-([0-9]{1,18})")
+
+
 def _queued_one(directory: Path, report_id: str) -> dict[str, Any] | None:
-    """The queued report ``report_id``, looked up by its key, read-only; None when it is not in the queue."""
+    """The queued report ``report_id``, looked up by its key (its own id, or ``bad-seq-<seq>`` for a row whose id the record
+    could not hold: :func:`_key`), read-only; None when it is not in the queue. The row carries its ``seq``."""
     path = reports_path(directory)
     if not path.exists():
         return None
@@ -273,6 +278,12 @@ def _queued_one(directory: Path, report_id: str) -> dict[str, Any] | None:
         try:
             row = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports WHERE report_id = ?",
                                (report_id,)).fetchone()
+            bad = _BAD_SEQ.fullmatch(report_id)
+            if row is None and bad is not None:
+                row = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports WHERE seq = ?",
+                                   (int(bad.group(1)),)).fetchone()
+                if row is not None and _key_ok(row[1]):      # that row has a good id of its own: it is not the bad-seq one
+                    row = None
         except sqlite3.OperationalError:
             return None
         return None if row is None else dict(zip(("seq", *_REPORT_COLS), row))
@@ -331,14 +342,20 @@ def _read_fd(fd: int) -> str:
     return b"".join(chunks).decode("utf-8", "replace")
 
 
+MARKER_LINE_MAX = 4096        # the longest marker line read: a drain line is a key (at most 100 characters) and one description
+
+
 def _marker_keys(text: str) -> set[str]:
     """The keys a marker's text records: a line counts once it ends in a newline and parses to an object with a string
-    ``key``, so a torn last line (a crash mid-write) names nothing and is drained again."""
+    ``key``, so a torn last line (a crash mid-write) names nothing and is drained again. A line over
+    :data:`MARKER_LINE_MAX` characters, or one whose parse raises ``RecursionError``, is corrupt: skipped as a torn line is."""
     keys: set[str] = set()
     for ln in text.split("\n")[:-1]:
+        if len(ln) > MARKER_LINE_MAX:
+            continue
         try:
             rec = json.loads(ln)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(rec, dict) and isinstance(rec.get("key"), str):
             keys.add(rec["key"])
@@ -346,14 +363,25 @@ def _marker_keys(text: str) -> set[str]:
 
 
 def _drained_keys(directory: Path | str) -> set[str]:
+    """The keys ``reports.drained`` records, opened read-only and never through a symlink (as the drain opens it): a
+    symlinked marker reads as absent here and in the drain."""
     try:
-        return _marker_keys(drained_path(directory).read_text(encoding="utf-8", errors="replace"))
-    except FileNotFoundError:
+        fd = os.open(drained_path(directory), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except (FileNotFoundError, OSError):          # O_NOFOLLOW on a symlink raises ELOOP: an OSError, read as absent
         return set()
+    try:
+        return _marker_keys(_read_fd(fd))
+    finally:
+        os.close(fd)
 
 
 def _append_durable(fd: int, text: str) -> None:
-    os.write(fd, text.encode("utf-8"))
+    data = memoryview(text.encode("utf-8"))
+    while data:                                   # os.write may write less than asked: every byte lands before the fsync
+        n = os.write(fd, data)
+        if n <= 0:
+            raise OSError("a zero-byte write to the drain record")
+        data = data[n:]
     os.fsync(fd)
 
 
@@ -368,7 +396,9 @@ def drain_reports(directory: Path | str) -> ApplyResult:
     (its key and what the drain line said of it), fsynced in a single write, so the line and the key are recorded
     together and no ordering exists. A crash mid-append leaves a torn last line, which readers ignore, so that report
     drains again on the next pass (never lost, at worst named twice). The process log line is printed by the caller.
-    The marker is made only when there is something to drain, and is opened 0600 and never through a symlink."""
+    The marker is made only when there is something to drain, and is opened 0600 and never through a symlink. The record
+    itself carries each line (:attr:`ApplyResult.described` is the same text), so a caller that crashes before printing
+    loses only the terminal echo, never the record."""
     d = Path(directory)
     result = ApplyResult()
     candidates = [r for r in _unresolved(d)]
@@ -399,7 +429,11 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
     kept so a caller's call still binds, and are not read)."""
     if not isinstance(token, int) or isinstance(token, bool):
         raise CoordError("applying reports needs the live lease token, an integer")
-    return drain_reports(store.directory)
+    directory = Path(store.directory)
+    held = store.coord_lease() if (directory / "dispatch.db").exists() else None
+    if held is None or not held.live or held.token != token:      # as desk_apply: a wrong token drains nothing
+        raise CoordError("the desk lease is not held by this token; no report was drained")
+    return drain_reports(directory)
 
 
 def _drained_line(got: ApplyResult) -> str:
@@ -411,6 +445,7 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None, every:
     """The ``levain desk watch`` pass over the board store: it applies nothing (T7). A report still queued at the switch
     is drained once into one log line; every later pass says nothing. No lease is taken and no store is opened for
     writing. Never raises. ``sessions`` and ``every`` are kept so the watch's call still binds."""
+    # ``sessions`` and ``every`` are IGNORED since T7: nothing records a sighting or paces an apply any more
     directory = Path(board) if board is not None else board_store_dir()
     if is_live_consent(directory):
         return [f"board reports: not drained, {directory} is the live consent store and never a board"]
