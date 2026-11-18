@@ -13,7 +13,7 @@ Every command here is a `levain board` or `levain charter` verb. `levain board <
 | --- | --- | --- |
 | What the operator said | nothing, or "work in X" | "track X", said in conversation with the desk |
 | INTENT (what the repo is for) | the operator's own files, if any | `CHARTER.md` at the repo root, on origin/main, checked by `levain charter check` |
-| Conventions (how to build and test) | the repo's own (AGENTS.md, CLAUDE.md, CONTRIBUTING) | the same files, unchanged. Tracking does not touch them |
+| Conventions (how to build and test) | the repo's own (AGENTS.md, CLAUDE.md, CONTRIBUTING) | the same files. Tracking does not change them, as long as `retire` does not name them (see Known edges) |
 | STATE (what is open, in flight, built, done) | the operator's own files | the board: items in Levain's store, with state derived on every read from git, seats and the band. No file holds it by hand |
 | RECORD (decisions, handoffs, findings) | the operator's own | episodes in the operator's memory store, tagged `repo:<name>` and `item:<name>#<n>`. Artifacts (design pages, review transcripts) are files in a record directory outside the repo's git |
 | The board | holds no items for it (once the store has a registry; see Known edges) | holds its items |
@@ -39,7 +39,7 @@ Tracking then starts from a conversation: the desk reads those files, drafts the
 
 ## Tracking a repo
 
-Tracking is a conversation first and a ceremony second. Only the registration in step 1 is written before the yes. It puts the repo in play without tracking it. Everything else waits for the yes.
+Tracking is a conversation first and a ceremony second. Before the yes, two things can be written, and neither tracks the repo: the store setup in step 1 (on a fresh install only), and the registration, which puts the repo in play. Everything else waits for the yes.
 
 1. **The operator says "track X".** If this install has no item store yet, the desk runs `levain board use <dir>` first. Then it puts X in play if X is not already there:
 
@@ -55,7 +55,7 @@ Tracking is a conversation first and a ceremony second. Only the registration in
 
 4. **The operator reads it and answers in conversation.** Edits go back to step 3.
 
-5. **The desk runs the ceremony in this order.** A keyed `add` repeats safely (see (b)), and `begin-track` derives its migration id, so a retry derives the same one.
+5. **The desk runs the ceremony in this order.** A keyed `add` repeats safely (see (b)), and `begin-track` derives its migration id when `--migration` is omitted, so a retry derives the same one.
 
    - **(a) Begin.** Writes the migration id and locks X to new work:
 
@@ -71,9 +71,9 @@ Tracking is a conversation first and a ceremony second. Only the registration in
      levain board add --repo X --title "<title>" --origin "<origin>" --by <desk> --key M:<k> --payload-hash <sha256>
      ```
 
-     The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire, so a second ceremony on X cannot receive the first one's items. The items exist but are outside the board's scope until the switch.
+     The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. A stalled landing only means the switch has not happened, and X stays locked.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan and the manifest name the same items. A stalled landing only means the switch has not happened, and X stays locked.
 
    - **(d) Switch.** This is the one record that moves the source of truth from the old files to the board:
 
@@ -129,7 +129,7 @@ Until a signed grade exists, `kind: operator` is a claim, and so is every author
 
 - **The signing slice is not in this tree.** It adds `--sign` (a Touch ID signature at a terminal, with `--author-kind operator`), `--source <q-id>` (relaying one of his band answers), the `signed-terminal` and `relayed` grades, and the rule that the decision-class verbs (`decide`, `begin-track`, `track`, `abandon-track`, `untrack`) refuse an unsigned record. `move` joins that rule while its repo is tracking or tracked. Until the slice lands, every record is `asserted`.
 - **`--source` will take native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) needs flow's reader first.
-- **The phone route arrives with the signing slice.** That slice's writer takes a phone signature (`signed-phone`), and the cockpit door that signs with the passkey is not in it either.
+- **The phone route is not in this tree.** The signing slice's writer takes a phone signature (`signed-phone`). The cockpit door that signs with the passkey is a separate, later piece.
 - **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
 - **Closing a tracked seat is not checked yet.** `levain/desk/seat_close.py` holds the check, and nothing in Levain calls it. Flow's seat close is the caller, and that side is not written.
 - **Before a store's first registration, `add` takes items for any repo.** The registry is inactive until the store has a `repos.jsonl`, and the mode check starts with it.
