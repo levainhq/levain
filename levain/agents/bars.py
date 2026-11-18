@@ -222,8 +222,9 @@ def _r2(conn, cockpit, state, bar: Bar, *, now, anchor, ssh_keygen) -> Outcome |
     kw = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
     try:
         appended = _auth.append(cockpit, link, bar.pending_signature, now=now, anchor=anchor, **kw)
-    except _auth.AuthorityError as exc:
-        # StaleHead or a refused link: the bar stays open and falls to R4; the reason is recorded on the bar
+    except (_auth.AuthorityError, sqlite3.Error) as exc:
+        # StaleHead, a refused link, or a journal that cannot take a write (a read-only or locked connection): the
+        # bar stays open and falls to R3/R4; the reason is recorded on the bar
         _guarded(conn, "last_error = ?", (("stale_head" if isinstance(exc, _auth.StaleHead)
                                            else f"append_refused:{type(exc).__name__}"),), bar.bar_id)
         return None
@@ -232,6 +233,10 @@ def _r2(conn, cockpit, state, bar: Bar, *, now, anchor, ssh_keygen) -> Outcome |
     if close_bar(conn, bar.bar_id, revoke_seq=seq, reason="signed", now=now):
         return Outcome("R2", bar.agent_id, bar.bar_id,
                        f"appended the stored signature at seq {seq}; bar closed (signed){tail}")
+    row = read_bar(conn, bar.bar_id)
+    if row is not None and (row.reason, row.revoke_seq) == ("signed", seq):
+        return Outcome("R2", bar.agent_id, bar.bar_id,
+                       f"appended the stored signature at seq {seq}; the bar was already closed (signed){tail}")
     return Outcome("R2", bar.agent_id, bar.bar_id,
                    f"revoke landed at seq {seq}; the bar had been abandoned; it is recorded from_log at the next tick{tail}")
 

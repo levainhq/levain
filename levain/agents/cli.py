@@ -839,8 +839,9 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
 
 
 def _landed_in_log(autonomic, cockpit, bar, clock):
-    """The seq this open bar's own pending link holds in the verified replay (and the bar closed signed there through
-    ``_landed``), else None: no bar, a malformed pending link, or a link the log does not hold. A replay that cannot
+    """The ``RevokeStep`` ``_landed`` returns for this open bar's own pending link when the verified replay holds it
+    (``landed``: the bar closed signed at ``step.seq``; ``landed_bar_abandoned``: the bar was closed abandoned
+    meanwhile), else None: no bar, a malformed pending link, or a link the log does not hold. A replay that cannot
     finish raises, and so does a verifier that cannot run (``AgentAuthorityError`` or the verifier's own
     ``VerifierUnavailable``): never None."""
     from levain import agent_authority as aa
@@ -850,8 +851,7 @@ def _landed_in_log(autonomic, cockpit, bar, clock):
     link = aa._unsigned(bar)
     if link is None or not aa._in_log(cockpit, link, None):
         return None
-    aa._landed(autonomic, bar.bar_id, link.seq, now=clock(), warning=None)
-    return link.seq
+    return aa._landed(autonomic, bar.bar_id, link.seq, now=clock(), warning=None)
 
 
 def _revoke_already_done(autonomic, cockpit, data_root, agent_id: str, store_id: str, clock) -> str | None:
@@ -865,9 +865,11 @@ def _revoke_already_done(autonomic, cockpit, data_root, agent_id: str, store_id:
 
     bar = bars.open_bar_of(autonomic, agent_id)
     try:
-        seq = _landed_in_log(autonomic, cockpit, bar, clock)
-        if seq is not None:
-            return f"the revoke had already landed at seq {seq}; the bar is closed"
+        step = _landed_in_log(autonomic, cockpit, bar, clock)
+        if step is not None:
+            if step.state == "landed_bar_abandoned":
+                return step.text
+            return f"the revoke had already landed at seq {step.seq}; the bar is closed"
         if bar is None:
             state = aa.AgentAuthority(data_root).replay()
             if not _auth.agent_links(state, agent_id, store_id):
@@ -924,7 +926,11 @@ def _run_abandon(args: argparse.Namespace) -> int:
                 return _no_open_bar(autonomic, args.agent)
             landed, checked = _abandon_landed(args, store, autonomic, bar)
             if landed is not None:
-                print(f"the revoke had already landed at seq {landed}; nothing to abandon")
+                if landed.state == "landed_bar_abandoned":
+                    print(f"the revoke had already landed at seq {landed.seq}; the bar had been abandoned meanwhile; "
+                          "nothing to abandon")
+                else:
+                    print(f"the revoke had already landed at seq {landed.seq}; nothing to abandon")
                 return 0
             # a bar holding a stored signature may have its append already done; when the log could not be read the
             # abandon cannot say the links stand as signed
@@ -949,19 +955,25 @@ def _run_abandon(args: argparse.Namespace) -> int:
         return _fail("revoke", f"the store refused it: {exc}")
 
 
-def _abandon_landed(args: argparse.Namespace, store, autonomic, bar) -> tuple[int | None, bool]:
-    """R1 alone for ``--abandon``: ``(seq, True)`` when the bar's own link is already in the verified log (the bar is
-    then closed signed), ``(None, True)`` when the check ran and the log does not hold it, and ``(None, False)`` when it
+def _abandon_landed(args: argparse.Namespace, store, autonomic, bar) -> tuple[object | None, bool]:
+    """R1 alone for ``--abandon``: ``(step, True)`` when the bar's own link is already in the verified log (``step`` is
+    the ``RevokeStep`` ``_landed`` returned), ``(None, True)`` when the check ran and the log does not hold it, and ``(None, False)`` when it
     could not run (a cockpit that cannot be reached, or a log that cannot be replayed): the abandon goes on, and the
     caller tells the two Nones apart. Never R2 or a full recovery: that would append the revoke the operator is
     abandoning."""
     from levain.agents import tick_driver
-    from levain.cockpit.keys import _journal
+    from urllib.parse import quote
+
+    from levain.cockpit.firejournal import DB_NAME
 
     try:
         root = args.data_root if args.data_root is not None else tick_driver._cockpit_root(store)
-        with _journal(root).autocommit() as cockpit:
+        # a read-only open: the check only reads the log, so it needs no signing credentials and takes no write lock
+        cockpit = sqlite3.connect(f"file:{quote(str(Path(root) / DB_NAME))}?mode=ro", uri=True, timeout=2.0)
+        try:
             return _landed_in_log(autonomic, cockpit, bar, _utcnow), True
+        finally:
+            cockpit.close()
     except Exception:  # noqa: BLE001
         return None, False
 
