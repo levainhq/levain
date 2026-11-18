@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 
 import pytest
 
@@ -348,3 +349,49 @@ def test_a_denials_write_failure_changes_nothing(tmp_path, env, monkeypatch):
     want = rb.decide_pre(_ev(p), env)
     monkeypatch.setattr(rb, "_denials_path", lambda *a: "/nonexistent-dir/x/denials.jsonl")
     assert rb.decide_pre(_ev(p), env) == want
+
+
+def test_a_deny_text_that_raises_allows_the_read_and_logs_no_denial(tmp_path, env, monkeypatch):
+    import glob
+    p = _big(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError("gone")
+    monkeypatch.setattr(rb, "_deny_text", boom)
+    assert rb.decide_pre(_ev(p), env) is None
+    assert not glob.glob(env[rb.STATE_ENV] + "/denials-*.jsonl")
+
+
+def test_the_denials_file_is_mode_0600(tmp_path, env):
+    import glob
+    import stat
+    assert rb.decide_pre(_ev(_big(tmp_path)), env)
+    f = glob.glob(env[rb.STATE_ENV] + "/denials-*.jsonl")[0]
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+
+def test_a_fifo_at_the_denials_path_does_not_block_or_change_the_decision(tmp_path, env, monkeypatch):
+    import signal
+    p = _big(tmp_path)
+    want = rb.decide_pre(_ev(p), env)
+    fifo = str(tmp_path / "fifo.jsonl")
+    os.mkfifo(fifo)
+    monkeypatch.setattr(rb, "_denials_path", lambda *a: fifo)
+
+    def alarm(*a):
+        raise AssertionError("the denial append blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, alarm)
+    signal.alarm(5)
+    try:
+        assert rb.decide_pre(_ev(p), env) == want
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_a_denial_row_logs_the_injected_now(tmp_path, env):
+    import glob
+    assert rb.decide_pre(_ev(_big(tmp_path)), env, now=86400.0)
+    f = glob.glob(env[rb.STATE_ENV] + "/denials-*.jsonl")[0]
+    with open(f, encoding="utf-8") as fh:
+        assert json.loads(fh.readline())["utc"] == "1970-01-02T00:00:00Z"
