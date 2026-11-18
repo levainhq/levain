@@ -735,6 +735,10 @@ class AuthoritySnapshot:
     # per ``(agent_id, agent_store_id)``, the seq of the last ``revoke_agent`` (:func:`agent_last_revoke`); absent: none
     agent_revoked: Mapping[tuple[str, str], int] = field(default_factory=lambda: MappingProxyType({}), compare=False,
                                                          repr=False)
+    # the graduation policies a passkey create already in the log brought in while the opt-in was stopped (row 190):
+    # taken by the replay, never in force (:data:`STOPPED_OPT_IN`). Kept while the id stays in the policy; a revoke ends
+    # it, so only a create of the same id again (a new incarnation) can answer
+    grant_born_stopped: frozenset[str] = field(default=frozenset(), compare=False, repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -1290,6 +1294,7 @@ def graduation_links(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str]
 # repaired by a renew.
 STOPPED_BORN = "the key that signed it was revoked"
 STOPPED_CURRENT = "the key that last renewed it was revoked"
+STOPPED_OPT_IN = "the graduation opt-in that admitted its create had stopped"
 
 
 def grant_signers(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str] | None:
@@ -1309,13 +1314,16 @@ def grant_signers(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str] | 
 
 def grant_stop_reason(state: AuthoritySnapshot, grant_id: str) -> str | None:
     """Why standing grant ``grant_id`` may answer nothing, or None while it may: the key that signed its born link and
-    the key that signed its current link must both be active (:func:`grant_signers`). Judged from ``state`` alone at
-    the moment of use, never stored: the replay is untouched and the policy still holds the grant, so it can be
-    revoked, listed or replaced. Kind-blind and class-blind (it reads ``.active`` and nothing else of a key). Fails
-    closed: a grant in the policy whose signers ``state`` cannot name is stopped, as is a signer ``state`` has no key
-    for. None for an id the policy does not hold."""
+    the key that signed its current link must both be active (:func:`grant_signers`), and it must not be one the replay
+    took stopped (``grant_born_stopped``: a passkey create already in the log, made while the opt-in was stopped,
+    :data:`STOPPED_OPT_IN`). Judged from ``state`` alone at the moment of use: the policy still holds the grant, so it
+    can be revoked, listed or replaced. Kind-blind and class-blind (it reads ``.active`` and nothing else of a key).
+    Fails closed: a grant in the policy whose signers ``state`` cannot name is stopped, as is a signer ``state`` has no
+    key for. None for an id the policy does not hold."""
     if state.policy.grants.get(grant_id) is None:
         return None
+    if grant_id in state.grant_born_stopped:
+        return STOPPED_OPT_IN
     signers = grant_signers(state, grant_id)
     if signers is None:
         return STOPPED_BORN
@@ -2769,7 +2777,7 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"], custody=custody)
 
 
-def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: str, *, new_link: bool = False) -> None:
+def _passkey_act(rec: Mapping[str, Any], state: AuthoritySnapshot, fingerprint: str, *, new_link: bool = False) -> bool:
     """Refuse a link a passkey signs unless it is one act of the allow-list (DESIGN_REV3 §7). A passkey signs consent
     answers (its own namespace, the consent queue's check), since K8 a cockpit pending of T2 at most in the phone
     namespace (the broker's check), and, in this log, exactly one of: the revoke of a grant :func:`passkey_revocable`
@@ -2777,8 +2785,15 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
     create of one while the live opt-in named it, so a log that holds them still replays. An appended link
     (``new_link``) is never a renew and never a create, of any kind. Every other op is refused, whatever its class's rank would allow, and a
     ``loosen`` with it, so no passkey link carries more than one act. The rule is the replay's, so a link built past
-    the phone's ceremonies is held to it."""
+    the phone's ceremonies is held to it. ``state`` is the predecessor snapshot.
+
+    The opt-in is read in force (row 190). A create already in the log that the opt-in admitted while it was stopped
+    (its signer revoked; an older levain took the link) is taken, since refusing it would leave the whole authority
+    unreadable, and True is returned: the caller records the created policy as stopped (``grant_born_stopped``), the
+    same absorbing bound as a change to a stopped grant. A new link never gets here (the refusal above). False
+    otherwise."""
     op = rec["op"]
+    policy = state.policy
     if new_link and op in ("renew", "create_grant"):
         if op == "create_grant":
             target = rec.get("grant")
@@ -2801,7 +2816,7 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
                                  f"{gid[:80]!r}, beyond a graduation policy and the graduation opt-in")
         if op == "renew" and not graduation_grant(target):
             raise AuthorityError(f"a {PASSKEY} key renews a graduation policy only, never grant {gid[:80]!r}")
-        return
+        return False
     if op == "revoke_agent":
         # its own branch: the op names an agent, not a grant_id. Every link of the agent goes in one act, so each must
         # be one a passkey may revoke, and there must be at least one
@@ -2811,7 +2826,7 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
             raise AuthorityError(f"a {PASSKEY} key revokes an agent's links the policy holds: none for {str(aid)[:80]!r}")
         if not all(passkey_revocable(g) for g in mine):
             raise AuthorityError(f"a {PASSKEY} key revokes only links of a kind that takes a passkey revoke")
-        return
+        return False
     refusal = (f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link (a "
                "graduation renew or create already in a log still replays)")
     if op == "create_grant":
@@ -2822,7 +2837,7 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
         if opt is None or fingerprint not in opt["passkeys"]:
             raise AuthorityError(f"a {PASSKEY} key creates a graduation policy only when the live graduation opt-in "
                                  f"names it; {fingerprint} is not named")
-        return
+        return grant_stop_reason(state, opt["id"]) is not None
     raise AuthorityError(refusal)
 
 
@@ -2943,6 +2958,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     grant_seqs = {} if state is None else dict(state.grant_seqs)
     grant_born = {} if state is None else dict(state.grant_born)
     agent_revoked = {} if state is None else dict(state.agent_revoked)
+    born_stopped = frozenset() if state is None else state.grant_born_stopped
     quarantined_history = False
     try:
         if state is None:
@@ -2977,8 +2993,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             quarantined_history = why is not None
             # known edge, kept: a quarantined key's links already in the log meet UV + origin only, not the op rule
             # below (stored custody fido/unstated), since holding them to it refuses existing logs (Phill's (a))
-            if signer.custody == PASSKEY:
-                _passkey_act(rec, policy, signer.fingerprint, new_link=new_link)
+            taken_stopped = signer.custody == PASSKEY and _passkey_act(rec, state, signer.fingerprint,
+                                                                         new_link=new_link)
             need = _apply_op(rec, seq, state, keys, ssh_keygen, new_link=new_link)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)
@@ -3011,6 +3027,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                                                                                          or gid in held) else seq)
                               for gid in need.grants}
                 grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
+                # a stop taken at create holds while the id stays in the policy (absorbing: no later change, and no
+                # fresh opt-in, brings it back); a revoke drops it, so a create of the id again is judged anew
+                born_stopped = frozenset(gid for gid in born_stopped if gid in policy.grants and gid in need.grants)
+                if taken_stopped:
+                    born_stopped |= {rec["grant"]["id"]}
                 if signer.custody == PASSKEY and op == "create_grant":
                     rank = GRADUATION_OPT_IN_RANK       # _passkey_act let it through only as the opt-in names it
                 policy = need
@@ -3061,7 +3082,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     signers = (() if state is None else state.link_signers) + (row.signer_fp,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born),
-                             link_signers=signers, agent_revoked=MappingProxyType(agent_revoked))
+                             link_signers=signers, agent_revoked=MappingProxyType(agent_revoked),
+                             grant_born_stopped=born_stopped)
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],

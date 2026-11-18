@@ -61,7 +61,7 @@ def before_the_cut():
         kinds[kind] = dataclasses.replace(kinds[kind], append_checks=(), renew_checks=())
     real = auth._passkey_act
     with mock.patch.object(auth, "_GRANT_KINDS", MappingProxyType(kinds)), \
-            mock.patch.object(auth, "_passkey_act", lambda rec, policy, fp, *, new_link=False: real(rec, policy, fp)):
+            mock.patch.object(auth, "_passkey_act", lambda rec, state, fp, *, new_link=False: real(rec, state, fp)):
         yield
 
 

@@ -42,8 +42,8 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "rule", "a record's identity (born seq and meaning); a route carries it and the live check compares it, "
                     "beside grants_in_force"),
     "levain/authority.py::graduation_opt_in":
-        (1, "replay", "read by the replay's passkey rule (_passkey_act), which judges a passkey's new link against the "
-                      "opt-in; stopping it would change what an existing log replays to (design 3: OUT, routed)"),
+        (1, "replay", "read by the replay's passkey rule (_passkey_act), which finds the opt-in here; a stored create "
+                      "while grant_stop_reason stops it is taken stopped (grant_born_stopped); no new create is appended"),
     "levain/authority.py::graduation_incarnation":
         (1, "rule", "a policy's identity, the shape of egress_key_incarnation"),
     "levain/authority.py::graduation_links":
@@ -80,9 +80,9 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/authority.py::_link_format":
         (1, "replay", "the format a link needs, from the policy the replay holds"),
     "levain/authority.py::_step":
-        (6, "replay", "the replay itself: grant_seqs and grant_born are computed from every grant the log holds, and a "
-                      "change to a stopped grant is refused (new link, its kind naming the way back) or leaves its "
-                      "current link unmoved"),
+        (7, "replay", "the replay itself: grant_seqs, grant_born and grant_born_stopped are computed from every grant "
+                      "the log holds, and a change to a stopped grant is refused (new link, its kind naming the way "
+                      "back) or leaves its current link unmoved"),
     "levain/authority.py::_append_only_checks":
         (2, "rule", "the append rules: the consent-workspace and per-kind checks of the grants a loosen changes, and "
                     "the renew's own grant lookup"),
@@ -109,7 +109,8 @@ READERS: dict[str, tuple[int, str, str]] = {
                    "and on a re-judge the link's current signer too"),
     "levain/graduation_policy.py::graduation_policies":
         (1, "use", "a policy whose born or current signer the log has revoked is left out (_graduation_policy, "
-                   "RULINGS_S1 item 2): the precedent grants_in_force generalises"),
+                   "RULINGS_S1 item 2), and so is one grant_stop_reason stops: the precedent grants_in_force "
+                   "generalises"),
     "levain/agents/signing.py::renew_agent_link.check":
         (1, "write", "refuses a renew of an id that is no agent link; the append rule refuses a renew of a stopped one"),
     "levain/cockpit/agents_panel.py::_links":

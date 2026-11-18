@@ -100,7 +100,8 @@ class TermedGraduationPolicy(GraduationPolicy):
 def graduation_policies(state: _auth.AuthoritySnapshot) -> tuple[GraduationPolicy, ...]:
     """Every graduation policy ``state`` holds, each with its incarnation and the public keys of the signers of its
     born and current links (with :data:`RENEW_NEEDS_ANCHOR` false, the born signer's for both). A policy whose links or
-    keys ``state`` cannot name, either of whose signers the log has since revoked, or whose record
+    keys ``state`` cannot name, either of whose signers the log has since revoked, that the log holds stopped
+    (:func:`levain.authority.grant_stop_reason`), or whose record
     :meth:`GraduationPolicy.from_record` refuses, is left out: it covers nothing. Each is a
     :class:`TermedGraduationPolicy`, carrying its signed ``min_clean_fires``."""
     out: list[GraduationPolicy] = []
@@ -128,6 +129,10 @@ def _graduation_policy(state: _auth.AuthoritySnapshot, gid: str, grant: object) 
         _UNBORN_WARNED.add(gid)
         _log.warning("graduation policy %r covers nothing: the replay has no grant_born entry for it", gid)
     if incarnation is None or links is None or born_seq is None:
+        return None
+    if _auth.grant_stop_reason(state, gid) is not None:
+        # stopped in the log (row 190): its signers' revoke below, or a create the replay took while the opt-in was
+        # stopped (``grant_born_stopped``), which no signer check sees
         return None
     born_key, current_key = (state.keys.get(fp) for fp in links)
     # RULINGS_S1 item 2: a signer the log has revoked anchors nothing, whatever root's file lists
