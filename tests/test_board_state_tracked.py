@@ -560,3 +560,19 @@ def test_a_store_id_that_is_not_a_regular_file_is_refused_never_a_plain_items_re
 
 
                                             # no deadline: as before
+
+
+def test_an_aborting_repos_cut_item_keeps_its_audit_line_until_abandon_done_levain93(store, tmp_path, mkrepo, capsys):
+    _two_tracked(capsys, tmp_path, store, mkrepo)
+    c = mkrepo("gamma")
+    ok(capsys, "register", "gamma", "--path", str(c), "--words", "w", *A)
+    ok(capsys, "begin-track", "gamma", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
+    add_item(capsys, "gamma", migration_of(store, "gamma"), "a")
+    ok(capsys, "abandon-track", "gamma", "--words", "never mind", *A)                         # aborting: the abort is not done
+    rc, doc, err = _state(capsys)
+    assert rc == 3, err
+    assert any(e["why"].startswith("gamma: the repo is aborting") for e in doc["audit"] if e["id"] is None), doc["audit"]
+    ok(capsys, "abandon-done", "gamma", *A)
+    rc, doc, err = _state(capsys)
+    assert _states(doc)["gamma#1"] == "cut"
+    assert not any(e["why"].startswith("gamma:") for e in doc["audit"] if e["id"] is None), doc["audit"]

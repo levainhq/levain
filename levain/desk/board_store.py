@@ -619,10 +619,10 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
         raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
 
 
-def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
+def _check_repo_mode(store_dir: Path, repo: str, key: str | None, exact_hit: bool = False) -> None:
     """I1, under the exclusive lock: ``add`` only for a repo the registry holds as tracking (keyed to its migration) or tracked."""
     from levain.desk import board_registry
-    board_registry.check_add(store_dir, repo, key)
+    board_registry.check_add(store_dir, repo, key, exact_hit=exact_hit)
 
 
 def add(target: Target, repo, title, origin, by, words="", done=None, done_kind="merged", tier=None, depends=(),
@@ -651,7 +651,9 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         fields = {**fields, "key": key, "payload_hash": payload_hash}
 
     def build(recs):
-        _check_repo_mode(target.store_dir, repo, key)
+        hit = key is not None and any(r.get("op") == "add" and r.get("key") == key and r.get("repo") == repo
+                                      and r.get("payload_hash") == payload_hash for r in recs)
+        _check_repo_mode(target.store_dir, repo, key, hit)
         if key is not None:
             for r in recs:
                 if r.get("op") == "add" and r.get("key") == key:

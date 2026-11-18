@@ -4,6 +4,7 @@ repository with a bare origin under the test's own temp; the levain home is a sc
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import json
 import os
@@ -1580,3 +1581,48 @@ def test_p1b_fix1_a_registry_chain_ack_keeps_the_line_and_binds_the_break(store,
     lines[1] = lines[1].replace(b'"words":"edited"', b'"words":"edited-again"')
     p.write_bytes(b"\n".join(lines) + b"\n")
     assert run(capsys, "repos")[0] == 2                                              # the same line before is edited again: breaks again
+
+
+def test_add_exact_retry_of_a_record_outside_plan_items_returns_its_id_levain93(store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, plan_items=["a"])), "--words", "y", *A)
+    m = migration_of(store, "alpha")
+    rec = {"v": 1, "op": "add", "id": "alpha#1", "at": "2026-11-17T10:00:00Z", "by": "t", "repo": "alpha", "title": "old", "origin": "o",
+           "done": None, "done_kind": "merged", "tier": None, "depends_on": [], "key": f"{m}:zz", "payload_hash": HASH_A}
+    items = store / "items.jsonl"
+    items.write_text((items.read_text() if items.exists() else "") + json.dumps(rec) + "\n")
+    assert add_item(capsys, "alpha", m, "zz") == "alpha#1"                      # exact retry: the stored id, before the membership check
+    rc, _, err = run(capsys, "add", "--repo", "alpha", "--title", "n", "--origin", "d", "--key", f"{m}:yy", "--payload-hash", HASH_A, *A)
+    assert rc == 2 and "not one of the manifest's plan_items" in err           # a new record still is checked
+
+
+def test_check_add_on_a_tracking_record_with_no_plan_items_or_no_migration_is_a_clean_refusal_levain93(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
+    m = migration_of(store, "alpha")
+    real = br._load
+    def view_with(**changes):
+        v = real(store)
+        v.fold.repos["alpha"] = dataclasses.replace(v.fold.repos["alpha"], **changes)
+        return v
+    monkeypatch.setattr(br, "_load", lambda d, *a, **k: view_with(manifest={"plan_items": None, "contract_items": []}))
+    with pytest.raises(bs.BoardError, match="not one of the manifest's plan_items .*none"):
+        br.check_add(store, "alpha", f"{m}:a")
+    monkeypatch.setattr(br, "_load", lambda d, *a, **k: view_with(migration=None))
+    with pytest.raises(bs.BoardError, match="alpha is tracking but its record carries no migration"):
+        br.check_add(store, "alpha", f"{m}:a")
+
+
+def test_track_backstop_names_a_plan_id_not_in_the_manifest_levain93(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    ok(capsys, "begin-track", "alpha", "--manifest", str(manifest(tmp_path, plan_items=["a"])), "--words", "y", *A)
+    m = migration_of(store, "alpha")
+    one = add_item(capsys, "alpha", m, "a")
+    monkeypatch.setattr(br, "check_add", lambda *a, **k: None)                  # as an older release wrote it: a keyed item the manifest never named
+    ok(capsys, "add", "--repo", "alpha", "--title", "extra", "--origin", "d", "--key", f"{m}:c", "--payload-hash", HASH_A, *A)
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {one}\n- alpha#2"))
+    rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
+    assert rc == 2 and "the charter's Plan ids not in the manifest: alpha#2" in err

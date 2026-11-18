@@ -30,7 +30,7 @@ def sha(b: bytes) -> str:
 
 @pytest.fixture(autouse=True)
 def _registry_not_under_test(monkeypatch):
-    monkeypatch.setattr(bs, "_check_repo_mode", lambda store_dir, repo, key: None)
+    monkeypatch.setattr(bs, "_check_repo_mode", lambda store_dir, repo, key, exact_hit=False: None)
 
 
 @pytest.fixture
