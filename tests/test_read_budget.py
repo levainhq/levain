@@ -323,3 +323,28 @@ def test_the_hook_command_runs_the_real_script_to_the_same_output_as_main(tmp_pa
     tiny.write_text("hi\n")
     ok = _run_hook(script, "pre", json.dumps(_ev(tiny)), {rb.STATE_ENV: env[rb.STATE_ENV]})
     assert ok.returncode == 0 and ok.stdout == ""
+
+
+def test_a_deny_appends_one_row_to_the_sessions_denials_file_and_an_allow_writes_none(tmp_path, env):
+    import glob
+    p = _big(tmp_path)
+    state = env[rb.STATE_ENV]
+    assert rb.decide_pre(_ev(p, offset=1, limit=20), env) is None
+    assert not glob.glob(state + "/denials-*.jsonl")
+    assert rb.decide_pre(_ev(p, sid="sA"), env).startswith(rb.DENY_PREFIX)
+    files = glob.glob(state + "/denials-*.jsonl")
+    assert len(files) == 1
+    rows = [json.loads(x) for x in open(files[0], encoding="utf-8")]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["path"] == str(p.resolve()) and r["session"] == "sA" and r["remaining"] == 10
+    assert r["bytes"] >= p.stat().st_size and r["price"] == rb.price(r["bytes"], 10) and isinstance(r["utc"], str)
+    assert rb.decide_pre(_ev(p, sid="sB"), env)               # another session: its own file
+    assert len(glob.glob(state + "/denials-*.jsonl")) == 2
+
+
+def test_a_denials_write_failure_changes_nothing(tmp_path, env, monkeypatch):
+    p = _big(tmp_path)
+    want = rb.decide_pre(_ev(p), env)
+    monkeypatch.setattr(rb, "_denials_path", lambda *a: "/nonexistent-dir/x/denials.jsonl")
+    assert rb.decide_pre(_ev(p), env) == want

@@ -290,6 +290,22 @@ def charge(state: str, session_id: str, *, tool: str, path: str, nbytes: int, re
     return cost
 
 
+def _denials_path(state: str, session_id: str) -> str:
+    return os.path.join(state, "denials-" + hashlib.sha256(session_id.encode()).hexdigest()[:24] + ".jsonl")
+
+
+def _log_denial(state: str, session_id: str, path: str, nbytes: int, cost: int, remaining: int) -> None:
+    """Append one row per deny to the session's ``denials-<session>.jsonl``; fail-open (never changes the decision)."""
+    try:
+        row = {"path": path, "bytes": nbytes, "price": cost, "remaining": remaining, "session": session_id,
+               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        with open(_denials_path(state, session_id), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _granted(state: str, real: str, now: float) -> bool:
     """``grants.json``: ``{"paths": {"<abs realpath>": <expires unix seconds or null>}}``, the desk's to write."""
     try:
@@ -354,6 +370,7 @@ def decide_pre(event: Any, environ: Mapping[str, str], now: float | None = None)
         else:
             return None
         max_bytes = max(FLOOR_BYTES, (call_budget // max(1, remaining)) * BYTES_PER_TOKEN)
+        _log_denial(state, sid, real, nbytes, cost, remaining)
         return _deny_text(real, nbytes, cost, max_bytes, why, remaining, offset, state)
     except Exception:  # noqa: BLE001  (any doubt: the vendor decides)
         return None
