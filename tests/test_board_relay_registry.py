@@ -252,3 +252,27 @@ def test_the_policy_refusal_names_a_q_id_not_an_np_id(world, capsys):
     _, _, mf, _, _ = world
     rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(mf), "--words", "yes", *BY)
     assert rc == 2 and "--sign" in err and "--source <q-id>" in err and "q-<24 hex>" in err and "np-" not in err
+
+
+def test_a_relayed_abandon_causes_a_cut_only_if_the_fold_applied_it_and_its_repo_still_aborts(world, capsys, monkeypatch):
+    """The merged predicate (P2 fix 4/5 and P3 (d)): applied (the fold's structure) + current + signed-or-relayed."""
+    from dataclasses import replace
+
+    from levain.desk import repos_fold as rf
+    store, _, _, band, _ = _begun(world, capsys)
+    rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)
+    assert rc == 0, err
+    n = len((store / "repos.jsonl").read_bytes().splitlines())
+    cause = hashlib.sha256((store / "repos.jsonl").read_text("utf-8").splitlines()[-1].encode()).hexdigest()
+    base = ("decide", "--id", "alpha#1", "--decision", "cut", "--words", "again", *BY, "--cause", cause)
+    rc, _, err = run(capsys, *base)                                   # applied, the repo still aborting, relayed: its cut's cause holds
+    assert rc == 0, err
+    real = rf.fold_repos
+
+    def not_applied(*a, **kw):                                        # the fold soft-rejected the relayed abandon
+        f = real(*a, **kw)
+        return replace(f, applied=tuple(x for x in f.applied if x != n))
+
+    monkeypatch.setattr(rf, "fold_repos", not_applied)
+    rc, _, err = run(capsys, *base)
+    assert rc == 2 and "the registry did not apply" in err, err
