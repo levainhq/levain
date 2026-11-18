@@ -192,15 +192,15 @@ def _doc():
             "reader": {"diverged": ["a:main", "b:main"]}}
 
 
-def test_only_repo_filters_items_audit_problems_and_diverged_and_keeps_store_wide_entries():
+def test_only_repo_filters_items_and_audit_by_id_keeps_store_wide_entries_and_leaves_problems_and_reader_whole():
     out = board_cli.only_repo(_doc(), "a")
     assert [i["id"] for i in out["items"]] == ["a#1"]
     assert [a["why"] for a in out["audit"]] == ["w", "store-wide"]
-    assert out["problems"] == ["repo a not read: x", "line 3: torn: x"]
-    assert out["reader"]["diverged"] == ["a:main"]
+    assert out["problems"] == _doc()["problems"]
+    assert out["reader"] == _doc()["reader"]
     assert board_cli.only_repo(_doc(), None) == _doc()
     text = "\n".join(board_cli.table_lines(_doc(), "a"))
-    assert "diverged: a:main" in text and "b:main" not in text and "b#1" not in text
+    assert "reader (whole board): diverged: b:main" in text and "b#1" not in text
 
 
 def test_ready_show_passes_queue_dir_filters_by_repo_and_notes_all(monkeypatch, capsys, tmp_path):
@@ -213,7 +213,8 @@ def test_ready_show_passes_queue_dir_filters_by_repo_and_notes_all(monkeypatch, 
     assert cli._coord_ready(args, out, None) == 0               # a readable board exits 0, as the v1 show did
     shown = json.loads(out.getvalue())
     assert seen["consent_dir"] == tmp_path and shown["exit"] == 3
-    assert [i["id"] for i in shown["board"]["items"]] == ["a#1"] and shown["board"]["reader"]["diverged"] == ["a:main"]
+    assert [i["id"] for i in shown["board"]["items"]] == ["a#1"] and shown["board"]["reader"]["diverged"] == ["a:main", "b:main"]
+    assert shown["board"]["reader_scope"] == "board"
     assert "--all is ignored" in capsys.readouterr().err
 
 
