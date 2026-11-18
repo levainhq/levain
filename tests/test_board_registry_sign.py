@@ -1520,3 +1520,28 @@ def test_f5_a_rerun_with_nothing_owed_is_a_no_op_that_says_so_and_never_prompts(
     assert "'abandon it' not recorded" in out
     assert br.abandon_track(tgt, "alpha", "other", "desk 1", author=OP, seal=rig.seal())[1] == []
     assert (raw(store), items_raw(store)) == before and prompts == []
+
+
+def test_p3fix6_a_relayed_rerun_resolves_its_authority_by_the_one_rule_the_unrelayed_one_does(
+        store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """levain#97 (gemini MED, L3 r5): the relayed path's lazy source called ``resolve_authority()()`` itself, a second rule next
+    to ``_source(a)``. On an install with no authority log the unrelayed re-run leaves the refusal to the cut's own check;
+    the relayed one refused with the missing-log text. It is ONE rule now (deferred, resolved only for a signed cause)."""
+    tgt = bs.resolve_store(None)
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    _band(monkeypatch, "abandon it")
+    calls: list[int] = []
+
+    def none(**kw):
+        calls.append(1)
+        raise bs.BoardError(sg.NO_AUTHORITY)
+    monkeypatch.setattr(sg, "resolve_authority", none)
+    before = raw(store), items_raw(store)
+    rc, _, plain = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    unrelayed_calls = len(calls)
+    rc2, _, relayed = run(capsys, "abandon-track", "alpha", "--words", "abandon it", "--source", Q5, "--by", "seat-1")
+    assert rc != 0 and rc2 != 0
+    assert (raw(store), items_raw(store)) == before
+    assert sg.NO_AUTHORITY not in relayed                                       # not the missing-log refusal the lazy path raised
+    assert "stands and cannot be the cause of the cuts still owed" in relayed   # the cut's own check speaks, as unrelayed
+    assert len(calls) - unrelayed_calls == unrelayed_calls == 1                 # one resolution each, through the same rule
