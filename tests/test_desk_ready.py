@@ -520,6 +520,19 @@ def _journal_only_v2(store):
     c.close()
 
 
+def test_a_journal_ahead_of_state_is_named_and_the_item_is_shown_at_its_state(store, token):
+    """The reader half of the old journal-ahead test (T7 fix 1, W9): ``list`` is live; the move half is retired."""
+    _add(store, token, to="ready")
+    _add(store, token, "levain:fine", title="Fine", to="ready")
+    _journal_only_v2(store)
+    out = ready.list(CoordStore(store.directory), all=True)
+    assert out["unreadable"] == ["desk:levain:gate (journal v2, state v1)"]
+    assert {i["id"] for i in out["items"]} == {"levain:gate", "levain:fine"}         # shown at its state, and named
+    with pytest.raises(ready.V1Retired):
+        ready.move(store, token, "levain:gate", to="done", who="desk", why="landed.")
+    assert _counts(store) == (3, 2)                                              # nothing written, nothing healed
+
+
 def test_a_state_row_with_a_wrong_shaped_depends_on_is_unreadable(store, token):
     _add(store, token, to="ready", tier="sonnet", done_line="green")
     c = _raw(store)

@@ -13,6 +13,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.consent.questions import QuestionStore
 from levain.desk import morning, ready
 from levain.desk.store import CoordError, CoordStore
+from tests import v1_seed
 
 OPTS = [("a", "A"), ("b", "B")]
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -24,7 +25,7 @@ def world(tmp_path):
     (tmp_path / "consent").mkdir(mode=0o700)
     st = CoordStore(tmp_path / "dispatch")
     tok = st.coord_take()
-    ready.add(st, tok, "x1", repo="levain", title="t", who="operator", why="w")
+    v1_seed.add(st, tok, "x1", repo="levain", title="t", who="operator", why="w")
     qs = QuestionStore(tmp_path / "consent")
     qs.file(agent="claude_code", agent_session_id="s", what="Which?", options=OPTS, rec="a", blocks="x", cwd="/tmp")
     return st, qs, tmp_path / "consent"
@@ -170,7 +171,7 @@ def test_list_ready_with_conn_reads_the_callers_snapshot_not_a_later_write(world
     tok = st.coord_take()
     with read_transaction(st.open_readonly) as conn:
         conn.execute("SELECT COUNT(*) FROM ready_items").fetchone()           # the snapshot starts at the first read
-        ready.add(st, tok, "x2", repo="levain", title="t2", who="operator", why="w")   # committed after the snapshot
+        v1_seed.add(st, tok, "x2", repo="levain", title="t2", who="operator", why="w")   # committed after the snapshot
         held = ready.list_ready(st, all=True, generated="g", conn=conn)
     assert [i["id"] for i in held["items"]] == ["x1"]
     assert [i["id"] for i in ready.list_ready(st, all=True, generated="g")["items"]] == ["x1", "x2"]

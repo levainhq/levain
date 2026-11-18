@@ -211,7 +211,7 @@ def test_a_report_queued_at_the_switch_is_drained_once_into_a_log_line_and_never
     _plant(d, report_id="r-old-2", event="landed", sha="a" * 40)
     before = _v1_rows(store)
     first = work_attach.watch_apply(d)
-    assert len(first) == 1 and "r-old-1" in first[0] and "r-old-2" in first[0] and "never applied" in first[0]
+    assert len(first) == 1 and "r-old-1" in first[0] and "r-old-2" in first[0] and "not applied" in first[0]
     assert work_attach.watch_apply(d) == [] and work_attach.desk_apply(store, token) == []     # once
     assert _v1_rows(store) == before == {"worker_attach": 0, "report_refusals": 0, "ready_items": 0,
                                          "ready_journal": 0, "sessions_seen": 0}
@@ -280,7 +280,7 @@ def _fake_board(monkeypatch, doc=DOC, code=0, err=""):
     from levain.desk import board_cli
 
     calls = []
-    monkeypatch.setattr(board_cli, "state_doc", lambda items=None: calls.append(items) or (code, doc, err))
+    monkeypatch.setattr(board_cli, "state_doc", lambda items=None, **kw: calls.append(items) or (code, doc, err))
     return calls
 
 

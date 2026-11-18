@@ -18,6 +18,7 @@ from levain.consent.questions import QuestionStore
 from levain.desk import drop_reply, intake, morning, ready, seam_plan, work_delta
 from levain.desk import launch as cl
 from levain.desk.store import CoordStore
+from tests import v1_seed
 from tests.test_consent_away import _cockpit
 from tests.test_desk_wake_silent import SID, Rig
 from tests.test_seam_ingest import World
@@ -330,7 +331,7 @@ def test_plan_lists_each_kind_of_thing_the_walk_needs(tmp_path, capsys, monkeypa
         {"request_id": "rq-1", "agent": "claude_code", "session": "seat-9", "tool": "Bash", "what": "git push",
          "cwd": "/x", "tier": "T2", "gap": "g", "undecided_at": "2026-11-03T01:00:00Z", "rule": "r"}])
     w.store.accept_drop("from the phone", surface="phone")
-    ready.add(w.store, w.token, "levain:s4", repo="levain", title="S4 polish", who="seat-9", why="running.", to="running")
+    v1_seed.add(w.store, w.token, "levain:s4", repo="levain", title="S4 polish", who="seat-9", why="running.", to="running")
     plan = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc) + timedelta(minutes=30), "levain")
     assert len(plan) == 7
     assert plan[0].startswith("band: 1 open (#1)") or plan[0].startswith("band: 1 open (new)")
