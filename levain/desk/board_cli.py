@@ -117,7 +117,7 @@ def register(subparsers: Any) -> None:
 
     def source_args(parser: Any) -> None:
         parser.add_argument("--source", default=None, metavar="Q-ID",
-                            help=("Relay a band answer (a native q-<24 hex> question id; flow's np- rows wait for T12's reader): the record is grade relayed (author kind agent), cites the row, and its words "
+                            help=("Relay a band answer (a native q-<24 hex> question id: levain's relay reads this install's own q- ids; an np- row belongs to flow's band and is not read here): the record is grade relayed (author kind agent), cites the row, and its words "
                                   "must be a verbatim excerpt of the answer. Refused for an unknown or unanswered row."))
         parser.add_argument("--band-dir", dest="band_dir", default=None, metavar="DIR",
                             help="The band store --source reads (default: this install's consent directory).")

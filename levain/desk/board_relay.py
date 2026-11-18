@@ -11,7 +11,7 @@ Three things live here, and nothing else does:
 
 * :class:`BandSource`: the one way a row is read by id. :class:`NativeBandSource` is levain's own (a
   :class:`~levain.consent.questions.QuestionStore`, ``q-`` ids, producer ``native``); it refuses an ``np-`` id (flow's band;
-  pinned by a test), so flow's source is T12's work behind this same interface.
+  pinned by a test), so flow's source is separate work behind this same interface.
 * :func:`relay_source`: the WRITE side. Reads the row at write time and refuses, or returns the ``source`` object.
 * :func:`verify_relayed` and :func:`check_manifest`: the READ side, pure over their inputs. They report the row's OWN
   grade and never promote it.
@@ -93,7 +93,7 @@ NATIVE_PRODUCER = "native"
 
 
 class NativeBandSource:
-    """Levain's own band (``questions.db``). It reads a native ``q-<hex>`` id; an ``np-`` id is flow's (T12's reader), so it
+    """Levain's own band (``questions.db``). It reads a native ``q-<hex>`` id; an ``np-`` id is flow's (its reader is not in this install), so it
     is not a row this band holds. The row's grade is the STORE'S CLAIM of a signature (``board_producers._grade``, the one
     grade function the board's evidence and this relay share), never a verification. An option answer's text is its option key,
     as stored."""
@@ -144,7 +144,7 @@ class LazyBand:
         return self._source.row(np_id)
 
 
-NP_UNREADABLE = ("np- rows are flow's band: their reader arrives with T12; cite a q- row (a native question id), or --sign")
+NP_UNREADABLE = ("np- rows are flow's band and are not read here: levain's relay reads this install's native q- question ids; cite a q- row or use --sign")
 
 
 def _grade_words(grade: str) -> str:
@@ -170,7 +170,7 @@ def _row_of(source: BandSource, np_id: str) -> BandRow:
 def check_source_id(np_id: str) -> None:
     """The one validator of a ``--source`` id: a native q-<24 hex> passes; anything else, an np- id included, is refused.
     Called by :func:`relay_source` and by the store's ``add`` BEFORE an idempotent key hit can return. Raises BoardError."""
-    if isinstance(np_id, str) and (NP_RE.fullmatch(np_id) or np_id.startswith("np-")):    # any np- width: flow's band, T12's
+    if isinstance(np_id, str) and (NP_RE.fullmatch(np_id) or np_id.startswith("np-")):    # any np- width: flow's band, not read here
         raise BoardError(f"--source {np_id}: {NP_UNREADABLE}")
     if not isinstance(np_id, str) or not Q_RE.fullmatch(np_id):
         raise BoardError(f"--source {np_id!r} is not a native q-<24 hex> question id")

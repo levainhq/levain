@@ -634,7 +634,7 @@ def register(sub: Any) -> None:
     p.add_argument("--items", type=str, metavar="PATH", help="The store directory or its items.jsonl (default: the pointer, else $LEVAIN_BOARD_ITEMS).")
     p.add_argument("--anneal", metavar="PATH", help=f"The anneal store (episodic db) to read the record from. Default: ${ANNEAL_ENV}.")
     p.add_argument("--flow-episodes", dest="flow_episodes", metavar="PATH",
-                   help=f"Flow's episodic.db, opened read-only for its tags (T9-a; optional). Default: ${FLOW_ENV}.")
+                   help=f"Flow's episodic.db, opened read-only for its tags (optional). Default: ${FLOW_ENV}.")
     p.add_argument("--repo", type=Path, metavar="PATH", help="The repository to read when the registry does not know it.")
     p.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter (as `levain board state --no-land-waiter`): waiters are then declared absent.")
