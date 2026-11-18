@@ -66,7 +66,7 @@ from levain.desk import board_store as bs
 
 __all__ = [
     "ASSERTED_OK", "DECISION_CLASS", "ITEMS_NONE", "NAMESPACE", "POLICY", "SIGNED_GRADES", "Prepared", "Seal", "Verdict",
-    "abandon_problem", "admit", "ceremony", "commit_phone", "earn", "move_is_decision", "prepare", "require_policy", "resolve_authority",
+    "abandon_problem", "admit", "ceremony", "commit_phone", "cut_cause_problem", "earn", "move_is_decision", "prepare", "require_policy", "resolve_authority",
     "signing_bytes", "terminal_seal", "verify_cause", "verify_record",
 ]
 
@@ -185,8 +185,9 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any) -> str | None:
     ``relayed`` one is P3's verifier's to check and is refused), :func:`verify_record` must find it ``valid`` against
     ``snapshot``, and it must name its migration and ``items_last`` (the items file's last line when it was written; an
     abandon from before that field cannot order the items, so it holds no cut). Raises ``VerifierUnavailable`` when
-    ssh-keygen cannot run. The recovery for any of these is to re-run ``abandon-track`` signed: on an ``aborting`` repo
-    whose abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``)."""
+    ssh-keygen cannot run. It is one step of :func:`cut_cause_problem`, the one judgement of a cut's cause; the recovery for
+    any refusal of that is to re-run ``abandon-track`` signed: on an ``aborting`` repo with a cut still owed whose latest
+    abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``)."""
     grade = held.get("grade")
     if grade == GRADE_RELAYED:
         return ("cause names a relayed abandon-track: a relayed citation is checked by P3's verifier, which this build "
@@ -213,7 +214,17 @@ def _index_of(lines: Sequence[bytes], digest: str) -> int | None:
 
 
 def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snapshot: Any) -> str | None:
-    """Why ``record``'s ``cause`` does not hold, or None when it does. ``store`` is :class:`board_store.StoreLines` (each
+    """Why ``record``'s ``cause`` does not hold, or None when it does: :func:`cut_cause_problem` of the record's ``cause``
+    and ``id``. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
+    return cut_cause_problem(record.get("cause"), record.get("id"), store, snapshot)
+
+
+def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", snapshot: Any) -> str | None:
+    """THE one predicate for "can the abandon-track whose line hashes to ``cause`` be the cause of a cut of ``item_id``":
+    why not, or None when it can. :func:`verify_cause` (every cut's write and P6's check) and the abandon recovery
+    (``board_registry._latest_abandon_problem``: must a signed re-run write a fresh abandon) both call it, so the recovery
+    writes a fresh abandon exactly when a cut citing the latest one would be refused (levain 29, fix 3).
+    ``store`` is :class:`board_store.StoreLines` (each
     file's lines as written, and the store id; ``board_store._store_lines``). It holds when ``cause`` is the sha256 of a line
     of ``repos.jsonl`` (ONLY that file is searched) that is an ``abandon-track`` naming THIS store (``store`` equals the store
     id), standing at the place in the registry chain its ``prev`` names (``prev`` is the chain hash of the registry bytes
@@ -224,7 +235,6 @@ def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snaps
     predates it). Both positions are in ``items.jsonl``; nothing is compared across the two files. Raises
     ``VerifierUnavailable`` when ssh-keygen cannot run."""
     from levain.desk import repos_fold as rf
-    cause = record.get("cause")
     if not isinstance(cause, str) or not bs.HASH_RE.fullmatch(cause):
         return "cause must be the lowercase sha256 of an abandon-track record"
     if store is None:
@@ -250,7 +260,6 @@ def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snaps
     if problem is not None:
         return problem
     migration = held["migration"]
-    item_id = record.get("id")
     added_at, added = next(((i, r) for i, r in enumerate(map(_parse, store.items))
                             if isinstance(r, dict) and r.get("op") == "add" and r.get("id") == item_id), (None, None))
     if added is None:
