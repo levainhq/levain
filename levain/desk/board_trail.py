@@ -69,9 +69,15 @@ Known edges, stated rather than hidden:
   ``board_author.annotate`` (the function ``board state`` calls for ``closed_by``; this module holds no attribution rule), in
   P4's words. ``export`` writes each close's ``closed_by`` into the bundle; a bundle ``verify`` RE-DERIVES it when the repo is
   reachable (a close that derives differently is a break) and otherwise says "recorded in the bundle, not re-derived (repo not
-  available)", never "verified". A derivation that fails is a note on that close (attribution never fails a read). The
-  re-derivation is made with THIS install's authority log (``--data-root``): a key revoked since the export reads as a
-  different tier, and that is a break the line explains (the bundle's close and the re-derived one are both printed).
+  available)", never "verified". A derivation that fails is a note on that close (attribution never fails a read). A BREAK
+  means the bundle and the evidence this verifier HOLDS disagree; what it could not check is said, rc 0, never "matches". The
+  re-derivation is made with THIS install's authority log and desk store, so a close can derive weaker here for a reason
+  that is no disagreement, and P4's structured ``degraded`` marker says which: a tier this install could not CHECK (no
+  authority log, no launch records) prints the bundle's close as "not re-derived here" with the reason; a signing key this
+  install's log revoked since the export prints a line of its own naming the revocation, but only for the SAME commit and
+  the SAME key the bundle names (a revocation never excuses another commit or another signer); a close the exporter could
+  not check that this install can is printed as re-derived here. A repo at the registered path that does not hold the
+  recorded close's commit is not the evidence the bundle was made from: "not re-derived" with that reason, never a break.
 """
 from __future__ import annotations
 
@@ -458,17 +464,108 @@ def derive_closes(trail: Trail) -> tuple[dict[str, dict[str, Any]], dict[str, st
     return closes, bands, read, ""
 
 
+_NOT_CLAIM = ("note", "degraded")                     # a verdict's caveats, not its claim
+_RANK = {"unattributed": 0, "git": 1, "trailer": 2, "signed": 3}
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+
+
 def _same_close(recorded: Mapping[str, Any], derived: Mapping[str, Any]) -> bool:
-    """Whether a recorded ``closed_by`` and a re-derived one are the same claim: every field alike but the free-text note."""
-    return {k: v for k, v in recorded.items() if k != "note"} == {k: v for k, v in derived.items() if k != "note"}
+    """Whether a recorded ``closed_by`` and a re-derived one are the same claim: every field alike but the free-text note and
+    the ``degraded`` marker (why a verdict is weaker, not what it claims)."""
+    return ({k: v for k, v in recorded.items() if k not in _NOT_CLAIM}
+            == {k: v for k, v in derived.items() if k not in _NOT_CLAIM})
+
+
+def _rank(tier: Any) -> int:
+    return _RANK.get(tier, -1) if isinstance(tier, str) else -1
+
+
+def _marker(c: Mapping[str, Any]) -> Mapping[str, Any]:
+    d = c.get("degraded")
+    return d if isinstance(d, Mapping) else {}
+
+
+def _same_commit(recorded: Mapping[str, Any], derived: Mapping[str, Any]) -> bool:
+    return (recorded.get("commit") is not None and recorded.get("commit") == derived.get("commit")
+            and recorded.get("close_commit") == derived.get("close_commit"))
+
+
+def _store_facts(trail: Trail) -> tuple[set[str] | None, dict[str, str]]:
+    """``(the item ids the trail's own items.jsonl holds (None: its fold could not be read), each registered repo's path)``,
+    by each file's own fold."""
+    from levain.desk.board_state import fold
+    from levain.desk.repos_fold import fold_repos
+    ids: set[str] | None
+    try:
+        texts = [x.decode("utf-8", "replace") for x in trail.lines["items.jsonl"]]
+        ids = set(fold(texts).items)
+    except Exception:                                   # noqa: BLE001 - the fold's own verdicts are printed above
+        ids = None
+    try:
+        got = fold_repos(trail.lines["repos.jsonl"], store_id=trail.store_id or None,
+                         unterminated_tail=bool(trail.unterminated.get("repos.jsonl")))
+        paths = {name: r.path for name, r in got.repos.items() if isinstance(r.path, str)}
+    except Exception:                                   # noqa: BLE001
+        paths = {}
+    return ids, paths
+
+
+def _held(path: str | None, recorded: Mapping[str, Any]) -> tuple[bool, str]:
+    """Whether the repo at ``path`` HOLDS the recorded close's commit(s) (``cat-file -e <sha>^{commit}`` through the evidence
+    reader's hardened git), and the first one it does not hold. A recorded close with no commit, or one that is not a commit
+    name, is not judged here: ``(True, "")`` (the caller's verdict stands)."""
+    from levain.desk import board_evidence as be
+    shas = [x for x in (recorded.get("commit"), recorded.get("close_commit")) if x is not None]
+    if not shas or not all(isinstance(x, str) and _HEX40.fullmatch(x) for x in shas) or not path:
+        return True, ""
+    for sha in shas:
+        try:
+            cp = be._run(Path(path), "cat-file", "-e", f"{sha}^{{commit}}")
+            ok = cp.returncode == 0
+        except be.GitFailed:
+            ok = False
+        if not ok:
+            return False, sha
+    return True, ""
+
+
+def _differ_line(item_id: str, rec: Mapping[str, Any], now: Mapping[str, Any]) -> str | None:
+    """The verdict on a recorded close that the re-derivation answers with a different claim, when the difference is no
+    disagreement (the rules below, in order); None: it is a disagreement (the caller's BREAK, after the held-commit check)."""
+    from levain.desk import board_author as ba
+    dn, dr = _marker(now), _marker(rec)
+    same = _same_commit(rec, now)
+    # 1. this install could not check (or read) what the bundle claims: the bundle's words, not re-derived, and why
+    if dn.get("kind") == "unread":
+        return f"close {item_id}: {ba.describe(rec)} (recorded in the bundle, not re-derived here: {dn.get('why')})"
+    if (dn.get("kind") == "unchecked" and same and _rank(rec.get("tier")) >= _rank(dn.get("from_tier"))
+            and _rank(dn.get("from_tier")) > 0):
+        return f"close {item_id}: {ba.describe(rec)} (recorded in the bundle, not re-derived here: {dn.get('why')})"
+    # 2. the same commit, signed by the same key the bundle names, and that key revoked in this install's log since (one way)
+    if (dn.get("kind") == "revoked" and rec.get("tier") == "signed" and same and rec.get("who") is not None
+            and rec.get("who") == dn.get("principal")):
+        return (f"close {item_id}: {ba.describe(now)}; the bundle records it signed by {rec.get('who')}, and that key is "
+                f"revoked in this install's authority log (seq {dn.get('revoked_seq')}) since")
+    # 3. the exporter could not check (or read) it and this install can: the same commit, credited higher here
+    if dr.get("kind") == "unread" and rec.get("commit") is None and _rank(now.get("tier")) > _rank(rec.get("tier")):
+        return f"close {item_id}: {ba.describe(now)} (the bundle could not check this close; re-derived here)"
+    if (dr.get("kind") == "unchecked" and same and _rank(rec.get("tier")) < _rank(now.get("tier"))
+            <= _rank(dr.get("from_tier"))):
+        return f"close {item_id}: {ba.describe(now)} (the bundle could not check this close; re-derived here)"
+    return None
 
 
 def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> tuple[list[str], int]:
     """``(lines, breaks)``: one verdict per closed item, in P4's words (``board_author.describe``), the weakest claim the evidence
     supports. A live store's closes are derived now. A bundle that records closes has each RE-DERIVED when its repo is reachable:
-    the same claim is "re-derived from the repo, matches the bundle's record", a different one is a break; a repo not reachable
-    prints the bundle's close as recorded, "not re-derived (repo not available)", never as verified. A close the repo shows that
-    the bundle does not record is said, not a break. A derivation that fails is one note line, never a crash and never a break."""
+    the same claim is "re-derived from the repo, matches the bundle's record" (with the bundle's note when it differs); a
+    different one is a break unless the difference is no disagreement (:func:`_differ_line`: this install could not check it,
+    the same key's revocation since, the exporter could not check it) or the repo does not HOLD the recorded commit (not the
+    evidence the bundle was made from: "not re-derived"); a recorded close of an item the bundle's own records do not hold is a
+    break; a repo not reachable prints the bundle's close as recorded, "not re-derived (repo not available)", never as
+    verified. A close the repo shows that the bundle does not record is said, not a break; a band close is printed as live
+    verify prints it. A bundle that records no closes prints this install's own derivation, labelled as that. A derivation
+    that fails is one note line, never a crash and never a break."""
     from levain.desk import board_author as ba
     closes, bands, read, why = derive_closes(trail)
     lines: list[str] = []
@@ -480,32 +577,54 @@ def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> tuple[list[st
         if trail.from_bundle:
             lines.append(f"closes: the export could not derive them ({trail.closes_unavailable})" if trail.closes_unavailable
                          else CLOSES_NONE)
+        label = " (derived by this install from the repo now; the bundle records none)" if trail.from_bundle else ""
         for item_id, by in sorted(closes.items()):
-            lines.append(f"close {item_id}: {ba.describe(by)}")
+            lines.append(f"close {item_id}: {ba.describe(by)}{label}")
         for item_id, note in sorted(bands.items()):
-            lines.append(f"close {item_id}: {note}")
+            lines.append(f"close {item_id}: {note}{label}")
         return lines, breaks
     if why:
         lines.append(f"closes: not re-derived ({why})")
     if trail.closes_unavailable:
         lines.append(f"closes: the export could not derive them ({trail.closes_unavailable})")
+    ids, paths = _store_facts(trail)
     for item_id, rec in sorted(recorded.items()):
         repo = item_id.rpartition("#")[0]
-        if item_id in closes:
-            now = closes[item_id]
-            if _same_close(rec, now):
-                lines.append(f"close {item_id}: {ba.describe(now)} (re-derived from the repo; matches the bundle)")
-            else:
-                breaks += 1
-                lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo derives [{ba.describe(now)}]")
-        elif repo in read:
+        if ids is not None and item_id not in ids:
             breaks += 1
-            lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo does not show the item closed")
-        else:
+            lines.append(f"BREAK close {item_id}: the bundle records a close for {item_id}, which its own records do not hold")
+            continue
+        if item_id in closes and _same_close(rec, closes[item_id]):
+            now = closes[item_id]
+            theirs = rec.get("note") or ""
+            extra = f"; the bundle's note: {theirs}" if theirs and theirs != (now.get("note") or "") else ""
+            lines.append(f"close {item_id}: {ba.describe(now)} (re-derived from the repo; matches the bundle{extra})")
+            continue
+        if item_id in closes:
+            said = _differ_line(item_id, rec, closes[item_id])
+            if said is not None:
+                lines.append(said)
+                continue
+        elif repo not in read:
             lines.append(f"close {item_id}: {ba.describe(rec)} (recorded in the bundle, not re-derived (repo not available))")
+            continue
+        held, missing = _held(paths.get(repo), rec)
+        if not held:
+            lines.append(f"close {item_id}: {ba.describe(rec)} (recorded in the bundle, not re-derived: the repo at "
+                         f"{paths.get(repo)} does not hold commit {missing[:12]})")
+            continue
+        breaks += 1
+        if item_id in closes:
+            lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo derives "
+                         f"[{ba.describe(closes[item_id])}]")
+        else:
+            lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo does not show the item closed")
     for item_id, now in sorted(closes.items()):
         if item_id not in recorded:
             lines.append(f"close {item_id}: {ba.describe(now)} (derived from the repo; the bundle records no close for it)")
+    for item_id, note in sorted(bands.items()):
+        if item_id not in recorded:
+            lines.append(f"close {item_id}: {note}")
     return lines, breaks
 
 

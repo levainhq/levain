@@ -811,3 +811,48 @@ def test_a_file_added_then_removed_on_main_is_still_credited_to_the_commit_that_
     c = verdict(sc, item(8, "document", "docs/gone.md"), "docs/gone.md")
     assert (c.who, c.commit) == ("Gone Adder", added)
     assert c.how == "first added docs/gone.md, asserted by git author"
+
+
+# ------------------------------------------------------------------------------------------------ DEGRADED (P6 fix 4)
+def test_degraded_a_revoked_key_carries_the_structured_revocation_beside_the_unchanged_note(sc):
+    c = verdict(sc, item(9), sc.c["old_before"])
+    fp = sc.keys["old"].fp
+    d = c.to_dict()["degraded"]
+    assert d == {"kind": "revoked", "from_tier": "signed", "key": fp, "principal": d["principal"], "revoked_seq": 4}
+    assert d["principal"].startswith("k") and f"signed by {fp}, revoked at seq 4" in c.note       # describe() is unchanged
+
+
+def test_degraded_a_signed_tier_this_reader_could_not_check_is_unchecked_from_signed(sc, tmp_path, monkeypatch):
+    for res in (ba.Resolvers(None, seats(sc)), ba.Resolvers(ba.CockpitAuthority(tmp_path / "no-cockpit"), seats(sc))):
+        d = verdict(sc, item(1), sc.c["signed"], res).to_dict()["degraded"]
+        assert (d["kind"], d["from_tier"]) == ("unchecked", "signed") and "not checked" in d["why"]
+    from levain.team import signing
+    monkeypatch.setattr(signing, "verify_commit", lambda repo, sha: signing.Verdict("indeterminate", None, "ssh-keygen gone"))
+    d = verdict(sc, item(4), sc.c["plain"]).to_dict()["degraded"]
+    assert (d["kind"], d["from_tier"]) == ("unchecked", "signed") and "ssh-keygen gone" in d["why"]
+
+
+def test_degraded_a_trailer_this_reader_could_not_check_is_unchecked_from_trailer(sc):
+    d = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), None)).to_dict()["degraded"]
+    assert d == {"kind": "unchecked", "from_tier": "trailer", "why": "a Board-Seat trailer is present but no launch records are consulted"}
+
+    def unreadable(key):
+        raise ba.NotChecked("the desk store is absent")
+    d = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), unreadable)).to_dict()["degraded"]
+    assert (d["kind"], d["from_tier"]) == ("unchecked", "trailer") and "the desk store is absent" in d["why"]
+    gone = ba.Resolvers(sc.authority(), seats(sc, cwd=sc.repo.parent / "worktree-removed"))
+    d = verdict(sc, item(3), sc.c["seat"], gone).to_dict()["degraded"]
+    assert (d["kind"], d["from_tier"]) == ("unchecked", "trailer") and "is not a git repo this reader can read" in d["why"]
+
+
+def test_degraded_a_tier_checked_and_refused_carries_no_marker(sc, tmp_path):
+    assert "degraded" not in verdict(sc, item(2), sc.c["stranger"]).to_dict()                        # key not in the log
+    assert "degraded" not in verdict(sc, item(14), sc.c["unknown_seat"]).to_dict()                   # no launch maps it
+    assert "degraded" not in verdict(sc, item(3), sc.c["seat"], ba.Resolvers(sc.authority(), seats(sc, items=("scratch#99",)))).to_dict()
+    assert "degraded" not in verdict(sc, item(4), sc.c["plain"]).to_dict()
+    assert "degraded" not in verdict(sc, item(1), sc.c["signed"]).to_dict()
+
+
+def test_degraded_an_author_that_cannot_be_read_is_unread():
+    d = ba._unread(ba.be.GitFailed("git went away")).to_dict()
+    assert d["degraded"] == {"kind": "unread", "why": "the author could not be read (git went away)"} and d["how"] == d["degraded"]["why"]
