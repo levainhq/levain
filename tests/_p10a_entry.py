@@ -46,8 +46,13 @@ def _gates() -> None:
         from levain.agents import bars
 
         # the five points of the revoke's crash matrix (A0 section 2.2), each the first call of its step: SIGKILL there
+        from levain.agents import controller as _controller
+
+        # c9 (P6-5): the launcher, after its launch commit, at the one door to a fire (the row is committed 'launched'
+        # with its slot and reservation; the process dies before any fire exists)
         point = {"c1": (bars, "open_bar"), "c2": (aa, "_prepare_onto"), "c3": (aa, "revoke_agent_sign"),
-                 "c4": (aa, "revoke_agent_finish"), "c5": (bars, "close_bar")}[kill]
+                 "c4": (aa, "revoke_agent_finish"), "c5": (bars, "close_bar"),
+                 "c9": (_controller, "spawn_fire")}[kill]
         setattr(point[0], point[1], _sigkill)
     sink = os.environ.get("P10A_NO_SPAWN")
     if sink:

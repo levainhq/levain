@@ -579,3 +579,88 @@ def test_p10a_revoke_killed_c4_c5_recovery_by_the_tick(tmp_path, point):
     inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
     (bar,) = _bar(inst)
     assert (bar["open"], bar["reason"], bar["revoke_seq"]) == (0, "signed", 6)
+
+
+# ------------------------------------------------------- an open reservation at a crash (c9) and the counters' ceilings
+
+def _crashed_start(inst):
+    """``levain dream start`` SIGKILLed at the one door to a fire (P10A_KILL=c9): the launch has committed, the fire does
+    not exist."""
+    got = inst.cli("dream", "start", kill="c9", spawn_gate=False)
+    assert got.rc == -9 and got.out == "" and got.err == "", got
+
+
+def test_p10a_open_reservation_at_a_crash(tmp_path):
+    """invariant 7 / c9: the launcher dies after its launch commit and before any fire. The row is ``launched`` holding
+    its slot and an OPEN reservation (the whole 20 USD run cap); a second start is refused as in flight; the tick, past
+    the launch lease, ends the row stopped/crash_recovered, frees the slot and settles the reservation WHOLE (debited in
+    full, reason ``unreadable``: no usage was ever read, so the cap is the cost); that settled run counts at the
+    ceiling, so the next start is refused ``skipped-budget: ceiling`` and takes nothing."""
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    assert inst.sign(inst.link_doc(run_ceiling=1)).rc == 0
+    _crashed_start(inst)
+    (run,) = inst.rows()
+    assert (run["state"], run["reason"], run["pid"], run["epoch"]) == ("launched", None, None, 0) and run["lease_until"]
+    (slot,) = inst.rows("SELECT * FROM agent_slots")
+    assert (slot["owner_kind"], slot["owner_id"]) == ("occurrence", run["occurrence_id"])
+    (res,) = inst.rows("SELECT * FROM agent_reservations")
+    assert (res["state"], res["reserved_usd_micros"], res["debited_usd_micros"]) == ("open", 20_000_000, None)
+    assert inst.spawned() == []                                          # no fire was ever asked for
+
+    held = inst.cli("dream", "start")
+    assert held.err == (f"levain dream start: {run['occurrence_id']} (manual, launched) is still in flight, and the "
+                        "dream runs one occurrence at a time; nothing was claimed\n")
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    assert tick.rc == 6 and "was launched but no fire claimed it within its 900s launch lease: it was ended " \
+        "stopped/crash_recovered (takeover), its slot freed and its reservation settled\n" in tick.err
+    (ended,) = inst.rows()
+    assert (ended["state"], ended["reason"], ended["epoch"]) == ("stopped", "crash_recovered", 1)
+    assert inst.rows("SELECT * FROM agent_slots") == []
+    (settled,) = inst.rows("SELECT * FROM agent_reservations")
+    assert (settled["state"], settled["debited_usd_micros"], settled["settled_reason"]) == ("settled", 20_000_000, "unreadable")
+
+    over = inst.cli("dream", "start")
+    assert over.rc == 1 and over.err.endswith(" ended skipped-budget: ceiling; nothing was started\n")
+    assert [r["state"] for r in inst.rows("SELECT * FROM agent_occurrences ORDER BY admitted_at")] == ["stopped", "skipped-budget"]
+    assert len(inst.rows("SELECT * FROM agent_reservations")) == 1 and inst.rows("SELECT * FROM agent_slots") == []
+
+
+def test_p10a_counters_at_their_ceiling(tmp_path):
+    """invariant 7: counters at their ceiling. (a) run_ceiling 1: two ``dream start`` processes racing for the one place
+    leave exactly one launched (one slot, one reservation, one fire asked for) and the other ``skipped-overlap``; (b) the
+    dollar window (40 USD, 20 USD a run): two runs each settled whole by recovery fill it, and the next start, after the
+    operator resumes the paused dream, is refused ``skipped-budget: budget_window`` and takes nothing."""
+    from tests._p10a_rig import finish, popen
+
+    (tmp_path / "one").mkdir()
+    inst = Install(tmp_path / "one")
+    assert inst.enable("--time", "00:00").rc == 0
+    assert inst.sign(inst.link_doc(run_ceiling=1)).rc == 0
+    ran = [finish(p) for p in [popen(inst, "dream", "start", spawn_gate=True) for _ in range(2)]]
+    _clean(*ran)
+    wins = [r for r in ran if r.rc == 0]
+    losses = [r for r in ran if r.rc == 1]
+    assert len(wins) == 1 and len(losses) == 1, ran
+    assert losses[0].err == ("levain dream start: the claim answered skipped-overlap: another occurrence of the dream is "
+                             "live or this second was already claimed; nothing was started\n")
+    states = sorted(r["state"] for r in inst.rows())
+    assert states == ["launched", "skipped-overlap"]
+    assert len(inst.rows("SELECT * FROM agent_slots")) == 1 and len(inst.rows("SELECT * FROM agent_reservations")) == 1
+    (launched,) = [r for r in inst.rows() if r["state"] == "launched"]
+    assert inst.spawned() == [launched["occurrence_id"]]
+
+    (tmp_path / "two").mkdir()
+    dollars = Install(tmp_path / "two")
+    assert dollars.enable("--time", "00:00").rc == 0
+    assert dollars.sign(dollars.link_doc(run_ceiling=5)).rc == 0
+    for hour in (3, 4):
+        _crashed_start(dollars)
+        assert dollars.cli("agents", "tick", now=utc(2026, 11, 19, hour, 0, 0)).rc == 6
+    assert [(r["state"], r["debited_usd_micros"]) for r in dollars.rows("SELECT * FROM agent_reservations")] == [
+        ("settled", 20_000_000)] * 2
+    assert dollars.cli("agents", "resume", "dream", spawn_gate=False).out.endswith(": active\n")     # two failures paused it
+    third = dollars.cli("dream", "start")
+    assert third.rc == 1 and third.err.endswith(" ended skipped-budget: budget_window; nothing was started\n")
+    assert len(dollars.rows("SELECT * FROM agent_reservations")) == 2 and dollars.rows("SELECT * FROM agent_slots") == []
+    assert dollars.spawned() == []
