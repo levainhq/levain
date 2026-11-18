@@ -1662,3 +1662,42 @@ def test_one_name_rule_a_registered_name_the_charter_can_use_and_track(decision_
     assert charter.check_text(CHARTER.format(name=name, plan=f"- {iid}"), repo_name=name)[0] == []
     ok(capsys, "track", name, "--words", "go", *A)
     assert reg_lines(store)[-1]["op"] == "track"
+
+
+def test_charter_guard_refuses_when_the_registry_or_the_registered_path_cannot_be_read(store, tmp_path, mkrepo, capsys, monkeypatch):
+    import shutil
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    monkeypatch.chdir(b)
+    # a registered path that is gone: refused, with the move hint, nothing written
+    moved = tmp_path / "alpha-moved"
+    a.rename(moved)
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and "cannot be read as a git repository" in err and "levain board move" in err and f"--repo {os.path.realpath(a)}" in err
+    assert not (b / "CHARTER.md").exists()
+    rc, _, err = _charter(capsys, "check", "--repo-name", "alpha", "--worktree")
+    assert rc == 2 and "levain board move" in err
+    # --file reads only that file: not refused
+    f = tmp_path / "C.md"
+    f.write_text("x\n", encoding="utf-8")
+    rc, _, err = _charter(capsys, "check", "--repo-name", "alpha", "--file", str(f))
+    assert rc == 0 and "registered at" not in err
+    # --json refused: one document, rc 2
+    rc, out, _ = _charter(capsys, "check", "--repo-name", "alpha", "--worktree", "--json")
+    assert rc == 2 and json.loads(out)["valid"] is False and "levain board move" in json.loads(out)["why"]
+    # --stdout writes nothing: the guard does not run
+    rc, out, _ = _charter(capsys, "init", "alpha", "--stdout")
+    assert rc == 0 and out.startswith("# Charter: alpha")
+    moved.rename(a)
+    # a torn registry (a store IS found): refused, not open
+    p = store / "repos.jsonl"
+    p.write_bytes(p.read_bytes() + b'{"torn')
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and "cannot tell where alpha is registered" in err and not (b / "CHARTER.md").exists()
+
+
+def test_charter_guard_stays_open_with_no_store_or_an_unregistered_name(home, tmp_path, mkrepo, capsys, monkeypatch):
+    b = mkrepo("beta")
+    monkeypatch.chdir(b)                                                # no store configured at all
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 0 and (b / "CHARTER.md").exists(), err

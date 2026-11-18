@@ -550,3 +550,10 @@ def test_the_private_anneal_names_add_verbatim_uses_still_exist(name: str):
     assert hasattr(IntentionStore, name), (
         f"anneal's IntentionStore no longer has {name}, which levain.keep_migrate._add_verbatim calls. "
         "Update _add_verbatim, or ask anneal for a public add that takes notes/created/seen.")
+
+
+def test_a_printed_reason_carries_no_internal_id(env: Env):
+    import re
+    why = [i["why"] for i in km.load_plan(_plan(env))["items"]]
+    assert any("Tray" in w for w in why) and any("someday" in w for w in why)
+    assert not [w for w in why if re.search(r"\bT\d+[a-z]?\b|\bSD-\d+", w)]

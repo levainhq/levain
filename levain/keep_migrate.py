@@ -291,9 +291,9 @@ def _propose(row: Mapping[str, Any], *, handoff_to: str, agenda_date: str | None
             return ({"kind": DEST_INTENTION, "disposition": "agenda", "next": agenda_date},
                     f"legacy handoff to a dated agenda ({agenda_date}), so it reaches the operator once as a band row")
         return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
-                "legacy handoff to a someday: the agent sees it in the Tray at session start (T10a)")
+                "legacy handoff to a someday: the agent sees it in the Tray at session start")
     return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
-            "undated agenda never germinates: becomes a someday (SD-15, decided)")
+            "undated agenda never germinates: becomes a someday")
 
 
 # ---------------------------------------------------------------- the plan file
