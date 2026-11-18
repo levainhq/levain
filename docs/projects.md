@@ -47,7 +47,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
    levain board register X --words "<the operator's words>" --by <desk> --path <repo directory>
    ```
 
-   The repo needs at least one commit. Without one, `register` refuses: nothing identifies the repository.
+   The repo needs at least one commit. Without one, `register` refuses: nothing identifies the repository. The name X must match `[a-z0-9][a-z0-9._-]*`: lowercase only. `register Alpha` prints `refused: repo 'Alpha' must match [a-z0-9][a-z0-9._-]*`. X is a name, not the directory's name; the directory is what `--path` says.
 
 2. **The desk reads X's existing memory, read-only.** That is `next.md` or `brief.md`, any project memory, status pages, TODO files, the README and the conventions files.
 
@@ -63,7 +63,18 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
      levain board begin-track X --words "<the operator's yes>" --by <desk> --manifest <file.json> [--owner <desk>] [--migration M]
      ```
 
-     The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old memory files to copy and stub, and `record_dir` (optional) names where the copies go. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
+     The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old memory files to copy and stub, each as a `{repo, path}` object (a bare path string is refused: `a retire entry is exactly {repo, path}`), and `record_dir` (optional) names where the copies go. A complete manifest:
+
+     ```json
+     {
+       "plan_items": ["k1", "k2"],
+       "contract_items": ["alpha"],
+       "retire": [{"repo": "alpha", "path": "status.md"}],
+       "record_dir": "/path/to/records"
+     }
+     ```
+
+     `begin-track` prints the migration id: `tracking alpha (migration mf538fa9a1e)`. That id is the `M` in `--key M:<k>`; `board repos` shows it too, and a retry prints `already tracking alpha (migration ...)` with the same id. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
 
    - **(b) Expand: the items.** Each item is added with its key and a hash of its fields:
 
@@ -73,7 +84,9 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut. A stalled landing only means the switch has not happened, and X stays locked.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main --repo-name X --items <store>` reports `X's CHARTER.md (origin/main) is a valid charter.` once it is. The charter's title must name the registered repo X. `check` takes the repo's name from the directory it runs in, so when the directory is named otherwise (a clone called `clone-dir` for repo `alpha`) the title reads `names 'alpha', not this repository's name 'clone-dir'` until `--repo-name X` is passed. `check` only reports and exits 0; `track` is the gate. It runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut.
+
+     To cut an item: `levain board decide --id X#<n> --decision cut --words "<why>" --by <desk>` (it prints `decided X#<n>`). A cut item must also leave the landed Plan: `charter init --items` leaves a cut item out of a Plan it writes, but a Plan already landed is edited by hand and landed again before `track` will pass. A stalled landing only means the switch has not happened, and X stays locked.
 
    - **(d) Switch.** This is the one record that moves the source of truth from the old files to the board:
 
@@ -81,15 +94,23 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
      levain board track X --words "<the operator's yes>" --by <desk>
      ```
 
-     It refuses unless (b) and (c) hold. From here the board is the source, and the lock lifts.
+     It refuses unless (b) and (c) hold. From here the board is the source, and the lock lifts. `add --key` does not check the key's `<k>` against the manifest; `track` does (see Known edges).
 
-   - **(e) Contract: the stubs.** Each file named in `retire` is copied to `<record dir>/pre-track-<date>/` with a sha256 line, then replaced at its old path by a stub. The stub's first line is the marker `<!-- levain: tracked stub -->`. Until a stub lands, `levain board repos` reports `stale: <path> still holds pre-track content`. No seat acts on the old content in that gap.
+   - **(e) Contract: the stubs.** There is no verb for this step; the desk does it by hand. It copies each file named in `retire` to `<record dir>/pre-track-<date>/` with a sha256 line (a file such as `SHA256` holding `<hash>  status.md`; the name is the desk's choice and nothing checks it), then replaces the file at its old path with a stub, commits and pushes. The stub's first line must be the marker `<!-- levain: tracked stub -->`; the rest is free text (the run used `This file is retired; state lives on the Levain board (levain board state).`). The one thing checked is that marker, in the file in the repo's working tree, not on origin/main. Until a stub is in place, `levain board repos` reports `stale: <path> still holds pre-track content`. No seat acts on the old content in that gap.
 
 6. **The desk writes one decision episode** tagged `repo:X`, naming the charter, the item count and the record directory.
 
 **Aborting.** Before the switch only. `levain board abandon-track X --words "<the operator's words>" --by <desk>` makes X `aborting` and cuts its items. Run it again to finish the cuts. `levain board abandon-done X --by <desk>` returns X to untracked once every item is cut and any compensation, such as a reverted charter, has landed. After the switch there is no abort. Leaving tracked mode is `levain board untrack X --words "<the operator's words>" --by <desk>`, which refuses while any item is not done, cut, parked or out of 1.0.
 
 **The desk's own door.** A desk seat's brief opens the board verbs except `move`, `pause`, `resume` and `ack-torn`, and the charter verbs `init` and `check`. Those four board verbs run from a terminal.
+
+## Reading the board
+
+`levain board repos` lists each repo's mode and the next step. `levain board state` derives every item's state when you read it, and `levain board context X#<n>` prints one item's context.
+
+- The `as of` time in `board state`'s header is the time of the last fetch of origin, not of the read. `--now` does not move it; it moves when origin has changed.
+- On a store with no land-waiter configured, items read `unknown` (`waiters: not supplied`) and `board state` exits 3. Pass `--no-land-waiter` to read the items without one: `levain board state --no-land-waiter`, and the same for `board context`.
+- `board state` exits 3 while its audit is not empty, whatever the items say.
 
 ## Charter
 
@@ -133,6 +154,8 @@ Until a signed grade exists, `kind: operator` is a claim, and so is every author
 - **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
 - **Closing a tracked seat is not checked yet.** `levain/desk/seat_close.py` holds the check, and nothing in Levain calls it. Flow's seat close is the caller, and that side is not written.
 - **Before a store's first registration, `add` takes items for any repo.** The registry is inactive until the store has a `repos.jsonl`, and the mode check starts with it.
+- **An aborted repo that holds cut items keeps one audit line.** After `abandon-done`, `board state` carries `unknown: -: X: the repo is untracked, not tracked: not read` for as long as the repo has cut items.
+- **`add --key` does not check the key against the manifest.** `board add --key M:k3` succeeds for a `k3` that is not in `plan_items` and gets an id; `track` is what refuses it, when the Plan and the manifest differ.
 - **Agent names are asserted, not key-bound.** Binding an agent to a key is 1.1.
 - **The registry and the store belong to one install.** A second machine needs the same store.
 - **The stub check reads only the paths named in `retire` at tracking.** A status file added later is not caught.
