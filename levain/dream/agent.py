@@ -1768,7 +1768,9 @@ def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str |
         sb, sm = bound_pair(signed)
         spec_side = (f"the occurrence's spec binds the program {sb!r}, the model {sm!r} and "
                      f"{facts_file(bound_facts_path(signed))}: the facts changed after that spec was registered")
-    pair_differs = unknown is not None or bound_pair(signed) != (inst.claude_bin, inst.model)
+    spec_pair = (DEFAULT_CLAUDE_BIN, DEFAULT_CLAUDE_MODEL) if signed is None else bound_pair(signed)
+    pair_differs = unknown is not None or spec_pair != (inst.claude_bin or DEFAULT_CLAUDE_BIN,
+                                                        inst.model or DEFAULT_CLAUDE_MODEL)
     lead = ("the dream program and model are not what the occurrence's spec binds" if pair_differs else
             "the dream's first-run facts file is not what the occurrence's spec binds")
     return f"{lead}: {facts}, but {spec_side}. Every fire of that spec refuses. {_revise_advice(agent_dir, inst)}"

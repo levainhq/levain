@@ -110,6 +110,48 @@ def test_a_program_change_still_leads_with_the_program_words(env, capsys, monkey
     _refused_at_hook_and_fire(env, _row(signed), monkeypatch, REFUSED)
 
 
+def test_a_default_program_install_edited_in_its_facts_path_only_leads_with_the_facts_file(env, capsys):
+    # reproduced: the install names no program or model, only facts_path is edited, and the refusal printed
+    # "the first-run facts file is not what the occurrence's spec binds: ... the program 'claude', the model ..."
+    a = _refusing_facts(env["tmp"] / "a.json")
+    da.write_install(env["ag"], **env["kw"], facts_path=a)
+    signed = _enabled(env, capsys)
+    _hand_edit(env, facts_path=str(_passing_facts(env["tmp"] / "b.json")))
+    why = _refusal(env, _row(signed))
+    assert why.startswith(FACTS_REFUSED)
+    inst = da.read_install(env["ag"])
+    # an install whose program and model read back as unset is the same install, so the same lead
+    unset = SimpleNamespace(claude_bin=None, model=None, facts_path=inst.facts_path)
+    signed_here = da.live_binding(model=None, claude_bin=None, facts_path=a)
+    assert da._live_bound_refusal(env["ag"], unset, signed_here).startswith(FACTS_REFUSED)
+
+
+def test_a_spec_with_no_binding_is_judged_without_reading_a_binding(env, capsys):
+    da.write_install(env["ag"], **env["kw"])
+    signed = _enabled(env, capsys)
+    _hand_edit(env, facts_path=str(_passing_facts(env["tmp"] / "f.json")))
+    assert _refusal(env, _row(signed)).startswith(FACTS_REFUSED)
+
+
+def test_a_live_spec_registered_under_the_old_binding_words_is_refused_with_the_command_to_revise(env, capsys,
+                                                                                                  monkeypatch):
+    # #126's source text for a non-default program: this build does not write it, so its link covers no live install
+    old = ", bound to this dream program and model (a change is a new spec, which needs a new signed link): "
+    da.write_install(env["ag"], **env["kw"], claude_bin=str(env["tmp"] / "a" / "claude"))
+    with monkeypatch.context() as m:
+        m.setattr(da, "LIVE_BOUND", old)
+        signed = _enabled(env, capsys)
+    why = _refusal(env, _row(signed))
+    assert "not one this build writes" in why and "Every fire of that spec refuses" in why
+    assert "levain dream enable --revise" in why and "sign a new link" in why
+    _run_advice(env, capsys, why)
+    now = da.read_install(env["ag"])
+    from levain.agents import spec as _spec
+    from levain.agents.store import open_agent_store
+
+    da.check_bound(env["ag"], _row(_spec.get_agent(open_agent_store(env["ag"]), "dream")["spec_hash"]), now)
+
+
 # --------------------------------------------------------------------------------------------- what still runs
 
 def test_the_facts_path_the_spec_binds_passes(env, capsys):
