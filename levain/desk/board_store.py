@@ -75,7 +75,7 @@ AUTHOR_KINDS = ("operator", "agent")
 GRADE_ASSERTED = "asserted"
 SIGNED_CHAIN_MOVED = "the board changed while you signed: sign again"
 GRADE_RELAYED = "relayed"
-RELAY_AND_SIGN = "--source and --sign cannot be used together: a record is relayed (the desk quotes his answer) or signed (his own key), never both"
+RELAY_AND_SIGN = "--source and --sign cannot be used together: a record is relayed (the desk quotes the operator's answer) or signed (their own key), never both"
 
 
 class BoardError(RuntimeError):
@@ -405,7 +405,7 @@ def _utc_now() -> str:
 
 
 def _one_line(value, what: str, required: bool = True, verbatim: bool = False) -> str:
-    """One line with no control character. ``verbatim`` keeps the edges exactly (his words), else the value is stripped."""
+    """One line with no control character. ``verbatim`` keeps the edges exactly (the operator's words), else the value is stripped."""
     if value is None or not str(value).strip():
         if required:
             raise BoardError(f"{what} must not be empty")

@@ -159,7 +159,7 @@ def _refusal(op: str, why: str = "") -> str:
     if op not in RELAYABLE_OPS:
         return f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID); an asserted record is refused"
     return (f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <q-id> (the band's "
-            f"question id, q-<24 hex>) relaying his answer; an asserted record is refused")
+            f"question id, q-<24 hex>) relaying the operator's answer; an asserted record is refused")
 
 
 SIGNED_CUT_OF_RELAYED = ("a signed cut cannot cite a relayed abandon-track: its cause is re-read through the band, which a "

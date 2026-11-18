@@ -1396,7 +1396,7 @@ IMPORT_VIA = "import-focus"
 
 def _import_still_owns(repo: rf.Repo) -> bool:
     """Whether a re-run of the import may still set ``repo``'s attention: the import's own ``register`` record (marked ``via``)
-    is its only history in the FOLD. A repo registered by hand, or one anyone has paused, resumed or changed since, is his."""
+    is its only history in the FOLD. A repo registered by hand, or one anyone has paused, resumed or changed since, is the operator's."""
     return repo.via == IMPORT_VIA and repo.history == 0
 
 
@@ -1469,7 +1469,7 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
     except OSError as exc:
         raise BoardError(f"cannot set up the store at {store_dir}: {exc}") from None
     target = bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True)      # privileged: open until the pointer is written
-    known = read_registry(target, allow_inactive=True)                  # a re-run after a partial import: what the registry holds is his now
+    known = read_registry(target, allow_inactive=True)                  # a re-run after a partial import: what the registry holds is the operator's now
     clashes = [c for name, *_ in entries if (c := _import_identity_clash(known.fold, name, idents[name])) is not None]
     if clashes:                                                         # a known name is skipped only when it IS this repository
         raise BoardError("--import-focus refused, nothing written:\n  " + "\n  ".join(clashes))
@@ -1477,7 +1477,7 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
         if name not in known.fold.repos:
             register(target, name, path, words, by, author=author, via=IMPORT_VIA)
         elif not _import_still_owns(known.fold.repos[name]):
-            continue                                                    # his by hand, or decided since: never re-paused by a re-run
+            continue                                                    # the operator's by hand, or decided since: never re-paused by a re-run
         if state == "paused":
             pause(target, name, words, by, author=author)
     if focus.read_bytes() != data:
@@ -1518,7 +1518,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     def common(p: Any, *, words: bool | str = True) -> None:
         p.add_argument("name", metavar="NAME")
         if words:
-            p.add_argument("--words", required=words is True, default="", help="his words, verbatim")
+            p.add_argument("--words", required=words is True, default="", help="the operator's words, verbatim")
         p.add_argument("--by", required=True)
         author_args(p)
         p.add_argument("--items", type=str, metavar="PATH", help=items_help)

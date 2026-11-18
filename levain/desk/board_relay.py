@@ -2,7 +2,7 @@
 
 The desk relays most of the operator's decisions: the answer is in the band, the record is written by the desk. A
 ``--source <q-id>`` record is therefore ``grade: relayed`` (the writer's, never a caller's), ``author.kind: agent``, and
-carries ``source: {np, producer, question_sha256, answer_sha256}``. The one rule the page names: his sentence travels,
+carries ``source: {np, producer, question_sha256, answer_sha256}``. The one rule the page names: the operator's sentence travels,
 never the rule read into it, so the record's ``words`` must be a VERBATIM substring of the answer (an item quotes an
 excerpt; the whole answer is not required). The digests are sha256 of the question and answer text as the band store
 holds them, so the citation cannot later attach to a different answer.
@@ -16,7 +16,7 @@ Three things live here, and nothing else does:
 * :func:`verify_relayed` and :func:`check_manifest`: the READ side, pure over their inputs. They report the row's OWN
   grade and never promote it.
 
-Known edges, deliberate: a short excerpt ("yes") passes the verbatim check, since his whole answer is often one word (the
+Known edges, deliberate: a short excerpt ("yes") passes the verbatim check, since the operator's whole answer is often one word (the
 verifier reports the row, so a reader sees the full answer); the band read runs under the board's exclusive lock so the
 digests are those of the answer at write time (bounded by the band store's busy timeout); an ``unknown``-graded answer can
 be relayed and is reported as exactly that, never promoted; :class:`NativeBandSource` holds a QuestionStore with no explicit
@@ -195,7 +195,7 @@ def relay_source(np_id: str, words: str, source: BandSource, manifest_sha256: st
     except BandRefusal as exc:
         raise BoardError(f"--source {np_id}: {exc}") from None
     if words not in row.answer:
-        raise BoardError(f"--source {np_id}: the words are not a verbatim excerpt of the answer: {words!r} (his sentence "
+        raise BoardError(f"--source {np_id}: the words are not a verbatim excerpt of the answer: {words!r} (the operator's sentence "
                          f"travels, never a paraphrase; quote exactly what the answer says)")
     cited = {"np": np_id, "producer": row.producer, "question_sha256": digest(row.question),
              "answer_sha256": digest(row.answer)}
