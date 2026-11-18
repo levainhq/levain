@@ -29,6 +29,7 @@ from tests.test_board_sign import Rig
 
 OP = {"kind": "operator", "name": "phill"}
 DESK = {"kind": "agent", "name": "desk 24"}
+OPD = {"kind": "operator", "name": "desk 1"}
 NOW = "2026-11-17T12:00:00Z"
 Q1 = "q-" + "1b3dd088" * 3
 Q2 = "q-" + "0000000a" * 3
@@ -579,9 +580,205 @@ def test_a_cut_of_an_item_the_cited_abandon_does_not_cover_is_a_break(world, cap
 # --------------------------------------------------------------------------------------------------- the part B seam
 
 
-def test_close_verdicts_is_the_part_b_seam_and_prints_nothing_yet(world):
-    t = trail_of(world)
-    assert bt.close_verdicts(t, bt.verify_trail(t)) == []
+# ------------------------------------------------------------------------------------------- part B: one verdict per close
+
+
+def commit_as(repo: Path, who: str, msg: str, *, files: dict[str, str] | None = None) -> str:
+    """A commit by ``who`` (author and committer), pushed to origin/main and fetched, so it is on the main the board reads."""
+    for name, text in (files or {}).items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(text)
+    git(repo, "add", "-A")
+    env = {**os.environ, "GIT_AUTHOR_NAME": who, "GIT_AUTHOR_EMAIL": "x@x", "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": "x@x"}
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", msg], cwd=repo, check=True, capture_output=True, env=env)
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "fetch", "-q")
+    return git(repo, "rev-parse", "HEAD")
+
+
+@dataclass
+class ClosesWorld:
+    store: Path
+    target: bs.Target
+    repo: Path
+    out: Path
+    merged: str          # alpha#N closed by a commit's Board-Closes trailer (tier: git author)
+    doc: str             # closed by a document a commit added (first added <path>)
+    ghost: str           # a document in the tree that no commit on main added (unattributed)
+    open: str            # not closed
+    rig: Rig | None = None
+
+
+def build_closes_world(tmp_path: Path, monkeypatch, who: str = "Plain Person") -> ClosesWorld:
+    """A scratch store whose repo ``alpha`` is TRACKED (the real ceremony: register, signed begin-track, charter, signed track) with
+    three closes in P4's shapes: a ``merged`` item closed by a commit's trailer, a ``document`` item closed by the commit that added
+    its file, and a ``document`` item whose file is in the work tree but on no commit of main."""
+    from tests.test_board_registry import land, manifest
+    from tests.test_board_registry_sign import keyed, registered
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lhome"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    monkeypatch.delenv("LEVAIN_LAUNCH_KEY", raising=False)
+    store = tmp_path / "store"
+    assert main(["board", "use", str(store)]) == 0
+    store = Path(os.path.realpath(store))
+    (store / "repos.jsonl").touch()
+    tgt = bs.resolve_store(None)
+    rig = Rig(tmp_path)
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
+    repo = registered(tgt, lambda name: make_repo(tmp_path, name), "alpha")
+    br.begin_track(tgt, "alpha", manifest(tmp_path, plan_items=["a"]), "yes", "desk 1", author=OPD, seal=rig.seal())
+    mig = br.read_registry(tgt).fold.repos["alpha"].migration
+    open_item = keyed(tgt, "alpha", f"{mig}:a")
+    land(repo, "CHARTER.md", f"# Charter: alpha\nCharter-Version: 1\nExport: repo\n\n## Purpose\nT.\n\n## Criteria\n- C1: ok [judged: phill]\n\n"
+                              f"## Constraints\n- K1: none\n\n## Plan\n- {open_item}\n")
+    br.track(tgt, "alpha", "go", "desk 1", author=OPD, seal=rig.seal())
+    merged = bs.add(tgt, "alpha", "merged one", "desk 1", "desk 1", author=OPD, now=NOW)[0]
+    doc = bs.add(tgt, "alpha", "doc one", "desk 1", "desk 1", done="docs/report.md", done_kind="document", author=OPD, now=NOW)[0]
+    ghost = bs.add(tgt, "alpha", "ghost doc", "desk 1", "desk 1", done="docs/ghost.md", done_kind="document", author=OPD, now=NOW)[0]
+    commit_as(repo, who, f"close it\n\nBoard-Item: {merged}\nBoard-Closes: {merged}")
+    commit_as(repo, "Doc Person", "adds the report", files={"docs/report.md": "r\n"})
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "ghost.md").write_text("never committed\n")
+    return ClosesWorld(store, tgt, repo, tmp_path / "out", merged, doc, ghost, open_item, rig)
+
+
+@pytest.fixture
+def cw(tmp_path, monkeypatch) -> ClosesWorld:
+    return build_closes_world(tmp_path, monkeypatch)
+
+
+def state_closes(capsys) -> dict[str, dict]:
+    """``levain board state --json``'s closed_by per item: what the trail's close lines must agree with."""
+    main(["board", "state", "--json"])
+    out, _ = capsys.readouterr()
+    return {s["id"]: s["closed_by"] for s in json.loads(out)["items"] if s.get("closed_by")}
+
+
+def close_lines(out: str) -> dict[str, str]:
+    return {x.split(":", 1)[0].removeprefix("close ").removeprefix("BREAK close "): x for x in out.splitlines()
+            if x.startswith(("close ", "BREAK close "))}
+
+
+def test_live_verify_prints_one_verdict_per_close_derived_by_the_boards_own_function(cw, capsys):
+    from levain.desk import board_author as ba
+    closes = state_closes(capsys)
+    assert set(closes) == {cw.merged, cw.doc, cw.ghost}
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    lines = close_lines(out)
+    assert set(lines) == set(closes)
+    for item_id, by in closes.items():
+        assert lines[item_id] == f"close {item_id}: {ba.describe(by)}"              # P4's words, from P4's function, never a second rule
+    assert "asserted by git author Plain Person <x@x>" in lines[cw.merged]
+    assert "first added docs/report.md, asserted by git author Doc Person" in lines[cw.doc]
+    assert lines[cw.ghost].startswith(f"close {cw.ghost}: unattributed") and "no commit on main added it" in lines[cw.ghost]
+    assert cw.open not in lines
+
+
+def test_a_close_line_escapes_control_characters_an_author_name_carries(tmp_path, monkeypatch, capsys):
+    cw = build_closes_world(tmp_path, monkeypatch, who="Evil\x1b[2J Person")
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    assert "\x1b" not in out and "Evil\\x1b[2J Person" in out
+
+
+def test_export_writes_each_closes_derived_closed_by_as_state_emits_it(cw, capsys):
+    closes = state_closes(capsys)
+    rc, out, err = run(capsys, "export", "--out", str(cw.out) + os.sep)
+    assert rc == 0, err
+    bundle = json.loads(next(cw.out.glob("trail-*.json")).read_text("utf-8"))
+    assert bundle["closes"] == closes and "closes_unavailable" not in bundle
+
+
+def exported(cw, capsys) -> Path:
+    assert run(capsys, "export", "--out", str(cw.out) + os.sep)[0] == 0
+    return next(cw.out.glob("trail-*.json"))
+
+
+def test_bundle_verify_re_derives_every_close_when_the_repo_is_reachable(cw, capsys):
+    bundle = exported(cw, capsys)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    lines = close_lines(out)
+    assert set(lines) == {cw.merged, cw.doc, cw.ghost}
+    assert all(x.endswith("(re-derived from the repo; matches the bundle)") for x in lines.values())
+    assert "not re-derived" not in out
+
+
+def test_bundle_verify_says_recorded_not_re_derived_when_the_repo_is_not_reachable_and_never_verified(cw, capsys):
+    bundle = exported(cw, capsys)
+    os.rename(cw.repo, str(cw.repo) + ".away")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    lines = close_lines(out)
+    assert set(lines) == {cw.merged, cw.doc, cw.ghost}
+    assert all(x.endswith("(recorded in the bundle, not re-derived (repo not available))") for x in lines.values())
+    assert "matches" not in out and "re-derived from the repo" not in out and "closes: not re-derived (" in out
+
+
+def test_a_bundled_closed_by_that_the_repo_derives_differently_is_a_break(cw, capsys):
+    bundle = exported(cw, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    doc["closes"][cw.merged]["who"] = "Somebody Stronger"
+    bundle.write_text(json.dumps(doc), "utf-8")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3, out + err
+    assert f"BREAK close {cw.merged}: the bundle records [" in out and "Somebody Stronger" in out and "and the repo derives [" in out
+    assert "matches the bundle" in close_lines(out)[cw.doc]                 # the others are unaffected
+
+
+def test_a_bundled_close_of_an_item_the_repo_does_not_show_closed_is_a_break(cw, capsys):
+    bundle = exported(cw, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    doc["closes"][cw.open] = doc["closes"][cw.merged]
+    bundle.write_text(json.dumps(doc), "utf-8")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and f"BREAK close {cw.open}: " in out and "does not show the item closed" in out
+
+
+def test_a_close_the_repo_shows_that_the_bundle_does_not_record_is_said_and_not_a_break(cw, capsys):
+    bundle = exported(cw, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    del doc["closes"][cw.ghost]
+    bundle.write_text(json.dumps(doc), "utf-8")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0 and "the bundle records no close for it" in close_lines(out)[cw.ghost]
+
+
+def test_a_bundle_with_no_closes_says_so_and_a_malformed_one_is_refused(cw, capsys):
+    bundle = exported(cw, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    del doc["closes"]
+    bundle.write_text(json.dumps(doc), "utf-8")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0 and bt.CLOSES_NONE in out
+    doc["closes"] = {cw.merged: "not an object"}
+    bundle.write_text(json.dumps(doc), "utf-8")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 2 and "damaged bundle" in err
+
+
+def test_a_derivation_that_fails_is_a_note_never_a_crash_and_never_a_break(cw, capsys, monkeypatch):
+    from levain.desk import board_cli
+    monkeypatch.setattr(board_cli, "state_doc", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    assert "closes: not derived (the closes could not be derived (RuntimeError: boom))" in out and "BREAK" not in out
+
+
+def test_one_close_whose_author_cannot_be_read_is_that_closes_note_not_a_break(cw, capsys, monkeypatch):
+    from levain.desk import board_author as ba
+    real = ba.closer_of_item
+
+    def flaky(repo, item, *a, **k):
+        if item.id == cw.merged:
+            raise ba.be.GitFailed("git went away")
+        return real(repo, item, *a, **k)
+    monkeypatch.setattr(ba, "closer_of_item", flaky)
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    lines = close_lines(out)
+    assert "the author could not be read (git went away)" in lines[cw.merged] and "Doc Person" in lines[cw.doc]
 
 
 # --------------------------------------------------------------------- P6 fix 2: never a verdict stronger than the evidence
@@ -709,7 +906,7 @@ def test_a_bundle_and_the_live_store_give_the_same_verdicts_under_the_same_trust
     live = run(capsys, "verify")[1]
     rc, out, err = run(capsys, "verify", str(bundle))
     assert rc == 0
-    body = lambda text: [x for x in text.splitlines() if not x.startswith("authority:")]   # noqa: E731
+    body = lambda text: [x for x in text.splitlines() if not x.startswith(("authority:", "close"))]   # noqa: E731  (a close line says whether it was re-derived: that differs by design, and is pinned in the part B tests)
     assert body(out) == body(live)
 
 

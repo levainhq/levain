@@ -65,7 +65,13 @@ Known edges, stated rather than hidden:
 * A ``move`` is decision-class by :func:`levain.desk.board_sign.move_is_decision` on the registry as it stood before it (the
   fold the writer judged it on); recorded asserted after that, it is a break like any other decision-class op.
 * A cut's ``cause`` is judged AS OF THE CUT'S OWN POSITION, never against today's fold (see :func:`cause_problem_at`).
-* Per-close author verdicts (P4's tiers) are part B: :func:`close_verdicts` is the seam and returns nothing.
+* Per-close author verdicts (P4's tiers), part B: see :func:`close_verdicts`. One line per closed item, the author derived by
+  ``board_author.annotate`` (the function ``board state`` calls for ``closed_by``; this module holds no attribution rule), in
+  P4's words. ``export`` writes each close's ``closed_by`` into the bundle; a bundle ``verify`` RE-DERIVES it when the repo is
+  reachable (a close that derives differently is a break) and otherwise says "recorded in the bundle, not re-derived (repo not
+  available)", never "verified". A derivation that fails is a note on that close (attribution never fails a read). The
+  re-derivation is made with THIS install's authority log (``--data-root``): a key revoked since the export reads as a
+  different tier, and that is a break the line explains (the bundle's close and the re-derived one are both printed).
 """
 from __future__ import annotations
 
@@ -140,6 +146,10 @@ class Trail:
     trust: str = TRUST_LIVE
     trust_line: str = ""
     breaks: list[str] = field(default_factory=list)
+    data_root: str | None = None                        # the authority a close's signing key is judged against (P4's resolver)
+    from_bundle: bool = False                           # read from a bundle (whatever its trust root became)
+    closes: Any = None                                  # a bundle's recorded closes ({item: closed_by}); None: it records none
+    closes_unavailable: str = ""                        # why an export could not derive them
 
 
 def _split(raw: bytes) -> tuple[list[bytes], bool]:
@@ -186,7 +196,7 @@ def read_live(target: bs.Target, *, data_root: str | None, band_dir: str | None)
         lines[name], unterminated[name] = _split(raws[name])
     snapshot, why = _read_authority(data_root)
     return Trail(sid, lines, unterminated, snapshot, why, _LiveBand(band_dir), TRUST_LIVE,
-                 _authority_line(snapshot, why, "the log this install holds"))
+                 _authority_line(snapshot, why, "the log this install holds"), data_root=data_root)
 
 
 class _LiveBand:
@@ -400,10 +410,103 @@ def _acks_naming(lines: Sequence[bytes], targets: set[int]) -> dict[int, int]:
     return out
 
 
-def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> list[str]:
-    """PART B'S SEAM. One verdict per close, in P4's three tiers (signed commit / asserted by trailer / asserted by git author,
-    and "unattributed"), filled from P4's ``closed_by`` once the restack onto P4 lands. Part A prints nothing for closes."""
-    return []
+CLOSES_NONE = "closes: the bundle records none (a bundle made before per-close authors were exported)"
+
+
+def _materialise(trail: Trail, root: Path) -> Path:
+    """The trail's two files (and its id) as a store directory under ``root``, so ``board state``'s own read can fold and derive
+    from exactly the lines this verification judged. Never the live store: nothing is written there."""
+    for name in FILES:
+        body = b"\n".join(trail.lines[name])
+        (root / name).write_bytes(body if not trail.lines[name] or trail.unterminated[name] else body + b"\n")
+    if trail.store_id:
+        (root / bs.STORE_ID_NAME).write_text(trail.store_id + "\n", encoding="utf-8")
+    return root
+
+
+def derive_closes(trail: Trail) -> tuple[dict[str, dict[str, Any]], dict[str, str], set[str], str]:
+    """``(closed_by by item, the done items with no git close, the repos that were read, why)`` for the store the trail holds,
+    derived by ``board state``'s own function (:func:`levain.desk.board_cli.state_doc`, which calls ``board_author.annotate``),
+    the way ``board state --json`` reads it: every repo the registry tracks, read from its registered path. ``why`` is non-empty
+    when nothing could be derived (no repo reachable, a read refused); the closes are then empty. Nothing is written to the
+    live store."""
+    import tempfile
+    from levain.desk import board_cli
+    parser = argparse.ArgumentParser()
+    board_cli.register(parser.add_subparsers())
+    with tempfile.TemporaryDirectory(prefix="levain-trail-") as tmp:
+        root = _materialise(trail, Path(tmp))
+        argv = ["board", "state", "--json", "--items", str(root)]
+        if trail.data_root:
+            argv += ["--data-root", str(trail.data_root)]
+        args = parser.parse_args(argv)
+        said: list[str] = []
+        try:
+            # the copy is handed over as a target: ``--items`` would be compared with the pointer's store (a bundle is not it)
+            rc, doc = board_cli.state_doc(args, say=said.append, strict_store=True,
+                                          target=bs.Target(store_dir=root, items_path=root / bs.ITEMS_NAME, pointered=False))
+        except Exception as exc:                        # noqa: BLE001 - attribution never fails a read
+            return {}, {}, set(), f"the closes could not be derived ({type(exc).__name__}: {exc})"
+    if doc is None:
+        return {}, {}, set(), "; ".join(said) or f"board state refused (exit {rc})"
+    closes = {s["id"]: s["closed_by"] for s in doc.get("items", []) if s.get("state") == "done" and isinstance(s.get("closed_by"), dict)}
+    bands = {s["id"]: "no git close to read an author from" for s in doc.get("items", [])
+             if s.get("state") == "done" and not isinstance(s.get("closed_by"), dict)}
+    reader = doc.get("reader") or {}
+    read = {str(r.get("repo")) for r in reader.get("repos", [])} if reader.get("repos") else (
+        {str(reader["repo"])} if reader.get("repo") else set())
+    return closes, bands, read, ""
+
+
+def _same_close(recorded: Mapping[str, Any], derived: Mapping[str, Any]) -> bool:
+    """Whether a recorded ``closed_by`` and a re-derived one are the same claim: every field alike but the free-text note."""
+    return {k: v for k, v in recorded.items() if k != "note"} == {k: v for k, v in derived.items() if k != "note"}
+
+
+def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> tuple[list[str], int]:
+    """``(lines, breaks)``: one verdict per closed item, in P4's words (``board_author.describe``), the weakest claim the evidence
+    supports. A live store's closes are derived now. A bundle that records closes has each RE-DERIVED when its repo is reachable:
+    the same claim is "re-derived from the repo, matches the bundle's record", a different one is a break; a repo not reachable
+    prints the bundle's close as recorded, "not re-derived (repo not available)", never as verified. A close the repo shows that
+    the bundle does not record is said, not a break. A derivation that fails is one note line, never a crash and never a break."""
+    from levain.desk import board_author as ba
+    closes, bands, read, why = derive_closes(trail)
+    lines: list[str] = []
+    breaks = 0
+    recorded = trail.closes if isinstance(trail.closes, dict) else None
+    if not trail.from_bundle or recorded is None:
+        if why:
+            lines.append(f"closes: not derived ({why})")
+        if trail.from_bundle:
+            lines.append(f"closes: the export could not derive them ({trail.closes_unavailable})" if trail.closes_unavailable
+                         else CLOSES_NONE)
+        for item_id, by in sorted(closes.items()):
+            lines.append(f"close {item_id}: {ba.describe(by)}")
+        for item_id, note in sorted(bands.items()):
+            lines.append(f"close {item_id}: {note}")
+        return lines, breaks
+    if why:
+        lines.append(f"closes: not re-derived ({why})")
+    if trail.closes_unavailable:
+        lines.append(f"closes: the export could not derive them ({trail.closes_unavailable})")
+    for item_id, rec in sorted(recorded.items()):
+        repo = item_id.rpartition("#")[0]
+        if item_id in closes:
+            now = closes[item_id]
+            if _same_close(rec, now):
+                lines.append(f"close {item_id}: {ba.describe(now)} (re-derived from the repo; matches the bundle)")
+            else:
+                breaks += 1
+                lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo derives [{ba.describe(now)}]")
+        elif repo in read:
+            breaks += 1
+            lines.append(f"BREAK close {item_id}: the bundle records [{ba.describe(rec)}] and the repo does not show the item closed")
+        else:
+            lines.append(f"close {item_id}: {ba.describe(rec)} (recorded in the bundle, not re-derived (repo not available))")
+    for item_id, now in sorted(closes.items()):
+        if item_id not in recorded:
+            lines.append(f"close {item_id}: {ba.describe(now)} (derived from the repo; the bundle records no close for it)")
+    return lines, breaks
 
 
 def _signed_problem(rec: Mapping[str, Any], trail: Trail) -> tuple[sg.Verdict | None, str | None]:
@@ -907,6 +1010,13 @@ def _key_json(key: Any) -> dict:
     return {f.name: getattr(key, f.name) for f in dataclasses.fields(key)}
 
 
+def _closes_json(trail: Trail) -> dict:
+    """The bundle's ``closes``: each closed item's derived ``closed_by`` as ``board state --json`` emits it (the author of the
+    close, by P4's tiers). Derived with this install's authority log; a derivation that fails is carried as ``closes_unavailable``."""
+    closes, _bands, _read, why = derive_closes(trail)
+    return {"closes": closes} if not why else {"closes": {}, "closes_unavailable": why}
+
+
 def bundle_of(trail: Trail) -> dict:
     keys = sorted((_key_json(k) for k in trail.snapshot.keys.values()), key=lambda k: k["fingerprint"]) if trail.snapshot else []
     return {
@@ -917,6 +1027,7 @@ def bundle_of(trail: Trail) -> dict:
         "authority": ({"store_id": trail.snapshot.store_id, "seq": trail.snapshot.seq, "head_hash": trail.snapshot.head_hash,
                        "keys": keys} if trail.snapshot else {"unavailable": trail.why_no_authority}),
         "answers": collect_answers(trail),
+        **_closes_json(trail),
     }
 
 
@@ -960,6 +1071,14 @@ def load_bundle(path: Path) -> Trail:
             raise KeyError("shape")
         for np_id, got in answers.items():
             _check_answer(np_id, got)
+        closes = doc.get("closes")
+        if closes is not None:
+            if not isinstance(closes, dict) or not all(isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("tier"), str)
+                                                       and isinstance(v.get("how"), str) for k, v in closes.items()):
+                raise TypeError("closes must map an item id to a closed_by object (tier and how, each text)")
+        unavailable = doc.get("closes_unavailable", "")
+        if not isinstance(unavailable, str):
+            raise TypeError("closes_unavailable is not text")
         snapshot, why = None, ""
         if "unavailable" in auth:
             why = f"the bundle carries no keys: {auth['unavailable']}"
@@ -978,7 +1097,8 @@ def load_bundle(path: Path) -> Trail:
                                          policy=StandingPolicy())
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         raise TrailError(f"{path} is a damaged bundle ({type(exc).__name__}: {exc})") from None
-    return Trail(store, lines, unterminated, snapshot, why, _BundleBand(answers), TRUST_BUNDLE, "")
+    return Trail(store, lines, unterminated, snapshot, why, _BundleBand(answers), TRUST_BUNDLE, "", closes=closes,
+                 closes_unavailable=unavailable, from_bundle=True)
 
 
 def adopt_trust_root(trail: Trail, data_root: str | None) -> None:
@@ -987,6 +1107,7 @@ def adopt_trust_root(trail: Trail, data_root: str | None) -> None:
     break), and verify against it. With no log to replay, the bundle's keys stay claims: ``trust`` stays :data:`TRUST_BUNDLE`
     and every verdict that rests on them says so."""
     claimed = trail.snapshot
+    trail.data_root = data_root
     live, why = _read_authority(data_root)
     if live is None:
         trail.why_no_authority = (f"no authority log of yours could be read ({why})" if claimed is not None else
@@ -1094,9 +1215,10 @@ def _print_report(reports: Sequence[FileReport], trail: Trail) -> int:
         for b in rep.breaks:
             print(safe(f"BREAK {rep.name}: {b}"))
         broken += len(rep.breaks)
-    for line in close_verdicts(trail, reports):
+    close_lines, close_breaks = close_verdicts(trail, reports)
+    for line in close_lines:
         print(safe(line))
-    return broken
+    return broken + close_breaks
 
 
 def _parse_heads(raw: Sequence[str]) -> dict[str, str]:
