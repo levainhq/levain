@@ -166,10 +166,12 @@ def test_band_dir_without_source_is_refused(store, band, capsys):
 
 
 def test_an_unrelayed_write_is_still_asserted_with_no_source(store, capsys):
-    rc, _, err = run(capsys, "decide", "--id", "levain#1", "--decision", "cut", "--words", "w", "--by", "desk 24")
+    rc, _, err = run(capsys, "amend", "--id", "levain#1", "--why", "w", "--by", "desk 24", "--words", "w")
     assert rc == 0, err
     rec = records(store)[-1]
     assert rec["grade"] == "asserted" and "source" not in rec
+    rc, _, err = run(capsys, "decide", "--id", "levain#1", "--decision", "cut", "--words", "w", "--by", "desk 24")
+    assert rc == 2 and "decision-class" in err and records(store)[-1] == rec     # P2: a decide is decision-class; unrelayed, unsigned it is refused
 
 
 # ------------------------------------------------------------------------------------------------------------ verifying
