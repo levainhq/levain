@@ -266,9 +266,9 @@ def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
         if cur.mode != "tracking" or cur.migration != rec["migration"]:
             raise _Soft(f"track {name}: the repo is {cur.mode} (migration {cur.migration}), not tracking {rec['migration']}")
         want = (cur.manifest or {}).get("adopt_items") or []
-        if want:
-            if "adopted" not in rec:
-                raise _Soft(f"track {name}: the record carries no adopted list, but the manifest adopts {', '.join(want)}")
+        if want and "adopted" not in rec:
+            raise _Soft(f"track {name}: the record carries no adopted list, but the manifest adopts {', '.join(want)}")
+        if "adopted" in rec:
             foreign = [i for i in rec["adopted"] if i not in want]
             if foreign:
                 raise _Soft(f"track {name}: adopted {', '.join(foreign)}, which the manifest's adopt_items does not name")
