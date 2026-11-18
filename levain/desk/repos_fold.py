@@ -184,6 +184,8 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
         if not path.startswith("/"):
             raise _Bad("path must be absolute")
         _str(rec, "origin", empty_ok=True)
+        if op == "register" and "attention" in rec and rec["attention"] != "paused":
+            raise _Bad("a register record's attention is `paused` or absent (absent = active)")
         root = rec.get("root")
         if not isinstance(root, list) or not root or not all(isinstance(r, str) and r for r in root):
             raise _Bad("root must be a non-empty list of commit ids")
@@ -224,6 +226,7 @@ def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
     if op == "register":
         if cur is None:
             repos[name] = Repo(name, rec["path"], rec["origin"], tuple(sorted(rec["root"])), since=at, words=rec["words"],
+                               attention="paused" if rec.get("attention") == "paused" else "active",
                                via=rec["via"] if isinstance(rec.get("via"), str) else None)
         elif cur.path != rec["path"]:
             raise _Soft(f"register {name}: already registered at {cur.path}, not {rec['path']}; use move")

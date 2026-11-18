@@ -1567,3 +1567,46 @@ def test_p1b_fix1_a_registry_chain_ack_keeps_the_line_and_binds_the_break(store,
     lines[1] = lines[1].replace(b'"words":"edited"', b'"words":"edited-again"')
     p.write_bytes(b"\n".join(lines) + b"\n")
     assert run(capsys, "repos")[0] == 2                                              # the same line before is edited again: breaks again
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# register --attention (levain#88 slice): one record carries the initial attention
+
+
+def test_register_attention_paused_is_one_record_shown_paused_from_the_register_time(store, mkrepo, capsys):
+    repo = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A)
+    lines = reg_lines(store)
+    assert [r["op"] for r in lines] == ["register"] and lines[0]["attention"] == "paused"
+    f = br.read_registry(bs.resolve_store(None)).fold.repos["alpha"]
+    assert f.attention == "paused" and f.since == lines[0]["at"]
+    assert "alpha: untracked, paused" in ok(capsys, "repos")
+
+
+def test_an_active_register_carries_no_attention_key(store, mkrepo, capsys):
+    repo = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A)
+    assert "attention" not in reg_lines(store)[0]
+    repo2 = mkrepo("beta")
+    ok(capsys, "register", "beta", "--path", str(repo2), "--words", "w", "--attention", "active", *A)
+    assert "attention" not in reg_lines(store)[1]
+
+
+def test_a_re_register_is_a_no_op_when_attention_matches_and_refuses_naming_the_verb_when_it_differs(store, mkrepo, capsys):
+    repo = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A)
+    assert ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A) == "already registered alpha"
+    rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A)
+    assert rc != 0 and "levain board resume alpha" in err
+    ok(capsys, "resume", "alpha", "--words", "w", *A)
+    rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A)
+    assert rc != 0 and "levain board pause alpha" in err
+    assert ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A) == "already registered alpha"
+    assert [r["op"] for r in reg_lines(store)] == ["register", "resume"]            # the refusals wrote nothing
+
+
+def test_the_fold_reads_a_register_attention_and_judges_a_bad_one():
+    assert rf.fold_repos([rec("register", attention="paused")], store_id=SID).repos["x"].attention == "paused"
+    assert rf.fold_repos([rec("register")], store_id=SID).repos["x"].attention == "active"
+    f = rf.fold_repos([rec("register", attention="loud")], store_id=SID)
+    assert f.torn or f.problems or "x" not in f.repos
