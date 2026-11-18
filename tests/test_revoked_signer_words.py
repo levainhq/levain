@@ -501,7 +501,7 @@ def test_t17_a_key_that_signed_no_grant_says_so(world, capsys) -> None:
     assert code == 0 and err == ""
     lines = out.splitlines()
     assert lines[0].startswith(f"revoked: {world.fps['c']} at seq ")
-    assert lines[1:] == ["No standing grant was signed by this key."]
+    assert lines[1:] == ["No standing grant was stopped by this revoke."]
 
 
 def test_t17_a_grant_the_key_only_renewed_is_named(world, capsys) -> None:
@@ -587,9 +587,46 @@ def test_t17_a_creator_string_is_shown_through_visible() -> None:
 
 def test_t17_the_notice_is_the_only_place_the_verb_adds_words() -> None:
     """``stopped_notice`` is a pure function of its rows: empty is the none sentence, never silence."""
-    assert G.stopped_notice([]) == ["No standing grant was signed by this key."]
+    assert G.stopped_notice([]) == ["No standing grant was stopped by this revoke."]
     two = G.stopped_notice([("a", "consent", "consent grant: x"), ("b", "voice-key", "voice key: OpenAI voice key")])
     assert two[0].startswith("2 standing grants this key signed have stopped.")
+
+
+@pytest.mark.parametrize("hostile", ["cg-\x1b[2J\x1b[Hfake", "cg-\x1b]52;c;cHduZWQ=\x07x", "cg-a\nrevoked: spoof"])
+def test_review_r1_a_grant_id_is_shown_through_markers_never_raw(hostile) -> None:
+    """Codex MED: the id is a creator string. An ESC (screen clear), an OSC 52 clipboard write or a newline that would
+    forge a line is shown as its marker; the id stays one token on its line."""
+    lines = G.stopped_notice([(hostile, "consent", "consent grant: x")])
+    row = lines[1]
+    assert "\x1b" not in row and "\x07" not in row and "\n" not in row
+    assert row.startswith("  cg-") and row.endswith("  consent grant: x")
+    assert "⟨U+001B⟩" in row or "⟨U+000A⟩" in row
+    # main's way-back lines (row 190 L4) name the ids again: every printed line is held to the same markers
+    assert all("\x1b" not in line and "\x07" not in line and "\n" not in line for line in lines)
+    assert any(line.startswith("  ") and ": cg-" in line and "⟨U+00" in line for line in lines[2:])
+
+
+def test_review_r1_a_grant_an_earlier_revoke_stopped_is_named_once_for_that_revoke_only(world, capsys) -> None:
+    """Complement MED: A creates, B renews (two signers), A is revoked (named), then B is revoked: B's revoke stopped
+    nothing (the grant was already stopped by A's), so it is not named again."""
+    world.consent("cg-A")
+    world.renew("cg-A", "b")
+    _code, first, _err = _revoke_cli(world, capsys, "a", "c")
+    assert "  cg-A  consent grant:" in first
+    code, second, err = _revoke_cli(world, capsys, "b", "c")
+    assert code == 0 and err == ""
+    assert "cg-A" not in second
+    assert second.splitlines()[1:] == ["No standing grant was stopped by this revoke."]
+
+
+def test_review_r1_a_grant_that_had_already_expired_is_not_named(world) -> None:
+    """Codex LOW: a grant that lapsed before the revoke answered nothing before it either, so the notice (which says
+    "not expired") does not name it."""
+    world.consent("cg-old", days=1)
+    world.consent("cg-new", days=5)
+    world.revoke_key("a", by="b")
+    later = _now() + timedelta(days=2)
+    assert [gid for gid, _k, _w in G.stopped_by_key(world.root, world.fps["a"], now=later)] == ["cg-new"]
 
 
 # --- T18: the doctor row ------------------------------------------------------------------------------------

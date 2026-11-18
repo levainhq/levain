@@ -1349,9 +1349,19 @@ def grants_in_force(state: AuthoritySnapshot) -> Mapping[str, Any]:
 
 
 def grants_stopped_by(state: AuthoritySnapshot, fingerprint: str) -> list[str]:
-    """The ids of the standing grants whose born or current link ``fingerprint`` signed, sorted: what revoking that key
-    stops (for the revoke verb to name)."""
-    return sorted(gid for gid in state.policy.grants if fingerprint in (grant_signers(state, gid) or ()))
+    """The ids of the standing grants revoking ``fingerprint`` stops, sorted (for the revoke verb to name): each one
+    ``fingerprint`` signed (born or current link) that is in force with that key active and stopped with it revoked,
+    every other key as ``state`` holds it. The two states are derived from ``state`` alone, whether or not the key is
+    revoked in it, so a grant an EARLIER revoke of its other signer already stopped is never named again. Expiry is the
+    caller's (this has no clock)."""
+    key = state.keys.get(fingerprint)
+    if key is None:
+        return []
+    before = replace(state, keys=MappingProxyType({**state.keys, fingerprint: replace(key, revoked_seq=None)}))
+    revoked = key if not key.active else replace(key, revoked_seq=state.seq)
+    after = replace(state, keys=MappingProxyType({**state.keys, fingerprint: revoked}))
+    return sorted(gid for gid in state.policy.grants if fingerprint in (grant_signers(state, gid) or ())
+                  and grant_stop_reason(before, gid) is None and grant_stop_reason(after, gid) is not None)
 
 
 def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:

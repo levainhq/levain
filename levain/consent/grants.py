@@ -494,17 +494,22 @@ def ways_back(stopped: Iterable[tuple[str, Any]]) -> list[tuple[str, list[str]]]
 def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,
                    ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                    marker_directory: Path | None = None) -> list[tuple[str, str, str]]:
-    """``(id, kind, words)`` of every standing grant whose born or current link ``fingerprint`` signed (what revoking that key
-    stopped: :func:`levain.authority.grants_stopped_by`), from one fresh capture of the log, sorted by id. ``words`` is
-    the kind's label and what the grant is, creator strings through ``visible``. Words only: it reads, it never
-    changes what any grant may do, so a link landing between the revoke and this read can make the list stale and
-    nothing else."""
+    """``(id, kind, words)`` of every standing grant revoking ``fingerprint`` stopped (:func:`levain.authority.
+    grants_stopped_by`: one an earlier revoke of its other signer had already stopped is not named) and that had not
+    expired at ``now`` (a lapsed grant answered nothing before the revoke either), from one fresh capture of the log,
+    sorted by id. ``words`` is the kind's label and what the grant is, creator strings through ``visible``. Words only:
+    it reads, it never changes what any grant may do, so a link landing between the revoke and this read can make the
+    list stale and nothing else."""
     from levain.cockpit.display_safe import visible
 
     state = _signing_authority(_capture(_journal(data_root, marker_directory=marker_directory), now, ssh_keygen))
+    stamp = utc_stamp(now)
     out = []
     for gid in grants_stopped_by(state, fingerprint):
         grant = state.policy.grants[gid]
+        expires_at = grant.get("expires_at")
+        if isinstance(expires_at, str) and expires_at <= stamp:      # the opt-in carries no expiry: it never lapses
+            continue
         label = _STOPPED_LABELS.get(grant.get("kind"), None) or f"{visible(str(grant.get('kind')))} grant"
         out.append((gid, str(grant.get("kind")), f"{label}: {_stopped_tail(grant)}"))
     return out
@@ -514,19 +519,23 @@ def stopped_notice(stopped: list[tuple[str, str, str]]) -> list[str]:
     """The lines `levain cockpit keys revoke` prints after its own ``revoked:`` line: each grant the revoked key signed,
     now stopped, then the way to use each again in the order that works for its kind (:func:`levain.authority.
     stopped_way`: a kind with a one-live rule is refused at create until the stopped one is revoked) and the revoke
-    verb; or the sentence that none was signed by it (said, never silent)."""
+    verb; or the sentence that this revoke stopped none (said, never silent). An id is a creator string: wherever it
+    is printed, every unshowable character, newline and tab included (it is one token on one line), is shown as a
+    visible marker, so an id cannot write control sequences to the terminal."""
+    from levain import unshowable
+
     if not stopped:
-        return ["No standing grant was signed by this key."]
+        return ["No standing grant was stopped by this revoke."]
     n = len(stopped)
     lines = [f"{n} standing grant{' this key signed has' if n == 1 else 's this key signed have'} stopped. "
              f"{'It answers' if n == 1 else 'They answer'} nothing from now on, though "
              f"{'it has' if n == 1 else 'they have'} not expired:"]
-    lines += [f"  {gid}  {words}" for gid, _kind, words in stopped]
+    lines += [f"  {unshowable.mark(str(gid), allow='')}  {words}" for gid, _kind, words in stopped]
     it = "it" if n == 1 else "one"
     lines.append(f"A renew does not bring {it} back. To use {it} again:")
     # the rows come sorted by id, so each way's ids do too; the ways come in the order that works
     for shown, ids in ways_back((gid, kind) for gid, kind, _words in stopped):
-        lines.append(f"  {shown}: {', '.join(ids)}")
+        lines.append(f"  {shown}: {', '.join(unshowable.mark(str(gid), allow='') for gid in ids)}")
     lines.append("To revoke one: levain consent grant revoke --signing-key <key> -- <id>")
     if any(kind == EGRESS_KEY_KIND for _gid, kind, _words in stopped):
         lines.append("A chat key revokes with: levain chat key revoke --signing-key <key> <id>")
