@@ -405,7 +405,8 @@ def test_i3_no_regrouping_changes_who_the_envelope_binds(ctx):
     ctx.store.split(late_drop(ctx).drop_id, [Part("work", attach=ts[1].thread_id)])
     holds()
     assert "moved past the revision" in ctx.store.live_refusal(eid, ts[1].thread_id, authority=ctx.snap)
-    assert ctx.store.live_refusal(eid, ts[0].thread_id, authority=ctx.snap) is None
+    # Q4 (np-2034969a): the detach above ended this child's grant for good; the re-attach does not restore it
+    assert "killed" in ctx.store.live_refusal(eid, ts[0].thread_id, authority=ctx.snap)
     # a merge folds one child into another: the closed one is ended by the service, nobody new is bound
     ctx.store.merge(ts[0].thread_id, ts[2].thread_id)
     holds()
