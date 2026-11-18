@@ -1274,13 +1274,12 @@ def _hours_since(at: str, now: datetime) -> float | None:
 def _next_step(target: bs.Target, cur: rf.Repo) -> str:
     """The first step of the ceremony whose effect is missing (design 5(a), abort). During ``tracking`` it also names the live
     items of X the ceremony neither adopts nor keys (information, never a refusal)."""
-    step = _next_step_core(target, cur)
-    if cur.mode != "tracking":
+    step, facts = _next_step_core(target, cur)
+    if cur.mode != "tracking" or facts is None:
         return step
     from levain.desk import charter
     m = cur.migration or ""
-    with bs.store_lock(target.store_dir, exclusive=False):
-        adds, decision = _items_facts(target.store_dir)
+    adds, decision = facts                  # the SAME read the step came from
     adopted = set((cur.manifest or {}).get("adopt_items", []))
     left = sorted((i for i, r in adds.items() if r.get("repo") == cur.name and i not in adopted
                    and not (isinstance(r.get("key"), str) and r["key"].startswith(m + ":"))
@@ -1291,32 +1290,34 @@ def _next_step(target: bs.Target, cur: rf.Repo) -> str:
     return f"{step} [{len(left)} live items of {cur.name} neither adopted nor keyed, so outside the Plan: {shown}]"
 
 
-def _next_step_core(target: bs.Target, cur: rf.Repo) -> str:
+def _next_step_core(target: bs.Target, cur: rf.Repo) -> tuple[str, tuple[dict, dict] | None]:
+    """``(step, facts)``: ``facts`` is the one ``_items_facts`` read the step was judged on (None on the aborting path)."""
     from levain.desk import charter
     m = cur.migration or ""
     if cur.mode == "aborting":
         with bs.store_lock(target.store_dir, exclusive=False):
             uncut = _uncut(target.store_dir, cur.name, m)
         if uncut:
-            return f"cut {', '.join(uncut)} (levain board abandon-track {cur.name} again)"
+            return f"cut {', '.join(uncut)} (levain board abandon-track {cur.name} again)", None
         comp = _compensation_missing(cur)
-        return comp or f"levain board abandon-done {cur.name}"
+        return comp or f"levain board abandon-done {cur.name}", None
     with bs.store_lock(target.store_dir, exclusive=False):
         adds, decision = _items_facts(target.store_dir)
+    facts = (adds, decision)
     keys = {r["key"]: i for i, r in adds.items() if isinstance(r.get("key"), str) and r.get("repo") == cur.name}
     missing = [k for k in (cur.manifest or {}).get("plan_items", []) if f"{m}:{k}" not in keys]
     if missing:
-        return f"add the plan items {', '.join(missing)} (levain board add --key {m}:<k>)"
+        return f"add the plan items {', '.join(missing)} (levain board add --key {m}:<k>)", facts
     items, _ = charter._store(target.items_path)
     text, why, problems, _ = _charter_state(cur.path, cur.name, items)
     if text is None:
-        return f"land CHARTER.md on origin/main ({why})"
+        return f"land CHARTER.md on origin/main ({why})", facts
     if problems:
-        return f"fix CHARTER.md on origin/main ({len(problems)} problems: levain charter check --repo {cur.path})"
+        return f"fix CHARTER.md on origin/main ({len(problems)} problems: levain charter check --repo {cur.path})", facts
     expected, _ = _expected_plan(cur, adds, decision)
     if expected != set(_plan_ids(text)):
-        return "make the charter's Plan match the manifest's plan items and adopted items"
-    return f"levain board track {cur.name}"
+        return "make the charter's Plan match the manifest's plan items and adopted items", facts
+    return f"levain board track {cur.name}", facts
 
 
 def _stale_stubs(view: View, cur: rf.Repo) -> list[str]:
