@@ -22,7 +22,7 @@ Invariants this relies on, so a change to one of them is a change here:
 * a rollback card is keyed by the occurrence of the save it undoes (``dream-rollback:<occurrence>``), so a rollback
   cancels exactly that occurrence's save, whatever stamp it carries.
 
-The rotation itself is the desk's own act through :func:`levain.desk.dream_rotation.rotate` (its one caller is the ``coord open`` verb that takes a dream body), at a
+The rotation itself is the desk's own act through :func:`levain.desk.dream_rotation.rotate` (called by the ``coord open`` verb that takes a dream body), at a
 seam it is not in. Nothing here starts it, fences it or authorises it: :func:`rotation_due` only SAYS whether a desk is
 at such a seam with a dream to rotate onto, and writes nothing. Stdlib only.
 """
