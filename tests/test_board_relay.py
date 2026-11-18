@@ -388,7 +388,7 @@ def test_r1_an_np_id_is_refused_up_front_with_the_named_reason_and_opens_no_band
         raise AssertionError("the band must not be opened for an np- id")
     monkeypatch.setattr(br, "band_source", boom)
     rc, _, err = decide(capsys, EXCERPT, NP_FLOW)
-    assert rc == 2 and "np- rows are flow's band: their reader arrives with T12; cite a q- row" in err
+    assert rc == 2 and "np- rows are flow's band and are not read here: levain's relay reads this install's native q- question ids; cite a q- row or use --sign" in err
     assert len(records(store)) == 1
 
 
