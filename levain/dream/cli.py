@@ -284,13 +284,15 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     was = da.install_kind(store.directory)
     # ONE facts document is read (or, with --store-dir, built) and carried through the binding the spec registers, the
     # facts this call writes and the card: two reads of a file a concurrent enable rewrites could disagree. The spec
-    # binds a shadow install's facts, and a live install's program and model (None: the defaults, the unbound live
-    # spec); facts that are there but cannot be read are refused, never registered as the defaults.
+    # binds a shadow install's facts, and a live install's program, model and first-run facts file (None: the defaults
+    # with no facts file, the unbound live spec); facts that are there but cannot be read are refused, never registered
+    # as the defaults.
     kwargs = None
     if args.store_dir is None:
         try:
             facts = da.current_install_doc(store.directory)
             binding = None if facts is None else da.install_binding(facts)
+            live = None if facts is None else da.install_live_binding(facts)
         except (KeyError, TypeError) as exc:
             print(f"levain dream enable: the shadow install facts lack {exc}; nothing was registered or written (pass "
                   "--store-dir to write the facts again)", file=sys.stderr)
@@ -307,10 +309,10 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             kwargs.update({k: facts.get(k) for k in ("facts_path", "model", "claude_bin")})
             _write_install_facts(args, store, str(zone), da, check_only=True, kwargs=kwargs)
             binding = da.install_binding(facts)
+            live = da.install_live_binding(facts)
         except (da.InstallRefused, OSError) as exc:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
-    live = None if facts is None else da.install_live_binding(facts)
     try:
         reg = da.register_dream(store, revise=args.revise, binding=binding, time=when, live=live)
     except da.EnableRefused as exc:
@@ -321,8 +323,8 @@ def run_dream_enable(args: argparse.Namespace) -> int:
                     "(--revise), which needs a new signed link; nothing was written")
         elif (not args.revise and not isinstance(exc.__cause__, AgentStoreRefused)
               and _held_live_bound_differs(store, da, live)):
-            why += ("; this install's dream program and model are bound into the dream's spec, so a changed one is a "
-                    "new version (--revise), which needs a new signed link; nothing was written")
+            why += ("; this install's dream program, model and first-run facts file are bound into the dream's spec, "
+                    "so a changed one is a new version (--revise), which needs a new signed link; nothing was written")
         print(f"levain dream enable: {why}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001 - nothing was reported as registered
@@ -359,7 +361,8 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             install_store = None
         # the program and model the card names are the ones registered into the spec, never a second read of the file
         card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when,
-                                    store_dir=install_store, bound=None if live is None else da.bound_pair(live))
+                                    store_dir=install_store, bound=None if live is None else da.bound_pair(live),
+                                    bound_facts=da.bound_facts_path(live))
     floor_hours, floor_problem = da.orphan_floor_state(store.directory)
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
            "created": reg.created, "zone": reg.zone, "time": when, "signing_card": card,
@@ -382,8 +385,8 @@ def run_dream_enable(args: argparse.Namespace) -> int:
 
 
 def _held_live_bound_differs(store: object, da: object, live: str | None) -> bool:
-    """True when a dream spec is registered in ``store`` and the program and model it binds are not ``live`` (the
-    facts' :func:`~levain.dream.agent.live_binding`): only then is the refusal about them. False when none is
+    """True when a dream spec is registered in ``store`` and the program, model and facts file it binds are not
+    ``live`` (the facts' :func:`~levain.dream.agent.live_binding`): only then is the refusal about them. False when none is
     registered or it cannot be read: the refusal is then printed without the advice."""
     from levain.agents import spec as _spec
 

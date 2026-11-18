@@ -45,7 +45,9 @@ def _live_rig(tmp_path, *, link=True, **link_over):
     """A dream rig on the wall clock (the dream's input hook reads the wall clock), its install written, a link signed."""
     from anneal_memory import FLOW_SCHEMA, Store
 
-    rig = _dream_rig(tmp_path)
+    # the spec binds the install's first-run facts file (levain#130), as `levain dream enable` registers it
+    rig = _dream_rig(tmp_path, source=da.live_source(da.live_binding(model=None, claude_bin=None,
+                                                                     facts_path=tmp_path / "facts.json")))
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     db = tmp_path / "st" / "memory.db"
     db.parent.mkdir()
@@ -587,12 +589,13 @@ def test_d3_enable_survives_an_install_file_whose_read_raises_something_other_th
     facts.write_text(json.dumps(doc))
     with pytest.raises(RuntimeError):
         da.read_install(tmp_path / "ag")                       # the premise: this read raises a RuntimeError
-    again = _enable_args(tmp_path)                             # no --store-dir: the card is built from the file as it stands
-    assert again.func(again) == 0
-    out = json.loads(capsys.readouterr().out)
-    # D1-N's rule (the signing card never prints a stand-in for a path) governs what the card says when the facts are unreadable
-    assert "`levain dream rollback` (each morning card names the exact command, with this install's store in it)" in out["signing_card"]
-    assert "<the store's directory>" not in out["signing_card"]
+    again = _enable_args(tmp_path)                             # no --store-dir: the facts are read as they stand
+    # levain#130: a live spec binds its facts_path, so one that cannot be read as a path is refused before anything is
+    # registered (as #126 refuses a program it cannot read), a plain refusal and never a traceback
+    assert again.func(again) == 1
+    err = capsys.readouterr().err
+    assert "facts_path '~no_such_user_xyz/f.json' cannot be read as a path" in err
+    assert "nothing was registered or written" in err
 
 
 def test_d3_the_shadow_branch_falls_back_on_the_same_broader_errors(tmp_path, capsys, monkeypatch):

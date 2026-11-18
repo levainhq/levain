@@ -118,10 +118,9 @@ class Install:
         if not self.anneal.exists():
             self.make_anneal()
         self._bind_stub()                            # before the enable, so the spec the enable registers binds it
-        ran = self.cli("dream", "enable", "--store-dir", str(self.anneal), "--cockpit-root", str(self.world.root),
-                       "--coord-dir", str(self.desk), *extra)
         self._write_facts()
-        return ran
+        return self.cli("dream", "enable", "--store-dir", str(self.anneal), "--cockpit-root", str(self.world.root),
+                        "--coord-dir", str(self.desk), *extra)
 
     def _bind_stub(self) -> None:
         """With a stub: the install fact ``claude_bin`` is written first (``enable`` merges it and keeps it)."""
@@ -133,16 +132,17 @@ class Install:
                          coord_dir=self.desk, zone=ZONE, claude_bin=str(self.stub.path))
 
     def _write_facts(self) -> None:
-        """The first-run facts file the install names: the operator's own file (no flag writes it)."""
+        """The first-run facts file the install names: the operator's own file (no flag writes it). Named BEFORE the
+        enable, which keeps it (a fact not passed is merged): a live spec binds its facts file (levain#130), so one
+        named after the enable is refused at the fire until `enable --revise` and a new signed link."""
         from levain.dream import agent as da
         from levain.dream import executor as ex
 
         facts = self.tmp / "facts.json"
         ex.write_first_run_facts(facts, model=MODEL, models_charged=[MODEL], m_usd_micros=ex.one_call_ceiling(MODEL))
-        inst = da.read_install(self.store_dir)
-        da.write_install(self.store_dir, store_path=inst.store_path, cockpit_root=inst.cockpit_root,
-                         coord_dir=inst.coord_dir, zone=inst.zone, facts_path=facts,
-                         claude_bin=inst.claude_bin)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        da.write_install(self.store_dir, store_path=self.anneal / "memory.db", cockpit_root=self.world.root,
+                         coord_dir=self.desk, zone=ZONE, facts_path=facts)    # claude_bin, if bound, is merged
 
     def agent(self) -> dict:
         """``levain agents show dream --json``: the ``agent`` object (agent_id, spec_hash, version, ...)."""

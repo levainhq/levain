@@ -38,9 +38,11 @@ def _rename(rig: Rig, name: str) -> None:
         c.execute("UPDATE agents SET name = ? WHERE agent_id = ?", (name, rig.agent))
 
 
-def _dream_rig(tmp_path) -> Rig:
-    """A rig whose agent's spec is SIGNED under the name ``dream``, its dream-executor role in the store."""
-    rig = Rig(tmp_path, name="dream")
+def _dream_rig(tmp_path, source: str | None = None) -> Rig:
+    """A rig whose agent's spec is SIGNED under the name ``dream``, its dream-executor role in the store. ``source``:
+    the spec's input source (default the live dream's unbound one; levain#130: an install naming a first-run facts file
+    needs the source that binds it)."""
+    rig = Rig(tmp_path, name="dream") if source is None else Rig(tmp_path, name="dream", source=source)
     _dream_role(rig)
     return rig
 
