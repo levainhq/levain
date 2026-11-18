@@ -485,6 +485,7 @@ def test_the_runs_tmpdir_is_short_enough_for_a_unix_socket(tmp_path):
     d = verify.make_short_tmp(run)
     try:
         assert len(verify.clean_env(run)["TMPDIR"]) < 63
+        assert len(str(Path(verify.clean_env(run)["TMPDIR"]).resolve())) < 63      # macOS /tmp resolves under /private (+8)
         assert verify.clean_env(run)["TMPDIR"] == str(d)
     finally:
         assert verify.remove_short_tmp(d)
