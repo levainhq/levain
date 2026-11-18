@@ -95,7 +95,7 @@ def test_an_invented_quote_never_replaces_a_word_he_set_himself(tmp_path, his_wo
     set_word(tmp_path, his_word, now=NOW - 3000)
     on_file = (tmp_path / "webpush" / intent.FILE_NAME).read_text()
     by = {**SEAT, "role": role}
-    with pytest.raises(PresenceError, match="he ends it himself"):
+    with pytest.raises(PresenceError, match="only the operator ends it"):
         set_word(tmp_path, setter_word, by=by, said="anything at all", now=NOW,
                  match=quote.Match(False, None, "the quote is in none of the last 3 operator turns"))
     assert (tmp_path / "webpush" / intent.FILE_NAME).read_text() == on_file

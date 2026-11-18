@@ -524,10 +524,10 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
                             " (the operator says it himself; from a terminal outside any agent session the operator sets any word)")
     raw = said if isinstance(said, str) else ""
     if len(raw) > _SAID_MAX:
-        raise PresenceError(f"--said is too long: quote the sentence he said, at most {_SAID_MAX} characters")
+        raise PresenceError(f"--said is too long: quote the sentence the operator said, at most {_SAID_MAX} characters")
     quote = _clean(raw, _SAID_MAX)
     if not quote:
-        raise PresenceError(f"a {role_word(role)} sets `{word}` only on his words: pass --said \"<what he told you>\" "
+        raise PresenceError(f"a {role_word(role)} sets `{word}` only on the operator's words: pass --said \"<what the operator told you>\" "
                             "(no words, no change)")
     return quote
 

@@ -54,7 +54,7 @@ CEILING = 8
 MAX_PER_PASS = 10
 PASS_WALL = 60.0
 _ERROR_CHARS = 200
-_WAKE_TEXT = "he did not wake: pushed {pushes} times, no tap or answer"
+_WAKE_TEXT = "the operator did not wake: pushed {pushes} times, no tap or answer"
 _UNREACHABLE_TEXT = "unreachable: no push was delivered ({pushes} tried)"
 
 SCHEMA: tuple[str, ...] = (

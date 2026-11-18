@@ -544,7 +544,7 @@ def check_prerequisites(git: str, repo: Path, d: Derived, *, log: Log = None) ->
     for oid in d.prerequisites:
         r = _git(git, repo, "cat-file", "-e", oid, log=log)
         if r.returncode == 1:
-            raise Refused("base-missing", f"the prerequisite {oid} is not in his repository")
+            raise Refused("base-missing", f"the prerequisite {oid} is not in your repository")
         if r.returncode != 0:
             raise Refused(f"take-failed:{r.returncode}", "git cat-file -e: "
                           + r.stderr.decode("utf-8", "replace").strip()[-300:])

@@ -967,10 +967,10 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -
             name = ov["preset"] or "a setting"
             at = time.strftime("%H:%M", time.localtime(ov["ts"]))
             if not ev[0]:
-                raise PresenceError(f"he set `{name}` himself at {at} and your quote is not in your transcript "
-                                    f"({ev[2]}); he ends it himself")
+                raise PresenceError(f"the operator set `{name}` themselves at {at} and your quote is not in your transcript "
+                                    f"({ev[2]}); only the operator ends it")
             if ev[1] <= ov["ts"]:
-                raise PresenceError(f"he set `{name}` himself at {at}, after the sentence you quote; he ends it himself")
+                raise PresenceError(f"the operator set `{name}` themselves at {at}, after the sentence you quote; only the operator ends it")
         elif not ev[0]:
             note = f"unverified: {ev[2]}"
     if ending is not None:

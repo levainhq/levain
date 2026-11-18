@@ -364,7 +364,7 @@ def check_repo(seams: Seams, repo: Path, base: Mapping[str, object]) -> Path:
         raise Refused(f"repo-unreadable:{r.returncode}", "git rev-parse --show-object-format (needs git >= 2.38): "
                                                          f"{_stderr(r)}")
     if fmt != base["object_format"]:
-        raise Refused("object-format-mismatch", f"his repository is {adopt_preview.escape(fmt.encode())}, the "
+        raise Refused("object-format-mismatch", f"your repository is {adopt_preview.escape(fmt.encode())}, the "
                                                 f"session's base is {base['object_format']}")
     r = _git(seams, repo, "rev-parse", "--is-shallow-repository")
     out = (r.stdout or b"").strip()
