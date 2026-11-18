@@ -69,6 +69,7 @@ Known edges (ruled, one line each):
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -264,7 +265,7 @@ def _unresolved(directory: Path | str) -> list[dict[str, Any]]:
         conn.close()
 
 
-_BAD_SEQ = re.compile(r"bad-seq-([0-9]{1,18})")
+_BAD_SEQ = re.compile(r"bad-seq-([1-9][0-9]{0,18})")      # canonical: 1 to 19 digits, no leading zero
 
 
 def _queued_one(directory: Path, report_id: str) -> dict[str, Any] | None:
@@ -276,10 +277,12 @@ def _queued_one(directory: Path, report_id: str) -> dict[str, Any] | None:
     conn = _ro(path)
     try:
         try:
-            row = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports WHERE report_id = ?",
-                               (report_id,)).fetchone()
-            bad = _BAD_SEQ.fullmatch(report_id)
-            if row is None and bad is not None:
+            row = None
+            if _key_ok(report_id):                       # a key the record could hold: its own id first
+                row = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports WHERE report_id = ?",
+                                   (report_id,)).fetchone()
+            bad = _BAD_SEQ.fullmatch(report_id) if isinstance(report_id, str) else None
+            if row is None and bad is not None and int(bad.group(1)) <= 2 ** 63 - 1:
                 row = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports WHERE seq = ?",
                                    (int(bad.group(1)),)).fetchone()
                 if row is not None and _key_ok(row[1]):      # that row has a good id of its own: it is not the bad-seq one
@@ -367,12 +370,27 @@ def _drained_keys(directory: Path | str) -> set[str]:
     symlinked marker reads as absent here and in the drain."""
     try:
         fd = os.open(drained_path(directory), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-    except (FileNotFoundError, OSError):          # O_NOFOLLOW on a symlink raises ELOOP: an OSError, read as absent
-        return set()
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ELOOP):     # no marker, or a symlink (O_NOFOLLOW): read as absent, as the drain does
+            return set()
+        raise                                            # any other failure (EACCES, EIO, ...) is the drain's too: it propagates
     try:
         return _marker_keys(_read_fd(fd))
     finally:
         os.close(fd)
+
+
+def _record(key: str, line: str) -> str:
+    """One marker line for ``key`` and the drain line said of it, never longer than :data:`MARKER_LINE_MAX` (the reader
+    skips longer lines as corrupt): the line text is cut, with the cut marked, until the encoded record fits."""
+    cut = "...[cut]"
+    text = line
+    while True:
+        rec = json.dumps({"key": key, "line": text}) + "\n"
+        if len(rec) - 1 <= MARKER_LINE_MAX:
+            return rec
+        base = text[: -len(cut)] if text.endswith(cut) else text
+        text = base[: len(base) // 2] + cut if base else ""     # halve what is kept; the key alone always fits
 
 
 def _append_durable(fd: int, text: str) -> None:
@@ -416,7 +434,7 @@ def drain_reports(directory: Path | str) -> ApplyResult:
         what = {_key(r): f"{_key(r)} ({str(r.get('item_id'))[:60]} {str(r.get('event'))[:20]})" for r in candidates}
         result.described = [what[k] for k in keys]
         torn = "" if not text or text.endswith("\n") else "\n"
-        _append_durable(fd, torn + "".join(json.dumps({"key": k, "line": what[k]}) + "\n" for k in keys))
+        _append_durable(fd, torn + "".join(_record(k, what[k]) for k in keys))
         return result
     finally:
         os.close(fd)
