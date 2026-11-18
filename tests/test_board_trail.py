@@ -290,7 +290,10 @@ def test_editing_one_byte_before_the_last_signed_record_breaks_the_chain_and_the
     rc, out, err = run(capsys, "verify")
     assert rc == 3
     assert "BREAK items.jsonl: line 4:" in out and "prev does not match line 3" in out
-    assert "items.jsonl: NOT ANCHORED: the file breaks at line 4, at or before the last signed record (line 4)" in out
+    # L3 r2 (gemini MED 1): a signed record that carries a break anchors nothing; with no clean signed record before it, none
+    assert ("items.jsonl: NOT ANCHORED: the signed record at line 4 carries a break, and no signed record without one precedes "
+            "it") in out
+    assert "the tail is anchored" not in out
 
 
 def test_editing_a_signed_record_body_fails_its_signature(world, capsys):
@@ -767,7 +770,9 @@ def test_a_revoked_signer_is_named_on_the_anchor_line(world, monkeypatch):
     """L1 F5: the anchor never says "committed by the operator's key" of a key revoked since."""
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: world.rig.source(revoked_seq=9))
     anchor = report(world)["items.jsonl"].anchor
-    assert "committed by a key revoked since (seq 9): a forgery signed with it after the revocation would read the same" in anchor
+    assert anchor == ("items.jsonl: NOT ANCHORED by a key you can still trust: the signature at line 4 (signed at "
+                      "2026-11-17T12:00:00Z) commits every record up to it, by a key revoked since (seq 9): a forgery signed "
+                      "with it after the revocation would read the same")
     assert "the operator's key" not in anchor
 
 
@@ -864,3 +869,125 @@ def test_export_refuses_a_git_work_tree_reached_through_a_symlink(world, tmp_pat
 def test_a_store_id_never_steers_the_bundle_name_out_of_its_directory():
     """L1 F14."""
     assert bt.destination("/tmp/x" + os.sep, "../../e").name.startswith("trail-______e-")
+
+
+# ------------------------------------------------- P6 fix 3 (L3 round 2): no line claims more than another line's evidence
+
+
+def test_the_tail_never_says_anchored_where_the_anchor_line_does_not(world, capsys, monkeypatch):
+    """codex 1 HIGH / gemini MED 1: a file ending at a signature-valid record, read from a bundle with no authority of yours,
+    or with the signer revoked since: the tail line and the anchor line are one statement."""
+    bs.decide(world.target, "alpha#1", "parked", "later", "phill", author=OP, now=NOW, seal=world.rig.seal())    # line 10, last
+    assert report(world)["items.jsonl"].tail == ("items.jsonl: 0 records after the last signed record (at 2026-11-17T12:00:00Z): "
+                                                 "the tail is anchored")
+    bundle = export_bundle(world, capsys)
+
+    def gone(**kw):
+        raise bs.BoardError("holds no cockpit.db")
+    monkeypatch.setattr(sg, "resolve_authority", gone)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0 and "items.jsonl: NOT ANCHORED: the signatures were checked only against keys the bundle itself names" in out
+    assert "the tail is anchored" not in out
+    assert ("items.jsonl: 0 records after the last signature-valid record (line 10, at 2026-11-17T12:00:00Z); no anchor you can "
+            "trust covers it: its signature was checked only against a key the bundle names") in out
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: world.rig.source(revoked_seq=9))
+    r = report(world)["items.jsonl"]
+    assert r.anchor.startswith("items.jsonl: NOT ANCHORED by a key you can still trust: the signature at line 10 ")
+    assert r.tail.endswith("no anchor you can trust covers it: its signer's key is revoked since (seq 9)")
+
+
+def test_a_revoked_answer_signer_never_reads_anchored(world, monkeypatch):
+    """codex 14: the answer's key revoked since: the record says so, a note says what it means, the count is apart."""
+    monkeypatch.setattr(sg, "resolve_authority", lambda **kw: world.rig.source(revoked_seq=9))
+    r = report(world)["items.jsonl"]
+    assert {x.n: x.verdict for x in r.records}[6] == f"agent desk 24, relaying {Q1} (signed answer, by a key revoked since (seq 9))"
+    assert any(n.startswith(f"line 6: the answer {Q1} is signed by a key revoked at seq 9") for n in r.notes)
+    assert r.relayed == ("items.jsonl: 1 relayed record(s) rest on an answer signed by a key revoked since: a forgery signed with "
+                         "it after the revocation would read the same, so nothing you can trust anchors his words")
+    assert "anchored by the answer's own signature" not in r.relayed
+
+
+def test_an_option_pick_says_what_it_covers_in_every_trust_mode(world, capsys, monkeypatch):
+    """codex 2 / gemini LOW 3: the pick-only scope survives bundle-only trust (no early return drops it)."""
+    world.band.signs[Q1] = answer_sig(world.rig, Q1, pick="(a) yes")
+    bundle = export_bundle(world, capsys)
+
+    def gone(**kw):
+        raise bs.BoardError("holds no cockpit.db")
+    monkeypatch.setattr(sg, "resolve_authority", gone)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0
+    assert ("(answer signed as the pick '(a) yes' under a key the bundle names; not checked against an authority you hold; the "
+            "signature does not cover the option key") in out
+
+
+def test_an_ack_of_a_line_that_is_not_torn_is_a_break(world, capsys):
+    """codex 3: the file's own fold reports it; verify never suppresses it."""
+    lines = world.lines("items.jsonl")
+    ack = json.loads(next(x for x in lines if b'"ack-torn"' in x))
+    ack.update(line=3, sha256=bc.line_hash(lines[2]), prev=bc.line_hash(lines[-1]))
+    world.write("items.jsonl", lines + [json.dumps(ack, separators=(",", ":")).encode()])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and ("items.jsonl:10 ack-torn: asserted by phill, unsigned, but: it acknowledges line 3 as torn, and line 3 is "
+                        "not torn (the file's own fold reports this ack)  [BREAK]") in out
+
+
+def test_an_asserted_move_the_writer_would_call_a_decision_is_a_break(world, capsys):
+    """codex 8: classified by board_sign.move_is_decision on the registry as it stood before the move."""
+    lines = world.lines("repos.jsonl")
+    reg = json.loads(next(x for x in lines if b'"register"' in x and b'"alpha"' in x))
+    rec = {"v": reg["v"], "store": reg["store"], "op": "move", "repo": "alpha", "at": NOW, "by": "phill", "words": "moved",
+           "path": reg["path"], "origin": reg["origin"], "root": reg["root"], "author": OP, "grade": "asserted",
+           "prev": bc.line_hash(lines[-1])}
+    rec["path"] = reg["path"] + "-relocated"                # the same repository relocated: asserted-ok, as the writer says
+    world.write("repos.jsonl", lines + [json.dumps(rec, separators=(",", ":")).encode()])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    rec.update(origin="/elsewhere/alpha.git")                # a tracking repo's origin changed: decision-class
+    world.write("repos.jsonl", lines + [json.dumps(rec, separators=(",", ":")).encode()])
+    rc, out, err = run(capsys, "verify")
+    assert rc == 3 and ("repos.jsonl:5 move alpha: asserted by phill, unsigned, but: a decision-class move (the repo is tracking "
+                        "and the move changes its recorded origin or root set) recorded asserted") in out
+
+
+def test_a_signed_record_with_a_break_is_never_the_last_signed_record(world, capsys):
+    """gemini MED 1, second half: a signed record that carries a break anchors nothing."""
+    bs.decide(world.target, "alpha#1", "parked", "later", "phill", author=OP, now=NOW, seal=world.rig.seal())    # line 10
+    lines = world.lines("items.jsonl")
+    lines[8] = lines[8].replace(b"fifth", b"fifTH")         # line 9 edited: the signed line 10 is chain-broken
+    world.write("items.jsonl", lines)
+    r = report(world)["items.jsonl"]
+    assert r.anchor.startswith("items.jsonl: anchored through line 4 ") and "the tail is anchored" not in r.tail
+    assert r.tail.startswith("items.jsonl: 5 records after the last signed record")
+
+
+def test_a_line_the_fold_dropped_by_an_ack_the_chain_rule_does_not_honour_is_attributed_never_a_crash(world, capsys):
+    """gemini MED 2 / deepseek B: line 9 malformed AND chain-broken, dropped by a torn-style ack (the fold's rule) the chain's
+    own ack rule does not honour (a chain break needs a chain ack): attributed to the ack the fold names, no KeyError."""
+    lines = world.lines("items.jsonl")
+    r = json.loads(lines[8])
+    r.update(v=2, prev="0" * 64)
+    lines[8] = json.dumps(r, separators=(",", ":")).encode()
+    ack = {k: v for k, v in json.loads(lines[7]).items() if k not in ("have", "want")}
+    ack.update(line=9, sha256=bc.line_hash(lines[8]), prev=bc.line_hash(lines[8]))
+    world.write("items.jsonl", lines + [json.dumps(ack, separators=(",", ":")).encode()])
+    bs.decide(world.target, "alpha#1", "parked", "later", "phill", author=OP, now=NOW, seal=world.rig.seal())    # line 11
+    rc, out, err = run(capsys, "verify")
+    assert rc == 0, out + err
+    assert "items.jsonl:9 add alpha#5: not read: torn for itself and acknowledged by phill (asserted, line 10)" in out
+    assert ("lines 1-8 are committed by NOTHING but the acknowledgement of line 9 by phill (asserted, line 10)") in out
+
+
+def test_a_bundle_key_of_the_wrong_shape_is_a_damaged_bundle(world, capsys):
+    """gemini LOW 4: exit 2, never a traceback in the trust-root comparison."""
+    bundle = export_bundle(world, capsys)
+    doc = json.loads(bundle.read_text("utf-8"))
+    doc["authority"]["keys"][0]["public_key"] = None
+    bundle.write_text(json.dumps(doc))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 2 and "is a damaged bundle" in err
+
+
+def test_safe_escapes_the_unicode_line_separators_by_codepoint():
+    """complement LOW: the pattern names U+2028/U+2029 by escape, and a plain space is never escaped."""
+    assert bt.safe("a\u2028b\u2029c d") == "a\\u2028b\\u2029c d"
