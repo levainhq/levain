@@ -632,6 +632,8 @@ def test_a_dream_save_rotates_the_desk_and_the_next_desk_loads_the_saved_text_an
     from levain.desk import dream_rotation
 
     saved, occ = dreamed
+    # the seam is due on the dream's card (the step between the save and the rotation), and the rotation names that save
+    assert _due(desk)[0] is True
     got = dream_rotation.rotate(desk, token=desk.token, body=BODY)
     assert isinstance(got, dream_rotation.Rotation) and got.occurrence == occ
     assert got.handoff.seam_kind == "dream" and got.handoff.close_key == f"dream-rotation:{occ}"
