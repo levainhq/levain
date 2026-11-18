@@ -1907,6 +1907,7 @@ def test_a_three_rule_desk_install_gains_the_board_rules_on_upgrade(tmp_home, qd
     # upgrade path that brings Read brings the board and charter verbs too, in the install's own spelling
     from levain import install as inst
 
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_home / ".levain"))      # the door reads its record path under a test run
     with monkeypatch.context() as m:
         m.setattr(inst, "DESK_BOARD_VERBS", ())                         # the install as the release before T10 made it
         _main(qdir, capsys, "coord", "agent", "claude")
