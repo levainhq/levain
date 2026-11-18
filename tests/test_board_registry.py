@@ -1602,3 +1602,30 @@ def test_p1b_fix1_a_registry_chain_ack_keeps_the_line_and_binds_the_break(store,
     lines[1] = lines[1].replace(b'"words":"edited"', b'"words":"edited-again"')
     p.write_bytes(b"\n".join(lines) + b"\n")
     assert run(capsys, "repos")[0] == 2                                              # the same line before is edited again: breaks again
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# charter init / check act only on the registered repository (levain#105)
+
+
+def _charter(capsys, *argv):
+    rc = main(["charter", *argv])
+    out, err = capsys.readouterr()
+    return rc, out.strip(), err.strip()
+
+
+def test_charter_init_and_check_refuse_a_repo_that_is_not_the_registered_one(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    monkeypatch.chdir(b)                                                # the wrong repository, by the default of `here`
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and f"alpha is registered at {os.path.realpath(a)}" in err and f"Pass --repo {os.path.realpath(a)}" in err
+    assert os.path.realpath(b) in err and not (b / "CHARTER.md").exists()
+    rc, _, err = _charter(capsys, "check", "--repo-name", "alpha", "--worktree")
+    assert rc == 2 and f"Pass --repo {os.path.realpath(a)}" in err
+    rc, _, err = _charter(capsys, "init", "gamma")                        # an unregistered name: the old behaviour (it writes here)
+    assert rc == 0 and (b / "CHARTER.md").exists()
+    rc, out, err = _charter(capsys, "init", "alpha", "--repo", str(a))    # the registered path: written
+    assert rc == 0 and (a / "CHARTER.md").exists()
+    rc, out, _ = _charter(capsys, "check", "--repo-name", "alpha", "--repo", str(a), "--worktree")
+    assert rc == 0 and "CHARTER.md" in out

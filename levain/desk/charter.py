@@ -323,6 +323,11 @@ def run_check(args: Any) -> int:
         repo = repo.expanduser()
     except RuntimeError:                                    # `~nouser`: left as typed, git will say it is not a repository
         pass
+    if args.repo_name is not None:                          # a NAME given outright: it must be read from the repo it names
+        wrong = _wrong_repo("check", args.repo_name, _toplevel(repo), args.items)
+        if wrong is not None:
+            print(f"levain charter check: {wrong}", file=sys.stderr)
+            return 2
     if args.file is not None:
         where, label = str(args.file), "the file"
         text, why = _read_path(Path(args.file))
@@ -411,10 +416,35 @@ def _toplevel(path: Path) -> Path | None:
     return Path(out) if cp.returncode == 0 and out else None
 
 
+def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> str | None:
+    """The refusal text when NAME is registered in the board registry and ``top`` (the git top-level the verb is about to act
+    on) is not the registered path; None otherwise. An unregistered NAME, no registry, a store that cannot be read and a
+    ``top`` that is not a repository all return None: the verb behaves as it always did."""
+    if top is None:
+        return None
+    try:
+        from levain.desk import board_registry as br, board_store as bs
+        reg = br.read_registry(bs.resolve_store(items), allow_inactive=True).fold.repos.get(name)
+    except Exception:       # no store, no pointer, a torn registry: nothing to compare against
+        return None
+    if reg is None:
+        return None
+    try:
+        registered = Path(reg.path).expanduser().resolve()
+        here = top.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if registered == here:
+        return None
+    return (f"{name} is registered at {registered}, but this would write CHARTER.md in {here}. "
+            f"Pass --repo {registered}.") if verb == "init" else (
+            f"{name} is registered at {registered}, but this would read {here}. Pass --repo {registered}.")
+
+
 def run_init(args: Any) -> int:
-    def refuse(msg: str) -> int:
+    def refuse(msg: str, code: int = 1) -> int:
         print(f"levain charter init: {msg}", file=sys.stderr)
-        return 1
+        return code
 
     name = args.name
     if not _NAME.fullmatch(name):
@@ -426,6 +456,9 @@ def run_init(args: Any) -> int:
         root = _toplevel(where)
         if root is None:
             return refuse(f"{where} is not inside a git work tree.")
+        wrong = _wrong_repo("init", name, root, args.items)
+        if wrong is not None:
+            return refuse(wrong, 2)
     plan_ids: list[str] | None = None
     if args.items is None:
         print("levain charter init: no --items store was read; the Plan holds one placeholder line.", file=sys.stderr)
