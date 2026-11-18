@@ -428,7 +428,7 @@ def test_a_desk_with_no_reading_yet_says_so_and_is_not_drawn_as_unreadable_or_ze
 
 
 @needs_browser
-def test_the_lease_line_points_to_start_desk_only_when_the_button_is_drawn(tmp_path):
+def test_the_lease_line_points_to_new_desk_only_when_the_button_is_drawn(tmp_path):
     words = "document.querySelector('.dv-zone .dv-leasewords').textContent"
     with desk_page(tmp_path) as (stub, base):
         out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, _TAP_DESK, _OPEN,
@@ -439,8 +439,8 @@ def test_the_lease_line_points_to_start_desk_only_when_the_button_is_drawn(tmp_p
             put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"),
             {"eval": "JSON.stringify({w: " + words + ", start: !!document.querySelector('.dv-zone .dv-start'), marker: 'lw'})"}])
     with_btn, without = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"marker":"lw"' in v]
-    assert with_btn["w"].endswith("To start one, use Start desk below."), with_btn
-    assert "Start desk" not in without["w"] and not without["start"] and without["w"].endswith("A typed line never starts a desk."), without
+    assert with_btn["w"].endswith("To start one, use New Desk below."), with_btn
+    assert "New Desk" not in without["w"] and not without["start"] and without["w"].endswith("A typed line never starts a desk."), without
 
 
 def test_the_context_model_never_makes_a_non_finite_bar_and_the_desk_commands_keep_their_positions(tmp_path):

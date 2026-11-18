@@ -9,7 +9,7 @@
 //
 // One send per tap: the line in flight greys and says "Filing..."; a double tap sends once. The outbox id is minted once per
 // message and re-sent unchanged on a retry, so the server answers the line it already holds instead of filing it twice.
-// A typed line never starts a desk: with no lease it is held for the next one, and the page offers Start desk (the signing sheet, levain#78) and the signed Drop tab.
+// A typed line never starts a desk: with no lease it is held for the next one, and the page offers New Desk (the signing sheet, levain#78) and the signed Drop tab.
 // This page never says what the desk did with a line beyond the server's own words: it cannot observe that.
 //
 // Voice (levain#23): the same controls as the Room's, from the same code, never a second copy. The composer's Dictate and Mic are
@@ -34,13 +34,17 @@
   var CLEAR_HELD_WORDS = "Nothing settled to clear: a line still waiting for an answer, or not yet confirmed, stays.";
   var CLEARED_STAY_WORDS = "Cleared. A line still waiting for an answer, or not yet confirmed, stays.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
-  // Start desk (levain#78, moved here from the Room page): with no desk holding the lease this control opens the cockpit's own signing
-  // sheet (the page's LevainSignSheet.openDrop) with the start words filled in. The room cannot sign, and a typed line never starts a
-  // desk, so a desk is started only from that sheet: the passkey tap there is the signature, and the words stay his to edit (the other
-  // shape is one word away). The relay reads the first word and an optional shape. Drawn only where the page carries the sheet.
+  // The desk button (levain#78, moved here from the Room page; levain#107 names it by what a desk is doing): with no desk holding the
+  // lease it reads New Desk, and with one holding it Rotate Desk. Either opens the cockpit's own signing sheet (the page's
+  // LevainSignSheet.openDrop) with the same words filled in. The room cannot sign, and a typed line never starts a desk, so a desk is
+  // asked for only from that sheet: the passkey tap there is the signature, and the words stay his to edit (the other shape is one
+  // word away). The relay reads the first word and an optional shape. Drawn only where the page carries the sheet.
   var DESK_WORDS = "/fanin broad";
+  var NEW_LABEL = "New Desk", ROTATE_LABEL = "Rotate Desk";
   var START_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk inside limits; its Send words only button starts it with no limits; nothing starts until you press one of them.";
   var START_REFUSED_WORDS = "The signing sheet did not open, so no desk was started.";
+  var ROTATE_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to ask for a fresh desk inside limits; its Send words only button asks with no limits; nothing is asked until you press one of them. This page rotates nothing itself.";
+  var ROTATE_REFUSED_WORDS = "The signing sheet did not open, so no desk was rotated.";
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
 
   // The numbers voice.js is given for desk replies. voice.js remembers which numbers it has already decided on for the life of the
@@ -81,7 +85,7 @@
       return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false };
     }
     if (st === "none") {
-      return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk.", startHint: " To start one, use Start desk below.", drop: true };
+      return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk.", startHint: " To start one, use " + NEW_LABEL + " below.", drop: true };
     }
     return { state: "unknown", words: "The lease could not be checked; a line you send will queue.", drop: false };
   }
@@ -269,7 +273,7 @@
     // `threads` is the ordered list of the threads this page's sends returned (the host files each typed line under a NEW
     // thread): {id, cursor, events} each, oldest first, one per line still in the log (at most KEEP_SENT). There is no "current thread": a read names the
     // thread it asked for and is applied to that thread alone. `log` holds the lines this page sent.
-    var current = null, threads = [], log = [], lastKey = "", note = "", startNote = "";
+    var current = null, threads = [], log = [], lastKey = "", note = "", startNote = "", noteFor = "";
     var flight = { send: false };
 
     var wrap = el(doc, "div", "rv dv"), top = el(doc, "div", "rv-top"), bar = el(doc, "div", "dv-state"),
@@ -504,16 +508,17 @@
 
     function draw() {
       var all = rows();
-      // what Start desk said is true of the moment it was said: a lease that is no longer "none" takes it down
-      if (!(current && current.kind === "wired" && current.lease.state === "none")) startNote = "";
+      // what the desk button said is true of the moment it was said: a lease that is no longer in the state it was said in takes it down
+      if (!(current && current.kind === "wired" && current.lease.state === noteFor)) startNote = "";
       var key = JSON.stringify([current, all, unreadableNow(), note, startNote]);
       if (key === lastKey) { paintDock(); return; }
       var stick = wasEnd || atEnd();
       clear(bar);
       if (current && current.kind === "wired") {
         bar.className = "dv-state dv-lease-" + current.lease.state;
-        var canStart = current.lease.state === "none" && !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function";
-        // the pointer to Start desk is drawn only when the button below is
+        var hasSheet = !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function";
+        var canStart = current.lease.state === "none" && hasSheet, canRotate = current.lease.state === "held" && hasSheet;
+        // the pointer to New Desk is drawn only when the button below is
         bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words + (canStart && current.lease.startHint ? current.lease.startHint : ""))));
         if (current.lease.state === "held" && current.context) {
           var cx = current.context, box = el(doc, "div", "dv-ctx dv-ctx-" + (cx.state === "ok" ? cx.level : cx.state));
@@ -527,14 +532,16 @@
           }
           bar.appendChild(box);
         }
-        if (canStart) {
-          var st = el(doc, "button", "dv-start", "Start desk");
-          st.setAttribute("type", "button"); st.setAttribute("title", "Open the signing sheet to start a desk: " + DESK_WORDS);
-          st.setAttribute("aria-label", "Start a desk (opens the signing sheet)");
+        if (canStart || canRotate) {
+          var st = el(doc, "button", "dv-start", canRotate ? ROTATE_LABEL : NEW_LABEL), state = current.lease.state;
+          st.setAttribute("type", "button");
+          st.setAttribute("title", (canRotate ? "Open the signing sheet to ask for a fresh desk to replace this one: " : "Open the signing sheet to start a desk: ") + DESK_WORDS);
+          st.setAttribute("aria-label", canRotate ? "Rotate the desk (opens the signing sheet)" : "Start a new desk (opens the signing sheet)");
           st.addEventListener("click", function () {
             var S = root.LevainSignSheet, got = null;
             try { got = S && S.openDrop(DESK_WORDS); } catch (e) { got = null; }
-            startNote = got ? START_OPEN_WORDS : START_REFUSED_WORDS;
+            startNote = got ? (state === "held" ? ROTATE_OPEN_WORDS : START_OPEN_WORDS) : (state === "held" ? ROTATE_REFUSED_WORDS : START_REFUSED_WORDS);
+            noteFor = state;
             lastKey = ""; draw();
           });
           bar.appendChild(st);

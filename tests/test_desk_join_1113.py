@@ -27,6 +27,7 @@ from tests.test_desk_pane_page import PHONE, _OPEN, _TAP_DESK, _TOKENED, _no_ban
 
 ASSET = "/desk_tab_view.js"
 HOLDER = "desk 25, renewed 3 min ago"
+HELD_BAR = HOLDER + "\nRotate Desk"          # the lease bar's text with a desk live: its words, then the desk button (levain#107)
 
 # one JSON snapshot of the Desk view, with the buttons the ambiguous line offers
 _SNAP = """(() => { const z = document.querySelector('.dv-zone'), q = s => z.querySelector(s), all = s => [...z.querySelectorAll(s)];
@@ -97,7 +98,7 @@ def test_a_line_is_filed_through_the_real_route_and_the_deskss_answers_draw_from
     for s in (before, after):
         _no_ban_words(s)
         assert s["on"] and not s["errorBar"], s
-    assert before["bar"] == HOLDER and not before["unreadable"] and not before["drop"], before     # readable with no thread: never an alarm
+    assert before["bar"] == HELD_BAR and not before["unreadable"] and not before["drop"], before     # readable with no thread: never an alarm
     assert before["sendDisabled"] is False and not before["taDisabled"], before
     assert [p.words for p in port.posts] == ["hello desk"] and port.posts[0].origin.startswith("cockpit:"), port.posts
     you = after["lines"][0]
@@ -346,6 +347,6 @@ def test_a_poll_answered_503_keeps_the_last_view_and_polls_again(tmp_path, qdir)
         for t in port.hogs:
             t.join(timeout=10)
     busy, later = snaps(out)
-    assert busy["bar"] == HOLDER and not busy["errorBar"] and busy["barCls"].endswith("dv-lease-held"), busy      # the last view stays
-    assert later["bar"] == HOLDER and not later["errorBar"], later
+    assert busy["bar"] == HELD_BAR and not busy["errorBar"] and busy["barCls"].endswith("dv-lease-held"), busy      # the last view stays
+    assert later["bar"] == HELD_BAR and not later["errorBar"], later
     assert any(x[1] == 503 for x in busy["st"]), busy["st"]

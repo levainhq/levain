@@ -323,7 +323,7 @@ def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
         _no_ban_words(s)
         assert s["on"] and not s["room"], s
     assert unwired["bar"] == "This cockpit has no desk wired." and unwired["sendDisabled"] and unwired["taDisabled"], unwired
-    assert held["bar"] == "desk 25, renewed 3 min ago" and not held["drop"], held
+    assert held["bar"] == "desk 25, renewed 3 min ago\nRotate Desk" and not held["drop"], held
     assert held["sendDisabled"] is False and not held["taDisabled"] and held["barCls"].endswith("dv-lease-held"), held
     assert none["drop"] and "held for the next desk" in none["bar"] and "never starts a desk" in none["bar"] and not none["taDisabled"], none
     assert "will queue" in unknown["bar"] and not unknown["drop"] and not unknown["taDisabled"], unknown
