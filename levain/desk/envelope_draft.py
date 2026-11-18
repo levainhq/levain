@@ -174,10 +174,19 @@ def check_proposal(proposal: Any) -> dict[str, Any]:
     binds = proposal["binds"]
     if not isinstance(binds, list) or not binds:
         raise DraftError("a draft binds at least one thread")
-    # sorted by thread id: the first bind is the series' anchor thread. A proposal with several binds is a mission draft
-    # (see ``envelope_drafts.create_mission_draft``); a thread named twice is refused by ``env.parse_body`` below
-    ids = [b.get("thread_id") if isinstance(b, dict) else None for b in binds]
-    if all(isinstance(i, str) for i in ids) and ids != sorted(ids):
+    # each bind an object naming its thread as a string, no thread twice, sorted by thread id: checked here, on the
+    # proposal itself. The first bind is the series' anchor thread; a proposal with several binds is a mission draft
+    # (see ``envelope_drafts.create_mission_draft``). ``env.parse_body`` below then holds each bind to its exact keys
+    # and the form of its thread id, revision and members digest.
+    ids: list[str] = []
+    for b in binds:
+        if not isinstance(b, dict) or not isinstance(b.get("thread_id"), str):
+            raise DraftError("each bind is an object naming the thread_id it binds")
+        ids.append(b["thread_id"])
+    twice = next((i for n, i in enumerate(ids) if i in ids[:n]), None)
+    if twice is not None:
+        raise DraftError(f"a draft's binds names thread {twice[:40]} twice")
+    if ids != sorted(ids):
         raise DraftError("a draft's binds are sorted by thread id")
     check_fields({k: proposal[k] for k in EDITABLE})
     ref = {"draft_id": "ed-" + "0" * 32, "revision": 1, "digest": "sha256:" + "0" * 64}

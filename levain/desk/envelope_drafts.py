@@ -139,14 +139,28 @@ def _signed_by(conn: sqlite3.Connection, draft_id: str, revision: int | None = N
 
 
 def _unclosed(conn: sqlite3.Connection, thread_id: str) -> Draft | None:
-    """The latest revision of the thread's one unclosed series (not signed, not withdrawn), or None."""
+    """The latest revision of the one unclosed series (not signed, not withdrawn) that binds the thread, or None. A
+    series binds a thread through ANY of its binds, so a mission's series is found from every child, not only from
+    its anchor (L3 h15 r1: codex, deepseek, gemini). Revision 1's binds are the series' binds: a one-thread series
+    binds its own thread at every revision, and a mission's series is never revised once its mission moved (the
+    children, and so the bound threads, are the same at every revision)."""
     if not _has_tables(conn):
         return None
     row = conn.execute(
-        "SELECT d.draft_id FROM envelope_drafts d WHERE d.thread_id = ? AND d.revision = 1 AND NOT EXISTS (SELECT 1 "
+        "SELECT d.draft_id FROM envelope_drafts d WHERE d.revision = 1 AND (d.thread_id = ? OR EXISTS (SELECT 1 FROM "
+        "json_each(d.proposal, '$.binds') b WHERE json_extract(b.value, '$.thread_id') = ?)) AND NOT EXISTS (SELECT 1 "
         "FROM envelope_draft_withdrawals w WHERE w.draft_id = d.draft_id) AND NOT EXISTS (SELECT 1 FROM envelopes e "
-        "WHERE json_extract(e.body, '$.draft.draft_id') = d.draft_id) ORDER BY d.gseq LIMIT 1", (thread_id,)).fetchone()
+        "WHERE json_extract(e.body, '$.draft.draft_id') = d.draft_id) ORDER BY d.gseq LIMIT 1",
+        (thread_id, thread_id)).fetchone()
     return None if row is None else _row(conn, row[0])
+
+
+def _bind_of(d: Draft, thread_id: str) -> Mapping[str, Any]:
+    """The bind of ``d``'s proposal for ``thread_id``; :class:`CoordError` when the draft does not bind it."""
+    bind = next((b for b in d.proposal["binds"] if b["thread_id"] == thread_id), None)
+    if bind is None:
+        raise CoordError(f"draft {d.draft_id} does not bind thread {thread_id}")
+    return bind
 
 
 @contextmanager
@@ -174,10 +188,14 @@ def _mission_link(conn: sqlite3.Connection, draft_id: str | None) -> tuple[str, 
 def _mission_lapse_of(conn: sqlite3.Connection, link: tuple[str, int, str]) -> str | None:
     """Why the mission is not at the revision and children hash the link recorded, or None."""
     mission_id, rev, sha = link
-    try:
-        now_rev, _children, now_sha = ms._latest(conn, mission_id)
-    except (CoordError, sqlite3.OperationalError):
+    # absence is read by its own query (no table, or no revision row), so nothing else is caught: a fault reading a
+    # mission that IS here (a lock, a row this reader cannot read) propagates, and is never shown as a lapse
+    # (L3 h15 r1 deepseek). ``missions._latest`` raises one CoordError for absence and for nothing else today, but
+    # catching it here would also hide whatever it raises tomorrow.
+    if not _has(conn, "mission_revisions") or conn.execute(
+            "SELECT 1 FROM mission_revisions WHERE mission_id = ? LIMIT 1", (mission_id,)).fetchone() is None:
         return f"mission {mission_id} is not in this store"
+    now_rev, _children, now_sha = ms._latest(conn, mission_id)
     if now_rev != rev or now_sha != sha:
         return f"mission {mission_id} changed since this series was written (revision {now_rev}, not {rev})"
     return None
@@ -454,8 +472,12 @@ def _write_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: str, *,
     mission's series as a whole."""
     if draft_id is not None:
         series = _row(conn, draft_id)
-        if series is not None and (len(series.proposal["binds"]) > 1 or _mission_link(conn, draft_id) is not None):
-            raise CoordError(f"draft {draft_id} is a mission's draft and binds {len(series.proposal['binds'])} "
+        binds = series.proposal.get("binds") if series is not None and isinstance(series.proposal, dict) else None
+        if series is not None and not isinstance(binds, list):
+            raise CoordError(f"draft {draft_id} cannot be read as a bound series (its proposal holds no list of "
+                             "binds); nothing was written")
+        if series is not None and (len(binds) > 1 or _mission_link(conn, draft_id) is not None):
+            raise CoordError(f"draft {draft_id} is a mission's draft and binds {len(binds)} "
                              f"threads; a change for thread {thread_id} alone cannot revise it, and nothing was "
                              "written. Revise the mission's draft as a whole, or withdraw it first.")
     return _write_series_revision(store, conn, now, thread_id=thread_id, mission_id=None, draft_id=draft_id,
@@ -492,8 +514,9 @@ def _write_series_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: 
     if mission_id is not None:
         mission_rev, mission_sha, threads = _mission_children(store, conn, mission_id)
         thread_id = threads[0].thread_id
+    elif thread_id is None:          # an explicit check, not an assert: python -O strips those
+        raise CoordError("a draft revision names neither a thread nor a mission; nothing was written")
     else:
-        assert thread_id is not None
         threads = [store._must_thread(conn, thread_id)]
     newest: Draft | None = None
     if draft_id is not None:
@@ -505,6 +528,16 @@ def _write_series_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: 
         if newest.digest != parent:
             raise DraftStale(f"draft {draft_id} moved since it was rendered (its latest revision is "
                              f"#{newest.revision}); render it again")
+    else:
+        # a new series: no thread it would bind is bound by another unclosed series, through ANY of that series' binds
+        # (the store's trigger sees only each series' anchor thread), so a child of an open mission draft opens no
+        # competing draft, and a mission draft is not opened over a child's own (L3 h15 r1)
+        for t in threads:
+            other = _unclosed(conn, t.thread_id)
+            if other is not None:
+                raise CoordError(f"a thread holds one unclosed draft series: thread {t.thread_id} is already bound "
+                                 f"by draft {other.draft_id}; revise that draft or withdraw it first. Nothing was "
+                                 "written.")
     sid = store._jobs._store_id(conn)
     anchor = _anchor(conn, threads[0].members) if mission_id is None else _shared_drop(conn, threads)
     if anchor is None:
@@ -554,9 +587,15 @@ def _write_series_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: 
         # a trigger's refusal (a closed series, a second unclosed series, a stale parent) is the store's line
         raise CoordError(str(exc)) from None
     if mission_id is not None and revision == 1:
-        assert mission_rev is not None and mission_sha is not None
-        conn.execute("INSERT INTO mission_drafts (draft_id, mission_id, mission_revision, children_sha256, gseq, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?)", (did, mission_id, mission_rev, mission_sha, next_gseq(conn, now), now))
+        if mission_rev is None or mission_sha is None:      # explicit, not an assert (python -O strips those)
+            raise CoordError(f"mission {mission_id} was not read under this lock; nothing was written")
+        try:
+            conn.execute("INSERT INTO mission_drafts (draft_id, mission_id, mission_revision, children_sha256, gseq, "
+                         "at) VALUES (?, ?, ?, ?, ?, ?)",
+                         (did, mission_id, mission_rev, mission_sha, next_gseq(conn, now), now))
+        except sqlite3.IntegrityError as exc:
+            # the link table's refusal is the store's line, as the revision's is above; the transaction rolls back
+            raise CoordError(str(exc)) from None
     return Draft(did, revision, thread_id, gseq, parent_digest, proposal, wanted, digest, by, now)
 
 
@@ -944,8 +983,12 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
         parent = _row(conn, draft_id, revision - 1) if revision > 1 else None
         since = ed.field_diff(None if parent is None else parent.proposal, d.proposal)
         head = store._head(conn, d.thread_id)
-        # ANCHOR-ONLY: binds[0] is d.thread_id's own bind (a mission series' anchor is its first child)
-        bind_rev = d.proposal["binds"][0]["rev"]
+        # ANCHOR-ONLY, re-read for fix 2 (L3 h15 r1): the builder is per series, not per viewed thread, so it reads the
+        # series' own thread (a mission's anchor, its first child) and that thread's bind. The head-relative diff below
+        # cannot misreport a child: a multi-bind revision with a head on ANY bound thread is lapsed and refused by
+        # _stale_reason above, so for a mission's series ``head`` is None here. The since-parent diff and the sheet's
+        # member view over every child are lane 3's (L3 h15 r1 complement #3).
+        bind_rev = _bind_of(d, d.thread_id)["rev"]
         ended = effective = None
         added: list[str] = []
         removed: list[str] = []
@@ -1088,20 +1131,22 @@ def _with_words(conn: sqlite3.Connection, ids: list[str]) -> list[dict[str, str]
     return out
 
 
-def _view_inputs(store: EnvelopeStore, conn: sqlite3.Connection, d: Draft, head: Any) -> dict[str, Any]:
-    """What an ENVELOPE card shows about an open draft, read in the snapshot's transaction."""
-    # ANCHOR-ONLY: binds[0] is d.thread_id's own bind (a mission series' anchor is its first child)
-    bind_rev = d.proposal["binds"][0]["rev"]
+def _view_inputs(store: EnvelopeStore, conn: sqlite3.Connection, d: Draft, head: Any, thread_id: str
+                  ) -> dict[str, Any]:
+    """What an ENVELOPE card shows about an open draft on ``thread_id`` (the thread the card is read for, which a
+    mission's series binds as one of its children), read in the snapshot's transaction. ``head`` is that thread's."""
+    # the viewed thread's own bind and head, not the anchor's: a mission's series is found from every child now
+    bind_rev = _bind_of(d, thread_id)["rev"]
     parent = _row(conn, d.draft_id, d.revision - 1) if d.revision > 1 else None
     effective: dict[str, Any] | None = None
     added: list[str] = []
     removed: list[str] = []
     if head is not None:
-        effective = store._effective(conn, head.envelope_id, d.thread_id)
+        effective = store._effective(conn, head.envelope_id, thread_id)
         row = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
-                           (head.envelope_id, d.thread_id)).fetchone()
+                           (head.envelope_id, thread_id)).fetchone()
         if row is not None:
-            added, removed = store.members_diff(conn, d.thread_id, row[0], bind_rev)
+            added, removed = store.members_diff(conn, thread_id, row[0], bind_rev)
     anchor = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (d.proposal["drop_id"],)).fetchone()
     return {"parent": None if parent is None else parent.proposal, "effective": effective,
             "added": _with_words(conn, added), "removed": _with_words(conn, removed),
@@ -1142,7 +1187,8 @@ def _snapshot(store: EnvelopeStore, thread_id: str, queue_dir: Any, *, view: boo
                 reply_id = None if row is None else row[0]
         draft = _unclosed(conn, thread_id)
         lapse = None if draft is None else lapse_reason(conn, now, thread_id, draft.proposal, draft_id=draft.draft_id)
-        shown = None if not view or draft is None or lapse is not None else _view_inputs(store, conn, draft, head)
+        shown = None if not view or draft is None or lapse is not None else \
+            _view_inputs(store, conn, draft, head, thread_id)
     return _Snap(now, thread, head, rows, bind_rev, kill_at, done_at, gauge, reply_id, (added, removed), draft, lapse,
                  shown)
 

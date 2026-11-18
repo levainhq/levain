@@ -380,6 +380,8 @@ def test_i3_the_signed_envelopes_own_drop_cannot_be_split_again(ctx):
     with pytest.raises(CoordError, match="is already split"):
         ctx.store.split(d.drop_id, [Part("work", "the same drop again")])
     assert (count(ctx, "envelope_binds"), count(ctx, "threads")) == (3, threads)
+
+
 def test_i3_no_regrouping_changes_who_the_envelope_binds(ctx):
     # guard: EnvelopeStore._store_refusal's "not bound" for a thread the envelope does not bind
     d, ts, m, dr, stored = signed_mission(ctx, 3)
@@ -460,6 +462,152 @@ def test_a_one_thread_tap_or_rule_on_a_mission_anchor_is_refused_and_writes_noth
     f = fields_for(ctx, budget={**BUDGET, "hours": 1})
     r2 = drafts.revise(ctx.store, dr.draft_id, f, cites_for(d, f), parent=dr.digest, by="operator")
     assert r2.revision == 2 and len(r2.proposal["binds"]) == 3
+
+
+# --- fix 2 A: a mission's series is found from EVERY child it binds, not only from its anchor ------------------------
+def test_a_child_thread_sees_the_mission_draft_and_opens_no_competing_series(card):
+    """Reproduced first (h15_fix2_return.md): before the fix, ``_unclosed`` matched only the anchor thread, so on a
+    non-anchor child a card tap, ``drop_rule`` and ``spec_rule`` each opened a second, single-thread series next to the
+    open mission draft, and the child's card and facet showed no draft at all."""
+    # guard: envelope_drafts._unclosed matches a series through any of its binds, and _write_series_revision refuses
+    # a new series on a thread an unclosed series already binds
+    ctx = card.ctx
+    queue = ctx.tmp / "queue"
+    queue.mkdir()
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    for t in ts:
+        assert drafts.unclosed_series(ctx.store, t.thread_id).draft_id == dr.draft_id
+        (c,) = drafts.cards(ctx.store, t.thread_id, authority=ctx.snap, queue_dir=queue)
+        assert c.kind == "ENVELOPE" and c.detail["draft_id"] == dr.draft_id
+        facet = drafts.authority_facet(ctx.store, t.thread_id, authority=ctx.snap, queue_dir=queue)
+        assert drafts.label(facet) == "ENVELOPE" and facet.draft.draft_id == dr.draft_id
+    child = ts[1].thread_id
+    words = spec_text(ctx, stop="1h")
+    p = propose(card, child, words)
+    before = counts(card.store)
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        card_tap(card, p, words)
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        drafts.drop_rule(ctx.store, child, by="operator")
+    f = fields_for(ctx)
+    with pytest.raises(CoordError, match=f"thread {child} is already bound by draft {dr.draft_id}"):
+        drafts.create(ctx.store, child, f, cites_for(d, f), by="operator")
+    assert counts(card.store) == before
+    spec = ctx.plain(json.dumps({"stop": "1h"}))
+    before = counts(card.store)
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        drafts.spec_rule(ctx.store, child, spec.drop_id, by="operator")
+    assert counts(card.store) == before
+    assert ctx.rows("SELECT DISTINCT draft_id FROM envelope_drafts") == [(dr.draft_id,)]
+    # once the mission's series is withdrawn, the child drafts on its own again
+    drafts.withdraw(ctx.store, dr.draft_id)
+    one = drafts.create(ctx.store, child, f, cites_for(d, f), by="operator")
+    assert drafts.unclosed_series(ctx.store, child).draft_id == one.draft_id
+    assert drafts.unclosed_series(ctx.store, ts[0].thread_id) is None
+
+
+def test_a_mission_draft_is_refused_while_a_child_holds_its_own_series(ctx):
+    # guard: the same new-series check, the other way round: a child's own unclosed series blocks the mission's
+    d, ts, m = mission_of(ctx, 3)
+    f = fields_for(ctx)
+    own = drafts.create(ctx.store, ts[2].thread_id, f, cites_for(d, f), by="operator")
+    rows = count(ctx, "envelope_drafts")
+    with pytest.raises(CoordError, match=f"thread {ts[2].thread_id} is already bound by draft {own.draft_id}"):
+        mission_draft(ctx, m, d)
+    assert (count(ctx, "envelope_drafts"), count(ctx, "mission_drafts")) == (rows, 0)
+
+
+def test_a_child_card_reads_its_own_bind(ctx):
+    """The card reads the bind of the thread it is shown on, not the anchor's (``_view_inputs`` through ``_bind_of``).
+    No diff on screen can show the difference today (an open mission draft has no head on any child, and the member
+    diff runs only beside a head), so the pick itself is pinned."""
+    # guard: _bind_of, which _view_inputs reads the viewed thread's bind through
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    for t in ts:
+        assert drafts._bind_of(dr, t.thread_id) == {"thread_id": t.thread_id, "rev": t.rev,
+                                                    "members_sha256": t.members_sha256}
+    with pytest.raises(CoordError, match="does not bind thread"):
+        drafts._bind_of(dr, new_work_thread(ctx).thread_id)
+
+
+# --- fix 2 B-E: shape and store refusals are typed and in plain words -------------------------------------------------
+@pytest.mark.parametrize("binds, match", [
+    (lambda b: [b[0], b[0]], "names thread .* twice"),
+    (lambda b: [{k: v for k, v in b[0].items() if k != "thread_id"}, b[1]], "each bind is an object naming"),
+    (lambda b: ["not a bind", b[1]], "each bind is an object naming"),
+    (lambda b: [{**b[0], "thread_id": 7}, b[1]], "each bind is an object naming"),
+    (lambda b: [b[1], b[0]], "sorted by thread id"),
+], ids=["duplicate", "no thread id", "not an object", "thread id not a string", "unsorted"])
+def test_check_proposal_refuses_malformed_binds_itself(ctx, binds, match):
+    # guard: envelope_draft.check_proposal's own bind checks, before parse_body
+    d, ts, m = mission_of(ctx)
+    _d, _t, one = make(ctx, "an ordinary single-thread draft")
+    good = [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256} for t in ts]
+    called = []
+    real = env.parse_body
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(env, "parse_body", lambda text: called.append(1) or real(text))
+        with pytest.raises(ed.DraftError, match=match):
+            ed.check_proposal({**one.proposal, "binds": binds(good)})
+    assert called == []                                                  # refused before the body parse
+
+
+def test_a_mission_refusal_on_a_series_with_an_unreadable_proposal_is_typed(ctx, monkeypatch):
+    # guard: _write_revision reads the series' binds through a typed check, never a raw subscript
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    broken = drafts.Draft(dr.draft_id, dr.revision, dr.thread_id, dr.gseq, dr.parent, {"no": "binds"}, dr.cites,
+                          dr.digest, dr.by, dr.at)
+    monkeypatch.setattr(drafts, "_row", lambda conn, draft_id, revision=None: broken)
+    before = count(ctx, "envelope_drafts")
+    with ctx.store._write("operator") as (conn, now):
+        with pytest.raises(CoordError, match="cannot be read as a bound series"):
+            drafts._write_revision(ctx.store, conn, now, thread_id=ts[0].thread_id, draft_id=dr.draft_id, fields={},
+                                   cites=[], parent=dr.digest, by="operator")
+    assert count(ctx, "envelope_drafts") == before
+
+
+def test_a_broken_mission_store_is_not_read_as_a_mission_that_moved(ctx, monkeypatch):
+    # guard: _mission_lapse_of reads absence by its own query and catches nothing, so a fault reading a mission that
+    # is here propagates (before, any CoordError or OperationalError from missions._latest read as "not in this store")
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    with drafts._reading(ctx.store) as conn:
+        link = drafts._mission_link(conn, dr.draft_id)
+        assert drafts._mission_lapse_of(conn, ("mi-" + "0" * 32, link[1], link[2])) == \
+            f"mission {'mi-' + '0' * 32} is not in this store"
+
+        def broken(conn, mission_id):
+            raise CoordError("a mission revision row this reader cannot read")
+        monkeypatch.setattr(missions, "_latest", broken)
+        with pytest.raises(CoordError, match="cannot read"):
+            drafts._mission_lapse_of(conn, link)
+
+
+def test_a_mission_link_insert_the_table_refuses_is_a_typed_refusal(ctx, monkeypatch):
+    # guard: create_mission_draft wraps the mission_drafts INSERT as it wraps the envelope_drafts one
+    d, ts, m = mission_of(ctx, 3)
+    conn = sqlite3.connect(ctx.store.path)
+    try:
+        conn.execute("CREATE TRIGGER refuse_links BEFORE INSERT ON mission_drafts BEGIN "
+                     "SELECT RAISE(ABORT, 'a link this test refuses'); END")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(CoordError, match="a link this test refuses"):
+        mission_draft(ctx, m, d)
+    assert (count(ctx, "envelope_drafts"), count(ctx, "mission_drafts")) == (0, 0)
+
+
+def test_the_series_writer_refuses_no_thread_and_no_mission_without_an_assert(ctx):
+    # guard: _write_series_revision's explicit check (an assert is stripped under python -O)
+    with ctx.store._write("operator") as (conn, now):
+        with pytest.raises(CoordError, match="names neither a thread nor a mission"):
+            drafts._write_series_revision(ctx.store, conn, now, thread_id=None, mission_id=None, draft_id=None,
+                                          fields={}, cites=[], parent=None, by="operator", carry=False,
+                                          stop_span=None)
 
 
 # --- I5: stale is refused -------------------------------------------------------------------------------------------
