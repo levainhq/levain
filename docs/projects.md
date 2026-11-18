@@ -1,6 +1,6 @@
 # Projects: tracked and untracked
 
-Levain knows each repo in one of two modes. Both are supported. The mode decides where the repo's state lives. It does not change the repo's build or test commands, or its conventions files.
+Levain knows each repo in one of two modes. Both are supported. The mode decides where the repo's state lives. It does not change the repo's build or test commands, or its conventions files, as long as `retire` does not name them.
 
 - **Untracked** is the default. The repo keeps its own state (its own files, issues or status page), and a seat reads those files.
 - **Tracked** moves the repo's state onto Levain's work board. The repo keeps one file that says what it is for, `CHARTER.md`, on its main branch.
@@ -44,7 +44,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 1. **The operator says "track X".** If this install has no item store yet, the desk runs `levain board use <dir>` first. Then it puts X in play if X is not already there:
 
    ```
-   levain board register X --words "<his words>" --by <desk> --path <repo directory>
+   levain board register X --words "<the operator's words>" --by <desk> --path <repo directory>
    ```
 
    The repo needs at least one commit. Without one, `register` refuses: nothing identifies the repository.
@@ -60,7 +60,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
    - **(a) Begin.** Writes the migration id and locks X to new work:
 
      ```
-     levain board begin-track X --words "<his yes>" --by <desk> --manifest <file.json> [--owner <desk>] [--migration M]
+     levain board begin-track X --words "<the operator's yes>" --by <desk> --manifest <file.json> [--owner <desk>] [--migration M]
      ```
 
      The manifest is JSON. `plan_items` names the item keys (the `<k>` in each `M:<k>`), and the charter's Plan lists the ids those keys produce. `contract_items` names the repos that hold stubs to land. `retire` (optional) names the old memory files to copy and stub, and `record_dir` (optional) names where the copies go. While X is `tracking`, a seat launched on X must carry the migration id, and `board add` for X must be keyed to it. `board repos` shows the step that is next.
@@ -73,12 +73,12 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
      The same key with the same hash returns the existing id. The same key with a different hash is an error. Keys never expire. Each ceremony has its own migration id, and the key carries it, so a second ceremony's items get new ids. The items exist but are outside the board's scope until the switch.
 
-   - **(c) Expand: the charter.** The item ids go into the charter's Plan. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut. A stalled landing only means the switch has not happened, and X stays locked.
+   - **(c) Expand: the charter.** The item ids go into the charter's Plan: `levain charter init X --items <store>` writes it with the Plan prefilled from the items added in (b), and the desk edits the rest by hand. `CHARTER.md` lands on X's main through X's own landing path. `levain charter check --ref origin/main` reports no problems. `check` exits 0 in warn mode, so read what it reports, not its exit status. `track` runs the same check itself and refuses on any problem. It also refuses unless the Plan lists exactly the ids of the manifest's items that were added and not cut. A stalled landing only means the switch has not happened, and X stays locked.
 
    - **(d) Switch.** This is the one record that moves the source of truth from the old files to the board:
 
      ```
-     levain board track X --words "<his yes>" --by <desk>
+     levain board track X --words "<the operator's yes>" --by <desk>
      ```
 
      It refuses unless (b) and (c) hold. From here the board is the source, and the lock lifts.
@@ -87,7 +87,7 @@ Tracking is a conversation first and a ceremony second. Before the yes, two thin
 
 6. **The desk writes one decision episode** tagged `repo:X`, naming the charter, the item count and the record directory.
 
-**Aborting.** Before the switch only. `levain board abandon-track X --words "<his words>" --by <desk>` makes X `aborting` and cuts its items. Run it again to finish the cuts. `levain board abandon-done X --by <desk>` returns X to untracked once every item is cut and any compensation, such as a reverted charter, has landed. After the switch there is no abort. Leaving tracked mode is `levain board untrack X --words "<his words>" --by <desk>`, which refuses while any item is not done, cut or parked.
+**Aborting.** Before the switch only. `levain board abandon-track X --words "<the operator's words>" --by <desk>` makes X `aborting` and cuts its items. Run it again to finish the cuts. `levain board abandon-done X --by <desk>` returns X to untracked once every item is cut and any compensation, such as a reverted charter, has landed. After the switch there is no abort. Leaving tracked mode is `levain board untrack X --words "<the operator's words>" --by <desk>`, which refuses while any item is not done, cut, parked or out of 1.0.
 
 **The desk's own door.** A desk seat's brief opens the board verbs except `move`, `pause`, `resume` and `ack-torn`, and the charter verbs `init` and `check`. Those four board verbs run from a terminal.
 
@@ -127,7 +127,7 @@ Until a signed grade exists, `kind: operator` is a claim, and so is every author
 
 ## Known edges
 
-- **The signing slice is not in this tree.** It adds `--sign` (a Touch ID signature at a terminal, with `--author-kind operator`), `--source <q-id>` (relaying one of his band answers), the `signed-terminal` and `relayed` grades, and the rule that the decision-class verbs (`decide`, `begin-track`, `track`, `abandon-track`, `untrack`) refuse an unsigned record. `move` joins that rule while its repo is tracking or tracked. Until the slice lands, every record is `asserted`.
+- **The signing slice is not in this tree.** It adds `--sign` (a Touch ID signature at a terminal, with `--author-kind operator`), `--source <q-id>` (relaying one of the operator's band answers), the `signed-terminal` and `relayed` grades, and the rule that the decision-class verbs (`decide`, `begin-track`, `track`, `abandon-track`, `untrack`) refuse an unsigned record. `move` joins that rule while its repo is tracking or tracked. Until the slice lands, every record is `asserted`.
 - **`--source` will take native band ids only** (`q-` and 24 hex characters). A flow row (`np-…`) needs flow's reader first.
 - **The phone route is not in this tree.** The signing slice's writer takes a phone signature (`signed-phone`). The cockpit door that signs with the passkey is a separate, later piece.
 - **`retire` is not checked against the conventions files.** Keep AGENTS.md, CLAUDE.md and CONTRIBUTING out of it. The code does not refuse them.
