@@ -214,8 +214,22 @@ When a stronger tier is not credited, `note` says why: a key the rule refuses, a
 
 **Two rules for the document and run path, and for the email.**
 
-1. **The literal tracked path.** A document or run close credits the path exactly as the item's `done` line names it and as git tracks it. A symlink is not followed, and a submodule is not entered: the verdict is read for the tracked path itself, never for what a link points at or for what lies inside a submodule.
-2. **An empty email is kept.** A git author whose email is empty is kept as present-but-empty, never dropped. A commit with no email does not read as a commit that never had one.
+1. **The literal tracked path.** A document or run close credits the path exactly as the item's `done` line names it and as git tracks it. The path is worked out by its text alone (`..` is folded, nothing is looked up on disk) and git is run from the repo, never from inside the named path. So a symlink is not followed, and a submodule is not entered. A tracked link itself, or a submodule's own entry, credits the commit that added it. A file named through a tracked link (`link/f.txt`), or inside a submodule, reads `no commit on main added it`: git tracks the link, not what is under it. A path outside the work tree reads `outside version control`.
+2. **An empty email is kept.** A git author whose email is empty is kept as present-but-empty, never dropped, and shows as `<>` (`"email": ""` in `--json`). A commit with no email does not read as a commit that never had one.
+
+**Which repo is read.** The repo may be given as a relative path, and `board state` with no `--repo` on a store with no registry reads the repo in the current directory: the path and the repo are both made absolute from where it runs, so a document inside the repo is not read as outside it. The repo as given is tried before the toplevel git names, so a repo reached through a link to `.` reads as its whole work tree. A file added to main and later removed is still credited to the commit that added it.
+
+A run on a scratch repo with `cwd` inside it and no `--repo` (`levain board state --json`, abridged): a `merged` item closed by a commit with an empty author email; a document that is a plain file; a document named through a tracked link `dirlink -> docs`; the link itself; a path outside the repo.
+
+```
+alpha#1 git  No Mail     asserted by git author                              email ""
+alpha#2 git  Doc Person  first added docs/report.md, asserted by git author  email "x@x"
+alpha#3 unattributed     the path is in the repo's work tree but no commit on main added it   (done: dirlink/report.md)
+alpha#4 git  Link Person first added dirlink, asserted by git author         email "x@x"
+alpha#5 unattributed     the path exists outside version control (outside the repo's work tree)
+```
+
+The same output came from `--repo .`. The link-to-`.` case and the added-then-removed case are from the code and its tests; they were not run here.
 
 **A run on a scratch store.** Two items closed on a scratch repo by unsigned commits, and a third not yet closed (`levain board state --json`, abridged to `closed_by`):
 
@@ -280,9 +294,53 @@ The words, as the code prints them:
 - A line that names who closed an item quotes the words of [Who closed an item: `closed_by`](#who-closed-an-item-closed_by); that section says what each tier proves and does not.
 - `no kept head given`: the file can be cut at its end and still verify. Give `--head items=<hash>` (and `repos=<hash>`), the heads `export` printed. A head that is still on the chain reads `kept head ... is the current head: nothing was removed`. One that is not reads `TRUNCATION OR REWRITE: kept head ... is not on this chain (the file now ends at ...): records were removed or rewritten`, and that is a break.
 
-**Exit codes.** `0`: no break. `3`: any break (a chain break, a record its fold rejects, a signature that does not verify, a relayed citation that does not hold, a head that is gone); `verify` then prints `levain board trail verify: N breaks` and a `BREAK` line per break. `2`: it could not run (the store cannot be read, a bad argument). The `2` case is from the help and the code; it was not run here.
+**Exit codes.** `0`: no break. `3`: any break (a chain break, a record its fold rejects, a signature that does not verify, a relayed citation that does not hold, a head that is gone, a close the evidence refutes); `verify` then prints `levain board trail verify: N breaks` and a `BREAK` line per break. `2`: it could not run (the store cannot be read, a bad argument). The `2` case is from the help and the code; it was not run here.
 
-**A bundle.** `levain board trail export` writes one JSON file (format `levain-board-trail/1`) holding the records as written, the public keys the authority log holds, and every band answer a relayed record cites, and prints the two heads to keep:
+**Who closed each item.** After the file lines, `verify` prints one line per closed item whose close is git's, in the words of [Who closed an item: `closed_by`](#who-closed-an-item-closed_by) and derived by the same function `levain board state` uses. A band close prints as the live board prints it. A live store has nothing recorded to compare with, so its close lines are never a break. A run on the scratch store with one `merged` item, one `document` item and one document no commit added:
+
+```
+$ levain board trail verify
+...
+close alpha#2: asserted by git author Plain Person <x@x>
+close alpha#3: first added docs/report.md, asserted by git author Doc Person <x@x>
+close alpha#4: unattributed: the path is in the repo's work tree but no commit on main added it
+levain board trail verify: no breaks
+```
+
+`export` writes each close's `closed_by` into the bundle. `verify BUNDLE` does not take it on trust. It re-derives each close from the repo on the verifier's own install and judges the recorded close one predicate at a time: the commit, the signature, the trailer, the git author, the email, the committer and the `how` words. Each predicate holds, is refuted, or is undetermined. The same bundle, verified:
+
+```
+$ levain board trail verify out/trail-....json
+...
+close alpha#2: asserted by git author Plain Person <x@x> (re-derived from the repo; matches the bundle)
+close alpha#3: first added docs/report.md, asserted by git author Doc Person <x@x> (re-derived from the repo; matches the bundle)
+close alpha#4: unattributed: the path is in the repo's work tree but no commit on main added it (re-derived from the repo; matches the bundle)
+levain board trail verify: no breaks
+```
+
+What a close line can say:
+
+- `matches`: every predicate holds, and this install derives the tier the bundle records.
+- `holds; this install also derives ...`: every predicate holds and this install derives a stronger tier. A weaker true claim needs no excuse.
+- `BREAK close ...`: any one predicate is refuted. The line names the predicate and what the repo shows. One refuted predicate is a break, whatever else holds. A recorded close for an item the bundle's own records show open or closed by the band, or do not hold at all, is a break too, as is a recorded commit when the repo holds a different close for the item.
+- `recorded in the bundle, not re-derived here: <why>`: a predicate is undetermined, and the reason is something this install lacks: no authority log, a key its log does not hold, no launch record here (launch records belong to one install), an unreadable object, or a repo that does not hold the commit. An undetermined predicate never hides a refuted one, and `verify` still exits `0`. Exit `0` there means nothing was shown wrong, not that the close was checked. When the repo itself is not reachable the line reads `(recorded in the bundle, not re-derived (repo not available))`.
+- A close the repo shows that the bundle does not record is said, and is not a break. A bundle that records no closes prints this install's own derivation and says so.
+- A signature that verifies under a key this install's log has revoked reads `signature by <principal> verifies; that key is revoked in this install's authority log (seq N)`. It never says "since". It is undetermined, so it exits `0`. Not run here; from the code.
+
+Nothing in a bundle relaxes a check. A `degraded` flag it records is ignored, and its `note` is printed as the bundle's and is never compared. A recorded close the bundle says it could not read claims nothing, and `verify` prints what this install derives.
+
+One altered close. The scratch bundle was edited so the author of `alpha#2` reads `Someone Else`:
+
+```
+BREAK close alpha#2: the bundle records [asserted by git author Someone Else <x@x>] and the repo derives [asserted by git author Plain Person <x@x>] (refuted: git author: the commit's git author is Plain Person)
+close alpha#3: ... (re-derived from the repo; matches the bundle)
+close alpha#4: ... (re-derived from the repo; matches the bundle)
+levain board trail verify: 1 breaks
+```
+
+It exited `3`. A second edit, `alpha#2`'s tier changed to `signed`, also broke, with `refuted: email: a signed close carries no email; how: ...; signature: the commit carries no signature`. With the repo moved away, the same unedited bundle printed each close as `(recorded in the bundle, not re-derived (repo not available))` and exited `0`. The `signed`, `trailer` and revoked-key undetermined cases are from the code.
+
+**A bundle.** `levain board trail export` writes one JSON file (format `levain-board-trail/1`) holding the records as written, the public keys the authority log holds, every band answer a relayed record cites, and the author verdict of each git close, and prints the two heads to keep:
 
 ```
 $ levain board trail export --out out.json
@@ -308,7 +366,7 @@ Exit `0` there means nothing is broken, not that anything is anchored.
 - **The tail is not anchored, and a bundle edit there passes.** A record after the last signed one can be rewritten and its chain recomputed. On the scratch bundle, changing a title in the last (unsigned) item and verifying the result gave `no breaks` and a different head. Only a kept head from an earlier export catches it.
 - **A signature is checked against the authority log as it is now.** Whether it was valid at the record's own time is later work.
 - **An answer's signature binds his words, not the chain.** An option pick is signed as `(letter) label`; the verdict then says the signature covers the pick and not the words the record quotes.
-- **Close-author verdicts are not part of this output yet** (the seam exists and prints nothing).
+- **A revoked key is not told apart by time.** A signed close under a key this install's log has revoked reads as undetermined. An unsigned bundle carries no export time, so a promotion made after the revocation looks the same as an honest export made before it.
 - **Asserted `move`s cost O(M squared).** Each asserted `move` is judged on the registry as it stood before it. Measured: about 28 seconds for 2,000 of them. A registry that long is not a real store.
 
 ## Known edges
