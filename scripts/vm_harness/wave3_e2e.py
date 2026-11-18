@@ -309,7 +309,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
         extra = ("--dispatch-dir", dispatch_dir(cfg))
         if verb[:2] in (("dispatch", "file"), ("dispatch", "sign"), ("dispatch", "authorise")):
             extra += ("--data-root", authority_root(cfg))
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, *levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", f"HOME={dispatch_dir(cfg)}", *levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
 
     def operator(*verb: str, stdin: str | None = None, timeout: float = 300) -> tuple[str, int]:
         """A levain verb as the stopgap runs it: (merged output, exit code). A refusal (exit 2) is data, not an error."""
@@ -356,7 +356,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
             sleep(cfg.poll_s)
 
     def dispatch_user_argv() -> tuple[str, ...]:
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", cfg.profile.python, "-I", "-")
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={dispatch_dir(cfg)}", cfg.profile.python, "-I", "-")
 
     def tickets(job: str) -> list[dict]:
         sock = f"{cfg.profile.run_dir}/control/control.sock"
@@ -468,7 +468,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
                 "--path", cfg.install)
         lines, _rc = capture(guest, argv, 180)           # doctor exits 1 on unrelated rows: the verdict ignores rc
         row = next((ln for ln in lines if re.search(r"invoice ceiling \(" + re.escape(cfg.cred), ln)), "")
-        m = re.search(r"key limit (" + USD + r") total, (" + USD + r") remaining", row)
+        m = re.search(r"key limit (" + USD + r")(?: total)?, (" + USD + r") remaining", row)
         if not m:
             raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X total, $Y remaining'", row.strip())
         limit, remaining = (float(g.replace("$", "").replace(",", "")) for g in m.groups())

@@ -189,7 +189,7 @@ def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> St
             r = subprocess.run(vm_run.tart_exec_argv(vm, argv, stdin=True), input=text, capture_output=True, text=True,
                                timeout=timeout)
             if r.returncode:
-                raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {r.stderr.strip()[-300:]}")
+                raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {(r.stdout + r.stderr).strip()[-700:]}")
             return r.stdout
         return run
     askpass = Path(askpass_dir) / "askpass-stdin.sh"
@@ -211,6 +211,6 @@ def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> St
         r = subprocess.run([vm_run.SSH, *vm_run.SSH_OPTS, f"{profile.ssh_user}@{ip}", shlex.join(str(a) for a in argv)],
                            input=text, capture_output=True, text=True, timeout=timeout, env=env)
         if r.returncode:
-            raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {r.stderr.strip()[-300:]}")
+            raise GuestError(r.returncode, f"guest {list(argv)[:4]}: {(r.stdout + r.stderr).strip()[-700:]}")
         return r.stdout
     return run
