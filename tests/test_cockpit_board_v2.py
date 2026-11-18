@@ -515,7 +515,10 @@ def test_state_doc_names_the_unreadable_sources_and_not_the_item_entries_or_old_
 
 
 def test_a_configured_store_that_cannot_be_read_is_never_none_or_the_v1_queue(store, bare_copy, tmp_path, monkeypatch):
-    (bare_copy / "repos.jsonl").unlink()                                          # a store (store.id is there) whose registry is gone
+    (bare_copy / "repos.jsonl").unlink()                                          # a store (store.id is there) with no repo registered yet: EMPTY, healthy
+    v = board.build(None, None, board_items=bare_copy)
+    assert v["queue"] == "ok" and not v["unreadable"] and all(c["count"] == 0 for c in v["columns"])
+    (bare_copy / "repos.jsonl").mkdir()                                           # a repos.jsonl that is a directory is a real failure
     v = board.build(None, None, board_items=bare_copy)
     assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
     gone = tmp_path / "gone" / "items.jsonl"                                       # --items naming a store that is not there
@@ -533,6 +536,25 @@ def test_a_store_directory_that_refuses_the_read_is_unreadable_not_absent(store,
     finally:
         os.chmod(bare_copy, 0o755)
     assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_a_registry_that_refuses_the_read_is_unreadable(store, bare_copy):
+    reg = bare_copy / "repos.jsonl"
+    os.chmod(reg, 0)
+    try:
+        v = board.build(None, None, board_items=bare_copy)
+    finally:
+        os.chmod(reg, 0o644)
+    assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
+
+
+def test_a_store_board_use_just_made_reads_empty_not_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    seed.board("use", str(tmp_path / "fresh"), "--no-land-waiter")
+    v = board.build(None, None)
+    assert v["queue"] == "ok" and not v["unreadable"] and all(c["count"] == 0 for c in v["columns"])
 
 
 def test_an_install_with_no_store_at_all_still_reads_none(tmp_path, monkeypatch):

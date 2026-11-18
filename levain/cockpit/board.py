@@ -168,11 +168,16 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
         return out
 
 
+class _EmptyStore(Exception):
+    """A configured store whose directory exists and that has no ``repos.jsonl`` yet: nothing is tracked, which is not a failure."""
+
+
 def _v2_target(items: Path | str | None) -> Any:
     """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read).
     A store that is CONFIGURED (a pointer names it, or ``store.id`` is in it, or ``items`` / ``$LEVAIN_BOARD_ITEMS`` names it) and
-    cannot be read (its directory or its ``repos.jsonl`` missing, not a file, or refused) raises ``bs.BoardError``: that is an
-    unreadable board, never a quiet fall back to "no queue yet" or the v1 queue. Only an install with no store at all reads None."""
+    cannot be read (its directory missing or not a directory, its ``repos.jsonl`` not a file or refused) raises ``bs.BoardError``: that is
+    an unreadable board, never a quiet fall back to "no queue yet" or the v1 queue. A store directory with NO ``repos.jsonl`` yet (what
+    ``board use`` just made) raises ``_EmptyStore``: a healthy empty board. Only an install with no store at all reads None."""
     from levain.desk import board_store as bs
 
     try:
@@ -186,9 +191,16 @@ def _v2_target(items: Path | str | None) -> Any:
                       or os.path.lexists(target.store_dir / bs.STORE_ID_NAME))
     try:
         st = os.stat(registry)         # os.stat, not Path.is_file(): is_file() answers False for EACCES too, and a store we cannot read is not an absent one
-    except (FileNotFoundError, NotADirectoryError):
+    except (FileNotFoundError, NotADirectoryError) as exc:
         if configured:
-            raise bs.BoardError(f"the board store {target.store_dir} holds no {registry.name}") from None
+            if isinstance(exc, FileNotFoundError):
+                try:
+                    dst = os.stat(target.store_dir)
+                except OSError as dexc:
+                    raise bs.BoardError(f"the board store {target.store_dir} cannot be read: {dexc}") from None
+                if stat.S_ISDIR(dst.st_mode):
+                    raise _EmptyStore from None      # a store `board use` just made, no repo registered yet: a healthy, empty board
+            raise bs.BoardError(f"the board store {target.store_dir} cannot be read: {registry.name} is not reachable") from None
         return None                    # no registry file: `levain board state` would read the repository in ITS working directory, which for a
                                        # cockpit is wherever the server started. That is not a board; this install has none yet.
     except OSError as exc:
@@ -236,6 +248,8 @@ def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, An
 
     try:
         target = _v2_target(items)
+    except _EmptyStore:
+        return [], 0, [], None
     except bs.BoardError as exc:
         return [], 0, _unreadable_names([str(exc)]), None
     if target is None:
