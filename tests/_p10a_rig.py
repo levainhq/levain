@@ -70,6 +70,7 @@ class Install:
         self.key = tmp / "keys" / "laptop"
         self.store_dir = self.home / "autonomic"
         self._n = 0
+        self.facts_first = True
         self.stub = None
         if stub:                                     # the install fact claude_bin names a stub program (_p10a_stub.py)
             from tests._p10a_stub import StubClaude
@@ -118,7 +119,8 @@ class Install:
         if not self.anneal.exists():
             self.make_anneal()
         self._bind_stub()                            # before the enable, so the spec the enable registers binds it
-        self._write_facts()
+        if self.facts_first:
+            self._write_facts()
         return self.cli("dream", "enable", "--store-dir", str(self.anneal), "--cockpit-root", str(self.world.root),
                         "--coord-dir", str(self.desk), *extra)
 
@@ -132,9 +134,12 @@ class Install:
                          coord_dir=self.desk, zone=ZONE, claude_bin=str(self.stub.path))
 
     def _write_facts(self) -> None:
-        """The first-run facts file the install names: the operator's own file (no flag writes it). Named BEFORE the
-        enable, which keeps it (a fact not passed is merged): a live spec binds its facts file (levain#130), so one
-        named after the enable is refused at the fire until `enable --revise` and a new signed link."""
+        """The first-run facts file the install names: the operator's own file (no flag writes it). By default named
+        BEFORE the enable, which keeps it (a fact not passed is merged), so the spec the enable registers binds it. A
+        test that sets ``facts_first`` False names it itself, after the enable (``name_facts``)."""
+        self.name_facts()
+
+    def name_facts(self) -> None:
         from levain.dream import agent as da
         from levain.dream import executor as ex
 

@@ -1572,10 +1572,16 @@ def install_live_binding(doc: Mapping[str, Any]) -> str | None:
     if doc.get("shadow_flow_root") is not None:
         return None
     try:
-        return live_binding(model=doc.get("model"), claude_bin=doc.get("claude_bin"), facts_path=doc.get("facts_path"))
+        bound = live_binding(model=doc.get("model"), claude_bin=doc.get("claude_bin"), facts_path=doc.get("facts_path"))
     except (RuntimeError, TypeError) as exc:     # Path.expanduser of "~nouser/...", or a facts_path that is not a path
         raise InstallRefused(f"the install's facts_path {doc.get('facts_path')!r} cannot be read as a path "
                              f"({type(exc).__name__}: {exc}), so it cannot be bound into the spec") from exc
+    facts = doc.get("facts_path")
+    # a relative path would be bound, signed and then refused at every fire: refused here instead, as read_install does
+    if facts is not None and not Path(facts).expanduser().is_absolute():
+        raise InstallRefused(f"the install's facts_path {facts!r} is not an absolute path, so it cannot be bound into "
+                             "the spec")
+    return bound
 
 
 def check_program_facts(doc: Mapping[str, Any], path: Path | str) -> None:

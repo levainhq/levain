@@ -79,7 +79,7 @@ class Rig:
         # ``source``: the spec's input source (default the fixture's; a dream-named spec gets the live dream's)
         self.world = World(tmp)
         self.store = open_agent_store(tmp / "s")
-        spec = _spec(name=name) if source is None else _spec(name=name, source=source)    # a stand-in _spec takes no source
+        spec = _spec(name=name) if source is None else _spec(name=name, source=source)    # a source is passed only when the caller names one
         self.agent, self.spec_hash, *_ = register_spec(self.store, spec, "America/New_York")
         with self.store.read() as c:
             self.sid = c.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0]

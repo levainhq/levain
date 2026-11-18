@@ -571,9 +571,40 @@ def _enable_args(tmp_path, *extra):
     return p.parse_args(["dream", "enable", "--agent-store-dir", str(d), "--json", *extra])
 
 
-def test_d3_enable_survives_an_install_file_whose_read_raises_something_other_than_install_refused(tmp_path, capsys):
-    # reproduced: a hand-edited facts_path "~no_such_user/..." makes Path.expanduser() raise RuntimeError inside
-    # read_install, which run_dream_enable caught only as InstallRefused: a traceback AFTER the dream was registered
+def _enabled_live_install(tmp_path):
+    """A live install enabled once with --store-dir, its facts file at ``tmp_path/ag``; the facts path and the args."""
+    from tests.test_dream_ready import Entity
+
+    e = Entity(tmp_path / "ent")
+    cockpit = tmp_path / "cockpit"
+    cockpit.mkdir()
+    args = _enable_args(tmp_path, "--store-dir", str(e.store_dir), "--cockpit-root", str(cockpit), "--coord-dir",
+                        str(e.coord_dir))
+    assert args.func(args) == 0
+    return tmp_path / "ag" / da.INSTALL_FILE
+
+
+def test_d3_enable_survives_a_live_install_whose_card_read_raises_something_other_than_install_refused(tmp_path,
+                                                                                                       capsys):
+    # reproduced: a hand-edited cockpit_root "~no_such_user/..." makes Path.expanduser() raise RuntimeError inside
+    # read_install. The live spec does not bind that fact, so the dream registers, and the card-building read of the
+    # install must fall back instead of ending in a traceback
+    facts = _enabled_live_install(tmp_path)
+    capsys.readouterr()
+    doc = json.loads(facts.read_text())
+    doc["cockpit_root"] = "~no_such_user_xyz/c"
+    facts.write_text(json.dumps(doc))
+    with pytest.raises(RuntimeError):
+        da.read_install(tmp_path / "ag")                       # the premise: this read raises a RuntimeError
+    again = _enable_args(tmp_path)                             # no --store-dir: the facts are read as they stand
+    assert again.func(again) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["install_kind"] == "live" and out["signing_card"]
+
+
+def test_d3_enable_refuses_a_facts_path_it_cannot_read_before_registering(tmp_path, capsys):
+    # levain#130: a live spec binds its facts_path, so one that cannot be read as a path is refused before anything is
+    # registered (as #126 refuses a program it cannot read), a plain refusal and never a traceback
     from tests.test_dream_ready import Entity
 
     e = Entity(tmp_path / "ent")
@@ -590,12 +621,28 @@ def test_d3_enable_survives_an_install_file_whose_read_raises_something_other_th
     with pytest.raises(RuntimeError):
         da.read_install(tmp_path / "ag")                       # the premise: this read raises a RuntimeError
     again = _enable_args(tmp_path)                             # no --store-dir: the facts are read as they stand
-    # levain#130: a live spec binds its facts_path, so one that cannot be read as a path is refused before anything is
-    # registered (as #126 refuses a program it cannot read), a plain refusal and never a traceback
     assert again.func(again) == 1
     err = capsys.readouterr().err
     assert "facts_path '~no_such_user_xyz/f.json' cannot be read as a path" in err
     assert "nothing was registered or written" in err
+    assert "--store-dir" not in err                            # no flag writes facts_path, so none is advised
+
+
+def test_d3_enable_refuses_a_relative_facts_path_it_would_bind_and_every_fire_refuse(tmp_path, capsys):
+    # reproduced: a hand-edited relative facts_path was bound and `enable` exited 0, while read_install refuses it
+    # at every fire ("is not an absolute path"): a signed spec for an install that can never fire
+    facts = _enabled_live_install(tmp_path)
+    capsys.readouterr()
+    doc = json.loads(facts.read_text())
+    doc["facts_path"] = "f.json"
+    facts.write_text(json.dumps(doc))
+    with pytest.raises(da.InstallRefused, match="not an absolute path"):
+        da.read_install(tmp_path / "ag")                       # the premise: the fire's own read refuses it
+    again = _enable_args(tmp_path)
+    assert again.func(again) == 1
+    err = capsys.readouterr().err
+    assert "facts_path 'f.json' is not an absolute path" in err and "nothing was registered or written" in err
+    assert "--store-dir" not in err
 
 
 def test_d3_the_shadow_branch_falls_back_on_the_same_broader_errors(tmp_path, capsys, monkeypatch):
