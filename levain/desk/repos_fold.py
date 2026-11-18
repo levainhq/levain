@@ -209,6 +209,8 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
         _str(rec, "migration")
         _str(rec, "charter_blob")
         _retire(rec.get("retire"))
+        if "adopted" in rec and not (isinstance(rec["adopted"], list) and all(isinstance(i, str) and _ITEM_ID_RE.fullmatch(i) for i in rec["adopted"])):
+            raise _Bad("adopted must be a list of item ids")
     elif op == "abandon-track":
         _str(rec, "migration")
     elif op == "abandon-done" and rec.get("migration") is not None:

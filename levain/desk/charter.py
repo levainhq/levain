@@ -422,20 +422,32 @@ def _plan_ids(items: Mapping[str, tuple], name: str) -> list[str]:
                   key=lambda iid: int(iid.rpartition("#")[2]))
 
 
+class _RegistryUnreadable(Exception):
+    """The board registry (or its pointer) of a found store cannot be read, so NAME's mode is unknown."""
+
+
 def _tracking_plan(name: str, items_arg: Path | None, items: Mapping[str, tuple]) -> list[str] | None:
-    """Design rev 8, rule 5: NAME's Plan as its ceremony will check it, or None when NAME is not ``tracking`` (or the registry
-    cannot be read: today's rule then stands). The ``adopt_items`` plus NAME's items keyed ``M:<k>`` that exist, less any cut:
-    the set ``board track`` compares the charter's Plan to, in id order."""
+    """Design rev 8, rule 5: NAME's Plan as its ceremony will check it, or None when NAME is not ``tracking`` (no store, no
+    registry, NAME unregistered or in another mode: today's rule then stands). A store that is found whose registry or pointer
+    cannot be read never falls back silently: it raises :class:`_RegistryUnreadable` (the caller refuses, rc 2), since NAME
+    may be ``tracking`` and the old prefill is the wrong Plan. The ``adopt_items`` plus NAME's items keyed ``M:<k>`` that exist,
+    less any cut: the set ``board track`` compares the charter's Plan to, in id order."""
     from levain.desk import board_registry as br, board_store as bs
     try:
-        target = bs.resolve_store(items_arg)
+        pointer = bs.read_pointer()
+        try:
+            target = bs.resolve_store(items_arg)
+        except bs.BoardError:
+            if pointer is None and not ((items_arg is not None and str(items_arg) != "") or os.environ.get(bs.ITEMS_ENV)):
+                return None                 # no pointer, nothing explicit and no levain home: no store anywhere
+            raise
         if not target.pointered:
-            if not bs.is_store(target):
+            if pointer is None and not bs.is_store(target):
                 return None
             target = dataclasses.replace(target, pointered=True)
         cur = br.read_registry(target, allow_inactive=True).fold.repos.get(name)
-    except (bs.BoardError, OSError, ValueError, RuntimeError):
-        return None
+    except (bs.BoardError, OSError, ValueError, RuntimeError) as exc:
+        raise _RegistryUnreadable(f"cannot tell whether {name} is tracking: {exc}. Fix the store, then run this again.") from None
     if cur is None or cur.mode != "tracking":
         return None
     keyed = {f"{cur.migration}:{k}" for k in (cur.manifest or {}).get("plan_items", [])}
@@ -553,7 +565,10 @@ def run_init(args: Any) -> int:
         items, why = _store(args.items)
         if items is None:
             return refuse(f"the items file {args.items} {why}; nothing was written.")
-        tracking = _tracking_plan(name, args.items, items)
+        try:
+            tracking = _tracking_plan(name, args.items, items)
+        except _RegistryUnreadable as exc:
+            return refuse(f"{exc}", 2)
         plan_ids = tracking if tracking is not None else _plan_ids(items, name)
         if not plan_ids:
             print(f"levain charter init: no live items of {name} in the store", file=sys.stderr)
