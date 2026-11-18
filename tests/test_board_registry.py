@@ -1631,6 +1631,22 @@ def test_charter_init_and_check_refuse_a_repo_that_is_not_the_registered_one(sto
     assert rc == 0 and "CHARTER.md" in out
 
 
+def test_charter_guard_accepts_a_worktree_of_the_registered_repo_and_still_refuses_another_repo(store, tmp_path, mkrepo, capsys, monkeypatch):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    wt = tmp_path / "alpha-wt"
+    git(a, "worktree", "add", "-q", "-b", "seat/x", str(wt))
+    monkeypatch.chdir(wt)                                               # a worktree of alpha: the same repository
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 0, err
+    assert (wt / "CHARTER.md").exists() and not (a / "CHARTER.md").exists()      # written THERE, not in the main checkout
+    rc, _, err = _charter(capsys, "check", "--repo-name", "alpha", "--worktree")
+    assert rc == 0 and "registered at" not in err
+    monkeypatch.chdir(b)                                                # an unrelated repository: still refused, nothing written
+    rc, _, err = _charter(capsys, "init", "alpha")
+    assert rc == 2 and "Pass --repo" in err and not (b / "CHARTER.md").exists()
+
+
 def test_one_name_rule_a_registered_name_the_charter_can_use_and_track(decision_seal, store, tmp_path, mkrepo, capsys):
     name = "9lives.app"                                                 # a digit first and a dot: `register` takes it, so must the charter
     a = mkrepo(name)
