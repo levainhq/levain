@@ -237,7 +237,12 @@ def test_a_refused_rotated_log_closes_the_current_log_it_already_opened(lw, tmp_
     other = tmp_path / "other.log"
     other.write_text(line("b.example.org"))
     os.link(other, lw.log_dir / "front.log.1")
-    before = len(os.listdir("/dev/fd"))
+    # A leak ADDS a descriptor. In the shared test process another descriptor can also CLOSE while this runs, which
+    # lowers a whole-process count with no leak here (CI runs 44239946556 and 44241422341: 93 before, 86 after, on the
+    # shard that held this file once a new test file moved its neighbours), so compare the descriptors that APPEARED,
+    # not the length of the list.
+    before = {int(n) for n in os.listdir("/dev/fd")}
     for _ in range(5):
         refused(ask(lw), "egress-refusals-log")
-    assert len(os.listdir("/dev/fd")) == before
+    leaked = {int(n) for n in os.listdir("/dev/fd")} - before
+    assert not leaked, f"descriptors left open by the refused asks: {sorted(leaked)}"
