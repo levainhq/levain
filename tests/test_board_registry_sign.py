@@ -304,8 +304,8 @@ def test_a_cut_is_bound_to_the_abandons_migration_and_the_item_keyed_to_it_not_t
 def test_a_cut_citing_an_asserted_abandon_track_is_refused(tgt, store, tmp_path, mkrepo, rig):
     repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
     iid = keyed(tgt, "alpha", f"{m}:a")
-    forged = {"v": 1, "store": "s", "op": "abandon-track", "repo": "alpha", "at": NOW, "by": "x", "words": "w",
-              "migration": m, "author": OP, "grade": "asserted", "prev": "0" * 64}
+    forged = {"v": 1, "store": bs.read_store_id(store), "op": "abandon-track", "repo": "alpha", "at": NOW,
+              "prev": bs.chain_prev(raw(store)), "by": "x", "words": "w", "migration": m, "author": OP, "grade": "asserted"}
     line = bs.canonical_bytes(forged)
     with open(store / "repos.jsonl", "ab") as f:
         f.write(line + b"\n")
@@ -546,3 +546,123 @@ def test_register_cli_with_no_signer_refuses_sign_instead_of_ignoring_it_l1_4(st
     assert raw(store) == before
     args = p.parse_args(["pause", "alpha", "--words", "w", "--by", "desk 1"])
     assert args.func(args) == 0 and reg_lines(store)[-1]["op"] == "pause"
+
+
+# ------------------------------------------------------------ fix 2 (levain 29 rulings A and D): each case reproduced first
+
+
+def _crash_cuts(monkeypatch):
+    """bs.decide raising: the abandon lands, no cut does (a crash between the two files)."""
+    real = bs.decide
+
+    def crash(*a, **kw):
+        raise bs.BoardError("simulated crash")
+    monkeypatch.setattr(bs, "decide", crash)
+    return real
+
+
+def _lockfree_add(store, iid: str, key: str) -> None:
+    """An add appended by a writer that takes no lock and skips I1 (the item lands after the abandon's anchor)."""
+    data = items_raw(store)
+    rec = bs.build_record("add", iid, OP["name"], {"repo": "alpha", "title": "t", "words": "", "origin": "o", "done": None,
+                                                    "done_kind": "merged", "tier": None, "depends_on": [], "key": key,
+                                                    "payload_hash": "0" * 64}, NOW, author=OP)
+    with open(store / "items.jsonl", "ab") as f:
+        f.write(bs.canonical_bytes(bs._with_prev(rec, bs.chain_prev(data))) + b"\n")
+
+
+def test_an_item_added_after_the_anchor_is_recovered_by_a_signed_rerun_ruling_a(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """complement 16 / deepseek 75 / gemini 724 / codex MED 60, reproduced on 77bd80ff8: an add of M:late landing between the
+    abandon's anchor and its cuts made the cut refuse ("added after"), and the signed re-run wrote NO fresh abandon (the old
+    one "held"): the repo stayed aborting for good. Now the latest abandon does not hold while an uncut item of M sits after
+    its anchor: an unsigned re-run says so by name, a signed one writes a fresh abandon whose anchor covers it."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    first = keyed(tgt, "alpha", f"{m}:a")
+    real_read = br.read_registry
+    state = {"n": 0}
+
+    def add_between(target, **kw):
+        state["n"] += 1
+        if state["n"] == 2:                           # abandon_track's read right after its abandon lands, before the cuts
+            _lockfree_add(store, "alpha#2", f"{m}:late")
+        return real_read(target, **kw)
+    monkeypatch.setattr(br, "read_registry", add_between)
+    with pytest.raises(bs.BoardError, match="alpha#2 was added after the cited abandon-track"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(br, "read_registry", real_read)
+    n_abandons = raw(store).count(b'"op":"abandon-track"')
+    before = raw(store), items_raw(store)
+    with pytest.raises(bs.BoardError, match=r"alpha#2 was added after the recorded abandon-track\): re-run abandon-track signed"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
+    assert (raw(store), items_raw(store)) == before
+    tail_before = [ln for ln in items_raw(store).split(b"\n") if ln][-1]
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert cut == ["alpha#2"] and raw(store).count(b'"op":"abandon-track"') == n_abandons + 1
+    assert json.loads(abandon_line(store))["items_last"] == hashlib.sha256(tail_before).hexdigest()
+    decides = [json.loads(x) for x in items_raw(store).decode().splitlines() if '"op":"decide"' in x]
+    assert {d["id"] for d in decides} == {first, "alpha#2"}
+    assert all(d["cause"] == hashlib.sha256(abandon_line(store).encode()).hexdigest() for d in decides if d["id"] == "alpha#2")
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
+
+
+def test_a_lock_taking_add_during_the_abandons_prompt_refuses_the_abandon_and_the_rerun_covers_it_ruling_a(tgt, store, tmp_path, mkrepo, rig):
+    """The reviewers' interleaving through levain's own writer: on 77bd80ff8 the add WAITED for the whole prompt (store.lock
+    held) and was then refused (aborting). With the lock released for the prompt, the add lands while the repo still reads
+    tracking, and the abandon finds the store changed: it is refused, nothing is written, and a re-run anchors after it."""
+    import threading
+    from tests.test_board_sign import _slow_seal
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    keyed(tgt, "alpha", f"{m}:a")
+    started, out = threading.Event(), {}
+
+    def abandon():
+        try:
+            br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=_slow_seal(rig, started, 1.5))
+        except bs.BoardError as exc:
+            out["err"] = str(exc)
+    th = threading.Thread(target=abandon)
+    th.start()
+    assert started.wait(30)
+    late = keyed(tgt, "alpha", f"{m}:late")
+    th.join()
+    assert "the board changed while you signed: sign again" in out["err"]
+    assert b'"op":"abandon-track"' not in raw(store)
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert late in cut and len(cut) == 2
+
+
+def test_a_signed_rerun_recovers_when_the_abandons_anchor_left_the_items_file_codex_med_60(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """codex MED 60: the items file was cut back past the abandon's anchor (a repair), leaving an uncut item. On 77bd80ff8 the
+    signed re-run wrote no fresh abandon and every cut failed on the missing anchor."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a", "b"))
+    a = keyed(tgt, "alpha", f"{m}:a")
+    keyed(tgt, "alpha", f"{m}:b")
+    real = _crash_cuts(monkeypatch)
+    with pytest.raises(bs.BoardError, match="simulated crash"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(bs, "decide", real)
+    lines = items_raw(store).split(b"\n")
+    (store / "items.jsonl").write_bytes(b"\n".join(lines[:-2]) + b"\n")          # the last add (the anchor) repaired away
+    with pytest.raises(bs.BoardError, match="no longer in the items file.*re-run abandon-track signed"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert cut == [a]
+
+
+def test_an_unsigned_rerun_whose_abandon_no_longer_verifies_refuses_by_name_ruling_d(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """gemini 121/983: an unsigned re-run skipped the latest abandon's validity check (each cut then refused with the
+    cause text). Now it refuses up front, naming the recovery; with nothing left to cut it is the no-op it was."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    keyed(tgt, "alpha", f"{m}:a")
+    real = _crash_cuts(monkeypatch)
+    stranger = Rig(tmp_path / "gone", label="gone")
+    with pytest.raises(bs.BoardError, match="simulated crash"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(bs, "decide", real)
+    before = raw(store), items_raw(store)
+    with pytest.raises(bs.BoardError, match=r"cannot be the cause of the cuts still owed \(.*revoked.*\): re-run abandon-track signed"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source(revoked_seq=2))
+    with pytest.raises(bs.BoardError, match="re-run abandon-track signed"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=stranger.source())
+    assert (raw(store), items_raw(store)) == before

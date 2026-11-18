@@ -583,6 +583,32 @@ def _write_bytes(fd: int, payload: bytes) -> None:
 def _require_pointered(target: Target) -> None:
     if not target.pointered:
         raise BoardError(NO_STORE)
+def _store_seen(store_dir: Path) -> tuple:
+    """What a write's checks were judged against, beyond the bytes of the file it appends to: ``(name, dev, inode, size,
+    mtime_ns)`` of each store file (``(name,)`` when absent). A build reads BOTH files (the registry for I1, the items for
+    ``items_last``, both for a cause), so a change to either between the build and the write sends the write back."""
+    out = []
+    for name in APPEND_FILES:
+        try:
+            st = os.stat(store_dir / name)
+        except FileNotFoundError:
+            out.append((name,))
+            continue
+        except OSError as exc:
+            raise BoardError(f"the board store could not be checked ({exc})") from None
+        out.append((name, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+    return tuple(out)
+
+
+def _write_record(target: Target, fd: int, path: Path, raw: bytes, rec: dict, empty: bool) -> None:
+    # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
+    label = rec.get("id") or rec.get("repo") or rec.get("op")        # a registry record has no id
+    _write_all(fd, (b"\n" if raw and not raw.endswith(b"\n") else b"") + canonical_bytes(rec) + b"\n")
+    if not _same_file(fd, path):
+        raise BoardError(f"{path} was replaced while {label} was being written (a git operation?): the record may or may not be "
+                         f"in the new file; run \"levain board state\" and check before retrying (an add with --key is safe to retry)")
+    if empty:
+        _fsync_dir_or_warn(target.store_dir, label)
 
 
 def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filename: str = ITEMS_NAME,
@@ -594,52 +620,60 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     a ``parse`` that accepts one gets this far: an ``ack-torn`` is written after it) gets a newline first.
     When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read in this same locked read) and is
     appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
-    before the write the held fd's size is compared with the size of the bytes the record was built from: a lock-free writer
-    that appended in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
+    before the write the held fd's size, and the identity, size and mtime of BOTH store files (:func:`_store_seen`, what the
+    build's checks read), are compared with what the record was built from: a lock-free writer that appended to or replaced
+    either file in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
     break, which the verifier reports.
 
-    ``seal`` (see :mod:`levain.desk.board_sign`) is run on the chained record by ``board_sign.admit``, under the lock, before
-    the size check and the write: the signature is made, the authority log is replayed and the signed record must verify, or
-    BoardError is raised and nothing is written. A signer that is slow holds the lock for that long. After a seal, a store
-    file that was replaced or grew is a refusal (:data:`SIGNED_CHAIN_MOVED`), never a re-read: a second prompt is never
-    shown for one write."""
+    ``seal`` (see :mod:`levain.desk.board_sign`): the record is built and chained under the lock, then the lock is RELEASED for
+    the ceremony (``board_sign.ceremony``: a Touch ID prompt or a phone signature is human time, and no reader or other
+    writer waits on it), then taken again: the store must be exactly as it was (the file's bytes, both files' identity, size
+    and mtime), else the write is refused (:data:`SIGNED_CHAIN_MOVED`, never a re-read: a second prompt is never shown for
+    one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed record must verify, or
+    BoardError is raised and nothing is written."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
     path = target.store_dir / filename
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
     with store_lock(target.store_dir, exclusive=True) as held:
         for _ in range(OPEN_RETRIES):
-            fd = held.open(filename, os.O_RDWR | os.O_CREAT | os.O_APPEND, fcntl.LOCK_EX)
+            fd = held.open(filename, flags, fcntl.LOCK_EX)
             try:
                 empty = os.fstat(fd).st_size == 0           # a write into a zero-length file may have just created it
                 raw = _read_fd(fd)
                 if not _same_file(fd, path):
                     continue                    # replaced before anything was written (a git operation): open, read and build again
+                seen = _store_seen(target.store_dir)
                 rec, write = build(parse(raw))
                 if not write:
                     return rec, False
                 rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
                 if seal is not None:
-                    from levain.desk import board_sign
-                    rec = board_sign.admit(target, seal, rec)       # signs the bytes that include prev, then verifies; raises on any failure
-                    if not _same_file(fd, path) or os.fstat(fd).st_size != len(raw):
-                        raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
-                if os.fstat(fd).st_size != len(raw):
-                    if seal is not None:
-                        raise BoardError(SIGNED_CHAIN_MOVED)    # every post-seal mismatch refuses: a re-build would seal again
-                    continue                    # a writer that takes no lock appended since the read: re-read and re-build (bounded)
-                # ensure_ascii: no raw U+2028/2029/0085 reaches the file, so a reader that splits with splitlines() sees the same lines
-                label = rec.get("id") or rec.get("repo") or rec.get("op")        # a registry record has no id
-                _write_all(fd, (b"\n" if raw and not raw.endswith(b"\n") else b"") + canonical_bytes(rec) + b"\n")
-                if not _same_file(fd, path):
-                    raise BoardError(f"{path} was replaced while {label} was being written (a git operation?): the record may or may not be "
-                                     f"in the new file; run \"levain board state\" and check before retrying (an add with --key is safe to retry)")
-                if empty:
-                    _fsync_dir_or_warn(target.store_dir, label)
+                    break                       # the ceremony runs with no lock held (below)
+                if os.fstat(fd).st_size != len(raw) or _store_seen(target.store_dir) != seen:
+                    continue                    # a writer that takes no lock changed a store file since the read: re-read and re-build (bounded)
+                _write_record(target, fd, path, raw, rec, empty)
                 return rec, True
             finally:
                 os.close(fd)
-        raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
+        else:
+            raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
+
+    from levain.desk import board_sign
+    sealed = board_sign.ceremony(seal, rec)         # signs the bytes that include prev; raises on any failure; NO lock held
+    with store_lock(target.store_dir, exclusive=True) as held:
+        fd = held.open(filename, flags, fcntl.LOCK_EX)
+        try:
+            if (not _same_file(fd, path) or _read_fd(fd) != raw or _store_seen(target.store_dir) != seen):
+                raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
+            sealed = board_sign.earn(target, seal, sealed)     # the authority log replayed now; the signed record must verify
+            if not _same_file(fd, path) or os.fstat(fd).st_size != len(raw) or _store_seen(target.store_dir) != seen:
+                raise BoardError(SIGNED_CHAIN_MOVED)        # every post-seal mismatch refuses: a re-build would seal again
+            _write_record(target, fd, path, raw, sealed, empty)
+            return sealed, True
+        finally:
+            os.close(fd)
 
 
 def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
@@ -648,37 +682,78 @@ def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
     board_registry.check_add(store_dir, repo, key)
 
 
-def _store_lines(target: Target) -> list[bytes]:
-    """Every line of both store files as written, for the cause check. Called from a ``build`` that runs under the exclusive
-    lock, so it takes none of its own."""
-    out: list[bytes] = []
+@dataclass(frozen=True)
+class StoreLines:
+    """The store as the cause check reads it: each file's lines AS WRITTEN (split on ``\\n`` only, the final empty piece
+    dropped, blank lines kept, so a line's index is its place in its own file and the bytes before it are exactly
+    ``b"".join(l + b"\\n" for l in lines[:i])``), whether ``repos.jsonl`` ends in an unterminated line, and the store's id.
+    The two files are two chains (design 7.4, P1): nothing here is ever indexed across them."""
+    items: tuple[bytes, ...]
+    repos: tuple[bytes, ...]
+    store_id: str
+    repos_unterminated: bool = False
+
+
+def _split_written(raw: bytes) -> tuple[tuple[bytes, ...], bool]:
+    parts = raw.split(b"\n")
+    tail = parts[-1] != b""
+    if not tail:
+        parts.pop()
+    return tuple(parts), tail
+
+
+def read_store_id(store_dir: Path) -> str:
+    """The store's ``store.id`` (stripped). A store without one, or with an empty one, refuses."""
+    p = Path(store_dir) / STORE_ID_NAME
+    if not p.exists():
+        raise BoardError(f"{store_dir} holds no {STORE_ID_NAME}; run `levain board use`")
+    sid = _read_stable(p).decode("utf-8", "replace").strip()
+    if not sid:
+        raise BoardError(f"{p} is empty; run `levain board use`")
+    return sid
+
+
+def _store_lines(target: Target) -> StoreLines:
+    """Both store files' lines as written, and the store id, for the cause check. Called from a ``build`` (or ``earn``) that
+    runs under the exclusive lock, so it takes none of its own. A missing file reads as no lines."""
+    got: dict[str, tuple[tuple[bytes, ...], bool]] = {}
     for name in APPEND_FILES:
         try:
-            out.extend(ln for ln in _read_stable(target.store_dir / name).split(b"\n") if ln)
+            got[name] = _split_written(_read_stable(target.store_dir / name))
         except BoardError:
             if (target.store_dir / name).exists():
                 raise
-    return out
+            got[name] = ((), False)
+    return StoreLines(got["items.jsonl"][0], got["repos.jsonl"][0], read_store_id(target.store_dir), got["repos.jsonl"][1])
+
+
+def _with_store(rec: dict, store_id: str) -> dict:
+    """``rec`` naming ``store``. A registry record carries it already (after ``v``, from its builder). An item record gets it
+    LAST (after ``grade``; ``sig`` follows it), so everything before it stays the bytes flow's writer wrote."""
+    return rec if "store" in rec else {**rec, "store": store_id}
 
 
 def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = "") -> dict:
     """The writer's word on a built record, before ``prev`` and before any prompt: the grade the seal's ``via`` claims
-    (``asserted`` with none; a claimed grade is earned only by ``board_sign.admit`` after the ceremony), a signed record's
+    (``asserted`` with none; a claimed grade is earned only by ``board_sign.earn`` after the ceremony), a signed record's
     author must be the operator, and the fixed policy (:func:`levain.desk.board_sign.require_policy`) must accept it. A
-    record carrying ``cause`` has it checked here against the authority log read now (the seal's source, else
-    ``authority``): for an unsigned record no blocking step follows this check; a sealed one is checked again by ``admit``
-    against the log replayed after the ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write)."""
+    SIGNED record names its store: ``store`` (this store's ``store.id``) is put on it, last (a registry record has it
+    already), so the signature binds the record to this store and a signed line copied or a phone signature replayed into
+    another store is refused there (``earn`` refuses a ``store`` that is not this one). A record carrying ``cause`` has
+    it checked here against the authority log read now (the seal's source, else ``authority``): for an unsigned record no
+    blocking step follows this check; a sealed one is checked again by ``earn`` against the log replayed after the
+    ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write)."""
     from levain.desk import board_sign
     if seal is not None:
         board_sign.check_signable(rec)
-        rec = {**rec, "grade": seal.grade}
+        rec = {**_with_store(rec, read_store_id(target.store_dir)), "grade": seal.grade}
     grade = rec["grade"]
-    lines, snapshot = (), None
+    store, snapshot = None, None
     if "cause" in rec and rec["op"] == "decide" and rec.get("decision") == "cut":
-        lines = _store_lines(target)
+        store = _store_lines(target)
         source = seal.authority if seal is not None else authority
         snapshot = board_sign.read_authority(source) if source is not None else None
-    board_sign.require_policy(rec["op"], grade, rec, lines=lines, snapshot=snapshot, decision=decision)
+    board_sign.require_policy(rec["op"], grade, rec, store=store, snapshot=snapshot, decision=decision)
     return rec
 
 

@@ -41,8 +41,14 @@ Known edges, left open under the reachability line (nobody reaches them):
 * likewise a repo registered BY HAND at the same path between that snapshot and the import's ``register`` makes the
   import's register an unwritten no-op for that name: the hand record stands, and a ``paused`` focus state for that name
   still pauses it (a hand registration at ANOTHER path makes ``register`` refuse, which stops the import there).
-* a repo already ``aborting`` whose abandon-track is asserted, legacy, relayed or no longer valid can never finish its cuts
-  (no cause holds): re-run ``abandon-track`` signed to recover (it writes a fresh signed abandon the cuts cite);
+* a repo already ``aborting`` whose abandon-track is asserted, legacy, relayed or no longer valid, or whose anchor
+  (``items_last``) no longer covers an uncut item of its migration (an add by a writer outside the lock, or a repaired
+  store), can never finish its cuts from that abandon: re-run ``abandon-track`` signed to recover (it writes a fresh signed
+  abandon the cuts cite); an unsigned re-run says so;
+* two ``abandon-track`` re-runs at once can each write a cut for the same item (each read the missing cuts before the other
+  wrote): both cuts cite a valid abandon and the fold reads the item cut either way;
+* a signing writer holds no lock during the prompt (``board_store._append``): a writer that lands meanwhile makes the
+  signed write refuse ("sign again"), so signing alongside a busy writer can take more than one try;
 * the phone (passkey) path does not reach the registry verbs in 1.0: they are signed at the terminal (P2's door is T6's);
 * ``ack-torn`` of a torn SIGNED decision record is asserted (it acknowledges the tear, it re-decides nothing); P6's verify
   reports who acknowledged it.
@@ -300,7 +306,7 @@ def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tup
     abandon-track|untrack``, is refused unsigned). ``decision(fold, record)``, when given, returns the words naming why THIS
     record of an asserted-ok op is decision-class (``move``, :func:`levain.desk.board_sign.move_is_decision`), or ``""``; it
     is judged on the fold read under the same lock. ``seal`` (a ``board_sign.Seal``) is then passed to ``_append``, which
-    earns the signed grade by ``admit`` after the ceremony."""
+    earns the signed grade by ``board_sign.earn`` after the ceremony."""
     bs._require_pointered(target)
     if not creates and not (target.store_dir / REPOS_NAME).exists():
         raise BoardError(NO_REGISTRY)
@@ -597,19 +603,48 @@ def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
     return None
 
 
-def _latest_abandon_holds(raw: bytes, name: str, migration: str, snapshot: Any) -> bool:
-    """Whether the latest abandon-track of ``(name, migration)`` in the registry bytes ``raw`` can be a cut's cause now."""
+def _latest_abandon_problem(raw: bytes, name: str, migration: str, snapshot: Any, store_dir: Path) -> tuple[str | None, list[str]]:
+    """``(problem, uncut)``: why the latest abandon-track of ``(name, migration)`` in the registry bytes ``raw`` cannot be the
+    cause of every cut still owed now (None when it can), and the ceremony's item ids that do not read ``cut``. It cannot
+    when there is none, when ``board_sign.abandon_problem`` refuses it (asserted, legacy, relayed, a key since revoked, no
+    ``items_last``), when its ``items_last`` line is no longer in the items file, or when an uncut item keyed to the
+    migration was added AFTER that line (an add that landed between the abandon's anchor and its cuts: a writer outside the
+    lock, or a store repaired since). The caller holds the exclusive ``store.lock`` (the items are read here, under it)."""
     from levain.authority_sig import VerifierUnavailable
     from levain.desk import board_sign as sg
+    ids, decision = _migration_facts(store_dir, name, migration)
+    uncut = [i for i in ids if decision.get(i) != "cut"]
     lines, _ = _split(raw)
+    held = None
     for line in reversed(lines):
         rec = sg._parse(line)
         if isinstance(rec, dict) and rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
-            try:
-                return sg.abandon_problem(rec, snapshot) is None
-            except VerifierUnavailable as exc:
-                raise BoardError(f"the abandon-track signature cannot be checked now ({exc}): nothing was written") from None
-    return False
+            held = rec
+            break
+    if held is None:
+        return f"no abandon-track of {migration} is recorded for {name}", uncut
+    try:
+        problem = sg.abandon_problem(held, snapshot)
+    except VerifierUnavailable as exc:
+        raise BoardError(f"the abandon-track signature cannot be checked now ({exc}): nothing was written") from None
+    if problem is not None:
+        return problem, uncut
+    item_lines, _ = _split(_items_raw(store_dir))
+    last = held["items_last"]
+    anchor = None
+    if last != sg.ITEMS_NONE:
+        anchor = next((n for n, ln in enumerate(item_lines) if hashlib.sha256(ln).hexdigest() == last), None)
+        if anchor is None:
+            return "the items line the recorded abandon-track names (items_last) is no longer in the items file", uncut
+    added: dict[str, int] = {}
+    for n, ln in enumerate(item_lines):
+        rec = sg._parse(ln)
+        if isinstance(rec, dict) and rec.get("op") == "add" and isinstance(rec.get("id"), str):
+            added.setdefault(rec["id"], n)
+    late = [i for i in uncut if anchor is None or added.get(i, -1) > anchor]
+    if late:
+        return f"{', '.join(late)} {'was' if len(late) == 1 else 'were'} added after the recorded abandon-track", uncut
+    return None, uncut
 
 
 def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
@@ -617,15 +652,18 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     """``tracking`` becomes ``aborting``; every item keyed to the ceremony's M is decided ``cut`` with the abandon's words and
     ``cause``, the hash of the abandon-track record. The registry record and the cuts are two files, so a crash can land the
     first without all the second: run again on an ``aborting`` repo and only the missing cuts are written (T2-d, T2-f).
-    The abandon is decision-class: it needs ``seal`` (a signed abandon, earned by ``admit``). The cuts are asserted decides
-    whose ``cause`` (P2-d) must name that signed abandon, keyed to ITS migration M and the item keyed to M: ``authority`` (an
-    authority SOURCE, default the seal's) is what the cause check replays; with ``seal`` it must be the seal's own source (or
-    not given). The abandon names ``items_last``, the sha256 of the items file's last line when it was written (``none``: no
-    line), read under the same lock: a cut's cause holds only for an item added before it (L2 M2, levain 26).
-    A re-run on an ``aborting`` repo writes no new abandon and still needs ``authority`` for the cuts it finishes, except a
-    SIGNED re-run whose latest abandon does not hold a cut (``board_sign.abandon_problem``: asserted, legacy, relayed, a key
-    since revoked, no ``items_last``): it writes a fresh signed abandon of the same migration (the fold reads it as a retry)
-    and the cuts cite that one.
+    The abandon is decision-class: it needs ``seal`` (a signed abandon, earned by ``board_sign.earn``). The cuts are asserted
+    decides whose ``cause`` (P2-d) must name that signed abandon, keyed to ITS migration M and the item keyed to M:
+    ``authority`` (an authority SOURCE, default the seal's) is what the cause check replays; with ``seal`` it must be the
+    seal's own source (or not given). The abandon names ``items_last``, the sha256 of the items file's last line when it was
+    written (``none``: no line), read under the same lock: a cut's cause holds only for an item added before it (L2 M2,
+    levain 26). The lock is released during the signing prompt; an add that lands then makes the write refuse ("sign
+    again"), so the anchor is never stale for a writer that takes the lock.
+    A re-run on an ``aborting`` repo writes no new abandon and still needs ``authority`` for the cuts it finishes. When the
+    latest abandon cannot cause every cut still owed (:func:`_latest_abandon_problem`: not signed or no longer valid, no
+    ``items_last``, its anchor gone, or an uncut item of M added after its anchor): a SIGNED re-run writes a fresh signed
+    abandon of the same migration (the fold reads it as a retry) whose anchor covers them, and the cuts cite that one; an
+    UNSIGNED re-run with an authority source refuses by name ("re-run abandon-track signed") before anything is written.
     Returns ``(repo, ids cut by this call)``."""
     from levain.desk import board_sign as sg
     if seal is not None and authority is not None and authority is not getattr(seal, "authority", None):
@@ -642,7 +680,16 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     def build(fold, sid, raw):
         c = _need_repo(fold, name)
         if c.mode == "aborting" and c.migration == cur.migration:
-            if seal is None or _latest_abandon_holds(raw, name, c.migration, sg.read_authority(seal.authority)):
+            if seal is None:
+                if authority is not None:
+                    problem, uncut = _latest_abandon_problem(raw, name, c.migration, sg.read_authority(authority),
+                                                             target.store_dir)
+                    if problem is not None and uncut:
+                        raise BoardError(f"abandon-track {name}: the recorded abandon-track cannot be the cause of the cuts "
+                                         f"still owed ({problem}): re-run abandon-track signed (--sign); nothing was written")
+                return None, False
+            problem, _ = _latest_abandon_problem(raw, name, c.migration, sg.read_authority(seal.authority), target.store_dir)
+            if problem is None:
                 return None, False
             body_words = c.words                            # the recovery abandon re-signs the abandon already recorded
         elif c.mode != "tracking" or c.migration != cur.migration:

@@ -6,41 +6,52 @@ grade it claims. The SSHSIG is made under the namespace :data:`NAMESPACE` and ri
 ``sig: {"sshsig": <armored>, "fingerprint": <fp>, "via": "terminal"|"phone"}``, the last key of the record.
 
 The grade is the writer's, and it is EARNED by a check, never by a label. A seal's ``via`` only says which grade the record
-claims; :func:`admit` (which ``board_store._append`` calls on every sealed record, under the lock, after the ceremony and
+claims; :func:`earn` (which ``board_store._append`` calls on every sealed record, under the lock, after the ceremony and
 before the write) replays the authority log at that moment from the seal's authority SOURCE and refuses the write unless
 :func:`verify_record` says ``valid``: an unenrolled, revoked, quarantined or wrong-class key writes nothing. A write path
 with no authority log to read is refused: a signature nobody can verify is not a signed grade. A caller's body carrying
 ``sig`` or ``grade`` is refused by ``board_store.build_record``. ``author.kind`` must be ``operator`` on a signed record.
 
-Two ways to sign, both reaching the store through one ``seal`` hook that ``board_store._append`` calls UNDER the exclusive
-lock, after ``prev`` is stamped (``prev`` is known only there):
+A signed record names its store: ``store`` (the store's ``store.id``) is in the signed bytes (a registry record carries it
+already; ``board_store._graded`` puts it on a signed item record), and :func:`earn` refuses a ``store`` that is not the
+store being written. A signature made for one store never lands in another, even one whose chain is byte-identical (two
+empty item files have the same ``prev``).
+
+Two ways to sign, both reaching the store through one ``seal`` hook. ``board_store._append`` builds and chains the record
+under the exclusive lock (``prev`` is known only there), RELEASES the lock for the ceremony (:func:`ceremony`: a prompt is
+human time, and no reader or other writer waits on it), then takes it again and refuses ("the board changed while you
+signed: sign again") unless the store is exactly as it was; the prompt is never shown twice for one write.
 
 * :func:`terminal_seal`: Touch ID through ``levain.consent.terminal_sign`` (its key finder, its ``sign``, its remote and agent
-  session refusals). A refused, cancelled or failed signature raises :class:`~levain.desk.board_store.BoardError` and nothing
-  is appended. If the store file moved during the prompt the write is refused ("the board changed while you signed: sign
-  again"); the prompt is never shown twice for one write.
+  session refusals; the remote check is made at the prompt, not before). A refused, cancelled or failed signature raises
+  :class:`~levain.desk.board_store.BoardError` and nothing is appended.
 * :func:`prepare` then :func:`commit_phone`: the cockpit's passkey ceremony signs the exact bytes ``prepare`` returns (the
-  door that mints that signature is not here), and ``commit_phone`` re-builds the record under the lock and refuses if the
-  chain head moved or the bytes differ from what was signed; :func:`admit` then verifies it against the authority log
-  replayed after the ceremony.
+  door that mints that signature is not here), and ``commit_phone`` refuses a store other than the one prepared for,
+  re-builds the record under the lock and refuses if the chain head moved, the bytes differ from what was signed, or the
+  verb would write nothing now (an idempotent ``add`` that another writer landed: nothing was signed); :func:`earn` then
+  verifies it against the authority log replayed after the ceremony.
 
 The cause (P2-d). A ``decide`` of ``cut`` may carry ``cause``: the lowercase hex sha256 of the cited ``abandon-track`` line's
 bytes exactly as written in the store file, without its trailing newline (the same byte range the chain's ``prev`` hashes).
 :func:`verify_cause` holds it: the cited record is an ``abandon-track`` whose signature verifies ``valid`` against the
-authority log (a ``relayed`` one is refused until P3's verifier lands), of a migration ``M`` the item is keyed to (its ``add``
-carries key ``M`` or ``M:...``), of the item's own repo, and the item's ``add`` predates the abandon (it is at or before the
-items line the abandon names in ``items_last``). A present cause is checked on every decide, signed or not.
+authority log (a ``relayed`` one is refused until P3's verifier lands), a line of THIS store's ``repos.jsonl`` naming this
+store, at the place in the registry chain its signed ``prev`` names, in a registry that is not torn, of a migration ``M`` the
+item is keyed to (its ``add`` carries key ``M`` or ``M:...``), of the item's own repo, and the item's ``add`` predates the
+abandon (it is at or before the ``items.jsonl`` line the abandon names in ``items_last``). Each file is searched on its
+own; no position is ever compared across the two files. A present cause is checked on every decide, signed or not.
 
 :func:`verify_record` is pure over ``(record, authority snapshot)``. :func:`require_policy` is the one table of the fixed 1.0
 policy; the writer calls it before it signs or writes.
 
 Known edges:
-* the cause check reads ``repos.jsonl`` under the items lock; a process that REPLACES that file mid-write is not detected
-  (the store dir is not a git checkout).
+* a process that changes a store file in the instant between the writer's last check and its write is not excluded (the
+  writer re-checks both files' identity, size and mtime right before it writes; a lock-free writer is outside the protocol).
 * a cited line nested deeper than the JSON parser's recursion limit: the cause check refuses it as "not a record"
   (RecursionError is caught here, never a crash).
 * an idempotent ``add --sign`` that writes nothing still needs a findable terminal key and an authority log (preflight runs
   before the store is read).
+* two signed writes prepared at once: the second to finish its ceremony finds the store changed and is refused ("sign
+  again"); with the lock released during the prompt, that is the price of never keeping a reader waiting on the operator.
 """
 from __future__ import annotations
 
@@ -55,7 +66,7 @@ from levain.desk import board_store as bs
 
 __all__ = [
     "ASSERTED_OK", "DECISION_CLASS", "ITEMS_NONE", "NAMESPACE", "POLICY", "SIGNED_GRADES", "Prepared", "Seal", "Verdict",
-    "abandon_problem", "admit", "commit_phone", "move_is_decision", "prepare", "require_policy", "resolve_authority",
+    "abandon_problem", "admit", "ceremony", "commit_phone", "earn", "move_is_decision", "prepare", "require_policy", "resolve_authority",
     "signing_bytes", "terminal_seal", "verify_cause", "verify_record",
 ]
 
@@ -79,7 +90,15 @@ def resolve_authority(*, data_root: Path | str | None = None, queue_dir: Path | 
     """The authority SOURCE a board signature is verified against
     (``levain.consent.queue.authority_source`` over a cockpit's ``cockpit.db`` and its anchor), at ``data_root``, else the one
     cockpit the consent hooks in ``queue_dir`` (default: this process's consent queue) name. Calling the source replays the
-    log NOW; the log itself is not read here. Refused (BoardError) when there is no single cockpit holding a log."""
+    log NOW; the log itself is not read here. Refused (BoardError) when there is no single cockpit holding a log, and when the
+    consent hooks or the cockpit directory cannot be read (an OSError or ValueError there is a refusal, never a traceback)."""
+    try:
+        return _resolve_authority(data_root, queue_dir)
+    except (OSError, ValueError) as exc:
+        raise bs.BoardError(f"{NO_AUTHORITY} (the consent hooks or the cockpit could not be read: {exc})") from None
+
+
+def _resolve_authority(data_root: Path | str | None, queue_dir: Path | str | None) -> AuthoritySource:
     from levain.authority import anchor_path
     from levain.consent.answering import hook_roots
     from levain.consent.queue import authority_source, default_queue_dir
@@ -189,34 +208,50 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any) -> str | None:
     return None
 
 
-def verify_cause(record: Mapping[str, Any], lines: Sequence[bytes | str], snapshot: Any) -> str | None:
-    """Why ``record``'s ``cause`` does not hold, or None when it does. ``lines`` is every line of BOTH store files as written
-    (no trailing newline; each file's lines in file order). It holds when ``cause`` is the sha256 of one of ``lines``, that
-    line is an ``abandon-track`` that :func:`abandon_problem` accepts, and the item ``record`` decides (L2 M2, levain 26):
-    was added for the abandon's ``repo``, with key ``M`` or ``M:...`` where ``M`` is the abandon's ``migration``, and BEFORE
-    the abandon: its ``add`` line is at or before the line whose sha256 is the abandon's ``items_last`` (``none``: the items
-    file was empty then, so no item predates it). Both are item lines, so their order in ``lines`` is their order in the
-    items file. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
+def _index_of(lines: Sequence[bytes], digest: str) -> int | None:
+    return next((i for i, ln in enumerate(lines) if _record_hash(ln) == digest), None)
+
+
+def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snapshot: Any) -> str | None:
+    """Why ``record``'s ``cause`` does not hold, or None when it does. ``store`` is :class:`board_store.StoreLines` (each
+    file's lines as written, and the store id; ``board_store._store_lines``). It holds when ``cause`` is the sha256 of a line
+    of ``repos.jsonl`` (ONLY that file is searched) that is an ``abandon-track`` naming THIS store (``store`` equals the store
+    id), standing at the place in the registry chain its ``prev`` names (``prev`` is the chain hash of the registry bytes
+    before it, and is inside the signed bytes), in a registry that is not torn, that :func:`abandon_problem` accepts, and the
+    item ``record`` decides (L2 M2, levain 26): was added for the abandon's ``repo``, with key ``M`` or ``M:...`` where ``M``
+    is the abandon's ``migration``, and BEFORE the abandon: its ``add`` line in ``items.jsonl`` is at or before the
+    ``items.jsonl`` line whose sha256 is the abandon's ``items_last`` (``none``: the items file was empty then, so no item
+    predates it). Both positions are in ``items.jsonl``; nothing is compared across the two files. Raises
+    ``VerifierUnavailable`` when ssh-keygen cannot run."""
+    from levain.desk import repos_fold as rf
     cause = record.get("cause")
     if not isinstance(cause, str) or not bs.HASH_RE.fullmatch(cause):
         return "cause must be the lowercase sha256 of an abandon-track record"
-    held = None
-    for line in lines:
-        if _record_hash(line) == cause:
-            held = _parse(line)
-            if not isinstance(held, dict):
-                return "cause names a line that is not a record"
-            break
-    else:
-        return "cause names no abandon-track record in the store"
+    if store is None:
+        return "cause cannot be checked: the store's lines were not read"
+    at = _index_of(store.repos, cause)
+    if at is None:
+        return "cause names no abandon-track record in the store's registry (repos.jsonl)"
+    held = _parse(store.repos[at])
+    if not isinstance(held, dict):
+        return "cause names a line that is not a record"
     if held.get("op") != "abandon-track":
         return "cause names a record that is not an abandon-track"
+    if held.get("store") != store.store_id:
+        return (f"cause names an abandon-track of another store ({held.get('store')!r}; this store is "
+                f"{store.store_id!r})")
+    if held.get("prev") != bs.chain_prev(b"".join(ln + b"\n" for ln in store.repos[:at])):
+        return ("the cited abandon-track does not stand where its signed prev places it in the registry chain (a line "
+                "moved or copied)")
+    folded = rf.fold_repos(store.repos, store_id=store.store_id, unterminated_tail=store.repos_unterminated)
+    if folded.torn:
+        return f"the registry is torn ({folded.torn_why}): no abandon-track in it can be the cause of a cut"
     problem = abandon_problem(held, snapshot)
     if problem is not None:
         return problem
     migration = held["migration"]
     item_id = record.get("id")
-    added_at, added = next(((i, r) for i, r in enumerate(map(_parse, lines))
+    added_at, added = next(((i, r) for i, r in enumerate(map(_parse, store.items))
                             if isinstance(r, dict) and r.get("op") == "add" and r.get("id") == item_id), (None, None))
     if added is None:
         return f"{item_id} has no add record in the store"
@@ -226,23 +261,23 @@ def verify_cause(record: Mapping[str, Any], lines: Sequence[bytes | str], snapsh
         return (f"cause names the abandon-track of repo {held.get('repo')!r}, and {item_id} was added for "
                 f"{added.get('repo')!r}")
     last = held["items_last"]
-    anchor = None if last == ITEMS_NONE else next((i for i, ln in enumerate(lines) if _record_hash(ln) == last), None)
+    anchor = None if last == ITEMS_NONE else _index_of(store.items, last)
     if last != ITEMS_NONE and anchor is None:
-        return "the items line the cited abandon-track names (items_last) is not in the store"
+        return "the items line the cited abandon-track names (items_last) is not in the items file"
     if anchor is None or added_at > anchor:
         return f"{item_id} was added after the cited abandon-track: an abandon cuts only the items that predate it"
     return None
 
 
 def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None, *,
-                   lines: Sequence[bytes | str] = (), snapshot: Any = None, decision: str = "") -> None:
+                   store: "bs.StoreLines | None" = None, snapshot: Any = None, decision: str = "") -> None:
     """Refuse (:class:`~levain.desk.board_store.BoardError`) a record the fixed 1.0 policy does not accept at ``grade``. An op
-    not in :data:`POLICY` is refused (fail closed). ``grade`` is the WRITER's (a signed grade is then earned by :func:`admit`;
+    not in :data:`POLICY` is refused (fail closed). ``grade`` is the WRITER's (a signed grade is then earned by :func:`earn`;
     ``relayed`` is P3's). A decision-class op needs ``signed-*`` or ``relayed``; the one exception (P2-d) is a ``decide`` of
-    ``cut`` whose ``cause`` holds (:func:`verify_cause` over ``lines``, every store line as written, and ``snapshot``). A
-    present ``cause`` is checked whatever the grade, and refused on anything but a cut. ``decision`` (non-empty: the words
-    naming why) makes an asserted-ok op decision-class for THIS record: the writer passes it for a ``move`` that
-    :func:`move_is_decision` names."""
+    ``cut`` whose ``cause`` holds (:func:`verify_cause` over ``store``, the store's lines, and ``snapshot``). A present
+    ``cause`` is checked whatever the grade, and refused on anything but a cut. ``decision`` (non-empty: the words naming why)
+    makes an asserted-ok op decision-class for THIS record: the writer passes it for a ``move`` that :func:`move_is_decision`
+    names."""
     from levain.authority_sig import VerifierUnavailable
     record = record or {}
     if op not in POLICY:
@@ -252,7 +287,7 @@ def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None,
         if not (op == "decide" and record.get("decision") == "cut"):
             raise bs.BoardError("cause belongs to a decide of cut only")
         try:
-            problem = verify_cause(record, lines, snapshot)
+            problem = verify_cause(record, store, snapshot)
         except VerifierUnavailable as exc:
             raise bs.BoardError(f"the cause cannot be checked now ({exc}): nothing was written") from None
         if problem is not None:
@@ -291,8 +326,9 @@ def _attach(record: Mapping[str, Any], sshsig: str, fingerprint: str, via: str) 
 
 class Seal:
     """What a store verb takes as ``seal``: the grade it CLAIMS (from ``via``, never from a caller), the authority SOURCE
-    :func:`admit` replays after the ceremony, a ``preflight`` that runs BEFORE the lock, and ``__call__(record) -> record``
-    that runs UNDER the exclusive lock on the chained record. A seal's output is never trusted: :func:`admit` verifies it."""
+    :func:`earn` replays after the ceremony, a ``preflight`` that runs BEFORE the lock, and ``__call__(record) -> record``
+    that runs on the chained record with NO lock held (:func:`ceremony`). A seal's output is never trusted: :func:`earn`
+    verifies it under the lock."""
 
     via = ""
     authority: AuthoritySource | None = None
@@ -308,16 +344,26 @@ class Seal:
         raise NotImplementedError
 
 
-def admit(target: bs.Target, seal: Seal, record: dict) -> dict:
-    """Run ``seal`` on the chained ``record`` and earn its grade: called by ``board_store._append`` under the exclusive lock,
-    right before the write. After the ceremony the authority log is replayed from ``seal.authority`` (never a snapshot
-    taken earlier); the write is REFUSED (BoardError, nothing written) unless the sealed record is ``record`` plus a ``sig``
-    and :func:`verify_record` finds it ``valid``, and, when it carries a ``cause``, :func:`verify_cause` holds against the
-    same replay."""
-    from levain.authority_sig import VerifierUnavailable
+def ceremony(seal: Seal, record: dict) -> dict:
+    """Run ``seal`` on the chained ``record``: the prompt (or the phone signature's check). ``board_store._append`` calls it
+    with NO lock held. The result must be ``record`` plus a ``sig``, or the write is refused (BoardError). Nothing is
+    trusted yet: :func:`earn` verifies it under the lock."""
     sealed = seal(record)
     if not isinstance(sealed, dict) or {k: v for k, v in sealed.items() if k != "sig"} != record or "sig" not in sealed:
         raise bs.BoardError("the seal returned a record other than the one built: nothing was written")
+    return sealed
+
+
+def earn(target: bs.Target, seal: Seal, sealed: dict) -> dict:
+    """Earn the sealed record's grade: called by ``board_store._append`` under the exclusive lock, after the ceremony and
+    right before the write, once it has checked the store is as the record was built from. The authority log is replayed
+    from ``seal.authority`` NOW (never a snapshot taken earlier); the write is REFUSED (BoardError, nothing written) unless
+    the record names this store (``store``), :func:`verify_record` finds it ``valid``, and, when it carries a ``cause``,
+    :func:`verify_cause` holds against the same replay."""
+    from levain.authority_sig import VerifierUnavailable
+    sid = bs.read_store_id(target.store_dir)
+    if sealed.get("store") != sid:
+        raise bs.BoardError(f"not written: the signed record names store {sealed.get('store')!r}, and this store is {sid!r}")
     snapshot = read_authority(seal.authority)
     try:
         verdict = verify_record(sealed, snapshot)
@@ -331,6 +377,12 @@ def admit(target: bs.Target, seal: Seal, record: dict) -> dict:
     return sealed
 
 
+def admit(target: bs.Target, seal: Seal, record: dict) -> dict:
+    """:func:`ceremony` then :func:`earn`, in one call (the caller holds whatever lock it needs; ``board_store._append``
+    calls the two halves itself, with the lock released between them)."""
+    return earn(target, seal, ceremony(seal, record))
+
+
 class _TerminalSeal(Seal):
     via = "terminal"
 
@@ -340,7 +392,6 @@ class _TerminalSeal(Seal):
         self._key_dir, self._factory, self._remote, self._agent, self._bound = key_dir, signer_factory, remote, in_agent_session, bound_s
         self.authority = authority
         self._key = None
-        self._why: str | None = None
 
     def preflight(self) -> None:
         from levain.consent import terminal_sign as ts
@@ -358,14 +409,13 @@ class _TerminalSeal(Seal):
             raise bs.BoardError(f"the terminal key cannot be used: {exc}") from None
         if self._key is None:
             raise bs.BoardError("no terminal key with a touch-id sidecar: nothing was written (levain terminal-key create)")
-        self._why = (self._remote or ts.remote_reason)()            # a process-table read: kept out of the lock
 
     def __call__(self, record: dict) -> dict:
         from levain.consent import terminal_sign as ts
         from levain.cockpit import keys as _keys
         if self._key is None:
             self.preflight()
-        why = self._why
+        why = (self._remote or ts.remote_reason)()          # judged AT the prompt (no lock is held here), never earlier
         factory = self._factory or (lambda path, bound: _keys.ssh_signer(
             _keys.refuse_real_key_in_tests(path, "the signing key"), namespace=NAMESPACE, timeout=bound))
         out = ts.sign(signing_bytes(record), key=self._key, signer_factory=factory, remote=why is not None, remote_why=why,
@@ -454,12 +504,14 @@ def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
 @dataclass(frozen=True)
 class Prepared:
     """A record ready for an external signer: ``message`` is the exact bytes to sign (namespace :data:`NAMESPACE`), ``prev``
-    the chain head those bytes commit to. ``verb`` and ``kwargs`` re-build the same record in :func:`commit_phone`."""
+    the chain head those bytes commit to, ``store`` the id of the store it was prepared for (the record names it too, inside
+    ``message``). ``verb`` and ``kwargs`` re-build the same record in :func:`commit_phone`."""
     verb: str
     kwargs: Mapping[str, Any] = field(repr=False)
     record: Mapping[str, Any] = field(repr=False)
     message: bytes
     prev: str
+    store: str = ""
 
 
 class _Captured(Exception):
@@ -485,18 +537,21 @@ def _verb(name: str) -> Callable[..., Any]:
 
 
 def prepare(target: bs.Target, verb: str, *, authority: AuthoritySource | None = None, **kwargs: Any) -> Prepared:
-    """Build, under the lock and without writing, the record ``verb`` would write now, with grade ``signed-phone`` and its
-    ``prev``; the caller hands ``message`` to the passkey ceremony. ``kwargs`` are the verb's own arguments (``author`` must be
-    the operator; ``seal`` is refused). ``now`` is frozen here, after the arguments are merged (a ``now`` of None is replaced),
-    so :func:`commit_phone` re-builds the same bytes. ``authority`` (a source) is required for a cut that carries a ``cause``: without it the build refuses with NO_AUTHORITY.
+    """Build, under the lock and without writing, the record ``verb`` would write now, with grade ``signed-phone``, its
+    ``prev`` and this store's ``store``; the caller hands ``message`` to the passkey ceremony. ``kwargs`` are the verb's own
+    arguments (``author`` must be the operator, refused before anything else otherwise; ``seal`` is refused). ``now`` is frozen
+    here, after the arguments are merged (a ``now`` of None is replaced), so :func:`commit_phone` re-builds the same bytes.
+    ``authority`` (a source) is required for a cut that carries a ``cause``: without it the refusal is :data:`NO_AUTHORITY`.
     Nothing is written."""
     if "seal" in kwargs:
         raise bs.BoardError("prepare makes its own seal: a seal argument is refused")
+    if verb == "decide" and kwargs.get("cause") is not None and authority is None:
+        raise bs.BoardError(NO_AUTHORITY)
     kwargs = {**kwargs, "now": kwargs.get("now") or bs._utc_now()}
     try:
         _verb(verb)(target, **kwargs, seal=_CaptureSeal(authority))
     except _Captured as got:
-        return Prepared(verb, kwargs, got.record, signing_bytes(got.record), got.record["prev"])
+        return Prepared(verb, kwargs, got.record, signing_bytes(got.record), got.record["prev"], got.record["store"])
     raise bs.BoardError(f"{verb} would write nothing: there is nothing to sign")
 
 
@@ -505,8 +560,10 @@ class _PhoneSeal(Seal):
 
     def __init__(self, prepared: Prepared, sshsig: str, authority: AuthoritySource):
         self._p, self._sig, self.authority = prepared, sshsig, authority
+        self.used = False
 
     def __call__(self, record: dict) -> dict:
+        self.used = True
         if record["prev"] != self._p.prev:
             raise bs.BoardError(CHAIN_MOVED)
         if signing_bytes(record) != self._p.message:
@@ -522,10 +579,21 @@ class _PhoneSeal(Seal):
 def commit_phone(target: bs.Target, prepared: Prepared, sshsig: str, authority: AuthoritySource) -> Any:
     """Append ``prepared``'s record with an externally produced SSHSIG over ``prepared.message``, graded ``signed-phone``.
     ``authority`` is an authority SOURCE (:func:`resolve_authority`, or a test's callable), replayed under the lock after the
-    ceremony, never a snapshot the caller took before it (a snapshot is refused). Under the lock the record is re-built; it
-    is REFUSED (nothing written) when the chain head is no longer ``prepared.prev`` ("the board changed while you signed:
-    sign again"), when its bytes differ from what was signed, or when :func:`admit` does not find it valid. Returns what the
-    verb returns."""
+    ceremony, never a snapshot the caller took before it (a snapshot is refused). Refused before anything is read when
+    ``target`` is not the store ``prepared`` was made for. Under the lock the record is re-built; it is REFUSED (nothing
+    written) when the chain head is no longer ``prepared.prev`` ("the board changed while you signed: sign again"), when its
+    bytes differ from what was signed, when the verb would now write nothing (an idempotent ``add`` another writer landed:
+    the signature signed nothing that is written, so the commit is not a success), or when :func:`earn` does not find it
+    valid. Returns what the verb returns."""
     if not callable(authority):
         raise bs.BoardError("commit_phone takes an authority SOURCE, replayed after the ceremony, not a snapshot")
-    return _verb(prepared.verb)(target, **prepared.kwargs, seal=_PhoneSeal(prepared, sshsig, authority))
+    sid = bs.read_store_id(target.store_dir)
+    if prepared.store != sid:
+        raise bs.BoardError(f"this decision was prepared for store {prepared.store!r}, and this store is {sid!r}: "
+                            f"nothing was written")
+    seal = _PhoneSeal(prepared, sshsig, authority)
+    out = _verb(prepared.verb)(target, **prepared.kwargs, seal=seal)
+    if not seal.used:
+        raise bs.BoardError(f"{CHAIN_MOVED} (the {prepared.verb} is already on the board, written by another writer: "
+                            f"nothing was signed or written)")
+    return out
