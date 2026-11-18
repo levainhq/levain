@@ -485,3 +485,30 @@ def test_the_own_id_strip_has_token_boundaries_and_a_line_before_the_title_is_re
     # problem, not an exempt-title case: the exemption by index 0 can never skip a title that sits lower
     probs = charter.check_text("\n" + text, repo_name=name)[0]
     assert any(p.rule == "title" for p in probs)
+
+
+def test_a_full_stop_after_the_own_id_is_stripped_but_a_glued_suffix_is_not(tmp_path):
+    name = "2026-11-18"
+    repo = _git_repo(tmp_path / "r")
+    store = _store_file(tmp_path / "items.jsonl", [(f"{name}#1", None)])
+    assert main(["charter", "init", name, "--repo", str(repo), "--items", str(store)]) == 0
+    text = _fill((repo / "CHARTER.md").read_text(encoding="utf-8")).replace("[judged: filled]", f"[item: {name}#1]")
+    for tail in (".", ".\n\nAnd more", ". Next", ".)"):
+        sentence = text.replace("filled\n\n## Criteria", f"this follows {name}#1{tail}\n\n## Criteria", 1)
+        assert [p for p in charter.check_text(sentence, repo_name=name)[0] if p.rule == "status"] == [], tail
+    after_dot = text.replace("filled\n\n## Criteria", f"see.{name}#1 here\n\n## Criteria", 1)
+    assert any(p.rule == "status" for p in charter.check_text(after_dot, repo_name=name)[0])
+    for glued in (f"{name}#1st", f"{name}#1.5", f"{name}#1.x"):
+        t = text.replace("filled\n\n## Criteria", f"shipped {glued}\n\n## Criteria", 1)
+        assert any(p.rule == "status" for p in charter.check_text(t, repo_name=name)[0]), glued
+
+
+def test_a_badly_named_items_exits_two_for_check_and_init(tmp_path, capsys):
+    repo = _git_repo(tmp_path / "r")
+    bad = tmp_path / "notes.txt"
+    bad.write_text("x\n", encoding="utf-8")
+    assert main(["charter", "check", "--repo", str(repo), "--repo-name", "alpha", "--items", str(bad)]) == 2
+    assert "--items must name a store directory" in capsys.readouterr().err
+    assert main(["charter", "init", "alpha", "--repo", str(repo), "--items", str(bad)]) == 2
+    assert not (repo / "CHARTER.md").exists()
+    assert "--items must name a store directory" in capsys.readouterr().err
