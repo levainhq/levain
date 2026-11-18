@@ -11,7 +11,11 @@ import time
 from levain.desk import board_cli as bc
 from levain.desk import board_evidence as be
 from levain.desk import board_store as bs
-from tests.test_board_registry import A, bare_store, git, home, mkrepo, ok, run, store, track_ready  # noqa: F401
+import pytest
+
+from tests.test_board_registry import A, bare_store, decision_seal, git, home, mkrepo, ok, run, store, track_ready  # noqa: F401
+
+pytestmark = pytest.mark.usefixtures("decision_seal")     # P2: begin-track and track are decision-class; the test seam seals them
 
 
 def _two_tracked(capsys, tmp_path, store, mkrepo):
