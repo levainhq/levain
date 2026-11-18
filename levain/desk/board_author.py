@@ -443,14 +443,15 @@ def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
     git's ``--show-toplevel``. EVERY git call runs from the repo itself, never from inside the named path, so an ancestor
     symlink is not followed and a submodule is not entered: ``dirlink/f.txt`` (``dirlink`` a tracked link) and a file under
     a submodule were added by no superproject commit (git tracks the link, the gitlink). The literal path is the answer."""
-    path = os.path.normpath(str(be.done_path(key, repo)))
-    given = os.path.normpath(str(repo))
+    path = os.path.abspath(str(be.done_path(key, repo)))       # abspath: lexical, never resolve/realpath; a relative repo
+    given = os.path.abspath(str(repo))                         # (``Path(".")``) is made absolute from the cwd, both alike
     top = be._git(repo, "rev-parse", "--show-toplevel").strip()
     prefix = be._git(repo, "rev-parse", "--show-prefix").strip()
-    # the toplevel as git names it, and the repo as given (a subdirectory of the toplevel when ``prefix`` is not empty)
-    rel = _lexical_rel(path, os.path.normpath(top), "")
+    # the repo as given is tried FIRST (a subdirectory of the toplevel when ``prefix`` is not empty; a tracked link to ``.``
+    # given as the repo reads as the whole work tree, not as the commit that added the link), then the toplevel as git names it
+    rel = _lexical_rel(path, given, prefix)
     if rel is None:
-        rel = _lexical_rel(path, given, prefix)
+        rel = _lexical_rel(path, os.path.normpath(top), "")
     if rel is None:
         return None, OUTSIDE
     if not rel:
