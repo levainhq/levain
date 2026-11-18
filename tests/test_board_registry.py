@@ -65,6 +65,12 @@ def decision_seal(tmp_path, monkeypatch):
     the writer earns ``signed-terminal`` for real. It also seals a CLI call made without --sign, so a test using it can
     assert NO unsigned-write refusal: the policy itself, unsigned and signed, is tested in test_board_registry_sign.py and
     by every test here that does not request this fixture."""
+    seal_decisions(tmp_path, monkeypatch)
+
+
+def seal_decisions(tmp_path, monkeypatch):
+    """The body of ``decision_seal``, callable with any ``MonkeyPatch`` (a module-scoped store seed, tests/_board_v2_seed.py,
+    has no function-scoped fixture to ask for)."""
     from tests.test_board_sign import Rig
     rig = Rig(tmp_path)
 
