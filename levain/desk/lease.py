@@ -39,6 +39,10 @@ update. (C3c, 1021+18): :func:`set_agent` took codex while a codex launch was bu
 removal it refuses it, and a codex row an older install still holds wakes nothing (:func:`wake_state`). (C3b fix 1): a thread
 or drop write the fence lets through is recorded as a ``beat`` row by desk that moves nothing
 (:func:`record_write`), so "it wrote as desk" is one question over ``lease_events``. Stdlib only.
+
+Known edge (T7 fix 7): an install upgraded from before T7 may hold a live lease row whose holder is ``service`` (the retired
+apply pass's claim). Nothing beats it now, so :func:`claim` refuses and :func:`wake_state` reports it held until its ``until``,
+at most the old ``SERVICE_TTL`` of 120 seconds after the claim (less than one ``LEASE_TTL``), then it lapses as any claim does.
 """
 from __future__ import annotations
 
@@ -479,8 +483,12 @@ def claim_board_items(conn: sqlite3.Connection, now: str, launch_id: str, items:
     board item id (:func:`check_board_items`); whether the board holds it is the board's to say, never
     this write's: a launch is claimed for an id and the board's reader judges the claim."""
     got = check_board_items(items)
+    cell = json.dumps(got)
+    if len(cell) > BOARD_ITEMS_CELL_MAX:         # the read refuses a longer cell as damaged: never write one it would call so
+        raise _refused(f"a launch's board items are distinct board item ids (NAME#N, at most {BOARD_ITEM_MAX} characters), "
+                       f"and the claim is at most {BOARD_ITEMS_CELL_MAX} characters serialised")
     conn.execute("INSERT INTO launch_board_items (launch_id, gseq, items, at) VALUES (?, ?, ?, ?)",
-                 (launch_id, next_gseq(conn, now), json.dumps(got), now))
+                 (launch_id, next_gseq(conn, now), cell, now))
 
 
 def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:

@@ -2120,7 +2120,8 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore | None
 
     if getattr(args, "all", False):
         print("levain desk ready show: --all is ignored; the board is always shown whole", file=sys.stderr)
-    qdir = getattr(args, "queue_dir", None)       # the desk store whose seats and band the board's native producer reads
+    qdir = _store(args).directory if getattr(args, "queue_dir", None) is not None else None   # _store expands a quoted ~/desk
+    # the desk store whose seats and band the board's native producer reads
     code, doc, err = board_cli.read_board(consent_dir=qdir)
     retired = "the v1 ready queue is retired; this is `levain board state`, the board"
     if doc is None:

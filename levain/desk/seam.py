@@ -543,7 +543,8 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
         raise CoordError(err or f"levain board state exited {code} with no board")
     items = doc["items"]
     audit = doc["audit"]
-    if not items and not audit:
+    problems = board_cli.problem_lines(doc)         # a repo that could not be read says so: never "0 items" over a failed read
+    if not items and not audit and not problems:
         return ["Board: 0 items"]
     lines = [f"Board: {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
              f"(levain board state, as of {doc.get('as_of') or 'unknown'})"]
@@ -555,6 +556,10 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
         lines.append(_cap(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}"))
     if len(audit) > _LIST_LINES:
         lines.append(f"  ... {len(audit) - _LIST_LINES} more audit not listed")
+    for line in problems[:_LIST_LINES]:
+        lines.append(_cap(line))
+    if len(problems) > _LIST_LINES:
+        lines.append(f"  ... {len(problems) - _LIST_LINES} more problems not listed")
     return lines
 
 
