@@ -265,6 +265,7 @@ class _Authority:
     link_signers = ("k",)
     grant_born = {"g1": 1}
     grant_seqs = {"g1": 1}
+    grant_born_stopped = frozenset()        # row 190: no create the replay took while the opt-in was stopped
     keys = {"k": _Key()}
 
     def grant_link(self, gid):
