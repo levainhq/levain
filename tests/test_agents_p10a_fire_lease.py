@@ -12,9 +12,8 @@ at ``stop_at`` the reaper stops it. Item (4), the executor's stop at link expiry
 the fire through its identity record; the fire stops on SIGTERM and takes the stub's group down.
 
 Observed on the real fire, each hand-run first (see levain's project_memory/1118-27_lanes/firelease_return.md):
-a stop that lands inside ``compose`` settles a READABLE ZERO (``usage.json`` ``readable: true, actual_usd_micros: 0,
-composes: []``; the reservation row ``settled/actual`` debiting 0). That contradicts the module's rule that a count that
-could not be read is None, never 0. It is pinned below as a strict xfail; no product code is changed here.
+a stop that landed inside ``compose`` once settled a READABLE ZERO. The executor now books an attempted compose as an
+unreadable row, and the last test pins it.
 """
 from __future__ import annotations
 
@@ -62,10 +61,13 @@ def _wait(pred, what: str, timeout: float = 90.0):
 class Fire:
     """One live dream fire on a stub-claude install, held by a sleeping stub. ``close`` always ends whatever is left."""
 
-    def __init__(self, tmp_path, *, expires_in_min: float | None = None, sleep_s: float = SLEEP_S, reply=None) -> None:
+    def __init__(self, tmp_path, *, expires_in_min: float | None = None, sleep_s: float = SLEEP_S, reply=None,
+                 hold: bool = False) -> None:
         self.inst = inst = Install(tmp_path, stub=True)
         assert inst.enable("--time", "00:00").rc == 0
-        inst.stub.sleep(sleep_s, 1)
+        inst.stub.sleep(0 if hold else sleep_s, 1)
+        if hold:                                      # held until the test releases it, not for a wall-clock guess
+            inst.stub.hold(1)
         if reply is not None:
             inst.stub.reply(reply, 1)
         if expires_in_min is None:
@@ -115,7 +117,7 @@ class Fire:
     def group_alive(self) -> bool:
         try:
             os.killpg(self.child, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):     # macOS: EPERM while the group holds only unreaped zombies
             return False
         return True
 
@@ -181,10 +183,11 @@ def test_a_fire_that_finishes_after_the_lapse_lands_done(live):
     done/completed. (A lapsed lease not fencing a claimed fire is the designed behaviour: the tick_driver docstring.)"""
     from tests.test_dream_executor import _VALID
 
-    f = live(sleep_s=8, reply=success_doc(_VALID, 0.02))
+    f = live(hold=True, reply=success_doc(_VALID, 0.02))
     held = f.row
     lapse = f.inst.cli("agents", "tick", now=_at(16))
     assert lapse.rc == 0 and f.now_row() == held, lapse.text
+    f.inst.stub.release(1)                           # the stub finishes only now, after the lapse tick has run
     row = _wait(lambda: (r := f.now_row())["state"] != "launched" and r, "the fire to end its own row", timeout=60)
     _say("fire end", {k: row.get(k) for k in ("state", "reason", "epoch")}, f.reservation(), f.usage())
     assert (row["state"], row["reason"], row["epoch"]) == ("done", "completed", 0)
@@ -259,14 +262,19 @@ def _alive(pid: int) -> bool:
 
 def test_a_stop_mid_compose_does_not_settle_a_readable_zero(live):
     """The invariant: a run stopped while its ``claude -p`` child was live spent an UNKNOWN amount, so its usage is not a
-    readable zero: it is unreadable and the whole reservation is debited, with no breach."""
+    readable zero: it is unreadable (the compose row says it did not finish) and the whole reservation is debited, with
+    no breach: the agent stays active and the row ends stopped/link_not_live."""
     f = live(expires_in_min=10)
     assert f.inst.cli("agents", "tick", now=_at(15)).rc == 0
-    assert f.now_row()["state"] == "stopped"
+    row = f.now_row()
+    assert (row["state"], row["reason"]) == ("stopped", "link_not_live")
     usage, res = f.usage(), f.reservation()
     _say("usage", usage, res)
-    assert not (usage["readable"] is True and usage["actual_usd_micros"] == 0)
-    assert res["debited_usd_micros"] == res["reserved_usd_micros"]
     assert usage["readable"] is False and usage["actual_usd_micros"] is None
+    (compose,) = usage["composes"]                   # the attempted compose has a row, its fields None
+    assert compose["usd_micros"] is None and compose["turns"] is None
+    assert compose["error"].startswith("stopped mid-compose")
     assert (res["state"], res["settled_reason"], res["debited_usd_micros"]) == ("settled", "unreadable", 20_000_000)
-    assert not res.get("breach") and res["settled_reason"] != "breach"
+    assert res["debited_usd_micros"] == res["reserved_usd_micros"]
+    (agent,) = f.inst.rows("SELECT * FROM agents")
+    assert agent["operation"] == "active"            # an unreadable settle is not a breach: no pause

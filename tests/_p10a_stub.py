@@ -7,7 +7,8 @@ environment and could not read one from a variable.
 
 Per call n (1-based) the script records ``argv-n`` (one argument per line), ``stdin-n`` and ``cwd-n`` beside itself,
 then replies from ``result-n.json`` (else ``result.json``, else a minimal success document), sleeps for ``sleep-n`` /
-``sleep`` seconds first if that file exists, and exits with ``exit-n`` / ``exit`` if that file exists.
+``sleep`` seconds first if that file exists, then waits for as long as ``hold-n`` exists (a gate the test removes with
+``release(n)``, so a test waits on what it observes, never a wall-clock guess), and exits with ``exit-n`` / ``exit`` if that file exists.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ printf '%s\\n' "$@" > "$D/argv-$n"
 pwd > "$D/cwd-$n"
 cat > "$D/stdin-$n"
 for k in "sleep-$n" sleep; do [ -f "$D/$k" ] && {{ sleep "$(cat "$D/$k")"; break; }}; done
+while [ -f "$D/hold-$n" ]; do sleep 0.1; done
 if [ -f "$D/result-$n.json" ]; then cat "$D/result-$n.json"
 elif [ -f "$D/result.json" ]; then cat "$D/result.json"
 else cat "$D/default.json"; fi
@@ -58,6 +60,13 @@ class StubClaude:
 
     def sleep(self, seconds: float, n: int | None = None) -> None:
         (self.dir / ("sleep" if n is None else f"sleep-{n}")).write_text(str(seconds), encoding="utf-8")
+
+    def hold(self, n: int = 1) -> None:
+        """Call ``n`` will not reply until ``release(n)``."""
+        (self.dir / f"hold-{n}").write_text("", encoding="utf-8")
+
+    def release(self, n: int = 1) -> None:
+        (self.dir / f"hold-{n}").unlink(missing_ok=True)
 
     def exit_code(self, rc: int, n: int | None = None) -> None:
         (self.dir / ("exit" if n is None else f"exit-{n}")).write_text(str(rc), encoding="utf-8")

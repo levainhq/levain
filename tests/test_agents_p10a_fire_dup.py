@@ -67,14 +67,14 @@ def _cards(inst: Install, *extra: str) -> list[dict]:
 
 
 
-def _saving(inst: Install, sleep: float = 0.0) -> None:
+def _saving(inst: Install, hold: bool = False) -> None:
     """The stub's reply is a valid dream package, so the fire saves and the dream files its card."""
     inst.stub.reply({"type": "result", "subtype": "success", "is_error": False, "result": _VALID,
                      "usage": {"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 0},
                      "modelUsage": {"claude-opus-5-5": {"costUSD": 0.01}}, "total_cost_usd": 0.01})
-    if sleep:
-        inst.stub.sleep(sleep)
+    if hold:
+        inst.stub.hold(1)             # the first call replies only once the test releases it
 
 
 def _settled(inst: Install, n: int = 1) -> list[dict]:
@@ -83,13 +83,13 @@ def _settled(inst: Install, n: int = 1) -> list[dict]:
 
 
 def test_a_second_fire_for_a_claimed_row_does_nothing_and_there_is_one_card(tmp_path):
-    """Reproduced on the real fire (levain#121 5a): while the first fire's stub sleeps, the product's own fire argv
+    """Reproduced on the real fire (levain#121 5a): while the first fire's stub is held, the product's own fire argv
     (the one a tick respawn uses) run as a second process exits 0 with no output, leaves the identity record and the
     row's pid as they were, and the stub is called once; the row settles done/completed with ONE agent card."""
     from levain.agents import controller as ctl
 
     inst = Install(tmp_path, stub=True)
-    _saving(inst, sleep=6)
+    _saving(inst, hold=True)
     _started(inst)
     _wait(lambda: inst.stub.calls() >= 1, "the first fire's stub call")
     (row,) = inst.rows()
@@ -105,6 +105,7 @@ def test_a_second_fire_for_a_claimed_row_does_nothing_and_there_is_one_card(tmp_
     assert (mid["state"], mid["pid"], mid["epoch"]) == ("launched", row["pid"], row["epoch"])
     assert inst.stub.calls() == 1
 
+    inst.stub.release(1)
     (done,) = _settled(inst)
     assert (done["state"], done["reason"], done["pid"]) == ("done", "completed", row["pid"])
     _wait(lambda: len(_cards(inst)) >= 1, "the card")

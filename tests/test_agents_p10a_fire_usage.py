@@ -252,3 +252,84 @@ def test_unreadable_usage_cause_iii_with_the_compose_child_still_alive_nothing_i
     assert pic["res"] == ("settled", RESERVED, RESERVED, "unreadable")
     assert pic["agent"][0] == "active" and pic["slots"] == [] and pic["usage"] is None
     assert pic["cards"]["items"] == []
+
+
+# ------------------------------------------------------------------- the executor's compose row, no fire, no stub
+# The rule: an ATTEMPTED compose always has a row in usage.json, unfinished = None fields; the list is empty only when
+# no compose was attempted (``all([])`` is True, so an empty list reads as a readable zero).
+from tests.test_dream_executor import scratch  # noqa: E402,F401  (the fixture: a tiny anneal store)
+
+
+class _Mind:
+    name, source, unit, model = "x", "x", "usd_list", "x"
+
+    def __init__(self, compose) -> None:
+        self.compose = compose
+
+
+def _run_usage(store, tmp_path, mind):
+    from levain.dream import executor as ex
+
+    occ = tmp_path / "occ"
+    try:
+        res = ex.consolidate_store(store, mind=mind, occurrence_dir=occ, max_seconds=3000)
+    except BaseException:                                   # a stop propagates; usage.json is written all the same
+        res = None
+    return res, json.loads((occ / "usage.json").read_text())
+
+
+def test_a_compose_that_raised_is_an_unreadable_row_not_a_readable_zero(scratch, tmp_path):
+    """Reproduced first: a mind whose ``compose`` raised an ordinary Exception left ``composes: []``, so usage.json
+    read ``readable: true, actual_usd_micros: 0`` (the raise can come after the model was called)."""
+    def boom(req):
+        raise RuntimeError("endpoint down")
+
+    res, usage = _run_usage(scratch, tmp_path, _Mind(boom))
+    assert res.outcome == "compose-failed"
+    assert usage["readable"] is False and usage["actual_usd_micros"] is None and usage["turns"] is None
+    (row,) = usage["composes"]
+    assert row["n"] == 1 and row["usd_micros"] is None and row["error"] == "compose raised (RuntimeError)"
+
+
+def test_a_compose_unavailable_is_no_attempt_and_no_row(scratch, tmp_path):
+    from levain.dream import executor as ex
+
+    def gone(req):
+        raise ex.ComposeUnavailable("no extra")             # always raised before anything is spent
+
+    res, usage = _run_usage(scratch, tmp_path, _Mind(gone))
+    assert res.outcome == "compose-unavailable"
+    assert usage["composes"] == [] and usage["actual_usd_micros"] == 0
+
+
+def test_a_stop_after_compose_returns_but_before_its_row_is_filled_stays_unreadable(scratch, tmp_path, monkeypatch):
+    """The window the row is reserved for: the compose returned a priced result, a stop lands before it is booked."""
+    from levain.dream import executor as ex
+
+    def returns(req):
+        return ex.ComposeResult(text=_VALID, usd_micros=1_000, input_tokens=1, output_tokens=1, turns=1,
+                                model="x", unit="usd_list")
+
+    def stop(*a, **k):
+        raise ex.FireStopRequested()
+
+    monkeypatch.setattr(ex, "_compose_row", stop)
+    res, usage = _run_usage(scratch, tmp_path, _Mind(returns))
+    assert res is None                                      # the stop propagated
+    assert usage["readable"] is False and usage["actual_usd_micros"] is None
+    (row,) = usage["composes"]
+    assert row["usd_micros"] is None and row["error"] == "compose did not finish"
+
+
+def test_a_usage_json_from_an_earlier_run_is_gone_once_this_run_owns_the_dir(scratch, tmp_path):
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    (occ / "usage.json").write_text(json.dumps({"readable": True, "actual_usd_micros": 5}), encoding="utf-8")
+    seen: list[bool] = []
+
+    def peek(req):
+        seen.append((occ / "usage.json").exists())
+        raise RuntimeError("stop here")
+
+    _run_usage(scratch, tmp_path, _Mind(peek))
+    assert seen == [False]

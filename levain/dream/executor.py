@@ -1162,6 +1162,10 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 print(f"{L}: progress.json could not be written in {occ_dir} ({progress.write_error}); nothing was "
                       "started.")
                 return _fail("precondition", 2, f"progress.json unwritable: {progress.write_error}")
+            # This run owns the dir now (lock held, no live record): a usage.json left by an earlier run is not this
+            # run's. Gone, a run that dies before its own write reads as absent (the whole reservation settles).
+            with contextlib.suppress(OSError):
+                (occ_dir / "usage.json").unlink()
             ctx.owns_occ = True
 
         headings = [s["heading"] for s in store.section_schema]
@@ -1321,15 +1325,26 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                                  occ_dir=occ_dir, attempt=attempt, refusals=list(refusals),
                                  prior_draft_path=prior_draft, cap_usd_micros=cap, timeout_s=timeout_s,
                                  progress=progress)
+            # One rule: an ATTEMPTED compose always has a row, and unfinished means None fields. The row is reserved
+            # BEFORE the call and filled in on a clean return, so no stop (or raise) between the attempt and the
+            # fill leaves an empty list that _write_usage would read as a readable zero.
+            row = {"n": attempt, "usd_micros": None, "input_tokens": None, "output_tokens": None,
+                   "cache_read": None, "cache_creation": None, "turns": None, "seconds": None, "model": None,
+                   "models_charged": None, "error": "compose did not finish", "warnings": []}
+            ctx.composes.append(row)
             try:
                 res = mind.compose(req)
             except ComposeUnavailable as exc:
+                ctx.composes.remove(row)      # always raised before anything was spent: no compose was attempted
                 cancelled = cancel_ours()
                 print(f"{L}: {exc}")
                 if not cancelled:
                     print(_cancel_failed())
                 return _fail("compose-unavailable", 2, str(exc))
             except Exception as exc:  # noqa: BLE001 — a model/endpoint failure is a run failure, not a crash
+                # It can raise after the model was called, so what it spent is unknown: the reserved row stays
+                # unreadable (the whole reservation settles), never a readable zero.
+                row["error"] = f"compose raised ({type(exc).__name__})"
                 cancelled = cancel_ours()
                 print(f"{L}: the compose model failed ({type(exc).__name__}: {exc}).\n"
                       "  Nothing was saved; the memory is unchanged and its episodes are safe. "
@@ -1338,14 +1353,12 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                     print(_cancel_failed())
                 return _fail("compose-failed", 1, f"{type(exc).__name__}: {exc}")
             except BaseException as exc:
-                # A stop (FireStopRequested, a SIGTERM) landed while the model call was live: what it spent is
-                # unknown, so the usage is an UNREADABLE compose (settles the whole reservation), never a zero.
-                ctx.composes.append({"n": attempt, "usd_micros": None, "input_tokens": None,
-                                     "output_tokens": None, "cache_read": None, "cache_creation": None,
-                                     "turns": None, "seconds": None, "model": None, "models_charged": None,
-                                     "error": f"stopped mid-compose ({type(exc).__name__})", "warnings": []})
+                # A stop (FireStopRequested, SIGTERM, KeyboardInterrupt, ...) ended the call: it MAY have spent, so
+                # the reserved row stays unreadable (settles the whole reservation). A stop held inside compose
+                # before any child existed lands here too: that over-debits a run that spent nothing (safe side).
+                row["error"] = f"stopped mid-compose ({type(exc).__name__})"
                 raise
-            ctx.composes.append(_compose_row(attempt, res))
+            ctx.composes[-1] = _compose_row(attempt, res)
             if cap is not None:
                 ctx.spent += charged_after(cap, budget.m_usd_micros if budget else None, res.usd_micros)
             if res.fatal_outcome is not None:
