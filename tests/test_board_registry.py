@@ -563,6 +563,7 @@ def test_track_refuses_a_manifest_item_that_was_never_added(decision_seal, store
 
 def test_track_writes_the_blob_that_passed_and_the_retire_entries_and_does_not_wait_for_stubs(decision_seal, store, tmp_path, mkrepo, capsys):
     a = mkrepo("alpha")
+    ok(capsys, "register", "flow", "--path", str(mkrepo("flow")), "--words", "w", *A)        # a retire entry's repo must be registered at begin (rev 8, rule 6)
     retire = [{"repo": "alpha", "path": "next.md"}, {"repo": "flow", "path": "projects/alpha/next.md"}]
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha", retire=retire)
     (a / "next.md").write_text("pre-track content\n")                    # not stubbed yet: track does not wait

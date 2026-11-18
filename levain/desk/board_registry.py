@@ -486,6 +486,12 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
         if migration is not None and migration in _used_migrations(fold):
             raise BoardError(f"migration id {migration!r} was already used by a begin-track in this registry: each ceremony has its own M "
                              f"(leave --migration off to derive a new one)")
+        for e in manifest.get("retire", []):                    # design rev 8, rule 6: refuse now what `board repos` would fail on later
+            if e["repo"] not in fold.repos:
+                raise BoardError(f"--manifest retire: {e['repo']} is not registered (levain board register {e['repo']} --path ...), "
+                                 f"so its stub cannot be checked")
+        if manifest.get("adopt_items"):
+            _check_adopt(manifest, name, *_items_facts(target.store_dir))
         m = migration or _derive_migration(name, sha, words, cur.begins)
         body = {"words": words, "migration": m, "manifest": manifest, "manifest_sha256": sha, "owner": owner,
                 "charter_before": before}
@@ -494,6 +500,35 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
 
     _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
+
+
+def _check_adopt(manifest: Mapping[str, Any], name: str, adds: Mapping[str, dict], decision: Mapping[str, str | None]) -> None:
+    """Design rev 8, rule 1: each ``adopt_items`` entry must be an item that exists, is X's own, and is not cut (a repeat is
+    refused by the manifest's own shape check). The caller holds the registry lock and has read the items."""
+    for iid in manifest.get("adopt_items", []):
+        rec = adds.get(iid)
+        if rec is None:
+            raise BoardError(f"--manifest adopt_items: {iid} is not an item in the store")
+        if rec.get("repo") != name:
+            raise BoardError(f"--manifest adopt_items: {iid} is {rec.get('repo')}'s item, not {name}'s: a ceremony adopts only its own repo's items")
+        if decision.get(iid) == "cut":
+            raise BoardError(f"--manifest adopt_items: {iid} is cut: a cut item is not adopted")
+
+
+def _expected_plan(cur: rf.Repo, adds: Mapping[str, dict], decision: Mapping[str, str | None]) -> tuple[set[str], list[str]]:
+    """``(expected, missing)``: the ids the charter's Plan must hold, and the manifest keys never added. Design rev 8, rule 2:
+    the keyed ``plan_items`` (as ``M:<k>``) and the ``adopt_items``, less any that read cut."""
+    manifest = cur.manifest or {}
+    by_key = {r["key"]: i for i, r in adds.items() if isinstance(r.get("key"), str) and r.get("repo") == cur.name}
+    expected, missing = set(), []
+    for k in manifest.get("plan_items", []):
+        iid = by_key.get(f"{cur.migration}:{k}")
+        if iid is None:
+            missing.append(k)
+        elif decision.get(iid) != "cut":
+            expected.add(iid)
+    expected.update(i for i in manifest.get("adopt_items", []) if decision.get(i) != "cut")
+    return expected, missing
 
 
 def _landed(fold: Any, op: str, name: str, migration: str | None) -> Mapping[str, Any] | None:
@@ -601,14 +636,7 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
         if now_cur.mode != "tracking" or now_cur.migration != cur.migration:
             raise BoardError(f"{name} changed under the check ({now_cur.mode}); run it again")
         adds, decision = _items_facts(target.store_dir)
-        by_key = {r["key"]: i for i, r in adds.items() if isinstance(r.get("key"), str) and r.get("repo") == name}
-        expected, missing = set(), []
-        for k in manifest.get("plan_items", []):
-            iid = by_key.get(f"{cur.migration}:{k}")
-            if iid is None:
-                missing.append(k)
-            elif decision.get(iid) != "cut":
-                expected.add(iid)
+        expected, missing = _expected_plan(now_cur, adds, decision)
         if missing:
             raise BoardError(f"the manifest's plan items {', '.join(missing)} were never added (levain board add --key {cur.migration}:<k> ...)")
         if expected != plan:
@@ -1253,9 +1281,9 @@ def _next_step(target: bs.Target, cur: rf.Repo) -> str:
         return f"land CHARTER.md on origin/main ({why})"
     if problems:
         return f"fix CHARTER.md on origin/main ({len(problems)} problems: levain charter check --repo {cur.path})"
-    expected = {keys[f"{m}:{k}"] for k in (cur.manifest or {}).get("plan_items", []) if decision.get(keys[f"{m}:{k}"]) != "cut"}
+    expected, _ = _expected_plan(cur, adds, decision)
     if expected != set(_plan_ids(text)):
-        return "make the charter's Plan match the manifest's plan items"
+        return "make the charter's Plan match the manifest's plan items and adopted items"
     return f"levain board track {cur.name}"
 
 
@@ -1611,7 +1639,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     p = sub.add_parser("begin-track", description="Start the tracking ceremony for a registered, untracked repo.")
     common(p)
-    p.add_argument("--manifest", required=True, metavar="FILE", help="JSON: plan_items (item keys), contract_items (repos), optional retire and record_dir.")
+    p.add_argument("--manifest", required=True, metavar="FILE", help="JSON: plan_items (item keys), contract_items (repos), optional adopt_items (existing item ids), retire and record_dir.")
     p.add_argument("--owner", default=None, metavar="DESK", help="The desk that owns the ceremony.")
     p.add_argument("--migration", default=None, metavar="M", help="The migration id (default: derived, so a retry derives the same one).")
     with_source(p)

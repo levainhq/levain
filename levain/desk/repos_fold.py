@@ -135,9 +135,13 @@ def _retire(value: Any) -> tuple[Mapping[str, str], ...]:
     return tuple(out)
 
 
+_ITEM_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*#[1-9][0-9]*")
+
+
 def _manifest(value: Any) -> dict:
     """``plan_items`` are the KEYS ``k`` of X's own items (each is added as ``M:<k>``; the ids exist only after the add, so the
-    manifest cannot name them); ``contract_items`` are the repos that get a stubs item; ``retire`` and ``record_dir`` are optional."""
+    manifest cannot name them); ``contract_items`` are the repos that get a stubs item; ``adopt_items`` (optional) are the ids of X's EXISTING items the ceremony takes in
+    unchanged (design rev 8); ``retire`` and ``record_dir`` are optional."""
     if not isinstance(value, dict):
         raise _Bad("manifest must be an object")
     plan, contract = value.get("plan_items"), value.get("contract_items")
@@ -145,6 +149,11 @@ def _manifest(value: Any) -> dict:
         raise _Bad("manifest plan_items must be a list of distinct item keys (no whitespace)")
     if not isinstance(contract, list) or not all(isinstance(i, str) and _REPO_RE.fullmatch(i) for i in contract):
         raise _Bad("manifest contract_items must be a list of repo names")
+    if "adopt_items" in value:
+        adopt = value["adopt_items"]
+        if not isinstance(adopt, list) or len(set(map(str, adopt))) != len(adopt) \
+                or not all(isinstance(i, str) and _ITEM_ID_RE.fullmatch(i) for i in adopt):
+            raise _Bad("manifest adopt_items must be a list of distinct existing item ids (X#N)")
     if "retire" in value:
         _retire(value["retire"])
     if "record_dir" in value and not (isinstance(value["record_dir"], str) and value["record_dir"]):

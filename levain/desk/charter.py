@@ -422,6 +422,29 @@ def _plan_ids(items: Mapping[str, tuple], name: str) -> list[str]:
                   key=lambda iid: int(iid.rpartition("#")[2]))
 
 
+def _tracking_plan(name: str, items_arg: Path | None, items: Mapping[str, tuple]) -> list[str] | None:
+    """Design rev 8, rule 5: NAME's Plan as its ceremony will check it, or None when NAME is not ``tracking`` (or the registry
+    cannot be read: today's rule then stands). The ``adopt_items`` plus NAME's items keyed ``M:<k>`` that exist, less any cut:
+    the set ``board track`` compares the charter's Plan to, in id order."""
+    from levain.desk import board_registry as br, board_store as bs
+    try:
+        target = bs.resolve_store(items_arg)
+        if not target.pointered:
+            if not bs.is_store(target):
+                return None
+            target = dataclasses.replace(target, pointered=True)
+        cur = br.read_registry(target, allow_inactive=True).fold.repos.get(name)
+    except (bs.BoardError, OSError, ValueError, RuntimeError):
+        return None
+    if cur is None or cur.mode != "tracking":
+        return None
+    keyed = {f"{cur.migration}:{k}" for k in (cur.manifest or {}).get("plan_items", [])}
+    ids = set((cur.manifest or {}).get("adopt_items", []))
+    ids.update(i for i, (repo, _dec, key) in items.items() if repo == name and key in keyed)
+    live = [i for i in ids if i in items and items[i][1] != "cut"]
+    return sorted(live, key=lambda iid: int(iid.rpartition("#")[2]))
+
+
 def _toplevel(path: Path) -> Path | None:
     from levain.desk.board_evidence import _env
     try:
@@ -530,7 +553,8 @@ def run_init(args: Any) -> int:
         items, why = _store(args.items)
         if items is None:
             return refuse(f"the items file {args.items} {why}; nothing was written.")
-        plan_ids = _plan_ids(items, name)
+        tracking = _tracking_plan(name, args.items, items)
+        plan_ids = tracking if tracking is not None else _plan_ids(items, name)
         if not plan_ids:
             print(f"levain charter init: no live items of {name} in the store", file=sys.stderr)
     text = skeleton_text(name, args.export, plan_ids)
@@ -611,7 +635,8 @@ def register(subparsers: Any) -> None:
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
     q.add_argument("--items", type=Path, metavar="PATH",
-                   help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out-of-1.0.")
+                   help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out-of-1.0; "
+                        "for a repo in `tracking`, from its ceremony's adopted items and the items added under its key.")
     q.add_argument("--stdout", action="store_true", help="Print the skeleton instead of writing it.")
     q.set_defaults(func=run_init)
     door_ok_author(q)
