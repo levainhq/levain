@@ -370,8 +370,6 @@ class _Reader:
         :class:`Signature` facts (EVIDENCE: valid for a fingerprint or not, and the key's standing here). Memoised per commit."""
         if sha in self._signed:
             return self._signed[sha]
-        from levain.cockpit.keys import principal_of
-
         notes: list[str] = []
         principal = None
         facts = Signature("unjudged")
@@ -384,6 +382,18 @@ class _Reader:
             text = f"the commit's signature could not be checked ({type(exc).__name__})"
             notes.append(text)
             facts = Signature("unjudged", text)
+        if sig is not None and sig.kind == "signed":
+            try:                                    # a malformed or empty fingerprint is a signature that cannot be judged
+                from levain.cockpit.keys import principal_of
+                fp = sig.fingerprint or ""
+                if not fp:
+                    raise ValueError("empty fingerprint")
+                fp_principal = principal_of(fp)
+            except Exception as exc:  # noqa: BLE001
+                text = f"the commit's signature could not be checked (its fingerprint cannot be read: {type(exc).__name__})"
+                notes.append(text)
+                self._signed[sha] = (None, notes, Signature("unjudged", text))
+                return self._signed[sha]
         if sig is not None and sig.kind == "indeterminate":
             text = f"the commit's signature could not be checked ({_clip(sig.reason, 120)})"
             notes.append(text)
@@ -398,7 +408,7 @@ class _Reader:
             fp = sig.fingerprint or ""
 
             def standing(kind: str, why: str = "", seq: int | None = None, in_log: bool = False) -> Signature:
-                return Signature("valid", "", fp, principal_of(fp), kind, why, seq, in_log)
+                return Signature("valid", "", fp, fp_principal, kind, why, seq, in_log)
 
             if self.res.authority is None:
                 text = "the commit is signed but no authority log is consulted, so the signature is not checked"
@@ -653,9 +663,17 @@ def _git_closes(doc: dict[str, Any], items: Mapping[str, Any]) -> Iterable[tuple
         yield s, item
 
 
+UNREAD_HOW = "the author could not be read ("
+
+
 def _unread(exc: BaseException) -> Closer:
     text = str(exc) if isinstance(exc, be.GitFailed) else f"{type(exc).__name__}: {exc}"
-    return Closer("unattributed", None, f"the author could not be read ({_clip(text, 160)})")
+    return Closer("unattributed", None, f"{UNREAD_HOW}{_clip(text, 160)})")
+
+
+#: The key set of the record this install's own unread verdict emits (``_unread(...).to_dict()``): the one shape
+#: :func:`levain.desk.board_trail._vacuous` accepts, built from the constructor so the two cannot drift.
+UNREAD_KEYS = frozenset(_unread(Exception("x")).to_dict())
 
 
 def _unread_evidence(c: Closer, s: Mapping[str, Any], item: Any) -> Evidence:

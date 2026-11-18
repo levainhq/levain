@@ -52,6 +52,11 @@ a file, and a failed write removes the file it created.
 
 Known edges, stated rather than hidden:
 
+* A trailer close's ``who`` while its launch record is undetermined (the launch id needs the record) is judged on what is read:
+  the shape (``agent ...``) is refuted where wrong, the name itself stays undetermined with the trailer predicate.
+* ``board_author._Reader.evidence()``'s exception path keeps the verdict it derived (the facts read failing after the close read
+  succeeded): the tier predicate is then undetermined without comparing ``who`` to the verdict's.
+
 * A signature is checked against the authority log as it is NOW. Whether it was valid AT THE RECORD'S TIME arrives with part B.
   A key revoked since is reported ("revoked since (seq N)", and the anchor line says so; the tail line and the relayed counts
   never call what it signed anchored), never silently valid and never a break by itself; a key that was never enrolled, quarantined or of the wrong class is a break.
@@ -477,7 +482,7 @@ def derive_closes(trail: Trail, evidence: dict[str, Any] | None = None) -> tuple
 
 _RANK = {"unattributed": 0, "git": 1, "trailer": 2, "signed": 3}
 _BASE_HOW = {"signed": "signed by an operator key", "trailer": "asserted (trailer)", "git": "asserted by git author"}
-_UNREAD_HOW = "the author could not be read ("
+_GIT_KINDS = ("merged", "document", "run")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 HOLDS, REFUTED, UNDETERMINED = "holds", "refuted", "undetermined"
 
@@ -486,15 +491,15 @@ def _rank(tier: Any) -> int:
     return _RANK.get(tier, -1) if isinstance(tier, str) else -1
 
 
-def _store_facts(trail: Trail) -> tuple[set[str] | None, dict[str, str]]:
-    """``(the item ids the trail's own items.jsonl holds (None: its fold could not be read), each registered repo's path)``,
-    by each file's own fold."""
+def _store_facts(trail: Trail) -> tuple[dict[str, str] | None, dict[str, str]]:
+    """``(each item id the trail's own items.jsonl holds, with its done_kind (None: its fold could not be read), each registered
+    repo's path)``, by each file's own fold."""
     from levain.desk.board_state import fold
     from levain.desk.repos_fold import fold_repos
-    ids: set[str] | None
+    ids: dict[str, str] | None
     try:
         texts = [x.decode("utf-8", "replace") for x in trail.lines["items.jsonl"]]
-        ids = set(fold(texts).items)
+        ids = {k: str(getattr(v, "done_kind", "")) for k, v in fold(texts).items.items()}
     except Exception:                                   # noqa: BLE001 - the fold's own verdicts are printed above
         ids = None
     try:
@@ -543,9 +548,43 @@ def _commit_words(commit: Any, close_commit: Any) -> str:
 
 def _vacuous(rec: Mapping[str, Any]) -> bool:
     """A recorded close that claims no author at all: the exporter could not read it (``the author could not be read (...)``,
-    no commit). It claims nothing a predicate could refute; the verdict prints what this install derives."""
-    return (rec.get("tier") == "unattributed" and rec.get("who") is None and rec.get("commit") is None
-            and rec.get("close_commit") is None and isinstance(rec.get("how"), str) and rec["how"].startswith(_UNREAD_HOW))
+    no commit). It claims nothing a predicate could refute; the verdict prints what this install derives. True ONLY for the
+    exact shape this install's own unread verdict emits (``board_author.UNREAD_KEYS``, built from its constructor): no email,
+    no committer, no close_commit, no note key; anything else is judged as the record it is."""
+    from levain.desk import board_author as ba
+    return (set(rec) == ba.UNREAD_KEYS and rec.get("tier") == "unattributed" and rec.get("who") is None
+            and rec.get("commit") is None and isinstance(rec.get("how"), str) and rec["how"].startswith(ba.UNREAD_HOW))
+
+
+def _shape(rec: Mapping[str, Any], tier: str, prefix: str | None) -> list[_Pred]:
+    """The RECORD-SHAPE predicates: the tier's own field rules, read from the record alone (no evidence, no capability), so a
+    violation is REFUTED on every path. ``prefix``: the ``how`` prefix of the item's close (None: not known here, then a
+    ``first added <path>, `` prefix is allowed)."""
+    out: list[_Pred] = []
+    who, how = rec.get("who"), rec.get("how")
+    if tier == "unattributed":
+        if who is not None:
+            out.append(_Pred("who", REFUTED, "an unattributed close names no one"))
+        if rec.get("email") is not None:
+            out.append(_Pred("email", REFUTED, "an unattributed close carries no email"))
+        if rec.get("committer") is not None:
+            out.append(_Pred("committer", REFUTED, "an unattributed close carries no committer"))
+        return out
+    if not isinstance(who, str):
+        out.append(_Pred("who", REFUTED, f"a {tier} close names who made it"))
+    elif tier == "trailer" and not who.startswith("agent "):
+        out.append(_Pred("who", REFUTED, "a trailer close names an agent"))
+    if tier != "git" and rec.get("email") is not None:
+        out.append(_Pred("email", REFUTED, f"a {tier} close carries no email"))
+    base = _BASE_HOW[tier]
+    if prefix is not None:
+        ok, want = how == prefix + base, prefix + base
+    else:
+        ok = isinstance(how, str) and (how == base or (how.startswith("first added ") and how.endswith(", " + base)))
+        want = base
+    if not ok:
+        out.append(_Pred("how", REFUTED, f"the {tier} tier reads {want!r} here"))
+    return out
 
 
 def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
@@ -563,6 +602,8 @@ def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
         put("tier", REFUTED, f"{tier!r} is not a tier")
         return out
     rc, rcc = rec.get("commit"), rec.get("close_commit")
+    for p in _shape(rec, tier, None if ev is None else ev.how_prefix):      # the record's own shape: before every early return
+        out.append(p)
     # commit: the repo's own derivation of the item's close
     if ev is None:
         held, missing = _held(path, rec)
@@ -596,10 +637,6 @@ def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
             put("commit", UNDETERMINED, f"the repo at {path} does not hold commit {_short(missing)}")
     else:                                               # a different close commit the repo holds: refuted, held or not (ruling 6)
         put("commit", REFUTED, f"the repo derives the close from {_commit_words(c.commit, c.close_commit)}")
-    # how: recomputed here from the item and the recorded tier, whatever else could be read
-    if tier != "unattributed":
-        want = ev.how_prefix + _BASE_HOW[tier]
-        put("how", HOLDS if rec.get("how") == want else REFUTED, "" if rec.get("how") == want else f"the {tier} tier reads {want!r} here")
     commit = next(p for p in out if p.name == "commit")
     if commit.result == REFUTED or (commit.result == UNDETERMINED and not blind):
         return out                                      # a refuted close is a break; of a commit the repo does not hold, nothing more is read
@@ -607,8 +644,8 @@ def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
         put({"signed": "signature", "trailer": "trailer", "git": "git author", "unattributed": "unattributed"}[tier],
             UNDETERMINED, ev.unread)
         return out
-    # committer: on every tier
-    if rec.get("committer") != (ev.committer if tier != "unattributed" else None):
+    # committer: on every tier but unattributed (its shape is judged above)
+    if tier != "unattributed" and rec.get("committer") != ev.committer:
         put("committer", REFUTED, f"the commit's committer here is {ev.committer or 'its author'}")
     if tier == "unattributed":
         if c.tier != "unattributed":
@@ -626,8 +663,6 @@ def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
         else:
             put("git author", HOLDS)
         return out
-    if rec.get("email") is not None:
-        put("email", REFUTED, f"a {tier} close carries no email")
     if tier == "trailer":
         t = ev.trailer
         if t is None or not t.texts:
@@ -744,6 +779,16 @@ def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> tuple[list[st
         if ids is not None and item_id not in ids:
             breaks += 1
             lines.append(f"BREAK close {item_id}: the bundle records a close for {item_id}, which its own records do not hold")
+            continue
+        state = None
+        if item_id not in closes:                       # the bundle's own records show no git close of it (needs no capability)
+            if ids is not None and ids[item_id] not in _GIT_KINDS:
+                state = "closed by the band" if item_id in bands else "open"
+            elif repo in read and any(i.rpartition("#")[0] == repo for i in closes):    # a repo that shows this registry's other closes
+                state = "closed by the band" if item_id in bands else "open"
+        if state is not None:
+            breaks += 1
+            lines.append(f"BREAK close {item_id}: the bundle records a git close for {item_id}, which its own records show {state}")
             continue
         if item_id not in closes and repo not in read:
             lines.append(f"close {item_id}: {_rec_words(rec)} (recorded in the bundle, not re-derived (repo not available))")

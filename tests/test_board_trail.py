@@ -733,7 +733,7 @@ def test_a_bundled_close_of_an_item_the_repo_does_not_show_closed_is_a_break(cw,
     doc["closes"][cw.open] = doc["closes"][cw.merged]
     bundle.write_text(json.dumps(doc), "utf-8")
     rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {cw.open}: " in out and "does not show the item closed" in out
+    assert rc == 3 and f"BREAK close {cw.open}: " in out and "which its own records show open" in out
 
 
 def test_a_close_the_repo_shows_that_the_bundle_does_not_record_is_said_and_not_a_break(cw, capsys):
@@ -1379,6 +1379,9 @@ def _apply(cap: str, tw: TierWorld, monkeypatch, tmp_path: Path) -> None:
         _other_repo(tw, tmp_path)
 
 
+_VACUOUS = {"tier": "unattributed", "who": None, "how": "the author could not be read (git went away)", "commit": None}
+
+
 def _rows(tw: TierWorld, base: dict) -> list[tuple[str, str, Any, set[str]]]:
     """``(name, item, mutate(record), the capabilities under which rc 0 is RIGHT)``: one field changed per row. rc 0 is right only
     where that field's predicate depends on the capability the verifier lacks; everywhere else the row is a BREAK."""
@@ -1389,9 +1392,9 @@ def _rows(tw: TierWorld, base: dict) -> list[tuple[str, str, Any, set[str]]]:
         ("none", S, lambda r: None, set(CAPS)),
         ("signed: tier -> git, who kept", S, lambda r: r.update(tier="git", how="asserted by git author"), blind),
         ("signed: who -> kEVIL", S, lambda r: r.update(who="kEVIL"), blind),
-        ("signed: email added", S, lambda r: r.update(email="x@x"), blind),
+        ("signed: email added", S, lambda r: r.update(email="x@x"), set()),            # the tier's own shape: every capability
         ("signed: committer added", S, lambda r: r.update(committer="Evil <e@e>"), blind),
-        ("signed: how altered", S, lambda r: r.update(how="signed by the operator"), {"other-repo"}),
+        ("signed: how altered", S, lambda r: r.update(how="signed by the operator"), set()),
         ("signed: commit -> another HELD close", S, lambda r: r.update(commit=held_other), {"other-repo"}),
         ("signed: commit -> unheld sha", S, lambda r: r.update(commit="ab" * 20), {"other-repo"}),
         ("signed: close_commit added", S, lambda r: r.update(close_commit=held_other), {"other-repo"}),
@@ -1407,6 +1410,10 @@ def _rows(tw: TierWorld, base: dict) -> list[tuple[str, str, Any, set[str]]]:
         ("document: how -> another path", D, lambda r: r.update(how="first added docs/other.md, asserted by git author"),
          {"other-repo"}),
         ("document: who -> Mallory", D, lambda r: r.update(who="Mallory"), blind),
+        ("vacuous: committer added", G, lambda r: (r.clear(), r.update(_VACUOUS, committer="Evil <e@e>")), set()),
+        ("vacuous: email added", G, lambda r: (r.clear(), r.update(_VACUOUS, email="evil@x")), set()),
+        ("open item: a git close added, unheld sha", tw.cw.open,
+         lambda r: r.update(tier="git", who="Op Person", how="asserted by git author", commit="ab" * 20, email="x@x"), {"other-repo"}),
     ]
 
 
@@ -1434,7 +1441,7 @@ def test_matrix_single_field_mutations_by_verifier_capability(cap, tw, capsys, m
         variants = [None, *(_DEGRADED if name in _DEGRADED_ROWS else ())]
         for deg in variants:
             doc = copy.deepcopy(base)
-            mutate(doc["closes"][item_id])
+            mutate(doc["closes"].setdefault(item_id, {}))
             if deg is not None:
                 doc["closes"][item_id]["degraded"] = deg
             work.write_text(json.dumps(doc), "utf-8")
@@ -1538,7 +1545,7 @@ def test_a_repo_that_holds_the_recorded_commit_and_does_not_show_the_close_is_a_
     bundle = exported(tw.cw, capsys)
     edit_bundle(bundle, lambda d: d["closes"].__setitem__(tw.cw.open, d["closes"][tw.signed]))
     rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {tw.cw.open}: " in out and "does not show the item closed" in out
+    assert rc == 3 and f"BREAK close {tw.cw.open}: " in out and "which its own records show open" in out
 
 
 def test_the_bundle_s_note_is_labelled_as_the_bundle_s_and_never_compared(tw, capsys, monkeypatch):
@@ -1656,3 +1663,64 @@ def test_an_unread_author_at_verify_is_recorded_not_re_derived_here(cw, capsys, 
     assert rc == 0, out + err
     assert close_lines(out)[cw.merged] == (f"close {cw.merged}: asserted by git author Plain Person <x@x> (recorded in the bundle, "
                                            "not re-derived here: the author could not be read (git went away))")
+
+
+# ---------------------------------------------------------------- P6 fix 7 (levain#104): bound fixes from L3 round 2
+def test_fix7_a_close_for_an_item_the_records_show_open_or_band_closed_is_a_break_on_any_capability(cw, capsys):
+    """Ruling A: with a held sha, an unheld sha, and with the repo gone; and a band-kind item (no git close) with the repo gone."""
+    band = bs.add(cw.target, "alpha", "band one", "desk 1", "desk 1", done="np-q1", done_kind="band", author=OPD, now=NOW)[0]
+    bundle = exported(cw, capsys)
+    base = json.loads(bundle.read_text("utf-8"))["closes"][cw.merged]
+    for item_id, sha in ((cw.open, "ab" * 20), (cw.open, base["commit"]), (band, "ab" * 20)):
+        edit_bundle(bundle, lambda d: d["closes"].__setitem__(item_id, {**base, "commit": sha}))
+        rc, out, err = run(capsys, "verify", str(bundle))
+        assert rc == 3, (item_id, sha, out)
+        assert f"BREAK close {item_id}: the bundle records a git close for {item_id}, which its own records show " in out
+    os.rename(cw.repo, str(cw.repo) + ".away")            # no repo at all: the band item still breaks (its kind is in the fold)
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and f"BREAK close {band}: the bundle records a git close for {band}, which its own records show " in out
+
+
+def test_fix7_vacuous_is_only_the_exact_unread_shape(cw, capsys):
+    from levain.desk import board_author as ba
+    assert bt._vacuous(ba._unread(Exception("boom")).to_dict())
+    for extra in ({"committer": "Evil <e@e>"}, {"email": "evil@x"}, {"close_commit": None}, {"note": "n"}):
+        assert not bt._vacuous({**ba._unread(Exception("boom")).to_dict(), **extra}), extra
+    bundle = exported(cw, capsys)
+    for extra in ({"committer": "Evil <e@e>"}, {"email": "evil@x"}):
+        edit_bundle(bundle, lambda d: d["closes"].__setitem__(cw.merged, {**_VACUOUS, **extra}))
+        rc, out, err = run(capsys, "verify", str(bundle))
+        assert rc == 3 and close_lines(out)[cw.merged].startswith(f"BREAK close {cw.merged}: "), out
+
+
+def test_fix7_record_shape_is_refuted_before_any_blind_path(tw, capsys, monkeypatch, tmp_path):
+    bundle = exported(tw.cw, capsys)
+    _author_unread(monkeypatch)
+    for item_id, change in ((tw.signed, {"email": "x@x"}),                              # email on a signed close
+                            (tw.signed, {"how": "signed by the operator"}),             # how off the tier's template
+                            (tw.cw.doc, {"how": "asserted by git author"}),             # a document close without its prefix
+                            (tw.trailer, {"who": "Mallory"}),                           # a trailer close naming no agent
+                            (tw.cw.merged, {"tier": "unattributed", "who": "Mallory", "how": "x"})):   # unattributed naming someone
+        work = tmp_path / "shape.json"
+        doc = json.loads(bundle.read_text("utf-8"))
+        doc["closes"][item_id].update(change)
+        work.write_text(json.dumps(doc), "utf-8")
+        rc, out, err = run(capsys, "verify", str(work))
+        assert rc == 3 and close_lines(out)[item_id].startswith(f"BREAK close {item_id}: "), (item_id, change, out)
+
+
+def test_fix7_a_malformed_or_empty_fingerprint_is_a_signature_that_cannot_be_judged(tw, capsys, monkeypatch):
+    import types
+
+    from levain.desk import board_author as ba
+    from levain.team import signing
+    bundle = exported(tw.cw, capsys)
+    sha = json.loads(bundle.read_text("utf-8"))["closes"][tw.signed]["commit"]
+    for fp in ("", 12345):
+        monkeypatch.setattr(signing, "verify_commit", lambda repo, s, fp=fp: types.SimpleNamespace(kind="signed", fingerprint=fp, reason=""))
+        rd = ba._Reader(tw.cw.repo, ba.Resolvers())
+        principal, notes, facts = rd._signature(sha, rd.facts(sha))
+        assert principal is None and facts.state == "unjudged" and "could not be checked" in notes[0]
+        rc, out, err = run(capsys, "verify", str(bundle))
+        assert rc == 0, out + err
+        assert "its fingerprint cannot be read" in close_lines(out)[tw.signed]
