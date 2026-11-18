@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pytest
 
@@ -16,7 +17,7 @@ def seeded(capsys, bare_store, repo_names, per=3):
     """Items that exist BEFORE any ceremony (the registry is not yet active, so I1 is off): ``{repo: [ids]}``."""
     out = {}
     for name in repo_names:
-        out[name] = [ok(capsys, "add", "--repo", name, "--title", f"old {name} {n}", "--origin", "desk 1", "--payload-hash", HASH_A, *A)
+        out[name] = [ok(capsys, "add", "--repo", name, "--title", f"old {name} {n}", "--origin", "desk 1", *A)
                      for n in range(per)]
     (bare_store / "repos.jsonl").touch()
     return out
@@ -92,7 +93,7 @@ def test_abort_after_adopting_cuts_the_keyed_items_and_leaves_the_adopted_exactl
     new = ok(capsys, "add", "--repo", "alpha", "--title", "new", "--origin", "d", "--key", f"{m}:n", "--payload-hash", HASH_A, *A)
     out = ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
     assert out == f"aborting alpha; cut 1 items: {new}"
-    ok(capsys, "abandon-done", "alpha", "--words", "done", *A)
+    ok(capsys, "abandon-done", "alpha", *A)
     lines = (bare_store / "items.jsonl").read_bytes().split(b"\n")
     assert b"\n".join(lines[:len(before.split(b"\n")) - 1]) + b"\n" == before         # the adopted items' lines: untouched
     cut = [r["id"] for r in item_lines(bare_store) if r.get("op") == "decide"]
@@ -153,3 +154,132 @@ def test_a_gitignored_retire_path_is_read_in_the_working_tree_i3(decision_seal, 
     (a / "project_memory" / "STATUS.md").write_text("<!-- levain: tracked stub -->\nretired\n")
     rc, out, _ = run(capsys, "repos")
     assert rc == 0 and "stale" not in out
+
+
+# ---------------------------------------------------------------------------------------------------------- adoptfix1 (L1 + L2)
+
+
+def test_k1_an_adopted_item_keyed_to_this_ceremony_is_refused_so_abort_never_cuts_an_adopted_item(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    plain = [ok(capsys, "add", "--repo", "alpha", "--title", f"old {n}", "--origin", "d", *A) for n in range(2)]
+    keyed = ok(capsys, "add", "--repo", "alpha", "--title", "pre-keyed", "--origin", "d", "--key", "foo:k", "--payload-hash", HASH_A, *A)
+    (bare_store / "repos.jsonl").touch()                       # the registry becomes active after the items exist (I1 was off)
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, plan_items=["k"], adopt_items=[plain[0], keyed])),
+                     "--words", "y", "--migration", "foo", *A)
+    assert rc == 2 and keyed in err and "keyed foo:k to this ceremony" in err and plain[0] not in err
+    assert [r for r in reg_lines(bare_store) if r["op"] == "begin-track"] == []
+    # the real path: the same item is the ceremony's keyed item (not adopted); abort cuts it and only it
+    ok(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, "m2.json", plan_items=["k"], adopt_items=plain)),
+       "--words", "y", "--migration", "foo", *A)
+    assert ok(capsys, "abandon-track", "alpha", "--words", "no", *A) == f"aborting alpha; cut 1 items: {keyed}"
+    assert [r["id"] for r in item_lines(bare_store) if r.get("op") == "decide"] == [keyed]
+
+
+@pytest.mark.parametrize("decision", ["parked", "out-of-1.0", "cut"])
+def test_k2_begin_track_refuses_an_adopted_item_that_is_parked_or_out_of_1_0(decision_seal, bare_store, tmp_path, mkrepo, capsys, decision):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    ok(capsys, "decide", "--id", ids[1], "--decision", decision, "--words", "w", *A)
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, adopt_items=[ids[0], ids[1]])), "--words", "y", *A)
+    assert rc == 2 and ids[1] in err and decision in err and ids[0] not in err
+    assert [r for r in reg_lines(bare_store) if r["op"] == "begin-track"] == []
+
+
+def test_k5_every_bad_adopt_entry_is_named_in_one_refusal(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    ids = seeded(capsys, bare_store, ["alpha", "beta"])
+    ok(capsys, "decide", "--id", ids["alpha"][2], "--decision", "cut", "--words", "gone", *A)
+    ok(capsys, "decide", "--id", ids["alpha"][1], "--decision", "parked", "--words", "later", *A)
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    bad = ["alpha#99", ids["beta"][0], ids["alpha"][2], ids["alpha"][1]]
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, adopt_items=[ids["alpha"][0], *bad])), "--words", "y", *A)
+    assert rc == 2 and "4 bad entries" in err and all(i in err for i in bad) and err.count("--manifest adopt_items") == 1
+    assert ids["alpha"][0] not in err
+
+
+def test_k4_the_track_record_carries_the_adopted_ids(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids)
+    ok(capsys, "decide", "--id", ids[2], "--decision", "cut", "--words", "dropped", *A)
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan="\n".join(f"- {i}" for i in ids[:2])))
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    track = [r for r in reg_lines(bare_store) if r["op"] == "track"]
+    assert len(track) == 1 and track[0]["adopted"] == ids[:2]                   # what the switch moved in; the cut one is not
+    assert ok(capsys, "repos").count("alpha") >= 1                              # the registry still folds with the new key
+
+
+def test_k4_a_track_record_with_a_malformed_adopted_is_torn(bare_store):
+    from levain.desk import repos_fold as rf
+    sid = "s"
+    base = {"v": 1, "store": sid, "at": "2026-11-18T10:00:00Z", "by": "d", "repo": "x", "words": ""}
+    lines = [json.dumps({**base, "op": "register", "path": "/p", "origin": "", "root": ["a"]}),
+             json.dumps({**base, "op": "track", "migration": "m", "charter_blob": "b", "retire": [], "adopted": "x#1"})]
+    assert rf.fold_repos(lines, store_id=sid).torn
+
+
+def test_k6_the_reporter_names_the_live_items_neither_adopted_nor_keyed(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"], per=26)["alpha"]
+    ok(capsys, "decide", "--id", ids[25], "--decision", "parked", "--words", "later", *A)        # parked: not live, not named
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids[:1])
+    rc, out, _ = run(capsys, "repos")
+    assert rc == 0 and "24 live items of alpha neither adopted nor keyed" in out and "and 4 more" in out
+    assert ids[1] in out and ids[20] in out and ids[21] not in out and not re.search(r"alpha#1\b", out.split("neither adopted")[1]) and ids[25] not in out
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {ids[0]}"))
+    rc, out, _ = run(capsys, "repos")
+    assert "levain board track alpha" in out and "24 live items" in out                       # information, never a refusal
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+
+
+def test_k6_no_unadopted_live_item_no_note(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids)
+    assert "neither adopted nor keyed" not in run(capsys, "repos")[1]
+
+
+def test_k3_charter_init_refuses_when_the_registry_cannot_be_read_and_keeps_today_s_prefill_when_untracked(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    items = str(bare_store / "items.jsonl")
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    assert main(["charter", "init", "alpha", "--stdout", "--repo", str(a), "--items", items]) == 0      # untracked: today's prefill
+    plan_out = capsys.readouterr().out
+    assert all(f"- {i}\n" in plan_out for i in ids)
+    with open(bare_store / "repos.jsonl", "a") as fh:
+        fh.write("garbage\n")
+    for argv in (["--stdout", "--repo", str(a)], ["--stdout"]):       # --stdout skips the wrong-repo guard: the prefill's own refusal
+        rc = main(["charter", "init", "alpha", *argv, "--items", items])
+        cap = capsys.readouterr()
+        assert rc == 2 and "cannot tell whether alpha is tracking" in cap.err and "registry is unreadable" in cap.err and cap.out == "", argv
+    rc = main(["charter", "init", "alpha", "--repo", str(a), "--items", items])                # the writing path: the guard refuses first
+    assert rc == 2 and "registry is unreadable" in capsys.readouterr().err
+    assert not (a / "CHARTER.md").exists()
+
+
+def test_k_an_adopted_item_parked_between_begin_and_track_stays_in_the_plan(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids[:2])
+    ok(capsys, "decide", "--id", ids[1], "--decision", "parked", "--words", "later", *A)
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {ids[0]}"))
+    rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
+    assert rc == 2 and f"the manifest's items not in the charter's Plan: {ids[1]}" in err       # parked is not cut: still adopted
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {ids[0]}\n- {ids[1]}"))
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+
+
+def test_k_an_adopted_item_cut_then_reopened_between_begin_and_track_returns_to_the_plan(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    begin(capsys, tmp_path, a, "alpha", adopt_items=ids[:2])
+    ok(capsys, "decide", "--id", ids[1], "--decision", "cut", "--words", "gone", *A)
+    ok(capsys, "decide", "--id", ids[1], "--decision", "reopen", "--words", "back", *A)
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {ids[0]}"))
+    rc, _, err = run(capsys, "track", "alpha", "--words", "go", *A)
+    assert rc == 2 and f"the manifest's items not in the charter's Plan: {ids[1]}" in err
+    land(a, "CHARTER.md", CHARTER.format(name="alpha", plan=f"- {ids[0]}\n- {ids[1]}"))
+    ok(capsys, "track", "alpha", "--words", "go", *A)

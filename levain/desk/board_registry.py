@@ -490,9 +490,9 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
             if e["repo"] not in fold.repos:
                 raise BoardError(f"--manifest retire: {e['repo']} is not registered (levain board register {e['repo']} --path ...), "
                                  f"so its stub cannot be checked")
-        if manifest.get("adopt_items"):
-            _check_adopt(manifest, name, *_items_facts(target.store_dir))
         m = migration or _derive_migration(name, sha, words, cur.begins)
+        if manifest.get("adopt_items"):
+            _check_adopt(manifest, name, m, *_items_facts(target.store_dir))
         body = {"words": words, "migration": m, "manifest": manifest, "manifest_sha256": sha, "owner": owner,
                 "charter_before": before}
         return _record("begin-track", name, by, sid, body, author, now,
@@ -502,17 +502,28 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
     return _fold_one(target, name), written
 
 
-def _check_adopt(manifest: Mapping[str, Any], name: str, adds: Mapping[str, dict], decision: Mapping[str, str | None]) -> None:
-    """Design rev 8, rule 1: each ``adopt_items`` entry must be an item that exists, is X's own, and is not cut (a repeat is
-    refused by the manifest's own shape check). The caller holds the registry lock and has read the items."""
+def _check_adopt(manifest: Mapping[str, Any], name: str, migration: str, adds: Mapping[str, dict],
+                 decision: Mapping[str, str | None]) -> None:
+    """Design rev 8 and its corrections, rule 1: each ``adopt_items`` entry must be an item that exists, is X's own, is not cut,
+    is not parked or out-of-1.0 (``charter.OUT_OF_PLAN``) and is not keyed to this ceremony (``migration:<k>``: abort cuts
+    keyed items, so an adopted one must never carry such a key). A repeat is refused by the manifest's own shape check. EVERY
+    bad entry is reported in the one refusal. The caller holds the registry lock and has read the items."""
+    from levain.desk import charter
+    bad = []
     for iid in manifest.get("adopt_items", []):
         rec = adds.get(iid)
         if rec is None:
-            raise BoardError(f"--manifest adopt_items: {iid} is not an item in the store")
-        if rec.get("repo") != name:
-            raise BoardError(f"--manifest adopt_items: {iid} is {rec.get('repo')}'s item, not {name}'s: a ceremony adopts only its own repo's items")
-        if decision.get(iid) == "cut":
-            raise BoardError(f"--manifest adopt_items: {iid} is cut: a cut item is not adopted")
+            bad.append(f"{iid} is not an item in the store")
+        elif rec.get("repo") != name:
+            bad.append(f"{iid} is {rec.get('repo')}'s item, not {name}'s: a ceremony adopts only its own repo's items")
+        elif decision.get(iid) == "cut":
+            bad.append(f"{iid} is cut: a cut item is not adopted")
+        elif decision.get(iid) in charter.OUT_OF_PLAN:
+            bad.append(f"{iid} is {decision.get(iid)}: a parked or out-of-1.0 item is not adopted (reopen it first)")
+        elif isinstance(rec.get("key"), str) and rec["key"].startswith(migration + ":"):
+            bad.append(f"{iid} is keyed {rec['key']} to this ceremony: abort cuts keyed items, so it cannot also be adopted")
+    if bad:
+        raise BoardError(f"--manifest adopt_items: {len(bad)} bad entr{'y' if len(bad) == 1 else 'ies'}: " + "; ".join(bad))
 
 
 def _expected_plan(cur: rf.Repo, adds: Mapping[str, dict], decision: Mapping[str, str | None]) -> tuple[set[str], list[str]]:
@@ -648,7 +659,9 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
             if gone:
                 parts.append(f"the charter's Plan ids not in the manifest: {', '.join(gone)}")
             raise BoardError("the charter's Plan and the manifest's plan items are not the same set (" + "; ".join(parts) + ")")
-        body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
+        adopted = [i for i in manifest.get("adopt_items", []) if decision.get(i) != "cut"]     # what the switch moved in by id
+        body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", [])),
+                "adopted": adopted}
         source = bs._read_relay(relay, words, now_cur.manifest_sha256, require_manifest=True)
         return _record("track", name, by, sid, body, author, now, source), True
 
@@ -1259,7 +1272,26 @@ def _hours_since(at: str, now: datetime) -> float | None:
 
 
 def _next_step(target: bs.Target, cur: rf.Repo) -> str:
-    """The first step of the ceremony whose effect is missing (design 5(a), abort)."""
+    """The first step of the ceremony whose effect is missing (design 5(a), abort). During ``tracking`` it also names the live
+    items of X the ceremony neither adopts nor keys (information, never a refusal)."""
+    step = _next_step_core(target, cur)
+    if cur.mode != "tracking":
+        return step
+    from levain.desk import charter
+    m = cur.migration or ""
+    with bs.store_lock(target.store_dir, exclusive=False):
+        adds, decision = _items_facts(target.store_dir)
+    adopted = set((cur.manifest or {}).get("adopt_items", []))
+    left = sorted((i for i, r in adds.items() if r.get("repo") == cur.name and i not in adopted
+                   and not (isinstance(r.get("key"), str) and r["key"].startswith(m + ":"))
+                   and decision.get(i) not in charter.OUT_OF_PLAN), key=lambda i: int(i.rpartition("#")[2]))
+    if not left:
+        return step
+    shown = ", ".join(left[:20]) + (f" and {len(left) - 20} more" if len(left) > 20 else "")
+    return f"{step} [{len(left)} live items of {cur.name} neither adopted nor keyed, so outside the Plan: {shown}]"
+
+
+def _next_step_core(target: bs.Target, cur: rf.Repo) -> str:
     from levain.desk import charter
     m = cur.migration or ""
     if cur.mode == "aborting":
