@@ -109,7 +109,8 @@ EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
      # figures), or a limit with the BYOK caveat alone at exactly the expected limit and remainder. A reset, an exhausted
      # key, any other caveat or other figures match neither, so the row is left unconsumed and fails.
      r"(?:" + USD + r" total, " + USD + r" remaining.*)?"
-     r"(?:<limit>, <remaining> remaining; BYOK usage is not counted against this limit(?: \(as keys read it .*\))?)?",
+     r"(?:<limit>, <remaining> remaining; BYOK usage is not counted against this limit"
+     r"(?: \(as keys read it [a-z0-9 ]+ ago\))?)?",
      r"invoice ceiling \(<cred>"),
     ("T3", "one real call settles from real usage", None, r"AGREE .*", r"^(AGREE|DISAGREE|NOCALL|NOMOVE) "),
     ("T4", "an overrun stops the session", None, r"overrun-row .*", r"^(overrun-row|no-overrun-row) "),

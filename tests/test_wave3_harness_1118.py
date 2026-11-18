@@ -2,7 +2,7 @@
 
 (a) the W2/T2 doctor-row checks take the healthy "total" row and the fresh BYOK-only row at the exact figures, and fail any other
 warning row; (b) every guest invocation as the dispatch account sets HOME to the dispatch dir; (c) a nonzero guest exit's
-GuestError text carries each stream's tail, with stdout redacted of the stdin text and of capabilities. The closures inside
+GuestError text carries each stream's tail, a stdin-fed call quoting stderr only and the structured capability value removed. The closures inside
 ``run_wave3`` are reached by running it against the existing fake world, not by copying their bodies."""
 from __future__ import annotations
 
@@ -27,12 +27,13 @@ class WordingWorld(World):
 
 
 BYOK = "BYOK usage is not counted against this limit"
+BYOKFAIL = f"{BYOK} (as keys read it 3 min ago; its latest read failed: timed out)"
 CAPPED = "cap $2.00 per day, not a total: spend can pass it across periods"
 
 
 @pytest.mark.parametrize("tail,remaining", [
     ("key limit $2.00 total, $1.60 remaining (as keys read it now)", "1.60"),     # the doctor's healthy row
-    (f"key limit $2.00, $2.00 remaining; {BYOK} (as keys read it now)", "2.00"),  # a fresh key, only BYOK uncounted
+    (f"key limit $2.00, $2.00 remaining; {BYOK} (as keys read it 3 min ago)", "2.00"),  # a fresh key, only BYOK uncounted
 ])
 def test_w2_takes_the_healthy_row_and_the_fresh_byok_only_row(tmp_path, tail, remaining):
     _w, _ev, (status, steps, path) = go(tmp_path, WordingWorld(tail))
@@ -48,6 +49,8 @@ def test_w2_takes_the_healthy_row_and_the_fresh_byok_only_row(tmp_path, tail, re
     f"key limit $2.00, $2.00 remaining; {CAPPED}",                         # a resetting cap
     f"key limit $2.00, $2.00 remaining; {CAPPED}; {BYOK}",                 # a resetting cap and BYOK
     f"key limit $2.00, $0.00 remaining; the key is exhausted: OpenRouter will refuse its calls; {BYOK}",   # exhausted
+    f"key limit $2.00, $2.00 remaining; {BYOKFAIL}",                       # right figures, a further failed-read caveat
+    f"key limit $2.00, $2.00 remaining; {BYOK}; its latest read failed: timed out",
 ])
 def test_w2_fails_a_warning_row_that_does_not_match_both_figures(tmp_path, tail):
     _w, _ev, (status, steps, _p) = go(tmp_path, WordingWorld(tail))
@@ -97,14 +100,12 @@ def _fake_run(monkeypatch, *, stdout, stderr, rc=2):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, rc, stdout=stdout, stderr=stderr))
 
 
-def test_a_nonzero_guest_exit_carries_the_stdout_tail_as_well_as_stderr(tmp_path, monkeypatch):
+def test_a_no_stdin_guest_exit_carries_the_stdout_refusal_and_stderr(tmp_path, monkeypatch):
     _fake_run(monkeypatch, stdout="refused: cannot read ~/.levain/consent/coordinator_workspaces.json\n", stderr="warn: x\n")
     run = RB.make_stdin_runner("vm", DARWIN, tmp_path, "tart_exec")
     with pytest.raises(GuestError) as e:
-        run(["levain", "dispatch", "show"], "stdin-secret", 5)
-    text = str(e.value)
-    assert "coordinator_workspaces.json" in text and "warn: x" in text
-    assert "stdin-secret" not in text
+        run(["levain", "dispatch", "show"], "", 5)
+    assert "coordinator_workspaces.json" in str(e.value) and "warn: x" in str(e.value)
 
 
 def test_each_stream_has_its_own_tail_so_a_long_stderr_cannot_push_the_refusal_out(tmp_path, monkeypatch):
@@ -125,21 +126,39 @@ def test_a_long_stdout_is_cut_to_its_own_tail(tmp_path, monkeypatch):
 
 
 SECRET = "sk-or-v1-0123456789abcdef0123456789abcdef"
-CAP = "Zk3_9aQ-xLmN0pRsTuVwXyZ12345abcdEfGhIjKlMnO"
+PARTIAL = "0123456789abcdef0123456789abcdef"
+CAP = "ZkaQxLmNpRsTuVwXyZabcdEfGhIjKlMnOpQrStUvWxY"        # 43 chars, url-safe, no digit
+SHA = "75442615e90551d4f1a5afb62a2e0e86761e1251bfe3"
+assert len(CAP) == 43 and not any(c.isdigit() for c in CAP)
 
 
-@pytest.mark.parametrize("transport", ["tart_exec", "ssh"])
-def test_a_guest_that_echoes_the_stdin_secret_or_prints_a_capability_leaks_neither_into_the_error(tmp_path, monkeypatch, transport):
+def _raise(monkeypatch, tmp_path, transport, stdin, stdout, stderr):
     from scripts.vm_harness import vm_run
     monkeypatch.setattr(vm_run, "_clone_guard", lambda vm: None)
     monkeypatch.setattr(vm_run, "tart_exec_argv", lambda vm, argv, stdin=False: ["tart", "exec", vm, *argv])
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
-        a, 255, stdout=f'rejected key {SECRET}\n{{"id": "dj-1", "capability": "{CAP}"}}\n', stderr=f"echo {SECRET}\n"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 255, stdout=stdout, stderr=stderr))
     run = RB.make_stdin_runner("vm", DARWIN, tmp_path, transport)
     with pytest.raises(GuestError) as e:
-        run(["levain", "dispatch", "file"], SECRET, 5)
-    text = str(e.value)
-    assert SECRET not in text and CAP not in text and "rejected key" in text
+        run(["levain", "dispatch", "file"], stdin, 5)
+    return str(e.value)
+
+
+@pytest.mark.parametrize("transport", ["tart_exec", "ssh"])
+def test_a_stdin_fed_call_never_quotes_stdout_so_a_partial_echo_cannot_leak(tmp_path, monkeypatch, transport):
+    text = _raise(monkeypatch, tmp_path, transport, f"OPENROUTER_API_KEY={SECRET}\n",
+                  f'bad line "OPENROUTER_API_KEY={PARTIAL}" and {{"capability": "{CAP}"}}\n', "ssh: dropped\n")
+    assert PARTIAL not in text and SECRET not in text and CAP not in text
+    assert "ssh: dropped" in text and "withheld" in text
+
+
+@pytest.mark.parametrize("transport", ["tart_exec", "ssh"])
+def test_a_digitless_capability_in_json_is_removed_from_both_streams_of_a_no_stdin_call(tmp_path, monkeypatch, transport):
+    text = _raise(monkeypatch, tmp_path, transport, "",
+                  f'refused: no consent\n{{"id": "dj-1", "capability": "{CAP}"}}\n',
+                  f'oops {{"capability":"{CAP}"}} capability={CAP} and a sha {SHA}\n')
+    assert CAP not in text
+    assert "refused: no consent" in text            # the refusal line survives
+    assert SHA in text                              # a git SHA or other token is not guessed at
 
 
 def test_run_wave3_writes_neither_the_stdin_text_nor_a_capability_to_its_logs(tmp_path, monkeypatch):
@@ -155,8 +174,10 @@ def test_run_wave3_writes_neither_the_stdin_text_nor_a_capability_to_its_logs(tm
             if "dispatch" in argv and "file" in argv:
                 first = next(ln for ln in text.splitlines() if len(ln.strip()) >= 12)
                 self.echoed.append(first)
+                part = first.strip()[4:-2]
                 fake = lambda *a, **k: subprocess.CompletedProcess(
-                    a, 255, stdout=f'echo {first}\n{{"id": "dj-x", "capability": "{CAP}"}}\n', stderr="ssh: dropped\n")
+                    a, 255, stdout=f'echo "{part}" {first}\n{{"id": "dj-x", "capability": "{CAP}"}}\n',
+                    stderr=f'ssh: dropped {{"capability": "{CAP}"}}\n')
                 monkeypatch.setattr(subprocess, "run", fake)
                 try:
                     RB.make_stdin_runner("vm", DARWIN, tmp_path, "tart_exec")(argv, text, timeout)
@@ -169,7 +190,7 @@ def test_run_wave3_writes_neither_the_stdin_text_nor_a_capability_to_its_logs(tm
     log = (ev / "steps.log").read_text() + path.read_text()
     assert CAP not in log
     echoed = w.echoed[0]
-    assert echoed not in log
+    assert echoed not in log and echoed.strip()[4:-2] not in log
     assert "ssh: dropped" in log
 
 
@@ -186,7 +207,7 @@ def _t2():
 @pytest.mark.parametrize("tail", [
     "key limit $2.00 total, $1.60 remaining",
     f"key limit $2.00, $2.00 remaining; {BYOK}",
-    f"key limit $2.00, $2.00 remaining; {BYOK} (as keys read it 3s ago)",
+    f"key limit $2.00, $2.00 remaining; {BYOK} (as keys read it less than a minute ago)",
 ])
 def test_threec10_t2_takes_the_healthy_row_and_the_fresh_byok_only_row(tail):
     rx, _sel = _t2()
@@ -200,6 +221,8 @@ def test_threec10_t2_takes_the_healthy_row_and_the_fresh_byok_only_row(tail):
     f"key limit $2.00, $2.00 remaining; {CAPPED}",
     f"key limit $2.00, $2.00 remaining; {CAPPED}; {BYOK}",
     f"key limit $2.00, $0.00 remaining; the key is exhausted: OpenRouter will refuse its calls; {BYOK}",
+    f"key limit $2.00, $2.00 remaining; {BYOKFAIL}",
+    f"key limit $2.00, $2.00 remaining; {BYOK}; its latest read failed: timed out",
 ])
 def test_threec10_t2_refuses_a_warning_row_that_does_not_match_both_figures(tail):
     rx, _sel = _t2()

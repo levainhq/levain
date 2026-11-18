@@ -173,26 +173,26 @@ def overall(statuses: Sequence[str], omitted: Sequence[str] = ()) -> str:
 
 # ---- the stdin transport (a secret never goes in an argv) ----------------------------------------------------------
 
-#: A job capability's shape: a long url-safe token that has a digit (a plain identifier or path word does not). A job id
-#: (``dj-`` and hex) is not one. Stdout is redacted of any such run.
-_CAPABILITY_SHAPE = re.compile(r"(?<![A-Za-z0-9_-])(?!dj-)(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,128}")
+#: The one structured form a job capability is printed in: the value after the key name ``capability`` (a JSON field, or
+#: ``capability=<value>``), whatever its length or characters. Nothing else is guessed at, so a git SHA or any other token
+#: in the output is kept.
+_CAPABILITY_QUOTED = re.compile(r"""(capability["']?\s*[:=]\s*")[^"]*(")""")
+_CAPABILITY_BARE = re.compile(r"""(capability["']?\s*[:=]\s*['"]?)[A-Za-z0-9_+/.=-]{20,}""")
 _TAIL = 350
 
 
 def guest_error_text(argv, r, stdin_text: str = "") -> str:
-    """The text of a nonzero guest exit: each stream's own tail (so a long stderr cannot push a refusal line off stdout),
-    labelled. Stdout is the stream that may echo what was sent on stdin or print a capability, so the stdin text and anything
-    shaped like a capability are removed from it before it is quoted; stderr is quoted as it is."""
-    def no_stdin(s: str) -> str:
-        # the whole text, then each of its lines, since a guest may echo one line of what it read
-        for piece in sorted({stdin_text.strip(), *(ln.strip() for ln in stdin_text.splitlines())}, key=len, reverse=True):
-            if len(piece) >= 6:
-                s = s.replace(piece, "<stdin>")
-        return s
+    """The text of a nonzero guest exit. A call that carried stdin text (the secret transport) quotes stderr only: its stdout
+    is never formatted, only its length. A call with none quotes each stream's own tail (so a long stderr cannot push a
+    refusal line off stdout) with the structured capability value removed from both."""
+    def no_capability(s: str) -> str:
+        return _CAPABILITY_BARE.sub(r"\1<redacted>", _CAPABILITY_QUOTED.sub(r"\1<redacted>\2", s))
 
-    out = _CAPABILITY_SHAPE.sub("<redacted>", no_stdin((r.stdout or "").strip()))[-_TAIL:]
-    err = no_stdin((r.stderr or "").strip())
-    return f"guest {list(argv)[:4]}: stdout: {out} | stderr: {err[-_TAIL:]}"
+    out, err = (r.stdout or "").strip(), no_capability((r.stderr or "").strip())
+    head = f"guest {list(argv)[:4]}"
+    if stdin_text.strip():
+        return f"{head}: stdout withheld ({len(out)} chars) | stderr: {err[-_TAIL:]}"
+    return f"{head}: stdout: {no_capability(out)[-_TAIL:]} | stderr: {err[-_TAIL:]}"
 
 
 def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> StdinRunner:

@@ -469,8 +469,8 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
                 "--path", cfg.install)
         lines, _rc = capture(guest, argv, 180)           # doctor exits 1 on unrelated rows: the verdict ignores rc
         row = next((ln for ln in lines if re.search(r"invoice ceiling \(" + re.escape(cfg.cred), ln)), "")
-        m = re.search(r"key limit (" + USD + r")( total)?, (" + USD + r") remaining(; BYOK usage is not counted against this limit)?",
-                      row)
+        m = re.search(r"key limit (" + USD + r")( total)?, (" + USD + r") remaining(; BYOK usage is not counted against this limit"
+                      r"(?: \(as keys read it (?:less than a minute ago|[0-9]+ min ago|[0-9]+ h ago)\))?\s*$)?", row)
         if not m:
             raise StepFail("the invoice-ceiling row for the credential has no 'key limit $X total, $Y remaining'", row.strip())
         limit, remaining = (float(g.replace("$", "").replace(",", "")) for g in (m.group(1), m.group(3)))
