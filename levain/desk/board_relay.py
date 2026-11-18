@@ -193,9 +193,11 @@ def check_source_id(np_id: str) -> None:
         raise BoardError(f"--source {np_id}: {NP_UNREADABLE}")
 
 
-def relay_source(np_id: str, words: str, source: BandSource) -> dict:
+def relay_source(np_id: str, words: str, source: BandSource, manifest_sha256: str | None = None) -> dict:
     """The WRITE side: read the row now, and refuse unless it is answered and ``words`` is a verbatim, non-blank substring
-    of the answer. Returns the record's ``source`` object. Raises BoardError."""
+    of the answer. Returns the record's ``source`` object. With ``manifest_sha256`` (a ``begin-track`` or ``track``, P3-b) the
+    SAME row must also pass :func:`check_manifest`: its question carries that digest, so the relayed "yes" binds the exact
+    manifest. Raises BoardError."""
     check_source_id(np_id)
     if not isinstance(words, str) or not words.strip():
         raise BoardError("a relayed record must carry the words it relays: they must be a verbatim excerpt of the answer")
@@ -208,8 +210,13 @@ def relay_source(np_id: str, words: str, source: BandSource) -> dict:
     if words not in row.answer:
         raise BoardError(f"--source {np_id}: the words are not a verbatim excerpt of the answer: {words!r} (his sentence "
                          f"travels, never a paraphrase; quote exactly what the answer says)")
-    return {"np": np_id, "producer": row.producer, "question_sha256": digest(row.question),
-            "answer_sha256": digest(row.answer)}
+    cited = {"np": np_id, "producer": row.producer, "question_sha256": digest(row.question),
+             "answer_sha256": digest(row.answer)}
+    if manifest_sha256 is not None:
+        said = check_manifest({"source": cited}, row, manifest_sha256)
+        if not said.ok:
+            raise BoardError(f"--source {np_id}: {said.text}")
+    return cited
 
 
 def verify_relayed(rec: Mapping[str, Any], band_source: BandSource) -> Verdict:

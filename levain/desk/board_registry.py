@@ -268,9 +268,10 @@ def _words(value: Any, *, required: bool = True) -> str:
 
 
 def _record(op: str, repo: str | None, by: str, store_id: str, body: Mapping[str, Any], author: Mapping[str, Any],
-            now: str | None = None) -> dict:
-    """The record, built by the store's one builder and reshaped to 4.2's key order. ``repo`` rides in the builder's id slot."""
-    base = bs.build_record(op, repo or "-", by, dict(body), now, author=author)
+            now: str | None = None, source: Mapping[str, Any] | None = None) -> dict:
+    """The record, built by the store's one builder and reshaped to 4.2's key order. ``repo`` rides in the builder's id slot.
+    ``source`` (from ``board_store._read_relay``) makes it a relayed record: grade ``relayed``, ``source`` after the grade."""
+    base = bs.build_record(op, repo or "-", by, dict(body), now, author=author, source=source)
     out: dict[str, Any] = {"v": base.pop("v"), "store": store_id, "op": base.pop("op")}
     rid = base.pop("id")
     if repo is not None:
@@ -438,10 +439,12 @@ def _used_migrations(fold: Any) -> set[str]:
 
 def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: str, by: str, *, author: Mapping[str, Any],
                 owner: str | None = None, migration: str | None = None, now: str | None = None,
-                seal: Any = None) -> tuple[rf.Repo | None, bool]:
+                seal: Any = None, relay: Any = None) -> tuple[rf.Repo | None, bool]:
     """X becomes ``tracking``. Refuses unless X is registered and untracked. The migration id is ``migration`` or derived from
     (name, manifest bytes, words, how many ceremonies X has had): a repeat with the same manifest and words after a lost
-    response derives the same id and is a no-op (T2-a). Returns ``(repo, written)``."""
+    response derives the same id and is a no-op (T2-a). ``relay`` = ``(q id, band source)`` makes the record relayed
+    (P3): the row's question must carry this manifest's sha256 (``board_relay.check_manifest``, P3-b). Returns ``(repo, written)``."""
+    _check_relay_id(relay)
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     owner = bs._one_line(owner, "owner") if owner is not None else None
     try:
@@ -481,7 +484,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
         m = migration or _derive_migration(name, sha, words, cur.begins)
         body = {"words": words, "migration": m, "manifest": manifest, "manifest_sha256": sha, "owner": owner,
                 "charter_before": before}
-        return _record("begin-track", name, by, sid, body, author, now), True
+        return _record("begin-track", name, by, sid, body, author, now, bs._read_relay(relay, words, sha)), True
 
     _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
@@ -532,12 +535,22 @@ def _charter_by_blob(path: str, name: str, items: Mapping | None) -> tuple[str |
     return text, blob, "", problems
 
 
+def _check_relay_id(relay: Any) -> None:
+    """A ``--source`` id is validated before any no-op return can hide it (the same validator ``add`` runs)."""
+    if relay is not None:
+        from levain.desk import board_relay
+        board_relay.check_source_id(relay[0])
+
+
 def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any], migration: str | None = None,
-          now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
+          now: str | None = None, seal: Any = None, relay: Any = None) -> tuple[rf.Repo | None, bool]:
     """The one switchover record (design 5(d)). Refuses unless X is ``tracking``, its charter passes ``charter check`` on
     origin/main (I2), and the manifest's plan items (less any cut) and the charter's Plan ids are the same set, both ways.
-    It does not wait for the stubs. A repeat on a ``tracked`` repo with the same migration and words is a no-op (T2-a)."""
+    It does not wait for the stubs. A repeat on a ``tracked`` repo with the same migration and words is a no-op (T2-a).
+    ``relay`` = ``(q id, band source)`` makes the record relayed (P3): the row's question must carry the sha256 of the
+    manifest the ceremony's ``begin-track`` recorded (``board_relay.check_manifest``, P3-b)."""
     from levain.desk import charter
+    _check_relay_id(relay)
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
@@ -590,7 +603,8 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
                 parts.append(f"the charter's Plan ids not in the manifest: {', '.join(gone)}")
             raise BoardError("the charter's Plan and the manifest's plan items are not the same set (" + "; ".join(parts) + ")")
         body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
-        return _record("track", name, by, sid, body, author, now), True
+        source = bs._read_relay(relay, words, now_cur.manifest_sha256)
+        return _record("track", name, by, sid, body, author, now, source), True
 
     _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
@@ -1331,7 +1345,8 @@ def import_focus_use(directory: str | Path, focus_file: str | Path, *, by: str, 
 
 
 def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callable[[Any], dict], items_help: str,
-                 seal_of: Callable[[Any, dict], Any] | None = None) -> None:
+                 seal_of: Callable[[Any, dict], Any] | None = None, source_args: Callable[[Any], None] | None = None,
+                 relay_of: Callable[[Any], Any] | None = None) -> None:
     """Add the registry's verbs under ``levain board``."""
     def common(p: Any, *, words: bool | str = True) -> None:
         p.add_argument("name", metavar="NAME")
@@ -1350,6 +1365,19 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
                 raise BoardError("--sign cannot be honoured here (no signer is wired into this CLI): nothing was written")
             return None
         return seal_of(a, author_of(a))
+
+    def relay(a: Any) -> Any:
+        """``(q id, band source)`` for ``--source`` (None without it); with no ``relay_of`` wired, ``--source`` refuses rather
+        than being accepted and writing an unrelayed record."""
+        if relay_of is None:
+            if getattr(a, "source", None) is not None:
+                raise BoardError("--source cannot be honoured here (no band is wired into this CLI): nothing was written")
+            return None
+        return relay_of(a)
+
+    def with_source(p: Any) -> None:
+        if source_args is not None:
+            source_args(p)
 
     def _source(a: Any) -> Any:
         """The authority source an UNSIGNED abandon-track's cuts are checked against (a re-run that finishes cuts). None when
@@ -1417,12 +1445,14 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p.add_argument("--manifest", required=True, metavar="FILE", help="JSON: plan_items (item keys), contract_items (repos), optional retire and record_dir.")
     p.add_argument("--owner", default=None, metavar="DESK", help="The desk that owns the ceremony.")
     p.add_argument("--migration", default=None, metavar="M", help="The migration id (default: derived, so a retry derives the same one).")
-    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, seal=seal(a)), "tracking", "already tracking")))
+    with_source(p)
+    p.set_defaults(func=run(lambda a, t: said(a, *begin_track(t, a.name, a.manifest, a.words, a.by, author=author_of(a), owner=a.owner, migration=a.migration, seal=seal(a), relay=relay(a)), "tracking", "already tracking")))
 
     p = sub.add_parser("track", description="The switchover record: the board becomes the repo's source of truth.")
     common(p)
     p.add_argument("--migration", default=None, metavar="M")
-    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, seal=seal(a)), "tracked", "already tracked")))
+    with_source(p)
+    p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, seal=seal(a), relay=relay(a)), "tracked", "already tracked")))
 
     def run_abandon(a: Any, t: bs.Target) -> None:
         sl = seal(a)
