@@ -40,6 +40,12 @@ class _Unsure(Exception):
     """The spelling of an EXISTING path could not be learned (internal: the seam's way to say "exists, unknowable")."""
 
 
+class _Unopened(_Unsure):
+    """The path exists and stats, and only the OPEN that would reveal its spelling was refused (a directory the caller
+    may search but not open, such as another account's 0700 home). Its place is known by identity; only the letter case
+    of its last component is not."""
+
+
 def _fs_spelling(path: str) -> Optional[str]:
     """The filesystem's own spelling of ``path`` when it EXISTS, ``None`` when it does not (the test seam: tests replace
     this to stand in for a case-insensitive volume where none is at hand). Raises :class:`_Unsure` for a path that
@@ -72,6 +78,13 @@ def _fs_spelling(path: str) -> Optional[str]:
                 return None
             last = exc
     if fd < 0:
+        if last is not None and last.errno in (errno.EACCES, errno.EPERM):
+            try:
+                os.stat(path)
+            except (OSError, ValueError):
+                pass
+            else:
+                raise _Unopened(str(last))
         raise _Unsure(str(last))
     try:
         return os.fsdecode(_fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0])
@@ -98,6 +111,10 @@ def _canon(path) -> Tuple[Path, bool]:
     while True:
         try:
             spelled = _fs_spelling(str(base))
+        except _Unopened:
+            # placed by stat, so not unsure: take the spelling of the nearest openable ancestor and join this name as
+            # given; `_decide` compares by identity, which sees a case variant of it as the same directory
+            spelled = None
         except _Unsure:
             unsure = True
             spelled = str(base)

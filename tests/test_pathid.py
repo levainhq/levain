@@ -282,3 +282,58 @@ def test_maybe_same_is_equal_spelling_same_file_or_unsure(tree, monkeypatch):
     assert not pathid.maybe_same(root / "never", root / "made")
     _unknowable(monkeypatch, tree / "other" / "x")
     assert pathid.maybe_same(tree / "other" / "x", root / "sub")        # could not place it: possibly the same
+
+
+# ---------------------------------------------------------------- levain#137: a directory that stats but cannot be opened
+
+@pytest.fixture
+def closed_home(tree):
+    """A sibling directory with mode 0: ``os.stat`` of it works, ``open`` of it is EACCES (another account's 0700 home
+    seen by the operator)."""
+    home = tree / "closed_home"
+    (home / "inner").mkdir(parents=True)
+    home.chmod(0)
+    yield home
+    home.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_a_directory_that_stats_but_cannot_be_opened_is_placed_not_unsure(tree, closed_home):
+    """The refusal was the spelling step failing on the open, not an overlap: the identity walk places it."""
+    assert not pathid.maybe_inside(tree / "root", closed_home)
+    assert not pathid.maybe_inside(closed_home, tree / "root")
+    assert not pathid.maybe_same(tree / "root", closed_home)
+    assert pathid._canon(closed_home)[1] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_an_unopenable_directory_is_still_caught_when_it_really_overlaps(tree, closed_home):
+    assert pathid.maybe_same(closed_home, closed_home)
+    assert pathid.inside(closed_home, closed_home)
+    assert pathid.maybe_inside(tree, closed_home)                    # the root above it
+    assert not pathid.maybe_inside(closed_home, tree)                # and the reverse is a plain no
+    assert pathid.maybe_inside(closed_home, closed_home / "inner")  # below it: not searchable, so unsure, so refused
+    assert pathid.maybe_inside(closed_home / "inner", closed_home)
+    assert pathid.maybe_same(closed_home, tree / "closed_home" / ".")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_an_unopenable_directory_in_another_letter_case_is_still_the_same_directory(tree, closed_home):
+    alias = _case_alias(closed_home)
+    assert pathid.maybe_same(closed_home, alias)
+    assert pathid.inside(closed_home, alias) and pathid.inside(alias, closed_home)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_an_unopenable_directory_with_a_failing_stat_stays_unsure(tree, closed_home, monkeypatch):
+    """Only a path that stats is placed: when the stat fails too, the refusal stands."""
+    real_stat = os.stat
+
+    def stat(p, *a, **k):
+        if isinstance(p, (str, os.PathLike)) and os.fspath(p) == str(closed_home):
+            raise PermissionError(13, "injected", os.fspath(p))
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(pathid.os, "stat", stat)
+    assert pathid._canon(closed_home)[1] is True
+    assert pathid.maybe_inside(tree / "root", closed_home)

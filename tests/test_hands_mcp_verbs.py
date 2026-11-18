@@ -652,3 +652,23 @@ def test_the_hands_home_check_with_an_injected_case_fold(tmp_path, monkeypatch):
         assert "operator's own home" in (hml.store_problem(_hands_at(spelled)) or ""), spelled
     assert "operator's own home" in (hml.store_problem(_hands_at(op)) or "")                    # canonical: as before
     assert hml.store_problem(_hands_at(hh)) is None and hml.store_problem(_hands_at(hh.with_name("HANDS"))) is None
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_a_hands_home_the_operator_cannot_open_is_accepted(tmp_path, monkeypatch):
+    """levain#137: the hands home is made private (0700, the hands user's) on purpose, so the operator can stat it and not
+    open it. That is not an overlap: the check places it by identity (mode 0 stands in for another account's 0700)."""
+    op = tmp_path.resolve() / "operator"
+    hh = tmp_path.resolve() / "_levain_ent_1"
+    op.mkdir()
+    (hh / ".levain").mkdir(parents=True)
+    hh.chmod(0)
+    try:
+        monkeypatch.setattr(hml, "_operator_home", lambda: str(op))
+        assert hml.store_problem(_hands_at(hh)) is None
+        monkeypatch.setattr(hml, "_operator_home", lambda: str(hh))              # the same home, still refused
+        assert "operator's own home" in (hml.store_problem(_hands_at(hh)) or "")
+        monkeypatch.setattr(hml, "_operator_home", lambda: str(hh.parent))       # above it, still refused
+        assert "operator's own home" in (hml.store_problem(_hands_at(hh)) or "")
+    finally:
+        hh.chmod(0o700)
