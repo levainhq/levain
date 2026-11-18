@@ -467,7 +467,9 @@ def test_the_leader_exit_is_seen_without_os_waitid_and_without_reaping(monkeypat
             time.sleep(0.05)
         assert verify._leader_exited(p) is True
         assert p.returncode is None                       # not reaped by the check
-        assert os.waitpid(p.pid, os.WNOHANG)[0] == p.pid  # still ours to reap: the pid was never freed
+        # still ours to reap: a blocking waitpid returns it (a reaped pid would raise ChildProcessError). Not WNOHANG:
+        # kqueue's NOTE_EXIT can arrive before the zombie is collectable, so a non-blocking wait races (8/15 failed, 11-17).
+        assert os.waitpid(p.pid, 0)[0] == p.pid
     finally:
         p.poll()
         if p.returncode is None:
