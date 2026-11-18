@@ -501,14 +501,19 @@ def test_front_policy_without_the_limit_function_is_refused_not_written_uncapped
     assert e.value.name == "front-limits-unbuilt"
 
 
-def test_a_brokered_ticket_is_still_refused_route_policy_unavailable(tmp_path):
+def test_a_brokered_ticket_is_pinned_and_its_front_policy_needs_its_generation(tmp_path):
     from tests.test_slot_3b8a_f1 import _ticketed
     from tests.test_slot_3b8a_front_wiring import _world
     w = _world(tmp_path)
-    a = w.alloc(_ticketed(w, "anthropic"))
-    with pytest.raises(Refused) as e:
-        H.refuse_ticketed_front(a)
-    assert e.value.name == "route-policy-unavailable"
+    a = w.alloc(_ticketed(w, "openrouter-glm"))
+    assert H.ticket_pin(a) is not None
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(Refused) as e:
+            H.front_policy_bytes(store, a, ["openrouter-glm", "github"])     # no generation file holds its route
+    finally:
+        store.close()
+    assert e.value.name == "route-not-allowed"
 
 
 def test_a_passthrough_alloc_with_a_brokered_ticket_fact_is_not_a_passthrough_ticket(tmp_path):
@@ -516,8 +521,15 @@ def test_a_passthrough_alloc_with_a_brokered_ticket_fact_is_not_a_passthrough_ti
     w = _world(tmp_path)
     a = w.alloc(_pt_alloc(w, facts={"auth": "brokered"}))
     assert not H.is_passthrough_ticket(a)
-    with pytest.raises(Refused):
-        H.refuse_ticketed_front(a)
+    with pytest.raises(Refused) as e:                      # a brokered ticket is pinned, and these facts carry no pin
+        H.ticket_pin(a)
+    assert e.value.name == "ticket-facts-missing"
+
+
+def test_a_passthrough_ticket_is_pinned_to_nothing(tmp_path):
+    from tests.test_slot_3b8a_front_wiring import _world
+    w = _world(tmp_path)
+    assert H.ticket_pin(w.alloc(_pt_alloc(w))) is None
 
 
 @pytest.mark.parametrize("missing", ["max_tunnel_bytes", "deadline"])

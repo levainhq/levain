@@ -37,12 +37,38 @@ VER_FACTS = {"job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "
              "egress_routes": [], "reserved_microdollars": 0, "verifier_generation": 1, "verifier_id": "pytest-report",
              "verifier_steps": STEPS, "input_bundle_digest": "sha256:" + "2" * 64,
              "driver_input_digest": "sha256:" + "3" * 64}
-#: an executor ticket whose routes lane F2's base map holds (`anthropic` brokered, `github` egress)
-F2_FACTS = dict(EXEC_FACTS, route="anthropic", model_requested="claude-opus-5-5", brief_digest=BRIEF_DIGEST)
+#: the dispatch-map route an executor ticket here is pinned to (lane F2's base map holds `github` egress; a dispatch
+#: route id is never a base id), as generation 1 of `L/routes/dispatch/` holds it (:func:`write_pinned_generation`)
+PIN_ROUTE = "glm"
+PIN_POLICY = {"route": PIN_ROUTE, "type": "brokered", "hosts": ["openrouter.ai"],
+              "upstream": {"scheme": "https", "host": "openrouter.ai", "base_path": "/api"},
+              "requests": {"templates": [{"method": "POST", "path": "/v1/chat/completions"}], "headers": {},
+                           "body_cap": 1048576, "body_codec": "openai-chat"},
+              "credential": "or-key", "max_call_microdollars": 2000000}
+F2_FACTS = dict(EXEC_FACTS, route=PIN_ROUTE, model_requested="claude-opus-5-5", brief_digest=BRIEF_DIGEST,
+                routemap_generation=1, route_policy_digest=RM.policy_digest(PIN_POLICY))
+
+
+def write_pinned_generation(w, gen: int, policies, *, current: bool = True) -> str:
+    """`L/routes/dispatch/<gen>.json` in lane F2's world holding one route entry per policy (an unsigned item: root
+    reads the entries only, keys' signature check is test_routemaps'); `current` names it the active generation."""
+    from tests.test_routemaps import item, route as map_route
+
+    d = w.L / "routes" / "dispatch"
+    d.mkdir(exist_ok=True)
+    routes = []
+    for p in policies:
+        r = map_route(p["route"])
+        r["policy"] = p
+        routes.append(r)
+    (d / f"{gen}.json").write_bytes(canon.canonical_bytes(item(gen, routes)))
+    if current:
+        (d / "current").write_bytes(str(gen).encode())
+    return str(d / f"{gen}.json")
 
 
 def _blob(**kw) -> bytes:
-    obj = {"format": "levain-session-render/1", "vendor": "claude", "routes": ["anthropic", "github"],
+    obj = {"format": "levain-session-render/1", "vendor": "claude", "routes": [PIN_ROUTE, "github"],
            "model": "claude-opus-5-5"}
     obj.update(kw)
     return canon.canonical_bytes({k: v for k, v in obj.items() if v is not None})
@@ -122,6 +148,7 @@ def test_verifier_ticketed_prepare_writes_its_facts(dispatch):
 # ---- HIGH 2 / obs 1: render's second gate -----------------------------------------------------------------------
 
 def _prepared(d, facts: dict = F2_FACTS) -> str:
+    write_pinned_generation(d.w, 1, [PIN_POLICY])                        # the generation the ticket is pinned to
     line = d.prepare(_mint(d, facts))
     assert line["ok"], (line, d.w.last_err)
     d.w.stage(line["session"])                                           # so only the gate can refuse the render
@@ -130,16 +157,6 @@ def _prepared(d, facts: dict = F2_FACTS) -> str:
 
 def _render(d, s: str, blob: bytes) -> dict:
     return d.w.main(["render", s], blob, uid=F2_DISPATCH)[1]
-
-
-@pytest.fixture
-def pinning_stand_in(monkeypatch):
-    """3b-8a T5 refuses every ticketed egress render ``route-policy-unavailable`` until S2 builds route pinning
-    (CONTRACT §3.3). A test of what a ticketed render does PAST that refusal (its first CAS, a post-CAS REVOKE) lifts
-    it here, so the machinery S2 re-opens stays held; the refusal itself is held by ``test_slot_3b8a_f1``."""
-    from levain.slot import runtime_helper as H
-
-    monkeypatch.setattr(H, "refuse_ticketed_front", lambda a: None)
 
 
 def test_prepare_failing_after_attach_leaves_render_refused(dispatch):
@@ -167,8 +184,8 @@ def test_prepare_failing_after_attach_leaves_render_refused(dispatch):
 
 
 @pytest.mark.parametrize("change,name", [
-    ({"routes": ["anthropic"]}, "ticket-routes-mismatch"),                      # an egress route dropped
-    ({"routes": ["anthropic", "github", "claude-sub"]}, "ticket-routes-mismatch"),   # one the ticket never named
+    ({"routes": [PIN_ROUTE]}, "ticket-routes-mismatch"),                      # an egress route dropped
+    ({"routes": [PIN_ROUTE, "github", "claude-sub"]}, "ticket-routes-mismatch"),   # one the ticket never named
     ({"model": "claude-other"}, "ticket-model-mismatch"),
     ({"model": None}, "ticket-model-mismatch"),
 ])
@@ -182,13 +199,12 @@ def test_render_refuses_a_blob_off_its_ticket(dispatch, change, name):
     assert w.calls[calls:] == [] and w.state(s).state == R.ALLOCATED and w.alloc(s).policy is None
 
 
-@pytest.mark.usefixtures("pinning_stand_in")
 def test_render_on_its_ticket_passes_the_gate(dispatch):
     """The blob the ticket names passes the second gate: render goes on to its first CAS."""
     d, w = dispatch, dispatch.w
     s = _prepared(d)
     calls = len(w.calls)
-    line = _render(d, s, _blob(routes=["github", "anthropic"]))                # order is not a mismatch
+    line = _render(d, s, _blob(routes=["github", PIN_ROUTE]))                # order is not a mismatch
     assert w.calls[calls][0] == "CAS", (line, w.last_err)
 
 

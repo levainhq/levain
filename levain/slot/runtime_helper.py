@@ -27,6 +27,7 @@ import base64
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -832,9 +833,8 @@ def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
     blob's order, with :data:`FRONT_DROPPED_FIELDS` removed. An id with no base-map entry is refused
     ``front-policy-unavailable``. ``dispatch`` (a dispatch or planner session): ``max_session_microdollars`` is
     dropped too, as a dispatch-session file carries none (the ticket's reservation is the cap, kept by keys).
-    Render never brings a ticketed session here: :func:`refuse_ticketed_front` refuses it ``route-policy-unavailable`` first
-    (3b-8a T5), since its brokered entry is to come from the ticket's pinned generation file, its digest re-checked
-    (CONTRACT §3.3 ROUTE PINNING, S2), never from the base map."""
+    A ticketed session's brokered route is not here: it comes from the ticket's pinned generation file
+    (:func:`front_policy_bytes`), never from the base map."""
     by_id = {r.get("route"): r for r in base.get("routes", ()) if isinstance(r, dict)}   # type: ignore[union-attr]
     drop = FRONT_DROPPED_FIELDS + (("max_session_microdollars",) if dispatch else ())
     out: List[dict] = []
@@ -850,16 +850,22 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     """``R/gw/slot<n>/session.json``'s bytes for alloc ``a`` and the blob's ``routes``: format, kind, session, the
     routes (:func:`front_session_routes` over ``L/routes/base.json``) and the incarnation, the lease's ``lease_seq``
     (render (2)'s DECISION). The front's own parser (``levain.broker.front.load_policy``) reads them here first: a
-    file it would refuse is ``front-policy-refused``. An alloc carrying a ticket is ``route-policy-unavailable``
-    (3b-8a T5): the base map is read for a session with no ticket only (render refuses it earlier too)."""
-    refuse_ticketed_front(a)
+    file it would refuse is ``front-policy-refused``. A ticketed brokered session's route entry is its PINNED generation's
+    (CONTRACT §3.3 ROUTE PINNING, :func:`pinned_route_entry`), the rest of its routes the base map's."""
     # on the call: the front's import closure (asyncio, h11) stays out of every other verb's start
     from levain.broker import front as FR
 
     data = store.read(("routes",), "base.json")
     if data is None:
         raise Refused("base-map-missing", "L/routes/base.json")
-    routes_view = front_session_routes(_canon_obj(data, "base-map"), routes, dispatch=a.kind in FR.DISPATCH_KINDS)
+    dispatch = a.kind in FR.DISPATCH_KINDS
+    pin = ticket_pin(a)
+    pinned = pinned_route_entry(store, pin) if pin is not None else None
+    base_ids = [r for r in routes if pin is None or r != pin.route]
+    base_view = {r["route"]: r for r in front_session_routes(_canon_obj(data, "base-map"), base_ids, dispatch=dispatch)}
+    if pin is not None and pin.route not in routes:
+        raise Refused("ticket-routes-mismatch", f"the blob does not name the ticket's route {pin.route}")
+    routes_view = [_front_entry(pinned, dispatch) if pin is not None and r == pin.route else base_view[r] for r in routes]
     doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session, "routes": routes_view,
            "incarnation": a.lease_seq}
     if is_passthrough_ticket(a):
@@ -870,6 +876,13 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     except FR.PolicyError as e:
         raise Refused("front-policy-refused", str(e)[:200]) from None
     return out
+
+
+def _front_entry(entry: Mapping[str, object], dispatch: bool) -> dict:
+    """One route's policy object as the front reads it (:data:`FRONT_DROPPED_FIELDS` removed, and for a dispatch or
+    planner session ``max_session_microdollars``, as :func:`front_session_routes`)."""
+    drop = FRONT_DROPPED_FIELDS + (("max_session_microdollars",) if dispatch else ())
+    return {k: v for k, v in entry.items() if k not in drop}
 
 
 def is_passthrough_ticket(a: R.Alloc) -> bool:
@@ -895,13 +908,111 @@ def passthrough_front_limits(a: R.Alloc) -> Dict[str, object]:
     return dict(fn(tunnel_bytes_cap=facts["max_tunnel_bytes"], deadline=facts["deadline"]))
 
 
-def refuse_ticketed_front(a: R.Alloc) -> None:
-    """3b-8a T5, until S2 builds CONTRACT §3.3 ROUTE PINNING: a ticketed egress session (dispatch or planner) has no
-    front policy root can build, so it is refused by name. The base map's entry is never a ticket's, even under the
-    same id. c7.14: a PASSTHROUGH ticket is the one exception: it names no dispatch-map route, so there is nothing to
-    pin, and its front file is the base map's passthrough entry plus the ticket's limits."""
-    if a.ticket is not None and a.slot.slot_class == "egress" and not is_passthrough_ticket(a):
-        raise Refused("route-policy-unavailable", "a ticketed session's front policy needs route pinning (S2)")
+#: ``L/routes/dispatch/``: CONTROL's generation files (``<gen>.json``) and ``current``
+DISPATCH_ROUTES = ("routes", "dispatch")
+_ROUTE_POLICY_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def policy_digest(policy: object) -> str:
+    """A route entry's ``policy`` digest, as the ticket carries it: ``sha256:`` over the policy's canonical bytes."""
+    return "sha256:" + hashlib.sha256(canon.canonical_bytes(policy)).hexdigest()
+
+
+@dataclass(frozen=True)
+class TicketPin:
+    """The route a ticketed brokered session is pinned to: its ticket's ``route``, ``routemap_generation`` and
+    ``route_policy_digest``."""
+    route: str
+    generation: int
+    digest: str
+
+
+def ticket_pin(a: R.Alloc) -> Optional[TicketPin]:
+    """CONTRACT §3.3 ROUTE PINNING: the pin of a ticketed egress session (dispatch or planner) from alloc's ticket
+    facts; None for a session with no ticket and for a PASSTHROUGH ticket (c7.14), which names no dispatch-map route,
+    so there is nothing to pin (its front file is the base map's passthrough entry plus the ticket's limits). Facts
+    that do not carry the pin whole are ``ticket-facts-missing``."""
+    if a.ticket is None or a.slot.slot_class != "egress" or is_passthrough_ticket(a):
+        return None
+    facts = a.ticket_facts or {}
+    route, gen, dig = facts.get("route"), facts.get("routemap_generation"), facts.get("route_policy_digest")
+    if type(route) is not str or type(gen) is not int or gen < 1 or type(dig) is not str \
+            or _ROUTE_POLICY_DIGEST.match(dig) is None:
+        raise Refused("ticket-facts-missing", "a ticketed session's route, routemap_generation or route_policy_digest")
+    return TicketPin(route, gen, dig)
+
+
+def _generation_routes(store: Store, name: str, what: str) -> Dict[str, dict]:
+    """The route entries (``{policy id: entry}``) of the generation file ``name`` under ``L/routes/dispatch/``. A file
+    that is absent, a link, over the cap, not one canonical object, or whose body does not list routes whose ``policy``
+    each carry a ``route`` id once is ``route-not-allowed``: root cannot say what the generation holds."""
+    try:
+        data = store.read(DISPATCH_ROUTES, name, trusted=False)
+    except (Refused, OSError):
+        data = None
+    if data is None:
+        raise Refused("route-not-allowed", f"{what} cannot be read")
+    try:
+        body = _canon_obj(data, "route-map").get("body")
+    except Refused:
+        raise Refused("route-not-allowed", f"{what} does not parse") from None
+    routes = body.get("routes") if type(body) is dict else None
+    out: Dict[str, dict] = {}
+    if type(routes) is not list:
+        raise Refused("route-not-allowed", f"{what} lists no routes")
+    for entry in routes:
+        pol = entry.get("policy") if type(entry) is dict else None
+        rid = pol.get("route") if type(pol) is dict else None
+        if type(rid) is not str or rid in out:
+            raise Refused("route-not-allowed", f"{what} has an entry that is not one route")
+        out[rid] = entry
+    return out
+
+
+def _active_generation(store: Store) -> int:
+    """The active generation: ``L/routes/dispatch/current`` (a decimal integer from 1 and nothing else)."""
+    try:
+        data = store.read(DISPATCH_ROUTES, "current", trusted=False, cap=32)
+    except (Refused, OSError):
+        data = None
+    if data is None or re.fullmatch(rb"[1-9][0-9]{0,15}", data) is None:
+        raise Refused("route-not-allowed", "the active generation cannot be read")
+    return int(data)
+
+
+def pinned_route_entry(store: Store, pin: TicketPin) -> dict:
+    """The ``levain-route-policy/1`` object the ticket pinned, from its PINNED generation's file, in keys' order of
+    rules: the generation loads and holds the route; the route is still in the ACTIVE generation (a route removed
+    by a newer generation is refused though pinned); the digest of the file's ``policy`` equals the ticket's
+    (``route-policy-mismatch``). The entry is brokered and its id is no base-map id: the base map's entry is never a
+    ticket's. Anything that does not hold is ``route-not-allowed``; nothing here falls back to the base map or to
+    another generation."""
+    held = _generation_routes(store, f"{pin.generation}.json", f"pinned generation {pin.generation}")
+    entry = held.get(pin.route)
+    if entry is None:
+        raise Refused("route-not-allowed", f"generation {pin.generation} holds no route {pin.route}")
+    active = _active_generation(store)
+    live = held if active == pin.generation else _generation_routes(store, f"{active}.json", f"active generation {active}")
+    if pin.route not in live:
+        raise Refused("route-not-allowed", f"route {pin.route} is not in the active generation")
+    policy = entry["policy"]
+    if not hmac.compare_digest(policy_digest(policy), pin.digest):
+        raise Refused("route-policy-mismatch", f"generation {pin.generation}'s {pin.route} is not the ticket's policy")
+    if policy.get("type") != "brokered":
+        raise Refused("route-not-allowed", f"route {pin.route} is not brokered")
+    if pin.route in base_routes(store)[0]:
+        raise Refused("route-not-allowed", f"route {pin.route} is a base-map route")
+    return policy
+
+
+def session_route_types(store: Store, a: R.Alloc) -> Dict[str, str]:
+    """:func:`base_routes`' route types plus, for a pinned ticket, its pinned route's (brokered)."""
+    types = base_routes(store)[0]
+    pin = ticket_pin(a)
+    if pin is not None:
+        pinned_route_entry(store, pin)
+        types = {**types, pin.route: "brokered"}
+    return types
 
 
 def _front_dir_ok(st: os.stat_result, seams: "Seams", front_uid: int) -> bool:
@@ -2236,6 +2347,7 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None
     route_types, route_hosts = base_routes(ctx.store)
+    route_types = session_route_types(ctx.store, alloc)
     # identseed: a gated Claude session's .claude.json carries the slot's parked account block (absent: render seeds
     # nothing and start's gate refuses identity-seed-missing before any move). `egress and` drops no gated session:
     # identity_gated needs auth passthrough, and prepare refuses any auth but none on a none-class slot
@@ -2642,7 +2754,6 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
             raise Refused("not-allocated", req.session)
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
         RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts, auth=a.auth)
-        refuse_ticketed_front(a)        # 3b-8a T5: before the base map's route types are read, so one name for all
         if a.ticket is not None and a.ticket_facts is not None and a.ticket_facts.get("kind") == "verifier":
             RD.check_driver_template(a.ticket_facts["verifier"], ctx.seams.driver_template)   # type: ignore[arg-type]
         run = RenderRun(ctx, a, blob)
@@ -4345,7 +4456,7 @@ __all__ = ["Answer", "BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ct
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
            "front_policy_bytes", "front_session_routes", "read_passthrough_total", "read_session_total", "read_session_tunnel_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
-           "refuse_ticketed_front", "stub_front_args", "wait_child", "wants_stdin", "write_front_policy"]
+           "stub_front_args", "wait_child", "wants_stdin", "write_front_policy"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)

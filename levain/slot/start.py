@@ -327,7 +327,7 @@ def secret_env(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
     ans = ctx.call("SECRETS", session=a.session)
     facts = RD.RenderFacts(host=ctx.seams.host, session=a.session, slot=a.slot, kind=a.kind, vendor=a.vendor,
                            auth=a.auth, slot_uid=a.slot_uid, slot_gid=a.slot_gid,
-                           route_types=H.base_route_types(ctx.store))
+                           route_types=H.session_route_types(ctx.store, a))
     names = RD.secret_env_names(RenderBlob(vendor=a.vendor, routes=pol.routes, hooks=pol.hooks), facts)
     out: Dict[str, str] = {}
     for name in names:

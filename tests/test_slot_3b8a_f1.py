@@ -1,7 +1,8 @@
 """S1 3b-8a fix round 1 (head rulings T5-T9 on the s3b8a L3 r1 triage; T6 builds ruling T1, the front.log home).
 
-T5: a TICKETED session (dispatch / planner) is refused ``route-policy-unavailable`` at render until route pinning is built
-(S2): the base map's entry is never handed to a ticket's front, not even under a colliding id. T6: the front's tunnel log
+T5: the base map's entry is never handed to a TICKETED session's front (dispatch / planner), not even under a colliding
+id: its brokered route comes from the ticket's pinned generation (S2, ``test_slot_s2_route_pinning``), and a session whose
+generation file holds no such route is refused ``route-not-allowed`` at render. T6: the front's tunnel log
 lives in ``L/gw/slot<n>/`` (it survives a reboot), is opened ``O_NOFOLLOW`` with an explicit 0640 whatever the umask,
 is bounded (a size cap and one rotated file, rotated by the front), and render pre-creates it ``front account : root``
 0640 (never the slot's group). T7: the front's dirs are refused when group- or other-writable, and an unexpected object
@@ -31,7 +32,7 @@ from tests.test_slot_s2f2_runtime_helper import BOOT, BRIEF_DIGEST, DISPATCH_UID
 GW0 = 898          # _levain_gw0 in the World's account table
 
 
-# --- T5: a ticketed session is refused until route pinning ------------------------------------------------------------
+# --- T5: the base map is never a ticketed session's route ------------------------------------------------------------
 
 def _ticketed(w, route: str, session: str = "s-00000000000000e1") -> str:
     """A dispatch (executor) session on egress slot 1, its alloc carrying a ticket whose route is ``route``."""
@@ -48,19 +49,20 @@ def _ticketed(w, route: str, session: str = "s-00000000000000e1") -> str:
 
 
 @pytest.mark.parametrize("route", ["openrouter-glm", "anthropic"])
-def test_ticketed_session_refused_route_policy_unavailable(tmp_path, route):
+def test_ticketed_session_with_no_pinned_generation_refused_route_not_allowed(tmp_path, route):
     """``openrouter-glm``: a genuine dispatch-map route, absent from the base map. ``anthropic``: a dispatch route whose
-    id COLLIDES with a base-map id: before T5 render handed the ticket's front the base entry's bytes."""
+    id COLLIDES with a base-map id: before T5 render handed the ticket's front the base entry's bytes. Neither has a
+    generation file here, so neither has a policy."""
     w = _world(tmp_path)
     s = _ticketed(w, route)
     code, line = w.main(["render", s], _blob(routes=[route, "github"], model="m-1"), uid=DISPATCH_UID)
-    assert line == {"ok": False, "refused": "route-policy-unavailable"}, w.last_err
+    assert line == {"ok": False, "refused": "route-not-allowed"}, w.last_err
     assert w.fronts.procs == {} and w.calls == []                       # before step (1)'s CAS: nothing acted on
     assert not (w.R / "gw" / "slot1" / "session.json").exists()
 
 
-def test_front_policy_bytes_refuses_a_ticketed_alloc(tmp_path):
-    """The point-of-use guard: the base map is read for a session with no ticket only."""
+def test_front_policy_bytes_never_reads_the_base_map_for_a_ticketed_alloc(tmp_path):
+    """The point-of-use guard: a ticketed alloc's brokered route is its pinned generation's, whatever the base map says."""
     w = _world(tmp_path)
     s = _ticketed(w, "anthropic")
     store = H.Store(w.seams)
@@ -69,7 +71,7 @@ def test_front_policy_bytes_refuses_a_ticketed_alloc(tmp_path):
             H.front_policy_bytes(store, w.alloc(s), ["anthropic", "github"])
     finally:
         store.close()
-    assert e.value.name == "route-policy-unavailable"
+    assert e.value.name == "route-not-allowed"
 
 
 # --- T6: the log's home, mode and bound -------------------------------------------------------------------------------
