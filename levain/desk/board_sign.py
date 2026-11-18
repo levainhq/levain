@@ -151,9 +151,20 @@ POLICY: dict[str, str] = {
 }
 
 
+#: the ops whose verb takes ``--source`` (a relayed record); a decision-class refusal names it only for these
+RELAYABLE_OPS = ("add", "amend", "decide", "begin-track", "track", "abandon-track")
+
+
 def _refusal(op: str, why: str = "") -> str:
+    if op not in RELAYABLE_OPS:
+        return f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID); an asserted record is refused"
     return (f"{op}{why} is a decision-class write: it needs --sign (the operator's Touch ID), or --source <q-id> (the band's "
             f"question id, q-<24 hex>) relaying his answer; an asserted record is refused")
+
+
+SIGNED_CUT_OF_RELAYED = ("a signed cut cannot cite a relayed abandon-track: its cause is re-read through the band, which a "
+                         "signature does not carry; write the cut unsigned (decide --cause <sha> [--band-dir <dir>]), or re-run "
+                         "`abandon-track --source <q-id> [--band-dir <dir>]` to finish the cuts")
 
 
 MOVE_DECISION = " of a tracking, tracked or aborting repo that changes its origin or root set"
@@ -201,8 +212,9 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) ->
     grade = held.get("grade")
     if grade == GRADE_RELAYED:
         if band is None:
-            return ("cause names a relayed abandon-track and no band was given to re-read its row: give the band "
-                    "(--band-dir) the abandon cites")
+            return ("cause names a relayed abandon-track and no band was given to re-read its row: re-run "
+                    "`abandon-track --source <q-id> [--band-dir <dir>]` citing the row it relays (or `decide --cause <sha> "
+                    "[--band-dir <dir>]` for one cut)")
         from levain.desk import board_relay
         said = board_relay.verify_relayed(held, band)
         if not said.ok:
@@ -227,6 +239,25 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) ->
 
 def _index_of(lines: Sequence[bytes], digest: str) -> int | None:
     return next((i for i, ln in enumerate(lines) if _record_hash(ln) == digest), None)
+
+
+def cited_record(cause: Any, repos: Sequence[bytes]) -> Any:
+    """The parsed registry line ``cause`` names (its sha256), or None: what a cut cites, read BEFORE anything is judged so the
+    writer knows the cited abandon's grade (only a signed one needs the authority log). The judgement itself is
+    :func:`cause_problem`'s."""
+    if not isinstance(cause, str) or not bs.HASH_RE.fullmatch(cause):
+        return None
+    at = _index_of(repos, cause)
+    return _parse(repos[at]) if at is not None else None
+
+
+def cause_snapshot(cited: Any, source: AuthoritySource | None) -> Any:
+    """The authority snapshot a cut's cause is judged against: ``source`` replayed now ONLY when the cited record is SIGNED.
+    A relayed (or any other) cause needs no log, so a log that cannot be read never refuses it (codex 49, gemini 101); no
+    source is None (the predicate's own refusal then speaks)."""
+    if source is None or not isinstance(cited, Mapping) or cited.get("grade") not in SIGNED_GRADES:
+        return None
+    return read_authority(source)
 
 
 def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snapshot: Any, band: Any = None) -> str | None:
@@ -557,6 +588,15 @@ def _bad(why: str = "") -> Verdict:
     return Verdict("bad", "signature does not verify" + (f" ({why})" if why else ""))
 
 
+def grade_sig_problem(record: Mapping[str, Any]) -> str | None:
+    """The structural rule every reader holds: a ``sig`` belongs to a signed grade only (a record is relayed or signed, never
+    both). Why ``record`` breaks it, or None. :func:`verify_record` and ``board_relay.verify_relayed`` both apply it."""
+    grade = record.get("grade")
+    if grade not in SIGNED_GRADES and "sig" in record:
+        return f"a record graded {grade!r} carries a signature"
+    return None
+
+
 def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
     """The verdict on one record, from the record and an authority snapshot (``snapshot.keys``, fingerprint to
     ``AuthorityKey``) only. Exact grades only: a pre-cutover record (no ``grade``, no ``prev``) or one graded ``legacy`` is
@@ -567,9 +607,9 @@ def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
     from levain.authority import DISPLAY_PHONE, LAPTOP, quarantined
     from levain.authority_sig import verify_link_sig
     grade = record.get("grade")
-    has_sig = "sig" in record
-    if grade not in SIGNED_GRADES and has_sig:
-        return _bad(f"a record graded {grade!r} carries a signature")
+    structural = grade_sig_problem(record)
+    if structural is not None:
+        return _bad(structural)
     if ("grade" not in record and "prev" not in record) or grade == GRADE_LEGACY:
         return Verdict("legacy", "legacy")
     if grade == GRADE_RELAYED:

@@ -474,6 +474,8 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
             k = cur.begins - 1
             same = (migration or _derive_migration(name, sha, words, k)) == cur.migration
             if same and cur.manifest_sha256 == sha and cur.words == words and cur.owner == owner:
+                bs._relay_hit(relay, words, _landed(fold, "begin-track", name, cur.migration), author,
+                              f"begin-track of {name}", sha, require_manifest=True)
                 return None, False                              # the retry of a begin that already landed
             raise BoardError(f"{name} is already tracking (migration {cur.migration}): finish it with `track` or `abandon-track`")
         if cur.mode != "untracked":
@@ -484,10 +486,17 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
         m = migration or _derive_migration(name, sha, words, cur.begins)
         body = {"words": words, "migration": m, "manifest": manifest, "manifest_sha256": sha, "owner": owner,
                 "charter_before": before}
-        return _record("begin-track", name, by, sid, body, author, now, bs._read_relay(relay, words, sha)), True
+        return _record("begin-track", name, by, sid, body, author, now,
+                       bs._read_relay(relay, words, sha, require_manifest=True)), True
 
     _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
+
+
+def _landed(fold: Any, op: str, name: str, migration: str | None) -> Mapping[str, Any] | None:
+    """The latest ``op`` record of ``(name, migration)`` the registry fold accepted: what an idempotent hit stands on."""
+    return next((r for _, r in reversed(fold.records)
+                 if r.get("op") == op and r.get("repo") == name and r.get("migration") == migration), None)
 
 
 def _plan_ids(text: str) -> list[str]:
@@ -557,6 +566,8 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
     if cur.mode == "tracked" and migration in (None, cur.migration) and cur.words == words:
+        bs._relay_hit(relay, words, _landed(view.fold, "track", name, cur.migration), author, f"track of {name}",
+                      cur.manifest_sha256, require_manifest=True)
         return cur, False
     if cur.mode != "tracking":
         raise BoardError(f"{name} is {cur.mode}, not tracking: track needs a begun ceremony")
@@ -581,6 +592,8 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
     def build(fold, sid, raw):
         now_cur = _need_repo(fold, name)
         if now_cur.mode == "tracked" and now_cur.migration == cur.migration:
+            bs._relay_hit(relay, words, _landed(fold, "track", name, cur.migration), author, f"track of {name}",
+                          now_cur.manifest_sha256, require_manifest=True)
             return None, False
         if now_cur.mode != "tracking" or now_cur.migration != cur.migration:
             raise BoardError(f"{name} changed under the check ({now_cur.mode}); run it again")
@@ -605,22 +618,27 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
                 parts.append(f"the charter's Plan ids not in the manifest: {', '.join(gone)}")
             raise BoardError("the charter's Plan and the manifest's plan items are not the same set (" + "; ".join(parts) + ")")
         body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
-        source = bs._read_relay(relay, words, now_cur.manifest_sha256)
+        source = bs._read_relay(relay, words, now_cur.manifest_sha256, require_manifest=True)
         return _record("track", name, by, sid, body, author, now, source), True
 
     _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
-def _latest_abandon_hash(lines: Sequence[bytes], name: str, migration: str) -> str | None:
-    """sha256 of the LATEST abandon-track line of ``(name, migration)`` among the registry ``lines`` as written: the cause
-    the cuts carry, and so the one the recovery judges. None when there is none."""
+def _latest_abandon(lines: Sequence[bytes], name: str, migration: str) -> tuple[str | None, dict | None]:
+    """``(sha256, record)`` of the LATEST abandon-track line of ``(name, migration)`` among the registry ``lines`` as
+    written: the cause the cuts carry, and so the one the recovery judges. ``(None, None)`` when there is none."""
     from levain.desk import board_sign as sg
     for line in reversed(lines):
         rec = sg._parse(line)
         if isinstance(rec, dict) and rec.get("op") == "abandon-track" and rec.get("repo") == name and rec.get("migration") == migration:
-            return hashlib.sha256(line).hexdigest()
-    return None
+            return hashlib.sha256(line).hexdigest(), rec
+    return None, None
+
+
+def _latest_abandon_hash(lines: Sequence[bytes], name: str, migration: str) -> str | None:
+    """sha256 of :func:`_latest_abandon`'s line, or None."""
+    return _latest_abandon(lines, name, migration)[0]
 
 
 def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
@@ -629,7 +647,7 @@ def _abandon_record_hash(view: View, name: str, migration: str) -> str | None:
 
 
 def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, snapshot: Any,
-                            store_dir: Path, band: Any = None) -> tuple[str | None, list[str]]:
+                            store_dir: Path, band: Any = None, *, authority: Any = None) -> tuple[str | None, list[str]]:
     """``(problem, uncut)``: the ceremony's item ids that do not read ``cut``, and why a cut of one of them citing the latest
     abandon-track of ``(name, migration)`` in the registry bytes ``raw`` would be refused (None when every one would hold,
     and always None when ``uncut`` is empty: no cut is owed). The judgement is ``board_sign.cut_cause_problem``, the SAME
@@ -640,7 +658,8 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     ONCE for the call, then its per-item half for each owed item (complement 15, fix 4). A torn registry never reaches here
     (the write's reader refuses it, and ``abandon_track`` names the ``ack-torn`` first); a torn items file is a problem
     naming the ``ack-torn``, which no fresh abandon repairs. The caller holds the exclusive ``store.lock`` (the items are
-    read here, under it)."""
+    read here, under it). ``authority`` (a SOURCE) stands in for ``snapshot`` lazily: it is replayed only when the latest
+    abandon is SIGNED (``board_sign.cause_snapshot``), so a relayed one never needs the log (codex 49, gemini 101)."""
     from levain.authority_sig import VerifierUnavailable
     from levain.desk import board_sign as sg
     ids, decision = _migration_facts(store_dir, name, migration)
@@ -653,6 +672,8 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     cause = _latest_abandon_hash(repos, name, migration)
     if cause is None:
         return f"no abandon-track of {migration} is recorded for {name}", uncut
+    if snapshot is None and authority is not None:
+        snapshot = sg.cause_snapshot(sg.cited_record(cause, repos), authority)
     try:
         problem, held = sg.cause_problem(cause, store, snapshot, band)
         if problem is not None:
@@ -687,7 +708,10 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     store's, not where its prev places it, not applied by the fold, its repo no longer aborting M, no ``items_last``, its
     anchor gone, or an uncut item of M added after its anchor; a relayed abandon also needs its band row to re-verify): a
     SIGNED re-run writes a fresh signed abandon of the same migration (the fold reads it as a retry) whose anchor covers
-    them, and the cuts cite that one; an UNSIGNED re-run with an authority source refuses by name ("re-run abandon-track
+    them, and the cuts cite that one (a RELAYED re-run writes a fresh relayed abandon of the CALLER's words, verbatim in the
+    answer it cites; the fold takes a retry's words, so the cuts carry them); a re-run under ``--source`` that writes no
+    abandon still reads its row and must name the relayed abandon that landed (``board_store._relay_hit``); an UNSIGNED
+    re-run with an authority source refuses by name ("re-run abandon-track
     signed", or ``--source`` for a relayed one) before anything is written. With no item left uncut neither writes anything.
     A TORN registry or items file is not something a fresh abandon repairs: it refuses naming the ``ack-torn`` to run first
     (deepseek 71, fix 4). Returns ``(repo, ids cut by this call)``."""
@@ -726,19 +750,23 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
         if c.mode == "aborting" and c.migration == cur.migration:
             if seal is None and relay is None:
                 if authority is not None:
-                    problem, _ = _latest_abandon_problem(raw, sid, name, c.migration, sg.read_authority(authority),
-                                                         target.store_dir)
+                    problem, _ = _latest_abandon_problem(raw, sid, name, c.migration, None, target.store_dir,
+                                                         authority=authority)
                     if problem is not None:
                         raise BoardError(f"abandon-track {name}: the recorded abandon-track cannot be the cause of the cuts "
                                          f"still owed ({problem}): re-run abandon-track signed (--sign) or relayed "
                                          f"(--source); nothing was written")
                 return None, False
             held = seal.authority if seal is not None else authority
-            problem, _ = _latest_abandon_problem(raw, sid, name, c.migration, sg.read_authority(held) if held is not None else None,
-                                                 target.store_dir, band)
+            problem, _ = _latest_abandon_problem(raw, sid, name, c.migration, None, target.store_dir, band, authority=held)
             if problem is None:                             # nothing owed, or every owed cut holds: no new abandon
+                if relay is not None:                       # the --source is still read, and must be the abandon that landed
+                    bs._relay_hit(relay, words, _latest_abandon(bs._split_written(raw)[0], name, c.migration)[1], author,
+                                  f"abandon-track of {name}")
                 return None, False
-            body_words = c.words                            # the recovery abandon re-signs the abandon already recorded
+            # a signed recovery re-signs the words already recorded; a relayed one relays the CALLER's words, checked
+            # verbatim against the answer it cites (the fold takes a retry's words: repos_fold)
+            body_words = words if relay is not None else c.words
         elif c.mode != "tracking" or c.migration != cur.migration:
             raise BoardError(f"{name} changed under the abandon ({c.mode}); run it again")
         else:
@@ -1467,8 +1495,8 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     def run_abandon(a: Any, t: bs.Target) -> None:
         rl = relay(a)
         sl = seal(a)
-        repo, cut = abandon_track(t, a.name, a.words, a.by, author=author_of(a), seal=sl, relay=rl,
-                                  authority=None if sl is not None or seal_of is None else _source(a))
+        repo, cut = abandon_track(t, a.name, a.words, a.by, author=author_of(a), seal=sl, relay=rl,      # a relay needs no log
+                                  authority=None if sl is not None or rl is not None or seal_of is None else _source(a))
         print(f"aborting {a.name}; cut {len(cut)} items" + (f": {', '.join(cut)}" if cut else ""))
     p = sub.add_parser("abandon-track", description="Abort a ceremony before track: the repo becomes aborting and its items are cut. Run again to finish the cuts.")
     common(p)

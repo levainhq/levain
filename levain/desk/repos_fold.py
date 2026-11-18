@@ -251,6 +251,11 @@ def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
                               charter_blob=rec["charter_blob"], retire=_retire(rec["retire"]))
     elif op == "abandon-track":
         if cur.mode == "aborting" and cur.migration == rec["migration"]:
+            # a retry of the same abort (the recovery abandon): applied, and its words are the repo's now. The retry is the
+            # cause the cuts it finishes carry, so the words they carry are its words; a signed retry re-signs the recorded
+            # words (no change), a relayed one relays the caller's (P3 fix 4: never required to equal the recorded ones)
+            if rec["words"] != cur.words:
+                repos[name] = replace(cur, words=rec["words"])
             return
         if cur.mode != "tracking" or cur.migration != rec["migration"]:
             raise _Soft(f"abandon-track {name}: the repo is {cur.mode} (migration {cur.migration}), not tracking {rec['migration']}")
