@@ -867,6 +867,9 @@ _SK_RETRIES = 1                # a security-key answer that does not verify is a
 # a second touch is asked for only while at least this much of the ONE sign bound is left: the sheet comes up at once and a
 # touch takes a second or two, so 5 s is a real chance; any less and the person would be shown a sheet that closes under them
 _SK_RETRY_MIN_S = 5.0
+# held back from each ssh-keygen sign child's wait (never more than half of what is left), so an answer that comes in the
+# last moment that child is given still leaves its check room to run inside the same deadline
+_VERIFY_RESERVE_S = 1.0
 _SIGN_FAILURE_KEEP = 20        # evidence files kept per key directory; older ones are deleted when a new one is written
 _SIGN_FAILURE_DIR = "sign-failures"
 _SIGN_FAILURE_PREFIX = "sigfail-"
@@ -924,8 +927,16 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
         # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
         name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(body)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+        except BaseException:
+            # the file this call made is taken back (a full disk, an I/O error): no truncated evidence under a final name
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
         _prune_sign_failures(dfd, just_written=name)
         return str(directory / name)
     except Exception as exc:  # noqa: BLE001 - the evidence is a courtesy; the refusal is the point
@@ -992,13 +1003,17 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         bound is :data:`_SK_RETRIES`, a constant, and ``_once`` itself never retries. Everything else (a cancel, a
         timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt.
 
-        Every attempt shares ONE deadline, ``timeout`` from now: the first gets all of it, a retry gets only what is
-        left, and no retry is asked for once less than :data:`_SK_RETRY_MIN_S` is left. So the sign step never waits
-        longer than the bound a caller budgeted for, however many attempts it took. If the retry fails some other way
-        (cancelled, timed out), its own error is raised with the first attempt's flags and evidence named after it."""
+        Every attempt shares ONE deadline, ``timeout`` from now, and so does every ssh-keygen child the step runs: each
+        sign, each verify of its answer and each diagnostic check is handed only what is left of it (a sign child less
+        :data:`_VERIFY_RESERVE_S`, kept for its verify), and a diagnostic check is not run once nothing is left. No retry
+        is asked for once less than :data:`_SK_RETRY_MIN_S` is left. So no child outlives the bound a caller budgeted
+        for, however many attempts it took; what runs between children (the evidence file write, local disk I/O with no
+        timeout of its own) is the only time not under it. If the retry fails some other way (cancelled, timed out, the
+        verifier could not run), its own error, of its own type, is raised with the first attempt's flags and evidence
+        named after it."""
         bound = _SIGN_TIMEOUT if timeout is None else timeout
         deadline = time.monotonic() + bound
-        first = _once(message, 1, bound)
+        first = _once(message, 1, deadline)
         if isinstance(first, str):
             return first
         failed = [first]
@@ -1012,12 +1027,13 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             # stderr is the terminal's, where the touch prompt already goes; the words say what happened, not that it is safe
             print("the key's answer did not check out; touch again", file=sys.stderr, flush=True)
             try:
-                again = _once(message, n + 2, left)
-            except KeyError_ as exc:
+                again = _once(message, n + 2, deadline)
+            except (KeyError_, _authority.VerifierUnavailable) as exc:
                 # the retry's own words first (terminal_sign._classify reads them), then what attempt 1 left behind;
-                # attempt 1's ssh-keygen verdicts stay in its evidence file, so no verdict text can misfile this one
+                # attempt 1's ssh-keygen verdicts stay in its evidence file, so no verdict text can misfile this one.
+                # Re-raised as its own type: a caller that tells a verifier failure from a refusal still can
                 a = failed[0]
-                raise KeyError_(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
+                raise type(exc)(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
                                 f"{a.evidence})") from None
             if isinstance(again, str):
                 return again
@@ -1029,11 +1045,18 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                         f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.detail}; {b.evidence}); "
                         "so nothing was signed")
 
-    def _once(message: bytes, attempt: int, wait_s: float) -> "str | _SkRefusal":
-        """One ``ssh-keygen -Y sign`` (waiting at most ``wait_s``, the part of the deadline ``sign`` hands it) and its
-        check: the signature, a :class:`_SkRefusal` for an sk signature that presence-checks but does not verify (the
-        one retryable failure), or a raised :class:`KeyError_`."""
+    def _once(message: bytes, attempt: int, deadline: float) -> "str | _SkRefusal":
+        """One ``ssh-keygen -Y sign`` and its check, every child bounded by ``deadline`` (``sign``'s one deadline, on
+        ``time.monotonic``): the signature, a :class:`_SkRefusal` for an sk signature that presence-checks but does not
+        verify (the one retryable failure), or a raised :class:`KeyError_` (or :class:`VerifierUnavailable`, the
+        verify could not run, in time or at all)."""
         from levain.launch import child_env
+
+        def left() -> float:
+            return deadline - time.monotonic()
+
+        now_left = left()
+        wait_s = now_left - min(_VERIFY_RESERVE_S, now_left / 2)
 
         # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
         # security key provider; stderr stays the terminal's, for the touch or passphrase prompt
@@ -1061,7 +1084,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         # signature, measured 2026-10-12); output that is there and fails the check is named as that, with
         # what it carried, because calling a touched sign "cancelled" is a false record (11-17).
         if not _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
-                                          namespace=namespace, ssh_keygen=ssh_keygen):
+                                          namespace=namespace, ssh_keygen=ssh_keygen, timeout=max(left(), 0.0)):
             # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
             # (a hand-made key enrolled with --custody touch-id has no sidecar)
             is_touch = touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER
@@ -1082,7 +1105,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 raise KeyError_(f"ssh-keygen returned a signature for {fp} without the user-presence flag ({carried}), "
                                 "so nothing was signed")
             detail = _authority_sig.verify_failure_detail(message, signature, public_key=public_key,
-                                                          namespace=namespace, ssh_keygen=ssh_keygen)
+                                                          namespace=namespace, ssh_keygen=ssh_keygen, left=left)
             if flags is not None and sig_type.startswith("sk-"):
                 try:
                     counter = _authority_sig._sshsig_type_flags_counter(signature)[2]

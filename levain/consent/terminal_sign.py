@@ -966,12 +966,13 @@ def is_remote(env: Mapping[str, str] | None = None, presence: str | None = None)
 def _classify(exc: KeyError_) -> tuple[str, str]:
     msg = str(exc)
     first = msg.splitlines()[0] if msg else "signer failed"
-    if "Touch ID was cancelled" in msg:
+    # the first line only: it is where a signer names what happened; a later line (a path, a verdict) never refiles it
+    if "Touch ID was cancelled" in first:
         return "cancelled", first
-    if "TimeoutExpired" in msg:
+    if "TimeoutExpired" in first:
         return "timeout", first
     # a fast non-zero exit from ssh-keygen (R4 will say whether this is also the lid-closed case)
-    if re.search(r"could not sign with .*\(exit \d+\)", msg):
+    if re.search(r"could not sign with .*\(exit \d+\)", first):
         return "unavailable", first
     return "signer-error", first
 

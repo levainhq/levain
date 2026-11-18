@@ -34,11 +34,19 @@ def _sign_seen(tmp_path: Path, monkeypatch, **signer_kw) -> list[float]:
     return seen.timeouts
 
 
+def _the_sign_child_waits(bound: float, seen: list[float]) -> bool:
+    """The one sign child is handed the bound less the verify reserve (levain#125 fix 2: the verify runs inside the same
+    deadline), less only the real time between the deadline being set and the child starting."""
+    (t,) = seen
+    want = bound - min(keys._VERIFY_RESERVE_S, bound / 2)
+    return want - 0.5 < t <= want
+
+
 def test_the_default_timeout_is_the_modules(tmp_path, monkeypatch):
-    assert _sign_seen(tmp_path, monkeypatch) == [keys._SIGN_TIMEOUT]
+    assert _the_sign_child_waits(keys._SIGN_TIMEOUT, _sign_seen(tmp_path, monkeypatch))
 
 
 def test_a_per_signer_timeout_is_used_and_leaves_the_global_alone(tmp_path, monkeypatch):
     before = keys._SIGN_TIMEOUT
-    assert _sign_seen(tmp_path, monkeypatch, timeout=20.0) == [20.0]
+    assert _the_sign_child_waits(20.0, _sign_seen(tmp_path, monkeypatch, timeout=20.0))
     assert keys._SIGN_TIMEOUT == before

@@ -11,6 +11,7 @@ directory never holds more than the bound; a non-sk key is not retried."""
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import stat
@@ -88,11 +89,17 @@ class FakeKeygenSign:
     """Stands in for ONLY the ``ssh-keygen -Y sign`` call; every verify still runs the real ssh-keygen. ``plan`` is one
     entry per sign: the flags byte WRITTEN (None = honest), ``"cancel"`` (empty output, exit 0: a cancelled sheet) or
     ``"timeout"`` (the person never touches: the whole timeout handed to it passes, then TimeoutExpired). ``durations``
-    is how long each sign's touch takes on ``clock``; ``timeouts`` records the timeout each sign was handed."""
+    is how long each sign's touch takes on ``clock`` (a number, or a function of the timeout the sign was handed); a
+    touch slower than that timeout is a timeout. ``timeouts`` records the timeout each sign was handed.
+
+    Every other ``ssh-keygen -Y`` call (verify, check-novalidate) takes ``check_took`` seconds on ``clock`` (``inf`` = a
+    verifier that hangs: its whole timeout passes, then TimeoutExpired), and ``checks`` records its verb and timeout. Its
+    verdict still comes from the real ssh-keygen, under a real bound of its own, since its time is the fake clock's."""
 
     def __init__(self, key: SoftSk, plan: list, real_run, clock: FakeClock | None = None) -> None:
         self.key, self.plan, self.real_run, self.signs = key, list(plan), real_run, 0
         self.clock, self.durations, self.timeouts = clock, [], []
+        self.check_took, self.checks = 0.0, []
 
     def __call__(self, argv, **kw):
         if "-Y" in argv and argv[argv.index("-Y") + 1] == "sign":
@@ -100,7 +107,9 @@ class FakeKeygenSign:
             self.timeouts.append(kw.get("timeout"))
             written = self.plan.pop(0) if self.plan else None
             took = self.durations.pop(0) if self.durations else 0.0
-            if written == "timeout":
+            if callable(took):
+                took = took(kw["timeout"])
+            if written == "timeout" or (self.clock is not None and took > kw["timeout"]):
                 if self.clock is not None:
                     self.clock.t += kw["timeout"]
                 raise subprocess.TimeoutExpired(argv, kw["timeout"])
@@ -111,6 +120,13 @@ class FakeKeygenSign:
             ns = argv[argv.index("-n") + 1]
             out = self.key.sign(kw["input"], ns, counter=self.signs, sig_flags=written)
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
+        if self.clock is not None and "-Y" in argv:
+            self.checks.append((argv[argv.index("-Y") + 1], kw.get("timeout")))
+            if self.check_took > kw["timeout"]:
+                self.clock.t += kw["timeout"]
+                raise subprocess.TimeoutExpired(argv, kw["timeout"])
+            self.clock.t += self.check_took
+            kw = dict(kw, timeout=30.0)
         return self.real_run(argv, **kw)
 
 
@@ -133,9 +149,12 @@ def rig(tmp_path, monkeypatch):
 
 def worst_sign_step_s(where: Path, bound: float) -> float:
     """The longest the sign step (the signer terminal_sign's factory builds, bounded by ``bound``) can keep a person's Touch ID sheet
-    waiting, MEASURED: a first answer that does not verify, arriving at every interesting moment of the bound, then a
-    second touch that never comes. The callers' budgets (band_hook.PROMPT_HOOK_TIMEOUT_S, desk_click._WAIT_S) are
-    asserted against this number, not against ``bound`` itself, so a sign step that grows past its bound fails them."""
+    waiting, MEASURED: a first answer (honest, or one that does not verify) arriving at every interesting moment of the
+    bound, then a second answer that does not verify either, late or never; and every check of an answer (verify,
+    check-novalidate) instant, slow, or hung. The checks' time is counted on the same clock as the touches. The callers'
+    budgets (band_hook.PROMPT_HOOK_TIMEOUT_S, desk_click._WAIT_S) are asserted against this number, not against
+    ``bound`` itself, so a sign step that grows past its bound fails them."""
+    from levain.authority_sig import VerifierUnavailable
     from levain.consent import terminal_sign as ts
     where.mkdir(parents=True, exist_ok=True)
     key = SoftSk(where / "worst-case-key")
@@ -148,14 +167,18 @@ def worst_sign_step_s(where: Path, bound: float) -> float:
         mp.setattr(keys, "time", clock)
         # what ts.default_signer_factory builds (the seat tests guard that name itself, so it is not called here)
         _fp, sign = ssh_signer(key.path, namespace=ts.NAMESPACE, timeout=bound)
-        for first in (0.0, bound / 2, bound - floor - 0.01, bound - floor, bound - floor + 0.01, bound * 0.99):
-            if first < 0:
-                continue
-            fake.plan, fake.durations = [0x21, "timeout"], [first]
-            start = clock.t
-            with pytest.raises(KeyError_):
-                sign(MESSAGE)
-            worst = max(worst, clock.t - start)
+        for check_took in (0.0, 1.5, float("inf")):
+            for plan in ([0x21, "timeout"], [0x21, 0x21], [None]):
+                for first in (0.0, bound / 2, bound - floor - 0.01, bound - floor, bound - floor + 0.01, bound * 0.99):
+                    if first < 0:
+                        continue
+                    fake.plan, fake.durations, fake.check_took = list(plan), [first, lambda t: t * 0.99], check_took
+                    start = clock.t
+                    try:
+                        sign(MESSAGE)
+                    except (KeyError_, VerifierUnavailable):
+                        pass
+                    worst = max(worst, clock.t - start)
     return worst
 
 
@@ -289,13 +312,16 @@ def test_the_second_attempt_gets_only_what_is_left_of_the_one_bound(rig):
     sign = _bounded(rig, 20.0)
     rig.fake.plan, rig.fake.durations = [0x21, None], [6.0]
     assert _sshsig_type_and_flags(sign(MESSAGE))[1] == 0x01
-    assert rig.fake.timeouts == [20.0, pytest.approx(14.0)]
+    # each sign child waits what is left less the verify reserve (fix round 2): 20 - R, then (20 - 6) - R
+    r = keys._VERIFY_RESERVE_S
+    assert rig.fake.timeouts == [pytest.approx(20.0 - r), pytest.approx(14.0 - r)]
 
 
 def test_the_whole_sign_step_never_outlasts_its_bound(tmp_path):
     from levain.consent import terminal_sign as ts
     for bound in (ts.SIGN_BOUND_S, keys._SIGN_TIMEOUT, 7.0, 3.0):
-        assert worst_sign_step_s(tmp_path / str(bound), bound) <= bound + 1e-6, bound
+        worst = worst_sign_step_s(tmp_path / str(bound), bound)
+        assert worst <= bound + 1e-6, (bound, worst)
 
 
 def test_no_second_touch_is_asked_for_when_too_little_of_the_bound_is_left(rig, capsys):
@@ -357,6 +383,7 @@ def test_a_loose_evidence_dir_is_not_written(rig):
     assert list(rig.dir.iterdir()) == []
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes into a 0500 directory anyway")
 def test_a_read_only_evidence_dir_does_not_change_the_refusal(rig):
     rig.dir.mkdir(mode=0o700)
     rig.dir.chmod(0o500)
@@ -393,3 +420,118 @@ def test_the_file_just_written_is_never_pruned_even_when_it_sorts_oldest(rig):
     ours = [p for p in rig.dir.iterdir() if not p.name.startswith("sigfail-9999")]
     assert len(ours) == 1 and json.loads(ours[0].read_text())["flags"] == "0x21"
     assert len(list(rig.dir.iterdir())) == keys._SIGN_FAILURE_KEEP
+
+
+# --- fix round 2 (L3 r1): the deadline governs the checks too; attempt 1 named past a verifier failure; no truncated
+# evidence; _classify reads the first line only -------------------------------------------------------------------------
+
+def test_a_late_touch_and_a_hung_verifier_end_at_the_bound(rig):
+    from levain.authority_sig import VerifierUnavailable
+    sign = _bounded(rig, 20.0)
+    rig.fake.plan, rig.fake.durations, rig.fake.check_took = [None], [lambda t: t * 0.99], float("inf")
+    start = rig.clock.t
+    with pytest.raises(VerifierUnavailable):
+        sign(MESSAGE)
+    assert rig.clock.t - start <= 20.0 + 1e-6
+    assert rig.fake.checks and all(0 < t <= 20.0 for _verb, t in rig.fake.checks), rig.fake.checks
+
+
+def test_a_late_touch_with_a_slow_verify_still_signs_inside_the_bound(rig):
+    """The verify reserve: a touch in the last moment the sign child is given still leaves its check room to finish."""
+    sign = _bounded(rig, 20.0)
+    rig.fake.plan, rig.fake.durations, rig.fake.check_took = [None], [lambda t: t * 0.99], 0.5
+    start = rig.clock.t
+    assert _sshsig_type_and_flags(sign(MESSAGE))[1] == 0x01
+    assert rig.clock.t - start <= 20.0 + 1e-6
+
+
+def test_the_diagnostic_checks_get_only_what_is_left_and_none_once_it_is_spent(rig):
+    from levain.consent import terminal_sign as ts
+    sign = _bounded(rig, 20.0)
+    # touched at 18.5 s; each check takes 1 s: the verify ends at 19.5, the diagnostic verify is cut at 20, and
+    # check-novalidate is not run at all
+    rig.fake.plan, rig.fake.durations, rig.fake.check_took = [0x21], [18.5], 1.0
+    start = rig.clock.t
+    with pytest.raises(KeyError_) as err:
+        sign(MESSAGE)
+    text = str(err.value)
+    assert rig.clock.t - start == pytest.approx(20.0)
+    assert [verb for verb, _t in rig.fake.checks] == ["verify", "verify"], rig.fake.checks
+    assert "check-novalidate: not run" in text and "no second touch" in text, text
+    assert "TimeoutExpired" not in text, text
+    assert ts._classify(err.value)[0] == "signer-error"        # a refused answer, not a timed-out sign
+
+
+def test_the_diagnostic_detail_runs_nothing_when_no_time_is_left(rig, monkeypatch):
+    sig = rig.key.sign(MESSAGE, NS, flags=0x01, sig_flags=0x21).decode()
+    pub = SK + " " + base64.b64encode(rig.key.blob).decode()
+    detail = keys._authority_sig.verify_failure_detail(MESSAGE, sig, public_key=pub, namespace=NS, left=lambda: 0.0)
+    assert "verify: not run" in detail and "check-novalidate: not run" in detail, detail
+    assert rig.fake.checks == []
+
+
+def test_a_verifier_failure_on_the_retry_still_names_the_first_attempts_evidence(rig, monkeypatch):
+    from levain.authority_sig import VerifierUnavailable
+    real = keys._authority.verify_link_sig
+    calls: list[int] = []
+
+    def second_cannot_run(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:
+            raise VerifierUnavailable("ssh-keygen could not verify an authority signature (TimeoutExpired)")
+        return real(*a, **k)
+
+    monkeypatch.setattr(keys._authority, "verify_link_sig", second_cannot_run)
+    rig.fake.plan = [0x21, None]
+    with pytest.raises(VerifierUnavailable) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    (only,) = list(rig.dir.iterdir())
+    assert type(err.value) is VerifierUnavailable
+    assert text.startswith("ssh-keygen could not verify an authority signature") and "0x21" in text and str(only) in text
+
+
+class _OsWithFullDisk:
+    """``keys.os`` whose ``fdopen`` gives a file that takes a few bytes and then fails as a full disk would."""
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    @staticmethod
+    def fdopen(fd, mode="r", *a, **k):
+        fh = os.fdopen(fd, mode, *a, **k)
+
+        class Full:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                fh.close()
+                return False
+
+            def write(self, data):
+                fh.write(data[:10])
+                fh.flush()
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        return Full()
+
+
+def test_a_failed_evidence_write_leaves_no_truncated_file(rig, monkeypatch):
+    rig.dir.mkdir(mode=0o700)
+    monkeypatch.setattr(keys, "os", _OsWithFullDisk())
+    rig.fake.plan = [0x21, 0x21]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert text.count("evidence not written (OSError: No space left on device)") == 2, text
+    assert list(rig.dir.iterdir()) == []
+
+
+def test_classify_reads_only_the_first_line(rig):
+    from levain.consent import terminal_sign as ts
+    first = f"ssh-keygen returned a signature that does not verify as {rig.fp} (flags 0x21), so nothing was signed"
+    for later in ("evidence: /k/sign-failures/TimeoutExpired.json", "verdict: Touch ID was cancelled",
+                  "ssh-keygen could not sign with /k/id (exit 1)"):
+        assert ts._classify(KeyError_(first + "\n" + later)) == ("signer-error", first), later
+    assert ts._classify(KeyError_("ssh-keygen could not sign (TimeoutExpired)\nmore"))[0] == "timeout"

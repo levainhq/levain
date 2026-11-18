@@ -17,7 +17,7 @@ import struct
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
@@ -274,13 +274,19 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
 
 
 def verify_failure_detail(message: bytes, signature: str, *, public_key: str, namespace: str = NAMESPACE,
-                          ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, timeout: float = 2.0) -> str:
+                          ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, timeout: float = 2.0,
+                          left: Callable[[], float] | None = None) -> str:
     """Words for a signature :func:`verify_link_sig` refused, for an error message only (never a verdict; nothing
     reads it back): what ``ssh-keygen -Y verify`` says about it against the key, and whether the signature is
     consistent over ``message`` at all (``-Y check-novalidate``, which takes the key out of the question). Told apart,
     they say whether the signer made a signature over other bytes than these (the second fails) or the key was the
     question (the second holds), the one fact a touched-but-refused sign leaves open (1118-12: a Touch ID sign
-    that ssh-keygen made in 0.9 s and the check refused). Never raises: any trouble is said in its place."""
+    that ssh-keygen made in 0.9 s and the check refused). Never raises: any trouble is said in its place.
+
+    ``left``, when given, is read before each check: the seconds left of the caller's own bound. That check gets at most
+    that (never more than ``timeout``) and is not run once nothing is left, so the detail never takes the caller past
+    its bound. A check cut short is said as "timed out", never as the exception's type name, so the words cannot read
+    as a timed-out sign to a caller that files messages by that name (``terminal_sign._classify``)."""
     try:
         sig_bytes = (signature.strip() + "\n").encode("ascii")
         problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
@@ -304,13 +310,25 @@ def verify_failure_detail(message: bytes, signature: str, *, public_key: str, na
                                                          "authority-signer", "-n", namespace, "-s", f"/dev/fd/{fds[1]}"]),
             ("check-novalidate", (sig_bytes,), lambda fds: [str(keygen), "-Y", "check-novalidate", "-n", namespace,
                                                            "-s", f"/dev/fd/{fds[0]}"])):
+        budget = timeout
+        if left is not None:
+            try:
+                budget = min(timeout, left())
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"{label}: not run (the time left could not be read: {type(exc).__name__})")
+                continue
+            if budget <= 0:
+                out.append(f"{label}: not run (the caller's time bound was spent)")
+                continue
         fds: list[int] = []
         try:
             for data in readers:
                 fds.append(_pipe_reading(data))
-            cp = subprocess.run(argv(fds), input=message, capture_output=True, timeout=timeout,
+            cp = subprocess.run(argv(fds), input=message, capture_output=True, timeout=budget,
                                 env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
             out.append(f"{label}: {first(cp)}")
+        except subprocess.TimeoutExpired:
+            out.append(f"{label}: unavailable (timed out after {budget:.1f}s)")
         except Exception as exc:  # noqa: BLE001
             out.append(f"{label}: unavailable ({type(exc).__name__})")
         finally:
