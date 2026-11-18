@@ -88,6 +88,7 @@ class RepoFold:
     kept: tuple[tuple[int, int], ...] = ()                          # (line, the line of the ack): chain-broken lines KEPT and applied
     malformed: tuple[int, ...] = ()                                 # lines torn by themselves (shape), chain break or not
     records: tuple[tuple[int, Mapping[str, Any]], ...] = ()         # (line, record) of every record the fold accepted, acks excluded
+    applied: tuple[int, ...] = ()                                   # lines of the records the fold APPLIED: accepted and allowed by the state (a soft rejection is not)
 
 
 _NOT_JSON = object()
@@ -316,6 +317,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
     kept: list[tuple[int, int]] = []
     malformed: list[int] = []
     records: list[tuple[int, Mapping[str, Any]]] = []
+    applied: list[int] = []
     last = len(lines)
     for n, raw in enumerate(lines, 1):
         sha = shas[n - 1]
@@ -378,5 +380,7 @@ def fold_repos(lines: Iterable[str], *, store_id: str | None = None, unterminate
                 _apply(rec, repos)
             except _Soft as e:
                 problems.append(f"line {n}: {e}")
+            else:
+                applied.append(n)
     return RepoFold(repos, tuple(problems), bool(torn_why), torn_why, tuple(acked), tuple(torn_lines), tuple(dropped), tuple(kept),
-                    tuple(malformed), tuple(records))
+                    tuple(malformed), tuple(records), tuple(applied))

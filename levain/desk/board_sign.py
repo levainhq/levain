@@ -264,17 +264,11 @@ class CauseHeld:
     anchor_missing: bool
 
 
-_ACK_NAMES_UNTORN = "ack-torn names this line, which is not torn"
-
-
 def _applied(folded: Any, n: int) -> bool:
-    """Whether the registry fold APPLIED line ``n`` (1-based): it is a record the fold accepted, not one an ``ack-torn``
-    names (a dropped line is no record; a chain break an ack keeps is not trusted as a cause either), and the fold raised no
-    problem on it but an ack naming it. ``repos_fold`` records a record the state does not allow only as a problem
-    ``line n: ...``, so ANY other problem on the line reads as not applied (fail closed)."""
-    if n in folded.acked or n not in {ln for ln, _ in folded.records}:
-        return False
-    return not any(p.startswith(f"line {n}: ") and p != f"line {n}: {_ACK_NAMES_UNTORN}" for p in folded.problems)
+    """Whether the registry fold APPLIED line ``n`` (1-based), read from the fold's structure, never its problem text: the
+    line is in ``applied`` (accepted, and a change its repo's state allowed; a soft rejection is not), and no ``ack-torn``
+    names it (a dropped line is never applied; a chain break an ack keeps is applied, but not trusted as a cause)."""
+    return n in folded.applied and n not in folded.acked
 
 
 def _items_torn(why: str, n: int | None) -> str:
