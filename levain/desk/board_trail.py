@@ -32,7 +32,7 @@ from a record is printed with its control characters escaped. It exits 3 on any 
 
 The trust root is never the bundle. ``verify BUNDLE`` replays the authority log of the verifier's OWN install (``--data-root``,
 default the install's) and reads the bundle's keys as claims compared against it (a key the bundle names that the log does not
-hold the same way is a break). With no authority log of his own, a signature that verifies under a key the bundle names reads
+hold the same way is a break). With no authority log of their own, a signature that verifies under a key the bundle names reads
 "signature valid under a key the bundle names; not checked against an authority you hold", and no anchor is claimed. Given the
 same trust root, a bundle and the live store give the same verdicts.
 
@@ -1243,14 +1243,14 @@ def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport
         rep.tail = _tail_line(name, anchor, records_after(n))
     said = []
     if relays["anchored"]:
-        said.append(f"{name}: {relays['anchored']} relayed record(s) rest on a signed answer: his words are anchored by the "
+        said.append(f"{name}: {relays['anchored']} relayed record(s) rest on a signed answer: the operator's words are anchored by the "
                     f"answer's own signature, which does not cover the chain")
     if relays["revoked"]:
         said.append(f"{name}: {relays['revoked']} relayed record(s) rest on an answer signed by a key revoked since: a forgery "
-                    f"signed with it after the revocation would read the same, so nothing you can trust anchors his words")
+                    f"signed with it after the revocation would read the same, so nothing you can trust anchors the operator's words")
     if relays["unanchored"]:
         said.append(f"{name}: {relays['unanchored']} relayed record(s) rest on an answer no signature of a key you hold binds: "
-                    f"nothing anchors his words")
+                    f"nothing anchors the operator's words")
     rep.relayed = "\n".join(said)
     if name in heads:
         h = heads[name]
@@ -1480,7 +1480,7 @@ def destination(out: str | None, store_id: str) -> Path:
     dest = Path(os.path.abspath(dest))
     repo = _inside_git(dest.parent) or _inside_git(Path(os.path.realpath(dest.parent)))
     if repo is not None:
-        raise TrailError(f"{dest} is inside a git work tree ({repo}): the bundle carries his words and never goes into a repo; "
+        raise TrailError(f"{dest} is inside a git work tree ({repo}): the bundle carries the operator's words and never goes into a repo; "
                          f"name a place outside one with --out")
     return dest
 
@@ -1626,7 +1626,7 @@ def register(sub: Any) -> None:
         description=("Writes one JSON bundle: both files' records as written, the public keys the authority log holds, and every "
                      "cited band answer. Prints `items=<hash> repos=<hash>`: keep them, so a later `verify --head` can tell a "
                      "truncated tail. The bundle goes to <levain home>/board-trail/ unless --out names a file or directory; it "
-                     "carries his words, so a place inside a git work tree is refused."))
+                     "carries the operator's words, so a place inside a git work tree is refused."))
     common(e)
     e.add_argument("--out", metavar="PATH", default=None, help="A file, or a directory the bundle is named inside.")
     e.set_defaults(func=run_export)

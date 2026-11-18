@@ -204,7 +204,7 @@ def test_the_anchor_and_tail_lines_are_per_file_and_never_hidden(world):
     assert r["repos.jsonl"].tail.startswith("repos.jsonl: 1 records after the last signed record ")
     # the repos relay rests on an UNSIGNED answer: never summarised as anchored; the items relay rests on a signed one
     assert r["repos.jsonl"].relayed == ("repos.jsonl: 1 relayed record(s) rest on an answer no signature of a key you hold binds: "
-                                        "nothing anchors his words")
+                                        "nothing anchors the operator's words")
     assert r["items.jsonl"].relayed.startswith("items.jsonl: 1 relayed record(s) rest on a signed answer")
 
 
@@ -1109,7 +1109,7 @@ def test_a_revoked_answer_signer_never_reads_anchored(world, monkeypatch):
     assert {x.n: x.verdict for x in r.records}[6] == f"agent desk 24, relaying {Q1} (signed answer, by a key revoked since (seq 9))"
     assert any(n.startswith(f"line 6: the answer {Q1} is signed by a key revoked at seq 9") for n in r.notes)
     assert r.relayed == ("items.jsonl: 1 relayed record(s) rest on an answer signed by a key revoked since: a forgery signed with "
-                         "it after the revocation would read the same, so nothing you can trust anchors his words")
+                         "it after the revocation would read the same, so nothing you can trust anchors the operator's words")
     assert "anchored by the answer's own signature" not in r.relayed
 
 

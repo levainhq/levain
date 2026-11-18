@@ -139,7 +139,7 @@ def register(subparsers: Any) -> None:
     a.add_argument("--repo", required=True)
     a.add_argument("--title", required=True)
     a.add_argument("--origin", required=True, help="desk N | np-xxxxxxxx | STATUS_1_0.md#<n>@<blob sha> | found by <seat>, <path>")
-    a.add_argument("--words", default="", help="his words verbatim when he gave them")
+    a.add_argument("--words", default="", help="the operator's words verbatim when they gave them")
     a.add_argument("--done", default=None)
     a.add_argument("--done-kind", dest="done_kind", default="merged", choices=bs.DONE_KINDS)
     a.add_argument("--tier", default=None, choices=bs.TIERS)

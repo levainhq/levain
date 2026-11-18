@@ -6,7 +6,7 @@ costs the others:
 1. ``charter``: the repo's CHARTER.md on origin/main (path from the registry): Purpose, Criteria, Constraints in full and, from the Plan,
    only the group that holds the item (ids, titles and derived states). A group is a run of Plan lines with no blank line
    between them; today's Plan is flat, so the group is the whole Plan and the budget cuts it, nearest the item first.
-2. ``item``: title, his words verbatim, origin, DONE line and ``done_kind``, each dependency with its derived state.
+2. ``item``: title, the operator's words verbatim, origin, DONE line and ``done_kind``, each dependency with its derived state.
 3. ``state``: the item's derived state and reason (the board's own :func:`~levain.desk.board_state.derive_all`, over the ONE
    repo's own git evidence) and the commits on main, chain refs and branches carrying its id.
 4. ``record``: three named sources, each reporting for itself. ``record[anneal]``: the anneal store's episodes tagged
@@ -244,7 +244,7 @@ def _charter_part(repo: Any, name: str, item_id: str, folded: Any, derived: Deri
 
 
 def _item_part(item: Any, derived: Derived | None) -> Part:
-    # his words verbatim, on their own sub-budget, so the done line and the dependencies always survive
+    # the operator's words verbatim, on their own sub-budget, so the done line and the dependencies always survive
     lines = [f"item {item.id}: {_clip_marked(_s(item.title), MARK_CHARS)}",
              f"words: {_clip_marked(str(item.words), WORDS_CHARS) if item.words else '(none given)'}",
              f"origin: {_clip_marked(_s(item.origin), MARK_CHARS)}",
