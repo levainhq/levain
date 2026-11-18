@@ -514,12 +514,12 @@ def _open_section(store: CoordStore, launch: Any, lv: str, tail: str) -> list[st
 #: derived lines as well. Nothing checks the desk's lines; Levain's lines below them are verified like the band.
 _ARRIVAL_CARD = ("When the block Levain gives you carries a line starting `back:`, or you acknowledged an operator open "
                  "this turn and are answering a drop with `coord reply` (Levain freezes the block under your text, "
-                 "and you never see it), this reply is his arrival card, shown once.")
+                 "and you never see it), this reply is the operator's arrival card, shown once.")
 _DAY_PLAN = (
     f"{_ARRIVAL_CARD} Above your status line (in a `coord reply`, at the top of --text) write at most 5 plain lines of "
-    "the day: what you will run today and in what order, and what you are holding until he answers. Do not restate a "
+    "the day: what you will run today and in what order, and what you are holding until the operator answers. Do not restate a "
     "work line, a `back:`, handoff or `next:` line, or a band item: they are directly below, and a restatement drifts "
-    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. Ask him nothing: "
+    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. Ask the operator nothing: "
     "a question goes through `coord escalate` or the band's ask tool, and \"waits on you\" is never written. A reply "
     "that is neither has no such section: it is the reply as always.")
 _DAY_STATUS_ONLY = (
@@ -532,10 +532,10 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
     """How the desk meets him arriving and leaving (C15 S5). Always in the brief, also when the open could not be
     built: it holds the verbs the operator seam runs on."""
     return [
-        "## When he arrives or leaves",
+        "## When the operator arrives or leaves",
         "",
-        f"- On every turn that carries his words (an attended turn, or a wake whose drops are new), run `{lv} coord open "
-        f"--light --token N {tail}` first, before you reply. It consumes his signed return and prints the open waiting "
+        f"- On every turn that carries the operator's words (an attended turn, or a wake whose drops are new), run `{lv} coord open "
+        f"--light --token N {tail}` first, before you reply. It consumes the operator's signed return and prints the open waiting "
         "for you with its exact acknowledge line (run it); when nothing waits it says \"no light open needed\".",
         f"- In the morning, after a night with a night desk, run `{lv} coord nightclose --token N {tail}`: it stops the "
         "night's claims and hands its open events (and any started effect) to you, and records every working seat "
@@ -543,8 +543,8 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
         "the night reserved after the read is recorded only by the next close: run it again until it reports "
         "`effects recorded 0`.",
         f"- {DAY_PARAGRAPH}",
-        f"- When his words say he is leaving: `{lv} coord away DROP_ID --token N {tail}`, then `{lv} coord close "
-        f"--plan {tail}` prints the walk checklist (it writes nothing); walk it with him, then write the handoff.",
+        f"- When the operator's words say they are leaving: `{lv} coord away DROP_ID --token N {tail}`, then `{lv} coord close "
+        f"--plan {tail}` prints the walk checklist (it writes nothing); walk it with the operator, then write the handoff.",
         f"- When you hand over (a rotation, the operator leaving, or a dream that saved memory after you started: "
         f"`coord open` then prints a `Dream seam:` line), write the handoff first: `{lv} coord close "
         f"--kind rotation|operator|dream --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
@@ -579,16 +579,16 @@ def _board_forms(lv: str) -> dict[str, str]:
         "board amend": f"{lv} board amend --id NAME#N --why \"...\" --by desk",
         "board amend --done": f"{lv} board amend --id NAME#N --why \"...\" --done \"what remains\" --by worker "
                               "--launch-key KEY",
-        "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk --source Q-ID",
+        "board decide": f"{lv} board decide --id NAME#N --decision DECISION --words \"the operator's words\" --by desk --source Q-ID",
         "board use": f"{lv} board use DIR",
-        "board register": f"{lv} board register NAME --path DIR --words \"his words\" --by desk",
+        "board register": f"{lv} board register NAME --path DIR --words \"the operator's words\" --by desk",
         "charter init": f"{lv} charter init NAME --repo DIR",
         "charter check": f"{lv} charter check --repo DIR",
-        "board begin-track": f"{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk --source Q-ID",
-        "board track": f"{lv} board track NAME --migration M --words \"his yes\" --by desk --source Q-ID",
-        "board abandon-track": f"{lv} board abandon-track NAME --words \"his words\" --by desk --source Q-ID",
+        "board begin-track": f"{lv} board begin-track NAME --manifest FILE --words \"the operator's yes\" --by desk --source Q-ID",
+        "board track": f"{lv} board track NAME --migration M --words \"the operator's yes\" --by desk --source Q-ID",
+        "board abandon-track": f"{lv} board abandon-track NAME --words \"the operator's words\" --by desk --source Q-ID",
         "board abandon-done": f"{lv} board abandon-done NAME --by desk",
-        "board untrack": f"{lv} board untrack NAME --words \"his words\" --by operator --author-kind operator --sign",
+        "board untrack": f"{lv} board untrack NAME --words \"the operator's words\" --by operator --author-kind operator --sign",
     }
 
 
@@ -609,16 +609,16 @@ def _board_modes_section(lv: str) -> list[str]:
         "carries the ceremony's migration id as `--migration M`.",
         "",
         "These are `board` and `charter` verbs, not `coord` verbs. Your door opens exactly the ones named below, and no "
-        "other, and you run them yourself, all but `untrack`: he runs that one at the laptop, and you give him its line. "
+        "other, and you run them yourself, all but `untrack`: the operator runs that one at the laptop, and you give them its line. "
         "On them `--by` names the record's author (you write `--by desk`) and "
         "they take no `--token`. A write's authority is checked by the writer, not by the door, and `decide`, `begin-track`, "
         "`track`, `abandon-track` and `untrack` are refused without it: use `--source Q-ID` (the id of the band row "
-        "carrying his answer) when you relay an answer he gave on the band, with `--words` an exact excerpt of it. For "
-        "`begin-track` and `track` the question you put to him must also carry the manifest's sha256 (the sha256 of the "
-        "manifest file's bytes): the SAME sha256 for both, since `track` holds his yes to the manifest `begin-track` "
-        "recorded; `decide` and `abandon-track` carry none. When he "
-        "signs at the laptop, he runs the same line himself with `--by operator --author-kind operator --sign` in place "
-        "of `--by desk ... --source Q-ID`. `untrack` takes no `--source`: it is his signed write only.",
+        "carrying the operator's answer) when you relay an answer the operator gave on the band, with `--words` an exact excerpt of it. For "
+        "`begin-track` and `track` the question you put to the operator must also carry the manifest's sha256 (the sha256 of the "
+        "manifest file's bytes): the SAME sha256 for both, since `track` holds the operator's yes to the manifest `begin-track` "
+        "recorded; `decide` and `abandon-track` carry none. When the operator "
+        "signs at the laptop, they run the same line themselves with `--by operator --author-kind operator --sign` in place "
+        "of `--by desk ... --source Q-ID`. `untrack` takes no `--source`: it is the operator's signed write only.",
         "",
         f"- read: `{f['board state']}`, `{f['board repos']}`, `{f['board context']}`;",
         f"- an item: `{f['board add']}`, `{f['board amend']}`, `{f['board decide']}`;",
@@ -628,17 +628,17 @@ def _board_modes_section(lv: str) -> list[str]:
         f"`{f['board abandon-done']}`, `{f['board untrack']}`.",
         "",
         "Tracking a repository starts when the operator says so, in conversation. Never begin it on your own reading, and "
-        "write nothing before his yes. In this order:",
+        "write nothing before the operator's yes. In this order:",
         "",
-        f"1. If this install has no item store, run `{f['board use']}` with him first. Then register the repository if "
+        f"1. If this install has no item store, run `{f['board use']}` with the operator first. Then register the repository if "
         f"it is not known: `{f['board register']}`.",
         "2. Read its existing memory, read-only: `next.md`, `brief.md`, `project_memory/`, status pages, TODO files, the "
         "README and the conventions files.",
         "3. Draft ONE review page (the review-page rule: HTML beside the markdown, with its URL). It holds the charter "
-        "filled from the old memory; the proposed items, each with his words verbatim where the old files carry them, a "
+        "filled from the old memory; the proposed items, each with the operator's words verbatim where the old files carry them, a "
         "DONE line and a `done_kind`; what is not carried, each with its reason; which old paths will be retired; and any "
         "build, test or deploy convention, routed to the repository's conventions file instead of the charter.",
-        "4. He answers in conversation, and edits go back to step 3. His yes, in his words, is what `--words` carries on "
+        "4. The operator answers in conversation, and edits go back to step 3. Their yes, in their words, is what `--words` carries on "
         "`begin-track` and later `track`.",
         f"5. Execute, in this order: first `{f['board begin-track']}`, which locks the repository and prints "
         "`tracking NAME (migration M)`: M is that migration id; then, for each item, "
@@ -906,14 +906,14 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "## The seats' questions (you read them first)",
         "",
         f"`{lv} coord questions {tail}` lists the questions you have not read, each marked MAY ANSWER or ESCALATE. "
-        "Your answer is YOUR OWN, never the operator's: it goes to his review queue as a KNOW, the seat gets it "
-        "labelled as yours, and the question stays open for him. Never answer through the question band's own answer "
-        "verb: that is his channel, and it refuses this session. A question's directory and session are the asking "
+        "Your answer is YOUR OWN, never the operator's: it goes to the operator's review queue as a KNOW, the seat gets it "
+        "labelled as yours, and the question stays open for the operator. Never answer through the question band's own answer "
+        "verb: that is the operator's channel, and it refuses this session. A question's directory and session are the asking "
         "process's own word, so MAY ANSWER (asked from inside the envelope) is a label, not proof.",
         "",
         f"- answer one marked MAY ANSWER, only when its subject is inside the envelope: `{lv} coord answer N "
         f"--option KEY --token N {tail}` (or `--text WORDS`);",
-        f"- leave the rest to him: `{lv} coord escalate N --why WHY --token N {tail}`.",
+        f"- leave the rest to the operator: `{lv} coord escalate N --why WHY --token N {tail}`.",
         "",
         "## The band",
         "",
@@ -922,21 +922,21 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "The band is rendered for you by Levain; you never fetch or recompute it.",
         "",
         "A wake is the exception: your first prompt begins `[levain wake ln-...]`. Nobody is waiting on that turn, so "
-        "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
+        "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs the operator, "
         "file it (`coord escalate`), never narrate it.",
         "",
-        "Words he dropped from the cockpit or the phone have no terminal for your reply, so answer each one you have "
+        "Words the operator dropped from the cockpit or the phone have no terminal for your reply, so answer each one you have "
         f"read with `{lv} coord reply DROP_ID --text-file PATH --token N {tail}` (`--stdin` reads it from stdin; one "
         "reply per drop, within 24 hours). Levain freezes its own block (what changed, and the band) onto that reply "
-        "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
+        "and shows it where the operator reads it; you do not write the block. A drop with no reply after ten minutes shows on "
         "the Desk panel as `no reply yet`.",
         "",
         *_arrival_section(lv, tail),
         *_board_modes_section(lv),
         "## How your turn ends",
         "",
-        "Your words are the last thing in a session the operator may see in his agent view, where a question or "
-        "\"waits on you\" reads as a blocker that reached no surface he answers from. So the last line of your own "
+        "Your words are the last thing in a session the operator may see in their agent view, where a question or "
+        "\"waits on you\" reads as a blocker that reached no surface the operator answers from. So the last line of your own "
         "words, on every turn, is ONE status line beginning `desk:` that says what you did and how many items "
         "you escalated, for example `desk: split d-41 into 2 threads, noted d-42; 1 escalated`. It is never a "
         "message to the operator, never a question, never \"waits on you\". Every escalation goes through the verb "
@@ -947,11 +947,11 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "",
         "## Away and budgets",
         "",
-        f"- when a drop says he is away (\"closing my eyes\"): `{lv} coord away DROP_ID --token N {tail}`. It sets away "
-        "ON only; leaving it is his, signed. While he is away every SIGN waits UNDECIDED for his morning card "
+        f"- when a drop says the operator is away (\"closing my eyes\"): `{lv} coord away DROP_ID --token N {tail}`. It sets away "
+        "ON only; leaving it is the operator's, signed. While the operator is away every SIGN waits UNDECIDED for the operator's morning card "
         f"(`{lv} coord morning {tail}`); you never rule on one.",
         f"- a thread's budget is a gauge (`{lv} coord budget {tail}`): once crossed, no new worker starts for it, and a "
-        "SIGN to extend waits on his morning card. Only his signature extends it.",
+        "SIGN to extend waits on the operator's morning card. Only the operator's signature extends it.",
         "",
         "## The drops waiting",
         "",

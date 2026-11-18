@@ -394,8 +394,8 @@ def pending(tmp_path):
 
 
 def _arrival_section(text):
-    assert "## When he arrives or leaves" in text
-    return text.split("## When he arrives or leaves")[1].split("\n## ")[0]
+    assert "## When the operator arrives or leaves" in text
+    return text.split("## When the operator arrives or leaves")[1].split("\n## ")[0]
 
 
 def test_the_brief_tells_the_desk_to_open_light_first_and_the_walk_order(pending):
@@ -404,7 +404,7 @@ def test_the_brief_tells_the_desk_to_open_light_first_and_the_walk_order(pending
     assert "coord open --light --token N" in sec and "before you reply" in sec
     assert cl.DAY_PARAGRAPH in sec and "back:" in cl.DAY_PARAGRAPH
     assert sec.index("coord away DROP_ID") < sec.index("coord close --plan") < sec.index("coord close --kind rotation|operator")
-    assert text.index("## When he arrives or leaves") < text.index("## How your turn ends")
+    assert text.index("## When the operator arrives or leaves") < text.index("## How your turn ends")
 
 
 def test_the_arrival_section_is_in_the_brief_when_the_open_could_not_be_built(tmp_path):

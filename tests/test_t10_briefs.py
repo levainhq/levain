@@ -181,7 +181,7 @@ def test_the_desk_brief_teaches_the_two_modes_and_the_ceremony_in_order(desk):
     assert "## The work board: two modes" in text and "untracked or tracked" in text
     assert "does not open" not in text
     order = ["\n1. If this install has no item store", "\n2. Read its existing memory", "\n3. Draft ONE review page",
-             "\n4. He answers in conversation", f"\n5. Execute, in this order: first `{lv} board begin-track NAME",
+             "\n4. The operator answers in conversation", f"\n5. Execute, in this order: first `{lv} board begin-track NAME",
              f"for each item, `{lv} board add --repo NAME", "then land `CHARTER.md`",
              f"then `{lv} board track NAME --migration M", "last, copy each old file", "pre-track-<date>/",
              f"`{lv} charter check --repo DIR` reports on the landed charter", f"`{lv} board abandon-track NAME",
@@ -348,7 +348,7 @@ def test_the_brief_ceremony_runs_through_the_door_in_a_desk_workspace(home, mkre
     man = manifest(tmp_path)
     sha = hashlib.sha256(man.read_bytes()).hexdigest()
     # the band row: the question carries the manifest's sha256 (the ceremony verbs check it), the answer holds his words
-    fill["Q-ID"] = _answered_band("yes, his yes: begin and track it; his words: abandon, park and untrack",
+    fill["Q-ID"] = _answered_band("yes, the operator's yes: begin and track it; the operator's words: abandon, park and untrack",
                                   f"Track alpha? manifest sha256 {sha}")
 
     def refused_without_a_source(verb, **kw):
@@ -707,7 +707,7 @@ def test_the_desk_brief_names_the_manifest_verbs_and_the_operator_signed_form():
     assert "For `begin-track` and `track` the question" in text and "the SAME sha256 for both" in text
     assert "`decide` and `abandon-track` carry none" in text and "three ceremony verbs" not in text
     assert "`--by operator --author-kind operator --sign` in place of `--by desk ... --source Q-ID`" in text
-    assert "all but `untrack`: he runs that one at the laptop" in text
+    assert "all but `untrack`: the operator runs that one at the laptop" in text
     assert "prints `tracking NAME (migration M)`" in text
 
 
