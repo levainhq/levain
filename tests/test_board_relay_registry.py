@@ -246,3 +246,9 @@ def test_a_relayed_abandon_whose_answer_changed_is_rewritten_by_a_relayed_rerun(
     assert sum(r["op"] == "abandon-track" for r in reg(store)) == 2
     assert reg(store)[-1]["source"]["answer_sha256"] == br.digest("no, abandon it, and say so twice")
     assert out.startswith("aborting alpha; cut 2 items")
+
+
+def test_the_policy_refusal_names_a_q_id_not_an_np_id(world, capsys):
+    _, _, mf, _, _ = world
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(mf), "--words", "yes", *BY)
+    assert rc == 2 and "--sign" in err and "--source <q-id>" in err and "q-<24 hex>" in err and "np-" not in err

@@ -230,7 +230,7 @@ def test_an_unsigned_decide_is_refused_naming_both_ways(target):
     item = add_item(target)
     with pytest.raises(bs.BoardError) as exc:
         bs.decide(target, item, "parked", "later", "phill", author=OPERATOR, now=NOW)
-    assert "--sign" in str(exc.value) and "--source <np-id>" in str(exc.value)
+    assert "--sign" in str(exc.value) and "--source <q-id>" in str(exc.value) and "<np-id>" not in str(exc.value)
     assert len(items(target)) == 1
 
 
