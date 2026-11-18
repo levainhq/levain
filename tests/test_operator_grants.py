@@ -508,11 +508,18 @@ def test_a_dirmngr_bound_by_another_worker_does_not_reach_this_spawn(rd, grants,
                        f"0000000000000000: 00000002 00000000 00010000 0001 01  9621 {leak}/S.dirmngr\n")
     monkeypatch.setattr(conf, "_ON_LINUX", True)
     monkeypatch.setattr(conf, "_PROC_NET_UNIX", str(listing))
-    assert conf._dirmngr_sockets() == [leak.resolve() / "S.dirmngr"]   # the leak is real: the listing shows it
+    # the check that the leak is real must not read the host's own gnupg places (a dirmngr socket under the real
+    # home or runtime dir would change the list, or refuse it): the default places are pointed at an empty tmp home
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setattr(conf, "_runtime_dirs", lambda: [])
+    assert leak.resolve() / "S.dirmngr" in conf._dirmngr_sockets()   # the leak is real: the listing shows it
     sh = _spawn(tmp_path, monkeypatch, {"PATH": "/usr/bin"})
     sh._canary = None
-    assert str(leak) not in sh._argv
-    sh.close()
+    try:
+        assert not any(str(leak) in a for a in sh._argv)   # no argument names the neighbour's home or its socket
+    finally:
+        sh.close()
 
 
 # --- gnupg's programs ----------------------------------------------------------------------------
