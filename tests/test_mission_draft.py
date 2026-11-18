@@ -4,7 +4,9 @@ A mission draft is one draft series whose proposal binds every child of one miss
 envelope with N binds. Real keys, real scratch git repos, the store's clock a list the test moves (the fixtures are
 H1-1's); the phone-port test at the end uses H1-3's world and its software passkey.
 
-Each invariant test names the revert that made it fail in the lane's return. What no instrument here holds: a person
+Each invariant test names, in a ``# guard:`` comment, the guard whose removal makes it fail; the mutation run and the
+red line for each are in project_memory/1118-22_lanes/h15_lane1_return.md and h15_fix1_return.md. I4's two
+FOREIGN-KEY tables have no revert of their own (see that test). What no instrument here holds: a person
 reading the sheet that lists the threads, and signing it on the installed build."""
 from __future__ import annotations
 
@@ -30,6 +32,8 @@ from levain.desk.store import CoordError, Part, Source
 from tests.test_desk_envelope import BUDGET, HOUR, NOW
 from tests.test_desk_envelope_draft import (  # noqa: F401  (fixtures)
     built, cites_for, ctx, fields_for, keys, make, repo, snapshot)
+from tests.test_spec_card import card, counts, propose, spec_text  # noqa: F401  (fixture)
+from tests.test_spec_card import tap as card_tap
 
 
 def mission_of(ctx, n=3, words="land the readme change in three parts"):
@@ -122,6 +126,7 @@ def test_a_per_thread_kill_stops_one_child_and_leaves_two_live(ctx):
 
 
 def test_a_thread_attached_after_signing_is_not_bound(ctx):
+    # guard: EnvelopeStore._store_refusal's "not bound" (I3)
     d, ts, m, dr, stored = signed_mission(ctx, 3)
     u = new_work_thread(ctx)
     missions.attach(ctx.store, m.mission_id, u.thread_id)
@@ -185,6 +190,22 @@ def _lease_token(ctx):
     return _lease(ctx.store)
 
 
+@pytest.mark.parametrize("holder", [0, -1], ids=["only the anchor holds it", "only the last child holds it"])
+def test_a_cite_held_by_one_child_only_is_refused(ctx, holder):
+    """A drop in ONE child: a check that reads only the first bind passes it when the anchor holds it, one that reads
+    only the last passes it when the last child does; the guard reads every bind."""
+    # guard: envelope_drafts._check_cites_against loops over every bind (not binds[:1] / binds[-1:])
+    d, ts, m = mission_of(ctx, 3)
+    late = late_drop(ctx, "a drop attached to one child only")
+    ctx.store.split(late.drop_id, [Part("work", attach=ts[holder].thread_id)])
+    f = fields_for(ctx)
+    bad = [{**c, "ref": late.drop_id, "digest": late.words_sha256} if c["field"] == "where" else c
+           for c in cites_for(d, f)]
+    with pytest.raises(CoordError, match="not in this thread and is not newer"):
+        drafts.create_mission_draft(ctx.store, m.mission_id, f, bad, by="operator")
+    assert count(ctx, "envelope_drafts") == 0
+
+
 def test_a_cite_must_hold_for_every_bound_thread(ctx):
     d, ts, m = mission_of(ctx, 3)
     elsewhere = new_work_thread(ctx, "a drop in no child").thread_id
@@ -225,7 +246,8 @@ def test_the_link_is_append_only_and_names_a_series(ctx):
 GOLDEN_DIGEST = "sha256:d31266e9456ae750cd21a029ee894b41daf5cb9f5c7957e3e1a7a9ba33d2da4b"   # read from origin/main's code
 
 
-def test_a_one_thread_draft_is_byte_identical_to_the_one_before_this_lane(ctx):
+def test_the_draft_digest_is_pinned_and_a_one_thread_draft_writes_one_bind_and_no_link(ctx):
+    # the golden digest guards the NEXT lane's change to draft_digest; the second half is this lane's regression check
     proposal = {"format": env.BODY_FORMAT, "store_id": "0" * 32, "envelope_id": "ev-" + "1" * 32, "origin": "worded",
                 "drop_id": "dr-" + "2" * 32, "words_sha256": "sha256:" + "3" * 64,
                 "binds": [{"thread_id": "th-" + "4" * 32, "rev": 1, "members_sha256": "sha256:" + "5" * 64}],
@@ -250,6 +272,7 @@ def test_i1_no_sequence_of_narrowings_is_wider_than_the_signed_body(ctx):
     """I1 and I2 over a seeded random sequence of ``attenuate`` calls (the three kinds, envelope-wide and per thread,
     refused ones included): every child's effective grant is never wider than the signed body, and never wider than
     it was before the call. A call the store refuses writes nothing."""
+    # guard: the `at > _stop` refusal in EnvelopeStore._attenuate (red at "a later stop was taken"); I2 is below
     d, ts, m, dr, stored = signed_mission(ctx, 3)
     eid, body = stored.envelope_id, stored.body
     stop = parse_stamp(body["stop_at"])
@@ -296,6 +319,7 @@ def test_i1_no_sequence_of_narrowings_is_wider_than_the_signed_body(ctx):
 
 
 def test_i1_a_later_stop_is_refused_in_plain_words_and_writes_nothing(ctx):
+    # guard: _attenuate's `at > _stop` refusal and its "identity the body holds" check for drop_effect
     d, ts, m, dr, stored = signed_mission(ctx, 3)
     later = utc_stamp(parse_stamp(stored.body["stop_at"]) + timedelta(hours=1))
     for scope in (None, ts[1].thread_id):
@@ -308,8 +332,56 @@ def test_i1_a_later_stop_is_refused_in_plain_words_and_writes_nothing(ctx):
         assert ctx.store.effective(stored.envelope_id, t.thread_id)["stop_at"] == stored.body["stop_at"]
 
 
+# --- I2: monotone over time ---------------------------------------------------------------------------------------
+def test_i2_the_narrowing_record_only_grows_and_never_records_a_later_stop(ctx):
+    """I2 as the store holds it: ``effective`` is computed from the signed body and the ``envelope_attenuations`` rows,
+    so it can only widen if a row is changed or removed, or a row records a stop later than the one in force when it
+    was written. Neither the MIN in ``_stop`` nor the I1 loop above can see either; this test reads the record."""
+    # guards: ENVELOPE_SCHEMA's _append_only("envelope_attenuations"), and the `at > _stop` refusal in _attenuate
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+    eid, stop = stored.envelope_id, parse_stamp(stored.body["stop_at"])
+    for minutes, scope in ((-30, None), (+60, ts[1].thread_id), (-40, ts[1].thread_id), (+10, None), (-50, None)):
+        try:
+            ctx.store.attenuate(eid, "stop_earlier", utc_stamp(stop + timedelta(minutes=minutes)), thread_id=scope)
+        except CoordError:
+            pass
+    # replay the record in its own order: every stop row is at or before the stop in force for its scope when written
+    wide, own = stop, {}
+    for tid, kind, value in ctx.rows(f"SELECT thread_id, kind, value FROM envelope_attenuations "
+                                     f"WHERE envelope_id = '{eid}' ORDER BY gseq"):
+        at = parse_stamp(value)
+        current = wide if tid is None else min(wide, own.get(tid, stop))
+        assert at <= current, f"the record holds a stop later than the one in force: {value} ({tid})"
+        if tid is None:
+            wide = at
+        else:
+            own[tid] = at
+    assert count(ctx, "envelope_attenuations") == 3
+    conn = sqlite3.connect(ctx.store.path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE envelope_attenuations SET value = ?", (stored.body["stop_at"],))
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM envelope_attenuations")
+    finally:
+        conn.close()
+    for t in ts:
+        assert ctx.store.effective(eid, t.thread_id)["stop_at"] == utc_stamp(stop + timedelta(minutes=-50))
+
+
 # --- I3: no new heirs -----------------------------------------------------------------------------------------------
+def test_i3_the_signed_envelopes_own_drop_cannot_be_split_again(ctx):
+    """``bind_on_split`` is the one store path that binds an envelope on a split, and it runs only at a drop's FIRST
+    split (``_split_done``). A worded envelope's drop is a member of every thread it binds, so it was split before it
+    could be signed: a new split of it, the one input that path would read for this envelope, is refused."""
+    # guard: CoordStore.split's "already split" refusal (bind_on_split's drop.envelope_id early return is behind it)
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+    threads = count(ctx, "threads")
+    with pytest.raises(CoordError, match="is already split"):
+        ctx.store.split(d.drop_id, [Part("work", "the same drop again")])
+    assert (count(ctx, "envelope_binds"), count(ctx, "threads")) == (3, threads)
 def test_i3_no_regrouping_changes_who_the_envelope_binds(ctx):
+    # guard: EnvelopeStore._store_refusal's "not bound" for a thread the envelope does not bind
     d, ts, m, dr, stored = signed_mission(ctx, 3)
     eid = stored.envelope_id
     outsider = new_work_thread(ctx)
@@ -340,27 +412,54 @@ def test_i3_no_regrouping_changes_who_the_envelope_binds(ctx):
 
 
 # --- I4: a draft grants nothing -------------------------------------------------------------------------------------
-def test_i4_a_mission_draft_writes_no_envelope_and_no_bind(ctx):
-    """The writer, a revision, the rules, the card read, the sign builder and a withdrawal write zero rows to
-    ``envelopes``, ``envelope_binds`` and ``envelope_attenuations``. (The room's card tap is not built in this lane.)"""
+def test_i4_a_mission_draft_writes_no_envelope(ctx):
+    """The writer, a revision, the card read, the sign builder and a withdrawal write zero rows to ``envelopes``. (The
+    one-thread rules are refused on a mission's series: see the W2 test below.) ``envelope_binds`` and
+    ``envelope_attenuations`` are NOT counted on their own: each has a FOREIGN KEY to ``envelopes``, so a zero there
+    is implied by this one count and no revert can fail it separately; the test pins the keys instead."""
+    # guard: the draft writers never call accept_envelope (the only writer of an envelopes row)
     d, ts, m = mission_of(ctx, 3)
     queue = ctx.tmp / "queue"
     queue.mkdir()
     dr = mission_draft(ctx, m, d)
     f = fields_for(ctx, budget={**BUDGET, "hours": 1})
     r2 = drafts.revise(ctx.store, dr.draft_id, f, cites_for(d, f), parent=dr.digest, by="operator")
-    r3 = drafts.drop_rule(ctx.store, ts[0].thread_id, by="operator")
-    assert r3.draft_id == dr.draft_id and r3.proposal["binds"] == dr.proposal["binds"]
-    spec = ctx.plain(json.dumps({"stop": "1h"}))
-    r4 = drafts.spec_rule(ctx.store, ts[0].thread_id, spec.drop_id, by="operator")
-    assert r4.draft_id == dr.draft_id and len(r4.proposal["binds"]) == 3
     for t in ts:
         drafts.cards(ctx.store, t.thread_id, authority=ctx.snap, queue_dir=queue)
-    built(ctx, r4)
+    built(ctx, r2)
     drafts.withdraw(ctx.store, dr.draft_id)
-    assert r2.revision == 2 and r4.revision == r3.revision + 1
-    for table in ("envelopes", "envelope_binds", "envelope_attenuations"):
-        assert count(ctx, table) == 0, table
+    assert r2.revision == 2 and count(ctx, "envelopes") == 0
+    for table in ("envelope_binds", "envelope_attenuations"):
+        keys_to = {r[2] for r in ctx.rows(f"PRAGMA foreign_key_list({table})")}
+        assert "envelopes" in keys_to, table
+
+
+# --- W2: a one-thread change never revises a mission's series --------------------------------------------------------
+def test_a_one_thread_tap_or_rule_on_a_mission_anchor_is_refused_and_writes_nothing(card):
+    """Reproduced first (h15_fix1_return.md): before the guard, a spec card tap on the anchor thread, and drop_rule on
+    it, each wrote revision 2 of the 3-bind series. The one-thread writer now refuses a series that binds several
+    threads; revise() still revises it whole."""
+    # guard: envelope_drafts._write_revision refuses a series with more than one bind (or a mission_drafts row)
+    ctx = card.ctx
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    words = spec_text(ctx, stop="1h")
+    p = propose(card, ts[0].thread_id, words)
+    before = counts(card.store)
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        card_tap(card, p, words)
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        drafts.drop_rule(ctx.store, ts[0].thread_id, by="operator")
+    assert counts(card.store) == before
+    spec = ctx.plain(json.dumps({"stop": "1h"}))
+    before = counts(card.store)                                          # with the spec drop this test sent itself
+    with pytest.raises(CoordError, match="is a mission's draft and binds 3 threads"):
+        drafts.spec_rule(ctx.store, ts[0].thread_id, spec.drop_id, by="operator")
+    assert counts(card.store) == before
+    assert drafts.latest(ctx.store, dr.draft_id).revision == 1
+    f = fields_for(ctx, budget={**BUDGET, "hours": 1})
+    r2 = drafts.revise(ctx.store, dr.draft_id, f, cites_for(d, f), parent=dr.digest, by="operator")
+    assert r2.revision == 2 and len(r2.proposal["binds"]) == 3
 
 
 # --- I5: stale is refused -------------------------------------------------------------------------------------------
@@ -385,6 +484,7 @@ def _gained_a_head(ctx, d, ts, m):
                          ids=["child attached", "child detached", "child revision moved", "child gained a head"])
 def test_i5_a_signature_over_a_stale_mission_draft_is_refused_and_writes_nothing(ctx, move):
     """The change is made to the LAST child by id, never the anchor, so a check that reads only the first bind passes it."""
+    # guard: lapse_reason's L4 call (attached, detached) and its loop over EVERY bind (revision moved, gained a head)
     d, ts, m = mission_of(ctx, 3)
     dr = mission_draft(ctx, m, d)
     signed, _since, _against = built(ctx, dr)                            # rendered and signed before the change
@@ -404,6 +504,7 @@ def test_i5_a_signature_over_a_stale_mission_draft_is_refused_and_writes_nothing
 def test_i5_a_mission_that_moved_and_came_back_still_lapses(ctx):
     """Attach then detach leaves the children as they were, but the mission is two revisions on: the link compares the
     revision as well as the children's hash."""
+    # guard: the `now_rev != rev` compare in envelope_drafts._mission_lapse_of
     d, ts, m = mission_of(ctx, 3)
     dr = mission_draft(ctx, m, d)
     u = new_work_thread(ctx)
@@ -413,9 +514,47 @@ def test_i5_a_mission_that_moved_and_came_back_still_lapses(ctx):
     assert drafts.state_of(ctx.store, dr.draft_id).kind == "lapsed"
 
 
+def test_i5_a_mission_that_moves_after_preflight_is_refused_under_the_write_lock(ctx, monkeypatch):
+    """The preflight reads the draft before the signature check; a child attached after it and before the write lock is
+    caught only by the re-check under the lock (design T2)."""
+    # guard: EnvelopeStore._draft_admit (admit_check under the write lock) in accept_envelope
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    signed, _since, _against = built(ctx, dr)
+    real = EnvelopeStore._draft_rederive
+    moved = []
+
+    def rederive_then_move(self, body):
+        real(self, body)                                   # runs after the preflight passed, outside the lock
+        if not moved:
+            moved.append(missions.attach(ctx.store, m.mission_id, new_work_thread(ctx).thread_id))
+
+    monkeypatch.setattr(EnvelopeStore, "_draft_rederive", rederive_then_move)
+    with pytest.raises(DraftStale, match="mission .* changed since this series was written"):
+        ctx.accept(signed)
+    assert moved and (count(ctx, "envelopes"), count(ctx, "envelope_binds")) == (0, 0)
+
+
+def test_l4_a_revision_that_binds_other_threads_than_the_mission_children_is_lapsed(ctx):
+    """No writer makes this (the binds are the children read under the lock), so it is built by hand: the same series
+    and an unmoved mission, a proposal binding two of its three children."""
+    # guard: the "binds equal the mission's children" half of envelope_drafts._mission_lapse
+    d, ts, m = mission_of(ctx, 3)
+    dr = mission_draft(ctx, m, d)
+    short = {**dr.proposal, "binds": dr.proposal["binds"][:2]}
+    conn = ctx.store.open_readonly()
+    try:
+        assert drafts.lapse_reason(conn, utc_stamp(NOW), ts[0].thread_id, dr.proposal, draft_id=dr.draft_id) is None
+        assert "does not bind exactly mission" in drafts.lapse_reason(conn, utc_stamp(NOW), ts[0].thread_id, short,
+                                                                      draft_id=dr.draft_id)
+    finally:
+        conn.close()
+
+
 def test_a_multi_bind_draft_that_supersedes_anything_is_lapsed(ctx):
     """In this build a mission envelope covers children that hold no envelope: a proposal that binds several threads and
     names a head to supersede is refused by the one lapse check every reader and the acceptance share."""
+    # guard: lapse_reason's `len(binds) > 1 and sup is not None` refusal
     d, ts, m = mission_of(ctx, 3)
     dr = mission_draft(ctx, m, d)
     forged = {**dr.proposal, "supersedes": {"envelope_id": "ev-" + "a" * 32, "digest": "sha256:" + "b" * 64, "seen": 0}}

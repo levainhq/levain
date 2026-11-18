@@ -1,11 +1,12 @@
 """levain.desk.envelope_draft — the signed draft envelope's record, digest and shapes (H1-1), pure.
 
 A DRAFT is one attempt to get one envelope signed for one thread, or for the children of one mission (its proposal then
-binds each, and the ``mission_drafts`` table links the series to the mission): a SERIES (``ed-`` + 32 hex) of REVISIONS 1..N, each
-a proposal (an envelope body without its ``draft`` key, whose editable values may still be ``null``) plus the records
-it cites. A signature over the revision's body covers the draft's id, revision and digest (the body's ``draft`` key),
-so one signature commits the exact digest he saw: a revision written after the render is another digest, and the store
-refuses a signature over the old one (:mod:`levain.desk.envelope_drafts`, :meth:`EnvelopeStore.accept_envelope`).
+binds each, and the ``mission_drafts`` table links the series to the mission): a SERIES (``ed-`` + 32 hex) of
+REVISIONS 1..N, each a proposal (an envelope body without its ``draft`` key, whose editable values may still be
+``null``) plus the records it cites. A signature over the revision's body covers the draft's id, revision and digest
+(the body's ``draft`` key), so one signature commits the exact digest he saw: a revision written after the render is
+another digest, and the store refuses a signature over the old one (:mod:`levain.desk.envelope_drafts`,
+:meth:`EnvelopeStore.accept_envelope`).
 
 This module holds what needs no store: the tables and their triggers (:data:`ENVELOPE_DRAFT_SCHEMA`), the shape
 checks of a proposal and its cites, the digest (:func:`draft_digest`) and the two diffs a signer is shown. A cite is a

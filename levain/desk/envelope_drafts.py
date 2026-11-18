@@ -37,9 +37,9 @@ from levain.desk.legacy import ROLE_DESK
 
 __all__ = [
     "AgainstHead", "AuthorityFacet", "Card", "Draft", "DraftStale", "DraftState", "HeadState", "RULES",
-    "admit_check", "authority_facet", "cards", "cite_label", "create", "create_mission_draft", "draft_sign_bytes", "drop_rule", "head_state",
-    "label", "latest", "lapse_reason", "parse_spec", "rederive_check", "render_spec", "SpecRefused", "renew_rule",
-    "replace_rule", "revise", "spec_rule",
+    "admit_check", "authority_facet", "cards", "cite_label", "create", "create_mission_draft", "draft_sign_bytes",
+    "drop_rule", "head_state", "label", "latest", "lapse_reason", "parse_spec", "rederive_check", "render_spec",
+    "SpecRefused", "renew_rule", "replace_rule", "revise", "spec_rule",
     "state_of", "unclosed_series", "withdraw",
 ]
 
@@ -205,8 +205,9 @@ def lapse_reason(conn: sqlite3.Connection, now: str, thread_id: str, proposal: M
     (the predicate acceptance runs for every superseding body); a proposal that binds several threads supersedes
     nothing, so a head on any of them lapses it. L3: a stop with less than :data:`~envelope_draft.MIN_LEFT` left. L4
     (``draft_id`` given, and the series has a ``mission_drafts`` row): the mission moved since the series was written,
-    by a child attached or detached. Every bind is read through its own thread (``thread_id`` is the series' anchor,
-    the first bind). Shared by the writers (born open), the readers, the sign builder and acceptance."""
+    by a child attached or detached. Every bind is read through its own thread; ``thread_id`` is not read (callers
+    still pass the series' thread; no check here depends on it). Shared by the writers (born open), the readers, the
+    sign builder and acceptance."""
     binds = proposal["binds"]
     sup = proposal["supersedes"]
     if len(binds) > 1 and sup is not None:
@@ -407,8 +408,8 @@ def _sorted(cites: Any) -> Any:
 def _mission_children(store: EnvelopeStore, conn: sqlite3.Connection, mission_id: str) -> tuple[int, str, list[Any]]:
     """``(mission revision, children hash, the children's threads sorted by id)`` of a mission as the lock holds it, or
     the refusal: fewer than two children (one is a plain thread draft), a child that is not an open work thread, a
-    child that already has a head (a mission is signed only over children that hold no envelope yet), a child with no
-    drops, or children that share no drop (worded as ``cli.run_envelope_echo`` words the last two)."""
+    child that already has a head (a mission is signed only over children that hold no envelope yet), or a child with
+    no drops. Children that share no drop are refused later, by :func:`_shared_drop`."""
     try:
         rev, children, sha = ms._latest(conn, mission_id)
     except sqlite3.OperationalError:
@@ -447,8 +448,16 @@ def _write_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: str, *,
     """One revision, inside the caller's write transaction. ``draft_id`` None starts a series (revision 1); otherwise
     the next revision of that series, whose latest digest must be ``parent``. ``carry`` keeps the parent's values and
     cites for every field ``fields`` leaves unnamed (a rule's rebase). Everything but the editable values is filled
-    from what the lock holds; the revision is checked to its shape, to every cite and to being born open. A series that
-    has a ``mission_drafts`` row takes its next revision through :func:`_write_series_revision` as a mission's."""
+    from what the lock holds; the revision is checked to its shape, to every cite and to being born open. This is the
+    ONE-THREAD writer (a card tap, a rule): a series that binds several threads (a mission's) is refused here with
+    nothing written, since a change read from one thread would rewrite every child's draft; :func:`revise` revises a
+    mission's series as a whole."""
+    if draft_id is not None:
+        series = _row(conn, draft_id)
+        if series is not None and (len(series.proposal["binds"]) > 1 or _mission_link(conn, draft_id) is not None):
+            raise CoordError(f"draft {draft_id} is a mission's draft and binds {len(series.proposal['binds'])} "
+                             f"threads; a change for thread {thread_id} alone cannot revise it, and nothing was "
+                             "written. Revise the mission's draft as a whole, or withdraw it first.")
     return _write_series_revision(store, conn, now, thread_id=thread_id, mission_id=None, draft_id=draft_id,
                                   fields=fields, cites=cites, parent=parent, by=by, carry=carry, stop_span=stop_span)
 
@@ -470,7 +479,11 @@ def _write_series_revision(store: EnvelopeStore, conn: sqlite3.Connection, now: 
     """The one writer behind :func:`_write_revision` (``thread_id``) and :func:`_write_mission_revision`
     (``mission_id``)."""
     link = _mission_link(conn, draft_id)
+    if mission_id is not None and draft_id is not None and link is None:
+        raise CoordError(f"draft {draft_id} is not mission {mission_id}'s draft")       # never written linkless
     if link is not None:
+        if mission_id not in (None, link[0]):
+            raise CoordError(f"draft {draft_id} is mission {link[0]}'s draft, not mission {mission_id}'s")
         mission_id = link[0]
         moved = _mission_lapse_of(conn, link)
         if moved is not None:
@@ -578,8 +591,10 @@ def revise(store: EnvelopeStore, draft_id: str, fields: Mapping[str, Any], cites
         newest = _row(conn, draft_id)
         if newest is None:
             raise CoordError(f"no draft {draft_id}")
-        return _write_revision(store, conn, now, thread_id=newest.thread_id, draft_id=draft_id, fields=fields,
-                               cites=cites, parent=parent, by=by)
+        # the series' own writer, not the one-thread one: a mission's series is revised whole (its link selects that)
+        return _write_series_revision(store, conn, now, thread_id=newest.thread_id, mission_id=None,
+                                      draft_id=draft_id, fields=fields, cites=cites, parent=parent, by=by,
+                                      carry=False, stop_span=None)
 
 
 def withdraw(store: EnvelopeStore, draft_id: str, *, by: str = "operator", expect_revision: int | None = None) -> int:
@@ -929,6 +944,7 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
         parent = _row(conn, draft_id, revision - 1) if revision > 1 else None
         since = ed.field_diff(None if parent is None else parent.proposal, d.proposal)
         head = store._head(conn, d.thread_id)
+        # ANCHOR-ONLY: binds[0] is d.thread_id's own bind (a mission series' anchor is its first child)
         bind_rev = d.proposal["binds"][0]["rev"]
         ended = effective = None
         added: list[str] = []
@@ -1074,6 +1090,7 @@ def _with_words(conn: sqlite3.Connection, ids: list[str]) -> list[dict[str, str]
 
 def _view_inputs(store: EnvelopeStore, conn: sqlite3.Connection, d: Draft, head: Any) -> dict[str, Any]:
     """What an ENVELOPE card shows about an open draft, read in the snapshot's transaction."""
+    # ANCHOR-ONLY: binds[0] is d.thread_id's own bind (a mission series' anchor is its first child)
     bind_rev = d.proposal["binds"][0]["rev"]
     parent = _row(conn, d.draft_id, d.revision - 1) if d.revision > 1 else None
     effective: dict[str, Any] | None = None
@@ -1252,8 +1269,9 @@ def _envelope_card(store: EnvelopeStore, s: _Snap, hs: HeadState) -> Card:
 def cards(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot, queue_dir: Any) -> list[Card]:
     """The card a thread shows now (none, or one): ENVELOPE while a draft is open; else REVOKED (killed, key, or a
     reopened thread whose head ended: ``replace`` and ``close``, NEVER ``extend``); else LAPSED (``extend`` and
-    ``close``; a budget that cannot be metered, beside any other lapse, offers only ``close``). A done or closed thread shows none: its work
-    facet is review. Reading creates nothing, and files no SIGN record (the budget lapse IS the existing one)."""
+    ``close``; a budget that cannot be metered, beside any other lapse, offers only ``close``). A done or closed
+    thread shows none: its work facet is review. Reading creates nothing, and files no SIGN record (the budget lapse IS
+    the existing one)."""
     s = _snapshot(store, thread_id, queue_dir, view=True)
     hs = _classify(store, s, _key_refusal(store, s, authority))
     if s.thread.state in ("done", "closed"):
