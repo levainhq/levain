@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -836,7 +837,7 @@ def _now(clock: Callable[[], datetime]) -> datetime:
     return now
 
 
-_SIGN_TIMEOUT = 120.0          # a touch-required key waits on a person
+_SIGN_TIMEOUT = 120.0          # a touch-required key waits on a person: the whole sign step's bound, retry included (ssh_signer)
 _PUBLIC_KEY_MAX = 16 * 1024
 
 
@@ -863,6 +864,9 @@ def signing_public_key(key_path: Path) -> str:
 
 
 _SK_RETRIES = 1                # a security-key answer that does not verify is asked for once more, never twice (levain#125)
+# a second touch is asked for only while at least this much of the ONE sign bound is left: the sheet comes up at once and a
+# touch takes a second or two, so 5 s is a real chance; any less and the person would be shown a sheet that closes under them
+_SK_RETRY_MIN_S = 5.0
 _SIGN_FAILURE_KEEP = 20        # evidence files kept per key directory; older ones are deleted when a new one is written
 _SIGN_FAILURE_DIR = "sign-failures"
 _SIGN_FAILURE_PREFIX = "sigfail-"
@@ -881,38 +885,78 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
                         counter: int | None, detail: str, namespace: str, attempt: int) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
-    (it has no data root or diagnostics directory of its own). The last :data:`_SIGN_FAILURE_KEEP` are kept; older
-    ones are deleted. The file holds the armored signature, its flags byte and counter, BOTH ssh-keygen verdicts
-    (``detail``), the key fingerprint and the time.
+    (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
+    ones are deleted (:func:`_prune_sign_failures`). The file holds the armored signature, its flags byte and counter,
+    BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time.
 
-    It holds the message's sha256 and NEVER the message: the message is what a person was asked to authorise
-    (a consent answer, a ruling's words), and a diagnostics file that sat on disk would become a second, unguarded copy of
-    it. The hash is enough to tie the file to the message the caller still holds, and the armored signature is enough to
-    re-run ``check-novalidate`` once that message is in hand. Returns the path, or ``evidence not written (why)``: a
-    diagnostic never changes whether a sign is refused."""
+    The directory is trusted only as this uid's own 0700 directory, opened without following a symlink, and every
+    write and prune goes through that one open descriptor; anything else (a symlink, another owner, a looser or
+    tighter mode) and nothing is written there.
+
+    No message bytes are stored: the message is what a person was asked to authorise (a consent answer, a ruling's
+    words), and a diagnostics file on disk must not be a second copy of it. What IS stored is the message's sha256 and
+    its length, the comparison key the failure analysis needs (it ties the file to the message the caller holds, and
+    with the armored signature lets ``check-novalidate`` be re-run once that message is in hand). The hash is not a
+    secret: whoever can read this file and can guess the message (a short answer, a known template) can confirm the
+    guess offline. Returns the path, or ``evidence not written (why)``: a diagnostic never fails a sign and never
+    replaces the refusal's own text."""
+    dfd = None
     try:
         directory = Path(key_path).parent / _SIGN_FAILURE_DIR
-        directory.mkdir(mode=0o700, exist_ok=True)
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        if os.path.islink(directory):
+            return f"evidence not written ({directory} is a symlink)"
+        # O_NOFOLLOW on the directory itself, so a symlink swapped in after the check above is refused, not followed
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        st = os.fstat(dfd)
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+            return (f"evidence not written ({directory} is not this user's 0700 directory: "
+                    f"mode {stat.S_IMODE(st.st_mode):04o}, uid {st.st_uid})")
         now = datetime.now(timezone.utc)
         record = {"format": "levain-sign-failure/1", "time": now.isoformat(), "fingerprint": fp, "namespace": namespace,
                   "algorithm": sig_type, "flags": format(flags, "#04x"), "counter": counter, "attempt": attempt,
                   "message_sha256": hashlib.sha256(message).hexdigest(), "message_bytes": len(message),
                   "ssh_keygen": detail, "signature": signature}
         body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
-        stem = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid()}-{attempt}"
-        path = directory / f"{stem}.json"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
+        name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
         with os.fdopen(fd, "wb") as fh:
             fh.write(body)
-        mine = sorted(p for p in directory.iterdir() if p.name.startswith(_SIGN_FAILURE_PREFIX) and p.suffix == ".json")
-        for old in mine[:max(0, len(mine) - _SIGN_FAILURE_KEEP)]:
-            try:
-                old.unlink()
-            except OSError:
-                pass
-        return str(path)
+        _prune_sign_failures(dfd, just_written=name)
+        return str(directory / name)
     except Exception as exc:  # noqa: BLE001 - the evidence is a courtesy; the refusal is the point
         return f"evidence not written ({type(exc).__name__}: {getattr(exc, 'strerror', None) or exc})"
+    finally:
+        if dfd is not None:
+            os.close(dfd)
+
+
+def _prune_sign_failures(dfd: int, *, just_written: str) -> None:
+    """Keep the newest :data:`_SIGN_FAILURE_KEEP` evidence files in the directory open as ``dfd``, counting
+    ``just_written``, which is never deleted (a clock stepped back can sort it oldest). Only regular files named
+    ``sigfail-*.json`` that this uid owns are counted or deleted; a symlink, a directory or another owner's file is left
+    alone. A file another sign removed first is skipped: the prune never fails the write it follows."""
+    uid = os.getuid()
+    ours = []
+    for name in os.listdir(dfd):
+        if name == just_written or not (name.startswith(_SIGN_FAILURE_PREFIX) and name.endswith(".json")):
+            continue
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_uid == uid:
+            ours.append(name)
+    ours.sort()
+    for name in ours[:max(0, len(ours) - (_SIGN_FAILURE_KEEP - 1))]:
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except OSError:
+            pass
 
 
 def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
@@ -928,8 +972,12 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     still wins. A passphrase key (its sidecar says so, or its file is encrypted) is always signed from the
     file with no agent, so ssh-keygen asks the passphrase for every signature and nothing caches it.
 
-    ``timeout`` bounds one signature's wait in seconds; ``None`` keeps the module default. It was added so a
-    caller that wants a shorter bound for its own signer does not have to change the module's global."""
+    ``timeout`` (seconds; ``None`` keeps :data:`_SIGN_TIMEOUT`) is ONE deadline for the whole of a ``sign`` call,
+    its retry included: ``sign`` below says how it is shared. A caller budgets for it once. It was added so a caller
+    that wants a shorter bound for its own signer does not have to change the module's global.
+
+    A security-key answer that does not verify leaves an evidence file (:func:`_write_sign_failure`, under
+    ``<key dir>/sign-failures``) and may be asked for once more (:data:`_SK_RETRIES`)."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
     public_key = signing_public_key(key_path)
@@ -942,15 +990,35 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         """One signature over ``message``. A security-key (sk-*) answer that does not verify is asked for ONCE more (a
         new sign over the same message, so a second touch); that retry loop is these few lines and nothing else: the
         bound is :data:`_SK_RETRIES`, a constant, and ``_once`` itself never retries. Everything else (a cancel, a
-        timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt."""
-        first = _once(message, 1)
+        timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt.
+
+        Every attempt shares ONE deadline, ``timeout`` from now: the first gets all of it, a retry gets only what is
+        left, and no retry is asked for once less than :data:`_SK_RETRY_MIN_S` is left. So the sign step never waits
+        longer than the bound a caller budgeted for, however many attempts it took. If the retry fails some other way
+        (cancelled, timed out), its own error is raised with the first attempt's flags and evidence named after it."""
+        bound = _SIGN_TIMEOUT if timeout is None else timeout
+        deadline = time.monotonic() + bound
+        first = _once(message, 1, bound)
         if isinstance(first, str):
             return first
         failed = [first]
         for n in range(_SK_RETRIES):
+            left = deadline - time.monotonic()
+            if left < _SK_RETRY_MIN_S:
+                a = failed[0]
+                raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({a.carried}; {a.detail}; "
+                                f"{a.evidence}), and no second touch was asked for: {max(left, 0.0):.1f}s of the "
+                                f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s, so nothing was signed")
             # stderr is the terminal's, where the touch prompt already goes; the words say what happened, not that it is safe
             print("the key's answer did not check out; touch again", file=sys.stderr, flush=True)
-            again = _once(message, n + 2)
+            try:
+                again = _once(message, n + 2, left)
+            except KeyError_ as exc:
+                # the retry's own words first (terminal_sign._classify reads them), then what attempt 1 left behind;
+                # attempt 1's ssh-keygen verdicts stay in its evidence file, so no verdict text can misfile this one
+                a = failed[0]
+                raise KeyError_(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
+                                f"{a.evidence})") from None
             if isinstance(again, str):
                 return again
             failed.append(again)
@@ -961,9 +1029,10 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                         f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.detail}; {b.evidence}); "
                         "so nothing was signed")
 
-    def _once(message: bytes, attempt: int) -> "str | _SkRefusal":
-        """One ``ssh-keygen -Y sign`` and its check: the signature, a :class:`_SkRefusal` for an sk signature that
-        presence-checks but does not verify (the one retryable failure), or a raised :class:`KeyError_`."""
+    def _once(message: bytes, attempt: int, wait_s: float) -> "str | _SkRefusal":
+        """One ``ssh-keygen -Y sign`` (waiting at most ``wait_s``, the part of the deadline ``sign`` hands it) and its
+        check: the signature, a :class:`_SkRefusal` for an sk signature that presence-checks but does not verify (the
+        one retryable failure), or a raised :class:`KeyError_`."""
         from levain.launch import child_env
 
         # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
@@ -977,7 +1046,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         try:
             cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", namespace],
                                 input=message, stdout=subprocess.PIPE,
-                                timeout=_SIGN_TIMEOUT if timeout is None else timeout, check=False, env=env)
+                                timeout=wait_s, check=False, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
         elapsed = time.monotonic() - started       # the sign step alone, never the verify below

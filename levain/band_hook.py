@@ -31,10 +31,10 @@ from typing import Any
 MODULE = "levain.band_hook"
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
 # The harness's kill bound for every UserPromptSubmit hook that can run band_view.hook_prompt (TERMSIGN L2): the
-# band's own worst turn (store read, a sign step bounded by terminal_sign.SIGN_BOUND_S waiting on a touch, the write,
-# the render) plus the codex install wrapper's bounded calls around it. Killed inside that window, an answer can be
-# recorded with no echo, or a Touch ID sheet left open. The codex template carries the same number; a test asserts it
-# for every install path and asserts the arithmetic.
+# band's own worst turn (store read, a sign step bounded AS A WHOLE by terminal_sign.SIGN_BOUND_S however many touches
+# it asks for (keys.ssh_signer), the write, the render) plus the codex install wrapper's bounded calls around it. Killed
+# inside that window, an answer can be recorded with no echo, or a Touch ID sheet left open. The codex template carries
+# the same number; a test asserts it for every install path and asserts the arithmetic with the sign step MEASURED.
 PROMPT_HOOK_TIMEOUT_S = 45
 _TIMEOUT = {"SessionStart": 30, "UserPromptSubmit": PROMPT_HOOK_TIMEOUT_S, "Stop": 10}
 _MATCHER = "startup|resume|clear|compact"          # the install's own SessionStart matcher

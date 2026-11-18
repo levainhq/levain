@@ -717,8 +717,10 @@ def test_a_credential_named_outside_the_form_answers_under_its_own_viewer(store,
     assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
 
 
-def test_a_duplicate_waits_longer_than_a_touch_can_take():
-    assert desk_click._WAIT_S > ts.SIGN_BOUND_S
+def test_a_duplicate_waits_longer_than_a_touch_can_take(tmp_path):
+    # the sign step measured through the real signer, retry included (levain#125 fix 1), never SIGN_BOUND_S read once
+    from tests.test_sk_sign_retry import worst_sign_step_s
+    assert desk_click._WAIT_S > worst_sign_step_s(tmp_path, ts.SIGN_BOUND_S)
 
 
 # --- L3 r2 W1: the history reader's scope is its own, never the signed message's ---------------------------------

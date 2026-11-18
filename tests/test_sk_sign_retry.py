@@ -14,8 +14,10 @@ import base64
 import hashlib
 import json
 import stat
+import os
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -69,17 +71,43 @@ class SoftSk:
         return ("-----BEGIN SSH SIGNATURE-----\n" + "\n".join(lines) + "\n-----END SSH SIGNATURE-----\n").encode()
 
 
+class FakeClock:
+    """``keys.time`` with a ``monotonic`` the fake sign advances: a person's slow touch, without sleeping."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 class FakeKeygenSign:
     """Stands in for ONLY the ``ssh-keygen -Y sign`` call; every verify still runs the real ssh-keygen. ``plan`` is one
-    entry per sign: the flags byte WRITTEN (None = honest)."""
+    entry per sign: the flags byte WRITTEN (None = honest), ``"cancel"`` (empty output, exit 0: a cancelled sheet) or
+    ``"timeout"`` (the person never touches: the whole timeout handed to it passes, then TimeoutExpired). ``durations``
+    is how long each sign's touch takes on ``clock``; ``timeouts`` records the timeout each sign was handed."""
 
-    def __init__(self, key: SoftSk, plan: list[int | None], real_run) -> None:
+    def __init__(self, key: SoftSk, plan: list, real_run, clock: FakeClock | None = None) -> None:
         self.key, self.plan, self.real_run, self.signs = key, list(plan), real_run, 0
+        self.clock, self.durations, self.timeouts = clock, [], []
 
     def __call__(self, argv, **kw):
         if "-Y" in argv and argv[argv.index("-Y") + 1] == "sign":
             self.signs += 1
+            self.timeouts.append(kw.get("timeout"))
             written = self.plan.pop(0) if self.plan else None
+            took = self.durations.pop(0) if self.durations else 0.0
+            if written == "timeout":
+                if self.clock is not None:
+                    self.clock.t += kw["timeout"]
+                raise subprocess.TimeoutExpired(argv, kw["timeout"])
+            if self.clock is not None:
+                self.clock.t += took
+            if written == "cancel":
+                return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
             ns = argv[argv.index("-n") + 1]
             out = self.key.sign(kw["input"], ns, counter=self.signs, sig_flags=written)
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
@@ -89,16 +117,46 @@ class FakeKeygenSign:
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     key = SoftSk(tmp_path / "keys")
-    fake = FakeKeygenSign(key, [], subprocess.run)
+    clock = FakeClock()
+    fake = FakeKeygenSign(key, [], subprocess.run, clock)
     monkeypatch.setattr(keys.subprocess, "run", fake)
+    monkeypatch.setattr(keys, "time", clock)
     fp, sign = ssh_signer(key.path, namespace=NS)
 
     class R:
         pass
 
     r = R()
-    r.key, r.fake, r.fp, r.sign, r.dir = key, fake, fp, sign, key.path.parent / "sign-failures"
+    r.key, r.fake, r.fp, r.sign, r.dir, r.clock = key, fake, fp, sign, key.path.parent / "sign-failures", clock
     return r
+
+
+def worst_sign_step_s(where: Path, bound: float) -> float:
+    """The longest the sign step (the signer terminal_sign's factory builds, bounded by ``bound``) can keep a person's Touch ID sheet
+    waiting, MEASURED: a first answer that does not verify, arriving at every interesting moment of the bound, then a
+    second touch that never comes. The callers' budgets (band_hook.PROMPT_HOOK_TIMEOUT_S, desk_click._WAIT_S) are
+    asserted against this number, not against ``bound`` itself, so a sign step that grows past its bound fails them."""
+    from levain.consent import terminal_sign as ts
+    where.mkdir(parents=True, exist_ok=True)
+    key = SoftSk(where / "worst-case-key")
+    floor = getattr(keys, "_SK_RETRY_MIN_S", 5.0)
+    worst = 0.0
+    with pytest.MonkeyPatch.context() as mp:
+        clock = FakeClock()
+        fake = FakeKeygenSign(key, [], subprocess.run, clock)
+        mp.setattr(keys.subprocess, "run", fake)
+        mp.setattr(keys, "time", clock)
+        # what ts.default_signer_factory builds (the seat tests guard that name itself, so it is not called here)
+        _fp, sign = ssh_signer(key.path, namespace=ts.NAMESPACE, timeout=bound)
+        for first in (0.0, bound / 2, bound - floor - 0.01, bound - floor, bound - floor + 0.01, bound * 0.99):
+            if first < 0:
+                continue
+            fake.plan, fake.durations = [0x21, "timeout"], [first]
+            start = clock.t
+            with pytest.raises(KeyError_):
+                sign(MESSAGE)
+            worst = max(worst, clock.t - start)
+    return worst
 
 
 MESSAGE = b"sign: 1267: 100% agree, a very private consent answer text that must never reach a diagnostics file\n"
@@ -218,3 +276,120 @@ def test_a_non_sk_key_that_fails_to_verify_is_not_retried(tmp_path, monkeypatch)
     with pytest.raises(KeyError_, match="does not verify"):
         sign(b"x")
     assert len(calls) == 1 and not (d / "sign-failures").exists()
+
+
+# --- fix round 1 (L1 HIGH 1/2, WARNING 5, NOTE 7/11; L2 LOW): one deadline, attempt 1 named, a trusted directory -------
+
+def _bounded(rig, bound: float):
+    _fp, sign = ssh_signer(rig.key.path, namespace=NS, timeout=bound)
+    return sign
+
+
+def test_the_second_attempt_gets_only_what_is_left_of_the_one_bound(rig):
+    sign = _bounded(rig, 20.0)
+    rig.fake.plan, rig.fake.durations = [0x21, None], [6.0]
+    assert _sshsig_type_and_flags(sign(MESSAGE))[1] == 0x01
+    assert rig.fake.timeouts == [20.0, pytest.approx(14.0)]
+
+
+def test_the_whole_sign_step_never_outlasts_its_bound(tmp_path):
+    from levain.consent import terminal_sign as ts
+    for bound in (ts.SIGN_BOUND_S, keys._SIGN_TIMEOUT, 7.0, 3.0):
+        assert worst_sign_step_s(tmp_path / str(bound), bound) <= bound + 1e-6, bound
+
+
+def test_no_second_touch_is_asked_for_when_too_little_of_the_bound_is_left(rig, capsys):
+    sign = _bounded(rig, 20.0)
+    rig.fake.plan, rig.fake.durations = [0x21, None], [20.0 - keys._SK_RETRY_MIN_S + 0.5]
+    with pytest.raises(KeyError_) as err:
+        sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 1 and "touch again" not in capsys.readouterr().err
+    (only,) = list(rig.dir.iterdir())
+    assert str(only) in text and "0x21" in text and "no second touch" in text
+    assert text.startswith(f"ssh-keygen returned a signature that does not verify as {rig.fp}")
+
+
+def test_a_cancelled_second_attempt_still_names_the_first_attempts_evidence(rig, monkeypatch):
+    from levain.cockpit.custody import APPLE_PROVIDER
+    from levain.consent import terminal_sign as ts
+    monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)        # a Touch ID signer, so an empty answer is a cancel
+    rig.fake.plan = [0x21, "cancel"]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    (only,) = list(rig.dir.iterdir())
+    assert "Touch ID was cancelled" in text and str(only) in text and "0x21" in text, text
+    assert ts._classify(err.value)[0] == "cancelled"
+
+
+def test_a_timed_out_second_attempt_still_names_the_first_attempts_evidence(rig):
+    from levain.consent import terminal_sign as ts
+    rig.fake.plan = [0x21, "timeout"]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    (only,) = list(rig.dir.iterdir())
+    assert "TimeoutExpired" in text and str(only) in text and "0x21" in text, text
+    assert ts._classify(err.value)[0] == "timeout"
+
+
+def test_a_symlinked_evidence_dir_is_never_written_or_pruned(rig, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    planted = [elsewhere / f"sigfail-0000{i:02d}.json" for i in range(keys._SIGN_FAILURE_KEEP + 5)]
+    for p in planted:
+        p.write_text("{}")
+    rig.dir.symlink_to(elsewhere)
+    rig.fake.plan = [0x21, 0x21]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    assert sorted(elsewhere.iterdir()) == planted                  # nothing written there, nothing pruned there
+    assert "evidence not written" in str(err.value)
+    assert str(err.value).startswith(f"ssh-keygen returned a signature that does not verify as {rig.fp}")
+
+
+def test_a_loose_evidence_dir_is_not_written(rig):
+    rig.dir.mkdir()
+    rig.dir.chmod(0o755)
+    rig.fake.plan = [0x21, None]
+    assert _sshsig_type_and_flags(rig.sign(MESSAGE))[1] == 0x01    # the sign itself is untouched
+    assert list(rig.dir.iterdir()) == []
+
+
+def test_a_read_only_evidence_dir_does_not_change_the_refusal(rig):
+    rig.dir.mkdir(mode=0o700)
+    rig.dir.chmod(0o500)
+    try:
+        rig.fake.plan = [0x21, 0x21]
+        with pytest.raises(KeyError_, match="evidence not written") as err:
+            rig.sign(MESSAGE)
+        assert "both attempts" in str(err.value) and rig.fake.signs == 2
+    finally:
+        rig.dir.chmod(0o700)
+
+
+def test_the_prune_takes_only_our_regular_files(rig, tmp_path):
+    rig.dir.mkdir(mode=0o700)
+    outside = tmp_path / "outside.json"
+    outside.write_text("keep")
+    link = rig.dir / "sigfail-00000000T000000000000-0000000001-1.json"
+    link.symlink_to(outside)
+    sub = rig.dir / "sigfail-00000000T000000000000-0000000002-1.json"
+    sub.mkdir()
+    for _ in range(keys._SIGN_FAILURE_KEEP):
+        rig.fake.plan = [0x21, 0x21]
+        with pytest.raises(KeyError_):
+            rig.sign(MESSAGE)
+    assert link.is_symlink() and sub.is_dir() and outside.read_text() == "keep"
+
+
+def test_the_file_just_written_is_never_pruned_even_when_it_sorts_oldest(rig):
+    rig.dir.mkdir(mode=0o700)
+    for i in range(keys._SIGN_FAILURE_KEEP + 3):                    # a clock that later stepped back: these sort newest
+        (rig.dir / f"sigfail-99991231T235959{i:06d}-0000000001-1.json").write_text("{}")
+    rig.fake.plan = [0x21, None]
+    rig.sign(MESSAGE)
+    ours = [p for p in rig.dir.iterdir() if not p.name.startswith("sigfail-9999")]
+    assert len(ours) == 1 and json.loads(ours[0].read_text())["flags"] == "0x21"
+    assert len(list(rig.dir.iterdir())) == keys._SIGN_FAILURE_KEEP

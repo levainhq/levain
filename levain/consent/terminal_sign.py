@@ -66,7 +66,7 @@ SIGNERS_NAMESPACES = f"{NAMESPACE},{DESK_NAMESPACE}"
 KEY_LABEL = "levain-terminal"
 MAX_BYTES = 8 * 1024
 LINE_MAX = 2000                    # one typed line
-SIGN_BOUND_S = 20.0                # the hook's own bound on the sign step (DESIGN section 6)
+SIGN_BOUND_S = 20.0                # the hook's own bound on the WHOLE sign step, a retry included (DESIGN section 6; keys.ssh_signer)
 STALE_S = 600                      # `at` must lie this long before the resolve event at most
 REASONS = ("no-key", "remote", "unavailable", "cancelled", "timeout", "signer-error")
 KINDS = ("information", "authority")
@@ -984,9 +984,9 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
     at, so no prompt reaches an unattended screen; ``remote_why`` (from :func:`remote_reason`) is named in the
     outcome's detail so a log can tell which leg fired.
 
-    ``bound_s`` goes to the signer factory, which hands it to the signer as its own per-call timeout, so one
-    ``subprocess.run`` timeout ends the ssh-keygen child (and with it the Touch ID sheet) and no process-wide
-    value is touched."""
+    ``bound_s`` goes to the signer factory, which hands it to the signer as its own timeout: ONE deadline for the
+    whole sign step however many ssh-keygen children it runs (``keys.ssh_signer``'s ``sign`` says how a retry shares
+    it), so the Touch ID sheet is closed by then and no process-wide value is touched."""
     if remote:
         return SignOutcome("unsigned", "remote",
                            f"the desk is remote ({remote_why})" if remote_why else "the desk is remote")

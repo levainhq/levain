@@ -407,10 +407,14 @@ def test_every_installed_prompt_hook_outlasts_the_whole_signing_turn(tmp_path):
     """codex HIGH r1: the codex install's hooks.json kept 10 s while the sign step may take 20. Every install path that
     can run :func:`band_view.hook_prompt` is enumerated (each template that registers a UserPromptSubmit, the codex
     one as install renders it, and the user-level band entry) and each carries ONE number, which budgets the band's
-    worst turn (read, sign, write, render) plus the codex wrapper's own bounded calls."""
+    worst turn (read, sign, write, render) plus the codex wrapper's own bounded calls. The sign term is MEASURED
+    through the real signer (levain#125 fix 1: a refused security-key answer asks for a second touch, and a budget
+    that read SIGN_BOUND_S once could not see that)."""
     from levain import install as inst
+    from tests.test_sk_sign_retry import worst_sign_step_s
 
-    need = (ts.SIGN_BOUND_S + 3 * band_view.HOOK_BUSY_MS / 1000
+    sign_step = worst_sign_step_s(tmp_path / "sign-step", ts.SIGN_BOUND_S)
+    need = (sign_step + 3 * band_view.HOOK_BUSY_MS / 1000
             + _wrapper_bounds_s(TEMPLATES / "adapters" / "codex" / "activation" / "hooks" / "user_prompt_submit.py"))
     assert band_hook.PROMPT_HOOK_TIMEOUT_S >= need + 5                              # 5 s for interpreter start-up
     found = {}

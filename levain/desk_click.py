@@ -139,7 +139,7 @@ def _fingerprint(route: str, req: "DeskRequest") -> str:
     return hashlib.sha256(canon.encode("ascii")).hexdigest()
 
 
-_WAIT_S = 40.0          # how long a duplicate waits for its first request (a test holds it above SIGN_BOUND_S)
+_WAIT_S = 40.0          # how long a duplicate waits for its first request (a test holds it above the measured sign step)
 
 
 def requires_sign(kind: str, policy: str = DESK_POLICY) -> bool:
