@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from levain.consent.questions import QuestionStore
+from tests import v1_seed
 from levain.desk import dream_status, seam, seam_build, seam_handoffs, seam_open
 from levain.desk.lease import LeaseRefused
 from levain.desk.store import CoordError, CoordStore
@@ -41,6 +42,15 @@ def _raw(store, sql, args=()):
         c.execute(sql, args)
     finally:
         c.close()
+
+
+@pytest.fixture(autouse=True)
+def _empty_board(monkeypatch):
+    """The open's board block is ``levain board state``'s read (T7); these tests are about the store's sections, so the
+    board reads as an empty one. The board block itself is tested in tests/test_t7_v1_retire.py."""
+    from levain.desk import board_cli
+
+    monkeypatch.setattr(board_cli, "state_doc", lambda items=None: (0, {"schema": 3, "as_of": None, "items": [], "audit": []}, ""))
 
 
 @pytest.fixture
@@ -185,8 +195,8 @@ def test_tables_absent_are_not_tables_present_and_empty(world):
         _raw(world, f"DROP TABLE {t}")
     absent = _brief(world).text.splitlines()
     assert any(ln.startswith("Unacknowledged: absent (") for ln in absent)
-    assert "Board: no lifecycle tables" in absent
-    assert not {"unacknowledged opens", "board items"} & _empty("\n".join(absent))
+    assert "board items" in _empty("\n".join(absent))        # the board block reads the board, not the v1 tables (T7)
+    assert "unacknowledged opens" not in _empty("\n".join(absent))
 
 
 # --- the cursor rule ------------------------------------------------------------------------------------------------
@@ -943,7 +953,7 @@ def test_each_detail_row_names_its_row_oldest_first(world):
 
     d2, _ = world.accept_drop("ship the doc fix\nsecond line never shown", surface="cli")
     long, _ = world.accept_drop("x" * 80, surface="cli")
-    ready.add(world, _token(world), "levain:doc-fix", repo="levain", title="Ship the doc fix", to="ready",
+    v1_seed.add(world, _token(world), "levain:doc-fix", repo="levain", title="Ship the doc fix", to="ready",
               tier="sonnet", done_line="merged", who=ROLE_DESK, why="probe")
     detail = [ln for ln in _brief(world).text.splitlines() if ln.startswith("  gseq ")]
     gseqs = [int(ln.split()[1]) for ln in detail]
@@ -953,8 +963,8 @@ def test_each_detail_row_names_its_row_oldest_first(world):
     assert by_id[long.drop_id].endswith("  cli  " + "x" * 59 + "…")         # at most 60 characters
     (receipt,) = [ln for ln in detail if f"re {d2.drop_id}" in ln]
     assert receipt.split("  ")[2] == "replies" and receipt.split("  ")[4] == "drop_receipt"
-    # the journal's who is a stored field, shown as stored (the role value, not its display word)
-    assert any(ln.endswith(f"  ready_journal  levain:doc-fix  {ROLE_DESK}  new -> ready") for ln in detail)
+    # a v1 journal row is not news since T7: board changes left the ordered stream (the v1 queue takes no more rows)
+    assert not any("ready_journal" in ln for ln in detail)
     assert any(ln.endswith("  coord_settings") for ln in detail)             # a table with no id is named alone
 
 

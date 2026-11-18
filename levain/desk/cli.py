@@ -110,10 +110,9 @@ _FOLLOWS_DESK = frozenset({"take", "release", "beat", "claim", "wake", "launch",
 
 
 def _opens_board(args: argparse.Namespace) -> bool:
-    """True for the verbs that act on board rows only: the board importers, and a spawn with ``--item`` (its launch and
-    the item's attach are one transaction, so the launch is in the board store too)."""
-    cmd = args.coord_cmd
-    return cmd in ("import-status", "apply-reports") or (cmd == "spawn" and getattr(args, "item", None) is not None)
+    """True for the verb that acts on the board store's queue only: ``apply-reports`` (which only drains it, T7). A spawn
+    with ``--item`` no longer opens the board store: its claim is written on the launch record of the desk's own store."""
+    return args.coord_cmd == "apply-reports"
 
 
 def _handle(args: argparse.Namespace) -> tuple[str, Any] | None:
@@ -1757,11 +1756,26 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
             signal.alarm(prev_alarm)
 
 
+def _retired_v1_verb(args: argparse.Namespace) -> str | None:
+    """The v1 ready queue's write verbs, retired (T7, levain#101): the name of the verb a caller used, else None. They are
+    refused before any store is opened or any token read, so a call that carries neither still learns where the board is."""
+    cmd = args.coord_cmd
+    if cmd == "ready" and args.ready_cmd in ("add", "move", "correct"):
+        return f"ready {args.ready_cmd}"
+    return cmd if cmd in ("import-status", "report") else None
+
+
 def _run_coord(args: argparse.Namespace, out: Any) -> int:
     cmd = args.coord_cmd
+    retired = _retired_v1_verb(args)
+    if retired is not None:
+        from levain.desk import ready
+
+        print(f"levain desk {retired}: {ready.RETIRED}; nothing was written", file=sys.stderr)
+        return 2
     try:
-        if cmd == "report":          # a seat's verb: it opens no desk store and holds no lease
-            return _coord_report(args, out)
+        if cmd == "ready":           # show reads the board (T3), never a desk store: no store is opened, no lease read
+            return _coord_ready(args, out, None)
         store = _coord_store(args)
         if cmd == "take":
             hold = None
@@ -1814,10 +1828,6 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_spawn(args, out, store)
         if cmd == "review":
             return _coord_review(args, out, store)
-        if cmd == "ready":
-            return _coord_ready(args, out, store)
-        if cmd == "import-status":
-            return _coord_import_status(args, out, store)
         if cmd == "apply-reports":
             return _coord_apply_reports(args, out, store)
         if cmd == "launch":
@@ -2098,102 +2108,30 @@ def _coord_reply(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     return 0
 
 
-def _ready_line(it: dict[str, Any]) -> str:
-    held = f"  [held: {it['held_reason']}]" if it.get("held_reason") else ""
-    return (f"{it['id']}  {it['repo']}  {it['status_category']}  {it['tier'] or '-'}  rank {it['rank']}  "
-            f"{it['title']}{held}")
+def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore | None = None) -> int:
+    """``levain desk ready show [--repo NAME]``: the v1 ready queue is retired (T7, levain#101), so this prints the board
+    (``levain board state``, T3's read) for the repo whose items read ``NAME#N``, then one line saying the queue is
+    retired: one operator question never has two answers. A read: no lease, no desk live, nothing written. ``add``,
+    ``move`` and ``correct`` never get here (:func:`_retired_v1_verb`)."""
+    from levain.desk import board_cli, ready
 
+    code, doc, err = board_cli.read_board()
+    retired = "the v1 ready queue is retired; this is `levain board state`, the board"
+    if doc is None:
+        _emit(out, args.json, {"retired": True, "board": None, "why": err, "exit": code},
+              f"{retired}\nthe board could not be read: {err or 'no reason given'}")
+        return 0 if code in (0, board_cli.EXIT_AUDIT) else 1
+    name = args.repo
+    if args.json:
+        def mine(i: Any) -> bool:
+            return name is None or str(i).startswith(name + "#")
 
-def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain desk ready show|add|move|correct`` (C13): the ready queue. ``show`` is a read (no lease, no
-    desk live). A write maps exactly to ``ready.add`` / ``move`` / ``correct`` and is fenced by the live lease
-    token (``--token``); every refusal is printed plainly and exits 2, with nothing written. On success it prints the
-    journal record's id (item and version)."""
-    from levain.desk import ready
-
-    verb = args.ready_cmd
-    try:
-        if verb == "show":
-            where = str(Path(str(store.path)).parent)
-            if _no_store(store):            # the same keys as a present store's answer, only empty
-                _emit(out, args.json, {"schema": ready.SCHEMA_VERSION,
-                                       "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
-                                       "items": [], "unreadable": [], "store": None},   # None = no store; a present store names its dir
-                      f"{NO_STORE}: nothing is queued")
-                return 0
-            got = {**ready.list_ready(store, all=args.all, repo=args.repo), "store": where}
-            lines = [_ready_line(i) for i in got["items"]]
-            if not lines and not got["unreadable"]:       # absence is only said when nothing was left unread
-                lines = ["nothing queued"]
-            lines += [f"unreadable: {u}" for u in got["unreadable"]]
-            _emit(out, args.json, got, "\n".join(lines))
-            return 0
-        given = {"title": args.title, "tier": args.tier, "done_line": args.done_line, "rank": args.rank,
-                 "depends_on": args.depends_on}
-        extra = {k: v for k, v in given.items() if v is not None}
-        if verb != "add":                   # --no-tier / --no-done-line: an explicit None clears the field
-            if args.no_tier:
-                extra["tier"] = None
-            if args.no_done_line:
-                extra["done_line"] = None
-        if verb == "add":
-            rec = ready.add(store, args.token, args.item_id, repo=args.repo, title=args.title, who=args.who,
-                            why=args.why, to=args.to, tier=args.tier, done_line=args.done_line,
-                            depends_on=args.depends_on or (), rank=args.rank)
-        else:
-            rec = (ready.move if verb == "move" else ready.correct)(store, args.token, args.item_id, to=args.to,
-                                                                    who=args.who, why=args.why, **extra)
-        ver = rec.ver
-    except _REFUSED as exc:
-        print(f"levain desk ready {verb}: {exc}", file=sys.stderr)
-        return 2
-    _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
-          f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
+        shown = {**doc, "items": [i for i in doc["items"] if mine(i["id"])],
+                 "audit": [a for a in doc["audit"] if a["id"] is None or mine(a["id"])]}
+        _emit(out, True, {"retired": True, "board": shown, "exit": code}, "")
+    else:
+        _emit(out, False, None, "\n".join([retired, *board_cli.table_lines(doc, name)]))
     return 0
-
-
-def _coord_import_status(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain desk import-status PATH [--repo R]``: read a status file's lane rows into the ready queue. It is the
-    desk's write, fenced by the live lease token; without it nothing is read or written and the exit is 1.
-    One line per bucket, with its count and ids."""
-    from levain.desk import status_import
-
-    held = None if _no_store(store) else store.coord_lease()
-    if held is None or not held.live or held.token != args.token:
-        print(f"levain desk import-status: the desk lease is not held by this token (levain desk status"
-              f"{_again(args, store)} shows the live one); nothing was read or written", file=sys.stderr)
-        return 1
-    try:
-        got = status_import.import_status(store, args.token, args.path, repo=args.repo)
-    except _REFUSED as exc:
-        print(f"levain desk import-status: {exc}", file=sys.stderr)
-        return 2
-    buckets = {"added": got.added, "corrected": got.corrected, "unchanged": got.unchanged, "absent": got.absent,
-               "unparsed": got.unparsed}
-    text = "\n".join(f"{name}: {len(ids)}" + (f" ({', '.join(str(i) for i in ids)})" if ids else "")
-                     for name, ids in buckets.items())
-    reports = _apply_queue(args, store)             # the holder's own pass over the board's queue (row 162)
-    if reports:
-        text += "\n" + "\n".join(reports)
-    _emit(out, args.json, {**buckets, "reports": reports}, text)
-    return 0
-
-
-def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
-    """The lease holder's pass over the board's queued worker reports (row 162): applied as the desk, facts only,
-    through the validator the watch's pass uses. A caller that is not the live lease holder (no token, another token,
-    no live lease) gets ``[]`` and nothing is read from the queue. Never raises: a fault is one line, and the verb it
-    rides on keeps its own result."""
-    from levain.desk import work_attach
-
-    try:
-        token = getattr(args, "token", None)
-        held = None if _no_store(store) else store.coord_lease()
-        if token is None or held is None or not held.live or held.token != token:
-            return []
-        return work_attach.desk_apply(store, token)
-    except Exception as exc:    # noqa: BLE001 - the verb this rides on has already done its work
-        return [f"board reports: not applied ({exc})"]
 
 
 def _coord_nightclose(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
@@ -2255,30 +2193,6 @@ def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStor
 _SLOTS_FILE_MAX = 64 * 1024
 
 
-def _coord_report(args: argparse.Namespace, out: Any) -> int:
-    """``levain desk report ITEM --worker W --event E [...]`` (row 156): a seat reports a fact about its work on a ready
-    item. It appends to the board store's ``reports.db`` queue (:func:`levain.desk.work_attach.queue_report`) and
-    never opens ``dispatch.db`` or takes a token; the watcher's applier copies it into ``worker_attach`` or refuses it
-    with a record. The session comes from ``--session`` or the harness's own environment."""
-    from levain.desk import work_attach
-
-    directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
-    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
-    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        rid, queued = work_attach.queue_report(
-            directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
-            event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha,
-            branch=args.branch, why=args.why)
-    except _REFUSED as exc:
-        # a malformed field or no board directory: one line, exit 2, nothing queued
-        print(f"levain desk report: {' '.join(str(exc).split())}", file=sys.stderr)
-        return 2
-    words = work_attach.report_line(directory, rid, queued)
-    _emit(out, args.json, {"report_id": rid, "queued": queued, "item": args.item, "store": str(directory)}, words)
-    return 0
-
-
 def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
     """``levain desk reports REPORT_ID`` (row 156 L2 F16): what became of one report, read-only (queued, applied,
     refused with its reason, or unknown). Opens no store for writing and takes no token. Exit 1 when the id is unknown."""
@@ -2291,7 +2205,7 @@ def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
     except (CoordError, sqlite3.Error, OSError) as exc:
         print(f"levain desk reports: {exc}", file=sys.stderr)
         return 2
-    words = {"queued": "queued; the next `levain desk watch` pass applies or refuses it",
+    words = {"queued": "queued before the v1 queue retired; it is drained once into the watch's log and never applied",
              "applied": f"applied ({st['kind']}, {st['attach_id']})",
              "refused": f"refused ({st['reason']}: {st['detail']})",
              "unknown": f"not in the queue at {directory}"}[st["state"]]
@@ -2891,22 +2805,21 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     csp.add_argument("--parent", default=None, metavar="LAUNCH_ID",
                      help="The active spawned worker asking for this one.")
     csp.add_argument("--item", default=None, metavar="ITEM_ID",
-                     help="The ready item this worker is for: the attach is recorded with the request, or neither is. "
-                          "With it the store is <levain home>/board unless --queue-dir names one, so the launch is "
-                          "asked for there too.")
+                     help="The board item (NAME#N) this worker is for: written on the launch record as its board "
+                          "claim in the request's own transaction, or the request is refused. The v1 ready "
+                          "queue is not read.")
     csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
                      help="The role registry's store (default: this Levain home's).")
     csp.add_argument("--token", type=int, required=True, help="Your desk lease token.")
     crt = c_sub.add_parser(
-        "report", help="Report a fact about your work on a ready item (queued; no token, no lease).",
-        description="Appends one report to the board store's queue and returns. It never writes the board itself: the "
-                    "watcher's applier copies it into the worker-attach record, or refuses it (an unknown item, a worker "
-                    "that is not a real launch) and leaves a refusal record the desk reads. Resending the same "
-                    "--report-id queues nothing twice and says so. Your session id comes from the environment.")
+        "report", help="RETIRED: the v1 queue takes no more reports; refuses, naming `levain board`.",
+        description="Retired (levain#101): the v1 ready queue takes no more rows, so a report would never be applied. "
+                    "This refuses and exits 2, queueing nothing. The board is `levain board add` / `amend` / "
+                    "`decide`; its state is `levain board state`.")
     crt.add_argument("item", metavar="ITEM", help="The ready item's id.")
-    crt.add_argument("--worker", required=True, help="Who you are: a seat or lane name, or a launch id.")
+    crt.add_argument("--worker", default=None, help="Who you are: a seat or lane name, or a launch id.")
     crt.add_argument("--kind", choices=_report_kinds(), default="seat", help="What kind of worker (default seat).")
-    crt.add_argument("--event", required=True, choices=_report_events(), help="The fact you report.")
+    crt.add_argument("--event", default=None, choices=_report_events(), help="The fact you report.")
     crt.add_argument("--launch", default=None, metavar="LAUNCH_ID", help="Your Levain launch id, if you are one.")
     crt.add_argument("--session", default=None, metavar="ID",
                      help="Your harness session id (default: CLAUDE_CODE_SESSION_ID from the environment).")
@@ -2984,11 +2897,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
     cop.add_argument("--token", type=int, default=None, help="Your desk lease token.")
     crd = c_sub.add_parser(
-        "ready", help="The ready queue: show it (a read), or add, move and correct an item (the desk's write).",
-        description="show reads the queue with no desk live. add, move and correct are the desk's: each "
-                    "needs --token (the live lease's, levain desk status shows it), --who and --why, writes one "
-                    "journal record, and prints its id. A refusal exits 2 and writes nothing. needs-you is the "
-                    "band's, never a move target.")
+        "ready", help="show prints the board (the v1 queue is retired); add, move and correct refuse.",
+        description="The v1 ready queue is retired (levain#101). show prints `levain board state`'s board for --repo, "
+                    "with one line saying so; no desk live. add, move and correct refuse, naming `levain board add`, "
+                    "exit 2, and write nothing.")
     rd_sub = crd.add_subparsers(dest="ready_cmd", required=True)
     ready_leaves: list[argparse.ArgumentParser] = []
     rds = rd_sub.add_parser("show", help="The queue: effectively-ready items (--all: every column).")
@@ -3003,9 +2915,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         rdw.add_argument("--token", type=int, default=None, help="The live desk lease's token (required).")
         rdw.add_argument("--who", default=None, help="Who makes this change.")
         rdw.add_argument("--why", default=None, help="Why (one line; goes in the journal).")
-        rdw.add_argument("--to", required=verb != "add", default="backlog" if verb == "add" else None,
+        rdw.add_argument("--to", default="backlog" if verb == "add" else None,
                          help="The category (backlog, ready, running, waiting, done).")
-        rdw.add_argument("--title", default=None, required=verb == "add",
+        rdw.add_argument("--title", default=None,
                          help="The title" + ("." if verb == "add" else " (changes it; omit to keep)."))
         tier_g = rdw.add_mutually_exclusive_group()
         done_g = rdw.add_mutually_exclusive_group()
@@ -3020,28 +2932,25 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         rdw.add_argument("--depends-on", dest="depends_on", nargs="*", default=None, metavar="ITEM",
                          help="Item ids it waits on (none given: clears them).")
         if verb == "add":
-            rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
+            rdw.add_argument("--repo", default=None, help="The item's repo.")
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the desk's write: refused without the live lease token
     cis = c_sub.add_parser(
-        "import-status", help="Read a status file's lane rows into the ready queue (the desk's write).",
-        description="Adds new rows, corrects changed ones and leaves the rest; a second run of an unchanged file "
-                    "writes nothing. Needs --token (the live lease's). Prints one line per bucket: added, corrected, "
-                    "unchanged, absent (in the queue, not in the file) and unparsed (row numbers: the row shape did "
-                    "not fit, or the store refused the row). The store is <levain home>/board, the board store "
-                    "`coord report` queues into, unless --queue-dir names one; never the consent directory by default.")
+        "import-status", help="RETIRED: the v1 queue takes no more rows; refuses, naming `levain board add`.",
+        description="Retired (levain#101): a status file is no longer imported into the v1 ready queue. This refuses "
+                    "and exits 2, writing nothing. Make the board's items with `levain board add`.")
     cis.add_argument("path", type=Path, metavar="PATH")
     cis.add_argument("--repo", default="levain", help="The repo the rows belong to.")
-    cis.add_argument("--token", type=int, required=True, help="The live desk lease's token.")
+    cis.add_argument("--token", type=int, default=None, help="Ignored: the verb is retired.")
     common(cis)
     cis.set_defaults(func=run_coord)
     door_ok(cis)
     car = c_sub.add_parser(
-        "apply-reports", help="Apply the board's queued worker reports as the lease holder (facts only).",
-        description="While a desk holds the board lease the watch's service pass is skipped, so the holder "
-                    "applies the queue itself: each queued report is judged by the validator the watch uses and is "
-                    "applied, deferred or refused with a record. Needs --token (the live lease's); the lease is kept. "
-                    "The store is <levain home>/board unless --queue-dir names one.")
+        "apply-reports", help="Drain the board's queued v1 reports once, read-only; applies nothing (retired).",
+        description="The v1 queue is retired (levain#101): no report is applied. A report still queued at the switch "
+                    "is named once in one line and never applied; nothing is written to the v1 tables. Needs --token "
+                    "(the live lease's); the lease is kept. The store is <levain home>/board unless --queue-dir "
+                    "names one.")
     car.add_argument("--token", type=int, required=True, help="The live desk lease's token.")
     common(car)
     car.set_defaults(func=run_coord)

@@ -41,6 +41,7 @@ import contextlib
 import copy
 import dataclasses
 import errno
+import io
 import json
 import os
 import stat
@@ -57,7 +58,7 @@ from levain.desk import board_producers as bp
 from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state", "state_doc"]
+__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "read_board", "register", "run_state", "state_doc", "table_lines"]
 
 ITEMS_ENV = bs.ITEMS_ENV
 #: Read when ``--launch-key`` is not given. Nothing in Levain's launch path exports it yet; the flag is the sure way.
@@ -764,11 +765,38 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     return (EXIT_AUDIT if board.audit or registry_audit else 0), doc
 
 
-def _print_table(doc: dict[str, Any]) -> None:
-    print(f"board {doc['schema']} as of {doc['as_of'] or 'unknown'}: {len(doc['items'])} items, {len(doc['audit'])} audit entries")
-    for s in doc["items"]:
-        print(f"  {s['id']:<14} {s['state']:<18} {s['reason']}")
-    for a in doc["audit"]:
-        print(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}")
+def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
+    """The table :func:`_print_table` prints, as lines. ``repo_name`` keeps only the items (and audit entries) of the
+    repo whose ids read ``NAME#N``; the header counts what it keeps."""
+    def mine(i: Any) -> bool:
+        return repo_name is None or (isinstance(i, str) and i.startswith(repo_name + "#"))
+
+    items = [s for s in doc["items"] if mine(s["id"])]
+    audit = [a for a in doc["audit"] if repo_name is None or a["id"] is None or mine(a["id"])]
+    lines = [f"board {doc['schema']} as of {doc['as_of'] or 'unknown'}: {len(items)} items, {len(audit)} audit entries"]
+    for s in items:
+        lines.append(f"  {s['id']:<14} {s['state']:<18} {s['reason']}")
+    for a in audit:
+        lines.append(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}")
     for name in doc.get("reader", {}).get("diverged", []):
-        print(f"  diverged: {name}: the local head and origin's copy each hold commits the other lacks (ahead is the union)")
+        lines.append(f"  diverged: {name}: the local head and origin's copy each hold commits the other lacks (ahead is the union)")
+    return lines
+
+
+def _print_table(doc: dict[str, Any]) -> None:
+    for line in table_lines(doc):
+        print(line)
+
+
+def read_board(items: str | None = None) -> tuple[int, dict[str, Any] | None, str]:
+    """``levain board state --json`` as a Python call: ``(exit code, the Board's JSON as a dict or None, what it said on
+    stderr)``. The same read as the CLI (the whole board of the store ``items`` names, else the one ``board use`` set), never a
+    second derivation: it runs :func:`state_doc` and keeps its refusal text. A read; it writes nothing. T7 reads the board
+    through it in the desk's open and in ``levain desk ready show``."""
+    args = argparse.Namespace(json=True, items=items, evidence_extra=None, producers=[], land_waiter=None, repo=None,
+                              repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=None)
+    said: list[str] = []
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        code, doc = state_doc(args, said.append)
+    return code, doc if isinstance(doc, dict) else None, "\n".join([*said, err.getvalue().strip()]).strip()

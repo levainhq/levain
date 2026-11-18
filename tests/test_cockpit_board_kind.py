@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from levain.cockpit import Cockpit, CockpitRegistrationError, ProviderSpec, Read
+from tests import v1_seed
 from levain.cockpit import board
 from levain.cockpit.engine import BOARD_CATEGORIES, KINDS
 from levain.consent.questions import QuestionStore

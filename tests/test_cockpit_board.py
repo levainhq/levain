@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from levain.cockpit import board
+from tests import v1_seed
 from levain.consent.questions import QuestionStore
 from levain.desk import ready
 from levain.desk.store import CoordStore
@@ -40,11 +41,11 @@ def filled(qdir):
     st = CoordStore(qdir)
     tok = st.coord_take()
     kw = dict(repo="levain", who="desk", why="queued it.")
-    ready.add(st, tok, "levain:a", title="Land A", to="ready", tier="sonnet", done_line="green", **kw)
-    ready.add(st, tok, "levain:b", title="Land B", to="ready", tier="sonnet", done_line="green",
+    v1_seed.add(st, tok, "levain:a", title="Land A", to="ready", tier="sonnet", done_line="green", **kw)
+    v1_seed.add(st, tok, "levain:b", title="Land B", to="ready", tier="sonnet", done_line="green",
               depends_on=["levain:a"], **kw)
-    ready.add(st, tok, "levain:c", title="Later C", to="backlog", **kw)
-    ready.move(st, tok, "levain:a", to="running", who="seat-9", why="the seat took it.")
+    v1_seed.add(st, tok, "levain:c", title="Later C", to="backlog", **kw)
+    v1_seed.move(st, tok, "levain:a", to="running", who="seat-9", why="the seat took it.")
     return qdir
 
 
@@ -129,7 +130,7 @@ def test_the_cards_and_their_journal_lines_come_from_one_read_transaction(filled
         calls.append(1)
         if len(calls) == 3 and not fired:          # _current, _diverged, then the journal read: the items are already read
             fired.append(1)
-            ready.move(st, st.coord_take(), "levain:c", to="ready", who="late", why="after the items were read.")
+            v1_seed.move(st, st.coord_take(), "levain:c", to="ready", who="late", why="after the items were read.")
         return real(conn)
 
     monkeypatch.setattr(ready, "_lifecycle_present", late_commit)
@@ -161,7 +162,7 @@ def test_a_live_launch_is_a_running_seat_card_with_no_journal_line_and_an_ended_
     assert col == "waiting" and "no live lease" in card["title"]
     assert out["unreadable"] == []
     with pytest.raises(Exception):
-        ready.move(st, tok, f"seat:{live.launch_id}", to="done", who="desk", why="no.")     # a projection is never writable
+        v1_seed.move(st, tok, f"seat:{live.launch_id}", to="done", who="desk", why="no.")     # a projection is never writable
 
 
 def test_a_journal_record_ahead_of_its_state_row_is_not_attached_to_the_card(filled):
@@ -222,7 +223,7 @@ def test_route_serves_the_board_behind_the_token(tmp_path, lh):
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
     st = CoordStore(lh)
     tok = st.coord_take()
-    ready.add(st, tok, "levain:a", repo="levain", title="Land A", to="ready", tier="sonnet", done_line="g",
+    v1_seed.add(st, tok, "levain:a", repo="levain", title="Land A", to="ready", tier="sonnet", done_line="g",
               who="desk", why="queued it.")
     _file(QuestionStore(lh))
     _root, src, _ids = _install(tmp_path)
@@ -252,7 +253,7 @@ def test_route_with_no_store_is_200_no_queue_and_creates_nothing(tmp_path, lh):
         assert _snapshot(lh) == before and not (lh / "dispatch.db").exists()
         # control: the server really reads `lh` (a store made there is seen), so the assertion above is not vacuous
         st = CoordStore(lh)
-        ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+        v1_seed.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
         assert json.loads(_raw(base, board.BOARD_PATH)[2])["queue"] == "ok"
 
 
@@ -260,7 +261,7 @@ def test_route_with_no_store_is_200_no_queue_and_creates_nothing(tmp_path, lh):
 def test_no_write_reaches_the_board(tmp_path, lh, method):
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
     st = CoordStore(lh)
-    ready.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
+    v1_seed.add(st, st.coord_take(), "levain:a", repo="levain", title="A", to="backlog", who="desk", why="w.")
     before = _snapshot(lh)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=TOKEN) as (base, _h):

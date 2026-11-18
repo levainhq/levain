@@ -335,8 +335,8 @@ def spawn_worker(store: Any, token: int, *, thread_id: str, cwd: str, ref: str |
     request that names no parent is depth 1), not a bound a caller cannot get around. What binds is the lease and the
     cap on live spawns (:data:`MAX_SPAWNS_LIVE`). ``harness`` and ``model`` default
     to the role's own, and one that names another is refused. Returns the pending launch; the watcher or ``levain
-    coord launch`` starts it. ``item`` is a ready item the worker is for: the attach is recorded in the request's own
-    transaction. Every refusal is a :class:`SpawnRefused` and leaves nothing written."""
+    coord launch`` starts it. ``item`` is the board item (NAME#N) the worker is for: its claim is written on the
+    launch record in the request's own transaction (T7), and a malformed id refuses the whole request. Every refusal is a :class:`SpawnRefused` and leaves nothing written."""
     role, digest, is_inline = resolve_role(agent_store, ref=ref, inline=inline)
     harness = role["harness"] if harness is None else harness
     model = role["model"] if model is None else model

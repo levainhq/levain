@@ -1,4 +1,6 @@
-"""Row 156 step 2C: the importer, a status markdown file's numbered LANE MENU rows -> the board store.
+"""Row 156 step 2C: a status markdown file's numbered LANE MENU rows. RETIRED as a writer (T7, levain#101): ``import_status``
+raises, because the v1 ready queue takes no more rows; :func:`parse_rows` still reads the rows. What follows is the
+design as it was.
 
 Each numbered row of the lane-menu section becomes one ready item, written through the ordinary ready
 :func:`~levain.desk.ready.add` / :func:`~levain.desk.ready.correct` API (the desk role, under the
@@ -180,53 +182,9 @@ def parse_rows(text: str, *, id_for: Callable[[int], str] = default_id) -> tuple
     return rows, unparsed
 
 
-def _stored(store: CoordStore, repo: str) -> dict[str, dict]:
-    return {i["id"]: i for i in ready.list_ready(store, all=True, repo=repo)["items"] if i["repo"] == repo}
-
-
-def _import_row(store: CoordStore, token: int, row: Row, have: dict | None, *, who: str, repo: str) -> str:
-    """Write one row (an add, a correction or nothing) and return its bucket name. Raises the store's CoordError."""
-    why = f"import of {row.ref}"
-    if have is None:
-        ready.add(store, token, row.id, repo=repo, title=row.title, who=who, why=why, to=row.category, tier=row.tier,
-                  done_line=row.done_line, rank=row.n, hold=row.hold, residue=row.residue, ref=row.ref)
-        return "added"
-    facts = ready.item_facts(store, row.id)
-    want = {"title": row.title, "done_line": row.done_line, "tier": row.tier, "hold": row.hold,
-            "residue": row.residue, "ref": row.ref}
-    now = {"title": have["title"], "done_line": have["done_line"], "tier": have["tier"], "hold": facts["hold"],
-           "residue": facts["residue"], "ref": facts["ref"]}
-    if want == now:
-        return "unchanged"
-    ready.correct(store, token, row.id, to=have["declared_category"], who=who, why=why, **want)
-    return "corrected"
-
-
 def import_status(store: CoordStore, token: int, path: str | Path, *, who: str = "status-import",
                   id_for: Callable[[int], str] = default_id, repo: str = "levain") -> ImportResult:
-    """Import the numbered lane-menu rows of the status file at ``path`` into ``store`` under the desk
-    lease ``token``. Returns what was added, corrected, left unchanged and left behind. Idempotent (see the module
-    docstring). A row the store refuses goes into ``unparsed`` by its number and the import goes on, so the result is
-    always returned once the file is read."""
-    data = Path(path).read_bytes()
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise CoordError(f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start}); nothing was "
-                         "imported") from None
-    rows, unparsed = parse_rows(text, id_for=id_for)
-    out = ImportResult(unparsed=unparsed)
-    stored = _stored(store, repo)
-    for row in rows:
-        try:
-            bucket = _import_row(store, token, row, stored.get(row.id), who=who, repo=repo)
-        except CoordError:
-            # a row the store refuses (a blank title, a hidden character) is named by its number; the rest still import
-            out.unparsed.append(row.n)
-            continue
-        getattr(out, bucket).append(row.id)
-    out.unparsed.sort()
-    mine = {row.id for row in rows}
-    out.absent = sorted(i for i in stored if i not in mine
-                        and str(ready.item_facts(store, i)["ref"] or "").startswith(f"{REF_NAME}#"))
-    return out
+    """RETIRED (T7, levain#101): the status file is no longer imported into the v1 ready queue, which takes no more
+    rows. Raises :class:`levain.desk.ready.V1Retired` before the file is read; nothing is written. The board's items
+    are made with ``levain board add``. :func:`parse_rows` still reads a status file's rows."""
+    raise ready.V1Retired(ready.RETIRED)
