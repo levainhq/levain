@@ -59,11 +59,11 @@ static void fwd(int sig) { if (kid > 0) kill(kid, sig); }
 
 int main(int argc, char **argv) {
     char **a = calloc((argc > 0 ? (size_t)argc : 1) + 2, sizeof *a);
-    int st;
+    int st, i;
     sigset_t block, old;
     a[0] = "/bin/sh";
     a[1] = {script};
-    for (int i = 1; i < argc; i++) a[i + 1] = argv[i];
+    for (i = 1; i < argc; i++) a[i + 1] = argv[i];
     sigemptyset(&block);
     sigaddset(&block, SIGTERM);
     sigaddset(&block, SIGINT);
