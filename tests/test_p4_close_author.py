@@ -421,6 +421,76 @@ def test_a_symlink_in_the_tree_is_read_where_read_documents_reads_it(sc, tmp_pat
     assert (c.who, c.commit) == ("Link Person", sha)
 
 
+def _republish(sc):
+    sc.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+
+def test_a_symlink_to_a_directory_in_the_repo_credits_the_commit_that_added_the_link_not_the_targets_first_adder(sc):
+    """The LITERAL tracked path is attributed: the link is probed as a file, never followed into realdir/."""
+    target = sc.commit("adds realdir", "Target Person", T1, files={"realdir/f.txt": "1"})
+    link = sc.repo / "dirlink"
+    link.symlink_to(sc.repo / "realdir")
+    try:
+        added = sc.commit("adds dirlink", "Link Person", T1)
+        _republish(sc)
+        c = verdict(sc, item(8, "document", "dirlink"), "dirlink")
+    finally:
+        link.unlink()
+        sc.commit("removes dirlink", "Link Person", T1)
+        _republish(sc)
+    assert added != target
+    assert (c.who, c.commit) == ("Link Person", added)
+
+
+def test_a_symlink_to_a_directory_outside_the_repo_credits_the_commit_that_added_the_link(sc, tmp_path):
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    (outside / "f.txt").write_text("x")
+    link = sc.repo / "outlink"
+    link.symlink_to(outside)
+    try:
+        added = sc.commit("adds outlink", "Out Link Person", T1)
+        _republish(sc)
+        c = verdict(sc, item(8, "document", "outlink"), "outlink")
+    finally:
+        link.unlink()
+        sc.commit("removes outlink", "Out Link Person", T1)
+        _republish(sc)
+    assert (c.tier, c.who, c.commit) == ("git", "Out Link Person", added)
+
+
+def test_a_submodule_path_credits_the_superproject_commit_that_added_it_never_enters_the_submodule(sc):
+    import shutil
+    sub = sc.repo / "subm"
+    sub.mkdir()
+    for args in (("init", "-q", "-b", "main"), ("-c", "user.name=S", "-c", "user.email=s@s", "commit", "--allow-empty", "-q", "-m", "sub")):
+        subprocess.run(["git", "-C", str(sub), *args], check=True, capture_output=True,
+                       env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull))
+    try:
+        added = sc.commit("adds subm", "Sub Adder", T1)
+        assert sc.git("ls-files", "-s", "subm").startswith("160000")
+        _republish(sc)
+        c = verdict(sc, item(8, "run", "subm"), "subm")
+    finally:
+        sc.git("rm", "-q", "--cached", "subm")
+        shutil.rmtree(sub)
+        sc.commit("removes subm", "Sub Adder", T1)
+        _republish(sc)
+    assert (c.tier, c.who, c.commit) == ("git", "Sub Adder", added)
+
+
+def test_an_empty_git_author_email_is_kept_as_empty_not_dropped(sc):
+    env = {"GIT_AUTHOR_NAME": "No Mail", "GIT_AUTHOR_EMAIL": "", "GIT_COMMITTER_NAME": "No Mail", "GIT_COMMITTER_EMAIL": "",
+           "GIT_AUTHOR_DATE": T1, "GIT_COMMITTER_DATE": T1}
+    sc.git("commit", "--allow-empty", "-q", "-m", "nomail\n\nBoard-Closes: scratch#50", env=env)
+    sha = sc.git("rev-parse", "HEAD")
+    _republish(sc)
+    c = verdict(sc, item(50), sha)
+    assert (c.tier, c.who, c.email) == ("git", "No Mail", "")
+    assert c.to_dict()["email"] == ""
+    assert ba.describe(c) == "asserted by git author No Mail <>"
+
+
 # ------------------------------------------------------------------------------------------------ the surface
 def test_annotate_sets_closed_by_on_every_done_git_close_and_nothing_else(sc):
     items = {"scratch#1": item(1), "scratch#6": item(6, "document", "docs/a.md"), "scratch#20": item(20, "band", "np-x"),
