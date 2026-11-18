@@ -607,7 +607,7 @@
       box.dataset.seen = seen ? "1" : "0";
       box.dataset.unseen = String(left);
       jump.hidden = seen;
-      jump.textContent = "Jump to the first part not yet shown (" + count(left) + " characters left)";
+      jump.textContent = "Next part not yet shown · " + count(left) + " left";
       box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
     };
     // the top page's visual viewport, whose own scroll and resize (pinch-zoom panning, an iOS keyboard) fire on it, not

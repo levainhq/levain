@@ -73,7 +73,7 @@ def test_a_fling_past_chunks_leaves_the_gate_shut_and_the_page_gives_a_way_to_th
     after = json.loads(v[-9])
     assert after["allow"] is True and after["unseen"] > 0, after            # the fling left parts unshown: Allow shut
     marked = json.loads(v[-8])
-    assert marked["marks"] > 0 and marked["jump"] is True and "characters left" in marked["label"], marked
+    assert marked["marks"] > 0 and marked["jump"] is True and " left" in marked["label"] and "Next part" in marked["label"], marked
     jumps = json.loads(v[-6])
     assert jumps["seen"] == "1" and jumps["taps"] >= 1, jumps
     end = json.loads(v[-5])
