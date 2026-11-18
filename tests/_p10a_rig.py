@@ -72,23 +72,26 @@ class Install:
         self._n = 0
 
     # ------------------------------------------------------------------------------------------------- the CLI
-    def env(self, now: str | None = None, spawn_gate: bool = True) -> dict[str, str]:
+    def env(self, now: str | None = None, spawn_gate: bool = True, kill: str | None = None) -> dict[str, str]:
         env = {k: os.environ[k] for k in _KEEP if k in os.environ}
         env.update(LEVAIN_HOME=str(self.home), HOME=str(self.uhome), PYTHONPATH=str(REPO),
                    PYTHONDONTWRITEBYTECODE="1")
         if now:
             env["P10A_NOW"] = now
+        if kill:
+            env["P10A_KILL"] = kill
         if spawn_gate:
             env["P10A_NO_SPAWN"] = str(self.spawns)
         return env
 
-    def cli(self, *argv: str, now: str | None = None, spawn_gate: bool = True, timeout: int = 180) -> Ran:
-        """``levain <argv>`` as a subprocess. With neither gate it is the console script itself; with a gate it is the
-        same ``main`` behind ``_p10a_entry.py``."""
-        gated = now is not None or spawn_gate
+    def cli(self, *argv: str, now: str | None = None, spawn_gate: bool = True, kill: str | None = None,
+            timeout: int = 180) -> Ran:
+        """``levain <argv>`` as a subprocess. With no gate it is the console script itself; with a gate it is the
+        same ``main`` behind ``_p10a_entry.py``. A killed process has a negative return code (-9: SIGKILL)."""
+        gated = now is not None or spawn_gate or kill is not None
         exe = levain_bin()
         cmd = [sys.executable, str(ENTRY), *argv] if gated or exe is None else [str(exe), *argv]
-        p = subprocess.run(cmd, cwd=self.tmp, env=self.env(now, spawn_gate), capture_output=True, text=True,
+        p = subprocess.run(cmd, cwd=self.tmp, env=self.env(now, spawn_gate, kill), capture_output=True, text=True,
                            timeout=timeout, stdin=subprocess.DEVNULL)
         return Ran(p.returncode, p.stdout, p.stderr)
 
@@ -207,3 +210,17 @@ def prepare_link(inst: Install, doc: dict):
     pending = auth.prepare(conn, {"op": "create_grant", "grant": grant}, signer_fp=inst.world.fp("laptop"), now=now,
                            cache=auth.ReplayCache())
     return conn, pending, inst.world.keys["laptop"][1](pending.message)
+
+
+def popen(inst: Install, *argv: str, now: str | None = None, spawn_gate: bool = False) -> subprocess.Popen:
+    """``levain <argv>`` started and NOT waited for (two of these are a race between two real processes)."""
+    gated = now is not None or spawn_gate
+    exe = levain_bin()
+    cmd = [sys.executable, str(ENTRY), *argv] if gated or exe is None else [str(exe), *argv]
+    return subprocess.Popen(cmd, cwd=inst.tmp, env=inst.env(now, spawn_gate), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+
+
+def finish(p: subprocess.Popen, timeout: int = 180) -> Ran:
+    out, err = p.communicate(timeout=timeout)
+    return Ran(p.returncode, out, err)

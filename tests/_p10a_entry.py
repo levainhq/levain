@@ -3,6 +3,10 @@
 A P10a case runs the CLI as a subprocess (the installed shape: argv in, exit code and text out). This file is that
 subprocess's ``python <file> <argv...>``. It adds NOTHING to what runs except what the environment names:
 
+* ``P10A_KILL``: ``c1`` .. ``c5``. The first call of that step of ``levain agents revoke`` (c1 the bar's open, c2 the
+  prepare, c3 the signing, c4 the append, c5 the bar's close) SIGKILLs the process instead: the revoke crash matrix's
+  points, in a real process, with no product code changed (the steps are module attributes the verb looks up at call).
+
 * ``P10A_NOW``: an ISO UTC instant. The two wall-clock reads a CLI verb makes before it hands a clock down (the tick
   driver's ``_utc`` and ``levain.dream.start``'s ``datetime.now``) answer it. Everything below those reads is the product
   as it runs: the schedule, the claims, the launch.
@@ -31,6 +35,20 @@ def _gates() -> None:
 
         tick_driver._utc = lambda: fixed
         dstart.datetime = _At
+    kill = os.environ.get("P10A_KILL")
+    if kill:
+        import signal
+
+        def _sigkill(*a, **k):
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        from levain import agent_authority as aa
+        from levain.agents import bars
+
+        # the five points of the revoke's crash matrix (A0 section 2.2), each the first call of its step: SIGKILL there
+        point = {"c1": (bars, "open_bar"), "c2": (aa, "_prepare_onto"), "c3": (aa, "revoke_agent_sign"),
+                 "c4": (aa, "revoke_agent_finish"), "c5": (bars, "close_bar")}[kill]
+        setattr(point[0], point[1], _sigkill)
     sink = os.environ.get("P10A_NO_SPAWN")
     if sink:
         from levain.agents import controller

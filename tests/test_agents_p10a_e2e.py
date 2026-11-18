@@ -341,3 +341,241 @@ def test_p10a_renewal_mid_run(tmp_path):
     finally:
         c.close()
     assert ops == ["create_grant", "renew"]
+
+
+# --------------------------------------------------------------------------- c6/c8 and c7: a revoke racing, two real processes
+
+def _revoke_argv(inst, agent_id):
+    return ("agents", "revoke", agent_id, "--data-root", str(inst.world.root), "--signing-key", str(inst.key))
+
+
+def _log_ops(inst):
+    import json
+    c = sqlite3.connect(inst.world.db)
+    try:
+        return [(s, json.loads(r)["op"]) for s, r in c.execute("SELECT seq, record FROM authority_log WHERE seq >= 5 ORDER BY seq")]
+    finally:
+        c.close()
+
+
+def _clean(*ran):
+    for r in ran:
+        assert "Traceback" not in r.err and "IntegrityError" not in r.err and "OperationalError" not in r.err, r.err
+
+
+def test_p10a_revoke_that_cannot_sign_is_abandoned(tmp_path):
+    """invariant 7 (c2/c3/c6 shape, deterministic): ``levain agents revoke`` with a key the log does not enrol opens the
+    bar and then cannot prepare its link: the agent stays barred (a hand start ends ``stopped: barred``, a sign is
+    refused), and the operator's ``--abandon`` closes the bar with nothing appended, exit 0; a second abandon finds no
+    open revoke (exit 1), the links stand as signed and the dream starts again."""
+    import subprocess
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    agent_id = inst.agent()["agent_id"]
+    assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+    other = tmp_path / "unenrolled"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(other)], check=True)
+    cant = inst.cli("agents", "revoke", agent_id, "--data-root", str(inst.world.root), "--signing-key", str(other),
+                    spawn_gate=False)
+    assert cant.rc == 1 and cant.out == "" and cant.err.startswith(
+        "levain agents revoke: the revoke cannot be prepared: authority log link 6: signer SHA256:") and cant.err.endswith(
+        " is not enrolled; the agent stays barred; run revoke again or --abandon\n")
+    (bar,) = inst.rows("SELECT * FROM agent_bars")
+    assert (bar["revoke_seq"], bar["reason"], bar["closed_at"]) == (None, None, None)
+
+    barred = inst.cli("dream", "start")
+    assert barred.rc == 1 and barred.err.startswith("levain dream start: oc-") and barred.err.endswith(
+        " ended stopped: barred; nothing was started\n")
+    assert inst.spawned() == []
+    signed = inst.sign(inst.link_doc(run_ceiling=3))
+    assert (signed.rc, signed.err) == (1, "levain agents sign: a revoke is open for this agent: finish or abandon it\n")
+
+    abandoned = inst.cli("agents", "revoke", agent_id, "--abandon", spawn_gate=False)
+    assert abandoned.rc == 0 and abandoned.out == f"abandoned: the bar {bar['bar_id']} is closed; nothing was appended\n"
+    assert abandoned.err == (f"attention [agent-abandon:{bar['bar_id']}]: the revoke of {agent_id} was abandoned; "
+                             "the agent's links stand as signed\n")
+    (closed,) = inst.rows("SELECT * FROM agent_bars")
+    assert (closed["reason"], closed["revoke_seq"]) == ("abandoned", None) and closed["closed_at"]
+    again = inst.cli("agents", "revoke", agent_id, "--abandon", spawn_gate=False)
+    assert (again.rc, again.err) == (1, f"levain agents revoke: no open revoke for {agent_id}; nothing to abandon\n")
+    assert _log_ops(inst) == [(5, "create_grant")]                       # nothing was appended
+    assert inst.cli("dream", "start").rc == 0                            # the signed link still arms the dream
+
+
+def test_p10a_revoke_racing_an_abandon(tmp_path):
+    """invariant 7 (c6/c8): ``levain agents revoke`` and ``revoke --abandon`` as two real processes, the abandon started
+    a few tens of milliseconds after the revoke so it lands inside the revoke's window. Whatever order the two land in,
+    the outcome is one of the three the protocol names, both exit 0 where it says so, nothing raises, and the log
+    holds at most one revoke: (a) the revoke landed first and the abandon found nothing open (exit 1); (b) the abandon
+    closed the bar first, the revoke says so and the agent is NOT revoked (exit 0, nothing appended); (c) the abandon
+    saw the bar open and lost the close to the revoke (exit 0, 'had already landed')."""
+    import time
+    from tests._p10a_rig import finish, popen
+
+    seen: set[str] = set()
+    for attempt, offset in enumerate((0.04, 0.08, 0.06, 0.05, 0.07, 0.04, 0.08, 0.06)):
+        (tmp_path / f"a{attempt}").mkdir()
+        inst = Install(tmp_path / f"a{attempt}")
+        assert inst.enable("--time", "00:00").rc == 0
+        agent_id = inst.agent()["agent_id"]
+        assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+        rev = popen(inst, *_revoke_argv(inst, agent_id))
+        time.sleep(offset)
+        abn = popen(inst, "agents", "revoke", agent_id, "--abandon")
+        r, a = finish(rev), finish(abn)
+        _clean(r, a)
+        (bar,) = inst.rows("SELECT * FROM agent_bars")
+        ops = _log_ops(inst)
+        assert r.rc == 0, r
+        if bar["reason"] == "signed":
+            assert ops == [(5, "create_grant"), (6, "revoke_agent")] and bar["revoke_seq"] == 6
+            assert r.out.endswith("revoke landed at seq 6; the bar is closed\n")
+            if a.rc == 1:
+                assert a.err == f"levain agents revoke: no open revoke for {agent_id}; nothing to abandon\n"
+                seen.add("revoke first")
+            else:
+                assert (a.rc, a.out) == (0, "the revoke had already landed at seq 6; nothing to abandon\n"), a
+                seen.add("abandon lost the close")
+            assert inst.cli("dream", "start").rc == 1                      # the revoke stands: nothing arms
+        else:
+            assert bar["reason"] == "abandoned" and bar["revoke_seq"] is None and ops == [(5, "create_grant")]
+            assert r.out.endswith("the revoke was abandoned; nothing was appended; the agent is NOT revoked\n")
+            assert a.rc == 0 and a.out.startswith("abandoned: the bar bar-") and a.out.endswith(
+                "is closed; nothing was appended\n")
+            seen.add("abandon first")
+            assert inst.cli("dream", "start").rc == 0                      # the links stand as signed
+        if "abandon first" in seen or "abandon lost the close" in seen:
+            break
+    assert seen & {"abandon first", "abandon lost the close"}, f"the race window was not hit in 8 tries: {seen}"
+
+
+def test_p10a_revoke_racing_a_renewal(tmp_path):
+    """invariant 7 (c7): ``levain agents renew`` and ``levain agents revoke`` as two real processes on the same log.
+    Renew started first, revoke 0.15 s later: the renew lands at seq 6 and the revoke one seq later at 7 (the revoke
+    re-prepares on the moved head); started together the revoke wins the bar and the renew is refused as open. Never an
+    error from the store, never two revokes, and a revoke always stands at the end."""
+    import time
+    from tests._p10a_rig import finish, popen
+
+    outcomes = []
+    for attempt, delay in enumerate((0.0, 0.15, 0.3)):
+        (tmp_path / f"b{attempt}").mkdir()
+        inst = Install(tmp_path / f"b{attempt}")
+        assert inst.enable("--time", "00:00").rc == 0
+        agent_id = inst.agent()["agent_id"]
+        link = inst.sign(inst.link_doc(run_ceiling=3)).out.split()[1]
+        renew = popen(inst, "agents", "renew", link, "--data-root", str(inst.world.root), "--signing-key", str(inst.key))
+        time.sleep(delay)
+        rev = popen(inst, *_revoke_argv(inst, agent_id))
+        rn, rv = finish(renew), finish(rev)
+        _clean(rn, rv)
+        assert rv.rc == 0
+        ops = _log_ops(inst)
+        (bar,) = inst.rows("SELECT * FROM agent_bars")
+        assert bar["reason"] == "signed"
+        if rn.rc == 0:
+            assert ops == [(5, "create_grant"), (6, "renew"), (7, "revoke_agent")] and bar["revoke_seq"] == 7
+            assert rn.out.startswith(f"renewed: {link} at seq 6, until ") and rv.out.endswith(
+                "revoke landed at seq 7; the bar is closed\n")
+            outcomes.append("renew then revoke at 7")
+        else:
+            assert ops == [(5, "create_grant"), (6, "revoke_agent")] and bar["revoke_seq"] == 6
+            assert (rn.rc, rn.err) == (1, "levain agents renew: a revoke is open for this agent: finish or abandon it\n")
+            outcomes.append("revoke first, renew refused")
+        assert inst.cli("dream", "start").rc == 1                           # the revoke stands whichever landed first
+    assert "renew then revoke at 7" in outcomes, outcomes
+
+
+# -------------------------------------------------------------------- c1-c5: a SIGKILL at each step of a revoke
+
+_REFUSED_START = ("levain dream start: no live signed link covers the dream's current spec (or the authority log could "
+                  "not be replayed), so nothing was claimed; the dream launches only under a live signed link\n")
+
+
+def _killed_revoke(tmp_path, point: str):
+    """A dream with a signed link and a hand run in flight, then ``levain agents revoke`` SIGKILLed at ``point`` (the
+    entry's P10A_KILL gate: the first call of that step). Returns the install, the agent id, the revoke argv."""
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    agent_id = inst.agent()["agent_id"]
+    assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+    assert inst.cli("dream", "start").rc == 0
+    argv = _revoke_argv(inst, agent_id)
+    killed = inst.cli(*argv, kill=point, spawn_gate=False)
+    assert killed.rc == -9 and killed.out == "", killed                    # SIGKILL: no text, no exit code of its own
+    return inst, agent_id, argv
+
+
+def _bar(inst):
+    return inst.rows("SELECT revoke_seq, reason, closed_at IS NULL AS open, pending_seq, "
+                     "pending_signature IS NOT NULL AS signed, attempts FROM agent_bars")
+
+
+LANDED = "the agent is barred; the revoke link waits for a signature\nrevoke landed at seq 6; the bar is closed\n"
+
+
+def test_p10a_revoke_killed_c1_before_the_bar(tmp_path):
+    """c1: killed before the bar commits. Nothing was written: no bar, no epoch bump on the run in flight, the log at
+    seq 5; the rerun lands at seq 6 and the dream is then unarmed."""
+    inst, agent_id, argv = _killed_revoke(tmp_path, "c1")
+    assert _bar(inst) == [] and inst.rows("SELECT epoch FROM agent_occurrences")[0]["epoch"] == 0
+    assert _log_ops(inst) == [(5, "create_grant")]
+    rerun = inst.cli(*argv, spawn_gate=False)
+    assert (rerun.rc, rerun.out) == (0, LANDED)
+    assert _bar(inst) == [{"revoke_seq": 6, "reason": "signed", "open": 0, "pending_seq": 6, "signed": 1, "attempts": 1}]
+    assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
+
+
+@pytest.mark.parametrize("point, pending, signed", [("c2", None, 0), ("c3", 6, 0), ("c4", 6, 1)])
+def test_p10a_revoke_killed_c2_to_c4_the_agent_stays_barred_and_the_rerun_lands(tmp_path, point, pending, signed):
+    """c2 (bar committed, nothing prepared), c3 (prepared, not signed), c4 (signature recorded, not appended): the bar
+    is open and the run in flight is fenced (epoch bumped), nothing is in the log; a tick does not move the bar; the
+    operator's rerun lands the revoke at seq 6 on the same bar (a new signing gesture: ``Signing data on standard input``
+    again) and the dream is unarmed. (BUILD_PLAN names recovery for c4: ``bars.recover`` has no caller in the installed
+    build, see test_p10a_revoke_killed_c4_c5_recovery_by_the_tick.)"""
+    inst, agent_id, argv = _killed_revoke(tmp_path, point)
+    (open_bar,) = _bar(inst)
+    assert open_bar == {"revoke_seq": None, "reason": None, "open": 1, "pending_seq": pending, "signed": signed,
+                        "attempts": 0 if point == "c2" else 1}
+    assert inst.rows("SELECT epoch FROM agent_occurrences")[0]["epoch"] == 1 and _log_ops(inst) == [(5, "create_grant")]
+    inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    assert [b["open"] for b in _bar(inst)] == [1] and _log_ops(inst) == [(5, "create_grant")]
+    rerun = inst.cli(*argv, spawn_gate=False)
+    assert (rerun.rc, rerun.out, rerun.err) == (0, LANDED, "Signing data on standard input\n")
+    (done,) = _bar(inst)
+    assert (done["revoke_seq"], done["reason"], done["open"]) == (6, "signed", 0)
+    assert done["attempts"] == (1 if point == "c2" else 2)
+    assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
+
+
+def test_p10a_revoke_killed_c5_after_the_append(tmp_path):
+    """c5: killed after the append, before the bar's close. As the installed build runs it TODAY: the revoke is in the log
+    (seq 6) and the dream is unarmed, but the bar stays open; the tick does not close it; the rerun is refused ('this
+    revoke_agent changes nothing; the agent stays barred'), and ``--abandon`` closes the bar 'abandoned' while saying
+    'nothing was appended' (the revoke stands). The recovery the design names for this point (R1: close it signed) is the
+    xfail below."""
+    inst, agent_id, argv = _killed_revoke(tmp_path, "c5")
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
+    (bar,) = _bar(inst)
+    assert (bar["open"], bar["revoke_seq"], bar["signed"]) == (1, None, 1)
+    assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    assert [b["open"] for b in _bar(inst)] == [1], tick
+    rerun = inst.cli(*argv, spawn_gate=False)
+    assert (rerun.rc, rerun.out, rerun.err) == (1, "", "levain agents revoke: the revoke cannot be prepared: authority "
+        "log link 7: this revoke_agent changes nothing; the agent stays barred; run revoke again or --abandon\n")
+    abandoned = inst.cli("agents", "revoke", agent_id, "--abandon", spawn_gate=False)
+    assert abandoned.rc == 0 and abandoned.out.endswith("is closed; nothing was appended\n")
+    assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]    # and the revoke is still the log's
+
+
+@pytest.mark.xfail(strict=True, reason="levain#121 finding: levain.agents.bars.recover (A0 section 2.2 rows R1, R2) has no "
+                   "caller in the installed build, so a revoke killed at c4/c5 is never finished by a tick")
+@pytest.mark.parametrize("point", ["c4", "c5"])
+def test_p10a_revoke_killed_c4_c5_recovery_by_the_tick(tmp_path, point):
+    """The design's recovery for c4 (append the recorded signature, no new gesture) and c5 (close the bar signed): after
+    the kill, one tick leaves the bar closed ``signed`` at seq 6 and the revoke in the log."""
+    inst, agent_id, argv = _killed_revoke(tmp_path, point)
+    inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    (bar,) = _bar(inst)
+    assert (bar["open"], bar["reason"], bar["revoke_seq"]) == (0, "signed", 6)
