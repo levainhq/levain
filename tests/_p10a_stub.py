@@ -13,12 +13,13 @@ then replies from ``result-n.json`` (else ``result.json``, else a minimal succes
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
 _SCRIPT = """#!/bin/sh
 D='{dir}'
-n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$D/n"
+n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$D/n.tmp.$$" && mv "$D/n.tmp.$$" "$D/n"
 printf '%s\\n' "$@" > "$D/argv-$n"
 pwd > "$D/cwd-$n"
 cat > "$D/stdin-$n"
@@ -30,6 +31,15 @@ else cat "$D/default.json"; fi
 for k in "exit-$n" exit; do [ -f "$D/$k" ] && exit "$(cat "$D/$k")"; done
 exit 0
 """
+
+
+def group_alive(pgid: int) -> bool:
+    """Is process group ``pgid`` still there? macOS answers EPERM while the group holds only unreaped zombies: ended."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def success_doc(text: str = "stub", cost: float | None = 0.01, model: str = "claude-opus-5-5") -> dict:
@@ -72,8 +82,10 @@ class StubClaude:
         (self.dir / ("exit" if n is None else f"exit-{n}")).write_text(str(rc), encoding="utf-8")
 
     def calls(self) -> int:
-        f = self.dir / "n"
-        return int(f.read_text()) if f.exists() else 0
+        try:
+            return int((self.dir / "n").read_text().strip() or 0)
+        except (FileNotFoundError, ValueError):
+            return 0
 
     def argv(self, n: int = 1) -> list[str]:
         return (self.dir / f"argv-{n}").read_text(encoding="utf-8").splitlines()

@@ -19,6 +19,7 @@ import pytest
 
 pytest.importorskip("cryptography")
 from tests._p10a_rig import Install  # noqa: E402
+from tests._p10a_stub import group_alive as _group_alive  # noqa: E402
 from tests._p10a_stub import success_doc  # noqa: E402
 from tests.test_dream_executor import _VALID  # noqa: E402
 
@@ -162,16 +163,6 @@ def _kill_group(pgid: int | None) -> None:
             pass
 
 
-def _group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _gone(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -186,7 +177,13 @@ def _sigkill_mid_compose(tmp_path):
     (row,) = inst.rows()
     assert row["state"] == "launched" and row["pid"]                       # claimed by the fire
     prog = inst.anneal / "dream" / row["occurrence_id"] / "progress.json"
-    child = _wait(inst, "the compose child to be journalled", lambda: json.loads(prog.read_text())["child_pid"])
+    def journalled():
+        try:                                       # the key is absent, or the file mid-write, until the child is journalled
+            return json.loads(prog.read_text()).get("child_pid")
+        except (OSError, ValueError):
+            return None
+
+    child = _wait(inst, "the compose child to be journalled", journalled)
     os.kill(row["pid"], signal.SIGKILL)                                    # the fire dies; no usage.json is written
     _wait(inst, "the fire to be gone", lambda: _gone(row["pid"]))
     assert _usage(inst, row["occurrence_id"]) is None
@@ -333,3 +330,43 @@ def test_a_usage_json_from_an_earlier_run_is_gone_once_this_run_owns_the_dir(scr
 
     _run_usage(scratch, tmp_path, _Mind(peek))
     assert seen == [False]
+
+
+def test_a_stale_usage_json_that_cannot_be_removed_refuses_the_start(scratch, tmp_path):
+    """Fail closed: a readable usage.json of an earlier run that cannot be unlinked (here a non-empty DIRECTORY, the
+    unlink raises an OSError that is not FileNotFoundError) refuses the start; nothing is composed, nothing settles."""
+    occ = tmp_path / "occ"
+    (occ / "usage.json").mkdir(parents=True)
+    (occ / "usage.json" / "keep").write_text("x", encoding="utf-8")
+    called: list[int] = []
+
+    def never(req):
+        called.append(1)
+        raise RuntimeError("must not be reached")
+
+    from levain.dream import executor as ex
+
+    res = ex.consolidate_store(scratch, mind=_Mind(never), occurrence_dir=occ, max_seconds=3000)
+    assert called == []
+    assert res.outcome == "precondition"
+    assert "usage.json of an earlier run cannot be removed" in res.detail
+    assert res.exit_code == 2 and res.composes == [] and res.wrap_token is None
+    assert (occ / "usage.json" / "keep").exists() and not (occ / "progress.json").exists()
+
+
+def test_the_stale_usage_json_is_gone_even_when_progress_update_raises(scratch, tmp_path, monkeypatch):
+    """A stop landing inside ``progress.update`` (its stop hold raises FireStopRequested on release) must not leave the
+    earlier run's readable usage.json behind: the unlink is ordered BEFORE the first journalling after the live check."""
+    from levain.dream import executor as ex
+
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    (occ / "usage.json").write_text(json.dumps({"readable": True, "actual_usd_micros": 5}), encoding="utf-8")
+
+    def boom(self, **kw):
+        raise KeyboardInterrupt("stop inside progress.update")
+
+    monkeypatch.setattr(ex.Progress, "update", boom, raising=True)
+    with pytest.raises(KeyboardInterrupt):
+        ex.consolidate_store(scratch, mind=_Mind(lambda req: None), occurrence_dir=occ, max_seconds=3000)
+    assert not (occ / "usage.json").exists()

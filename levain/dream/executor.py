@@ -1158,14 +1158,23 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 print(f"{L}: occurrence dir already holds a live run record: {occ_dir} — {live}. A run there may "
                       "still have a child to end; nothing was started and its record was left as it is.")
                 return _fail("precondition", 2, f"occurrence dir already holds a live run record: {live}")
+            # This run owns the dir now (lock held, no live record): a usage.json left by an earlier run is not this
+            # run's. It is gone BEFORE anything a stop can interrupt (progress.update's stop hold raises on release),
+            # so a run that dies before its own write reads as absent (the whole reservation settles). Only a missing
+            # file is fine: any other failure leaves a readable stale usage that settle would accept, so refuse.
+            try:
+                (occ_dir / "usage.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"{L}: usage.json of an earlier run cannot be removed in {occ_dir} "
+                      f"({type(exc).__name__}: {exc}); nothing was started.")
+                return _fail("precondition", 2, f"usage.json of an earlier run cannot be removed: "
+                                                f"{type(exc).__name__}: {exc}")
             if not progress.update():
                 print(f"{L}: progress.json could not be written in {occ_dir} ({progress.write_error}); nothing was "
                       "started.")
                 return _fail("precondition", 2, f"progress.json unwritable: {progress.write_error}")
-            # This run owns the dir now (lock held, no live record): a usage.json left by an earlier run is not this
-            # run's. Gone, a run that dies before its own write reads as absent (the whole reservation settles).
-            with contextlib.suppress(OSError):
-                (occ_dir / "usage.json").unlink()
             ctx.owns_occ = True
 
         headings = [s["heading"] for s in store.section_schema]
@@ -1335,7 +1344,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
             try:
                 res = mind.compose(req)
             except ComposeUnavailable as exc:
-                ctx.composes.remove(row)      # always raised before anything was spent: no compose was attempted
+                ctx.composes[:] = [c for c in ctx.composes if c is not row]   # by identity; always raised before anything was spent: no compose was attempted
                 cancelled = cancel_ours()
                 print(f"{L}: {exc}")
                 if not cancelled:

@@ -30,7 +30,7 @@ import pytest
 
 pytest.importorskip("cryptography")
 from tests._p10a_rig import Install  # noqa: E402
-from tests._p10a_stub import success_doc  # noqa: E402
+from tests._p10a_stub import group_alive, success_doc  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -115,11 +115,7 @@ class Fire:
         return self.inst.rows(f"SELECT * FROM agent_slots WHERE owner_id = '{self.oid}'")
 
     def group_alive(self) -> bool:
-        try:
-            os.killpg(self.child, 0)
-        except (ProcessLookupError, PermissionError):     # macOS: EPERM while the group holds only unreaped zombies
-            return False
-        return True
+        return group_alive(self.child)
 
     def close(self) -> None:
         for fn, pid in ((os.killpg, self.child), (os.kill, self.fire_pid)):
