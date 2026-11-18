@@ -405,25 +405,43 @@ def test_p10a_revoke_that_cannot_sign_is_abandoned(tmp_path):
 
 
 def test_p10a_revoke_racing_an_abandon(tmp_path):
-    """invariant 7 (c6/c8): ``levain agents revoke`` and ``revoke --abandon`` as two real processes, the abandon started
-    a few tens of milliseconds after the revoke so it lands inside the revoke's window. Whatever order the two land in,
-    the outcome is one of the three the protocol names, both exit 0 where it says so, nothing raises, and the log
+    """invariant 7 (c6/c8): ``levain agents revoke`` and ``revoke --abandon`` as two real processes, the abandon timed
+    from when the revoke opens its bar so it lands inside the revoke's window. Whatever
+    order the two land in, the outcome is one of the three the protocol names, both exit 0 where it says so, nothing
+    raises, and the log
     holds at most one revoke: (a) the revoke landed first and the abandon found nothing open (exit 1); (b) the abandon
     closed the bar first, the revoke says so and the agent is NOT revoked (exit 0, nothing appended); (c) the abandon
     saw the bar open and lost the close to the revoke (exit 0, 'had already landed')."""
     import time
     from tests._p10a_rig import finish, popen
 
+    def bar_exists(inst) -> bool:
+        try:
+            return bool(inst.rows("SELECT count(*) AS n FROM agent_bars")[0]["n"])
+        except sqlite3.Error:
+            return False                               # the store or its table is not there yet
+
     seen: set[str] = set()
-    for attempt, offset in enumerate((0.04, 0.08, 0.06, 0.05, 0.07, 0.04, 0.08, 0.06)):
+    bar_delay = None                                   # seconds from the revoke's start to its bar row, measured
+    # the abandon's own start-up (imports and its log check) runs before it can look at the bar, so it is launched
+    # `lead` seconds before the bar is due; the first attempt has no estimate and waits for the bar, each later one aims by the last
+    for attempt, lead in enumerate((0.0, 0.25, 0.3, 0.2, 0.35, 0.28, 0.32, 0.22, 0.4, 0.26, 0.3, 0.24)):
         (tmp_path / f"a{attempt}").mkdir()
         inst = Install(tmp_path / f"a{attempt}")
         assert inst.enable("--time", "00:00").rc == 0
         agent_id = inst.agent()["agent_id"]
         assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
+        started = time.monotonic()
         rev = popen(inst, *_revoke_argv(inst, agent_id))
-        time.sleep(offset)
-        abn = popen(inst, "agents", "revoke", agent_id, "--abandon")
+        if bar_delay is not None:
+            time.sleep(max(0.0, started + bar_delay - lead - time.monotonic()))
+        abn = popen(inst, "agents", "revoke", agent_id, "--abandon") if bar_delay is not None else None
+        while not bar_exists(inst):                    # every attempt re-measures, so a loaded machine moves the aim
+            assert time.monotonic() < started + 20, "the revoke never opened its bar"
+            time.sleep(0.005)
+        bar_delay = time.monotonic() - started
+        if abn is None:
+            abn = popen(inst, "agents", "revoke", agent_id, "--abandon")
         r, a = finish(rev), finish(abn)
         _clean(r, a)
         (bar,) = inst.rows("SELECT * FROM agent_bars")
@@ -448,7 +466,7 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
             assert inst.cli("dream", "start").rc == 0                      # the links stand as signed
         if "abandon first" in seen or "abandon lost the close" in seen:
             break
-    assert seen & {"abandon first", "abandon lost the close"}, f"the race window was not hit in 8 tries: {seen}"
+    assert seen & {"abandon first", "abandon lost the close"}, f"the race window was not hit in 12 tries: {seen}"
 
 
 def test_p10a_revoke_racing_a_renewal(tmp_path):
@@ -528,19 +546,21 @@ def test_p10a_revoke_killed_c1_before_the_bar(tmp_path):
     assert inst.cli("dream", "start").err.endswith(_REFUSED_START)
 
 
-@pytest.mark.parametrize("point, pending, signed", [("c2", None, 0), ("c3", 6, 0)])
+@pytest.mark.parametrize("point, pending, signed", [("c2", None, 0), ("c3", 6, 0), ("c4", 6, 1)])
 def test_p10a_revoke_killed_c2_to_c4_the_agent_stays_barred_and_the_rerun_lands(tmp_path, point, pending, signed):
-    """c2 (bar committed, nothing prepared), c3 (prepared, not signed): the bar
-    is open and the run in flight is fenced (epoch bumped), nothing is in the log; a tick does not move the bar; the
-    operator's rerun lands the revoke at seq 6 on the same bar (a new signing gesture: ``Signing data on standard input``
-    again) and the dream is unarmed. (c4's recovery is test_p10a_revoke_killed_c4_c5_recovery_by_the_tick.)"""
+    """c2 (bar committed, nothing prepared), c3 (prepared, not signed), c4 (signed and stored, not appended): the bar
+    is open and the run in flight is fenced (epoch bumped), nothing is in the log; a tick does not move the bar of c2 or
+    c3 (a tick lands c4 through R2, which test_p10a_revoke_killed_c4_c5_recovery_by_the_tick covers, so c4 runs no
+    tick); the operator's rerun lands the revoke at seq 6 on the same bar (a new signing gesture: ``Signing data on
+    standard input`` again) and the dream is unarmed."""
     inst, agent_id, argv = _killed_revoke(tmp_path, point)
     (open_bar,) = _bar(inst)
     assert open_bar == {"revoke_seq": None, "reason": None, "open": 1, "pending_seq": pending, "signed": signed,
                         "attempts": 0 if point == "c2" else 1}
     assert inst.rows("SELECT epoch FROM agent_occurrences")[0]["epoch"] == 1 and _log_ops(inst) == [(5, "create_grant")]
-    inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
-    assert [b["open"] for b in _bar(inst)] == [1] and _log_ops(inst) == [(5, "create_grant")]
+    if point != "c4":
+        inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+        assert [b["open"] for b in _bar(inst)] == [1] and _log_ops(inst) == [(5, "create_grant")]
     rerun = inst.cli(*argv, spawn_gate=False)
     assert (rerun.rc, rerun.out, rerun.err) == (0, LANDED, "Signing data on standard input\n")
     (done,) = _bar(inst)

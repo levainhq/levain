@@ -332,23 +332,46 @@ def _cockpit_root(store: AgentStore) -> Path:
 def recover_bars(st: AgentStore, auth: Any, clock: Callable[[], datetime],
                  attention: Callable[[str, str], None] | None) -> list:
     """Run ``bars.recover`` once over the store's open bars: the one helper the tick and ``levain agents show`` share.
-    It opens and closes its own two connections (the store's, no transaction open, and the cockpit journal's writable
-    one). A stand-in authority (a test's) is skipped, as is anything that is not an ``AgentAuthority``. Raises what
-    opening them raises; the callers catch it."""
+    It opens and closes its own two connections (the store's, no transaction open, and the cockpit journal's). The
+    journal is opened writable only when the store holds an open bar, because only R2 appends; with none open (and when
+    the writable open is refused, a governed marker) R5 and R1/R3 read it through a read-only connection. A stand-in
+    authority (a test's) is skipped, as is anything that is not an ``AgentAuthority``. Raises what opening them
+    raises; the callers catch it."""
+    import sqlite3
+    from urllib.parse import quote
+
     from levain.agent_authority import AgentAuthority
     from levain.agents import bars
     from levain.authority import anchor_path
-    from levain.cockpit.keys import _journal
+    from levain.cockpit.firejournal import DB_NAME
+    from levain.cockpit.keys import KeyError_, _journal
 
     if not isinstance(auth, AgentAuthority):
         return []
     root = auth.cockpit_root
-    with _journal(root).autocommit() as cockpit:
-        conn = st._db._connect()
+
+    def read_only() -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{quote(str(Path(root) / DB_NAME))}?mode=ro", uri=True, timeout=2.0)
+
+    conn = st._db._connect()
+    try:
+        cockpit = None
+        if conn.execute("SELECT 1 FROM agent_bars WHERE closed_at IS NULL LIMIT 1").fetchone() is not None:
+            try:
+                journal = _journal(root)
+            except KeyError_:
+                journal = None
+            if journal is not None:
+                with journal.autocommit() as cockpit:
+                    return bars.recover(conn, auth, cockpit, now=clock(), anchor=anchor_path(root),
+                                        attention=attention)
+        cockpit = read_only()
         try:
             return bars.recover(conn, auth, cockpit, now=clock(), anchor=anchor_path(root), attention=attention)
         finally:
-            conn.close()
+            cockpit.close()
+    finally:
+        conn.close()
 
 
 def outcome_note(outcome: Any) -> str:

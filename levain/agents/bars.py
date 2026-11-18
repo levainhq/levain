@@ -221,16 +221,19 @@ def _r2(conn, cockpit, state, bar: Bar, *, now, anchor, ssh_keygen) -> Outcome |
     link = _auth.UnsignedLink(seq, prev, rec, fp)
     kw = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
     try:
-        _auth.append(cockpit, link, bar.pending_signature, now=now, anchor=anchor, **kw)
+        appended = _auth.append(cockpit, link, bar.pending_signature, now=now, anchor=anchor, **kw)
     except _auth.AuthorityError as exc:
         # StaleHead or a refused link: the bar stays open and falls to R4; the reason is recorded on the bar
         _guarded(conn, "last_error = ?", (("stale_head" if isinstance(exc, _auth.StaleHead)
                                            else f"append_refused:{type(exc).__name__}"),), bar.bar_id)
         return None
+    warning = getattr(appended, "anchor_warning", None)
+    tail = "" if warning is None else f"; warning: {warning}"
     if close_bar(conn, bar.bar_id, revoke_seq=seq, reason="signed", now=now):
-        return Outcome("R2", bar.agent_id, bar.bar_id, f"appended the stored signature at seq {seq}; bar closed (signed)")
+        return Outcome("R2", bar.agent_id, bar.bar_id,
+                       f"appended the stored signature at seq {seq}; bar closed (signed){tail}")
     return Outcome("R2", bar.agent_id, bar.bar_id,
-                   f"revoke landed at seq {seq}; the bar had been abandoned; it is recorded from_log at the next tick")
+                   f"revoke landed at seq {seq}; the bar had been abandoned; it is recorded from_log at the next tick{tail}")
 
 
 def _r3(conn, cockpit, state, bar: Bar, *, now, store_id) -> Outcome | None:
