@@ -160,3 +160,21 @@ def test_standalone_probe_starts_where_levain_is_not_importable(tmp_path):
                        env={"PATH": os.environ["PATH"], "HOME": str(alone)})
     assert "ModuleNotFoundError" not in r.stderr, r.stderr
     assert "--nonce must be" in r.stderr, r.stderr
+
+
+def test_a_broken_levain_import_stays_loud_in_the_standalone_probe(tmp_path):
+    """Only the levain package's own absence is tolerated: a levain that is present but whose home_guard fails to
+    import must not silently skip the live marking."""
+    import shutil
+    import sys
+    alone = tmp_path / "alone"
+    (alone / "levain").mkdir(parents=True)
+    (alone / "levain" / "__init__.py").write_text("")
+    (alone / "levain" / "home_guard.py").write_text("import a_module_that_does_not_exist_xyz\n")
+    shutil.copyfile(cp.__file__, alone / "canary_probe.py")
+    r = subprocess.run([sys.executable, "-S", str(alone / "canary_probe.py"), "--nonce", "abcd1234",
+                        "--home", str(alone), "--port", "1", "--cockpit", str(alone), "--hookdir", str(alone)],
+                       cwd=alone, capture_output=True, text=True, timeout=60,
+                       env={"PATH": os.environ["PATH"], "HOME": str(alone), "PYTHONPATH": str(alone)})
+    assert r.returncode != 0
+    assert "a_module_that_does_not_exist_xyz" in r.stderr, r.stderr

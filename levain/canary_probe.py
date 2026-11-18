@@ -390,9 +390,11 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         from levain.home_guard import mark_live
-    except ImportError:
+    except ModuleNotFoundError as exc:
         # A copy run inside a slot has no levain package; there it resolves no levain home, so there is nothing to mark.
-        pass
+        # Only the package's own absence is that case: any other failed import stays loud.
+        if exc.name != "levain":
+            raise
     else:
         mark_live()
     sys.exit(main())
