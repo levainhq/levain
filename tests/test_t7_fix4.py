@@ -118,23 +118,34 @@ def _whole():
                        "repos": [sm("a", merged=2, d=["main"]), sm("b", merged=3, d=["dev"])]}}
 
 
-def test_only_repo_filters_reader_repos_recomputes_counts_and_drops_other_repos_idless_audit():
-    out = board_cli.only_repo(_whole(), "a")
-    assert [s["repo"] for s in out["reader"]["repos"]] == ["a"]
-    assert out["reader"]["merged"] == 2 and out["reader"]["repo"] == "a" and out["reader"]["diverged"] == ["a:main"]
-    assert [a["why"] for a in out["audit"]] == ["a: chain unreadable: y", "the registry file is torn"]   # a no-repo entry stays
-    assert out["problems"] == ["a: chain unreadable: y", "line 3: torn: x"]
-    assert "b" not in json.dumps(out["reader"]).replace('"main_ref"', "")
+def test_only_repo_leaves_the_reader_byte_identical_and_labels_it_the_whole_boards():
+    whole = _whole()
+    out = board_cli.only_repo(whole, "a")
+    assert json.dumps(out["reader"], sort_keys=True) == json.dumps(_whole()["reader"], sort_keys=True)
+    assert out["reader_scope"] == "board" and out["repo_filter"] == "a"
+    assert out["problems"] == whole["problems"]
+    unfiltered = board_cli.only_repo(_whole(), None)
+    assert "reader_scope" not in unfiltered and "repo_filter" not in unfiltered
     none = board_cli.only_repo(_whole(), "zzz")
-    assert none["reader"]["repos"] == [] and none["reader"]["merged"] == 0 and none["reader"]["diverged"] == []
+    assert none["reader"] == _whole()["reader"] and none["items"] == []
 
 
-def test_only_repo_with_an_also_reader_keeps_the_named_repos_summary():
+def test_only_repo_keeps_every_idless_audit_entry_even_one_naming_another_repo_and_drops_other_repos_ids():
     doc = _whole()
-    doc["reader"] = {"repo": "a", "merged": 2, "diverged": [], "also": [{"repo": "b", "merged": 3, "diverged": []}]}
-    assert board_cli.only_repo(doc, "a")["reader"] == {"repo": "a", "merged": 2, "diverged": [], "also": []}
-    got = board_cli.only_repo(doc, "b")["reader"]
-    assert got["repo"] == "b" and got["merged"] == 3 and got["also"] == []
+    doc["audit"].append({"kind": "k", "id": "b#1", "why": "w"})
+    doc["audit"].append({"kind": "k", "id": "a#1", "why": "w"})
+    out = board_cli.only_repo(doc, "a")
+    assert [a["why"] for a in out["audit"]] == ["b: main unreadable: x", "a: chain unreadable: y", "the registry file is torn", "w"]
+    assert [a["id"] for a in out["audit"]] == [None, None, None, "a#1"]
+    assert [i["id"] for i in out["items"]] == ["a#1"]
+
+
+def test_table_lines_labels_the_reader_whole_board_under_a_repo_filter_and_counts_what_it_keeps():
+    text = "\n".join(board_cli.table_lines({**_whole(), "reader": {"diverged": ["a:main", "b:dev"]}}, "a"))
+    assert "1 items, 3 audit entries" in text and "b#1" not in text
+    assert "reader (whole board): diverged: a:main" in text and "reader (whole board): diverged: b:dev" in text
+    plain = "\n".join(board_cli.table_lines({**_whole(), "reader": {"diverged": ["a:main"]}}))
+    assert "reader (whole board)" not in plain and "diverged: a:main" in plain
 
 
 # --- 5: run_state shows what was collected before an exception -------------------------------------------------------

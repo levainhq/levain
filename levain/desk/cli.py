@@ -2908,7 +2908,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ready_leaves: list[argparse.ArgumentParser] = []
     rds = rd_sub.add_parser("show", help="The queue: effectively-ready items (--all: every column).")
     rds.add_argument("--all", action="store_true", help="Every column, not only ready.")
-    rds.add_argument("--repo", default=None, help="Only this repo.")
+    rds.add_argument("--repo", default=None, help="Only the items and audit entries whose id reads NAME#N; the reader block "
+                     "and problems are the whole board's and say so.")
     ready_leaves.append(rds)
     door_ok(rds)
     for verb, what in (("add", "A new item (backlog unless --to says)."), ("move", "Move an item to --to."),
