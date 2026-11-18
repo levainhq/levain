@@ -318,16 +318,22 @@ def _spec(ctx: H.Ctx, a: R.Alloc, target: str, **kw) -> wall.Spec:
                             shared={"levain-slots": seams.group_gid("levain-slots")}, kind=a.kind, **kw)
 
 
-def secret_env(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
+def start_route_types(ctx: H.Ctx, a: R.Alloc) -> Dict[str, str]:
+    """The session's route types for ``start``: the base map's, plus a ticketed session's pinned route once its pin
+    still holds (:func:`H.pinned_route_entry`: a route withdrawn since render is ``route-not-allowed`` here). Taken
+    before anything ``start`` cannot undo, so such a refusal leaves the session RENDERED and unstarted."""
+    return H.session_route_types(ctx.store, a, H.base_route_types(ctx.store))
+
+
+def secret_env(ctx: H.Ctx, a: R.Alloc, route_types: Dict[str, str]) -> Dict[str, str]:
     """§3.2: ``SECRETS`` -> the vendor's extra env, under render's names for this session's policy (alloc's
-    routes and hooks; the base map's route types). A name the policy carries that the answer lacks is refused
-    ``secrets-missing:<name>``; a handle the policy does not name is never passed."""
+    routes and hooks; ``route_types``, :func:`start_route_types`). A name the policy carries that the answer lacks
+    is refused ``secrets-missing:<name>``; a handle the policy does not name is never passed."""
     pol = a.policy
     assert pol is not None
     ans = ctx.call("SECRETS", session=a.session)
     facts = RD.RenderFacts(host=ctx.seams.host, session=a.session, slot=a.slot, kind=a.kind, vendor=a.vendor,
-                           auth=a.auth, slot_uid=a.slot_uid, slot_gid=a.slot_gid,
-                           route_types=H.session_route_types(ctx.store, a))
+                           auth=a.auth, slot_uid=a.slot_uid, slot_gid=a.slot_gid, route_types=route_types)
     names = RD.secret_env_names(RenderBlob(vendor=a.vendor, routes=pol.routes, hooks=pol.hooks), facts)
     out: Dict[str, str] = {}
     for name in names:
@@ -1124,6 +1130,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
         raise Refused("already-started", a.session)
     if rec is None or rec.state != R.RENDERED:
         raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
+    route_types = start_route_types(ctx, a)
     if H.identity_gated(a):
         # c7.14: a ticketed passthrough session (alloc auth passthrough only exists on one CONTROL bound to a
         # passthrough ticket: ATTACH compares the two) takes the same keep/ return and identity compare
@@ -1138,7 +1145,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
         _spawn_forwarder(ctx, a)
 
     seams.at("secrets")
-    handles = secret_env(ctx, a)
+    handles = secret_env(ctx, a, route_types)
 
     seams.at("exec")
     spawn_kw: Dict[str, object] = {}

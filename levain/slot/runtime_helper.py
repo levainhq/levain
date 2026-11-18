@@ -858,11 +858,12 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     data = store.read(("routes",), "base.json")
     if data is None:
         raise Refused("base-map-missing", "L/routes/base.json")
+    base = _canon_obj(data, "base-map")
     dispatch = a.kind in FR.DISPATCH_KINDS
     pin = ticket_pin(a)
-    pinned = pinned_route_entry(store, pin) if pin is not None else None
+    pinned = pinned_route_entry(store, pin, _base_maps(base)[0]) if pin is not None else None
     base_ids = [r for r in routes if pin is None or r != pin.route]
-    base_view = {r["route"]: r for r in front_session_routes(_canon_obj(data, "base-map"), base_ids, dispatch=dispatch)}
+    base_view = {r["route"]: r for r in front_session_routes(base, base_ids, dispatch=dispatch)}
     if pin is not None and pin.route not in routes:
         raise Refused("ticket-routes-mismatch", f"the blob does not name the ticket's route {pin.route}")
     routes_view = [_front_entry(pinned, dispatch) if pin is not None and r == pin.route else base_view[r] for r in routes]
@@ -980,13 +981,13 @@ def _active_generation(store: Store) -> int:
     return int(data)
 
 
-def pinned_route_entry(store: Store, pin: TicketPin) -> dict:
+def pinned_route_entry(store: Store, pin: TicketPin, base_types: Mapping[str, str]) -> dict:
     """The ``levain-route-policy/1`` object the ticket pinned, from its PINNED generation's file, in keys' order of
     rules: the generation loads and holds the route; the route is still in the ACTIVE generation (a route removed
     by a newer generation is refused though pinned); the digest of the file's ``policy`` equals the ticket's
     (``route-policy-mismatch``). The entry is brokered and its id is no base-map id: the base map's entry is never a
-    ticket's. Anything that does not hold is ``route-not-allowed``; nothing here falls back to the base map or to
-    another generation."""
+    ticket's (``base_types``: the caller's one read of the base map). Anything that does not hold is
+    ``route-not-allowed``; nothing here falls back to the base map or to another generation."""
     held = _generation_routes(store, f"{pin.generation}.json", f"pinned generation {pin.generation}")
     entry = held.get(pin.route)
     if entry is None:
@@ -1000,19 +1001,19 @@ def pinned_route_entry(store: Store, pin: TicketPin) -> dict:
         raise Refused("route-policy-mismatch", f"generation {pin.generation}'s {pin.route} is not the ticket's policy")
     if policy.get("type") != "brokered":
         raise Refused("route-not-allowed", f"route {pin.route} is not brokered")
-    if pin.route in base_routes(store)[0]:
+    if pin.route in base_types:
         raise Refused("route-not-allowed", f"route {pin.route} is a base-map route")
     return policy
 
 
-def session_route_types(store: Store, a: R.Alloc) -> Dict[str, str]:
-    """:func:`base_routes`' route types plus, for a pinned ticket, its pinned route's (brokered)."""
-    types = base_routes(store)[0]
+def session_route_types(store: Store, a: R.Alloc, base_types: Mapping[str, str]) -> Dict[str, str]:
+    """``base_types`` (the caller's one read of the base map) plus, for a pinned ticket, its pinned route's
+    (brokered), once :func:`pinned_route_entry` holds."""
     pin = ticket_pin(a)
-    if pin is not None:
-        pinned_route_entry(store, pin)
-        types = {**types, pin.route: "brokered"}
-    return types
+    if pin is None:
+        return dict(base_types)
+    pinned_route_entry(store, pin, base_types)
+    return {**base_types, pin.route: "brokered"}
 
 
 def _front_dir_ok(st: os.stat_result, seams: "Seams", front_uid: int) -> bool:
@@ -1622,7 +1623,11 @@ def base_routes(store: Store) -> Tuple[Dict[str, str], Dict[str, Tuple[str, ...]
     data = store.read(("routes",), "base.json")
     if data is None:
         raise Refused("base-map-missing", "L/routes/base.json")
-    obj = _canon_obj(data, "base-map")
+    return _base_maps(_canon_obj(data, "base-map"))
+
+
+def _base_maps(obj: Mapping[str, object]) -> Tuple[Dict[str, str], Dict[str, Tuple[str, ...]]]:
+    """:func:`base_routes` over an already parsed base map."""
     routes = obj.get("routes")
     if obj.get("format") not in BASE_ROUTES_FORMATS or type(routes) is not list:
         raise Refused("base-map-malformed", "format or routes")
@@ -2346,8 +2351,8 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     term = ctx.env.get("TERM")
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None
-    route_types, route_hosts = base_routes(ctx.store)
-    route_types = session_route_types(ctx.store, alloc)
+    base_types, route_hosts = base_routes(ctx.store)
+    route_types = session_route_types(ctx.store, alloc, base_types)
     # identseed: a gated Claude session's .claude.json carries the slot's parked account block (absent: render seeds
     # nothing and start's gate refuses identity-seed-missing before any move). `egress and` drops no gated session:
     # identity_gated needs auth passthrough, and prepare refuses any auth but none on a none-class slot

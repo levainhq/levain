@@ -16,9 +16,10 @@ import pytest
 from levain.broker import front as FR
 from levain.contracts import canon
 from levain.slot import records as R
+from levain.slot import render as RD
 from levain.slot import routemaps as RM
 from levain.slot import runtime_helper as H
-from tests.test_pool import EXEC_FACTS, dispatch  # noqa: F401 - fixture
+from tests.test_pool import EXEC_FACTS, F2_DISPATCH, dispatch  # noqa: F401 - fixture
 from tests.test_slot_3c7_fix_r1 import _mint, _render, write_pinned_generation
 from tests.test_slot_s2f2_runtime_helper import BASE, BRIEF_DIGEST, _blob as _f2_blob
 
@@ -200,7 +201,99 @@ def test_start_names_the_pinned_routes_secrets_not_route_unknown(dispatch):
     s = _ticketed(d, _facts(RM.policy_digest(p)))
     store = H.Store(w.seams)
     try:
-        types = H.session_route_types(store, w.alloc(s))
+        types = H.session_route_types(store, w.alloc(s), H.base_route_types(store))
     finally:
         store.close()
     assert types[ROUTE] == "brokered" and types["github"] == "egress"
+
+
+def test_render_facts_takes_types_and_hosts_from_one_base_map_read(dispatch, monkeypatch):
+    """L3 r1 (codex, complement LOW): the route types, the hosts and the pin's base-id check are one read of
+    `L/routes/base.json`, so a map replaced between reads cannot pair one map's types with another's hosts."""
+    d, w = dispatch, dispatch.w
+    p = _policy()
+    _write_generation(w, 1, [p])
+    s = _ticketed(d, _facts(RM.policy_digest(p)))
+    reads = []
+    real = H.Store.read
+
+    def counted(self, parts, name, *a, **kw):
+        if tuple(parts) == ("routes",) and name == "base.json":
+            reads.append(name)
+        return real(self, parts, name, *a, **kw)
+    monkeypatch.setattr(H.Store, "read", counted)
+    store = H.Store(w.seams)
+    try:
+        from levain.slot.runtime_grammar import RenderBlob
+
+        ctx = H.Ctx(w.seams, store, 0, "dispatch", 0, {})
+        facts = H.render_facts(ctx, w.alloc(s), RenderBlob(vendor="claude", routes=(ROUTE, "github"), model="m-1"))
+    finally:
+        store.close()
+    assert facts.route_types[ROUTE] == "brokered" and facts.route_hosts["github"]
+    assert reads == ["base.json"]
+
+
+def _start_world(w):
+    """test_slot_s2f3_start's fake launch table on the dispatch world (Linux: the clone, the forwarder, the vendor)."""
+    from tests.test_slot_s2c_end import mine, thread_run_as
+    from tests.test_slot_s2f3_start import Launches, Table
+
+    table = Table()
+    la = Launches(w, table)
+    s = w.seams
+    s.spawn = lambda argv, spec_json, cgroup, exec_w, detach, **_capture: la.spawn(argv, spec_json, cgroup, exec_w,
+                                                                                    detach)
+    s.wait, s.wait_within, s.kill = la.wait, la.wait_within, la.kill
+    s.capture = la.capture
+    s.netns_names = lambda: {"levain-e0", "levain-e1", "levain-e2", "levain-v0"}
+    s.host_links = lambda: {"/bin": "usr/bin", "/sbin": "usr/sbin", "/lib": "usr/lib", "/lib64": None}
+
+    def make_cgroup(path):
+        table.cgroup_made = True
+    s.make_cgroup = make_cgroup
+    s.egress_ready = lambda slot, ids: None
+    s.proc_seams = table.seams()
+    s.end_overrides = {"owner_ok": mine, "run_as": thread_run_as(), "root_uid": os.getuid(),
+                       "root_gid": os.getgid(), "sleep": lambda x: None}
+    s.clock = lambda: 1_790_000_000.0
+    return la
+
+
+def _rendered_ticketed(d) -> tuple:
+    w = d.w
+    (w.L / "retained").mkdir(mode=0o700, exist_ok=True)
+    la = _start_world(w)
+    p = _policy()
+    _write_generation(w, 1, [p])
+    s = _ticketed(d, _facts(RM.policy_digest(p)))
+    w.session = s
+    assert _render(d, s, _blob()) == {"ok": True}, w.last_err
+    return s, la
+
+
+def test_a_route_withdrawn_after_render_stops_start_before_the_clone(dispatch):
+    """L3 r1 (codex MED): a route withdrawn between render and start refuses `start` before anything permanent: no
+    clone marker, no forwarder, no spawn, the record still RENDERED, so the refusal is the route's and not, on a
+    retry, `already-started`."""
+    d, w = dispatch, dispatch.w
+    s, la = _rendered_ticketed(d)
+    _write_generation(w, 2, [_policy("other-route")])
+    line = w.main(["start", s], uid=F2_DISPATCH)[1]
+    assert line == {"ok": False, "refused": "route-not-allowed"}, (line, w.last_err)
+    assert la.spawns == [] and not (w.L / "alloc" / f"{s}.cloned").exists()
+    assert w.state(s).state == R.RENDERED
+    assert w.main(["start", s], uid=F2_DISPATCH)[1]["refused"] == "route-not-allowed"
+
+
+def test_a_ticketed_session_starts_with_its_pinned_routes_token(dispatch, monkeypatch):
+    """The pinned route is the session's brokered route at start: the vendor is given the token's carrier. (The
+    read-set clone and its check are test_slot_s2f3_start's; here the clone step is a stand-in.)"""
+    from levain.slot import start as SS
+
+    d, w = dispatch, dispatch.w
+    s, la = _rendered_ticketed(d)
+    monkeypatch.setattr(SS, "_clone_repo", lambda ctx, a: None)
+    w.main(["start", s], uid=F2_DISPATCH)           # the drain of a fake vendor's capture is not this test's
+    (v,) = la.of("vendor")
+    assert set(v["spec"]["extra_env"]) == {RD.TOKEN_ENV["claude"]}
