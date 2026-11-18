@@ -538,7 +538,7 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
     open's one account of the board."""
     from levain.desk import board_cli
 
-    code, doc, err = board_cli.read_board()
+    code, doc, err = board_cli.read_board(consent_dir=store.directory)     # the store being rendered, not the process's home
     if doc is None:
         raise CoordError(err or f"levain board state exited {code} with no board")
     items = doc["items"]

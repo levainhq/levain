@@ -1,7 +1,9 @@
-"""RETIRED as a writer (T7, levain#101): the v1 queue takes no more rows. ``apply_reports``, ``watch_apply`` and ``desk_apply``
-write no ``worker_attach`` row, no refusal and no sighting; a report still queued at the switch is drained once, read-only,
-into one log line (:func:`drain_reports`). The tables and their append triggers stay, so what they hold stays readable. What
-follows is the design as it was.
+"""RETIRED as a writer (T7, levain#101): the v1 queue takes no more rows. ``enqueue_report`` raises; ``apply_reports``,
+``watch_apply`` and ``desk_apply`` write no ``worker_attach`` row, no refusal and no sighting; a report still queued at the
+switch is drained once, read-only toward the v1 tables, into one log line (:func:`drain_reports`; its keys are recorded
+in ``reports.drained``, the line is copied to ``reports.drained.log``). The tables and their append triggers stay, so
+what they hold stays readable. The rest of this docstring is the design as it was: the ``service`` role, the applier and
+the sightings below no longer run (their code is deleted), and ``levain desk report`` refuses.
 
 Row 156, step 2A: the worker-attach table and the service applier (design ``DESIGN_worker_attach.md``, ruled 11-08).
 
@@ -14,7 +16,7 @@ home>/board/``, never the consent directory). This module holds:
 * ``report_refusals``: one append-only row per report the applier could not validate mechanically, so the desk and the
   Work lens can see it (the ruling's condition 2).
 * ``reports.db``: the seat-writable queue beside the board store, append-only, one row per report with a unique
-  ``report_id``. A seat appends to it (:func:`enqueue_report`) and never touches ``dispatch.db`` or the lease; the
+  ``report_id``. A seat appended to it (:func:`enqueue_report`, now raising) and never touched ``dispatch.db`` or the lease; the
   applier copies each report into ``worker_attach`` or refuses it with a record, once.
 * :func:`apply_reports`, the applier. It records facts only (the ruling's condition 1): the ``service`` role
   (``CoordStore(..., role="service")``) is refused every write that DECIDES, in :meth:`CoordStore._write` itself, and the
@@ -35,7 +37,7 @@ holds, never on the worker name a report carries:
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
   and it never names the kind ``launch``. The session is real when its observed interval (``sessions_seen``, written
   by every service pass and every desk pass on a board with a queue file, whose listing it could read, from its
-  first sighting to its last, this pass's listing (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
+  first sighting to its last, this pass's own listing counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
   intervals after it, its first no more than :data:`DEFER_DEADLINE` later: a seat whose last act is ``landed`` or ``ended`` and which then exits is still judged on what
   was true when it spoke. An unreadable listing defers such a report, and one deferred past :data:`DEFER_DEADLINE`
   after its ``at`` is refused ``no-evidence-timeout``.
@@ -67,18 +69,18 @@ Known edges (ruled, one line each):
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable
-from levain.cockpit.consent import utc_stamp
-from levain.desk.store import _OID, CoordError, CoordStore, _append_only, _in, next_gseq
-from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
+from levain.autonomic.durable_sqlite import BUSY_WAIT_S
+from levain.desk.store import CoordError, CoordStore, _append_only, _in
+from levain.desk.legacy import ROLE_DESK
 
 __all__ = ["ApplyResult", "watch_apply", "DEFER_DEADLINE", "DRAINED_NAME", "EVENTS", "FUTURE_SKEW", "GRACE_PASSES",
            "PASS_INTERVAL_S", "REFUSAL_REASONS", "SEEN_KEEP", "desk_apply", "drain_reports", "migrate_seen",
@@ -277,12 +279,6 @@ def _queued_one(directory: Path, report_id: str) -> dict[str, Any] | None:
         conn.close()
 
 
-def _resolved(conn: sqlite3.Connection, key: str) -> bool:
-    """Whether the report keyed ``key`` already has its ``worker_attach`` row or its refusal."""
-    return conn.execute("SELECT 1 FROM worker_attach WHERE report_id = ? UNION ALL SELECT 1 FROM report_refusals "
-                        "WHERE report_id = ? LIMIT 1", (key, key)).fetchone() is not None
-
-
 def _key(raw: Mapping[str, Any]) -> str:
     """The key a queued row is applied or refused under: its own id, or, when the refusal record could not hold that id
     (empty, too long, not one printable line), ``bad-seq-<its queue seq>``, so one bad row never stops the queue."""
@@ -302,11 +298,13 @@ def migrate_seen(conn: sqlite3.Connection) -> None:
 # line, and its key recorded in ``reports.drained`` beside the queue, so the next pass does not name it again. The
 # queue and the v1 tables are never written.
 DRAINED_NAME = "reports.drained"
+DRAINED_LOG_NAME = "reports.drained.log"
 
 
 @dataclass
 class ApplyResult:
     drained: list[str] = field(default_factory=list)       # report ids named in the log line this pass, never applied
+    described: list[str] = field(default_factory=list)     # the same, each with its item and event, as the line names them
 
 
 def drained_path(directory: Path | str) -> Path:
@@ -314,29 +312,84 @@ def drained_path(directory: Path | str) -> Path:
     return Path(directory) / DRAINED_NAME
 
 
+def drained_log_path(directory: Path | str) -> Path:
+    """The durable copy of every drain line, beside the queue file: written before the keys are recorded."""
+    return Path(directory) / DRAINED_LOG_NAME
+
+
+def _open_beside(path: Path) -> int:
+    """Open (making, 0600) a file this module appends to, never through a symlink at ``path``."""
+    return os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+
+
+def _read_fd(fd: int) -> str:
+    size = os.fstat(fd).st_size
+    chunks: list[bytes] = []
+    got = 0
+    while got < size:
+        chunk = os.pread(fd, size - got, got)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def _marker_keys(text: str) -> set[str]:
+    """The keys a marker's text records: a line counts once it ends in a newline, so a torn last line (a crash mid-write)
+    names nothing and is drained again."""
+    return set(text.split("\n")[:-1])
+
+
 def _drained_keys(directory: Path | str) -> set[str]:
     try:
-        return set(drained_path(directory).read_text(encoding="utf-8").split("\n"))
+        return _marker_keys(drained_path(directory).read_text(encoding="utf-8", errors="replace"))
     except FileNotFoundError:
         return set()
 
 
+def _append_durable(fd: int, text: str) -> None:
+    os.write(fd, text.encode("utf-8"))
+    os.fsync(fd)
+
+
 def drain_reports(directory: Path | str) -> ApplyResult:
-    """Read the reports still queued in ``<directory>/reports.db`` that no earlier drain named, and record their keys as
-    drained. Read-only toward the queue and the v1 tables; the one write is the key record. A queue that cannot be read
-    drains nothing. Never applies a report."""
+    """Read the reports still queued in ``<directory>/reports.db`` that no earlier drain named, name them in the drain
+    line, and record their keys as drained. Read-only toward the queue and the v1 tables; the writes are the log copy
+    and the key record. A queue that cannot be read drains nothing. Never applies a report.
+
+    Once-only under concurrent passes (the watch and ``levain desk apply-reports``, or two watchers): the marker is
+    read, filtered and appended to under an exclusive ``flock`` on the marker file itself, so a second pass waits and
+    then finds the keys recorded. ORDER, decided: the line is made durable (``reports.drained.log``, fsynced) BEFORE the
+    keys are recorded (fsynced), so a crash between the two drains again and writes the line again (at-least-once);
+    it never records a key whose line was not written. The marker is made only when there is something to drain,
+    and is opened 0600 and never through a symlink."""
     d = Path(directory)
     result = ApplyResult()
-    queued = [r for r in _unresolved(d) if _key(r) not in _drained_keys(d)]
-    if not queued:
+    candidates = [r for r in _unresolved(d)]
+    if not candidates:
         return result
-    keys = list(dict.fromkeys(_key(r) for r in queued))
-    with open(drained_path(d), "a", encoding="utf-8") as fh:
-        fh.write("".join(k + "\n" for k in keys))
-        fh.flush()
-        os.fsync(fh.fileno())
-    result.drained = keys
-    return result
+    fd = _open_beside(drained_path(d))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        text = _read_fd(fd)
+        seen = _marker_keys(text)
+        keys = list(dict.fromkeys(k for k in (_key(r) for r in candidates) if k not in seen))
+        if not keys:
+            return result
+        result.drained = keys
+        what = {_key(r): f"{_key(r)} ({str(r.get('item_id'))[:60]} {str(r.get('event'))[:20]})" for r in candidates}
+        result.described = [what[k] for k in keys]
+        lfd = _open_beside(drained_log_path(d))
+        try:
+            _append_durable(lfd, _drained_line(result) + "\n")
+        finally:
+            os.close(lfd)
+        torn = "" if not text or text.endswith("\n") else "\n"
+        _append_durable(fd, torn + "".join(k + "\n" for k in keys))
+        return result
+    finally:
+        os.close(fd)
 
 
 def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[str] | None = None,
@@ -350,8 +403,8 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
 
 
 def _drained_line(got: ApplyResult) -> str:
-    return (f"board reports: {len(got.drained)} report(s) still queued at the switch drained, never applied (the v1 "
-            "queue is retired; the board is `levain board`): " + ", ".join(got.drained))
+    return (f"board reports: {len(got.drained)} report(s) still queued at the switch drained, not applied by this "
+            "release (the v1 queue is retired; the board is `levain board`): " + ", ".join(got.described or got.drained))
 
 
 def watch_apply(board: Path | str | None = None, *, sessions: Any = None, every: float = PASS_INTERVAL_S) -> list[str]:
@@ -378,8 +431,6 @@ def desk_apply(store: CoordStore, token: Any, *, sessions: Any = None,
     directory = Path(store.directory)
     if is_live_consent(directory):
         return [f"board reports: not drained, {directory} is the live consent store and never a board"]
-    if store.role != ROLE_DESK:
-        raise CoordError("the desk's pass runs on a desk-role store")
     held = store.coord_lease() if (directory / "dispatch.db").exists() else None
     if held is None or not held.live or held.token != token:
         raise CoordError("the desk lease is not held by this token; no report was drained")
@@ -391,15 +442,17 @@ def desk_apply(store: CoordStore, token: Any, *, sessions: Any = None,
 
 # ------------------------------------------------------------------------------------------------ a report's outcome
 def report_status(directory: Path | str, report_id: str) -> dict[str, Any]:
-    """What became of one report, read-only (``levain desk reports ID``): ``state`` is ``applied`` (with its
-    ``kind`` and ``attach_id``), ``refused`` (with ``reason`` and ``detail``), ``queued`` (waiting for a pass), or
-    ``unknown`` (not in this board's queue). Opens nothing for writing and makes nothing."""
+    """What became of one report, read-only (``levain desk reports ID``): ``applied`` (with its ``kind`` and
+    ``attach_id``) or ``refused`` (with ``reason`` and ``detail``), both from before the v1 queue retired; ``drained``
+    (queued at the switch and named once in the drain line, never applied: ``reports.drained`` holds its key);
+    ``queued`` (still in the queue, not yet drained); or ``unknown`` (not in this board's queue). Opens nothing for
+    writing and makes nothing."""
     d = Path(directory)
     out: dict[str, Any] = {"report_id": report_id, "state": "unknown", "item_id": None, "reason": None,
                            "detail": None, "kind": None, "attach_id": None}
     row = _queued_one(d, report_id)
     if row is not None:
-        out.update(state="queued", item_id=row["item_id"])
+        out.update(state="drained" if _key(row) in _drained_keys(d) else "queued", item_id=row["item_id"])
     db = d / "dispatch.db"
     if not db.exists():
         return out
