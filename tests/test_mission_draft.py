@@ -722,7 +722,9 @@ def test_a_reply_to_a_mission_signature_reads_every_bound_thread(ctx, monkeypatc
     monkeypatch.setattr(ds, "_cards", lambda store, tid: read.append(tid) or [{"thread": tid}])
     assert ds._bound_threads(stored) == [t.thread_id for t in ts]
     got = ds._cards_after(ctx.store, lambda: ds._bound_threads(stored))
-    assert read == [t.thread_id for t in ts] and got == {"cards": [{"thread": t.thread_id} for t in ts]}
+    # the flat list is kept and the same cards ride again grouped by thread (lane 3: a card names no thread of its own)
+    assert read == [t.thread_id for t in ts] and got["cards"] == [{"thread": t.thread_id} for t in ts]
+    assert [(g["thread_id"], g["cards"]) for g in got["groups"]] == [(t.thread_id, [{"thread": t.thread_id}]) for t in ts]
     read.clear()
     assert ds._cards_after(ctx.store, lambda: ts[0].thread_id) == {"cards": [{"thread": ts[0].thread_id}]}
     assert ds._cards_after(ctx.store, lambda: None) == {} and read == [ts[0].thread_id]

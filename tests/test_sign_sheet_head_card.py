@@ -723,3 +723,62 @@ def test_the_signing_line_of_an_earlier_attempt_is_not_shown_beside_the_next(tmp
     ])
     assert v["first"] == "Not signed: SIGNED LINE", v
     assert v["second"] == "" and v["hidden"] == "true", v
+
+
+# --- H1-5 lane 3: one signature over several threads ----------------------------------------------------------------------
+KIDS = [("th-head-1", "part 0"), ("th-head-2", "part 1"), ("th-head-3", "part 2")]
+SHARED = {"envelope_id": HEAD_ID, "mission_id": "ms-" + "a" * 32, "threads": [{"thread_id": t, "title": n} for t, n in KIDS]}
+SHEET = ["no head", "this one signature covers these 3 threads, each up to 40 tool calls, up to 3 x (40 tool calls) together "
+         "(120 tool calls); a thread added later is not covered", *(f"thread {t}: {n}" for t, n in KIDS)]
+
+
+def _mission_accept(groups: list[dict[str, Any]]) -> Step:
+    return lambda s: (200, {"created": True, "envelope": {"envelope_id": HEAD_ID}, "cards": [c for g in groups for c in g["cards"]],
+                            "groups": groups, "store_id": "st-1"})
+
+
+@needs_browser
+def test_the_sheet_lists_every_thread_and_a_card_in_a_group_acts_on_its_own_thread(tmp_path: Path) -> None:
+    """Reproduced on the base tip: the signed reply's one flat list was drawn in the anchor thread's box and its renew or
+    replace was posted to the anchor, whichever child the card was about."""
+    lapsed = _card("LAPSED", "the head ran out", ["extend"], {"since": "2026-11-04T00:00:00.000000Z"})
+    groups = [{"thread_id": t, "title": n, "cards": [lapsed] if t != "th-head-1" else [], "shared": SHARED} for t, n in KIDS]
+    stub = Stub([ENVELOPE])
+    stub.script["draft-review"] = [lambda s: (200, {"review_id": "dv-" + "a" * 32, "body_text": s.body_text, "rp_id": RP, "since_parent": [],
+                                                    "against": _against("none", False, EMPTY_DIFF), "view": SHEET, "store_id": "st-1"})]
+    stub.script["draft-accept"] = [_mission_accept(groups)]
+    v = _run(tmp_path, stub, [
+        _click("head-review"), _until("!!document.getElementById('head-sign')"),
+        _tag("sheet", "document.getElementById('head-diffs').textContent"),
+        _click("head-sign"), _until("/^Signed/.test(" + NOTE + ")"),
+        _until("document.querySelectorAll('#head-card .head-group').length === 3"),
+        _tag("titles", "[...document.querySelectorAll('#head-card .head-group-title')].map(n => n.textContent).join('|')"),
+        _tag("shared", "document.querySelector('#head-card .head-shared').textContent"),
+        {"tap": "document.querySelectorAll('#head-card .head-group')[2].querySelector('button')", "ms": 5000},
+        _until("fetch('/__posts').then(r => r.json()).then(a => a.includes('draft-rule'))"),
+    ])
+    for t, n in KIDS:
+        assert f"thread {t}: {n}" in v["sheet"], v
+    assert "this one signature covers these 3 threads" in v["sheet"] and "up to 3 x (40 tool calls) together" in v["sheet"], v
+    assert "not covered" in v["sheet"], v
+    assert v["titles"] == "|".join(f"Thread {n} ({t})" for t, n in KIDS), v
+    assert v["shared"].startswith("shared: mission ms-" + "a" * 32 + " covers 3 threads: part 0 (th-head-1); part 1"), v
+    rules = [r for a, r in stub.posts if a == "draft-rule"]
+    assert [r["thread_id"] for r in rules] == ["th-head-3"], rules          # the card was about the THIRD child, not the anchor
+    assert stub.bad == []
+
+
+@needs_browser
+def test_a_one_thread_reply_is_drawn_and_acted_on_as_before(tmp_path: Path) -> None:
+    """Pinned: a reply with no groups draws the one thread's cards under the head thread, with no group box and no shared line."""
+    stub = Stub([REVOKED])
+    v = _run(tmp_path, stub, [_click("head-replace"), _until("!!document.getElementById('head-review')"),
+                              _tag("groups", "document.querySelectorAll('#head-card .head-group, #head-card .head-shared').length")])
+    assert v["groups"] == "0", v
+    assert [r["thread_id"] for a, r in stub.posts if a == "draft-rule"] == [THREAD]
+
+
+def test_the_page_names_no_thread_but_the_group_it_draws_under() -> None:
+    """String-level: a rule's thread is the argument of the card's own group, never the page's head thread."""
+    assert 'hcall("draft-rule", { thread_id: tid,' in HEAD and 'hcall("draft-rule", { thread_id: headThread' not in HEAD
+    assert 'hdrawCard(card, String(g.thread_id))' in HEAD

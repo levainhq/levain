@@ -371,3 +371,81 @@ def test_the_page_locks_the_field_while_a_tap_is_in_flight_and_reads_no_dead_car
     assert "if (dead || replaced)" in env
     mount = JS[JS.index("function mount"):]
     assert "echo.settled" in mount
+
+
+# --- H1-5 lane 3: a MISSION card on the cockpit ------------------------------------------------------------------------
+from tests.test_spec_card_mission import family  # noqa: E402
+from tests.test_spec_card_mission import propose as mission_propose  # noqa: E402
+
+BUDGET_LINE = "each thread up to 200 tool calls, 2000000 tokens, $5.00, 2 hours; up to 3 x that together (600 tool calls, " \
+              "6000000 tokens, $15.00, 6 hours)"
+
+
+def test_the_read_of_a_mission_card_names_every_child_by_title_and_the_budget_line(served):
+    """Failure: a mission card the page could only draw as ONE thread (the anchor), hiding the other children and what the
+    signature lets them use together."""
+    _d, ts = family(served.ctx)
+    p = mission_propose(served, [t.thread_id for t in ts], spec_text(served.ctx))
+    [c] = cards(served)
+    assert c["proposal_id"] == p.proposal_id and c["kind"] == "envelope" and c["thread_id"] == ts[0].thread_id
+    assert c["threads"] == [{"thread_id": t.thread_id, "title": t.title} for t in ts] and len(ts) == 3
+    assert all(t.title for t in ts)
+    assert c["budget_line"] == BUDGET_LINE and c["mission_id"] is None
+
+
+def test_a_thread_card_read_carries_no_mission_key(one):
+    """A thread card's read is what it was: none of the mission's keys."""
+    [c] = cards(one)
+    assert not {"threads", "budget_line", "mission_id"} & set(c)
+
+
+def test_a_tapped_mission_card_names_the_mission_his_tap_made(served):
+    _d, ts = family(served.ctx)
+    text = spec_text(served.ctx)
+    p = mission_propose(served, [t.thread_id for t in ts], text)
+    body = {"words": text, "outbox_id": "ob-tap00001", "thread_id": ts[0].thread_id, "input_sha256": words_sha256(text)}
+    status, got = act(served, p, "commit", body)
+    assert status == 200, got
+    [c] = cards(served)
+    conn = sqlite3.connect(served.store.path)
+    try:
+        (mission,) = conn.execute("SELECT mission_id FROM missions").fetchone()
+    finally:
+        conn.close()
+    assert c["state"] == "committed" and c["mission_id"] == mission and len(c["threads"]) == 3
+    assert c["budget_line"] == BUDGET_LINE
+
+
+def test_the_page_draws_a_mission_card_from_its_children_and_adds_no_sign_control():
+    env = _fn("renderEnvelopeCard", "renderRoom")
+    assert "c.children" in env or "kids" in env
+    assert "c.budgetLine" in env and "covers" in env and "not covered" in env
+    assert "Sign" not in env.replace("signed", "").replace("signing", "").replace("sign.", "")    # the card has no Sign control
+    assert env.count('"Draft it"') == 1
+
+
+@needs_browser
+def test_in_a_browser_a_mission_card_lists_every_child_and_the_budget_with_no_sign_control(paged, tmp_path):
+    """The card on the real page: every child's title, the budget line and the not-covered line, one 'Draft it' that is a
+    draft and no Sign button, before the tap; after it, the mission and a link per child."""
+    _d, ts = family(paged.ctx)
+    text = spec_text(paged.ctx)
+    mission_propose(paged, [t.thread_id for t in ts], text)
+    out = _drive(tmp_path, paged.base + "/rvc.html", [
+        {"until": "document.querySelector('.rv-card .rv-readline') && !document.querySelector('.rv-commit').disabled"},
+        {"eval": "document.querySelector('.rv-card').textContent"},
+        {"eval": "[...document.querySelectorAll('.rv-card button')].map(b => b.textContent).join('|')"},
+        {"eval": "document.querySelector('.rv-commit').click(); 1"},
+        {"until": "document.querySelector('.rv-card-committed')"},
+        {"eval": "document.querySelector('.rv-card-committed').textContent"},
+        {"eval": "[...document.querySelectorAll('.rv-card-committed a')].map(a => a.getAttribute('href')).join('|')"},
+        {"eval": "document.querySelectorAll('.rv-card-committed button').length"},
+    ])
+    first, buttons, committed, links, nbuttons = out["values"][1], out["values"][2], out["values"][5], out["values"][6], out["values"][7]
+    for t in ts:
+        assert t.title in first and t.thread_id in first and t.title in committed
+    assert "one signature covers these" in first or "under one signature" in first
+    assert "up to 3 x" in first and "$15.00" in first and "not covered" in first
+    assert buttons == "Draft it|Not now"
+    assert "Mission ms-" in committed and "covers 3 threads" in committed and "$15.00" in committed
+    assert links.split("|") == ["/sign/drop#thread=" + t.thread_id for t in ts] and nbuttons == 0

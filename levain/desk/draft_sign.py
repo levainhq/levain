@@ -136,18 +136,93 @@ def _cards(store: Any, thread_id: str) -> list[dict[str, Any]]:
                                               queue_dir=store.directory)]
 
 
+def _title_of(store: Any, thread_id: str) -> str:
+    from levain.desk import envelope_drafts as drafts
+
+    with drafts._reading(store) as conn:
+        return store._must_thread(conn, thread_id).title
+
+
+def _shared(store: Any, thread_id: str) -> dict[str, Any] | None:
+    """What a thread's head says when ONE envelope heads several threads: ``{envelope_id, mission_id, threads}`` (each
+    thread with its title, sorted by id), or None for a head that binds only this thread or no head at all. The mission
+    is the one whose draft series was signed into the head, or None when the envelope came from no mission draft."""
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk.envelopes import EnvelopeStore
+
+    with drafts._reading(store) as conn:
+        if not drafts._has(conn, "envelope_binds"):
+            return None
+        head = EnvelopeStore._head(conn, thread_id)
+        if head is None:
+            return None
+        ids = [r[0] for r in conn.execute("SELECT thread_id FROM envelope_binds WHERE envelope_id = ? ORDER BY thread_id",
+                                          (head.envelope_id,))]
+        if len(ids) < 2:
+            return None
+        mission = None
+        if drafts._has(conn, "mission_drafts"):
+            row = conn.execute("SELECT m.mission_id FROM envelopes e JOIN mission_drafts m "
+                               "ON m.draft_id = json_extract(e.body, '$.draft.draft_id') WHERE e.envelope_id = ?",
+                               (head.envelope_id,)).fetchone()
+            mission = None if row is None else row[0]
+        return {"envelope_id": head.envelope_id, "mission_id": mission,
+                "threads": [{"thread_id": t, "title": store._must_thread(conn, t).title} for t in ids]}
+
+
+def _sheet_lines(store: Any, body_text: str) -> list[str]:
+    """The plain words a signature over SEVERAL threads adds to the sheet, or nothing for a one-thread draft (whose sheet
+    is exactly what it was). Every bound thread by title, that this one signature covers exactly these threads, the
+    budget each may use and the most they may use together (the budget is a gauge per thread, so N threads each get the
+    whole of it), that a thread added later is not covered, and what the sheet does NOT show per thread."""
+    import json
+
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk.spec_card import plain_budget
+
+    body = json.loads(body_text)
+    binds = body["binds"]
+    n = len(binds)
+    if n < 2:
+        return []
+    ids = [b["thread_id"] for b in binds]
+    words = plain_budget(body.get("budget"), n)
+    if words is None:
+        size = f"this one signature covers these {n} threads, with no budget limit set for any of them"
+    else:
+        each, together = words
+        size = (f"this one signature covers these {n} threads, each up to {each}, up to {n} x ({each}) together "
+                f"({together}); a thread added later is not covered")
+    with drafts._reading(store) as conn:
+        names = [store._must_thread(conn, t).title for t in ids]
+    return [size, *(f"thread {t}: {title}" for t, title in zip(ids, names)),
+            "a thread added to the mission later is NOT covered: it needs a signature of its own",
+            "what changed for each thread is not shown on this sheet: each thread's revision and members are in the "
+            "\"binds\" field of what exactly gets signed",
+            "while this draft is open, none of these threads can hold a draft of its own, and a draft of one thread's own "
+            "cannot be made beside it"]
+
+
 def _cards_after(store: Any, thread_id: Callable[[], str | list[str] | None]) -> dict[str, Any]:
     """The cards for a reply to a write that has COMMITTED. Finding the threads (a store read, or a field of the stored
     body) and reading their cards (another verifier call each) both run inside the one guard: whatever either raises,
     the write stands, so the reply says what was written and asks for the cards again rather than becoming a refusal
     that claims nothing changed. A thread of None answers no cards; a list answers each thread's cards in that order
-    (a draft that binds several threads shows each one's). The caller's ``store_id`` is the one ``_store`` already
+    (a draft that binds several threads shows each one's, flat in ``cards``, and ALSO grouped by thread in ``groups``, which
+    is what a page draws: a card names no thread of its own). The caller's ``store_id`` is the one ``_store`` already
     matched before the write, never a fresh read after it."""
     try:
         tid = thread_id()
         if tid is None:
             return {}
-        return {"cards": [c for t in ([tid] if isinstance(tid, str) else tid) for c in _cards(store, t)]}
+        tids = [tid] if isinstance(tid, str) else list(tid)
+        by_thread = [(t, _cards(store, t)) for t in tids]
+        out: dict[str, Any] = {"cards": [c for _t, cs in by_thread for c in cs]}
+        if len(tids) > 1:
+            out["groups"] = [{"thread_id": t, "title": _title_of(store, t), "cards": cs,
+                              **({"shared": sh} if (sh := _shared(store, t)) is not None else {})}
+                             for t, cs in by_thread]
+        return out
     except Exception as exc:  # noqa: BLE001  (any fault here is after the commit; the reply must still report it)
         return {"cards": None, "cards_note": f"the cards could not be read just now ({type(exc).__name__}): "
                                               "read the cards again"}
@@ -166,7 +241,9 @@ def handle(phone: Any, action: str, req: dict[str, Any], device: str) -> dict[st
     if action == "draft-cards":
         _text(req, "thread_id")
         store = _store(phone, req["store_id"])
-        return {"cards": _cards(store, req["thread_id"]), "store_id": store.store_id()}
+        shared = _shared(store, req["thread_id"])
+        return {"cards": _cards(store, req["thread_id"]), "store_id": store.store_id(),
+                **({} if shared is None else {"shared": shared})}
     if action == "draft-rule":
         return _rule(phone, req)
     if action == "draft-withdraw":
@@ -257,6 +334,7 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     # the builder IS the check: it raises DraftStale before any verifier call or byte when the draft is not signable
     body_text, _payload, since, against = _built(phone, store, kept, key, now)
     view = _view_lines(against)          # before the review is kept: a head the sheet cannot describe keeps nothing
+    view += _sheet_lines(store, body_text)
     kept["against"] = _against(against)
     kept["body_text"] = body_text
     review_id = "dv-" + secrets.token_hex(16)

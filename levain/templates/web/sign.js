@@ -1417,30 +1417,79 @@
         if (Array.isArray(d.stop_at)) out.push("stops: from " + hfield(d.stop_at[0]) + " to " + hfield(d.stop_at[1]));
         return out;
       };
-      const hcards = (cards) => {
+      // a head that covers several threads says so: the mission (when a mission's draft was signed into it) and each thread by title
+      const sharedLine = (sh) => {
+        const ts = sh && Array.isArray(sh.threads) ? sh.threads : [];
+        const who = sh && typeof sh.mission_id === "string" && sh.mission_id ? "mission " + sh.mission_id : "one envelope";
+        return el("p", "env-hint head-shared", "shared: " + who + " covers " + ts.length + " threads: " + ts.map((t) => String(t.title || "(no title)") + " (" + String(t.thread_id) + ")").join("; "));
+      };
+      let groupSet = null;        // the threads a mission's signature covered, once a reply drew them: every read names each of them
+      const hcards = (cards, shared) => {
         hreview = null;
         cardsBox.replaceChildren();
+        if (shared) cardsBox.appendChild(sharedLine(shared));
         if (!cards.length) cardsBox.appendChild(el("p", "env-hint", "This thread shows no head card: nothing to extend, replace or sign."));
-        else for (const card of cards) cardsBox.appendChild(hdrawCard(card));
+        else for (const card of cards) cardsBox.appendChild(hdrawCard(card, headThread));
+      };
+      // one group per thread under its title: a card names no thread, so each is drawn and acted on under the thread it was read for
+      const hgroups = (groups) => {
+        hreview = null;
+        cardsBox.replaceChildren();
+        groupSet = groups.map((g) => ({ thread_id: String(g.thread_id), title: String(g.title || "") }));
+        for (const g of groups) {
+          const gb = el("div", "head-group");
+          gb.appendChild(el("p", "env-label head-group-title", "Thread " + String(g.title || "(no title)") + " (" + String(g.thread_id) + ")"));
+          if (g.shared) gb.appendChild(sharedLine(g.shared));
+          const cs = Array.isArray(g.cards) ? g.cards : [];
+          if (!cs.length) gb.appendChild(el("p", "env-hint", "This thread shows no head card: nothing to extend, replace or sign."));
+          else for (const card of cs) gb.appendChild(hdrawCard(card, String(g.thread_id)));
+          cardsBox.appendChild(gb);
+        }
       };
       // read the card; it answers with the cards (drawn) or null (said in `hreadl`, never in the outcome lines)
       const hrefresh = () => {
         const s = hstop();
         if (s) { put(hreadl, s, true); return Promise.resolve(null); }
         put(hreadl, "Reading the head card…");
+        if (groupSet) return hreadGroups();
         return post("draft-cards", { thread_id: headThread, store_id: storeId }).then((c) => {
           if (hother(c)) { put(hreadl, ""); hmoved(); return null; }
           if (!c.ok) { put(hreadl, "The head card could not be read: " + why(c), true); return null; }
           if (otherStore(c.body.store_id)) { hmoved(); return null; }
           if (!Array.isArray(c.body.cards)) { put(hreadl, "The head card could not be read: the cockpit sent no list of cards.", true); return null; }
-          try { hcards(c.body.cards); } catch (e) { put(hreadl, "The head card could not be drawn (" + ((e && e.name) || "error") + ").", true); return null; }
+          try { hcards(c.body.cards, c.body.shared); } catch (e) { put(hreadl, "The head card could not be drawn (" + ((e && e.name) || "error") + ").", true); return null; }
           put(hreadl, "");
           return c.body.cards;
         }, () => { put(hreadl, "The head card could not be read (the cockpit did not answer).", true); return null; })
           .catch((e) => { put(hreadl, "The head card could not be read (the page failed: " + ((e && e.name) || "error") + ").", true); return null; });
       };
+      // a mission's threads, read one by one: each group is the cards of ITS thread, so a renew or replace tapped in a group goes to that thread
+      const hreadGroups = () => {
+        const got = [];
+        const next = (i) => {
+          if (i >= groupSet.length) return Promise.resolve(got);
+          const g = groupSet[i];
+          return post("draft-cards", { thread_id: g.thread_id, store_id: storeId }).then((c) => {
+            if (hother(c)) { put(hreadl, ""); hmoved(); return null; }
+            if (!c.ok) { put(hreadl, "The head card could not be read: " + why(c), true); return null; }
+            if (otherStore(c.body.store_id)) { hmoved(); return null; }
+            if (!Array.isArray(c.body.cards)) { put(hreadl, "The head card could not be read: the cockpit sent no list of cards.", true); return null; }
+            got.push({ thread_id: g.thread_id, title: g.title, cards: c.body.cards, shared: c.body.shared });
+            return next(i + 1);
+          });
+        };
+        return next(0).then((all) => {
+          if (all === null) return null;
+          try { hgroups(all); } catch (e) { put(hreadl, "The head card could not be drawn (" + ((e && e.name) || "error") + ").", true); return null; }
+          put(hreadl, "");
+          return all.flatMap((g) => g.cards);
+        }, () => { put(hreadl, "The head card could not be read (the cockpit did not answer).", true); return null; })
+          .catch((e) => { put(hreadl, "The head card could not be read (the page failed: " + ((e && e.name) || "error") + ").", true); return null; });
+      };
       // the cards a committed write answered with: a list is drawn; anything else means UNKNOWN (the write stands), never "no card"
       const hset = (b) => {
+        if (Array.isArray(b.groups) && b.groups.length > 1) { hgroups(b.groups); return Promise.resolve(); }
+        if (groupSet) return hrefresh().then(() => undefined);       // a write for ONE thread of a mission: every group is read again
         if (Array.isArray(b.cards)) { hcards(b.cards); return Promise.resolve(); }
         put(hreadl, typeof b.cards_note === "string" && b.cards_note ? b.cards_note : "The cockpit did not send the card back; reading it again.", true);
         return hrefresh().then(() => undefined);
@@ -1470,10 +1519,10 @@
           .catch((e) => { hsay(verb + ": the page failed (" + ((e && e.name) || "error") + ").", true); })
           .finally(() => { hbusy = false; });
       };
-      const hrule = (card, rule) => {
+      const hrule = (card, rule, tid) => {
         const head = card.head && typeof card.head.envelope_id === "string" ? card.head.envelope_id : "";
         if (!head) return hsay("This card names no head to " + (rule === "renew" ? "extend" : "replace") + ".", true);
-        return hcall("draft-rule", { thread_id: headThread, rule: rule, head: head }, (b) => {
+        return hcall("draft-rule", { thread_id: tid, rule: rule, head: head }, (b) => {
           hsay("A draft is written. It grants nothing until you review it and sign.");
           return hset(b);
         });
@@ -1615,7 +1664,7 @@
           // released only when the ceremony and any card read it asked for have settled (a late redraw never lands after it)
           .finally(() => { hbusy = false; if (ksel) ksel.disabled = false; });
       };
-      function hdrawCard(card) {
+      function hdrawCard(card, tid) {
         const box = el("div", "head-card-box");
         box.dataset.kind = String(card.kind);
         box.appendChild(el("p", "env-label", (KIND[card.kind] || String(card.kind)) + ": " + String(card.line || "")));
@@ -1623,8 +1672,8 @@
         const acts = el("div", "pair-actions");
         acts.id = "head-card-actions";
         const draftOnly = () => box.appendChild(el("p", "env-hint", "This only writes a draft. Nothing is signed until you review it and sign."));
-        if (card.kind === "LAPSED" && has(card, "extend")) { draftOnly(); acts.appendChild(hbtn("Draft an extension", "head-extend", () => hrule(card, "renew"), true)); }
-        if (card.kind === "REVOKED" && has(card, "replace")) { draftOnly(); acts.appendChild(hbtn("Draft a replacement", "head-replace", () => hrule(card, "replace"), true)); }
+        if (card.kind === "LAPSED" && has(card, "extend")) { draftOnly(); acts.appendChild(hbtn("Draft an extension", "head-extend", () => hrule(card, "renew", tid), true)); }
+        if (card.kind === "REVOKED" && has(card, "replace")) { draftOnly(); acts.appendChild(hbtn("Draft a replacement", "head-replace", () => hrule(card, "replace", tid), true)); }
         if (card.kind === "ENVELOPE") {
           const fl = Array.isArray(d.fields) ? d.fields.map((f) => (FIELD[f.field] || f.field) + ": " + plainField(f.field, f.value) + (Array.isArray(f.cites) && f.cites.length ? " (source given)" : " (no source given)")) : [];
           if (fl.length) box.appendChild(el("pre", "sheet-message", fl.join("\n")));

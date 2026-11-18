@@ -114,6 +114,23 @@ def check_mission_threads(store: EnvelopeStore, conn: sqlite3.Connection, thread
     drafts._shared_drop(conn, threads)
 
 
+def plain_budget(budget: Any, n: int) -> tuple[str, str] | None:
+    """``(each, together)`` in plain words for a signed budget shared by ``n`` threads: what ONE thread may use, and what
+    ``n`` threads may use together (every set value times ``n``). None when the budget sets no value at all. The sign
+    sheet and the room card say the same words, so both read them here."""
+    if not isinstance(budget, dict):
+        return None
+
+    def say(k: str, v: int) -> str:
+        return {"tool_calls": f"{v} tool calls", "tokens": f"{v} tokens", "dollars_cents": f"${v / 100:.2f}",
+                "hours": f"{v} hours"}[k]
+
+    keys = [k for k in env.BUDGET_KEYS if type(budget.get(k)) is int]
+    if not keys:
+        return None
+    return ", ".join(say(k, budget[k]) for k in keys), ", ".join(say(k, budget[k] * n) for k in keys)
+
+
 def _mission_lines(conn: sqlite3.Connection, store: EnvelopeStore, thread_ids: Sequence[str],
                    fields: dict[str, Any]) -> list[dict[str, Any]]:
     """What a mission card says in plain words beyond the spec's own lines: every child thread by title, that ONE

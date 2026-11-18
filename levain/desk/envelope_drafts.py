@@ -986,8 +986,9 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
         # ANCHOR-ONLY, re-read for fix 2 (L3 h15 r1): the builder is per series, not per viewed thread, so it reads the
         # series' own thread (a mission's anchor, its first child) and that thread's bind. The head-relative diff below
         # cannot misreport a child: a multi-bind revision with a head on ANY bound thread is lapsed and refused by
-        # _stale_reason above, so for a mission's series ``head`` is None here. The since-parent diff and the sheet's
-        # member view over every child are lane 3's (L3 h15 r1 complement #3).
+        # _stale_reason above, so for a mission's series ``head`` is None here. The since-parent diff compares the
+        # series' values, which every child shares. Per-thread member change text is NOT built for a several-thread
+        # draft: the sheet says so and names the ``binds`` field (draft_sign._sheet_lines).
         bind_rev = _bind_of(d, d.thread_id)["rev"]
         ended = effective = None
         added: list[str] = []
