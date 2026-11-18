@@ -510,7 +510,7 @@ def test_an_aborting_repo_with_an_asserted_abandon_recovers_by_a_signed_rerun_ru
     monkeypatch.setattr(sg, "resolve_authority", lambda **kw: rig.source())
     before, items_before = raw(store), items_raw(store)
     rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)    # unsigned: stuck, and says how to recover
-    assert rc == 2 and "graded 'asserted': it must be signed (re-run `abandon-track` with --sign)" in err, err
+    assert rc == 2 and "graded 'asserted': it must be signed or relayed (re-run `abandon-track` with --sign or --source)" in err, err
     assert raw(store) == before and items_raw(store) == items_before
     _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
     assert cut == [iid]
