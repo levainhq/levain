@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 import time
 from collections.abc import Mapping
@@ -294,14 +295,22 @@ def _denials_path(state: str, session_id: str) -> str:
     return os.path.join(state, "denials-" + hashlib.sha256(session_id.encode()).hexdigest()[:24] + ".jsonl")
 
 
-def _log_denial(state: str, session_id: str, path: str, nbytes: int, cost: int, remaining: int) -> None:
-    """Append one row per deny to the session's ``denials-<session>.jsonl``; fail-open (never changes the decision)."""
+def _log_denial(state: str, session_id: str, path: str, nbytes: int, cost: int, remaining: int,
+                now: float | None = None) -> None:
+    """Append one row per deny to the session's ``denials-<session>.jsonl``; fail-open (never changes the decision).
+    One ``os.write`` of the whole line on an O_APPEND fd (0600, non-blocking, no symlink); a non-regular file is refused."""
     try:
         row = {"path": path, "bytes": nbytes, "price": cost, "remaining": remaining, "session": session_id,
-               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+        line = (json.dumps(row) + "\n").encode("utf-8")
         os.makedirs(state, mode=0o700, exist_ok=True)
-        with open(_denials_path(state, session_id), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row) + "\n")
+        fd = os.open(_denials_path(state, session_id),
+                     os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                os.write(fd, line)
+        finally:
+            os.close(fd)
     except Exception:  # noqa: BLE001
         pass
 
@@ -370,8 +379,9 @@ def decide_pre(event: Any, environ: Mapping[str, str], now: float | None = None)
         else:
             return None
         max_bytes = max(FLOOR_BYTES, (call_budget // max(1, remaining)) * BYTES_PER_TOKEN)
-        _log_denial(state, sid, real, nbytes, cost, remaining)
-        return _deny_text(real, nbytes, cost, max_bytes, why, remaining, offset, state)
+        text = _deny_text(real, nbytes, cost, max_bytes, why, remaining, offset, state)
+        _log_denial(state, sid, real, nbytes, cost, remaining, now)   # only a deny that is certain leaves a row
+        return text
     except Exception:  # noqa: BLE001  (any doubt: the vendor decides)
         return None
 
