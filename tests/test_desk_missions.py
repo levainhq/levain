@@ -13,6 +13,10 @@ from levain.desk import missions, review
 from levain.desk.missions import AcceptanceRefused
 from levain.desk.store import CoordError, CoordStore, Part
 from levain.desk.legacy import ROLE_DESK
+from levain.desk.envelopes import EnvelopeStore
+from tests.test_desk_envelope_draft import (  # noqa: F401  (fixtures)
+    built, cites_for, ctx, fields_for, keys, make, repo, snapshot)
+from tests.test_mission_draft import mission_draft, mission_of, signed_mission
 
 T0 = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc)
 
@@ -368,3 +372,65 @@ def test_the_watermark_survives_a_store_with_attenuations_but_no_binds(store):
                 "CREATE TABLE envelope_attenuations (gseq INT, thread_id TEXT, envelope_id TEXT)"):
         conn.execute(ddl)
     assert missions._watermark(conn, [tid]) == 0
+
+
+# --- H1-5 lane 4 (Q4): detaching a child ends the mission envelope's grant for that child -------------------------------
+def _attenuations(ctx):
+    return ctx.rows("SELECT envelope_id, thread_id, kind, by FROM envelope_attenuations ORDER BY gseq")
+
+
+def test_detach_after_signing_kills_that_child_only(ctx):
+    # reproduced on the base tip: the signature names the thread, so before this a detach left the child live
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+    eid = stored.envelope_id
+    missions.detach(ctx.store, m.mission_id, ts[1].thread_id)
+    assert _attenuations(ctx) == [(eid, ts[1].thread_id, "kill", "service")]
+    assert "was killed" in ctx.store.live_refusal(eid, ts[1].thread_id, authority=ctx.snap)
+    for t in (ts[0], ts[2]):
+        assert ctx.store.live_refusal(eid, t.thread_id, authority=ctx.snap) is None
+        assert ctx.store.effective(eid, t.thread_id)["where"] == stored.body["where"]
+    # the bind rows stay as signed: a detach takes authority away and gives it to nobody
+    assert ctx.rows(f"SELECT COUNT(*) FROM envelope_binds WHERE envelope_id = '{eid}'") == [(3,)]
+
+
+def test_detach_with_no_mission_envelope_writes_no_attenuation(ctx):
+    d, ts, m = mission_of(ctx, 3)
+    missions.detach(ctx.store, m.mission_id, ts[0].thread_id)          # no draft at all
+    d2, ts2, m2 = mission_of(ctx, 3)
+    mission_draft(ctx, m2, d2)                                          # a draft nobody signed
+    missions.detach(ctx.store, m2.mission_id, ts2[0].thread_id)
+    assert _attenuations(ctx) == []
+
+
+def test_detach_of_a_child_the_envelope_never_covered_writes_none(ctx):
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+    u = ctx.store.split(ctx.plain("a later thread").drop_id, [Part("work", "u")])[0]
+    missions.attach(ctx.store, m.mission_id, u.thread_id)
+    missions.detach(ctx.store, m.mission_id, u.thread_id)
+    assert _attenuations(ctx) == []
+    for t in ts:
+        assert ctx.store.live_refusal(stored.envelope_id, t.thread_id, authority=ctx.snap) is None
+
+
+def test_a_second_detach_is_a_no_op_and_a_stranger_is_still_refused(ctx):
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+    after = missions.detach(ctx.store, m.mission_id, ts[1].thread_id)
+    again = missions.detach(ctx.store, m.mission_id, ts[1].thread_id)
+    assert again.rev == after.rev and len(_attenuations(ctx)) == 1
+    with pytest.raises(CoordError, match="is not in mission"):
+        missions.detach(ctx.store, m.mission_id, "th-" + "0" * 32)
+
+
+def test_a_fault_between_the_detach_and_the_kill_leaves_neither(ctx, monkeypatch):
+    d, ts, m, dr, stored = signed_mission(ctx, 3)
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("injected")
+
+    monkeypatch.setattr(EnvelopeStore, "_attenuate", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        missions.detach(ctx.store, m.mission_id, ts[1].thread_id)
+    monkeypatch.undo()
+    assert missions.get_mission(ctx.store, m.mission_id).rev == m.rev
+    assert _attenuations(ctx) == []
+    assert ctx.store.live_refusal(stored.envelope_id, ts[1].thread_id, authority=ctx.snap) is None
