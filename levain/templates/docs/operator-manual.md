@@ -89,6 +89,8 @@ Beyond *what* your partner knows, you can shift *how it thinks* for a stretch of
 - **`[!execute]`** — execution mode. Restate what's changing and why before touching it, verify against the actual goal, flag anything wrong-looking mid-flight. For when you're doing, not deciding.
 - **`[!humanize]`** — strip the AI-voice texture from writing meant for an audience that would distrust it. For a customer reply, a public post, anything where reading as machine-written would undercut it.
 
+On a deep turn (`[!deeper]`, `[!breakthrough]`) the partner may end its reply with an `Off-lens:` section of three lines at most: a thread, a doubt or a reframe outside the lens you gave it. It is the partner's own, and it is left out when there is nothing to say; a reply with no such section is a complete answer.
+
 You can chain them (`[!deeper][!creative]`) and drop them inline, mid-conversation, wherever the thinking needs to shift. Treat this set as the starting gears, not a fixed inventory — the seed ships with them, and a maturing partner may grow or rename its own; what matters is the gear-change, not the notation.
 
 **Why tags, not commands.** A tag stays resident, so it sets the posture *before* you consciously reach for it — which is the whole point, since a mode that only switched on after you'd started would arrive too late to shape the work. That's why they're inline tags you drop, not menu items you go fetch.

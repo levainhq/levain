@@ -6967,7 +6967,7 @@ def _print_manifest(
         print(
             "  (activation/posture.md is what DIRECTS your entity — see below. It "
             "and\n   recency_directives.md are yours to tune as you learn the shapes "
-            "your\n   substrate's training leaks.)"
+            "your\n   substrate's drift takes in the work.)"
         )
 
 

@@ -519,9 +519,9 @@ _DAY_PLAN = (
     f"{_ARRIVAL_CARD} Above your status line (in a `coord reply`, at the top of --text) write at most 5 plain lines of "
     "the day: what you will run today and in what order, and what you are holding until the operator answers. Do not restate a "
     "work line, a `back:`, handoff or `next:` line, or a band item: they are directly below, and a restatement drifts "
-    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. Ask the operator nothing: "
-    "a question goes through `coord escalate` or the band's ask tool, and \"waits on you\" is never written. A reply "
-    "that is neither has no such section: it is the reply as always.")
+    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. The card carries no "
+    "question: what you need from the operator goes through `coord escalate` or the band's ask tool, which reach a surface "
+    "they answer from. A reply that is neither has no such section: it is the reply as always.")
 _DAY_STATUS_ONLY = (
     f"{_ARRIVAL_CARD} Write only your status line (in a `coord reply`, a one-line --text): the lines Levain derived "
     "are the card.")
@@ -935,11 +935,11 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         *_board_modes_section(lv),
         "## How your turn ends",
         "",
-        "Your words are the last thing in a session the operator may see in their agent view, where a question or "
-        "\"waits on you\" reads as a blocker that reached no surface the operator answers from. So the last line of your own "
+        "Your words are the last thing in a session the operator may see in their agent view, where a question or a "
+        "decision handed to them reads as a blocker that reached no surface they answer from. So the last line of your own "
         "words, on every turn, is ONE status line beginning `desk:` that says what you did and how many items "
-        "you escalated, for example `desk: split d-41 into 2 threads, noted d-42; 1 escalated`. It is never a "
-        "message to the operator, never a question, never \"waits on you\". Every escalation goes through the verb "
+        "you escalated, for example `desk: split d-41 into 2 threads, noted d-42; 1 escalated`. It is a status record, "
+        "not a message or a question to the operator. Every escalation goes through the verb "
         f"that pings (`{lv} coord escalate`, or the band's ask tool), never through your last line. When the work is "
         f"done, release the lease (`{lv} coord release --by desk --token N {tail}`) and end your turn with "
         "that line"
