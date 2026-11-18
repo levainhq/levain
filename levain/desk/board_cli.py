@@ -434,11 +434,18 @@ def run_amend(args: argparse.Namespace) -> int:
 
 
 def _cause_authority(args: argparse.Namespace, seal: Any):
-    """The authority source an unsigned ``--cause`` is checked against (None when there is no cause, or a seal carries one)."""
+    """The authority source an unsigned ``--cause`` is checked against (None when there is no cause, or a seal carries one,
+    or this install has no authority log: the decide's own refusal then speaks, as ``board_registry``'s ``_source`` lets it;
+    gemini 124, fix 4). A cockpit that is there and cannot be read is passed through, naming it."""
     if args.cause is None or seal is not None:
         return None
     from levain.desk import board_sign
-    return board_sign.resolve_authority()
+    try:
+        return board_sign.resolve_authority()
+    except board_sign.AuthorityUnreadable:
+        raise
+    except bs.BoardError:
+        return None
 
 
 def run_decide(args: argparse.Namespace) -> int:

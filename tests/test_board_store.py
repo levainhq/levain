@@ -945,7 +945,7 @@ def test_a_record_without_at_is_refused_not_written_unchained(home, tmp_path):
     bs.use(t.store_dir)
     with pytest.raises(bs.BoardError, match="needs an at"):
         bs._append(t, lambda recs: ({"v": 1, "op": "add", "id": "levain#1"}, True), filename="repos.jsonl")
-    assert not (t.store_dir / "repos.jsonl").read_bytes()
+    assert not (t.store_dir / "repos.jsonl").exists()          # nothing written, and the file the refused write opened is gone (fix 4)
 
 
 @pytest.mark.parametrize("key", ["author", "grade", "prev", "sig"])

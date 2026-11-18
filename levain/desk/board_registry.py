@@ -193,15 +193,15 @@ def _load(store_dir: Path, deadline: float | None = None) -> View:
     return View(rf.fold_repos(lines, store_id=sid, unterminated_tail=tail), sid, raw, tuple(lines))
 
 
-def read_registry(target: bs.Target, *, allow_inactive: bool = False) -> View:
-    """The registry under the shared lock. Refuses with no pointer, on a torn file and (unless ``allow_inactive``) on a store
-    with no ``repos.jsonl`` yet."""
+def read_registry(target: bs.Target, *, allow_inactive: bool = False, allow_torn: bool = False) -> View:
+    """The registry under the shared lock. Refuses with no pointer, on a torn file (unless ``allow_torn``: the caller then
+    words that refusal itself) and (unless ``allow_inactive``) on a store with no ``repos.jsonl`` yet."""
     bs._require_pointered(target)
     with bs.store_lock(target.store_dir, exclusive=False):
         view = _load(target.store_dir)
     if not view.active and not allow_inactive:
         raise BoardError(NO_REGISTRY)
-    if view.fold.torn:
+    if view.fold.torn and not allow_torn:
         raise BoardError(_torn_text(view))
     return view
 
@@ -295,7 +295,8 @@ def _reg_parser(store_dir: Path, *, allow_torn: bool = False) -> Callable[[bytes
 
 def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tuple[dict | None, bool]], *,
                allow_torn: bool = False, creates: bool = False, seal: Any = None,
-               decision: Callable[[rf.RepoFold, dict], str] | None = None) -> tuple[dict | None, bool]:
+               decision: Callable[[rf.RepoFold, dict], str] | None = None,
+               author: Mapping[str, Any] | None = None) -> tuple[dict | None, bool]:
     """Every registry write: ``board_store._append`` (the one write path) with the registry's reader. ``build(fold, store_id,
     raw)`` returns ``(record, write)``. Only ``creates`` (``register``, ``use --import-focus``) may start the file: any other
     verb on a store with no ``repos.jsonl`` refuses before ``_append`` opens (and so creates) it.
@@ -311,7 +312,7 @@ def _reg_write(target: bs.Target, build: Callable[[rf.RepoFold, str, bytes], tup
     if not creates and not (target.store_dir / REPOS_NAME).exists():
         raise BoardError(NO_REGISTRY)
     parse = _reg_parser(target.store_dir, allow_torn=allow_torn)
-    bs._preflight(seal)                                         # a seal's refusals that need no lock come before it
+    bs._preflight(seal, author)                                 # a seal's refusals that need no lock (an operator author) come first
 
     def graded(view: View) -> tuple[dict | None, bool]:
         rec, write = build(view.fold, view.store_id, view.raw)
@@ -357,7 +358,7 @@ def register(target: bs.Target, name: str, path: str, words: str, by: str, *, au
             raise BoardError(f"{ident['path']} is already registered as {other}")
         return _record("register", name, by, sid, {"words": words, **ident, **({"via": via} if via else {})}, author, now), True
 
-    rec, written = _reg_write(target, build, creates=True, seal=seal)
+    rec, written = _reg_write(target, build, creates=True, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -391,7 +392,7 @@ def move(target: bs.Target, name: str, path: str, words: str, by: str, *, author
         cur = fold.repos[name]
         return sg.MOVE_DECISION if sg.move_is_decision(cur.mode, cur.origin, cur.root, rec["origin"], rec["root"]) else ""
 
-    _, written = _reg_write(target, build, seal=seal, decision=decision)
+    _, written = _reg_write(target, build, seal=seal, decision=decision, author=author)
     return _fold_one(target, name), written
 
 
@@ -405,7 +406,7 @@ def _set_attention(op: str, target: bs.Target, name: str, words: str, by: str, a
             return None, False
         return _record(op, name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -482,7 +483,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
                 "charter_before": before}
         return _record("begin-track", name, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -591,7 +592,7 @@ def track(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[
         body = {"words": words, "migration": cur.migration, "charter_blob": blob, "retire": list(manifest.get("retire", []))}
         return _record("track", name, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -618,8 +619,12 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     and always None when ``uncut`` is empty: no cut is owed). The judgement is ``board_sign.cut_cause_problem``, the SAME
     predicate ``verify_cause`` applies to each cut (levain 29, fix 3), over the same cause the cuts carry
     (:func:`_latest_abandon_hash`) and the store's lines as written (``raw`` for the registry, the items file read here):
-    so a signed re-run writes a fresh abandon exactly when a cut citing the latest one would be refused. The caller holds
-    the exclusive ``store.lock`` (the items are read here, under it)."""
+    so a signed re-run writes a fresh abandon exactly when a cut citing the latest one would be refused. The predicate's
+    item-independent half (``board_sign.cause_problem``: the line, the registry, the signature, the items fold) is judged
+    ONCE for the call, then its per-item half for each owed item (complement 15, fix 4). A torn registry never reaches here
+    (the write's reader refuses it, and ``abandon_track`` names the ``ack-torn`` first); a torn items file is a problem
+    naming the ``ack-torn``, which no fresh abandon repairs. The caller holds the exclusive ``store.lock`` (the items are
+    read here, under it)."""
     from levain.authority_sig import VerifierUnavailable
     from levain.desk import board_sign as sg
     ids, decision = _migration_facts(store_dir, name, migration)
@@ -627,13 +632,17 @@ def _latest_abandon_problem(raw: bytes, sid: str, name: str, migration: str, sna
     if not uncut:
         return None, uncut
     repos, tail = bs._split_written(raw)
-    store = bs.StoreLines(bs._split_written(_items_raw(store_dir))[0], repos, sid, tail)
+    items, items_tail = bs._split_written(_items_raw(store_dir))
+    store = bs.StoreLines(items, repos, sid, tail, items_tail)
     cause = _latest_abandon_hash(repos, name, migration)
     if cause is None:
         return f"no abandon-track of {migration} is recorded for {name}", uncut
     try:
+        problem, held = sg.cause_problem(cause, store, snapshot)
+        if problem is not None:
+            return problem, uncut
         for iid in uncut:
-            problem = sg.cut_cause_problem(cause, iid, store, snapshot)
+            problem = sg.cut_item_problem(held, iid)
             if problem is not None:
                 return problem, uncut
     except VerifierUnavailable as exc:
@@ -656,17 +665,23 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
     A re-run on an ``aborting`` repo writes no new abandon and still needs ``authority`` for the cuts it finishes. When the
     latest abandon cannot cause every cut still owed (:func:`_latest_abandon_problem`, which asks
     ``board_sign.cut_cause_problem``, the predicate every cut's ``verify_cause`` is: not signed or no longer valid, another
-    store's, not where its prev places it, a torn registry, no ``items_last``, its anchor gone, or an uncut item of M added
-    after its anchor): a SIGNED re-run writes a fresh signed abandon of the same migration (the fold reads it as a retry)
-    whose anchor covers them, and the cuts cite that one; an UNSIGNED re-run with an authority source refuses by name
-    ("re-run abandon-track signed") before anything is written. With no item left uncut neither writes anything.
-    Returns ``(repo, ids cut by this call)``."""
+    store's, not where its prev places it, not applied by the fold, its repo no longer aborting M, no ``items_last``, its
+    anchor gone, or an uncut item of M added after its anchor): a SIGNED re-run writes a fresh signed abandon of the same
+    migration (the fold reads it as a retry) whose anchor covers them, and the cuts cite that one; an UNSIGNED re-run with an
+    authority source refuses by name ("re-run abandon-track signed") before anything is written. With no item left uncut
+    neither writes anything. A TORN registry or items file is not something a fresh abandon repairs: it refuses naming the
+    ``ack-torn`` to run first (deepseek 71, fix 4). Returns ``(repo, ids cut by this call)``."""
     from levain.desk import board_sign as sg
     if seal is not None and authority is not None and authority is not getattr(seal, "authority", None):
         raise BoardError("abandon-track: a signed abandon's cuts are checked against the seal's own authority source; "
                          "another one was given")
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
-    view = read_registry(target)
+    view = read_registry(target, allow_torn=True)
+    if view.fold.torn:
+        n = next((ln for ln, _ in view.fold.torn_lines if ln not in view.fold.acked), None)
+        hint = f" (levain board ack-torn --file {REPOS_NAME} --line {n} --why \"...\")" if n else ""
+        raise BoardError(f"abandon-track {name}: the registry is torn ({view.fold.torn_why}): ack-torn first{hint}, then run "
+                         f"it again; nothing was written")
     cur = _need_repo(view.fold, name)
     if cur.mode not in ("tracking", "aborting"):
         raise BoardError(f"{name} is {cur.mode}: abandon-track needs a tracking repo (after track, leave with `untrack`)")
@@ -700,7 +715,7 @@ def abandon_track(target: bs.Target, name: str, words: str, by: str, *, author: 
         return _record("abandon-track", name, by, sid, {"words": body_words, "migration": c.migration, "items_last": last},
                        author, now), True
 
-    _reg_write(target, build, seal=seal)
+    _reg_write(target, build, seal=seal, author=author)
     authority = authority if authority is not None else getattr(seal, "authority", None)
     view = read_registry(target)
     m = cur.migration or ""
@@ -775,7 +790,7 @@ def abandon_done(target: bs.Target, name: str, words: str, by: str, *, author: M
             raise BoardError(f"abandon-done {name} refused: " + _uncut_text(name, late))
         return _record("abandon-done", name, by, sid, {"words": words, "migration": c.migration}, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -830,7 +845,7 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
             raise BoardError(f"untrack {name} refused: the items changed under the check; run it again")
         return _record("untrack", name, by, sid, {"words": words}, author, now), True
 
-    _, written = _reg_write(target, build, seal=seal)
+    _, written = _reg_write(target, build, seal=seal, author=author)
     return _fold_one(target, name), written
 
 
@@ -894,7 +909,7 @@ def ack_torn(target: bs.Target, file: str, line: int, why: str, by: str, *, auth
                          malformed=line in fold.malformed)
         return _record(rf.ACK, None, by, sid, body, author, now), True
 
-    _, written = _reg_write(target, build, allow_torn=True, seal=seal)
+    _, written = _reg_write(target, build, allow_torn=True, seal=seal, author=author)
     return written
 
 
@@ -927,7 +942,7 @@ def _ack_torn_items(target: bs.Target, line: int, why: str, by: str, author: Map
     bs._require_pointered(target)
     if not (target.store_dir / bs.ITEMS_NAME).exists():
         raise BoardError(f"{bs.ITEMS_NAME} does not exist; there is no line {line}")
-    bs._preflight(seal)
+    bs._preflight(seal, author)
     _, written = bs._append(target, build, filename=bs.ITEMS_NAME, parse=lambda raw: raw, seal=seal)
     return written
 
@@ -1327,10 +1342,13 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     def _source(a: Any) -> Any:
         """The authority source an UNSIGNED abandon-track's cuts are checked against (a re-run that finishes cuts). None when
-        this install has none: the policy's own refusal then speaks, not a missing-log one."""
+        this install has none: the policy's own refusal then speaks, not a missing-log one. A cockpit that is there and
+        cannot be READ is not "none": that refusal is passed through, naming it (deepseek 78, fix 4)."""
         from levain.desk import board_sign
         try:
             return board_sign.resolve_authority()
+        except board_sign.AuthorityUnreadable:
+            raise
         except BoardError:
             return None
 
