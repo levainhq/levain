@@ -566,6 +566,15 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
 _HOLD_GET = ("(() => { window.__getCalls = 0; navigator.credentials.get = () => new Promise((_ok, no) => {"
              " window.__getCalls = (window.__getCalls | 0) + 1; window.__release = () => no(new DOMException('declined', 'NotAllowedError')); }); return 1; })()")
 
+# Arms nothing by itself: while the page holds `window.__failList` truthy, EVERY read of the grants' sign listing fails (the
+# background Decisions panel and the modal each read it, and the page keeps only the newest fill, so one failure would be spent
+# on a read that never draws). The listing is a bounded read that answers null on a timeout or an error (a loaded box), and a card
+# drawn with no listing has no sign line at all: no Revoke button and no note element. That redraw is what b11's last wait must
+# not mistake for the card it is waiting for, and b11 observes it happen before it lets the listing answer again
+_FAIL_LIST_WHILE_ARMED = ("if (!window.__listPatched) { const real = window.fetch.bind(window); window.__listPatched = 1;"
+                   " window.fetch = (u, o) => { if (window.__failList && String(u).includes('/cockpit/grant/list.json'))"
+                   " { return Promise.reject(new TypeError('failed to fetch')); } return real(u, o); }; } ")
+
 # The Revoke tap of b11/b12: the page's own board reads can split a press (a lost press makes no click), so it is pressed again, but
 # ONLY while the ceremony has neither begun (the stub's call count is 0) nor ended (the grant note is still empty); a ceremony that
 # ran and failed ("nothing was revoked", a 5xx) is never pressed again and fails the wait with the card's own text. The retry's
@@ -595,7 +604,7 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
         httpd.grant_phone = rec
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
             _auth(newer, b"cred-new"), {"until": TILE},
-            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); " + _FAIL_LIST_WHILE_ARMED + "1"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": _HOLD_GET},
@@ -611,17 +620,29 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"eval": f"{_CARD}.querySelector('.sign-note').className"},
             # complement MED 1 / LOW 6: the ceremony has ended and the live card has said it; a later board read draws the
             # card plain, never the old refusal again
-            {"eval": f"window.__shown = {_CARD}; 1"},
-            {"do": "document.querySelector('#refresh').click(); 1",
-             "until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
-            {"eval": _GRANT_NOTE},
+            {"eval": f"window.__shown = {_CARD}; window.__failList = 1; 1"},
+            # every listing read fails: the redraw is a card with NO sign line (no note element), and it is seen here
+            {"do": "document.querySelector('#refresh').click(); 1", "every": 8000,
+             "until": (f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected"
+                       f" && !{_CARD}.querySelector('.sign-note') && 1"), "ms": 45000},
+            {"eval": "window.__failList = 0; 1"},
+            # the listing answers again: the card waited for is one drawn WITH its sign line. The page keeps only the newest
+            # fill (a press supersedes a read still in flight), so the press waits out the page's own 15 s bound on a read: a read
+            # answers or times out before the next press (a press every 1.5 s cancelled every answer under load). The note is
+            # read in the SAME evaluation that sees the
+            # card (the wait's own value): every redraw leaves the slot empty until its fill answers, so a read in a step of its
+            # own can land on no card at all
+            {"do": "document.querySelector('#refresh').click(); 1", "every": 16000,
+             "until": (f"(() => {{ const c = {_CARD}; if (!c || c === window.__shown || window.__shown.isConnected) return null;"
+                       f" const n = c.querySelector('.sign-note'); return n ? {{note: n.textContent}} : null; }})()"), "ms": 60000},
             {"eval": "window.__getCalls"},
         ])
     v = out["values"]
-    assert v[-8] == "locked", v[-8]                 # the card drawn mid-ceremony is locked, as the tapped one was
-    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-6], v[-6]
-    assert "sign-bad" in v[-5], v[-5]
-    assert v[-2] == "", v[-2]                       # the redraw after the ceremony ended does not repaint its word
+    assert v[-9] == "locked", v[-9]                 # the card drawn mid-ceremony is locked, as the tapped one was
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-7], v[-7]
+    assert "sign-bad" in v[-6], v[-6]
+    assert v[-4] == 1, v[-4]                        # a card drawn with no listing had no sign line, and the test saw it
+    assert v[-2] == {"note": ""}, v[-2]             # the redraw after the ceremony ended does not repaint its word
     assert v[-1] == 1, v[-1]                        # one ceremony: the re-press never started a second get
     _few_repressed(out)
     assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps
@@ -657,16 +678,17 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
             {"eval": f"window.__shown = {_CARD2}; 1"},
+            # the card's note and lock are read in the evaluation that sees the card, and only a card drawn WITH its sign line
+            # counts (b11: a card drawn with no listing has no note, and a redraw leaves the slot empty until its fill answers)
             {"do": "document.querySelector('#refresh').click(); 1",
-             "until": f"!!{_CARD2} && {_CARD2} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
-            {"eval": _GRANT_NOTE2},
-            {"eval": f"{_REVOKE2}.disabled"},
+             "until": (f"(() => {{ const c = {_CARD2}; if (!c || c === window.__shown || window.__shown.isConnected) return null;"
+                       f" const n = c.querySelector('.sign-note'), b = c.querySelector('.grant-revoke');"
+                       f" return n && b ? {{note: n.textContent, disabled: b.disabled}} : null; }})()"), "ms": 30000},
             {"eval": "window.__getCalls"},
         ])
     v = out["values"]
-    assert "a signature is already being asked for" in v[-8], v[-8]
-    assert v[-3] == "", v[-3]                       # the refused tap's word was never kept for B
-    assert v[-2] is False, v[-2]
+    assert "a signature is already being asked for" in v[-6], v[-6]
+    assert v[-2] == {"note": "", "disabled": False}, v[-2]    # the refused tap's word was never kept for B, and B is unlocked
     assert v[-1] == 1, v[-1]                        # one ceremony: B's refused tap and the re-press never reached get
     _few_repressed(out)
     assert [(g, a) for g, a, _r in rec.steps] == [(GID, "revoke-challenge")], rec.steps   # B's tap sent nothing
