@@ -440,3 +440,31 @@ def test_init_never_touches_a_stale_old_style_temp_and_leaves_no_temp_behind(tmp
     assert sorted(p.name for p in other.iterdir()) == sorted([".git", "CHARTER.md", stale.name])
     assert (other / "CHARTER.md").read_text(encoding="utf-8").startswith("# Charter: levain")
     assert oct((other / "CHARTER.md").stat().st_mode & 0o777) == "0o644"
+
+
+@pytest.mark.parametrize("name", ["2026-11-18", "cafe123", "1234567"])
+def test_a_date_or_sha_shaped_repo_name_still_passes_the_status_scan_once_filled(tmp_path, capsys, name):
+    repo = _git_repo(tmp_path / "r")
+    store = _store_file(tmp_path / "items.jsonl", [(f"{name}#1", None), (f"{name}#2", None)])
+    assert main(["charter", "init", name, "--repo", str(repo), "--items", str(store)]) == 0
+    text = _fill((repo / "CHARTER.md").read_text(encoding="utf-8")).replace("[judged: filled]", f"[item: {name}#1]")
+    items = {f"{name}#1": (name, None), f"{name}#2": (name, None)}
+    probs, _ = charter.check_text(text, repo_name=name, items=items)
+    assert [p for p in probs if p.rule == "status"] == [] and probs == []
+    # prose is still scanned: a real sha or date in it is refused
+    assert any(p.rule == "status" for p in charter.check_text(text.replace("filled\n\n## Criteria", "see deadbeef1 there\n\n## Criteria", 1), repo_name=name)[0])
+    assert any(p.rule == "status" for p in charter.check_text(text.replace("filled\n\n## Criteria", "shipped 2026-11-18\n\n## Criteria", 1), repo_name=name)[0])
+
+
+def test_check_file_reads_only_that_file_and_the_json_refusal_is_one_document(tmp_path, capsys, monkeypatch):
+    import json
+    from levain.desk import charter as c
+    monkeypatch.setattr(c, "_wrong_repo", lambda *a, **k: "alpha is registered at /x, but this would read /y. Pass --repo /x.")
+    f = tmp_path / "C.md"
+    f.write_text(REAL, encoding="utf-8")
+    assert main(["charter", "check", "--repo-name", "alpha", "--file", str(f)]) == 0          # --file: the guard does not run
+    capsys.readouterr()
+    rc = main(["charter", "check", "--repo-name", "alpha", "--json"])
+    cap = capsys.readouterr()
+    doc = json.loads(cap.out)                                   # exactly one document
+    assert rc == 2 and set(doc) == _KEYS and doc["valid"] is False and "registered at" in doc["why"] and "registered at" in cap.err

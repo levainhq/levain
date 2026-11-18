@@ -47,6 +47,8 @@ _PLAN_ID = re.compile(r"^- ([a-z0-9][a-z0-9._-]*)#(\d+)$")
 _TAG = re.compile(r"\[(check: [^\]]+|item: [a-z0-9][a-z0-9._-]*#\d+|judged: [^\]]+)\]\s*$")
 _TAGS_ANY = re.compile(r"\[(?:check|item|judged):")
 _ITEM_TAG = re.compile(r"\[item: ([a-z0-9][a-z0-9._-]*#\d+)\]\s*$")
+_PLAN_ID_ANY = re.compile(r"[a-z0-9][a-z0-9._-]*#\d+")
+_ITEM_TAG_ANY = re.compile(r"\[item: [a-z0-9][a-z0-9._-]*#\d+\]")
 _JUDGED = re.compile(r"\[judged: [^\]]*\]")
 _SHA = re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
@@ -214,9 +216,18 @@ def check_text(text: str, *, repo_name: str | None = None,
             if repo == name and iid not in planned and decision not in OUT_OF_PLAN:
                 warnings.append(f"{iid} is in the store and in no plan group")
 
-    # No status, by structure: shapes a machine can check without refusing an ordinary word.
+    # No status, by structure: shapes a machine can check without refusing an ordinary word. The scan does not see the
+    # charter's own NAME (the title) or an item id (`NAME#N`, a Plan row, an `[item: ...]` tag): a repo named `2026-11-18` or
+    # `cafe123` is date- or sha-shaped by name, and its charter must still be able to pass. Prose is scanned as ever.
+    own_id = re.compile(re.escape(name) + r"#\d+") if name else None
     for i, ln in enumerate(lines):
         n = i + 1
+        if i == 0 and title is not None:
+            ln = ""
+        else:
+            ln = _PLAN_ID_ANY.sub("", _ITEM_TAG_ANY.sub("", ln)) if (_PLAN_ID.match(ln) or _ITEM_TAG.search(ln)) else ln
+            if own_id is not None:
+                ln = own_id.sub("", ln)
         if _SHA.search(ln):
             bad(n, "status", "a sha-shaped token (a mutable fact: it names a state of the code)")
         if _GLYPH.search(ln):
@@ -324,10 +335,14 @@ def run_check(args: Any) -> int:
         repo = repo.expanduser()
     except RuntimeError:                                    # `~nouser`: left as typed, git will say it is not a repository
         pass
-    if args.repo_name is not None:                          # a NAME given outright: it must be read from the repo it names
+    if args.repo_name is not None and args.file is None:    # a NAME given outright: it must be read from the repo it names (--file reads only that file)
         wrong = _wrong_repo("check", args.repo_name, _toplevel(repo), args.items)
         if wrong is not None:
             print(f"levain charter check: {wrong}", file=sys.stderr)
+            if args.json:       # one document on stdout on every path: the refusal is its reason
+                print(json.dumps({"repo": repo_name, "source": "", "present": False, "readable": False, "why": f"refused: {wrong}",
+                                  "valid": False, "store_checked": False, "store_note": "", "problems": [], "warnings": []},
+                                 indent=2))
             return 2
     if args.file is not None:
         where, label = str(args.file), "the file"
@@ -375,7 +390,7 @@ def run_check(args: Any) -> int:
         print(f"  warning: {w}")
     if len(warnings) > MAX_PRINTED:
         print(f"  and {len(warnings) - MAX_PRINTED} more warnings (--json lists every one)")
-    return 0     # warn mode: the check never refuses in 1.0
+    return 0     # warn mode: a charter's content never refuses in 1.0; only the wrong-repo guard above exits 2
 
 
 _SKELETON_BODIES = {
@@ -420,8 +435,8 @@ def _toplevel(path: Path) -> Path | None:
 def _common_dir(path: Path) -> Path | None:
     """The resolved ``git rev-parse --git-common-dir`` of PATH (every worktree of one repository shares it), or None when
     PATH cannot be read as a git repository."""
-    from levain.desk.board_evidence import _env
     try:
+        from levain.desk.board_evidence import _env
         cp = subprocess.run(["git", "-C", str(path), "rev-parse", "--git-common-dir"],
                             capture_output=True, text=True, timeout=30, env=_env())
         out = cp.stdout.removesuffix("\n")
@@ -436,15 +451,24 @@ def _common_dir(path: Path) -> Path | None:
 def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> str | None:
     """The refusal text when NAME is registered in the board registry and ``top`` (the git top-level the verb is about to act
     on) belongs to a different repository than the registered path; None otherwise. The comparison is of the REPOSITORY
-    (the git common dir), so any worktree of the registered repo is allowed. An unregistered NAME, no registry, a store
-    that cannot be read and a ``top`` that is not a repository all return None: the verb behaves as it always did."""
+    (the git common dir), so any worktree of the registered repo is allowed. Open (None, the verb behaves as it always did):
+    no store configured or found, an unregistered NAME, and a ``top`` that is not a repository. Refused: a store that IS found
+    but whose pointer or registry cannot be read, and a registered path that cannot be read as a git repository.
+
+    Known edges, judged and not built: a ``board move`` landing between this read and the write (an operator running both
+    at once) is not guarded; a name like ``a..b`` or ``a.`` is accepted, the one rule ``register`` already applies."""
     if top is None:
         return None
+    from levain.desk import board_registry as br, board_store as bs
     try:
-        from levain.desk import board_registry as br, board_store as bs
+        if bs.read_pointer() is None:       # no pointer: no store is configured (an explicit --items alone is no registry)
+            return None
+    except bs.BoardError as exc:            # a pointer that exists but cannot be read: a store is configured and broken
+        return f"cannot tell where {name} is registered: {exc}. Fix the store pointer, then run this again."
+    try:
         reg = br.read_registry(bs.resolve_store(items), allow_inactive=True).fold.repos.get(name)
-    except Exception:       # no store, no pointer, a torn registry: nothing to compare against
-        return None
+    except (bs.BoardError, OSError, ValueError, RuntimeError) as exc:   # a pointer with no store, two stores, a torn or unreadable registry
+        return f"cannot tell where {name} is registered: {exc}. Fix the store, then run this again."
     if reg is None:
         return None
     try:
@@ -455,8 +479,10 @@ def _wrong_repo(verb: str, name: str, top: Path | None, items: Path | None) -> s
     if registered == here:
         return None
     reg_common = _common_dir(registered)
-    if reg_common is None:      # a registered path that is not readable as a git repo: no refusal, as before this guard compared repositories
-        return None
+    if reg_common is None:
+        return (f"{name} is registered at {registered}, which cannot be read as a git repository, so this cannot tell whether "
+                f"{here} is the same one. If the checkout moved, `levain board move` updates the registered path; or pass "
+                f"--repo {registered} to name the registered checkout.")
     if reg_common == _common_dir(here):
         return None
     return (f"{name} is registered at {registered}, but this would write CHARTER.md in {here}. "
@@ -479,7 +505,7 @@ def run_init(args: Any) -> int:
         root = _toplevel(where)
         if root is None:
             return refuse(f"{where} is not inside a git work tree.")
-        wrong = _wrong_repo("init", name, root, args.items)
+        wrong = None if args.stdout else _wrong_repo("init", name, root, args.items)     # --stdout writes nothing: nothing to guard
         if wrong is not None:
             return refuse(wrong, 2)
     plan_ids: list[str] | None = None
@@ -555,7 +581,9 @@ def register(subparsers: Any) -> None:
     q = sub.add_parser(
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
-                     "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites."))
+                     "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2 when NAME is "
+                     "registered in the board registry at a different repository than the one it would write to (a worktree "
+                     "of the registered repo is fine), or when that cannot be told; nothing is written then."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
