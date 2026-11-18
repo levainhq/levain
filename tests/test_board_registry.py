@@ -1605,7 +1605,7 @@ def test_p1b_fix1_a_registry_chain_ack_keeps_the_line_and_binds_the_break(store,
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# charter init / check act only on the registered repository (levain#105)
+# charter init / check act only on the registered repository; one name rule (levain#105)
 
 
 def _charter(capsys, *argv):
@@ -1629,3 +1629,20 @@ def test_charter_init_and_check_refuse_a_repo_that_is_not_the_registered_one(sto
     assert rc == 0 and (a / "CHARTER.md").exists()
     rc, out, _ = _charter(capsys, "check", "--repo-name", "alpha", "--repo", str(a), "--worktree")
     assert rc == 0 and "CHARTER.md" in out
+
+
+def test_one_name_rule_a_registered_name_the_charter_can_use_and_track(decision_seal, store, tmp_path, mkrepo, capsys):
+    name = "9lives.app"                                                 # a digit first and a dot: `register` takes it, so must the charter
+    a = mkrepo(name)
+    ok(capsys, "register", name, "--path", str(a), "--words", "w", *A)
+    ok(capsys, "begin-track", name, "--manifest", str(manifest(tmp_path)), "--words", "y", *A)
+    m = migration_of(store, name)
+    iid = add_item(capsys, name, m, "a")
+    rc, out, err = _charter(capsys, "init", name, "--repo", str(a), "--items", str(store / "items.jsonl"))
+    assert rc == 0, err
+    text = (a / "CHARTER.md").read_text("utf-8")
+    assert f"# Charter: {name}" in text and f"- {iid}" in text
+    land(a, "CHARTER.md", CHARTER.format(name=name, plan=f"- {iid}"))
+    assert charter.check_text(CHARTER.format(name=name, plan=f"- {iid}"), repo_name=name)[0] == []
+    ok(capsys, "track", name, "--words", "go", *A)
+    assert reg_lines(store)[-1]["op"] == "track"

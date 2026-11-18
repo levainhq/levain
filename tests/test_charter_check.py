@@ -398,7 +398,7 @@ def test_init_never_overwrites_and_refuses_a_bad_name_and_a_non_repo(tmp_path, c
     assert main(["charter", "init", "levain", "--repo", str(repo)]) == 1
     assert str(repo / "CHARTER.md") in capsys.readouterr().err
     assert (repo / "CHARTER.md").read_text(encoding="utf-8") == "mine\n"
-    for bad in ("Levain", "1x", "a b", "", "a#1"):
+    for bad in ("Levain", "a b", "", "a#1", ".x"):
         assert main(["charter", "init", bad, "--repo", str(repo), "--stdout"]) == 1
         assert "must be lowercase" in capsys.readouterr().err
     plain = tmp_path / "plain"
