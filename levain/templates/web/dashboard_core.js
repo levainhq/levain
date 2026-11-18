@@ -6861,7 +6861,11 @@
       dispatchStale();
       rereadBoard();
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
-      if (ev.data.dropDelivered === true) dropHandedClear(ev.data.words);
+      if (ev.data.dropDelivered === true) {
+        dropHandedClear(ev.data.words);
+        // told to the page's own views (the Desk view's Rotate Desk): the words the server accepted, and whether an envelope was taken with them
+        try { document.dispatchEvent(new CustomEvent("levain:drop-delivered", { detail: { words: typeof ev.data.words === "string" ? ev.data.words : "", signed: ev.data.signed === true } })); } catch (e) { /* a view that listens is told nothing */ }
+      }
       dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });

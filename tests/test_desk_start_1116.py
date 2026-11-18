@@ -1,9 +1,9 @@
 """levain#78 and levain#107: the desk button lives on the Desk view, not on the Room page. With no desk holding the lease it reads
-"New Desk" (levain#78, which started life as "Start desk"); with one live it reads "Rotate Desk" (levain#107); when the lease cannot
+"New Desk" (levain#78, which started life as "Start desk"); with one live it reads "Rotate Desk" (levain#107; its asks and its Take over are tests/test_desk_rotate_107b.py); when the lease cannot
 be told it is not drawn.
 
-The Desk view (desk_tab_view.js, the lease bar under its title) is the reference; the Room's header keeps only New. The words the
-control hands the cockpit's own signing sheet are unchanged ("/fanin broad", the relay reads the first word and an optional shape):
+The Desk view (desk_tab_view.js, the lease bar under its title) is the reference; the Room's header keeps only New. The words New Desk
+hands the cockpit's own signing sheet are unchanged ("/fanin broad", the relay reads the first word and an optional shape):
 the page starts nothing, the passkey tap in the sheet is the signature. Driven on the real cockpit page behind the desk stub of
 tests/test_desk_pane_page.py. LEVAIN_DESK_SHOTS=<dir> saves the screenshots the row asks for.
 """
@@ -90,7 +90,7 @@ def test_rotate_desk_hands_the_signing_sheet_the_same_words_and_rotates_nothing_
         {"eval": _STUB % "{}"}, {"tap": "document.querySelector('.dv-zone .dv-start')"},
         {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, LOOK, *_shot("desk_held_1280.png")])
     g = looks(out)[-1]
-    assert g["startText"] == "Rotate Desk" and g["drops"] == ["/fanin broad"], g
+    assert g["startText"] == "Rotate Desk" and len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate "), g      # the rotate request, not /fanin
     assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing is asked until you press one of them" in g["note"], g
     assert "rotates nothing" in g["note"], g                                   # the page says what it did not do
     assert out["sends"] == []                                                  # the tap filed nothing through the desk port
@@ -102,7 +102,7 @@ def test_a_refused_open_on_rotate_says_nothing_was_rotated(tmp_path):
         put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held .dv-start')"),
         {"eval": _STUB % "null"}, {"tap": "document.querySelector('.dv-zone .dv-start')"}, {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, LOOK])
     g = looks(out)[-1]
-    assert g["drops"] == ["/fanin broad"] and g["note"] == "The signing sheet did not open, so no desk was rotated.", g
+    assert len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate ") and g["note"] == "The signing sheet did not open, so no desk was rotated.", g
 
 
 @needs_browser

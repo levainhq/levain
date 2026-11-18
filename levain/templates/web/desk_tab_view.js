@@ -35,16 +35,27 @@
   var CLEARED_STAY_WORDS = "Cleared. A line still waiting for an answer, or not yet confirmed, stays.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
   // The desk button (levain#78, moved here from the Room page; levain#107 names it by what a desk is doing): with no desk holding the
-  // lease it reads New Desk, and with one holding it Rotate Desk. Either opens the cockpit's own signing sheet (the page's
-  // LevainSignSheet.openDrop) with the same words filled in. The room cannot sign, and a typed line never starts a desk, so a desk is
+  // lease it reads New Desk, and with one holding it Rotate Desk (or Take over, below). Each opens the cockpit's own signing sheet (the page's
+  // LevainSignSheet.openDrop) with its words filled in. The room cannot sign, and a typed line never starts a desk, so a desk is
   // asked for only from that sheet: the passkey tap there is the signature, and the words stay his to edit (the other shape is one
   // word away). The relay reads the first word and an optional shape. Drawn only where the page carries the sheet.
   var DESK_WORDS = "/fanin broad";
   var NEW_LABEL = "New Desk", ROTATE_LABEL = "Rotate Desk";
   var START_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk inside limits; its Send words only button starts it with no limits; nothing starts until you press one of them.";
   var START_REFUSED_WORDS = "The signing sheet did not open, so no desk was started.";
-  var ROTATE_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to ask for a fresh desk inside limits; its Send words only button asks with no limits; nothing is asked until you press one of them. This page rotates nothing itself.";
+  // Rotate Desk (levain#107): the live desk is ASKED to hand off, start its successor and stop, by a SIGNED drop over the same sheet. The
+  // desk port's post carries words and nothing that signs, so the ask is a drop, and the first word is the marker a desk reads. The page learns the drop was delivered and signed from the cockpit's own event (dashboard_core.js raises it for
+  // a message from the sheet's frame only); a drop sent as words only is not counted as an ask.
+  var ROTATE_MARK = "/rotate", ROTATE_WORDS = ROTATE_MARK + " Write your handoff, start your successor, then stop. Asked from the cockpit Desk view.";
+  var ROTATE_OPEN_WORDS = "The signing sheet is open with the rotate request. Sign it there to ask the desk to rotate; its Send words only button sends it with no signature; nothing is asked until you press one of them. This page rotates nothing itself.";
   var ROTATE_REFUSED_WORDS = "The signing sheet did not open, so no desk was rotated.";
+  var TAKEOVER_LABEL = "Take over";
+  var TAKEOVER_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to ask for a fresh desk to take over; its Send words only button sends it with no signature; nothing is asked until you press one of them. This page starts nothing itself.";
+  var TAKEOVER_REFUSED_WORDS = "The signing sheet did not open, so no take over was asked.";
+  var UNSIGNED_WORDS = "That went as words only, with no signature, so it is not counted as asked here. Open the sheet again and sign it.";
+  var DELIVERED_EVENT = "levain:drop-delivered";
+  var ROTATE_WAIT_MS = 25 * 60 * 1000;   // how long an ask is waited on before Take over is offered: a handoff written, then a successor started and holding the lease
+  var STALL_AGE_S = 15 * 60;             // a lease not renewed this long reads stalled: Take over at once, with or without an ask
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
 
   // The numbers voice.js is given for desk replies. voice.js remembers which numbers it has already decided on for the life of the
@@ -81,8 +92,9 @@
   function leaseModel(lease) {
     var st = lease && typeof lease === "object" && own(LEASE_STATES, lease.state) ? lease.state : "unknown";
     if (st === "held") {
-      var who = str(lease.holder), age = ageWords(lease.age_s);
-      return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false };
+      var who = str(lease.holder), age = ageWords(lease.age_s), an = Number(lease.age_s);
+      return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false,
+               holder: who || null, ageS: age && isFinite(an) ? an : null };
     }
     if (st === "none") {
       return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk.", startHint: " To start one, use " + NEW_LABEL + " below.", drop: true };
@@ -111,6 +123,31 @@
     return { state: "ok", level: level, tokens: c.tokens, soft: soft, hard: c.hard,
              words: "Context " + groups(c.tokens) + " tokens · " + lines + (verdict ? " · " + verdict : ""),
              fill: Math.min(100, c.tokens / c.hard * 100), tick: soft !== null ? Math.min(100, soft / c.hard * 100) : null };
+  }
+
+  // What the desk button offers a LIVE desk, from the ask this tab recorded (`rec`: {at, holder, wentNone, kind}, or null), the lease
+  // model and the clock (ms) passed in. Pure: returns {rec, phase, button, words}; `rec` is the record to keep (null once a rotation
+  // is seen). A rotation is seen when the lease passed through "none" after the ask, or another holder name holds it now (with no name
+  // to compare, only the gap shows one). The lease being unreadable concludes nothing. A desk whose lease is not renewed for STALL_AGE_S
+  // is offered Take over at once; an ask not followed by a rotation inside ROTATE_WAIT_MS offers it too. Phases: "none" (no live desk:
+  // nothing to offer here), "rotate", "waiting" (asked, no button), "takeover".
+  function rotateView(rec, lease, now) {
+    var st = lease && lease.state, next = rec;
+    if (rec && st === "none" && !rec.wentNone) next = { at: rec.at, holder: rec.holder, wentNone: true, kind: rec.kind };
+    if (st !== "held") return { rec: next, phase: "none", button: null, words: "" };
+    if (rec && (rec.wentNone || (rec.holder && lease.holder && lease.holder !== rec.holder))) next = null;
+    if (typeof lease.ageS === "number" && lease.ageS >= STALL_AGE_S) {
+      return { rec: next, phase: "takeover", button: TAKEOVER_LABEL, words: "The desk has not renewed its lease for " + Math.floor(lease.ageS / 60) + " min." };
+    }
+    if (!next) return { rec: null, phase: "rotate", button: ROTATE_LABEL, words: "" };
+    var gone = Math.max(0, now - next.at), mins = Math.floor(gone / 60000), wait = Math.floor(ROTATE_WAIT_MS / 60000);
+    var asked = next.kind === "takeover" ? "Asked for a fresh desk to take over" : "Asked the desk to rotate";
+    if (gone >= ROTATE_WAIT_MS) {
+      return { rec: next, phase: "takeover", button: TAKEOVER_LABEL,
+               words: (next.kind === "takeover" ? "No new desk was seen " : "No rotation was seen ") + wait + " min after you asked." };
+    }
+    return { rec: next, phase: "waiting", button: null,
+             words: asked + (mins < 1 ? " just now" : " " + mins + " min ago") + ". If it is not seen by " + wait + " min, Take over is offered." };
   }
 
   // One event the desk (or its script) filed back, as the words to draw. The kinds are the port's: took, held, reply.
@@ -427,6 +464,28 @@
       saveThreads();
     }
 
+    // The ask Rotate Desk (or Take over) made, kept in this tab's storage beside the lines it sent: {at, holder, wentNone, kind}. What it
+    // is, and when it ends, is rotateView's. `pendingOpen` is which sheet this view opened and has not yet seen delivered.
+    function validRot(r) {
+      return !!r && typeof r === "object" && typeof r.at === "number" && isFinite(r.at) && (r.kind === "rotate" || r.kind === "takeover") &&
+        (r.holder === null || typeof r.holder === "string") && typeof r.wentNone === "boolean";
+    }
+    var rotRec = (function () { var r = kept("levain.desk.rotate"); return validRot(r) ? r : null; })(), pendingOpen = null;
+    function nowMs() { return typeof opts.now === "function" ? opts.now() : Date.now(); }
+    // A signed drop the cockpit's sheet delivered, and what it said: counted as an ask only when this view opened that sheet for it, the
+    // words still begin with the marker that button handed over, and it was signed. A drop sent as words only is said not to count.
+    function onDelivered(ev) {
+      if (stopped || !pendingOpen || !current || current.kind !== "wired" || current.lease.state !== "held") return;
+      var d = ev && ev.detail, w = d && typeof d.words === "string" ? d.words.trim().split(/\s+/)[0].toLowerCase() : "";
+      if (w !== (pendingOpen === "rotate" ? ROTATE_MARK : DESK_WORDS.split(" ")[0])) return;
+      if (d.signed !== true) { startNote = UNSIGNED_WORDS; noteFor = "held"; lastKey = ""; draw(); return; }
+      rotRec = { at: nowMs(), holder: current.lease.holder, wentNone: false, kind: pendingOpen };
+      keep("levain.desk.rotate", rotRec);
+      pendingOpen = null; startNote = "";
+      lastKey = ""; draw();
+    }
+    doc.addEventListener(DELIVERED_EVENT, onDelivered);
+
     // The line under the box is SHARED with the dock (mic.js writes its dictation errors, Setup sentences and the insecure-context
     // words to the same element), so the view writes it only where it has its own words to say (as the Room does), never on a
     // repaint: a repaint would wipe the dock's.
@@ -510,14 +569,19 @@
       var all = rows();
       // what the desk button said is true of the moment it was said: a lease that is no longer in the state it was said in takes it down
       if (!(current && current.kind === "wired" && current.lease.state === noteFor)) startNote = "";
-      var key = JSON.stringify([current, all, unreadableNow(), note, startNote]);
+      var rot = null;
+      if (current && current.kind === "wired") {
+        rot = rotateView(rotRec, current.lease, nowMs());
+        if (JSON.stringify(rot.rec) !== JSON.stringify(rotRec)) { rotRec = rot.rec; keep("levain.desk.rotate", rotRec); }
+      }
+      var key = JSON.stringify([current, all, unreadableNow(), note, startNote, rot && [rot.phase, rot.words, rot.button]]);
       if (key === lastKey) { paintDock(); return; }
       var stick = wasEnd || atEnd();
       clear(bar);
       if (current && current.kind === "wired") {
         bar.className = "dv-state dv-lease-" + current.lease.state;
         var hasSheet = !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function";
-        var canStart = current.lease.state === "none" && hasSheet, canRotate = current.lease.state === "held" && hasSheet;
+        var canStart = current.lease.state === "none" && hasSheet, canRotate = current.lease.state === "held" && hasSheet && !!rot.button;
         // the pointer to New Desk is drawn only when the button below is
         bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words + (canStart && current.lease.startHint ? current.lease.startHint : ""))));
         if (current.lease.state === "held" && current.context) {
@@ -532,21 +596,29 @@
           }
           bar.appendChild(box);
         }
+        if (current.lease.state === "held" && rot.words) { var rn = el(doc, "div", "rv-note dv-rotatenote", rot.words); rn.setAttribute("role", "status"); bar.appendChild(rn); }
         if (canStart || canRotate) {
-          var st = el(doc, "button", "dv-start", canRotate ? ROTATE_LABEL : NEW_LABEL), state = current.lease.state;
+          // which sheet the button opens: a new desk, a rotation request, or the /fanin takeover
+          var mode = canStart ? "new" : (rot.button === TAKEOVER_LABEL ? "takeover" : "rotate");
+          var st = el(doc, "button", "dv-start", canStart ? NEW_LABEL : rot.button), state = current.lease.state;
           st.setAttribute("type", "button");
-          st.setAttribute("title", (canRotate ? "Open the signing sheet to ask for a fresh desk to replace this one: " : "Open the signing sheet to start a desk: ") + DESK_WORDS);
-          st.setAttribute("aria-label", canRotate ? "Rotate the desk (opens the signing sheet)" : "Start a new desk (opens the signing sheet)");
+          st.setAttribute("title", mode === "new" ? "Open the signing sheet to start a desk: " + DESK_WORDS
+            : mode === "takeover" ? "Open the signing sheet to ask for a fresh desk to take this one over: " + DESK_WORDS
+            : "Open the signing sheet to ask this desk to rotate: " + ROTATE_WORDS);
+          st.setAttribute("aria-label", mode === "new" ? "Start a new desk (opens the signing sheet)"
+            : mode === "takeover" ? "Take over the desk (opens the signing sheet)" : "Rotate the desk (opens the signing sheet)");
           st.addEventListener("click", function () {
             var S = root.LevainSignSheet, got = null;
-            try { got = S && S.openDrop(DESK_WORDS); } catch (e) { got = null; }
-            startNote = got ? (state === "held" ? ROTATE_OPEN_WORDS : START_OPEN_WORDS) : (state === "held" ? ROTATE_REFUSED_WORDS : START_REFUSED_WORDS);
+            try { got = S && S.openDrop(mode === "rotate" ? ROTATE_WORDS : DESK_WORDS); } catch (e) { got = null; }
+            pendingOpen = got && mode !== "new" ? mode : null;
+            startNote = got ? (mode === "new" ? START_OPEN_WORDS : mode === "takeover" ? TAKEOVER_OPEN_WORDS : ROTATE_OPEN_WORDS)
+              : (mode === "new" ? START_REFUSED_WORDS : mode === "takeover" ? TAKEOVER_REFUSED_WORDS : ROTATE_REFUSED_WORDS);
             noteFor = state;
             lastKey = ""; draw();
           });
           bar.appendChild(st);
-          if (startNote) { var sn = el(doc, "div", "rv-note dv-startnote", startNote); sn.setAttribute("role", "status"); bar.appendChild(sn); }
         }
+        if (startNote) { var sn = el(doc, "div", "rv-note dv-startnote", startNote); sn.setAttribute("role", "status"); bar.appendChild(sn); }
         if (current.lease.drop) {
           var go = el(doc, "button", "dv-droplink", "Open the signed Drop");
           go.setAttribute("type", "button");
@@ -718,6 +790,7 @@
         if (vdock) vdock.destroy();
         var T = vt(); if (T) T.end();
         doc.removeEventListener("visibilitychange", onVisible);
+        doc.removeEventListener(DELIVERED_EVENT, onDelivered);
         body.removeEventListener("scroll", onBodyScroll);
         if (vv) {
           vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport);
@@ -732,7 +805,8 @@
 
   var api = {
     deskModel: deskModel, leaseModel: leaseModel, contextModel: contextModel, eventModel: eventModel, mergeEvents: mergeEvents, isSettled: isSettled, sendOutcome: sendOutcome, filedNote: filedNote,
-    pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount,
+    pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount, rotateView: rotateView,
+    ROTATE_WORDS: ROTATE_WORDS, DESK_WORDS: DESK_WORDS, ROTATE_WAIT_MS: ROTATE_WAIT_MS, STALL_AGE_S: STALL_AGE_S,
     POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, ARRIVED_WORDS: ARRIVED_WORDS, NOT_ARRIVED_WORDS: NOT_ARRIVED_WORDS,
     HOSTILE_SOURCE: HOSTILE.source
   };

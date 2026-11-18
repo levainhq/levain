@@ -1206,7 +1206,7 @@
       else say(msg, plain || (e && e.taken) ? "ok" : "bad");
       // the server accepted this drop (a 2xx): the message names the exact words it accepted, so the cockpit's box lets go of
       // them only when it still holds those very words
-      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true, words: req.words } : null);
+      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true, words: req.words, signed: !plain && !!(e && e.taken) } : null);
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
