@@ -710,3 +710,64 @@ def test_a_real_launch_record_in_a_scratch_desk_store_maps_the_durable_key_to_a_
         ba._desk_seat_of(tmp_path / "absent")(key)                  # a store that cannot be read is "not checked", said
     c = verdict(sc, item(3), sc.c["seat"], ba.Resolvers(None, ba._desk_seat_of(qdir)))     # Board-Seat slot-key-77: no such launch
     assert c.tier == "git" and "maps to no launch record" in c.note
+
+
+def test_a_path_through_an_ancestor_directory_symlink_is_the_literal_path_no_commit_added_it(sc):
+    """``dirlink/f.txt`` with ``dirlink -> realdir``: git tracks ``dirlink`` as a link, never ``dirlink/f.txt``. The literal
+    path is computed lexically; the disk's target is not followed (levain#103, L3 p4 r2)."""
+    sc.commit("adds realdir2", "Target Person", T1, files={"realdir2/f.txt": "1"})
+    link = sc.repo / "dirlink2"
+    link.symlink_to(sc.repo / "realdir2")
+    try:
+        sc.commit("adds dirlink2", "Link Person", T1)
+        _republish(sc)
+        c = verdict(sc, item(8, "document", "dirlink2/f.txt"), "dirlink2/f.txt")
+        direct = verdict(sc, item(8, "document", "dirlink2"), "dirlink2")
+    finally:
+        link.unlink()
+        sc.commit("removes dirlink2", "Link Person", T1)
+        _republish(sc)
+    assert (c.tier, c.who, c.how) == ("unattributed", None, ba.NOT_ON_MAIN)
+    assert direct.who == "Link Person"
+
+
+def test_a_file_under_a_submodule_has_no_superproject_add_but_the_gitlink_does(sc):
+    import shutil
+    sub = sc.repo / "subm2"
+    sub.mkdir()
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+    subprocess.run(["git", "-C", str(sub), "init", "-q", "-b", "main"], check=True, capture_output=True, env=env)
+    (sub / "inner.txt").write_text("i")
+    subprocess.run(["git", "-C", str(sub), "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=S", "-c", "user.email=s@s", "commit", "-q", "-m", "sub"],
+                   check=True, capture_output=True, env=env)
+    try:
+        added = sc.commit("adds subm2", "Sub Adder", T1)
+        _republish(sc)
+        inner = verdict(sc, item(8, "document", "subm2/inner.txt"), "subm2/inner.txt")
+        link = verdict(sc, item(8, "document", "subm2"), "subm2")
+    finally:
+        sc.git("rm", "-q", "--cached", "subm2")
+        shutil.rmtree(sub)
+        sc.commit("removes subm2", "Sub Adder", T1)
+        _republish(sc)
+    assert (inner.tier, inner.how) == ("unattributed", ba.NOT_ON_MAIN)
+    assert (link.who, link.commit) == ("Sub Adder", added)
+
+
+def test_a_key_ending_in_dotdot_is_normalised_lexically_not_a_bad_pathspec(sc):
+    c = verdict(sc, item(6, "document", "docs/sub2/.."), "docs/sub2/..")
+    assert (c.who, c.commit) == ("Doc Person", sc.c["doc"])           # docs/sub2/.. is docs (the directory a.md is in)
+    assert verdict(sc, item(6, "document", "docs/a.md/.."), "x").who == "Doc Person"
+    whole = verdict(sc, item(6, "document", "docs/.."), "x")
+    assert (whole.tier, whole.how) == ("unattributed", "unattributed: the path is the repo's whole work tree")
+    assert verdict(sc, item(6, "document", "../outside_it"), "x").how == OUTSIDE_TEXT
+
+
+def test_a_repo_reached_through_a_symlinked_path_with_key_dot_is_the_whole_work_tree_not_outside(sc, tmp_path):
+    via = tmp_path / "via_link"
+    via.symlink_to(sc.repo)
+    c = ba.closer_of_item(via, item(8, "document", "."), "x", FULL(sc))
+    assert (c.tier, c.how) == ("unattributed", "unattributed: the path is the repo's whole work tree")
+    d = ba.closer_of_item(via, item(6, "document", "docs/a.md"), "x", FULL(sc))
+    assert (d.who, d.commit) == ("Doc Person", sc.c["doc"])
