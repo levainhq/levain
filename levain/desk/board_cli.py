@@ -191,6 +191,10 @@ def register(subparsers: Any) -> None:
                    help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
     author_args(u)
     u.set_defaults(func=run_use)
+    # the desk's door opens these, each where it is defined (install.DESK_BOARD_VERBS is the same list, for its allow rules)
+    from levain.desk.door import door_ok_author
+
+    door_ok_author(p, a, m, d, u)
     br.register_cli(sub, author_args, _author, items_help, _seal, source_args, _relay)
     from levain.desk import board_context       # imported here: board_context reads this module's helpers
     board_context.register(sub)

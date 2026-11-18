@@ -2,8 +2,11 @@
 
 np-6843ca07 (a), signed, and the head's 1021-18 rulings: a command run from inside the desk's workspace is
 DEFAULT-DENY. A command is refused, in every tree, unless its own parser was marked :func:`door_ok` where the verb is
-defined, and every write it does run goes ``--by desk`` under its lease token (an operator write is unfenced,
-so a session that lost its lease could otherwise still write). A verb with no mark (or marked :func:`not_door`) is
+defined. On a verb whose ``--by`` names a ROLE (the coord verbs) a write goes ``--by desk`` under its lease token (an
+operator write is unfenced, so a session that lost its lease could otherwise still write). A verb marked
+:func:`door_ok_author` (the board and charter verbs the desk brief names) is opened without that check: its ``--by`` is
+the record's author name, and the authority on that write is the writer's (the author record and its policy), never
+the door's. A verb with no mark (or marked :func:`not_door`) is
 refused there: the mark rides in the parsed arguments, so a new verb or tree needs no second list to be covered, and
 :func:`door_paths` derives the open paths from the parser.
 
@@ -25,7 +28,8 @@ command: the door cannot tell any directory is not the desk's. No database is re
 no store state (locked,
 corrupt, another store) can open the door. Consequences, accepted: the operator running ``levain`` from inside that
 workspace is doored too (it is Levain's directory, not his), and an agent that changes directory out of it leaves the
-door (the door is fencing for an honest desk; the lease token still fences every write).
+door (the door is fencing for an honest desk; the lease token still fences every write of a role verb, and a board
+write answers to its author record).
 
 :func:`refusal` is called once, from ``levain.cli.main``, after argument parsing. The hooks and Levain's MCP servers
 are other entry points and never reach it. This is not a boundary against a hostile process of the same user: such a
@@ -47,6 +51,8 @@ from levain.desk.legacy import RECORD_KEY_WORKSPACES, RECORD_NAME_WORKSPACES, RO
 # desk may run, ``not_door(leaf)`` marks one it may not, and a leaf marked neither is refused (default-deny).
 # Never `team record` / `retire` / `draft promote`: the ledger is signed by the operator.
 DOOR_DEST = "door"
+# "author" on a leaf whose --by is the record's author name, not a role: the door does not judge --by there
+DOOR_BY_DEST = "door_by"
 
 
 def _declare(parsers: tuple[argparse.ArgumentParser, ...], value: bool) -> None:
@@ -58,9 +64,17 @@ def _declare(parsers: tuple[argparse.ArgumentParser, ...], value: bool) -> None:
 
 
 def door_ok(*parsers: argparse.ArgumentParser) -> None:
-    """Declare each leaf parser a verb the desk's door lets run (a write still goes --by desk, under
-    its lease token)."""
+    """Declare each leaf parser a verb the desk's door lets run (a write whose --by names a role still goes --by desk,
+    under its lease token)."""
     _declare(parsers, True)
+
+
+def door_ok_author(*parsers: argparse.ArgumentParser) -> None:
+    """Declare each leaf parser a verb the desk's door lets run whose ``--by`` (if any) names the record's AUTHOR, not a
+    role (the board and charter verbs): the door does not judge ``--by`` on it; the writer judges the authority."""
+    _declare(parsers, True)
+    for p in parsers:
+        p.set_defaults(**{DOOR_BY_DEST: "author"})
 
 
 def not_door(*parsers: argparse.ArgumentParser) -> None:
@@ -483,9 +497,9 @@ def refusal(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str | 
     if getattr(args, DOOR_DEST, False) is not True:
         return (f"{words}: `{words}` is the operator's, and this is the desk's workspace ({ws}); run it "
                 "from your own terminal, outside it")
-    if getattr(args, "by", ROLE_DESK) != ROLE_DESK:
-        return (f"{words}: inside the desk's workspace ({ws}) a write goes --by desk --token N, "
-                "never as the operator")
+    if getattr(args, DOOR_BY_DEST, None) != "author" and getattr(args, "by", ROLE_DESK) != ROLE_DESK:
+        return (f"{words}: inside the desk's workspace ({ws}) this verb's --by names a role: it goes --by desk "
+                "--token N, never as the operator")
     return None
 
 

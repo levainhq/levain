@@ -631,3 +631,6 @@ def register(sub: Any) -> None:
                    help="This install runs no land waiter (as `levain board state --no-land-waiter`): waiters are then declared absent.")
     p.add_argument("--now", metavar="ISO", help="Judge at this instant (default: the clock).")
     p.set_defaults(func=run_context)
+    from levain.desk.door import door_ok_author
+
+    door_ok_author(p)     # the desk brief's read; opened where it is defined

@@ -119,6 +119,10 @@ class DropConflict(CoordError):
     """An ``outbox_id`` already stored for different words or another surface: never a silent overwrite."""
 
 
+class _DryRun(Exception):
+    """Rolls back a transaction that ran a request's checks only (:meth:`CoordStore.launch_request`)."""
+
+
 def _append_only(table: str, what: str) -> tuple[str, ...]:
     return (f"CREATE TRIGGER IF NOT EXISTS {table}_frozen BEFORE UPDATE ON {table} "
             f"BEGIN SELECT RAISE(ABORT, '{what} is append-only'); END",
@@ -1240,31 +1244,60 @@ class CoordStore:
         """Ask for a launch under ``token``. ``attach_item`` is the v2 claim (T7): the board item id the launch is
         started for is written on the launch record (``launch_board_items``, read as ``Launch.board_items``), in this
         same transaction, so a malformed id refuses the whole request and leaves no launch. The v1 ready queue is
-        not read or written. A worker's close protocol (T10) is taken from its repository's mode in the registry at this
-        moment and written on the record when it is not ``legacy`` (:func:`levain.desk.board_registry.launch_protocol`):
-        a worker on a ``tracking`` or ``aborting`` repository is refused unless it carries that ceremony's ``migration`` id."""
+        not read or written. A worker's close protocol (T10) is taken from its repository's mode in the registry
+        (:func:`levain.desk.board_registry.launch_protocol`, which also refuses a locked repository, a tracked one with no
+        item and a directory outside the item's repository) and written on the record when it is not ``legacy``. That read
+        and the launch record are one decision: the registry's stamp it was read under is compared again inside the launch's
+        own transaction, and any change refuses the launch (ask again). A refused request writes nothing anywhere: the lease
+        and request checks run first, in a transaction rolled back, before ``register_for_launch`` may write the registry."""
         from levain.desk import board_registry, lease
 
         # a malformed claim is refused first, before the board registry is written to (W4): the check reads no store
         if attach_item is not None:
             lease.check_board_items([attach_item])
-        # I5: once the board registry is active, a seat is never launched in a repo it does not list. A launch the lease will
-        # refuse for its shape alone (a worker asking for several threads) registers nothing: the refusal below is side-effect free.
-        threads = tuple(threads)                    # one pass over a one-shot iterable: the count below and the lease read the same threads
-        # Lock order: register_for_launch takes and RELEASES the board store lock here, before the launch DB transaction
-        # (`self._write()` below) begins; the store lock is never taken inside that transaction.
-        if cwd and not (role == "worker" and len(threads) > 1):
+        threads = tuple(threads)                    # one pass over a one-shot iterable: every check below reads the same threads
+
+        judged = role == "worker" and bool(cwd)     # only a worker's launch takes a close protocol from the registry
+
+        def decide() -> tuple[str, str | None, Any]:
+            if not judged:
+                return "legacy", None, None
             try:
-                board_registry.register_for_launch(cwd)
+                before = board_registry.registry_stamp()
+                protocol, carried = board_registry.launch_protocol(cwd, migration, item=attach_item)
+                after = board_registry.registry_stamp()
+            except (board_registry.BoardError, OSError, ValueError) as exc:
+                raise CoordError(f"launch refused: {exc}") from None
+            if before != after:
+                raise CoordError("launch refused: the board registry changed while this launch read it; ask again")
+            return protocol, carried, after
+
+        protocol, carried, stamp = decide()
+        # I5: once the board registry is active, a seat is never launched in a repo it does not list. Lock order:
+        # register_for_launch takes and RELEASES the board store lock here, before the launch DB transaction begins; the
+        # store lock is never taken inside that transaction (the stamp check there reads no lock). It runs only after the
+        # same request has passed every lease and request check, in a transaction that is then rolled back.
+        if cwd:
+            try:
+                with self._write() as (conn, now):
+                    lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
+                                         cwd=cwd, role_ref=role_ref)
+                    raise _DryRun
+            except _DryRun:
+                pass
+            try:
+                wrote = board_registry.register_for_launch(cwd)
             except board_registry.BoardError as exc:
                 raise CoordError(f"launch refused: {cwd} could not be registered on the board registry: {exc}") from None
-        protocol, carried = "legacy", None
-        if role == "worker" and cwd and len(threads) <= 1:
+            if wrote:
+                protocol, carried, stamp = decide()
+        with self._write() as (conn, now):
             try:
-                protocol, carried = board_registry.launch_protocol(cwd, migration)
+                moved = judged and board_registry.registry_stamp() != stamp
             except board_registry.BoardError as exc:
                 raise CoordError(f"launch refused: {exc}") from None
-        with self._write() as (conn, now):
+            if moved:
+                raise CoordError("launch refused: the board registry changed while this launch was decided; ask again")
             ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
                                       cwd=cwd, role_ref=role_ref)
             if protocol != "legacy":

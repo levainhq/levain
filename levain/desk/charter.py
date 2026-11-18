@@ -490,6 +490,9 @@ def register(subparsers: Any) -> None:
     p.add_argument("--items", type=Path, metavar="PATH", help="The board items store; when given, plan and criterion ids are checked against it.")
     p.add_argument("--json", action="store_true", help="Print the result as JSON.")
     p.set_defaults(func=run_check)
+    from levain.desk.door import door_ok_author
+
+    door_ok_author(p)     # the desk's door opens check and init, each where it is defined
     q = sub.add_parser(
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
@@ -501,3 +504,4 @@ def register(subparsers: Any) -> None:
                    help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out-of-1.0.")
     q.add_argument("--stdout", action="store_true", help="Print the skeleton instead of writing it.")
     q.set_defaults(func=run_init)
+    door_ok_author(q)

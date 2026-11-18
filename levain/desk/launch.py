@@ -571,15 +571,21 @@ def _board_modes_section(lv: str) -> list[str]:
         f"ceremony's migration id (`{lv} coord spawn --migration M`).",
         "",
         "These are `board` and `charter` verbs, not `coord` verbs, and you run them yourself: your door opens exactly "
-        "the ones named below, each in its full form, and no other. A write's authority is checked by the writer, not "
-        "by the door: a decision needs the operator's signature or a relayed answer of his.",
+        "the ones named below, and no other. On them `--by` names the record's author (you write `--by desk`) and "
+        "they take no `--token`. A write's authority is checked by the writer, not by the door: a decision needs the "
+        "operator's signature or a relayed answer of his.",
         "",
         f"- read: `{lv} board state`, `{lv} board repos`, `{lv} board context NAME#N`;",
-        f"- an item: `{lv} board add --key M:K ...`, `{lv} board amend`, `{lv} board decide`;",
-        f"- the store and a repository: `{lv} board use DIR`, `{lv} board register`;",
-        f"- a charter: `{lv} charter init NAME`, `{lv} charter check`;",
-        f"- the mode: `{lv} board begin-track`, `{lv} board track`, `{lv} board abandon-track`, "
-        f"`{lv} board abandon-done`, `{lv} board untrack`.",
+        f"- an item: `{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --by desk`, "
+        f"`{lv} board amend --id NAME#N --why \"...\" --by desk`, "
+        f"`{lv} board decide --id NAME#N --decision DECISION --words \"his words\" --by desk`;",
+        f"- the store and a repository: `{lv} board use DIR`, `{lv} board register NAME --path DIR --words \"his words\" "
+        "--by desk`;",
+        f"- a charter: `{lv} charter init NAME --repo DIR`, `{lv} charter check --repo DIR`;",
+        f"- the mode: `{lv} board begin-track NAME --manifest FILE --words \"his yes\" --by desk`, "
+        f"`{lv} board track NAME --migration M --words \"his yes\" --by desk`, "
+        f"`{lv} board abandon-track NAME --words \"his words\" --by desk`, `{lv} board abandon-done NAME --by desk`, "
+        f"`{lv} board untrack NAME --words \"his words\" --by desk`.",
         "",
         "Tracking a repository starts when the operator says so, in conversation. Never begin it on your own reading, and "
         "write nothing before his yes. In this order:",
@@ -604,7 +610,8 @@ def _board_modes_section(lv: str) -> list[str]:
         "6. Write one `decision` episode tagged `repo:NAME`, naming the charter blob, the item count and the record "
         "directory.",
         "",
-        "A worker you launch for an item gets the five rules of the board in its own brief: run `board context` first, "
+        f"A worker for an item is launched with `{lv} coord spawn ... --item NAME#N`; a worker on a tracked repository is "
+        "refused without it. It gets the five rules of the board in its own brief: run `board context` first, "
         "`Board-Item` on every commit, `Board-Closes` on the commit that meets the DONE line, `Board-Seat` with its key on "
         "every closing commit, and episodes tagged `repo:NAME` and `item:NAME#N`.",
         "",
@@ -638,37 +645,48 @@ def desk_command(install: Path | str | None) -> str:
 
 
 def _board_item_section(launch: Any) -> list[str]:
-    """The worker brief's section for a launch started for board items (``launch.board_items``): the five rules of the
-    brief (design 6, "The brief (T10)"). Empty for a launch that claimed none. The brief carries no copy of an item's
-    context: ``levain board context`` is the one source. The ids are checked against the board's id shape at the claim, and are
-    marked here all the same."""
-    items = launch.board_items
-    if not items:
+    """The worker brief's board section: for a launch started for board items (``launch.board_items``) the five rules of
+    the brief (design 6, "The brief (T10)"), and for any launch whose protocol is not ``legacy`` the close it is judged
+    by. Empty for a legacy launch that claimed none. The brief carries no copy of an item's context: ``levain board
+    context`` is the one source. The commands are spelled with this interpreter (:func:`levain.install.desk_levain`): a
+    worker runs in its own repository, not in a desk install. The ids are checked against the board's id shape at the
+    claim, and are marked here all the same."""
+    from levain.install import desk_levain
+
+    items = launch.board_items or ()
+    if not items and launch.protocol == "legacy":
         return []
     key = unshowable.mark(launch.session_key, allow="")
-    lv = desk_command(launch.cwd)
+    lv = desk_levain(sys.executable)
     ids = [unshowable.mark(i, allow="") for i in items]
     many = len(ids) > 1
     each = " (for each item you touch)" if many else ""
-    first = ids[0] if not many else "NAME#N"
-    repo = ids[0].partition("#")[0] if not many else "NAME"
+    first = ids[0] if len(ids) == 1 else "NAME#N"
+    repo = ids[0].partition("#")[0] if len(ids) == 1 else "NAME"
     lines = [
         "## Your board item" + ("s" if many else ""),
         "",
-        f"Levain started you for {', '.join(f'`{i}`' for i in ids)} on the work board. Five rules, in this order:",
-        "",
-        *([f"- Run `{lv} board context {i}` before anything else." for i in ids] if not many else
-          [f"- Run `{lv} board context NAME#N` for each of {', '.join(f'`{i}`' for i in ids)} before anything else."]),
-        "  That command is the one source of the item's context: its charter, the operator's words, its DONE line, its "
-        "record. This brief carries no copy of it.",
-        f"- Every commit you make carries the trailer `Board-Item: {first}`{each}.",
-        f"- The commit that meets the item's DONE line also carries `Board-Closes: {first}`.",
-        f"- Every closing commit also carries `Board-Seat: {key}`, your durable key.",
-        f"- Write each decision and each handoff as an episode tagged `repo:{repo}` and `item:{first}`, with source `{key}`.",
-        "",
+    ]
+    if ids:
+        lines += [
+            f"Levain started you for {', '.join(f'`{i}`' for i in ids)} on the work board. Five rules, in this order:",
+            "",
+            *([f"- Run `{lv} board context {i}` before anything else." for i in ids] if not many else
+              [f"- Run `{lv} board context NAME#N` for each of {', '.join(f'`{i}`' for i in ids)} before anything else."]),
+            "  That command is the one source of the item's context: its charter, the operator's words, its DONE line, its "
+            "record. This brief carries no copy of it.",
+            f"- Every commit you make carries the trailer `Board-Item: {first}`{each}.",
+            f"- The commit that meets the item's DONE line also carries `Board-Closes: {first}`.",
+            f"- Every closing commit also carries `Board-Seat: {key}`, your durable key.",
+            f"- Write each decision and each handoff as an episode tagged `repo:{repo}` and `item:{first}`, with source `{key}`.",
+            "",
+        ]
+    else:
+        lines += ["Levain started you for no board item (none was claimed on your launch, or its claim cannot be read).", ""]
+    lines += [
         f"Your launch is recorded as `{launch.protocol}`: " + (
             "a tracked repository has no `## ▶ CURRENT STATE` block to rewrite, so your close is an episode for each item "
-            "you touched, written after you started, plus a closing trailer or `levain board amend --done` naming what "
+            f"you touched, written after you started, plus a closing trailer or `{lv} board amend --done` naming what "
             "remains." if launch.protocol == "tracked" else
             "you close the way the repository's old memory does, and when the repository has since become tracked, the "
             "tracked close is accepted too."),
@@ -809,7 +827,8 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by desk --token N {tail}`;",
         f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
         f"- ask for a worker on a WORK thread: `{lv} coord spawn --thread ID --role @spawn/NAME --cwd DIR "
-        f"--slot NAME=VALUE --token N {tail}`; it runs outside your workspace, and `coord status` lists it.",
+        f"--slot NAME=VALUE --token N {tail}`, plus `--item NAME#N` when it is for a board item (on a tracked repository "
+        "it must be); it runs outside your workspace, and `coord status` lists it.",
         "",
         "## The seats' questions (you read them first)",
         "",
