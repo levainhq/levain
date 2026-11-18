@@ -117,7 +117,9 @@ def register(subparsers: Any) -> None:
         parser.add_argument("--sign", action="store_true",
                             help="Sign this record with the operator's Touch ID key (needs --author-kind operator, a fresh terminal, "
                                  "a terminal key and the authority log that enrols it; the record is verified against that log before it is "
-                                 "written). The lock is held while the prompt is up; a refused prompt writes nothing.")
+                                 "written). No lock is held while the prompt is up: a write that lands on the store meanwhile "
+                                 "makes the signed write refuse (\"the board changed while you signed: sign again\") and nothing is "
+                                 "written; run it again to sign afresh. A refused prompt writes nothing.")
         parser.add_argument("--author-kind", dest="author_kind", choices=bs.AUTHOR_KINDS, default="agent",
                             help="Who writes: an operator or an agent (default agent). The name is --by.")
         parser.add_argument("--launch-key", dest="launch_key", default=None, metavar="KEY",
