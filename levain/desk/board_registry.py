@@ -909,7 +909,7 @@ def _unsettled_items(target: bs.Target, cur: rf.Repo) -> tuple[list[str], str]:
 
 def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
             now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
-    """Leave tracked mode (a forward act). Refuses while the repo has an item that is not done, cut or parked."""
+    """Leave tracked mode (a forward act). Refuses while the repo has an item that is not done, cut, parked or out of 1.0."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
@@ -919,7 +919,7 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
         raise BoardError(f"{name} is {cur.mode}: untrack needs a tracked repo")
     open_ids, digest = _unsettled_items(target, cur)
     if open_ids:
-        raise BoardError(f"untrack {name} refused: items not done, cut or parked: {', '.join(open_ids[:20])}"
+        raise BoardError(f"untrack {name} refused: items not done, cut, parked or out of 1.0: {', '.join(open_ids[:20])}"
                          f"{' ...' if len(open_ids) > 20 else ''}; decide each one first")
 
     def build(fold, sid, raw):

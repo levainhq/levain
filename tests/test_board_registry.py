@@ -678,7 +678,7 @@ def test_untrack_refuses_while_an_item_is_not_done_cut_or_parked(decision_seal, 
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
     rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
-    assert rc == 2 and f"items not done, cut or parked: {iid}" in err
+    assert rc == 2 and f"items not done, cut, parked or out of 1.0: {iid}" in err
     ok(capsys, "decide", "--id", iid, "--decision", "out-of-1.0", "--words", "later", *A)
     assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "untracked alpha"
     assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "already untracked alpha"
@@ -1327,7 +1327,7 @@ def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_mi
     assert rc == 2 and "changed under the check" in err and len(reg_lines(store)) == n
     monkeypatch.setattr(br, "_unsettled_items", real)
     rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
-    assert rc == 2 and "items not done, cut or parked" in err                  # run again: now it sees the add
+    assert rc == 2 and "items not done, cut, parked or out of 1.0" in err                  # run again: now it sees the add
 
 
 def test_f4_abandon_done_rechecks_every_item_reads_cut_under_the_lock(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):
