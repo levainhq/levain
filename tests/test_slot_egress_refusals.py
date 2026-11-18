@@ -240,9 +240,22 @@ def test_a_refused_rotated_log_closes_the_current_log_it_already_opened(lw, tmp_
     # A leak ADDS a descriptor. In the shared test process another descriptor can also CLOSE while this runs, which
     # lowers a whole-process count with no leak here (CI runs 44239946556 and 44241422341: 93 before, 86 after, on the
     # shard that held this file once a new test file moved its neighbours), so compare the descriptors that APPEARED,
-    # not the length of the list.
-    before = {int(n) for n in os.listdir("/dev/fd")}
+    # not the length of the list. A descriptor is keyed by (number, device, inode), not by number alone: the kernel
+    # hands a leak the lowest free number, which can be one an earlier descriptor held (all four L3 seats found that
+    # a number-only comparison can hide a leak); the descriptor os.listdir opens to read the directory is already
+    # closed when fstat reaches it and is skipped.
+    def open_descriptors():
+        found = set()
+        for n in os.listdir("/dev/fd"):
+            try:
+                st = os.fstat(int(n))
+            except OSError:
+                continue
+            found.add((int(n), st.st_dev, st.st_ino))
+        return found
+
+    before = open_descriptors()
     for _ in range(5):
         refused(ask(lw), "egress-refusals-log")
-    leaked = {int(n) for n in os.listdir("/dev/fd")} - before
+    leaked = open_descriptors() - before
     assert not leaked, f"descriptors left open by the refused asks: {sorted(leaked)}"
