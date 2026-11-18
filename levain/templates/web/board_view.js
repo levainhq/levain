@@ -2,7 +2,7 @@
 //
 // The audit window over the desk's work: DERIVED columns (unknown, backlog, ready, running, waiting, needs-you, done) from a
 // board value (levain's own, or a provider's of the same shape). The panel lists the cards grouped under those column headings;
-// the six columns side by side are drawn (by renderBoard) in the panel's ⤢ focus modal. Read-only: no drag, no edit, no rename.
+// the columns side by side are drawn (by renderBoard) in the panel's ⤢ focus modal. Read-only: no drag, no edit, no rename.
 // Each card shows its journal line (who moved it, when, why). The one way to talk about a card is a drop: every card carries a
 // "Drop about this card" button that puts `About card <id> (<title>): ` in the cockpit's drop box (no route of its own here).
 // Every word from the record is set with textContent, never as markup.
@@ -156,7 +156,7 @@
     return t;
   }
 
-  // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
+  // The needs-you column's one sentence: said by the grouped tab and the columns alike, so the two cannot drift.
   function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
 
   // The queue's own state, said before any column (shared by the grouped tab and the modal's columns).

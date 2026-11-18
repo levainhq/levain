@@ -8,7 +8,8 @@ never folded into another; ``off`` (cut, parked, out of 1.0) is a COUNT (``off_c
 with no board store yet reads the desk's dispatch queue as before (C13's ``list(all=True)`` items, each with its last journal
 record), and its ``unknown`` column is empty. The needs-you column IS the Q17-ALL band's open items, read through
 ``levain.band_view``'s own read-only snapshot and its allocated numbers (a number not yet allocated reads ``None``: a look
-never numbers an item). A source that cannot be read is named in ``unreadable``, never shown as an empty column; a store
+never numbers an item). Known edge: the board's own ``audit`` (landed-not-closed, expired gates, unattributed work) is not carried
+here, and neither the List nor this board draws it: ``levain board state`` is where it shows. A source that cannot be read is named in ``unreadable``, never shown as an empty column; a store
 never made is ``queue: "none"`` ("no queue yet"). ``build`` never raises."""
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import argparse
 import copy
 import threading
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ TEXT_MAX = 1000        # the kernel's board validator refuses a longer card fiel
 CATEGORIES = ready.CATEGORIES
 COLUMNS = (UNKNOWN, *CATEGORIES)        # the columns a board value can carry, in drawing order: unknown first (v2 draws it above the rest),
                                          # and only while it holds a card: an empty unknown column is left out, so a board with nothing unplaced draws as it did
+CARDS_MAX = 2000       # the kernel's board validator refuses a board of more cards (engine.BOARD_CARDS_MAX; one test pins them equal)
 BAND_HINT = "levain band"
 NO_QUEUE = "no queue yet"
 _WHAT_MAX = 300
@@ -78,21 +80,17 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
     return card
 
 
-# A repo's git evidence is ~99% of a board build (a real two-repo install: ~5.5 s of ~5.6 s; the panel is read on every
-# cockpit poll, 30 s), so it is kept while the repo's refs have not moved. NOT a time-only TTL: the key is every ref and sha
-# (`for-each-ref`), the stamps of FETCH_HEAD / packed-refs / config in the git dir and the common dir (fetched_at, the repo's
-# shallow/partial flags), and the read's own arguments. Everything else the board derives (items, the registry, seats, the
-# band, waiters, documents) is read live on every build, so a card never waits for a cache. One entry per repo path.
+# A repo's git evidence is nearly all of a board build, so it is kept while the repo's refs have not moved. NOT a time-only TTL:
+# the key is every ref and sha (`for-each-ref`), the stamps (size + mtime_ns) of FETCH_HEAD / packed-refs / shallow in the git
+# dir and the common dir, every config file git reads for the repo (`board_evidence.config_stamp`), and the read's own arguments
+# (`since` among them). Everything else the board derives (items, the registry, seats, the band, waiters, documents) is read
+# live on every build, so a card never waits for a cache. One entry per repo path. A read that could not answer in full
+# (any `unreadable`) is never kept: it is retried by the next build. One build per repo at a time (single flight): a build
+# that arrives during another waits for it and takes its result from the cache. How often the panel is read is the panel
+# refresher's own interval (grep `board=` in levain/web_server.py), not stated here.
 _EVIDENCE_CACHE: dict[str, tuple[Any, Any, Any]] = {}
 _EVIDENCE_LOCK = threading.Lock()
-
-
-def _stamp(path: Path) -> tuple[int, int] | None:
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (st.st_size, st.st_mtime_ns)
+_BUILD_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _refs_state(repo: Path) -> Any:
@@ -101,11 +99,19 @@ def _refs_state(repo: Path) -> Any:
 
     try:
         refs = be._git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
-        dirs = [x.strip() for x in be._git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n") if x.strip()]
+        dirs, config = be.config_stamp(repo)
     except be.GitFailed:
         return None
-    stamps = tuple((d, name, _stamp(Path(d) / name)) for d in dict.fromkeys(dirs) for name in ("FETCH_HEAD", "packed-refs", "config", "shallow"))
-    return (refs, stamps)
+    stamps = tuple((d, name, be.stat_stamp(Path(d) / name)) for d in dirs for name in ("FETCH_HEAD", "packed-refs", "shallow"))
+    return (refs, stamps, config)
+
+
+def _hit(key: str, state: Any, arg_key: Any) -> Any:
+    with _EVIDENCE_LOCK:
+        hit = _EVIDENCE_CACHE.get(key)
+    if hit is not None and hit[0] == state and hit[1] == arg_key:
+        return copy.deepcopy(hit[2])
+    return None
 
 
 def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: str | None = None, **kw: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -116,16 +122,26 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
     state = _refs_state(Path(repo))
     key = str(Path(repo))
     arg_key = tuple(sorted(args.items()))
-    if state is not None:
-        with _EVIDENCE_LOCK:
-            hit = _EVIDENCE_CACHE.get(key)
-        if hit is not None and hit[0] == state and hit[1] == arg_key:
-            return copy.deepcopy(hit[2])
-    out = be.read_git_evidence(repo, **args)
-    if state is not None and _refs_state(Path(repo)) == state:      # a ref that moved while it was read is not kept
-        with _EVIDENCE_LOCK:
-            _EVIDENCE_CACHE[key] = (state, arg_key, copy.deepcopy(out))
-    return out
+    if state is None:
+        return be.read_git_evidence(repo, **args)
+    got = _hit(key, state, arg_key)
+    if got is not None:
+        return got
+    with _EVIDENCE_LOCK:
+        lock = _BUILD_LOCKS.setdefault(key, threading.Lock())
+    with lock:                                   # single flight: a second build waits here, then finds the first one's result
+        state = _refs_state(Path(repo))
+        if state is None:
+            return be.read_git_evidence(repo, **args)
+        got = _hit(key, state, arg_key)
+        if got is not None:
+            return got
+        out = be.read_git_evidence(repo, **args)
+        # kept only when it read in full, and only if nothing moved while it was read
+        if not out[0].get("unreadable") and _refs_state(Path(repo)) == state:
+            with _EVIDENCE_LOCK:
+                _EVIDENCE_CACHE[key] = (state, arg_key, copy.deepcopy(out))
+        return out
 
 
 def _v2_target(items: Path | str | None) -> Any:
@@ -154,8 +170,7 @@ def _v2_card(st: Mapping[str, Any]) -> dict[str, Any]:
     return card
 
 
-def _v2(items: Path | str | None, *, now: str | None, producers: Sequence[str] = (),
-        no_land_waiter: bool = False) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
+def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
     """``(cards, off_count, unreadable, as_of)`` from the board store, or None when there is none. ``cards`` holds every item
     the board shows but a needs-you one (the band owns that column) and an off one (counted, not drawn)."""
     from levain.desk import board_cli as bc
@@ -168,8 +183,8 @@ def _v2(items: Path | str | None, *, now: str | None, producers: Sequence[str] =
         return [], 0, [UNREADABLE_DESK], None
     if target is None:
         return None
-    args = argparse.Namespace(json=True, items=str(items) if items else None, evidence_extra=None, producers=list(producers),
-                              no_land_waiter=no_land_waiter, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
+    args = argparse.Namespace(json=True, items=str(items) if items else None, evidence_extra=None, producers=[],
+                              land_waiter=None, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
     try:
         rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence)
     except Exception:  # noqa: BLE001 - never a 500: the board is named unreadable
@@ -236,13 +251,13 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
 
 
 def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
-          drop_dir: Path | str | None = None, board_items: Path | str | None = None, producers: Sequence[str] | None = None,
-          no_land_waiter: bool | None = None) -> dict[str, Any]:
+          drop_dir: Path | str | None = None, board_items: Path | str | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], off_count, unreadable, band_hint,
     note, journal_as_of_read}``. With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
     home's own) the cards are the v2 board's, ``off_count`` counts what is cut, parked or out of 1.0 and ``store_dir`` (the
-    dispatch queue) is not read; without one this is the dispatch queue as it was and ``off_count`` is 0. For the dispatch queue: The items, the journal and the live-seat projections (``running`` cards, no journal line) come from
-    ONE read transaction (:func:`levain.desk.ready.snapshot`), so a card's journal line is never newer than its column;
+    dispatch queue) is not read; the producers and the land waiter are the store's board config, read by the same code as
+    ``levain board state``. Without a board store this is the dispatch queue as it was and ``off_count`` is 0: its items, the
+    journal and the live-seat projections (``running`` cards, no journal line) come from ONE read transaction (:func:`levain.desk.ready.snapshot`), so a card's journal line is never newer than its column;
     ``journal_as_of_read`` stays and names that the line is the record as of this read. No CI projection: Levain keeps no CI-wait
     source (flow's ``state/land_waiter`` is flow's).
 
@@ -256,7 +271,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     queue = "none"
     v2cards: list[dict[str, Any]] | None = None
     off_count = 0
-    v2 = _v2(board_items, now=generated, producers=producers or (), no_land_waiter=bool(no_land_waiter))
+    v2 = _v2(board_items, now=generated)
     if v2 is not None:
         v2cards, off_count, bad, as_of = v2
         unreadable.extend(bad)
@@ -291,8 +306,66 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
         unreadable.append(band_bad)
     by_cat["needs-you"] = band
     note = NO_QUEUE if queue == "none" else None
+    room = max(0, CARDS_MAX - sum(len(v) for c, v in by_cat.items() if c != "done"))
+    more = max(0, len(by_cat["done"]) - room)
+    if more:             # the whole board is refused past CARDS_MAX: the done column, which only grows, is what is cut
+        by_cat["done"] = by_cat["done"][:room]
+        note = (note + "; " if note else "") + f"done: [{more} more] not drawn"
     if band_bad:
         note = (note + "; " if note else "") + f"the needs-you band could not be read here; run `{BAND_HINT}`"
     return {"schema": 1, "generated": generated, "queue": queue, "unreadable": unreadable, "note": note,
             "band_hint": BAND_HINT, "journal_as_of_read": True, "off_count": off_count,
-            "columns": [{"category": c, "count": len(by_cat[c]), "cards": by_cat[c]} for c in COLUMNS if c != UNKNOWN or by_cat[c]]}
+            "columns": [{"category": c, "count": len(by_cat[c]) + (more if c == "done" else 0), "cards": by_cat[c]}
+                        for c in COLUMNS if c != UNKNOWN or by_cat[c]]}
+
+
+class Flight:
+    """One board build at a time for a host, and a bounded wait for it. ``get(fn, wait_s)`` starts ``fn`` on its own thread unless
+    one is already running, and waits at most ``wait_s`` for that build. A caller that does not get it in time is answered from
+    the last build that finished (marked ``stale``), or, with none yet, a board that says it is still being built: a request
+    never holds a slot of the host's gate for an unbounded cold read, and the build itself runs on."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._run: tuple[threading.Event, list[Any]] | None = None
+        self._last: dict[str, Any] | None = None
+
+    def get(self, fn: Callable[[], dict[str, Any]], wait_s: float) -> dict[str, Any]:
+        with self._lock:
+            if self._run is None:
+                done, slot = threading.Event(), []
+                self._run = (done, slot)
+                threading.Thread(target=self._work, args=(fn, done, slot), name="board-build", daemon=True).start()
+            done, slot = self._run
+        if done.wait(wait_s):
+            if isinstance(slot[0], BaseException):
+                raise slot[0]
+            return copy.deepcopy(slot[0])
+        with self._lock:
+            last = copy.deepcopy(self._last)
+        if last is not None:
+            last["stale"] = True
+            last["note"] = (last["note"] + "; " if last.get("note") else "") + "the board is being rebuilt: this is the last read"
+            return last
+        return building_board()
+
+    def _work(self, fn: Callable[[], dict[str, Any]], done: threading.Event, slot: list[Any]) -> None:
+        try:
+            value = fn()
+            with self._lock:
+                self._last = copy.deepcopy(value)
+            slot.append(value)
+        except BaseException as exc:  # noqa: BLE001 - handed to the waiters, never lost on a thread
+            slot.append(exc)
+        finally:
+            with self._lock:
+                self._run = None
+            done.set()
+
+
+def building_board() -> dict[str, Any]:
+    """The board a caller is given while the first build of this process has not finished: no cards, and it says so."""
+    return {"schema": 1, "generated": None, "queue": "unreadable", "unreadable": ["building"], "building": True,
+            "note": "the board is being read for the first time (a cold read of the repos): this view refreshes when it is done",
+            "band_hint": BAND_HINT, "journal_as_of_read": True, "off_count": 0,
+            "columns": [{"category": c, "count": 0, "cards": []} for c in CATEGORIES]}

@@ -53,8 +53,8 @@ Notes a provider relies on:
   `journal` (who moved it, when, why: `{iso, who, why, source, from_category, to_category, applied_by}`) is an object or
   null. The whole board holds at most `BOARD_CARDS_MAX` cards. It is `empty` only when the queue is `ok`, nothing is
   `unreadable` and no column holds a card. **Two draws, one value:** the page draws the panel GROUPED, one heading per
-  column in the desk's order with its count and the cards as rows beneath it, and the panel's ⤢ focus modal draws the
-  six columns side by side (the renderers of `board_view.js`; with that script absent the panel says so in one line).
+  column in the desk's order with its count and the cards as rows beneath it, and the panel's ⤢ focus modal draws
+  the columns side by side (the renderers of `board_view.js`; with that script absent the panel says so in one line).
   The `compact` profile (the phone's) reduces a board as it reduces a topology: `{queue, note, unreadable, columns: [{category,
   count}]}` and a `next` link to the full read; no card goes out in it.
   A board carries no write verb in this slice: it offers no box and posts nothing.

@@ -1,6 +1,6 @@
 """C12 follow-up, session B: the `board` VALUE kind. A downstream cockpit panel (flow's) declares `kind="board"` and sends levain's
 board.json value (`levain.cockpit.board.build`); the kernel validates its shape (it parses and executes nothing), lists it in the
-manifest, and the page draws it grouped under column headings on the tab and as the six columns in the panel's ⤢ modal.
+manifest, and the page draws it grouped under column headings on the tab and as the columns in the panel's ⤢ modal.
 
 The shape tests are in-process; the draw test is real headless Chrome over a served cockpit holding a seeded board-kind provider
 (`LEVAIN_BOARD_SHOTS=<dir>` keeps its screenshots there; the default is the test's tmp dir)."""

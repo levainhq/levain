@@ -93,9 +93,10 @@ def register(subparsers: Any) -> None:
     p.add_argument("--producer", dest="producers", action="append", default=[], metavar="NAME",
                    help="An external evidence producer to expect (repeatable): its blocks are read from evidence.NAME.json "
                         "in the store directory. Levain's own reads of seats and band are always expected.")
-    p.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
-                   help="This install runs no land waiter: Levain then declares waiters absent. Without it, waiters are "
-                        "unknown until a producer that runs them supplies them.")
+    p.add_argument("--land-waiter", dest="land_waiter", action=argparse.BooleanOptionalAction, default=None,
+                   help="--no-land-waiter: this install runs no land waiter, so Levain declares waiters absent; --land-waiter: it "
+                        "does, so waiters are unknown until a producer that runs them supplies them. Either one, given, overrides "
+                        "the store's board config; left off, the config's value stands.")
     p.add_argument("--repo", type=Path, default=None, metavar="PATH",
                    help=("The repository to read. Without it, a store with a registry reads every tracked repo (each as its own "
                          "--also-repo NAME=PATH); a store without one reads the repository here."))
@@ -165,10 +166,10 @@ def register(subparsers: Any) -> None:
     u.add_argument("--by", default="levain board use", help="Who writes the imported records (default: the verb).")
     u.add_argument("--producer", dest="producers", action="append", default=[], metavar="NAME",
                    help="An external evidence producer this install runs (repeatable); saved in the store's board config, which "
-                        "`board state` and the cockpit read. Given at all, the saved config is replaced by the flags given.")
+                        "`board state` and the cockpit read. The saved config is written exactly from the flags: a flag left off is "
+                        "the default, so `use` with none clears it.")
     u.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
-                   help="This install runs no land waiter; saved in the board config. Given at all, the saved config is replaced "
-                        "by the flags given (a flag left off is off).")
+                   help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
     author_args(u)
     u.set_defaults(func=run_use)
     br.register_cli(sub, author_args, _author, items_help)
@@ -420,20 +421,26 @@ def run_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_use_config(store_dir: Path, args: argparse.Namespace) -> bool:
+    """The board config, written EXACTLY from the flags (a flag left off is the default). With no flag and no config file there
+    is nothing to write; with no flag and a file, the file is replaced by the default, which clears it."""
+    if not (args.producers or args.no_land_waiter or (Path(store_dir) / bs.CONFIG_NAME).exists()):
+        return False
+    return bs.write_config(store_dir, args.producers, args.no_land_waiter)
+
+
 def run_use(args: argparse.Namespace) -> int:
     try:
         if args.import_focus is not None:
             store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
                                                            briefcase=args.briefcase)
-            if args.producers or args.no_land_waiter:
-                if bs.write_config(store_dir, args.producers, args.no_land_waiter):
-                    changed = True
+            if _write_use_config(store_dir, args):
+                changed = True
             print(f"{'using' if changed else 'already using'} {store_dir} ({note})")
             return 0
         store_dir, changed = bs.use(args.dir)
-        if args.producers or args.no_land_waiter:
-            if bs.write_config(store_dir, args.producers, args.no_land_waiter):
-                changed = True
+        if _write_use_config(store_dir, args):
+            changed = True
     except bs.BoardError as exc:
         return _refused(exc)
     print(f"{'using' if changed else 'already using'} {store_dir}")
@@ -521,6 +528,10 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             return _srefused(say, bs.BoardError(br._torn_text(view)))
         if args.repo_name:
             return _sfail(say, "--repo-name names one repo: give --repo with it (a registry names its own repos)")
+    try:
+        config = bs.read_config(target.store_dir)      # before any git read: a config that cannot be read refuses at once
+    except bs.BoardError as exc:
+        return _srefused(say, exc)
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
         return _sfail(say, f"--now {args.now!r} is not an ISO-8601 timestamp")
@@ -556,13 +567,10 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
-    try:
-        config = bs.read_config(store_dir)
-    except bs.BoardError as exc:
-        return _srefused(say, exc)
-    # The flags override the store's board config (tests, one-off runs); with none given the config is what this install runs.
+    # One rule: a flag GIVEN replaces the config's value, a flag left off leaves it (--land-waiter / --no-land-waiter is a tri-state).
     producers = list(dict.fromkeys(args.producers or config["producers"]))   # a name given twice is one producer
-    no_land_waiter = bool(args.no_land_waiter or config["no_land_waiter"])
+    land_waiter = getattr(args, "land_waiter", None)
+    no_land_waiter = config["no_land_waiter"] if land_waiter is None else not land_waiter
     if bp.NATIVE_PRODUCER in producers:
         return _sfail(say, f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
     native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=no_land_waiter)

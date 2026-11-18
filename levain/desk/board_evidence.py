@@ -50,6 +50,7 @@ import os
 import re
 import stat
 import subprocess
+import threading
 import time
 from collections import Counter, deque
 from collections.abc import Iterable, Mapping, Sequence
@@ -322,17 +323,69 @@ def _log(repo: Path, revs: Iterable[str], *, negatives: Iterable[str] = (), limi
     return _parse_log(out, notes if notes is not None else {})
 
 
+def stat_stamp(path: Path) -> tuple[int, int] | None:
+    """(size, mtime_ns) of a file, None when it is absent: the one shape every stamp here takes."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def config_stamp(repo: Path) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+    """``(git dirs, stamps)``: the git dir and the common dir of ``repo`` (absolute, deduplicated), and the stamp of every file whose
+    content changes what git reads of this repo: the config files git itself lists for it (``config --list --show-origin``, so
+    the system and global files and any ``include`` are covered), the repo's own ``config`` and ``config.worktree`` (named
+    even when absent, so one appearing is a change) and ``objects/info/alternates``. Raises :class:`GitFailed`."""
+    dirs = tuple(dict.fromkeys(x.strip() for x in _git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n")
+                               if x.strip()))
+    listed = _git(repo, "config", "--list", "--show-origin", "-z")
+    files = sorted({str(Path(repo) / rec[5:]) for rec in listed.split("\0") if rec.startswith("file:")})     # git names a repo file relative to -C
+    for d in dirs:
+        files += [str(Path(d) / n) for n in ("config", "config.worktree", "objects/info/alternates")]
+    return dirs, tuple((f, stat_stamp(Path(f))) for f in dict.fromkeys(files))
+
+
+# A commit's patch-id never changes, so it is kept per process: repo (its common git dir) -> (config stamp, sha -> id, or None for
+# a commit with no patch-id). The diff text depends on the repo's config (diff.*, core.*), so a changed config stamp drops the repo's
+# memo. A miss of the board's evidence read then diffs only the commits it has not seen.
+_PID_MEMO: dict[str, tuple[Any, dict[str, str | None]]] = {}
+_PID_MEMO_MAX = 200_000
+_PID_LOCK = threading.Lock()
+
+
 def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
     """sha -> stable patch-id for the non-merge commits among ``shas`` (an empty diff has none)."""
     if not shas:
         return {}
-    diff = _git(repo, "diff-tree", "--root", "-p", "--stdin", stdin="".join(f"{s}\n" for s in shas).encode())
-    out = _git(repo, "patch-id", "--stable", stdin=diff.encode())
-    pids: dict[str, str] = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            pids[parts[1]] = parts[0]
+    try:
+        dirs, stamps = config_stamp(repo)
+        key = dirs[-1]
+    except GitFailed:
+        key, stamps = None, None                  # no stamp, no memo: every id is computed
+    known: dict[str, str | None] = {}
+    if key is not None:
+        with _PID_LOCK:
+            held = _PID_MEMO.get(key)
+            if held is not None and held[0] == stamps:
+                known = {s: held[1][s] for s in shas if s in held[1]}
+    todo = [s for s in shas if s not in known]
+    got: dict[str, str] = {}
+    if todo:
+        diff = _git(repo, "diff-tree", "--root", "-p", "--stdin", stdin="".join(f"{s}\n" for s in todo).encode())
+        out = _git(repo, "patch-id", "--stable", stdin=diff.encode())
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                got[parts[1]] = parts[0]
+        if key is not None:
+            with _PID_LOCK:
+                held = _PID_MEMO.get(key)
+                if held is None or held[0] != stamps or len(held[1]) + len(todo) > _PID_MEMO_MAX:
+                    held = _PID_MEMO[key] = (stamps, {})
+                held[1].update({s: got.get(s) for s in todo})
+    pids = {s: v for s, v in known.items() if v is not None}
+    pids.update(got)
     return pids
 
 

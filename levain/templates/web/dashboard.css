@@ -3071,7 +3071,7 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
 .rv .dv-ambiguous .dv-status { color: var(--text); border-right: 2px solid var(--warn); padding-right: var(--sp-2); }
 .rv .dv-took, .rv .dv-held, .rv .dv-other { border-left: 2px solid var(--hair-2); padding: var(--sp-1) var(--sp-4); }
 
-/* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
+/* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the columns (one on a narrow page) are the ⤢ modal's. */
 .bd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--sp-4); align-items: start; }
 .bd-col { min-width: 0; }
 .bd-colhead { margin: 0 0 var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.3 var(--sans); color: var(--text); text-transform: uppercase; }

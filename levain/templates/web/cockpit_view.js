@@ -1780,7 +1780,7 @@
     emptyQueued = true;
     root.setTimeout(() => { emptyQueued = false; markEmptyCards(); }, 0);
   }
-  // The board kind (board_view.js): grouped under column headings on the page, the six columns in the focus modal (the same two
+  // The board kind (board_view.js): grouped under column headings on the page, the columns in the focus modal (the same two
   // renderers the Board tab and its modal use). A page without the view draws one plain line, never a blank panel.
   function paintBoard(s) {
     const V = root.LevainBoardView;

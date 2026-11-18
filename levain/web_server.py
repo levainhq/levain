@@ -1353,7 +1353,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/room_view.js": ("room_view.js", "text/javascript; charset=utf-8"),
     # The Desk view: a second full tab beside the room, over GET /cockpit/desk.json and POST /cockpit/desk/send.
     "/desk_tab_view.js": ("desk_tab_view.js", "text/javascript; charset=utf-8"),
-    # The board painters (C12): the board-kind panel's grouped tab and its six columns draw with these. GET /cockpit/board.json
+    # The board painters (C12): the board-kind panel's grouped tab and its columns draw with these. GET /cockpit/board.json
     # is served for external readers; no page zone reads it.
     "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
 }
@@ -1914,6 +1914,10 @@ def build_job_json(job_runtime: "JobRuntime | None", job_id: str) -> bytes:
     return json.dumps(job_runtime.store.read_status(job_id, now)).encode("utf-8")
 
 
+_BOARD_FLIGHT_LOCK = threading.Lock()
+BOARD_WAIT_S = 10.0      # the longest a board read holds a request slot waiting for a build; past it the last read (stale) or "building" is answered
+
+
 def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
     """The cockpit's own board value (:func:`levain.cockpit.board.build`) over this server's desk store directory and
     question store: the one read behind both ``GET /cockpit/board.json`` and the built-in Work board panel, so the two cannot
@@ -1925,7 +1929,12 @@ def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
         from levain.consent.queue import default_queue_dir
 
         directory = reader.directory if reader.directory is not None else default_queue_dir()
-    value = cockpit_board.build(directory, getattr(server, "question_store", None))
+    with _BOARD_FLIGHT_LOCK:
+        flight = getattr(server, "_board_flight", None)
+        if flight is None:
+            flight = server._board_flight = cockpit_board.Flight()    # one build at a time per server, however many readers
+    store = getattr(server, "question_store", None)
+    value = flight.get(lambda: cockpit_board.build(directory, store), BOARD_WAIT_S)
     value["drop_here"] = _drop_files_here(server, directory)
     return value if stamped else {**value, "generated": None}
 
