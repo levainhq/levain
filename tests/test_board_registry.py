@@ -1596,7 +1596,8 @@ def test_a_re_register_is_a_no_op_when_attention_matches_and_refuses_naming_the_
     repo = mkrepo("alpha")
     ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A)
     assert ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A) == "already registered alpha"
-    rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A)
+    assert ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A) == "already registered alpha"   # no flag: no opinion
+    rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "active", *A)
     assert rc != 0 and "levain board resume alpha" in err
     ok(capsys, "resume", "alpha", "--words", "w", *A)
     rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "paused", *A)
@@ -1609,4 +1610,48 @@ def test_the_fold_reads_a_register_attention_and_judges_a_bad_one():
     assert rf.fold_repos([rec("register", attention="paused")], store_id=SID).repos["x"].attention == "paused"
     assert rf.fold_repos([rec("register")], store_id=SID).repos["x"].attention == "active"
     f = rf.fold_repos([rec("register", attention="loud")], store_id=SID)
-    assert f.torn or f.problems or "x" not in f.repos
+    assert f.torn or f.problems
+
+
+def test_apply_one_fails_closed_on_an_attention_it_does_not_know():
+    repos: dict = {}
+    with pytest.raises(rf._Soft):
+        rf._apply_one(json.loads(rec("register", attention="loud")), repos)
+    assert "x" not in repos
+
+
+def test_a_second_register_record_that_contradicts_the_folded_attention_is_a_named_problem():
+    f = rf.fold_repos([rec("register", attention="paused"), rec("register")], store_id=SID)
+    assert f.repos["x"].attention == "paused" and any("contradict" in p for p in f.problems)
+    f = rf.fold_repos([rec("register"), rec("register", attention="paused")], store_id=SID)
+    assert f.repos["x"].attention == "active" and any("contradict" in p for p in f.problems)
+    f = rf.fold_repos([rec("register", attention="paused"), rec("register", attention="paused")], store_id=SID)
+    assert not f.problems                                                            # duplicates that agree stay quiet
+    f = rf.fold_repos([rec("register"), rec("register")], store_id=SID)
+    assert not f.problems
+
+
+def test_a_re_register_without_the_flag_is_a_no_op_on_a_paused_repo(store, mkrepo, capsys):
+    repo = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    assert ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A) == "already registered alpha"
+    rc, out, err = run(capsys, "register", "alpha", "--path", str(repo), "--words", "w", "--attention", "active", *A)
+    assert rc != 0 and "levain board resume alpha" in err
+
+
+def test_move_keeps_attention_after_pause_and_after_a_paused_register(store, tmp_path, mkrepo, capsys):
+    import shutil
+    repo = mkrepo("alpha")
+    ok(capsys, "register", "alpha", "--path", str(repo), "--words", "w", *A)
+    ok(capsys, "pause", "alpha", "--words", "w", *A)
+    copy = tmp_path / "alpha2"
+    shutil.copytree(repo, copy)
+    ok(capsys, "move", "alpha", "--path", str(copy), "--words", "w", *A)
+    assert br.read_registry(bs.resolve_store(None)).fold.repos["alpha"].attention == "paused"
+    repo2 = mkrepo("beta")
+    ok(capsys, "register", "beta", "--path", str(repo2), "--words", "w", "--attention", "paused", *A)
+    copy2 = tmp_path / "beta2"
+    shutil.copytree(repo2, copy2)
+    ok(capsys, "move", "beta", "--path", str(copy2), "--words", "w", *A)
+    assert br.read_registry(bs.resolve_store(None)).fold.repos["beta"].attention == "paused"

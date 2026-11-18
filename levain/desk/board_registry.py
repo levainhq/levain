@@ -312,13 +312,13 @@ def _need_repo(fold: rf.RepoFold, name: str) -> rf.Repo:
 
 
 def register(target: bs.Target, name: str, path: str, words: str, by: str, *, author: Mapping[str, Any],
-             now: str | None = None, via: str | None = None, attention: str = "active") -> tuple[rf.Repo | None, bool]:
-    """Put ``name`` in play, untracked. Records the path's realpath, origin and root set. A known name at the same path is a
-    no-op when ``attention`` matches the folded attention (it refuses, naming ``pause`` / ``resume``, when it differs: a register never
-    changes attention after the fact); at another path it refuses and names ``move``. ``attention="paused"`` rides on the ONE register
+             now: str | None = None, via: str | None = None, attention: str | None = None) -> tuple[rf.Repo | None, bool]:
+    """Put ``name`` in play, untracked. Records the path's realpath, origin and root set. ``attention`` None = no opinion. A known name
+    at the same path is a no-op when ``attention`` is None or matches the folded attention (it refuses, naming ``pause`` / ``resume``,
+    only for an explicit value that differs: a register never changes attention after the fact); at another path it refuses and names ``move``. ``attention="paused"`` rides on the ONE register
     record (an active register's bytes carry no such key). ``via`` marks the record's writer (``import-focus``). Returns ``(repo as folded, written)``."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
-    if attention not in ("active", "paused"):
+    if attention not in (None, "active", "paused"):
         raise BoardError(f"attention must be active or paused (got {attention!r})")
     ident = identity(path)
 
@@ -326,7 +326,7 @@ def register(target: bs.Target, name: str, path: str, words: str, by: str, *, au
         cur = fold.repos.get(name)
         if cur is not None:
             if cur.path == ident["path"]:
-                if cur.attention != attention:
+                if attention is not None and cur.attention != attention:
                     verb = "resume" if cur.attention == "paused" else "pause"
                     raise BoardError(f"{name} is already registered and {cur.attention}, not {attention}: a register never changes attention; "
                                      f"use `levain board {verb} {name}`")
@@ -1251,8 +1251,9 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     p = sub.add_parser("register", description="Put a repo in play (untracked). Idempotent for the same path and attention.")
     common(p)
     p.add_argument("--path", required=True)
-    p.add_argument("--attention", choices=("active", "paused"), default="active",
-                   help="the repo's attention from the register record on (default active); a later register with another attention refuses: use pause / resume.")
+    p.add_argument("--attention", choices=("active", "paused"), default=None,
+                   help="the repo's attention from the register record on (default active for a new repo; no opinion for a known one). "
+                        "A later register naming another attention refuses: use pause / resume. Known edge: an older levain folds a paused register as active.")
     p.set_defaults(func=run(lambda a, t: said(a, *register(t, a.name, a.path, a.words, a.by, author=author_of(a), attention=a.attention), "registered", "already registered")))
 
     p = sub.add_parser("move", description="Re-base a registered repo onto a new path (the same repository).")

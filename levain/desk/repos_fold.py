@@ -160,6 +160,15 @@ def check_manifest(value: Any) -> str | None:
     return None
 
 
+def register_attention(rec: Mapping[str, Any]) -> str:
+    """A register record's initial attention: ``paused``, or absent (= ``active``). The one rule, for the validator and the fold."""
+    if "attention" not in rec:
+        return "active"
+    if rec["attention"] != "paused":
+        raise _Bad("a register record's attention is `paused` or absent (absent = active)")
+    return "paused"
+
+
 def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
     """Shape only: raises :class:`_Bad` on a record that cannot be trusted."""
     if rec.get("v") != SCHEMA:
@@ -184,8 +193,8 @@ def _validate(rec: Mapping[str, Any], store_id: str | None) -> None:
         if not path.startswith("/"):
             raise _Bad("path must be absolute")
         _str(rec, "origin", empty_ok=True)
-        if op == "register" and "attention" in rec and rec["attention"] != "paused":
-            raise _Bad("a register record's attention is `paused` or absent (absent = active)")
+        if op == "register":
+            register_attention(rec)
         root = rec.get("root")
         if not isinstance(root, list) or not root or not all(isinstance(r, str) and r for r in root):
             raise _Bad("root must be a non-empty list of commit ids")
@@ -224,12 +233,19 @@ def _apply_one(rec: Mapping[str, Any], repos: dict[str, Repo]) -> None:
     op, name, at = rec["op"], rec["repo"], rec["at"]
     cur = repos.get(name)
     if op == "register":
+        try:
+            attn = register_attention(rec)
+        except _Bad as e:
+            raise _Soft(f"register {name}: {e}") from None
         if cur is None:
             repos[name] = Repo(name, rec["path"], rec["origin"], tuple(sorted(rec["root"])), since=at, words=rec["words"],
-                               attention="paused" if rec.get("attention") == "paused" else "active",
+                               attention=attn,
                                via=rec["via"] if isinstance(rec.get("via"), str) else None)
         elif cur.path != rec["path"]:
             raise _Soft(f"register {name}: already registered at {cur.path}, not {rec['path']}; use move")
+        elif attn != cur.attention:
+            raise _Soft(f"register {name}: a second register record says {attn}, the fold holds {cur.attention}; "
+                        f"the registry holds two contradicting facts (a hand edit or an older writer); the first is kept")
         return
     if cur is None:
         raise _Soft(f"{op} {name}: the repo was never registered")
