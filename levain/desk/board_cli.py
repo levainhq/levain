@@ -57,7 +57,7 @@ from levain.desk import board_producers as bp
 from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
+__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state", "state_doc"]
 
 ITEMS_ENV = bs.ITEMS_ENV
 #: Read when ``--launch-key`` is not given. Nothing in Levain's launch path exports it yet; the flag is the sure way.
@@ -428,18 +428,43 @@ def run_use(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sfail(say: Any, message: str) -> tuple[int, None]:
+    say(f"levain board state: {message}")
+    return EXIT_USAGE, None
+
+
+def _srefused(say: Any, exc: Exception) -> tuple[int, None]:
+    say(f"levain board: refused: {exc}")
+    return EXIT_USAGE, None
+
+
 def run_state(args: argparse.Namespace) -> int:
+    rc, doc = state_doc(args)
+    if doc is None:
+        return rc
+    if args.json:
+        print(json.dumps(doc, indent=2, sort_keys=False))
+    else:
+        _print_table(doc)
+    return rc
+
+
+def state_doc(args: argparse.Namespace, say: Any = None) -> tuple[int, dict[str, Any] | None]:
+    """``(exit code, the Board document or None)`` of ``levain board state --json``, with no printing of the document: a refusal is
+    handed to ``say`` (a line of text; default stderr). The cockpit board reads the board through this, so it never captures a stream."""
+    if say is None:
+        say = lambda text: print(text, file=sys.stderr)  # noqa: E731
     try:
         target = bs.resolve_store(args.items)
     except bs.BoardError as exc:
         if str(exc).startswith("no items store"):
-            return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}")
-        return _refused(exc)
+            return _sfail(say, f"no items store: pass --items PATH or set {ITEMS_ENV}")
+        return _srefused(say, exc)
     given = args.items or os.environ.get(ITEMS_ENV)
     if not target.pointered and os.path.lexists(target.store_dir / bs.STORE_ID_NAME):
         target = dataclasses.replace(target, pointered=True)    # an explicit store that holds a store.id is a store: its lock, its registry
     if not given and not target.pointered and not target.items_path.is_file():
-        return _fail(f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
+        return _sfail(say, f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
     store_id: str | None = None
     store_id_exc: Exception | None = None
     view: br.View | None = None
@@ -464,27 +489,27 @@ def run_state(args: argparse.Namespace) -> int:
                 except bs.BoardError as exc:
                     view_exc = exc
     except bs.LockWaiting as exc:
-        print(f"levain board state: refused: {exc}", file=sys.stderr)
-        return EXIT_LOCKED
+        say(f"levain board state: refused: {exc}")
+        return EXIT_LOCKED, None
     except (OSError, UnicodeDecodeError, bs.BoardError) as exc:
-        return _fail(f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
+        return _sfail(say, f"the items file {given or target.items_path} cannot be read ({type(exc).__name__}: {exc})")
     if store_id_exc is not None:                        # first: a store.id that cannot be read is said as that, not as a registry that cannot load
         if isinstance(store_id_exc, ValueError) and not isinstance(store_id_exc, UnicodeDecodeError):
-            return _fail(str(store_id_exc))
-        return _fail(f"store.id could not be read: {type(store_id_exc).__name__}: {store_id_exc}")
+            return _sfail(say, str(store_id_exc))
+        return _sfail(say, f"store.id could not be read: {type(store_id_exc).__name__}: {store_id_exc}")
     # No --repo (and no --also-repo) on a store that has a registry file: every tracked repo is read (T3). Otherwise one repo, as
     # before (a store with no registry file reads the repository here, whatever its registry audit says).
     whole = args.repo is None and not args.also_repo and registry_file
     if whole:
         if view_exc is not None:                        # it cannot know which repos to read: fail closed, as the launch does (I5)
-            return _refused(view_exc)
+            return _srefused(say, view_exc)
         if view is not None and view.fold.torn:
-            return _refused(bs.BoardError(br._torn_text(view)))
+            return _srefused(say, bs.BoardError(br._torn_text(view)))
         if args.repo_name:
-            return _fail("--repo-name names one repo: give --repo with it (a registry names its own repos)")
+            return _sfail(say, "--repo-name names one repo: give --repo with it (a registry names its own repos)")
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
-        return _fail(f"--now {args.now!r} is not an ISO-8601 timestamp")
+        return _sfail(say, f"--now {args.now!r} is not an ISO-8601 timestamp")
     folded = fold(lines)
     reads: list[tuple[str | None, Path]]
     unread_why: dict[str, str] = {}
@@ -505,7 +530,7 @@ def run_state(args: argparse.Namespace) -> int:
         for name in sorted(held - set(view.fold.repos)):    # items of a repo the registry does not name: never dropped either
             unread_why[name] = "the repo is not registered: not read, its items read unknown"
         if not reads:
-            return _fail("the registry has no tracked repo that can be read" + (": " + "; ".join(f"{n}: {w}" for n, w in unread_why.items())
+            return _sfail(say, "the registry has no tracked repo that can be read" + (": " + "; ".join(f"{n}: {w}" for n, w in unread_why.items())
                          if unread_why else " (track one with `levain board begin-track`/`track`, or pass --repo)"))
         cross = True
     else:
@@ -519,11 +544,11 @@ def run_state(args: argparse.Namespace) -> int:
     store_dir = target.store_dir
     producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
     if bp.NATIVE_PRODUCER in producers:
-        return _fail(f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
+        return _sfail(say, f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
     native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=args.no_land_waiter)
     external, failures = bp.read_external(store_dir, producers)
     if store_id is None and any(isinstance(b, dict) and b.get("store_id") for bl in external.values() for b in bl):
-        print(f"levain board state: the store {store_dir} has no id, so an external block naming one is taken as this store's", file=sys.stderr)
+        say(f"levain board state: the store {store_dir} has no id, so an external block naming one is taken as this store's")
     extra = None
     flat_at: str | None = None
     if args.evidence_extra is not None:
@@ -531,23 +556,23 @@ def run_state(args: argparse.Namespace) -> int:
         try:
             extra, flat_at = _read_extra(extra_path)
         except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
-            return _fail(f"--evidence-extra {args.evidence_extra} cannot be read ({type(exc).__name__}: {exc})")
+            return _sfail(say, f"--evidence-extra {args.evidence_extra} cannot be read ({type(exc).__name__}: {exc})")
         bad = _merge_extra(evidence, extra, captured_at=flat_at)
         if bad is not None:
-            return _fail(f"--evidence-extra {args.evidence_extra}: {bad}")
+            return _sfail(say, f"--evidence-extra {args.evidence_extra}: {bad}")
     _attach_producers(evidence, native, external, failures)
     primary = Evidence.from_dict(evidence, now=now, store_id=store_id)
     repo_evidence: dict[str, Evidence] | None = None
     also: list[dict[str, Any]] = []
     if cross:
         if not summary["repo"]:
-            return _fail(f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
+            return _sfail(say, f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
         repo_evidence = {summary["repo"]: primary}
         for given, other in reads[1:]:
             ev2, sum2 = be.read_git_evidence(other, repo_name=given, since=args.since)
             name = sum2["repo"]
             if not name or name in repo_evidence:
-                return _fail(f"--also-repo {other}: its repo name ({name!r}) is empty or already read; say it with NAME=PATH")
+                return _sfail(say, f"--also-repo {other}: its repo name ({name!r}) is empty or already read; say it with NAME=PATH")
             ev2["documents"] = be.read_documents({i: it for i, it in folded.items.items() if it.repo == name}, other)
             if extra is not None:
                 _merge_extra(ev2, extra, primary=False, captured_at=flat_at)     # the same flow-supplied sources; validated once above
@@ -566,8 +591,8 @@ def run_state(args: argparse.Namespace) -> int:
     try:
         registry_audit = br.audit_for_state(target, now, view=view, view_exc=view_exc, deadline=deadline)
     except bs.LockWaiting as exc:
-        print(f"levain board state: refused: {exc}", file=sys.stderr)
-        return EXIT_LOCKED
+        say(f"levain board state: refused: {exc}")
+        return EXIT_LOCKED, None
     doc["audit"] += [{"kind": "unknown", "id": None, "why": why} for why in registry_audit]
     doc["reader"] = summary
     if whole:                                           # no repo is privileged: freshness, counts and labels span every repo read
@@ -575,11 +600,7 @@ def run_state(args: argparse.Namespace) -> int:
         doc["reader"] = _merged_reader([summary, *also])
     elif also:
         doc["reader"] = {**summary, "also": also}
-    if args.json:
-        print(json.dumps(doc, indent=2, sort_keys=False))
-    else:
-        _print_table(doc)
-    return EXIT_AUDIT if board.audit or registry_audit else 0
+    return (EXIT_AUDIT if board.audit or registry_audit else 0), doc
 
 
 def _print_table(doc: dict[str, Any]) -> None:

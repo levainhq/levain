@@ -35,7 +35,7 @@ def _card(cid: str, **kw: Any) -> dict[str, Any]:
 
 def _value(**by_cat: list[dict[str, Any]]) -> dict[str, Any]:
     cols = [{"category": c, "count": len(by_cat.get(c.replace("-", "_"), [])), "cards": by_cat.get(c.replace("-", "_"), [])}
-            for c in BOARD_CATEGORIES]
+            for c in BOARD_CATEGORIES if c != "unknown"]
     return {"schema": 1, "generated": "2026-10-29T12:00:00Z", "queue": "ok", "unreadable": [], "note": None, "columns": cols}
 
 
@@ -58,7 +58,7 @@ def _refused(value: Any, *needles: str) -> None:
 def test_the_board_kind_is_in_the_vocabulary_and_its_categories_are_the_desks() -> None:
     from levain.desk import ready
     assert "board" in KINDS
-    assert BOARD_CATEGORIES == ("backlog", "ready", "running", "waiting", "needs-you", "done") == ready.CATEGORIES == board.CATEGORIES
+    assert BOARD_CATEGORIES == ("unknown", "backlog", "ready", "running", "waiting", "needs-you", "done") == ("unknown", *ready.CATEGORIES) and board.CATEGORIES == ready.CATEGORIES
 
 
 def test_a_board_provider_registers_and_appears_in_the_manifest() -> None:
@@ -69,7 +69,7 @@ def test_a_board_provider_registers_and_appears_in_the_manifest() -> None:
     assert man["panels"]["b"]["kind"] == "board"
     got = ck.panel("b")
     assert got["status"] == "ok" and got["kind"] == "board"
-    assert [c["category"] for c in got["value"]["columns"]] == list(BOARD_CATEGORIES)     # the value goes out as sent
+    assert [c["category"] for c in got["value"]["columns"]] == list(BOARD_CATEGORIES[1:])     # the value goes out as sent
     assert got["value"]["columns"][1]["cards"][0]["id"] == "levain:a"
     # a registered board still has no row ordering, and is no widget (one answer, never a list)
     with pytest.raises(CockpitRegistrationError):
@@ -170,7 +170,7 @@ def test_a_compact_read_of_a_board_is_counts_and_a_link_not_the_cards() -> None:
     got = ck.panel("b", profile="compact")
     assert got["status"] == "ok" and got["next"] == "/cockpit/panel/b.json?profile=full", got
     assert got["value"] == {"queue": "ok", "note": "journal missing", "unreadable": ["band"],
-                            "columns": [{"category": c, "count": n} for c, n in zip(BOARD_CATEGORIES, (0, 2, 0, 0, 0, 1))]}, got["value"]
+                            "columns": [{"category": c, "count": n} for c, n in zip(BOARD_CATEGORIES[1:], (0, 2, 0, 0, 0, 1))]}, got["value"]
     assert "levain:a" not in json.dumps(got) and "Card" not in json.dumps(got)
 
 

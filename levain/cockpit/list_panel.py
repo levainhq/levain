@@ -371,6 +371,9 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
     others = sorted({u for u in unreadable if u != "band"})
     if others:
         out.skipped.append((1, f"the agents' board could not be fully read ({', '.join(others)})"))
+    if cols.get("unknown"):       # the board could not place these: said here, never folded into the ready rows (the Board draws them)
+        n = len(cols["unknown"])
+        out.skipped.append((1, f"{n} board item{'s' if n != 1 else ''} read unknown and {'are' if n != 1 else 'is'} not listed: see the Board"))
     from levain import band_agenda
 
     every, per_row = band_agenda.offer_blocks(question_store) if cols.get("needs-you") else (None, {})

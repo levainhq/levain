@@ -1,6 +1,6 @@
 // levain board_view.js — the painters of the cockpit's board kind (C12).
 //
-// The audit window over the desk's work: six DERIVED columns (backlog, ready, running, waiting, needs-you, done) from a
+// The audit window over the desk's work: DERIVED columns (unknown, backlog, ready, running, waiting, needs-you, done) from a
 // board value (levain's own, or a provider's of the same shape). The panel lists the cards grouped under those column headings;
 // the six columns side by side are drawn (by renderBoard) in the panel's ⤢ focus modal. Read-only: no drag, no edit, no rename.
 // Each card shows its journal line (who moved it, when, why). The one way to talk about a card is a drop: every card carries a
@@ -9,7 +9,8 @@
 (function (root) {
   "use strict";
 
-  var ORDER = ["backlog", "ready", "running", "waiting", "needs-you", "done"];
+  // `unknown` leads, and is drawn only while it holds a card: an item the board cannot place is shown in a column of its own, never folded into another (v2)
+  var ORDER = ["unknown", "backlog", "ready", "running", "waiting", "needs-you", "done"];
 
   // The journal line of one card: "who · when · why". A card with no record draws no line: absence is the ordinary case for a
   // card nothing here ever moved (a projected seat or CI row, a downstream's own cards), so a line saying so reads as a fault.
@@ -38,7 +39,9 @@
       // provider's board is the desk's own work and says nothing, which reads as true
       dropHere: body.drop_here !== false,
       unreadable: Array.isArray(body.unreadable) ? body.unreadable.map(String) : [],
-      columns: ORDER.map(function (name) {
+      // what the board has set aside (cut, parked, out of 1.0): a count, not a column of cards
+      off: typeof body.off_count === "number" && body.off_count > 0 ? Math.floor(body.off_count) : 0,
+      columns: ORDER.filter(function (name) { return name !== "unknown" || (cols.unknown && visibleCards(cols.unknown.cards).length); }).map(function (name) {
         var c = cols[name] || { cards: [] };
         return {
           category: name,
@@ -46,7 +49,7 @@
           cards: visibleCards(c.cards).map(function (k) {
             return {
               id: String(k.id), title: k.title == null ? "" : String(k.title), repo: k.repo || "",
-              tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
+              tier: k.tier || "", held: k.held_reason || "", reason: k.held_reason ? "" : (k.reason || ""), number: k.number == null ? null : k.number,
               band: k.band === true, later: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) ? k.later : "",
               laterLabel: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) && typeof k.later_label === "string" ? k.later_label.slice(0, 80) : "", source: k.source || "", blocks: k.blocks || "",
               malformed: k.well_formed === false, unknownCategory: k.unknown_category || "",
@@ -163,6 +166,7 @@
     if (model.queue === "unreadable") note.push("The queue could not be read; this is not an empty queue.");
     model.unreadable.forEach(function (u) { note.push("Could not read: " + u + "."); });
     if (model.note && model.queue !== "none") note.push(model.note);
+    if (model.off) note.push(model.off + " off the board (cut, parked or out of 1.0).");
     if (note.length) host.appendChild(el(doc, "p", "bd-note", note.join(" ")));
   }
 
@@ -192,6 +196,7 @@
         if (k.malformed) row.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) row.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
         if (!k.band && k.journal) row.appendChild(el(doc, "div", "bd-journal", k.journal));
+        if (k.reason) row.appendChild(el(doc, "div", "bd-journal", k.reason));
         drawDrop(doc, row, k, model);
         wrap.appendChild(row);
       });
@@ -225,6 +230,7 @@
         if (k.malformed) card.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) card.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
         if (!k.band && k.journal) card.appendChild(el(doc, "div", "bd-journal", k.journal));
+        if (k.reason) card.appendChild(el(doc, "div", "bd-journal", k.reason));
         drawDrop(doc, card, k, model);
         c.appendChild(card);
       });

@@ -1,15 +1,21 @@
-"""The cockpit's read-only board (C12): the ready queue as six DERIVED columns, the audit window over the desk's
-work. Nothing here writes, stores a column, or keeps a second needs-you list.
+"""The cockpit's read-only board (C12): the work as DERIVED columns, the audit window over the desk's work. Nothing here
+writes, stores a column, or keeps a second needs-you list.
 
-Columns are READY_SCHEMA section 2's six categories in column order. Cards are C13's ``list(all=True)`` items, each with
-its last journal record (who moved it, when, why). The needs-you column IS the Q17-ALL band's open items, read through
+Two sources, one value. When this install has a board store (T3, READY_SCHEMA v3: items stored, state derived on every read,
+every tracked repo of the registry read from one snapshot) the cards are that board's items, read through
+:func:`levain.desk.board_cli.state_doc`; the columns are the v2 ``STATE_COLUMN`` set: ``unknown`` is its own column, first, and
+never folded into another; ``off`` (cut, parked, out of 1.0) is a COUNT (``off_count``), never a column of cards. An install
+with no board store yet reads the desk's dispatch queue as before (C13's ``list(all=True)`` items, each with its last journal
+record), and its ``unknown`` column is empty. The needs-you column IS the Q17-ALL band's open items, read through
 ``levain.band_view``'s own read-only snapshot and its allocated numbers (a number not yet allocated reads ``None``: a look
 never numbers an item). A source that cannot be read is named in ``unreadable``, never shown as an empty column; a store
 never made is ``queue: "none"`` ("no queue yet"). ``build`` never raises."""
 from __future__ import annotations
 
+import argparse
+import os
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +24,16 @@ from levain.cockpit.display_safe import visible
 from levain.desk import ready
 
 BOARD_PATH = "/cockpit/board.json"
+UNKNOWN = "unknown"
+#: Until the board config that ``levain board use`` is to write exists, the two things ``levain board state`` is told on its
+#: command line (the external evidence producers to expect, and that this install runs no land waiter) are told to the cockpit
+#: here: comma-separated producer names, and any non-empty value. Unset, every item that rests on an absence reads unknown.
+PRODUCERS_ENV = "LEVAIN_BOARD_PRODUCERS"
+NO_LAND_WAITER_ENV = "LEVAIN_BOARD_NO_LAND_WAITER"
 TEXT_MAX = 1000        # the kernel's board validator refuses a longer card field (engine.BOARD_TEXT_MAX; one test pins them equal)
 CATEGORIES = ready.CATEGORIES
+COLUMNS = (UNKNOWN, *CATEGORIES)        # the columns a board value can carry, in drawing order: unknown first (v2 draws it above the rest),
+                                         # and only while it holds a card: an empty unknown column is left out, so a board with nothing unplaced draws as it did
 BAND_HINT = "levain band"
 NO_QUEUE = "no queue yet"
 _WHAT_MAX = 300
@@ -66,6 +80,65 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
         card[k] = _text(card[k])
     card["journal"] = _line(rec)
     return card
+
+
+def _v2_target(items: Path | str | None) -> Any:
+    """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read). A store that is
+    named but cannot be resolved raises ``bs.BoardError``: that is an unreadable board, never a quiet fall back."""
+    from levain.desk import board_store as bs
+
+    try:
+        target = bs.resolve_store(items)
+    except bs.BoardError as exc:
+        if str(exc).startswith("no items store"):
+            return None
+        raise
+    # No registry file: ``levain board state`` would read the repository in ITS working directory, which for a cockpit is
+    # whatever directory the server started in. That is not a board; this install has none yet.
+    return target if (target.store_dir / "repos.jsonl").is_file() else None
+
+
+def _v2_card(st: Mapping[str, Any]) -> dict[str, Any]:
+    state = str(st.get("state"))
+    card: dict[str, Any] = {"id": _text(str(st.get("id"))), "repo": _text(st.get("repo")), "title": _text(st.get("title") or ""),
+                            "tier": st.get("tier"), "status": state, "status_category": str(st.get("column")).replace("_", "-"),
+                            "kind": st.get("kind"), "reason": _text(st.get("reason")), "journal": None}
+    if state in ("unknown", "blocked"):
+        card["held_reason"] = card["reason"]
+    return card
+
+
+def _v2(items: Path | str | None, *, now: str | None, producers: Sequence[str] = (),
+        no_land_waiter: bool = False) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
+    """``(cards, off_count, unreadable, as_of)`` from the board store, or None when there is none. ``cards`` holds every item
+    the board shows but a needs-you one (the band owns that column) and an off one (counted, not drawn)."""
+    from levain.desk import board_cli as bc
+    from levain.desk import board_evidence as be
+    from levain.desk import board_store as bs
+
+    try:
+        target = _v2_target(items)
+    except bs.BoardError:
+        return [], 0, [UNREADABLE_DESK], None
+    if target is None:
+        return None
+    args = argparse.Namespace(json=True, items=str(items) if items else None, evidence_extra=None, producers=list(producers),
+                              no_land_waiter=no_land_waiter, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
+    try:
+        rc, doc = bc.state_doc(args, lambda _text: None)
+    except Exception:  # noqa: BLE001 - never a 500: the board is named unreadable
+        rc, doc = bc.EXIT_USAGE, None
+    if doc is None:
+        return [], 0, [UNREADABLE_DESK], None
+    cards: list[dict[str, Any]] = []
+    off = 0
+    for st in doc.get("items") or ():
+        col = st.get("column")
+        if col == "off":
+            off += 1
+        elif col != "needs_you":
+            cards.append(_v2_card(st))
+    return cards, off, [], doc.get("as_of")
 
 
 def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
@@ -117,9 +190,12 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
 
 
 def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
-          drop_dir: Path | str | None = None) -> dict[str, Any]:
-    """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note,
-    journal_as_of_read}``. The items, the journal and the live-seat projections (``running`` cards, no journal line) come from
+          drop_dir: Path | str | None = None, board_items: Path | str | None = None, producers: Sequence[str] | None = None,
+          no_land_waiter: bool | None = None) -> dict[str, Any]:
+    """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], off_count, unreadable, band_hint,
+    note, journal_as_of_read}``. With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
+    home's own) the cards are the v2 board's, ``off_count`` counts what is cut, parked or out of 1.0 and ``store_dir`` (the
+    dispatch queue) is not read; without one this is the dispatch queue as it was and ``off_count`` is 0. For the dispatch queue: The items, the journal and the live-seat projections (``running`` cards, no journal line) come from
     ONE read transaction (:func:`levain.desk.ready.snapshot`), so a card's journal line is never newer than its column;
     ``journal_as_of_read`` stays and names that the line is the record as of this read. No CI projection: Levain keeps no CI-wait
     source (flow's ``state/land_waiter`` is flow's).
@@ -132,7 +208,19 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     items: list[Mapping[str, Any]] = []
     journal: dict[str, Mapping[str, Any]] = {}
     queue = "none"
-    if store_dir is not None:
+    v2cards: list[dict[str, Any]] | None = None
+    off_count = 0
+    if producers is None:
+        producers = [x.strip() for x in os.environ.get(PRODUCERS_ENV, "").split(",") if x.strip()]
+    if no_land_waiter is None:
+        no_land_waiter = bool(os.environ.get(NO_LAND_WAITER_ENV))
+    v2 = _v2(board_items, now=generated, producers=producers, no_land_waiter=no_land_waiter)
+    if v2 is not None:
+        v2cards, off_count, bad, as_of = v2
+        unreadable.extend(bad)
+        queue = "unreadable" if bad else "ok"
+        generated = generated or as_of
+    elif store_dir is not None:
         try:
             out = ready.snapshot(store_dir, generated=generated)
             items = list(out.get("items") or [])
@@ -148,7 +236,9 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
         except Exception:  # noqa: BLE001 - never a 500: the store is named unreadable
             unreadable.append(UNREADABLE_DESK)
             queue = "unreadable"
-    by_cat: dict[str, list[dict[str, Any]]] = {c: [] for c in CATEGORIES}
+    by_cat: dict[str, list[dict[str, Any]]] = {c: [] for c in COLUMNS}
+    for card in v2cards or ():
+        by_cat[card["status_category"] if card["status_category"] in by_cat else UNKNOWN].append(card)
     for item in items:
         cat = item.get("status_category")
         if cat == "needs-you":
@@ -162,5 +252,5 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     if band_bad:
         note = (note + "; " if note else "") + f"the needs-you band could not be read here; run `{BAND_HINT}`"
     return {"schema": 1, "generated": generated, "queue": queue, "unreadable": unreadable, "note": note,
-            "band_hint": BAND_HINT, "journal_as_of_read": True,
-            "columns": [{"category": c, "count": len(by_cat[c]), "cards": by_cat[c]} for c in CATEGORIES]}
+            "band_hint": BAND_HINT, "journal_as_of_read": True, "off_count": off_count,
+            "columns": [{"category": c, "count": len(by_cat[c]), "cards": by_cat[c]} for c in COLUMNS if c != UNKNOWN or by_cat[c]]}
