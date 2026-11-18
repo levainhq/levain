@@ -41,7 +41,6 @@ import contextlib
 import copy
 import dataclasses
 import errno
-import io
 import json
 import os
 import stat
@@ -816,7 +815,5 @@ def read_board(items: str | None = None, *, consent_dir: Path | str | None = Non
                               repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=None,
                               consent_dir=None if consent_dir is None else Path(consent_dir))
     said: list[str] = []
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        code, doc = state_doc(args, said.append)
-    return code, doc if isinstance(doc, dict) else None, "\n".join([*said, err.getvalue().strip()]).strip()
+    code, doc = state_doc(args, said.append)       # a refusal goes to ``said``: no process stream is touched, so threads are safe
+    return code, doc if isinstance(doc, dict) else None, "\n".join(said).strip()

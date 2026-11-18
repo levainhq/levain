@@ -148,19 +148,18 @@ def test_table_lines_labels_the_reader_whole_board_under_a_repo_filter_and_count
     assert "reader (whole board)" not in plain and "diverged: a:main" in plain
 
 
-# --- 5: run_state shows what was collected before an exception -------------------------------------------------------
-def test_run_state_writes_the_collected_streams_when_the_read_raises(monkeypatch, capsys):
-    def boom(args, out, err):
-        out.write("partial out\n")
-        err.write("earlier stderr line\n")
+# --- 5: what the read said before an exception is not lost ----------------------------------------------------------
+def test_run_state_keeps_what_the_read_said_when_the_read_raises(monkeypatch, capsys):
+    # state_doc writes a refusal to stderr as it goes (nothing is buffered to lose), so the line said before the raise stands.
+    def boom(args, say=None, *a, **kw):
+        say("earlier stderr line")
         raise RuntimeError("partway")
 
-    monkeypatch.setattr(board_cli, "_state", boom)
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, *a, **kw: boom(args, lambda t: print(t, file=sys.stderr)))
     with pytest.raises(RuntimeError):
         board_cli.run_state(object())
     cap = capsys.readouterr()
-    assert cap.out == "partial out\n" and cap.err == "earlier stderr line\n"
-    assert sys.stdout is not None
+    assert cap.out == "" and cap.err == "earlier stderr line\n"
 
 
 def test_table_lines_takes_the_label_from_the_docs_scope_and_marks_idless_audit_lines():

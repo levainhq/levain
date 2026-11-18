@@ -3,6 +3,7 @@ validator, the durable append, the bounded marker, a drained bad-seq report, the
 ``ready show``'s scope. Scratch stores only."""
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import sqlite3
@@ -27,17 +28,16 @@ def desk_board(tmp_path):
 
 # --- 1: state_doc never touches the process's streams ----------------------------------------------------------------
 def test_state_doc_from_threads_while_another_prints_keeps_every_doc_and_the_real_stdout(monkeypatch):
-    def fake_state(args, out, err):
+    # P2 made board_cli.state_doc(args, say) stream-free (it returns the doc and hands refusals to ``say``); read_board
+    # is that call plus the text, so it never redirects a process stream and threads cannot capture each other.
+    def fake_state(args, say=None, *a, **kw):
         tag = str(args.consent_dir)
-        out.write('{"tag": "' + tag + '", "pad": [')
         for _ in range(20):
-            time.sleep(0.001)                       # yield: another thread runs while this one is mid-write
-            out.write("1, ")
-        out.write('0]}\n')
-        err.write("err-" + tag)
-        return 0
+            time.sleep(0.001)                       # yield: another thread runs while this one is mid-read
+        say("err-" + tag)
+        return 0, {"tag": tag}
 
-    monkeypatch.setattr(board_cli, "_state", fake_state)
+    monkeypatch.setattr(board_cli, "state_doc", fake_state)
     original = sys.stdout, sys.stderr
     got: dict[str, tuple] = {}
     stop = threading.Event()
@@ -65,21 +65,17 @@ def test_state_doc_from_threads_while_another_prints_keeps_every_doc_and_the_rea
         assert code == 0 and doc["tag"] == name and err == "err-" + name        # nobody's output leaked into anybody's
 
 
-def test_state_doc_says_what_was_emitted_when_it_is_not_json(monkeypatch):
-    def junk(args, out, err):
-        out.write("not json " + "x" * 500)
-        return 0
-
-    monkeypatch.setattr(board_cli, "_state", junk)
+def test_read_board_gives_none_for_a_doc_that_is_not_an_object(monkeypatch):
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, *a, **kw: (0, ["not", "an", "object"]))
     code, doc, err = board_cli.read_board()
-    assert code == 0 and doc is None and "not json" in err and err.endswith("...") and len(err) < 400
+    assert code == 0 and doc is None
 
 
 def test_run_state_still_prints_to_the_real_streams(monkeypatch, capsys):
-    monkeypatch.setattr(board_cli, "_state", lambda a, out, err: (out.write("O\n"), err.write("E\n"), 3)[2])
-    assert board_cli.run_state(object()) == 3
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, *a, **kw: (3, {"schema": 3, "as_of": None, "items": [], "audit": []}))
+    assert board_cli.run_state(argparse.Namespace(json=True)) == 3
     cap = capsys.readouterr()
-    assert (cap.out, cap.err) == ("O\n", "E\n")
+    assert '"schema": 3' in cap.out and cap.err == ""
 
 
 # --- 2: the claim cell is read with the write validator --------------------------------------------------------------
