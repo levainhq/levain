@@ -850,7 +850,7 @@ def test_the_flights_are_bounded_across_keys_and_a_finished_one_leaves_no_entry(
     while len(starts) < n and time.monotonic() < deadline:
         time.sleep(0.01)
     over = flight.get(slow, 0.05, key="one-too-many")
-    assert len(starts) == n and over.get("building") is True                                           # no new thread past the bound
+    assert len(starts) == n and over.get("building") is False                                          # no new thread past the bound
     gate.set()
     for w in waiters:
         w.join(10)
@@ -884,8 +884,83 @@ def test_use_import_focus_writes_the_config_then_the_tombstone_then_the_pointer(
     real_cfg, real_ptr = board_store.write_config, board_store._write_pointer
     monkeypatch.setattr(board_store, "write_config", lambda *a, **k: (order.append("config"), real_cfg(*a, **k))[1])
     monkeypatch.setattr(board_store, "_write_pointer", lambda *a, **k: (order.append("pointer"), real_ptr(*a, **k))[1])
+    real_replace = os.replace
+
+    def replace(src, dst, *a, **k):                    # the tombstone is the rename that lands ON the focus file
+        if str(dst) == str(focus):
+            order.append("tombstone")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", replace)
     from levain.cli import main
 
     rc = main(["board", "use", str(tmp_path / "s"), "--import-focus", str(focus), "--briefcase", str(base), "--no-land-waiter", "--by", "t",
                "--author-kind", "operator"])
-    assert rc == 0 and order == ["config", "pointer"] and "moved_to" in focus.read_text()
+    assert rc == 0 and order == ["config", "tombstone", "pointer"] and "moved_to" in focus.read_text()
+
+
+def test_a_fresh_store_mutes_only_the_git_sources_a_failing_producer_or_a_corrupt_store_id_still_reads_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    d = tmp_path / "f"
+    seed.board("use", str(d), "--no-land-waiter")
+    got = []
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: None, lambda *a, **k: pytest.fail("no repository is read"), got, strict_store=True)
+    assert rc == 0 and doc["audit"] == [] and got == [] and board.build(None, None)["queue"] == "ok"      # clean and fresh: empty, ok
+    got = []
+    rc, doc = board_cli.state_doc(_state_args(producers=["ghost"]), lambda t: None, lambda *a, **k: pytest.fail("no repository is read"),
+                                  got, strict_store=True)
+    assert rc != 0 and doc is not None and got and any("ghost" in a["why"] or "unreadable" in a["why"] for a in doc["audit"])
+    assert not any(a["why"].startswith(("main unreadable", "chain unreadable", "refs unreadable", "documents unreadable")) for a in doc["audit"])
+    (d / board_store.STORE_ID_NAME).write_bytes(b"\xff\xfe")                                              # a store.id that cannot be read
+    seen = []
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: seen.append(t), lambda *a, **k: pytest.fail("no repository is read"), [], strict_store=True)
+    assert rc != 0 and (doc is None and seen or any("unreadable" in a["why"] for a in doc["audit"]))
+
+
+def test_a_non_store_target_is_a_legacy_items_file_that_must_exist_in_the_cockpit_and_the_cli_alike(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    d = tmp_path / "dir"
+    d.mkdir()
+    monkeypatch.setenv("LEVAIN_BOARD_ITEMS", str(d / "gone.jsonl"))                                       # a missing file in an existing dir
+    v = board.build(None, None)
+    assert v["queue"] == "unreadable" and v["unreadable"] and v.get("building") is not True
+    seen = []
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: seen.append(t), strict_store=True)
+    assert rc != 0 and doc is None and seen
+    (d / "items.jsonl").write_text("")                                                                    # a dir with a repos.jsonl and no store.id
+    (d / "repos.jsonl").write_text("")
+    monkeypatch.setenv("LEVAIN_BOARD_ITEMS", str(d / "items.jsonl"))
+    assert not board_store.is_store(board_store.resolve_store(str(d / "items.jsonl")))
+    v = board.build(None, None)
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: None, lambda *a, **k: ({"evidence_v": 2}, {"repo": "x"}), strict_store=True)
+    assert not any("registry" in u or "repos.jsonl" in u for u in v["unreadable"])                       # the registry beside it is read in neither place
+    assert doc is not None and doc["reader"] == {"repo": "", "repos": []} and not any("registry" in a["why"] for a in doc["audit"])
+
+
+def test_a_key_with_no_run_past_the_flight_cap_says_retry_not_building():
+    flight = board.Flight()
+    gate = threading.Event()
+    good = {"schema": 1, "generated": "g", "queue": "ok", "unreadable": [], "note": None, "columns": []}
+    started = []
+
+    def slow():
+        started.append(1)
+        gate.wait(10)
+        return dict(good)
+
+    n = board.Flight.MAX_FLIGHTS
+    ws = [threading.Thread(target=lambda k=k: flight.get(slow, 5, key=k)) for k in range(n)]
+    for w in ws:
+        w.start()
+    deadline = time.monotonic() + 5
+    while len(started) < n and time.monotonic() < deadline:
+        time.sleep(0.01)
+    over = flight.get(slow, 0.05, key="no-run")
+    assert over["building"] is False and "retry" in over["note"] and over["queue"] == "unreadable"
+    busy = flight.get(slow, 0.05, key=0)                                                                  # a key that HAS a run: still "building"
+    assert busy.get("building") is True
+    gate.set()
+    for w in ws:
+        w.join(10)

@@ -220,6 +220,16 @@ def _v2_target(snap: Snapshot) -> Any:
     target = snap.target
     if target is None:
         return None
+    if not bs.is_store(target):        # ONE rule for a target that is no store (as in ``state_doc``): a legacy items file, which must
+        if not snap.configured:        # exist as a regular file; a repos.jsonl beside it is not read
+            return None
+        try:
+            ist = os.stat(target.items_path)
+        except OSError as exc:
+            raise bs.BoardError(f"the items file {target.items_path} cannot be read: {exc.strerror or type(exc).__name__}") from None
+        if not stat.S_ISREG(ist.st_mode):
+            raise bs.BoardError(f"the items file {target.items_path} cannot be read: not a file")
+        return target
     registry = target.store_dir / "repos.jsonl"
     try:
         st = os.stat(registry)         # os.stat, not Path.is_file(): is_file() answers False for EACCES too, and a store we cannot read is not an absent one
@@ -453,7 +463,7 @@ class Flight:
         with self._lock:
             run = self._runs.get(key)
             if run is None and len(self._runs) >= self.MAX_FLIGHTS:
-                return self._stale_or_building(key)
+                return self._too_many(key)
             if run is None:
                 done, slot = threading.Event(), []
                 self._runs[key] = (done, slot)
@@ -472,6 +482,17 @@ class Flight:
         if isinstance(slot[0], BaseException):
             raise slot[0]
         return copy.deepcopy(slot[0])
+
+    def _too_many(self, key: Any) -> dict[str, Any]:
+        """No build runs for ``key`` and the flights are all busy: its last read marked stale, or a board that says to retry
+        (it is not being built, so it is not "building"; the caller holds ``_lock``)."""
+        if key in self._last:
+            return self._stale_or_building(key)
+        board = building_board()
+        board["building"] = False
+        board["unreadable"] = ["too many builds in flight"]
+        board["note"] = "too many board builds in flight; retry"
+        return board
 
     def _stale_or_building(self, key: Any) -> dict[str, Any]:
         """The last read of ``key`` marked stale, or the "building" board when it has none (the caller holds ``_lock``)."""

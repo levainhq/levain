@@ -476,6 +476,11 @@ def run_state(args: argparse.Namespace) -> int:
     return rc
 
 
+#: The sources of a repository read (git and its documents): an empty store reads none, so the stand-in primary has none of them.
+#: Every other source (seats, band, waiters, a producer, the store's id) is read there too, and a failure of one still shows.
+_GIT_SKIPPED = frozenset({"main", "chain", "branches", "refs", "documents", "unattributed"})
+
+
 def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None,
               unreadable: list[str] | None = None, strict_store: bool = False,
               target: bs.Target | None = None) -> tuple[int, dict[str, Any] | None]:
@@ -651,7 +656,8 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
                        primary_repo=summary["repo"] if cross else None, label_primary=whole or empty_store, unread_repos=unread_why)
     if empty_store:                    # nothing was read, and nothing failed to be: the stand-in primary's sources are not "unreadable"
-        mute = {f"{src} unreadable: {why}" for src, why in primary.unreadable.items()}
+        mute = {f"{src} unreadable: {why}" for src, why in primary.unreadable.items()      # by source, never by text: only the git sources
+                if src in _GIT_SKIPPED and why == "not supplied"}                          # skipped because no repo was read are quiet
         keep = lambda w: w not in mute and not w.startswith("stale_evidence:")  # noqa: E731
         board = dataclasses.replace(board, audit=tuple(x for x in board.audit if x.id is not None or keep(x.why)),
                                     problems=tuple(w for w in board.problems if keep(w)))
