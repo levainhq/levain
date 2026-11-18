@@ -1516,18 +1516,22 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
     with_source(p)
     p.set_defaults(func=run(lambda a, t: said(a, *track(t, a.name, a.words, a.by, author=author_of(a), migration=a.migration, relay=relay(a), seal=seal(a)), "tracked", "already tracked")))
 
-    def lazy_authority() -> Any:
-        """The authority source a RELAYED abandon-track's cuts get: resolved and replayed only when a cut's cited abandon is
-        SIGNED (``board_sign.cause_snapshot``): a relayed re-run on a repo whose signed abandon stands finishes its cuts
-        citing that one (levain 32 ruling), and a relayed cause still never reads the log (codex 49, gemini 101)."""
-        from levain.desk import board_sign
-        return board_sign.resolve_authority()()
+    def lazy_authority(a: Any) -> Any:
+        """The authority source a RELAYED abandon-track's cuts get: ``_source(a)``, the ONE rule every abandon-track resolves
+        by, but deferred: it is resolved and replayed only when a cut's cited abandon is SIGNED (``board_sign.cause_snapshot``),
+        so a relayed re-run on a repo whose signed abandon stands finishes its cuts citing that one (levain 32 ruling), and a
+        relayed cause still never reads the log (codex 49, gemini 101). An install with no log resolves to no snapshot, as
+        the unrelayed path does: the cut's own refusal speaks, not a missing-log one."""
+        def source() -> Any:
+            resolved = _source(a)
+            return None if resolved is None else resolved()
+        return source
 
     def run_abandon(a: Any, t: bs.Target) -> None:
         rl = relay(a)
         sl = seal(a)
         said: list[str] = []
-        authority = None if sl is not None or seal_of is None else (lazy_authority if rl is not None else _source(a))
+        authority = None if sl is not None or seal_of is None else (lazy_authority(a) if rl is not None else _source(a))
         repo, cut = abandon_track(t, a.name, a.words, a.by, author=author_of(a), seal=sl, relay=rl, authority=authority,
                                   out=said)
         what = f"cut {len(cut)} items: {', '.join(cut)}" if cut else ("nothing to cut" if said else "cut 0 items")
