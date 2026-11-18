@@ -3,8 +3,8 @@
 A pure function over facts the caller reads; it opens no store and reads no file. What a seat's close is judged by is the
 protocol its LAUNCH recorded (:attr:`levain.desk.lease.Launch.protocol`), never the repository's mode now:
 
-* ``tracked``: for each item the seat touched, at least one episode written after its launch whose ``source`` is the seat's
-  durable key and that is tagged ``item:<id>``, AND a closing trailer or an ``amend --done`` for that item.
+* ``tracked``: for each item the seat touched, at least one episode written at or after the launch's whole second whose
+  ``source`` is the seat's durable key and that is tagged ``item:<id>``, AND a closing trailer or an ``amend --done`` for that item.
   A ``tracked`` launch with no readable item claim is NOT closed: it has nothing the predicate can judge;
 * ``legacy`` and ``ceremony``: the old close, ``old_close_ok`` (the caller's reading of the pickup file's CURRENT STATE
   check). When the repository has become tracked while the seat ran (``repo_tracked_now``) its old pickup file is a stub, so
@@ -12,7 +12,14 @@ protocol its LAUNCH recorded (:attr:`levain.desk.lease.Launch.protocol`), never 
   CURRENT STATE close, so such a seat with no item claimed closes by the tracked predicate, which then has no item to want.
 
 Times are compared as instants: each is parsed (an offset is honoured; a time with no offset is unreadable and never
-counts), and an episode written to whole seconds counts when its second is not before the launch's second.
+counts). An episode counts when it is at or after the launch's whole second: episodes are stored at whole seconds and
+launches at microseconds, so an episode in the launch's own second is counted. A launch time that cannot be read is
+reported only when there is an item to judge against it.
+
+Known edges, judged and left:
+
+* the same-second tolerance would count an episode written in the launch's second but before its instant; that was judged
+  not reachable as a false accept, since it needs a close episode for the item written in the very second the seat launched.
 
 Nothing here decides which episodes or trailers exist: the caller (flow's seat close) reads them and passes them in.
 """
@@ -55,8 +62,9 @@ def _instant(text: Any) -> datetime | None:
 
 
 def _after(at: Any, launched: datetime | None) -> bool:
-    """Whether the episode time ``at`` is after the launch, at the episode's own precision: a whole-second time is the
-    second it names, so it counts when that second is not before the launch's."""
+    """Whether the episode time ``at`` is at or after the launch's whole second, at the episode's own precision: a
+    whole-second time is the second it names, so it counts when that second is not before the launch's; a time with a
+    fraction counts when it is after the launch's instant."""
     when = _instant(at)
     if when is None or launched is None:
         return False
@@ -68,17 +76,19 @@ def _after(at: Any, launched: datetime | None) -> bool:
 def tracked_missing(items: Iterable[str], *, key: str, launched_at: str, episodes: Iterable[Mapping[str, Any]],
                     closed_items: Iterable[str]) -> list[str]:
     """What the tracked close lacks, one line each (empty: it holds). ``episodes`` are mappings with ``source``, ``at`` and
-    ``tags`` (or ``metadata.tags``); ``at`` and ``launched_at`` are compared as instants (see the module). ``closed_items``
-    are the item ids a closing trailer or an ``amend --done`` covers."""
+    ``tags`` (or ``metadata.tags``); an episode counts at or after the launch's whole second (see the module).
+    ``closed_items`` are the item ids a closing trailer or an ``amend --done`` covers. An unreadable ``launched_at`` is
+    a missing line only when there are items to judge: with none, nothing is compared against it."""
+    items = list(items)
     launched = _instant(launched_at)
     eps = [e for e in episodes if isinstance(e, Mapping) and e.get("source") == key and _after(e.get("at"), launched)]
     closed = set(closed_items)
     out: list[str] = []
-    if launched is None:
+    if items and launched is None:
         out.append(f"the launch time {str(launched_at)[:40]!r} is unreadable, so no episode can be judged after it")
     for item in items:
         if launched is not None and not any(f"item:{item}" in _tags(e) for e in eps):
-            out.append(f"{item}: no episode with source {key} tagged item:{item} after launch")
+            out.append(f"{item}: no episode with source {key} tagged item:{item} at or after the launch's whole second")
         if item not in closed:
             out.append(f"{item}: no closing trailer (Board-Closes) and no `levain board amend --done` for it")
     return out

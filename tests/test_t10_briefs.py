@@ -180,11 +180,13 @@ def test_the_desk_brief_teaches_the_two_modes_and_the_ceremony_in_order(desk):
     assert "## The work board: two modes" in text and "untracked or tracked" in text
     assert "does not open" not in text
     order = ["\n1. If this install has no item store", "\n2. Read its existing memory", "\n3. Draft ONE review page",
-             "\n4. He answers in conversation", f"\n5. Execute, in this order: `{lv} board begin-track`",
-             f"`{lv} board add --key M:K` for each item", f"where `{lv} charter check` reports on it", f"`{lv} board track` (the one record",
-             "pre-track-<date>/", f"`{lv} board abandon-track`, finish", f"then `{lv} board abandon-done`",
-             f"leaving tracked mode is `{lv} board untrack`", "\n6. Write one `decision` episode"]
-    at = [text.index(x) for x in order]
+             "\n4. He answers in conversation", f"\n5. Execute, in this order: `{lv} board begin-track NAME",
+             f"for each item, `{lv} board add --repo NAME", f"where `{lv} charter check --repo DIR` reports on it",
+             f"`{lv} board track NAME --migration M", "pre-track-<date>/", f"`{lv} board abandon-track NAME",
+             f"then `{lv} board abandon-done NAME", f"leaving tracked mode is `{lv} board untrack NAME",
+             "\n6. Write one `decision` episode"]
+    steps = text.index("In this order:")                       # the verb list above spells the same forms
+    at = [text.index(x, steps) for x in order]
     assert at == sorted(at), dict(zip(order, at))
     assert "--migration M" in text and "Board-Seat" in text
 
@@ -234,13 +236,29 @@ def _desk_workspace(tmp_path, monkeypatch):
     return ws
 
 
-def _verb_lines(lv):
-    """Every board or charter command the desk brief's verb list spells, as argv after the install's prefix."""
+FILL = {"NAME": "alpha", "NAME#N": "alpha#1", "M": "m1", "M:K": "m1:a", "DECISION": "parked", "SHA256": "a" * 64}
+
+
+def _printed_commands(lines, lv):
+    """Every command a brief section prints (each backticked span that starts with the install's command), as argv after
+    the install's prefix."""
     import shlex
 
-    lines = [x for x in cl._board_modes_section(lv) if x.startswith("- ")]
-    cmds = [c for x in lines for c in re.findall(r"`([^`]+)`", x) if c.startswith(lv + " ")]
-    return [shlex.split(c.removeprefix(lv + " ")) for c in cmds]
+    cmds = [c for x in lines for c in re.findall(r"`([^`]+)`", x) if c == lv or c.startswith(lv + " ")]
+    return [shlex.split(c.removeprefix(lv).strip()) for c in cmds]
+
+
+def _verb_lines(lv):
+    """Every board or charter command the desk brief's board section prints (the verb list AND each ceremony step)."""
+    return _printed_commands(cl._board_modes_section(lv), lv)
+
+
+def _parses(parser, argv):
+    """The real parser's reading of ``argv``; a line argparse refuses fails the test, naming it."""
+    try:
+        return parser.parse_args(argv)
+    except SystemExit:
+        pytest.fail(f"a printed command does not parse: {argv}")
 
 
 def test_every_board_and_charter_line_of_the_brief_parses_and_passes_the_door(home, tmp_path, monkeypatch):  # noqa: F811
@@ -252,13 +270,14 @@ def test_every_board_and_charter_line_of_the_brief_parses_and_passes_the_door(ho
 
     _desk_workspace(tmp_path, monkeypatch)
     lv = inst_.desk_levain(sys.executable)
-    fill = {"NAME": "alpha", "NAME#N": "alpha#1", "DIR": str(tmp_path), "FILE": str(tmp_path / "m.json"), "M": "m1",
-            "DECISION": "parked"}
+    fill = {**FILL, "DIR": str(tmp_path), "FILE": str(tmp_path / "m.json")}
     parser = build_parser()
     seen = set()
-    for argv in _verb_lines(lv):
+    printed = _verb_lines(lv)
+    assert len(printed) > len(inst_.DESK_BOARD_VERBS)          # the ceremony steps are printed commands too, and checked
+    for argv in printed:
         argv = [fill.get(a, a) for a in argv]
-        args = parser.parse_args(argv)
+        args = _parses(parser, argv)
         assert door.refusal(parser, args) is None, argv
         seen.add(" ".join(argv[:2]))
     assert seen == set(inst_.DESK_BOARD_VERBS)                 # the brief spells every opened verb, and only those
@@ -448,3 +467,61 @@ def test_times_are_compared_as_instants(launched, at, counts):
 def test_an_empty_top_level_tag_list_reads_the_metadata_tags():
     ep = {"source": KEY, "at": "2026-11-17T11:00:00Z", "tags": [], "metadata": {"tags": ["item:levain#1"]}}
     assert _close("tracked", episodes=[ep], closed_items=["levain#1"]).ok
+
+
+# --- T10 fix 3 ---------------------------------------------------------------------------------------------------------
+def test_every_command_the_worker_board_section_prints_parses():
+    # codex OPEN 10: the worker's close names `board amend` in its complete form, not a bare `amend --done`
+    from types import SimpleNamespace
+
+    from levain.cli import build_parser
+    from levain.install import desk_levain
+
+    lv = desk_levain(sys.executable)
+    parser = build_parser()
+    for items in (("alpha#1",), ()):
+        ln = SimpleNamespace(board_items=items, protocol="tracked", session_key=KEY)
+        printed = _printed_commands(cl._board_item_section(ln), lv)
+        assert any(a[:2] == ["board", "amend"] for a in printed)
+        for argv in printed:
+            _parses(parser, [FILL.get(a, a) for a in argv])
+
+
+def test_the_desk_brief_scopes_the_token_to_coord_drops_and_thread_writes():
+    src = __import__("inspect").getsource(cl._brief_text)
+    assert "Every write goes" not in src
+    assert "Every `drops`, `thread` and `coord` write takes your token" in src
+    assert "they take no token, and their complete forms are in" in src
+    text = "\n".join(cl._board_modes_section("lv"))
+    assert "`lv coord spawn" not in text                        # a spawn shape is never printed as a command here
+
+
+def test_an_item_of_an_unregistered_repo_is_refused_wherever_the_launch_runs(desk, registry, mkrepo, board_store_dir, tmp_path, capsys):  # noqa: F811
+    # codex OPEN 6 / gemini MED 1: `--item typo#1` names no registered repository, so it cannot be a board item
+    store, token = desk
+    a, b = mkrepo("alpha"), mkrepo("beta")
+    track_ready(capsys, tmp_path, board_store_dir, a, "alpha")
+    ok(capsys, "track", "alpha", "--words", "yes", *A)                        # alpha tracked
+    ok(capsys, "register", "beta", "--path", str(b), "--words", "w", *A)      # beta untracked
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    before = (board_store_dir / "repos.jsonl").read_bytes()
+    for cwd in (a, b, outside):
+        with pytest.raises(inst.SpawnRefused, match="'typo', which is not a registered repository"):
+            _spawn(store, token, registry, cwd, item="typo#1")
+    assert (board_store_dir / "repos.jsonl").read_bytes() == before            # nothing registered by a refusal
+    ln = _spawn(store, token, registry, a, item="alpha#1")                      # the right item in its own repo
+    assert (ln.protocol, ln.board_items) == ("tracked", ("alpha#1",))
+    with pytest.raises(inst.SpawnRefused, match="item of alpha"):              # a registered repo other than cwd's
+        _spawn(store, token, registry, b, item="alpha#1")
+
+
+def test_an_unreadable_launch_time_strands_no_seat_that_has_no_item():
+    # gemini LOW 2: with no item nothing is judged against the launch time, so the dual-accept close holds
+    for protocol in ("legacy", "ceremony"):
+        got = seat_close.check_close(protocol, [], key=KEY, launched_at="2026-11-17 10:00:00", episodes=[], closed_items=[],
+                                     old_close_ok=False, repo_tracked_now=True)
+        assert got.ok and got.via == "tracked" and got.missing == (), protocol
+    got = seat_close.check_close("legacy", ["levain#1"], key=KEY, launched_at="2026-11-17 10:00:00", episodes=[],
+                                 closed_items=["levain#1"], old_close_ok=False, repo_tracked_now=True)
+    assert not got.ok and "unreadable" in got.missing[0]                       # with an item, it still reports it
