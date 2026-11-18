@@ -944,8 +944,7 @@ def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, 
         if problem == "pack":
             raise ReadSetRefused("readset-surplus", f"the pack header does not hold exactly {N} objects")
         copy, p = os.path.join(workdir, _COPY), os.path.join(workdir, _P)
-        limits = clone_limits()
-        rc, err = _run_bounded(clone_argv(copy, p), env=_clone_env(), limits=limits, cwd=workdir)
+        limits, rc, err = _clone_under_limits(copy, p, workdir)
         if rc != 0:
             tail = err.decode("utf-8", "replace").strip().splitlines()
             # the first line names the cause (an fsck message); the last is the transport's generic one
@@ -976,6 +975,39 @@ def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, 
                                digest=D, objects=N, limits=limits, repo_settings=settings)
     finally:
         _close_dir(wfd, workdir)
+
+
+#: [judged] tries the ingest clone gets when its fork is refused for the uid's task count (the first plus two), and the
+#: pause before each retry (grows by this much per try).
+CLONE_FORK_TRIES = 3
+CLONE_FORK_PAUSE_S = 0.25
+
+
+def _fork_refused(err: bytes) -> bool:
+    """Is this git stderr a refused fork (``EAGAIN``), the one failure :func:`_clone_under_limits` retries?"""
+    text = err.decode("utf-8", "replace")
+    return "cannot fork()" in text and "Resource temporarily unavailable" in text
+
+
+def _clone_under_limits(copy: str, p: str, workdir: str) -> tuple:
+    """``(limits, rc, stderr)`` of the ingest clone, run under :func:`clone_limits`; a clone whose fork the kernel
+    refused (``EAGAIN``: ``cannot fork() for index-pack``) is run again, at most :data:`CLONE_FORK_TRIES` times in all.
+
+    Why a retry, and why only here: ``RLIMIT_NPROC`` is the uid's task count at the moment of measuring plus a fixed
+    margin, so any other task of the same uid that starts in the gap (a sibling pytest-xdist worker, another dispatch
+    run) can eat the margin and the clone's own children are refused. Reproduced (levain#117): measure, start 150
+    sleeping processes, clone: ``cannot fork() for index-pack: Resource temporarily unavailable``; CI went red on that
+    in three tests. Each retry MEASURES AGAIN, so the limit stays the uid's count at clone time plus the margin, never
+    wider: the bound is not weakened, only taken at the right time. Only that stderr is retried (any other failure, a
+    timeout and every fsck refusal stand at once); git removes its half-made destination when it fails, and a ``p``
+    that is still there after a failed try is not retried over."""
+    for attempt in range(CLONE_FORK_TRIES):
+        limits = clone_limits()
+        rc, err = _run_bounded(clone_argv(copy, p), env=_clone_env(), limits=limits, cwd=workdir)
+        if rc == 0 or attempt == CLONE_FORK_TRIES - 1 or not _fork_refused(err) or os.path.lexists(p):
+            return limits, rc, err
+        time.sleep(CLONE_FORK_PAUSE_S * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def _write_attributes(p: str) -> None:
