@@ -506,14 +506,15 @@ def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now
     return rec
 
 
-def _read_relay(relay, words) -> dict | None:
+def _read_relay(relay, words, manifest_sha256: str | None = None) -> dict | None:
     """The ``source`` for a record relaying ``relay`` = ``(np id, band source)``, read NOW (at write time), or None for no
-    relay. Refuses an unknown or unanswered row and words that are not a verbatim excerpt of the answer."""
+    relay. Refuses an unknown or unanswered row and words that are not a verbatim excerpt of the answer. ``manifest_sha256``
+    (``begin-track`` and ``track``) also holds the question to that digest (``board_relay.check_manifest``)."""
     if relay is None:
         return None
     from levain.desk import board_relay
     np_id, band = relay
-    return board_relay.relay_source(np_id, words, band)
+    return board_relay.relay_source(np_id, words, band, manifest_sha256)
 
 
 def canonical_bytes(rec: Mapping[str, object]) -> bytes:
