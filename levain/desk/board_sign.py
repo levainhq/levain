@@ -67,7 +67,7 @@ from levain.desk import board_store as bs
 __all__ = [
     "ASSERTED_OK", "DECISION_CLASS", "ITEMS_NONE", "NAMESPACE", "POLICY", "SIGNED_GRADES", "Prepared", "Seal", "Verdict",
     "abandon_problem", "admit", "ceremony", "commit_phone", "cut_cause_problem", "earn", "move_is_decision", "prepare", "require_policy", "resolve_authority",
-    "signing_bytes", "terminal_seal", "verify_cause", "verify_record",
+    "key_standing", "signing_bytes", "terminal_seal", "verify_cause", "verify_record",
 ]
 
 NAMESPACE = "levain-board"
@@ -597,6 +597,26 @@ def grade_sig_problem(record: Mapping[str, Any]) -> str | None:
     return None
 
 
+def key_standing(snapshot: Any, fingerprint: str, via: str) -> tuple[str, str, Any]:
+    """The board's rule for a signer's KEY, the one :func:`verify_record` applies, from an authority snapshot
+    (``snapshot.keys``, fingerprint to ``AuthorityKey``) alone: ``(standing, why, key)``. ``refused``: the key is not in the
+    log, is not of the class ``via`` signs with (``terminal``: laptop-presence; ``phone``: display-phone), or is
+    QUARANTINED (:func:`levain.authority.quarantined`); ``why`` says which and ``key`` is the log's key or None.
+    ``revoked``: the log revoked it (``key.revoked_seq``; the snapshot carries no time for it). ``valid``: none of these.
+    Whether a signature verifies under the key is the caller's to check (it needs the signed bytes)."""
+    from levain.authority import DISPLAY_PHONE, LAPTOP, quarantined
+    key = snapshot.keys.get(fingerprint)
+    if key is None:
+        return "refused", f"{fingerprint} is not a key in the authority log", None
+    if key.key_class != (LAPTOP if via == "terminal" else DISPLAY_PHONE):
+        return "refused", f"{fingerprint} is not a {via} key", key
+    if quarantined([key]):
+        return "refused", f"{fingerprint} is quarantined", key
+    if key.revoked_seq is not None:
+        return "revoked", f"{fingerprint} is revoked at seq {key.revoked_seq}", key
+    return "valid", "", key
+
+
 def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
     """The verdict on one record, from the record and an authority snapshot (``snapshot.keys``, fingerprint to
     ``AuthorityKey``) only. Exact grades only: a pre-cutover record (no ``grade``, no ``prev``) or one graded ``legacy`` is
@@ -604,7 +624,6 @@ def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
     ``sig`` on anything but a signed grade, is ``bad``. A revoked key's signature is reported as signed by a revoked key,
     never silently valid and never erased (the record's own time is the signer's claim, so no "valid at its time" is
     asserted). Raises ``VerifierUnavailable`` when ssh-keygen cannot run: that is no verdict on the record."""
-    from levain.authority import DISPLAY_PHONE, LAPTOP, quarantined
     from levain.authority_sig import verify_link_sig
     grade = record.get("grade")
     structural = grade_sig_problem(record)
@@ -628,16 +647,12 @@ def verify_record(record: Mapping[str, Any], snapshot: Any) -> Verdict:
     author = record.get("author")
     if not isinstance(author, Mapping) or author.get("kind") != "operator":
         return _bad("a signed record's author must be the operator")
-    key = snapshot.keys.get(fp)
-    if key is None:
-        return _bad(f"{fp} is not a key in the authority log")
-    if key.key_class != (LAPTOP if via == "terminal" else DISPLAY_PHONE):
-        return _bad(f"{fp} is not a {via} key")
-    if quarantined([key]):
-        return _bad(f"{fp} is quarantined")
+    standing, why, key = key_standing(snapshot, fp, via)
+    if standing == "refused":
+        return _bad(why)
     if not verify_link_sig(signing_bytes(record), armored, public_key=key.public_key, fingerprint=fp, namespace=NAMESPACE):
         return _bad()
-    if key.revoked_seq is not None:
+    if standing == "revoked":
         when = getattr(key, "revoked_at", None)           # the authority log does not carry a time on a key: usually unknown
         return Verdict("revoked", f"signed by {fp}, revoked at seq {key.revoked_seq}" + (f" ({when})" if when else "")
                        + "; the record's own time is the signer's claim", fp, key.revoked_seq)
