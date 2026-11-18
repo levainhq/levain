@@ -19,7 +19,9 @@ import os
 import stat
 import threading
 import warnings
+import zlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -95,13 +97,19 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
 # (any `unreadable`) is never kept: it is retried by the next build. One build per repo at a time (single flight): a build
 # that arrives during another waits for it and takes its result from the cache. How often the panel is read is the panel
 # refresher's own interval (grep `board=` in levain/web_server.py), not stated here.
-# Both tables are bounded, least recently used out (a long-lived server cycling through checkouts never grows them without end): at
-# most ``EVIDENCE_MAX`` repos' evidence, ``LOCKS_MAX`` build locks, and a lock that is held (a build running) is never the one evicted.
+# The evidence table is bounded, least recently used out (a long-lived server cycling through checkouts never grows it without end): at
+# most ``EVIDENCE_MAX`` repos. The build locks are STRIPED, not kept per repo: a fixed tuple of ``LOCK_STRIPES`` locks, a repo's lock
+# the one at ``crc32(repo key) % LOCK_STRIPES``. There is no table of locks to grow or evict, so no lock can be dropped between
+# being looked up and being taken (two repos that share a stripe just wait for each other).
 _EVIDENCE_CACHE: OrderedDict[str, tuple[Any, Any, Any]] = OrderedDict()
 _EVIDENCE_LOCK = threading.Lock()
-_BUILD_LOCKS: OrderedDict[str, threading.Lock] = OrderedDict()
 EVIDENCE_MAX = 64
-LOCKS_MAX = 256
+LOCK_STRIPES = 32
+_BUILD_LOCKS: tuple[threading.Lock, ...] = tuple(threading.Lock() for _ in range(LOCK_STRIPES))
+
+
+def _build_lock(key: str) -> threading.Lock:
+    return _BUILD_LOCKS[zlib.crc32(key.encode("utf-8", "surrogateescape")) % LOCK_STRIPES]
 
 
 def _refs_state(repo: Path) -> Any:
@@ -140,17 +148,7 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
     got = _hit(key, state, arg_key)
     if got is not None:
         return got
-    with _EVIDENCE_LOCK:
-        lock = _BUILD_LOCKS.get(key)
-        if lock is None:
-            lock = _BUILD_LOCKS[key] = threading.Lock()
-        _BUILD_LOCKS.move_to_end(key)
-        for old in [k for k in _BUILD_LOCKS if k != key]:      # least recently used first; a lock in use stays
-            if len(_BUILD_LOCKS) <= LOCKS_MAX:
-                break
-            if not _BUILD_LOCKS[old].locked():
-                del _BUILD_LOCKS[old]
-    with lock:                                   # single flight: a second build waits here, then finds the first one's result
+    with _build_lock(key):                                   # single flight: a second build waits here, then finds the first one's result
         state = _refs_state(Path(repo))
         if state is None:
             return be.read_git_evidence(repo, **args)
@@ -168,45 +166,80 @@ def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: st
         return out
 
 
-class _EmptyStore(Exception):
-    """A configured store whose directory exists and that has no ``repos.jsonl`` yet: nothing is tracked, which is not a failure."""
+@dataclass(frozen=True)
+class Snapshot:
+    """What ONE board request is of, resolved once: the target (store directory, items file, pointered), the refusal when the store
+    could not be resolved, whether the install names a store at all (``configured``), and ``key``: the store directory, its
+    ``store.id``, the stamps of its board config and registry. The flight key is ``key`` and the build is handed THIS value, so the
+    key and the board it names cannot diverge (nothing in the build resolves the pointer again)."""
+
+    target: Any
+    refusal: str | None
+    configured: bool
+    key: Any
 
 
-def _v2_target(items: Path | str | None) -> Any:
-    """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read).
-    A store that is CONFIGURED (a pointer names it, or ``store.id`` is in it, or ``items`` / ``$LEVAIN_BOARD_ITEMS`` names it) and
-    cannot be read (its directory missing or not a directory, its ``repos.jsonl`` not a file or refused) raises ``bs.BoardError``: that is
-    an unreadable board, never a quiet fall back to "no queue yet" or the v1 queue. A store directory with NO ``repos.jsonl`` yet (what
-    ``board use`` just made) raises ``_EmptyStore``: a healthy empty board. Only an install with no store at all reads None."""
+def take_snapshot(items: Path | str | None = None) -> Snapshot:
+    """Resolve the board store once. Cheap (a few stats and a small read) and never raises."""
+    from levain.desk import board_evidence as be
     from levain.desk import board_store as bs
 
     try:
         target = bs.resolve_store(items)
     except bs.BoardError as exc:
         if str(exc).startswith("no items store"):
-            return None
-        raise
+            return Snapshot(None, None, False, ("none",))
+        return Snapshot(None, str(exc), True, ("unresolved", str(exc)[:200]))
+    except Exception as exc:  # noqa: BLE001 - a snapshot is never a reason for a 500
+        return Snapshot(None, f"the board store cannot be resolved ({type(exc).__name__})", True, ("unresolved", type(exc).__name__))
+    d = target.store_dir
+    try:
+        sid = (d / bs.STORE_ID_NAME).read_text("utf-8").strip()
+    except (OSError, ValueError):
+        sid = None
+    configured = bool(target.pointered or (items is not None and str(items) != "") or os.environ.get(bs.ITEMS_ENV) or bs.is_store(target))
+    return Snapshot(target, None, configured, (str(d), sid, be.stat_stamp(d / bs.CONFIG_NAME), be.stat_stamp(d / "repos.jsonl")))
+
+
+def store_key(items: Path | str | None = None) -> Any:
+    """The key of a fresh snapshot (see :class:`Snapshot`); a caller that also builds takes the snapshot itself and uses both."""
+    return take_snapshot(items).key
+
+
+def _v2_target(snap: Snapshot) -> Any:
+    """The snapshot's board store to read, or None when this install has none yet (else the dispatch queue is read). A store that
+    is CONFIGURED (a pointer names it, or ``store.id`` is in it, or ``items`` / ``$LEVAIN_BOARD_ITEMS`` names it) and cannot be
+    read (its directory missing or not a directory, its ``repos.jsonl`` not a file, dangling or refused) raises ``bs.BoardError``:
+    an unreadable board, never a quiet fall back to "no queue yet" or the v1 queue. A configured store with NO ``repos.jsonl`` is
+    returned like any other: ``state_doc`` reads it (an empty board when it holds no item, its items read unknown when it does).
+    There is no shortcut here that decides a store is empty without reading it. Only an install with no store at all reads None."""
+    from levain.desk import board_store as bs
+
+    if snap.refusal is not None:
+        raise bs.BoardError(snap.refusal)
+    target = snap.target
+    if target is None:
+        return None
     registry = target.store_dir / "repos.jsonl"
-    configured = bool(target.pointered or (items is not None and str(items) != "") or os.environ.get(bs.ITEMS_ENV)
-                      or os.path.lexists(target.store_dir / bs.STORE_ID_NAME))
     try:
         st = os.stat(registry)         # os.stat, not Path.is_file(): is_file() answers False for EACCES too, and a store we cannot read is not an absent one
     except (FileNotFoundError, NotADirectoryError) as exc:
-        if configured:
-            if isinstance(exc, FileNotFoundError):
-                try:
-                    dst = os.stat(target.store_dir)
-                except OSError as dexc:
-                    raise bs.BoardError(f"the board store {target.store_dir} cannot be read: {dexc}") from None
-                if stat.S_ISDIR(dst.st_mode):
-                    raise _EmptyStore from None      # a store `board use` just made, no repo registered yet: a healthy, empty board
-            raise bs.BoardError(f"the board store {target.store_dir} cannot be read: {registry.name} is not reachable") from None
-        return None                    # no registry file: `levain board state` would read the repository in ITS working directory, which for a
+        if os.path.lexists(registry):  # the name is there but leads nowhere (a dangling symlink): that is a registry that cannot be read
+            raise bs.BoardError(f"the board store's {registry.name} cannot be read: it leads nowhere") from None
+        if not snap.configured:
+            return None                # no registry file: `levain board state` would read the repository in ITS working directory, which for a
                                        # cockpit is wherever the server started. That is not a board; this install has none yet.
+        try:
+            dst = os.stat(target.store_dir)
+        except OSError as dexc:
+            raise bs.BoardError(f"the board store {target.store_dir} cannot be read: {dexc}") from None
+        if not stat.S_ISDIR(dst.st_mode):
+            raise bs.BoardError(f"the board store {target.store_dir} cannot be read: not a directory") from None
+        return target
     except OSError as exc:
         raise bs.BoardError(f"the board store {registry} cannot be read: {exc}") from None
     if not stat.S_ISREG(st.st_mode):
-        if configured:
+        if snap.configured:
             raise bs.BoardError(f"the board store's {registry.name} is not a file")
         return None
     return target
@@ -235,7 +268,7 @@ def _unreadable_names(why: list[str]) -> list[str]:
     return out
 
 
-def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
+def _v2(items: Path | str | None, *, now: str | None, snap: Snapshot | None = None) -> tuple[list[dict[str, Any]], int, list[str], str | None] | None:
     """``(cards, off_count, unreadable, as_of)`` from the board store, or None when there is none. ``cards`` holds every item
     the board shows but a needs-you one (the band owns that column) and an off one (counted, not drawn). ``unreadable`` names every
     SOURCE the read could not read (see :func:`levain.desk.board_cli.state_doc`'s ``unreadable``): the one rule is that exit 3 and
@@ -246,10 +279,9 @@ def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, An
     from levain.desk import board_evidence as be
     from levain.desk import board_store as bs
 
+    snap = snap or take_snapshot(items)
     try:
-        target = _v2_target(items)
-    except _EmptyStore:
-        return [], 0, [], None
+        target = _v2_target(snap)
     except bs.BoardError as exc:
         return [], 0, _unreadable_names([str(exc)]), None
     if target is None:
@@ -258,7 +290,7 @@ def _v2(items: Path | str | None, *, now: str | None) -> tuple[list[dict[str, An
                               land_waiter=None, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
     bad: list[str] = []
     try:
-        rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence, bad)
+        rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence, bad, strict_store=True, target=target)
     except Exception:  # noqa: BLE001 - never a 500: the board is named unreadable
         rc, doc = bc.EXIT_USAGE, None
     if doc is None:
@@ -323,7 +355,7 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
 
 
 def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
-          drop_dir: Path | str | None = None, board_items: Path | str | None = None) -> dict[str, Any]:
+          drop_dir: Path | str | None = None, board_items: Path | str | None = None, snapshot: Snapshot | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], off_count, unreadable, band_hint,
     note, journal_as_of_read, as_of}``: ``generated`` is the time of this build, ``as_of`` the OLDEST fetch time of the repos read
     (null when a repo has none, or there is no board store). With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
@@ -345,7 +377,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     v2cards: list[dict[str, Any]] | None = None
     off_count = 0
     as_of: str | None = None             # the OLDEST fetch of the repos read (the board's freshness), its own key: ``generated`` stays this build's clock
-    v2 = _v2(board_items, now=generated)
+    v2 = _v2(board_items, now=generated, snap=snapshot)
     if v2 is not None:
         v2cards, off_count, bad, as_of = v2
         unreadable.extend(bad)
@@ -398,28 +430,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     return {"schema": 1, "generated": generated, "as_of": as_of, "queue": queue, "unreadable": unreadable, "note": note,
             "band_hint": BAND_HINT, "journal_as_of_read": True, "off_count": off_count,
             "columns": [{"category": c, "count": len(by_cat[c]) + more[c], "cards": by_cat[c]}
-                        for c in COLUMNS if c != UNKNOWN or by_cat[c]]}
-
-
-def store_key(items: Path | str | None = None) -> Any:
-    """What a board build is OF: the resolved store directory, its ``store.id``, the stamp of its board config and the registry, so
-    two reads of two stores (a ``levain board use`` between them, a config rewritten) never share a flight or an answer. A store
-    that cannot be resolved is a key of its own, naming why. Cheap (a few stats and a small read) and never raises."""
-    from levain.desk import board_evidence as be
-    from levain.desk import board_store as bs
-
-    try:
-        target = bs.resolve_store(items)
-    except bs.BoardError as exc:
-        return ("unresolved", str(exc)[:200])
-    except Exception as exc:  # noqa: BLE001 - a key is never a reason for a 500
-        return ("unresolved", type(exc).__name__)
-    d = target.store_dir
-    try:
-        sid = (d / bs.STORE_ID_NAME).read_text("utf-8").strip()
-    except (OSError, ValueError):
-        sid = None
-    return (str(d), sid, be.stat_stamp(d / bs.CONFIG_NAME), be.stat_stamp(d / "repos.jsonl"))
+                        for c in COLUMNS if c != UNKNOWN or by_cat[c] or more[c]]}
 
 
 class Flight:
@@ -431,6 +442,7 @@ class Flight:
     another key's board, fresh or stale."""
 
     KEPT = 4              # the last boards kept (one per key, the most recent keys): a host with one store keeps one
+    MAX_FLIGHTS = 4       # builds in progress across ALL keys: past it a request starts no thread, it is answered from the last read of its key
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -440,6 +452,8 @@ class Flight:
     def get(self, fn: Callable[[], dict[str, Any]], wait_s: float, key: Any = None) -> dict[str, Any]:
         with self._lock:
             run = self._runs.get(key)
+            if run is None and len(self._runs) >= self.MAX_FLIGHTS:
+                return self._stale_or_building(key)
             if run is None:
                 done, slot = threading.Event(), []
                 self._runs[key] = (done, slot)
@@ -453,16 +467,20 @@ class Flight:
         if not done.wait(wait_s):
             with self._lock:
                 if not done.is_set():          # still running: the last read of this key, or "building"
-                    last = copy.deepcopy(self._last.get(key))
-                    if last is None:
-                        return building_board()
-                    last["stale"] = True
-                    last["note"] = (last["note"] + "; " if last.get("note") else "") + "the board is being rebuilt: this is the last read"
-                    return last
+                    return self._stale_or_building(key)
             # it finished while this call was giving up: the fresh result beats the stale one
         if isinstance(slot[0], BaseException):
             raise slot[0]
         return copy.deepcopy(slot[0])
+
+    def _stale_or_building(self, key: Any) -> dict[str, Any]:
+        """The last read of ``key`` marked stale, or the "building" board when it has none (the caller holds ``_lock``)."""
+        last = copy.deepcopy(self._last.get(key))
+        if last is None:
+            return building_board()
+        last["stale"] = True
+        last["note"] = (last["note"] + "; " if last.get("note") else "") + "the board is being rebuilt: this is the last read"
+        return last
 
     def _work(self, fn: Callable[[], dict[str, Any]], done: threading.Event, slot: list[Any], key: Any) -> None:
         try:

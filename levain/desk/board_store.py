@@ -48,7 +48,7 @@ from levain.desk import board_chain, work_attach
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
     "TWO_STORES", "add", "amend", "build_record", "canonical_bytes", "chain_prev", "decide", "next_id", "read_item_lines", "read_pointer",
-    "resolve_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config",
+    "resolve_store", "is_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config",
 ]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
@@ -159,6 +159,13 @@ def resolve_store(items: Path | str | None = None, environ: Mapping[str, str] | 
     if home is None:
         raise BoardError("no items store: pass --items PATH or set " + ITEMS_ENV)
     return Target(home, home / ITEMS_NAME, False)
+
+
+def is_store(target: Target) -> bool:
+    """Whether ``target`` is a REAL store: a pointer names it, or ``store.id`` sits beside it (however it was reached: the pointer,
+    ``--items`` or the environment). A bare legacy items file with no ``store.id`` is not one: it has no board config. The ONE
+    predicate every reader asks (the state read, the cockpit's board)."""
+    return bool(target.pointered or os.path.lexists(target.store_dir / STORE_ID_NAME))
 
 
 # --------------------------------------------------------------------------------------------------------------- lock

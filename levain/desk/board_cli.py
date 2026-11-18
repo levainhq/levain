@@ -477,7 +477,8 @@ def run_state(args: argparse.Namespace) -> int:
 
 
 def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None,
-              unreadable: list[str] | None = None) -> tuple[int, dict[str, Any] | None]:
+              unreadable: list[str] | None = None, strict_store: bool = False,
+              target: bs.Target | None = None) -> tuple[int, dict[str, Any] | None]:
     """``(exit code, the Board document or None)`` of ``levain board state --json``, with no printing of the document: a refusal is
     handed to ``say`` (a line of text; default stderr). ``read_evidence`` replaces :func:`board_evidence.read_git_evidence` (same signature):
     the cockpit hands it a reader that keeps a repo's evidence while that repo's refs are unchanged. The cockpit board reads the board through this, so it never captures a stream.
@@ -486,18 +487,25 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     a git/producer source of a repo that failed, a tracked repo that cannot be read or is not tracked or registered, the registry.
     These are the audit entries with no item id; the rest of the audit (a gate, landed-not-closed, an item that reads unknown) is
     about an item, not a source, and is not here, nor is ``stale_evidence`` (old evidence is not an unread one, and the exit
-    code 3 means any audit entry at all, so it does not tell the two apart)."""
+    code 3 means any audit entry at all, so it does not tell the two apart).
+
+    ``strict_store`` (the cockpit's read): a real store with no ``repos.jsonl`` tracks no repo, so NO repository is read (the command line
+    reads the one in its working directory, which for a cockpit is wherever the server started): its items, if any, read unknown as
+    items of a repo that is not registered, and none is an empty board. A ``repos.jsonl`` that exists but cannot be reached (a dangling
+    symlink) is an unreadable registry in both modes. ``target`` (a resolved :class:`board_store.Target`) is used as given: the cockpit
+    resolves the store once per request and the read does not resolve the pointer again."""
     read_git = read_evidence or be.read_git_evidence
     if say is None:
         say = lambda text: print(text, file=sys.stderr)  # noqa: E731
-    try:
-        target = bs.resolve_store(args.items)
-    except bs.BoardError as exc:
-        if str(exc).startswith("no items store"):
-            return _sfail(say, f"no items store: pass --items PATH or set {ITEMS_ENV}")
-        return _srefused(say, exc)
+    if target is None:
+        try:
+            target = bs.resolve_store(args.items)
+        except bs.BoardError as exc:
+            if str(exc).startswith("no items store"):
+                return _sfail(say, f"no items store: pass --items PATH or set {ITEMS_ENV}")
+            return _srefused(say, exc)
     given = args.items or os.environ.get(ITEMS_ENV)
-    if not target.pointered and os.path.lexists(target.store_dir / bs.STORE_ID_NAME):
+    if not target.pointered and bs.is_store(target):
         target = dataclasses.replace(target, pointered=True)    # an explicit store that holds a store.id is a store: its lock, its registry
     if not given and not target.pointered and not target.items_path.is_file():
         return _sfail(say, f"no items store: pass --items PATH or set {ITEMS_ENV}, or run `levain board use`")
@@ -517,7 +525,7 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             except (ValueError, OSError) as exc:        # UnicodeDecodeError is a ValueError
                 store_id_exc = exc
             if target.pointered:
-                registry_file = (target.store_dir / br.REPOS_NAME).exists()
+                registry_file = os.path.lexists(target.store_dir / br.REPOS_NAME)       # a dangling symlink is a registry that cannot be read
                 try:
                     view = br._load(target.store_dir, deadline)
                 except bs.LockWaiting:
@@ -545,7 +553,7 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             return _sfail(say, "--repo-name names one repo: give --repo with it (a registry names its own repos)")
     try:       # before any git read: a config that cannot be read refuses at once. Only a real store has one: a legacy standalone
                # --items file (no store.id beside it) is the default, whatever board.json happens to sit next to it
-        config = bs.read_config(target.store_dir) if target.pointered else {"producers": [], "no_land_waiter": False}
+        config = bs.read_config(target.store_dir) if bs.is_store(target) else {"producers": [], "no_land_waiter": False}
     except bs.BoardError as exc:
         return _srefused(say, exc)
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
@@ -554,7 +562,13 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     folded = fold(lines)
     reads: list[tuple[str | None, Path]]
     unread_why: dict[str, str] = {}
-    if whole:
+    empty_store = strict_store and not registry_file and args.repo is None and not args.also_repo
+    if empty_store:
+        reads = []
+        for name in sorted({it.repo for it in folded.items.values()}):
+            unread_why[name] = "the repo is not registered: not read, its items read unknown"
+        cross = True
+    elif whole:
         assert view is not None
         reads = []
         held = {it.repo for it in folded.items.values()}
@@ -577,11 +591,14 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     else:
         reads = [(args.repo_name, args.repo if args.repo is not None else Path(".")), *[_split_also(x) for x in args.also_repo]]
         cross = bool(args.also_repo)
-    repo = Path(reads[0][1]).expanduser()
-    evidence, summary = read_git(repo, repo_name=reads[0][0], since=args.since)
-    # One repo reads every item, as before; with --also-repo each repo reads the items that belong to it.
-    mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
-    evidence["documents"] = be.read_documents(mine, repo)
+    if empty_store:                    # no repository to read: the primary evidence is the flow-side sources alone
+        repo, evidence, summary = Path("."), {"evidence_v": EVIDENCE_V}, {"repo": None}
+    else:
+        repo = Path(reads[0][1]).expanduser()
+        evidence, summary = read_git(repo, repo_name=reads[0][0], since=args.since)
+        # One repo reads every item, as before; with --also-repo each repo reads the items that belong to it.
+        mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
+        evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
     # One rule: a flag GIVEN replaces the config's value, a flag left off leaves it (--land-waiter / --no-land-waiter is a tri-state).
     producers = list(dict.fromkeys(args.producers or config["producers"]))   # a name given twice is one producer
@@ -609,9 +626,12 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     repo_evidence: dict[str, Evidence] | None = None
     also: list[dict[str, Any]] = []
     if cross:
-        if not summary["repo"]:
+        if empty_store:
+            repo_evidence = {}
+        elif not summary["repo"]:
             return _sfail(say, f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
-        repo_evidence = {summary["repo"]: primary}
+        else:
+            repo_evidence = {summary["repo"]: primary}
         for given, other in reads[1:]:
             ev2, sum2 = read_git(other, repo_name=given, since=args.since)
             name = sum2["repo"]
@@ -629,7 +649,12 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
                 {"evidence_v": EVIDENCE_V, "unreadable": {src: why for src in ("main", "chain", "branches", "refs", "unattributed")}},
                 now=now, store_id=store_id)
     board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
-                       primary_repo=summary["repo"] if cross else None, label_primary=whole, unread_repos=unread_why)
+                       primary_repo=summary["repo"] if cross else None, label_primary=whole or empty_store, unread_repos=unread_why)
+    if empty_store:                    # nothing was read, and nothing failed to be: the stand-in primary's sources are not "unreadable"
+        mute = {f"{src} unreadable: {why}" for src, why in primary.unreadable.items()}
+        keep = lambda w: w not in mute and not w.startswith("stale_evidence:")  # noqa: E731
+        board = dataclasses.replace(board, audit=tuple(x for x in board.audit if x.id is not None or keep(x.why)),
+                                    problems=tuple(w for w in board.problems if keep(w)))
     doc = board.to_dict()
     if unreadable is not None:         # a source the board named unreadable: an audit ``unknown`` with no item id (stale_evidence is its own line)
         unreadable.extend(a.why for a in board.audit if a.kind == "unknown" and a.id is None and not a.why.startswith("stale_evidence:"))
@@ -643,7 +668,9 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
     if unreadable is not None:         # the registry lines are two kinds: it could not be read (here), or the 72-hour rule (an ordinary entry)
         unreadable.extend(w for w in registry_audit if w.startswith("registry: unreadable:") or "the registry is unreadable:" in w)
     doc["reader"] = summary
-    if whole:                                           # no repo is privileged: freshness, counts and labels span every repo read
+    if empty_store:
+        doc["as_of"], doc["reader"] = None, {"repo": "", "repos": []}
+    elif whole:                                           # no repo is privileged: freshness, counts and labels span every repo read
         doc["as_of"] = _oldest_fetch(read_evidence)
         doc["reader"] = _merged_reader([summary, *also])
     elif also:

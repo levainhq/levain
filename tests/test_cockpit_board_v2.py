@@ -65,7 +65,7 @@ def test_off_is_a_count_and_never_a_column_of_cards(store):
 def test_an_empty_unknown_column_is_left_out_and_the_rest_is_the_six(store, monkeypatch):
     doc = {"as_of": "2026-11-17T00:00:00Z", "items": [{"id": "a#1", "repo": "a", "title": "T", "tier": None, "state": "ready", "column": "ready",
                                                       "reason": "r", "refs": [], "as_of": None, "kind": "work"}]}
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None: (0, doc))
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None, **kw: (0, doc))
     v = board.build(None, None)
     assert [c["category"] for c in v["columns"]] == list(board.CATEGORIES) and v["off_count"] == 0
 
@@ -75,7 +75,7 @@ def test_every_state_lands_in_its_columns_and_needs_you_stays_the_bands(store, m
 
     items = [{"id": f"a#{n}", "repo": "a", "title": s, "tier": None, "state": s, "column": col, "reason": f"{s} reason", "refs": [], "as_of": None,
               "kind": None} for n, (s, col) in enumerate(STATE_COLUMN.items(), 1)]
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None: (3, {"as_of": None, "items": items}))
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None, **kw: (3, {"as_of": None, "items": items}))
     v = board.build(None, None)
     cols = {c["category"]: [k["title"] for k in c["cards"]] for c in v["columns"]}
     assert cols["unknown"] == ["unknown"] and cols["running"] == ["in_flight"] and cols["waiting"] == ["landing"]
@@ -90,7 +90,7 @@ def test_the_needs_you_column_is_the_bands_alone(store, monkeypatch, tmp_path):
 
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh2"))
     (tmp_path / "lh2" / "consent").mkdir(parents=True, mode=0o700)
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None: (0, {"as_of": None, "items": [
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None, **kw: (0, {"as_of": None, "items": [
         {"id": "a#1", "repo": "a", "title": "in the band", "tier": None, "state": "needs_you", "column": "needs_you", "reason": "band 1",
          "refs": [], "as_of": None, "kind": None}]}))
     v = board.build(None, QuestionStore(tmp_path / "lh2" / "consent"))
@@ -438,7 +438,7 @@ def test_the_done_column_is_capped_at_the_kernels_card_limit_and_says_how_many_m
     monkeypatch.setattr(board, "CARDS_MAX", 5)
     cards = [{"id": f"x#{i}", "repo": "x", "title": "t", "tier": None, "status": "done", "status_category": "done", "kind": None,
               "reason": None, "journal": None} for i in range(9)]
-    monkeypatch.setattr(board, "_v2", lambda items, now=None: (cards, 0, [], None))
+    monkeypatch.setattr(board, "_v2", lambda items, now=None, **kw: (cards, 0, [], None))
     v = board.build(None, None)
     (done,) = [c for c in v["columns"] if c["category"] == "done"]
     assert len(done["cards"]) == 5 and done["count"] == 9 and "[4 more]" in v["note"]
@@ -494,7 +494,7 @@ def test_a_tracked_repo_that_cannot_be_read_names_the_board_unreadable_and_an_it
 
 def test_an_unreadable_source_of_a_repo_makes_the_board_unreadable_even_with_no_items(tmp_path, monkeypatch):
     doc = {"as_of": None, "items": [], "audit": [{"kind": "unknown", "id": None, "why": "alpha: main unreadable: git log failed"}]}
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None: (unreadable.append(doc["audit"][0]["why"]), (3, doc))[1])
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None, unreadable=None, **kw: (unreadable.append(doc["audit"][0]["why"]), (3, doc))[1])
     v = board.build(None, None)
     assert v["queue"] == "unreadable" and any("git log failed" in u for u in v["unreadable"]) and v["columns"][0]["cards"] == []
 
@@ -515,9 +515,10 @@ def test_state_doc_names_the_unreadable_sources_and_not_the_item_entries_or_old_
 
 
 def test_a_configured_store_that_cannot_be_read_is_never_none_or_the_v1_queue(store, bare_copy, tmp_path, monkeypatch):
-    (bare_copy / "repos.jsonl").unlink()                                          # a store (store.id is there) with no repo registered yet: EMPTY, healthy
+    (bare_copy / "repos.jsonl").unlink()                                          # a store with items and no registry: its items are READ (unknown), never "empty"
     v = board.build(None, None, board_items=bare_copy)
-    assert v["queue"] == "ok" and not v["unreadable"] and all(c["count"] == 0 for c in v["columns"])
+    assert v["queue"] == "unreadable" and sum(c["count"] for c in v["columns"]) > 0
+    assert any("not registered" in u for u in v["unreadable"])
     (bare_copy / "repos.jsonl").mkdir()                                           # a repos.jsonl that is a directory is a real failure
     v = board.build(None, None, board_items=bare_copy)
     assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
@@ -694,7 +695,7 @@ def test_the_card_cap_holds_across_every_column_done_first_and_keeps_true_totals
 
     monkeypatch.setattr(board, "CARDS_MAX", 10)
     cards = _cards("done", 4) + _cards("backlog", 5) + _cards("ready", 4) + _cards("unknown", 2)
-    monkeypatch.setattr(board, "_v2", lambda items, now=None: (cards, 0, [], None))
+    monkeypatch.setattr(board, "_v2", lambda items, now=None, **kw: (cards, 0, [], None))
     v = board.build(None, None)
     cols = {c["category"]: c for c in v["columns"]}
     assert sum(len(c["cards"]) for c in v["columns"]) == 10
@@ -703,10 +704,18 @@ def test_the_card_cap_holds_across_every_column_done_first_and_keeps_true_totals
     assert len(cols["ready"]["cards"]) == 4 and len(cols["unknown"]["cards"]) == 2
     assert "done: [4 more]" in v["note"] and "backlog: [1 more]" in v["note"]
     monkeypatch.setattr(board, "CARDS_MAX", engine.BOARD_CARDS_MAX)
-    monkeypatch.setattr(board, "_v2", lambda items, now=None: (_cards("ready", 2001), 0, [], None))
+    monkeypatch.setattr(board, "_v2", lambda items, now=None, **kw: (_cards("ready", 2001), 0, [], None))
     big = board.build(None, None)
     engine._v_board(type("S", (), {"id": "board", "kind": "board"})(), big)                      # the kernel accepts it
     assert sum(len(c["cards"]) for c in big["columns"]) == engine.BOARD_CARDS_MAX
+
+
+def test_an_unknown_column_cut_entirely_is_still_a_column_with_its_true_count(monkeypatch):
+    monkeypatch.setattr(board, "CARDS_MAX", 10)
+    monkeypatch.setattr(board, "_v2", lambda items, now=None, **kw: (_cards("unknown", 3), 0, [], None))
+    monkeypatch.setattr(board, "_band_cards", lambda q: (_cards("needs-you", 10), None))
+    cols = {c["category"]: c for c in board.build(None, None)["columns"]}
+    assert cols["unknown"]["cards"] == [] and cols["unknown"]["count"] == 3 and len(cols["needs-you"]["cards"]) == 10
 
 
 def test_a_flight_whose_thread_cannot_start_does_not_wedge_and_a_late_finish_beats_the_stale_read(monkeypatch):
@@ -739,21 +748,33 @@ def test_a_flight_whose_thread_cannot_start_does_not_wedge_and_a_late_finish_bea
     assert out["n"] == 2 and "stale" not in out
 
 
-def test_the_evidence_cache_and_the_build_locks_are_bounded_and_a_held_lock_stays(tmp_path, monkeypatch):
+def test_the_evidence_cache_is_bounded_and_the_build_locks_are_a_fixed_stripe_set(tmp_path, monkeypatch):
     board._EVIDENCE_CACHE.clear()
-    board._BUILD_LOCKS.clear()
     monkeypatch.setattr(board, "EVIDENCE_MAX", 3)
-    monkeypatch.setattr(board, "LOCKS_MAX", 3)
+    before = tuple(board._BUILD_LOCKS)
     repos = [seed.mkrepo(tmp_path, f"r{i}") for i in range(6)]
-    held = threading.Lock()
-    held.acquire()
-    board._BUILD_LOCKS["/a/build/in/progress"] = held                                                      # the oldest, and in use
     for r in repos:
         board._cached_read_evidence(r, repo_name=r.name, since=board_evidence.BOARD_EPOCH)
-    assert len(board._EVIDENCE_CACHE) <= 3 and len(board._BUILD_LOCKS) <= 3
-    assert board._BUILD_LOCKS["/a/build/in/progress"] is held                                              # never evicted while held
+    assert len(board._EVIDENCE_CACHE) <= 3
     assert str(repos[-1]) in board._EVIDENCE_CACHE and str(repos[1]) not in board._EVIDENCE_CACHE   # least recently used went
-    held.release()
+    assert tuple(board._BUILD_LOCKS) == before and len(before) == board.LOCK_STRIPES                  # nothing to grow or evict
+    assert board._build_lock("/a/repo") is board._build_lock("/a/repo")                                # a repo's lock is stable ...
+    assert len({id(board._build_lock(f"/r/{n}")) for n in range(500)}) == board.LOCK_STRIPES           # ... and every stripe is used
+
+
+def test_a_repo_held_by_a_build_makes_the_next_build_of_it_wait_then_hit(tmp_path):
+    board._EVIDENCE_CACHE.clear()
+    repo = seed.mkrepo(tmp_path, "held")
+    out = []
+    lock = board._build_lock(str(Path(repo)))
+    lock.acquire()
+    t = threading.Thread(target=lambda: out.append(board._cached_read_evidence(repo, repo_name="held", since=board_evidence.BOARD_EPOCH)))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive() and not out                                                                    # waits at its stripe
+    lock.release()
+    t.join(30)
+    assert out and not t.is_alive()
 
 
 def test_generated_is_the_build_clock_and_as_of_is_the_oldest_fetch(store):
@@ -761,3 +782,110 @@ def test_generated_is_the_build_clock_and_as_of_is_the_oldest_fetch(store):
     assert v["as_of"] is None or isinstance(v["as_of"], str)
     assert v["generated"] and v["generated"] != v["as_of"]
     assert board.build(None, None, generated="2026-11-17T00:00:00Z")["generated"] == "2026-11-17T00:00:00Z"
+
+
+def _state_args(**kw):
+    base = dict(json=True, items=None, evidence_extra=None, producers=[], land_waiter=None, repo=None, repo_name=None, also_repo=[],
+                since=board_evidence.BOARD_EPOCH, now=None)
+    return argparse.Namespace(**{**base, **kw})
+
+
+def test_state_doc_reads_a_fresh_store_empty_and_a_store_with_items_and_no_registry_by_its_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    seed.board("use", str(tmp_path / "a"), "--no-land-waiter")
+    got = []
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: None, lambda *a, **k: pytest.fail("no repository is read"), got, strict_store=True)
+    assert rc == 0 and doc["items"] == [] and doc["audit"] == [] and got == []                       # fresh: empty, from the real read
+    assert board.build(None, None)["queue"] == "ok"
+    seed.board("use", str(tmp_path / "b"), "--no-land-waiter")
+    seed.board("add", "--repo", "zz", "--title", "legacy", "--origin", "desk 1", *seed.A)             # an item, no registry (an inactive one allows it)
+    rc, doc = board_cli.state_doc(_state_args(), lambda t: None, lambda *a, **k: pytest.fail("no repository is read"), got, strict_store=True)
+    assert [(i["id"], i["state"]) for i in doc["items"]] == [("zz#1", "unknown")] and any("not registered" in w for w in got)
+    v = board.build(None, None)
+    assert v["queue"] == "unreadable" and sum(c["count"] for c in v["columns"]) == 1
+
+
+def test_a_dangling_registry_symlink_is_unreadable_not_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    seed.board("use", str(tmp_path / "c"), "--no-land-waiter")
+    os.symlink(str(tmp_path / "nowhere"), str(tmp_path / "c" / "repos.jsonl"))
+    v = board.build(None, None)
+    assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
+
+
+def test_one_request_is_one_snapshot_the_build_never_resolves_the_pointer_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    a, b = tmp_path / "a", tmp_path / "b"
+    seed.board("use", str(a), "--no-land-waiter")
+    seed.board("add", "--repo", "only-in-a", "--title", "A", "--origin", "desk 1", *seed.A)
+    seed.board("use", str(b), "--no-land-waiter")
+    seed.board("use", str(a), "--no-land-waiter")
+    snap = board.take_snapshot()
+    seed.board("use", str(b), "--no-land-waiter")                                                      # the pointer flips between key and build
+    v = board.build(None, None, snapshot=snap)
+    assert v["queue"] == "unreadable" and sum(c["count"] for c in v["columns"]) == 1                   # it is A's board, under A's key
+    assert board.take_snapshot().key != snap.key
+    assert sum(c["count"] for c in board.build(None, None)["columns"]) == 0                           # a fresh request reads B
+
+
+def test_the_flights_are_bounded_across_keys_and_a_finished_one_leaves_no_entry():
+    flight = board.Flight()
+    gate = threading.Event()
+    good = {"schema": 1, "generated": "g", "queue": "ok", "unreadable": [], "note": None, "columns": []}
+    starts = []
+
+    def slow():
+        starts.append(1)
+        gate.wait(10)
+        return dict(good)
+
+    n = board.Flight.MAX_FLIGHTS
+    waiters = [threading.Thread(target=lambda k=k: flight.get(slow, 5, key=k)) for k in range(n)]
+    for w in waiters:
+        w.start()
+    deadline = time.monotonic() + 5
+    while len(starts) < n and time.monotonic() < deadline:
+        time.sleep(0.01)
+    over = flight.get(slow, 0.05, key="one-too-many")
+    assert len(starts) == n and over.get("building") is True                                           # no new thread past the bound
+    gate.set()
+    for w in waiters:
+        w.join(10)
+    assert flight._runs == {}                                                                          # finished flights are dropped
+
+
+def test_a_store_reached_by_items_or_env_with_a_store_id_reads_its_board_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.delenv("LEVAIN_BOARD_ITEMS", raising=False)
+    d = tmp_path / "s"
+    seed.board("use", str(d), "--no-land-waiter")
+    (d / board_store.CONFIG_NAME).write_text("not a config at all")
+    (board_store._home_dir(None) / board_store.POINTER_NAME).unlink()                                              # no pointer: the store is named by --items alone
+    seen = []
+    rc, doc = board_cli.state_doc(_state_args(items=str(d)), lambda t: seen.append(t), strict_store=True)
+    assert doc is None and any("board config" in t or "board.json" in t for t in seen)                 # the real store's config is read (and refused)
+    assert board_store.is_store(board_store.resolve_store(str(d)))
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "legacy" / "items.jsonl").write_text("")
+    assert not board_store.is_store(board_store.resolve_store(str(tmp_path / "legacy" / "items.jsonl")))
+
+
+def test_use_import_focus_writes_the_config_then_the_tombstone_then_the_pointer(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    seed.mkrepo(tmp_path, "imp")
+    base = tmp_path / "repos"
+    focus = tmp_path / "x" / "y" / "z" / "focus.json"
+    focus.parent.mkdir(parents=True)
+    focus.write_text(json.dumps({"imp": {"state": "active", "words": "go"}}))
+    order = []
+    real_cfg, real_ptr = board_store.write_config, board_store._write_pointer
+    monkeypatch.setattr(board_store, "write_config", lambda *a, **k: (order.append("config"), real_cfg(*a, **k))[1])
+    monkeypatch.setattr(board_store, "_write_pointer", lambda *a, **k: (order.append("pointer"), real_ptr(*a, **k))[1])
+    from levain.cli import main
+
+    rc = main(["board", "use", str(tmp_path / "s"), "--import-focus", str(focus), "--briefcase", str(base), "--no-land-waiter", "--by", "t",
+               "--author-kind", "operator"])
+    assert rc == 0 and order == ["config", "pointer"] and "moved_to" in focus.read_text()

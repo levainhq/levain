@@ -1935,7 +1935,8 @@ def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
         if flight is None:
             flight = server._board_flight = cockpit_board.Flight()    # one build at a time per server, however many readers
     store = getattr(server, "question_store", None)
-    value = flight.get(lambda: cockpit_board.build(directory, store), BOARD_WAIT_S, key=(str(directory), cockpit_board.store_key()))
+    snap = cockpit_board.take_snapshot()      # the store resolved ONCE for this request: the key is of it, and the build is handed the same value
+    value = flight.get(lambda: cockpit_board.build(directory, store, snapshot=snap), BOARD_WAIT_S, key=(str(directory), snap.key))
     value["drop_here"] = _drop_files_here(server, directory)
     return value if stamped else {**value, "generated": None}
 
