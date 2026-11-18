@@ -95,7 +95,13 @@ def resolve_authority(*, data_root: Path | str | None = None, queue_dir: Path | 
     try:
         return _resolve_authority(data_root, queue_dir)
     except (OSError, ValueError) as exc:
-        raise bs.BoardError(f"{NO_AUTHORITY} (the consent hooks or the cockpit could not be read: {exc})") from None
+        raise AuthorityUnreadable(f"{NO_AUTHORITY} (the consent hooks or the cockpit could not be read: {exc})") from None
+
+
+class AuthorityUnreadable(bs.BoardError):
+    """:func:`resolve_authority`'s refusal when the consent hooks or the cockpit exist and cannot be READ: a caller that treats
+    "no authority log" as no source (an unsigned write's own refusal then speaks) passes this one through, so the operator is
+    sent to the unreadable cockpit, not told there is no log (deepseek 78, fix 4)."""
 
 
 def _resolve_authority(data_root: Path | str | None, queue_dir: Path | str | None) -> AuthoritySource:
@@ -150,15 +156,16 @@ def _refusal(op: str, why: str = "") -> str:
             f"his answer; an asserted record is refused")
 
 
-MOVE_DECISION = " of a tracking or tracked repo that changes its origin or root set"
+MOVE_DECISION = " of a tracking, tracked or aborting repo that changes its origin or root set"
 
 
 def move_is_decision(mode: str, old_origin: str, old_root: Sequence[str], new_origin: str, new_root: Sequence[str]) -> bool:
-    """A ``move`` is decision-class (head ruling, levain 26, 11-17; L2 M1) when the repo is ``tracking`` or ``tracked`` and the
-    move CHANGES the recorded origin or root set: the tracked repo's evidence (its items done on origin/main, its charter
-    blob) would then be read from another repository. The same repository relocated on disk (origin and root set kept), and
-    any move of an ``untracked`` repo, stay asserted-ok."""
-    return mode in ("tracking", "tracked") and (old_origin != new_origin or sorted(old_root) != sorted(new_root))
+    """A ``move`` is decision-class (head ruling, levain 26, 11-17; L2 M1) when the repo is ``tracking``, ``tracked`` or
+    ``aborting`` and the move CHANGES the recorded origin or root set: the repo's evidence (its items done on origin/main, its
+    charter blob, an abort's charter compensation that ``abandon-done`` reads) would then be read from another repository
+    (``aborting``: complement 28, fix 4). The same repository relocated on disk (origin and root set kept), and any move of an
+    ``untracked`` repo, stay asserted-ok."""
+    return mode in ("tracking", "tracked", "aborting") and (old_origin != new_origin or sorted(old_root) != sorted(new_root))
 
 
 def _record_hash(line: bytes | str) -> str:
@@ -186,8 +193,9 @@ def abandon_problem(held: Mapping[str, Any], snapshot: Any) -> str | None:
     ``snapshot``, and it must name its migration and ``items_last`` (the items file's last line when it was written; an
     abandon from before that field cannot order the items, so it holds no cut). Raises ``VerifierUnavailable`` when
     ssh-keygen cannot run. It is one step of :func:`cut_cause_problem`, the one judgement of a cut's cause; the recovery for
-    any refusal of that is to re-run ``abandon-track`` signed: on an ``aborting`` repo with a cut still owed whose latest
-    abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``)."""
+    a refusal of that is to re-run ``abandon-track`` signed: on an ``aborting`` repo with a cut still owed whose latest
+    abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``). A TORN store
+    file is not repaired that way: it is acknowledged first (``ack-torn``), and no abandon is written over it."""
     grade = held.get("grade")
     if grade == GRADE_RELAYED:
         return ("cause names a relayed abandon-track: a relayed citation is checked by P3's verifier, which this build "
@@ -221,59 +229,146 @@ def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snaps
 
 def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", snapshot: Any) -> str | None:
     """THE one predicate for "can the abandon-track whose line hashes to ``cause`` be the cause of a cut of ``item_id``":
-    why not, or None when it can. :func:`verify_cause` (every cut's write and P6's check) and the abandon recovery
-    (``board_registry._latest_abandon_problem``: must a signed re-run write a fresh abandon) both call it, so the recovery
-    writes a fresh abandon exactly when a cut citing the latest one would be refused (levain 29, fix 3).
-    ``store`` is :class:`board_store.StoreLines` (each
-    file's lines as written, and the store id; ``board_store._store_lines``). It holds when ``cause`` is the sha256 of a line
-    of ``repos.jsonl`` (ONLY that file is searched) that is an ``abandon-track`` naming THIS store (``store`` equals the store
-    id), standing at the place in the registry chain its ``prev`` names (``prev`` is the chain hash of the registry bytes
-    before it, and is inside the signed bytes), in a registry that is not torn, that :func:`abandon_problem` accepts, and the
-    item ``record`` decides (L2 M2, levain 26): was added for the abandon's ``repo``, with key ``M`` or ``M:...`` where ``M``
-    is the abandon's ``migration``, and BEFORE the abandon: its ``add`` line in ``items.jsonl`` is at or before the
-    ``items.jsonl`` line whose sha256 is the abandon's ``items_last`` (``none``: the items file was empty then, so no item
-    predates it). Both positions are in ``items.jsonl``; nothing is compared across the two files. Raises
+    why not, or None when it can. :func:`verify_cause` (every cut's write) and the abandon recovery
+    (``board_registry._latest_abandon_problem``: must a signed re-run write a fresh abandon) both judge it, so the recovery
+    writes a fresh abandon exactly when a cut citing the latest one would be refused (levain 29, fix 3). It is two halves,
+    and nothing else: :func:`cause_problem` (everything that does not depend on the item, judged ONCE for a whole abandon by
+    the recovery) then :func:`cut_item_problem` (the item's own place; fix 4, complement 15).
+
+    ``store`` is :class:`board_store.StoreLines` (each file's lines as written, and the store id;
+    ``board_store._store_lines``). It holds when ``cause`` is the sha256 of a line of ``repos.jsonl`` (ONLY that file is
+    searched) that is an ``abandon-track`` naming THIS store (``store`` equals the store id), standing at the place in the
+    registry chain its ``prev`` names (``prev`` is the chain hash of the registry bytes before it, and is inside the signed
+    bytes), in a registry that is not torn, that the registry fold APPLIED (not acknowledged as torn, not rejected by the
+    state it met) and whose repo is aborting ITS migration NOW (a crashed abandon's repo still is: that is the recovery; an
+    old abandon of a repo since tracked again is not: gemini 109, codex 42), that :func:`abandon_problem` accepts, in an items
+    file that is not torn; and the item ``record`` decides (L2 M2, levain 26), located through the ITEM FOLD (an
+    acknowledged-torn line is never its add, nor the anchor: gemini 104), was added for the abandon's ``repo``, with key ``M``
+    or ``M:...`` where ``M`` is the abandon's ``migration``, and BEFORE the abandon: its ``add`` line in ``items.jsonl`` is at
+    or before the ``items.jsonl`` line whose sha256 is the abandon's ``items_last`` (``none``: the items file was empty then,
+    so no item predates it). Both positions are in ``items.jsonl``; nothing is compared across the two files. Raises
     ``VerifierUnavailable`` when ssh-keygen cannot run."""
+    problem, held = cause_problem(cause, store, snapshot)
+    return problem if problem is not None else cut_item_problem(held, item_id)
+
+
+@dataclass(frozen=True)
+class CauseHeld:
+    """What :func:`cause_problem` found holding, for :func:`cut_item_problem`: the cited abandon ``record``, every item's
+    ``add`` as the item fold applied it (id to ``(index in the items file, record)``; the first accepted add of an id, never
+    an acknowledged-torn line), and the index of the ``items_last`` line among the lines the fold kept (None: ``none``, or
+    not there, which ``anchor_missing`` says)."""
+    record: Mapping[str, Any]
+    adds: Mapping[str, tuple[int, Mapping[str, Any]]]
+    anchor: int | None
+    anchor_missing: bool
+
+
+_ACK_NAMES_UNTORN = "ack-torn names this line, which is not torn"
+
+
+def _applied(folded: Any, n: int) -> bool:
+    """Whether the registry fold APPLIED line ``n`` (1-based): it is a record the fold accepted, not one an ``ack-torn``
+    names (a dropped line is no record; a chain break an ack keeps is not trusted as a cause either), and the fold raised no
+    problem on it but an ack naming it. ``repos_fold`` records a record the state does not allow only as a problem
+    ``line n: ...``, so ANY other problem on the line reads as not applied (fail closed)."""
+    if n in folded.acked or n not in {ln for ln, _ in folded.records}:
+        return False
+    return not any(p.startswith(f"line {n}: ") and p != f"line {n}: {_ACK_NAMES_UNTORN}" for p in folded.problems)
+
+
+def _items_torn(why: str, n: int | None) -> str:
+    hint = f" ({bs.ack_hint(bs.ITEMS_NAME, n)})" if n else ""
+    return f"the items store is torn ({why}): no cut can be judged against it; repair it or ack-torn first{hint}"
+
+
+def _items_kept(store: "bs.StoreLines") -> tuple[str | None, frozenset[int]]:
+    """``(problem, dropped)``: the items file judged by the item fold (:func:`levain.desk.board_state.fold`), and the
+    0-based indices of the lines it DROPPED (acknowledged-torn). A torn file is a problem naming the ack-torn."""
+    from levain.desk.board_state import fold
+    if getattr(store, "items_unterminated", False):
+        return _items_torn("it does not end in a newline: an append in flight, or a crash", len(store.items)), frozenset()
+    text: list[str] = []
+    for n, ln in enumerate(store.items, 1):
+        try:
+            text.append(ln.decode("utf-8"))
+        except UnicodeDecodeError:
+            return _items_torn(f"line {n}: not UTF-8", n), frozenset()
+    folded = fold(text)
+    if folded.torn:
+        n = next((ln for ln, _ in folded.torn_lines if ln not in folded.acked), None)
+        return _items_torn(folded.torn_why, n), frozenset()
+    return None, frozenset(n - 1 for n, _ in folded.dropped)
+
+
+def cause_problem(cause: Any, store: "bs.StoreLines | None", snapshot: Any) -> tuple[str | None, CauseHeld | None]:
+    """The item-independent half of :func:`cut_cause_problem`: ``(why the cited abandon cannot cause a cut, None)`` or
+    ``(None, what holds)``. Everything but the item's own place is here: the line, its store and ``prev``, a registry that is
+    not torn, the fold having applied it, its repo aborting its migration now, :func:`abandon_problem` (the signature), and
+    the items file read through the item fold. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
     from levain.desk import repos_fold as rf
     if not isinstance(cause, str) or not bs.HASH_RE.fullmatch(cause):
-        return "cause must be the lowercase sha256 of an abandon-track record"
+        return "cause must be the lowercase sha256 of an abandon-track record", None
     if store is None:
-        return "cause cannot be checked: the store's lines were not read"
+        return "cause cannot be checked: the store's lines were not read", None
     at = _index_of(store.repos, cause)
     if at is None:
-        return "cause names no abandon-track record in the store's registry (repos.jsonl)"
+        return "cause names no abandon-track record in the store's registry (repos.jsonl)", None
     held = _parse(store.repos[at])
     if not isinstance(held, dict):
-        return "cause names a line that is not a record"
+        return "cause names a line that is not a record", None
     if held.get("op") != "abandon-track":
-        return "cause names a record that is not an abandon-track"
+        return "cause names a record that is not an abandon-track", None
     if held.get("store") != store.store_id:
         return (f"cause names an abandon-track of another store ({held.get('store')!r}; this store is "
-                f"{store.store_id!r})")
+                f"{store.store_id!r})"), None
     if held.get("prev") != bs.chain_prev(b"".join(ln + b"\n" for ln in store.repos[:at])):
         return ("the cited abandon-track does not stand where its signed prev places it in the registry chain (a line "
-                "moved or copied)")
+                "moved or copied)"), None
     folded = rf.fold_repos(store.repos, store_id=store.store_id, unterminated_tail=store.repos_unterminated)
     if folded.torn:
-        return f"the registry is torn ({folded.torn_why}): no abandon-track in it can be the cause of a cut"
+        return f"the registry is torn ({folded.torn_why}): no abandon-track in it can be the cause of a cut", None
+    if not _applied(folded, at + 1):
+        return (f"the registry did not apply the cited abandon-track (repos.jsonl line {at + 1}: acknowledged as torn, or "
+                f"not a change its repo's state allowed): it abandoned nothing"), None
+    repo, migration = held.get("repo"), held.get("migration")
+    cur = folded.repos.get(repo) if isinstance(repo, str) else None
+    if cur is None or cur.mode != "aborting" or cur.migration != migration:
+        now = "not registered" if cur is None else f"{cur.mode} (migration {cur.migration})"
+        return (f"the cited abandon-track's repo {repo} is {now}, not aborting {migration}: an abandon causes cuts only "
+                f"while its repo is aborting that migration"), None
     problem = abandon_problem(held, snapshot)
     if problem is not None:
-        return problem
-    migration = held["migration"]
-    added_at, added = next(((i, r) for i, r in enumerate(map(_parse, store.items))
-                            if isinstance(r, dict) and r.get("op") == "add" and r.get("id") == item_id), (None, None))
+        return problem, None
+    problem, dropped = _items_kept(store)
+    if problem is not None:
+        return problem, None
+    adds: dict[str, tuple[int, Mapping[str, Any]]] = {}
+    for i, ln in enumerate(store.items):
+        r = _parse(ln) if i not in dropped else None
+        if isinstance(r, dict) and r.get("op") == "add" and isinstance(r.get("id"), str):
+            adds.setdefault(r["id"], (i, r))
+    last = held["items_last"]
+    anchor = None if last == ITEMS_NONE else next(
+        (i for i, ln in enumerate(store.items) if i not in dropped and _record_hash(ln) == last), None)
+    return None, CauseHeld(held, adds, anchor, last != ITEMS_NONE and anchor is None)
+
+
+def cut_item_problem(held: CauseHeld, item_id: Any) -> str | None:
+    """The per-item half of :func:`cut_cause_problem`, over what :func:`cause_problem` found holding: the item's add (as the
+    item fold applied it) was for the abandon's repo, keyed to its migration, at or before its anchor."""
+    migration = held.record["migration"]
+    added_at, added = held.adds.get(item_id, (None, None)) if isinstance(item_id, str) else (None, None)
     if added is None:
         return f"{item_id} has no add record in the store"
     if not _keyed_to(added.get("key"), migration):
         return f"cause names an abandon-track of migration {migration!r}, and {item_id} is not keyed to it"
-    if added.get("repo") != held.get("repo"):
-        return (f"cause names the abandon-track of repo {held.get('repo')!r}, and {item_id} was added for "
+    if added.get("repo") != held.record.get("repo"):
+        return (f"cause names the abandon-track of repo {held.record.get('repo')!r}, and {item_id} was added for "
                 f"{added.get('repo')!r}")
-    last = held["items_last"]
-    anchor = None if last == ITEMS_NONE else _index_of(store.items, last)
-    if last != ITEMS_NONE and anchor is None:
+    if held.anchor_missing:
         return "the items line the cited abandon-track names (items_last) is not in the items file"
-    if anchor is None or added_at > anchor:
+    if held.anchor is None or added_at > held.anchor:
         return f"{item_id} was added after the cited abandon-track: an abandon cuts only the items that predate it"
     return None
 
@@ -554,6 +649,7 @@ def prepare(target: bs.Target, verb: str, *, authority: AuthoritySource | None =
     Nothing is written."""
     if "seal" in kwargs:
         raise bs.BoardError("prepare makes its own seal: a seal argument is refused")
+    check_signable({"author": bs._author(kwargs.get("author"))})        # before anything else (gemini 136, fix 4)
     if verb == "decide" and kwargs.get("cause") is not None and authority is None:
         raise bs.BoardError(NO_AUTHORITY)
     kwargs = {**kwargs, "now": kwargs.get("now") or bs._utc_now()}

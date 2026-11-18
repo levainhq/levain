@@ -585,19 +585,62 @@ def _require_pointered(target: Target) -> None:
         raise BoardError(NO_STORE)
 def _store_seen(store_dir: Path) -> tuple:
     """What a write's checks were judged against, beyond the bytes of the file it appends to: ``(name, dev, inode, size,
-    mtime_ns)`` of each store file (``(name,)`` when absent). A build reads BOTH files (the registry for I1, the items for
-    ``items_last``, both for a cause), so a change to either between the build and the write sends the write back."""
+    sha256 of the bytes)`` of each store file (``(name,)`` when absent). A build reads BOTH files (the registry for I1, the
+    items for ``items_last``, both for a cause), so a change to either between the build and the write sends the write back.
+    The bytes, not the mtime: a file only touched (a sync client, ``touch``, a checkout that rewrites the same bytes in place)
+    is unchanged, while a replace (another inode), a resize or any other bytes still count (complement 23, fix 4)."""
     out = []
     for name in APPEND_FILES:
+        path = store_dir / name
         try:
-            st = os.stat(store_dir / name)
+            fd = os.open(path, os.O_RDONLY)
         except FileNotFoundError:
             out.append((name,))
             continue
         except OSError as exc:
             raise BoardError(f"the board store could not be checked ({exc})") from None
-        out.append((name, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+        try:
+            st = os.fstat(fd)
+            h = hashlib.sha256()
+            while chunk := os.read(fd, 1 << 20):
+                h.update(chunk)
+            digest = h.hexdigest()
+        except OSError as exc:
+            raise BoardError(f"the board store could not be checked ({exc})") from None
+        finally:
+            os.close(fd)
+        out.append((name, st.st_dev, st.st_ino, st.st_size, digest))
     return tuple(out)
+
+
+def _seen_changed(before: tuple, after: tuple) -> str:
+    """The store files whose identity, size or bytes differ between two :func:`_store_seen` readings, named."""
+    names = [b[0] for b, a in zip(before, after) if b != a] if len(before) == len(after) else []
+    return " and ".join(names) or "the store"
+
+
+def _created_by(path: Path, existed: bool, fd: int, created: tuple | None) -> tuple | None:
+    """``(dev, inode)`` of the file at ``path`` when THIS write created it (it was not there before the open), else None; a
+    re-open of the inode an earlier pass of the same write created keeps it."""
+    st = os.fstat(fd)
+    ident = (st.st_dev, st.st_ino)
+    if not existed:
+        return ident
+    return created if created == ident else None
+
+
+def _drop_created(path: Path, created: tuple | None) -> None:
+    """Unlink ``path`` when it is still the EMPTY inode this write created: a write that ends without writing a record
+    (refused, cancelled, nothing to write, ``prepare``'s capture) leaves no file behind (codex 46, gemini 118, fix 4); a
+    file's existence activates the registry. The caller holds the exclusive store lock. Best effort: never raises."""
+    if created is None:
+        return
+    try:
+        st = os.stat(path)
+        if (st.st_dev, st.st_ino) == created and st.st_size == 0:
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 def _write_record(target: Target, fd: int, path: Path, raw: bytes, rec: dict, empty: bool) -> None:
@@ -620,51 +663,80 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     a ``parse`` that accepts one gets this far: an ``ack-torn`` is written after it) gets a newline first.
     When ``write`` is true the record gets ``prev`` (:func:`chain_prev` of the bytes read in this same locked read) and is
     appended as one line, fsynced. Returns what ``build`` returned, with ``prev`` on it when it was written (a record returned unwritten, an idempotent ``add`` hit, is the stored one and may carry none). Immediately
-    before the write the held fd's size, and the identity, size and mtime of BOTH store files (:func:`_store_seen`, what the
-    build's checks read), are compared with what the record was built from: a lock-free writer that appended to or replaced
-    either file in between sends this round back to the read (bounded). A race in the remaining window shows up as a chain
-    break, which the verifier reports.
+    before the write (and, for a sealed write, before it leaves for the ceremony) the held fd's size, and the identity, size and
+    bytes of BOTH store files (:func:`_store_seen`, what the build's checks read), are compared with what the record was built
+    from: a lock-free writer that appended to or replaced either file in between sends this round back to the read (bounded;
+    the refusal past the bound names what changed). A race in the remaining window shows up as a chain break, which the
+    verifier reports.
 
     ``seal`` (see :mod:`levain.desk.board_sign`): the record is built and chained under the lock, then the lock is RELEASED for
     the ceremony (``board_sign.ceremony``: a Touch ID prompt or a phone signature is human time, and no reader or other
     writer waits on it), then taken again: the store must be exactly as it was (the file's bytes, both files' identity, size
-    and mtime), else the write is refused (:data:`SIGNED_CHAIN_MOVED`, never a re-read: a second prompt is never shown for
-    one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed record must verify, or
-    BoardError is raised and nothing is written."""
+    and bytes; an mtime alone is no change), else the write is refused (:data:`SIGNED_CHAIN_MOVED`, never a re-read: a second
+    prompt is never shown for one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed
+    record must verify, or BoardError is raised and nothing is written.
+
+    A write that ends without writing a record (refused, cancelled, nothing to write, ``prepare``'s capture) leaves no file
+    it created: the ``O_CREAT`` open of a file that was not there is undone while that file is still the same empty inode."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
     path = target.store_dir / filename
     flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    created: tuple | None = None                    # (dev, inode) of the file THIS write created, while no record is in it
     with store_lock(target.store_dir, exclusive=True) as held:
-        for _ in range(OPEN_RETRIES):
-            fd = held.open(filename, flags, fcntl.LOCK_EX)
-            try:
-                empty = os.fstat(fd).st_size == 0           # a write into a zero-length file may have just created it
-                raw = _read_fd(fd)
-                if not _same_file(fd, path):
-                    continue                    # replaced before anything was written (a git operation): open, read and build again
-                seen = _store_seen(target.store_dir)
-                rec, write = build(parse(raw))
-                if not write:
-                    return rec, False
-                rec = _with_prev(rec, chain_prev(raw))      # recomputed on every rebuild: it is the bytes of THIS inode
-                if seal is not None:
-                    break                       # the ceremony runs with no lock held (below)
-                if os.fstat(fd).st_size != len(raw) or _store_seen(target.store_dir) != seen:
-                    continue                    # a writer that takes no lock changed a store file since the read: re-read and re-build (bounded)
-                _write_record(target, fd, path, raw, rec, empty)
-                return rec, True
-            finally:
-                os.close(fd)
-        else:
-            raise BoardError(f"{path} was replaced {OPEN_RETRIES} times before a write (a git operation?); nothing was written, retry")
+        try:
+            changed = ""
+            for _ in range(OPEN_RETRIES):
+                existed = path.exists()             # under the exclusive lock: no writer that takes it creates the file now
+                fd = held.open(filename, flags, fcntl.LOCK_EX)
+                try:
+                    created = _created_by(path, existed, fd, created)
+                    empty = os.fstat(fd).st_size == 0       # a write into a zero-length file may have just created it
+                    raw = _read_fd(fd)
+                    if not _same_file(fd, path):
+                        changed = f"{path} was replaced (a git operation?)"
+                        continue                # replaced before anything was written: open, read and build again
+                    seen = _store_seen(target.store_dir)
+                    rec, write = build(parse(raw))
+                    if not write:
+                        _drop_created(path, created)
+                        return rec, False
+                    rec = _with_prev(rec, chain_prev(raw))  # recomputed on every rebuild: it is the bytes of THIS inode
+                    now_seen = _store_seen(target.store_dir)
+                    if os.fstat(fd).st_size != len(raw) or now_seen != seen:
+                        changed = (f"{filename} grew" if os.fstat(fd).st_size != len(raw)
+                                   else f"{_seen_changed(seen, now_seen)} changed") + " under a writer that takes no lock"
+                        continue                # a lock-free writer changed a store file since the read: re-read and re-build
+                    if seal is not None:        # (bounded); checked BEFORE a sealed write leaves for its one prompt (gemini 130)
+                        break                   # the ceremony runs with no lock held (below)
+                    _write_record(target, fd, path, raw, rec, empty)
+                    return rec, True
+                finally:
+                    os.close(fd)
+            else:
+                raise BoardError(f"the store changed between the read and the write {OPEN_RETRIES} times (the last time: "
+                                 f"{changed}); nothing was written, retry")
+        except BaseException:
+            _drop_created(path, created)
+            raise
 
     from levain.desk import board_sign
-    sealed = board_sign.ceremony(seal, rec)         # signs the bytes that include prev; raises on any failure; NO lock held
+    try:
+        sealed = board_sign.ceremony(seal, rec)     # signs the bytes that include prev; raises on any failure; NO lock held
+    except BaseException:
+        if created is not None:
+            try:
+                with store_lock(target.store_dir, exclusive=True):
+                    _drop_created(path, created)
+            except (BoardError, OSError):
+                pass                            # the refusal that is raising is the one to report
+        raise
     with store_lock(target.store_dir, exclusive=True) as held:
+        existed = path.exists()
         fd = held.open(filename, flags, fcntl.LOCK_EX)
         try:
+            created = _created_by(path, existed, fd, created)  # a file removed during the ceremony is re-created here: not left
             if (not _same_file(fd, path) or _read_fd(fd) != raw or _store_seen(target.store_dir) != seen):
                 raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
             sealed = board_sign.earn(target, seal, sealed)     # the authority log replayed now; the signed record must verify
@@ -672,6 +744,9 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
                 raise BoardError(SIGNED_CHAIN_MOVED)        # every post-seal mismatch refuses: a re-build would seal again
             _write_record(target, fd, path, raw, sealed, empty)
             return sealed, True
+        except BaseException:
+            _drop_created(path, created)
+            raise
         finally:
             os.close(fd)
 
@@ -692,6 +767,7 @@ class StoreLines:
     repos: tuple[bytes, ...]
     store_id: str
     repos_unterminated: bool = False
+    items_unterminated: bool = False          # the items file ends in an unterminated line: the cause check reads it torn
 
 
 def _split_written(raw: bytes) -> tuple[tuple[bytes, ...], bool]:
@@ -724,7 +800,8 @@ def _store_lines(target: Target) -> StoreLines:
             if (target.store_dir / name).exists():
                 raise
             got[name] = ((), False)
-    return StoreLines(got["items.jsonl"][0], got["repos.jsonl"][0], read_store_id(target.store_dir), got["repos.jsonl"][1])
+    return StoreLines(got["items.jsonl"][0], got["repos.jsonl"][0], read_store_id(target.store_dir), got["repos.jsonl"][1],
+                      got["items.jsonl"][1])
 
 
 def _with_store(rec: dict, store_id: str) -> dict:
@@ -757,8 +834,13 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
     return rec
 
 
-def _preflight(seal) -> None:
+def _preflight(seal, author: Mapping[str, object] | None = None) -> None:
+    """A seal's refusals that need no lock, before it is taken: the author must be the operator (``board_sign.check_signable``,
+    up front even for a write that will build nothing: gemini 136, fix 4), then the seal's own ``preflight``."""
     if seal is not None:
+        if author is not None:
+            from levain.desk import board_sign
+            board_sign.check_signable({"author": _author(author)})
         seal.preflight()
 
 
@@ -800,7 +882,7 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                                      f"this add carries {payload_hash}")
         return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author), seal), True
 
-    _preflight(seal)
+    _preflight(seal, author)
     rec, written = _append(target, build, seal=seal)
     return rec["id"], written
 
@@ -863,7 +945,7 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
             _require_path_done(out.get("done_kind", now_kind), out["done"] if "done" in out else now_done)
         return _graded(target, build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author), seal), True
 
-    _preflight(seal)
+    _preflight(seal, author)
     return _append(target, build, seal=seal)[0]["id"]
 
 
@@ -888,7 +970,7 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
         _require_known(recs, item_id)
         return _graded(target, build_record("decide", item_id, by, body, now, author=author), seal, authority), True
 
-    _preflight(seal)
+    _preflight(seal, author)
     return _append(target, build, seal=seal)[0]["id"]
 
 

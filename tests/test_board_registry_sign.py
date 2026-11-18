@@ -391,7 +391,8 @@ def test_a_cut_of_another_repos_item_keyed_to_the_abandons_migration_is_refused_
 
 def test_a_cut_of_the_abandoned_repos_item_added_after_the_abandon_is_refused_l2_m2(tgt, store, tmp_path, mkrepo, rig):
     """Ruling 1: alpha abandoned (M), done, re-tracked (M2) and tracked, so an add for alpha takes any key again; an item keyed
-    M:y added now, after the abandon, cannot be cut unsigned by citing the old abandon."""
+    M:y added now, after the abandon, cannot be cut unsigned by citing the old abandon (since fix 4 the first refusal is that
+    alpha is no longer aborting M; the item-order refusal is pinned by test_board_sign and gemini 104 case 2 below)."""
     repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
     keyed(tgt, "alpha", f"{m}:a")
     br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
@@ -405,7 +406,7 @@ def test_a_cut_of_the_abandoned_repos_item_added_after_the_abandon_is_refused_l2
     br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())
     late = keyed(tgt, "alpha", f"{m}:y")
     before = items_raw(store)
-    with pytest.raises(bs.BoardError, match="decision-class write.*was added after the cited abandon-track"):
+    with pytest.raises(bs.BoardError, match=f"decision-class write.*alpha is tracked .*not aborting {m}"):
         bs.decide(tgt, late, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=cause, authority=rig.source())
     assert items_raw(store) == before
 
@@ -416,7 +417,7 @@ def test_a_move_that_changes_a_tracking_or_tracked_repos_origin_is_decision_clas
     fork = tmp_path / "fork"
     git(tmp_path, "clone", "-q", str(repo), str(fork))
     before = raw(store)
-    with pytest.raises(bs.BoardError, match="move of a tracking or tracked repo that changes its origin or root set is a decision-class"):
+    with pytest.raises(bs.BoardError, match="move of a tracking, tracked or aborting repo that changes its origin or root set is a decision-class"):
         br.move(tgt, "alpha", str(fork), "m", "seat-1", author=AGENT)
     assert raw(store) == before
     br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())  # alpha: tracked
@@ -782,3 +783,313 @@ def test_the_sign_help_says_no_lock_is_held_during_the_prompt_fix3():
     text = " ".join(verbs["decide"].format_help().split())
     assert "No lock is held while the prompt is up" in text and "sign again" in text
     assert "The lock is held while the prompt is up" not in text
+
+
+# ------------------------------------------- fix 4 (L3 on the restack, l3_p2_restack2): each case reproduced first on 664f72209
+
+
+def _abandon_for(store, rig, m, **kw) -> bytes:
+    """A signed abandon-track of alpha's migration ``m`` at the registry chain's end, anchored at the items file's last line."""
+    tail = [ln for ln in items_raw(store).split(b"\n") if ln]
+    rec = {"v": 1, "store": bs.read_store_id(store), "op": "abandon-track", "repo": "alpha", "at": "2026-11-17T13:00:00Z",
+           "prev": bs.chain_prev(raw(store)), "by": "desk 1", "words": "w", "migration": m,
+           "items_last": hashlib.sha256(tail[-1]).hexdigest() if tail else sg.ITEMS_NONE, "author": OP, **kw}
+    return _signed_line(rig, rec)
+
+
+def _torn_add(store, iid: str, key: str) -> None:
+    """A lock-free add of ``iid``, chained, torn for itself (no origin): the item fold drops it once it is acknowledged."""
+    data = items_raw(store)
+    rec = bs.build_record("add", iid, OP["name"], {"repo": iid.split("#")[0], "title": "t", "words": "", "key": key,
+                                                    "payload_hash": "1" * 64}, NOW, author=OP)
+    with open(store / "items.jsonl", "ab") as f:
+        f.write(bs.canonical_bytes(bs._with_prev(rec, bs.chain_prev(data))) + b"\n")
+
+
+def test_a_signed_abandon_the_registry_fold_rejected_causes_no_cut_codex_42(tgt, store, tmp_path, mkrepo, rig):
+    """codex MED 42, reproduced on 664f72209: alpha tracked, a signed, chained abandon-track of its migration appended (the
+    fold soft-rejects it: alpha stays tracked). An unsigned agent cut citing it was ACCEPTED."""
+    repo, m, iid = tracked(tgt, tmp_path, mkrepo, rig)
+    br.track(tgt, "alpha", "go", "desk 1", author=OP, seal=rig.seal())
+    line = _abandon_for(store, rig, m)
+    _append_reg(store, line)
+    view = br.read_registry(tgt)
+    assert view.fold.repos["alpha"].mode == "tracked" and not view.fold.torn
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="decision-class write.*the registry did not apply"):
+        bs.decide(tgt, iid, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=hashlib.sha256(line).hexdigest(),
+                  authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_an_acknowledged_torn_abandon_causes_no_cut_gemini_102_case_3(tgt, store, tmp_path, mkrepo, rig):
+    """gemini 102 case 3, reproduced on 664f72209: a signed abandon line malformed for itself (words not a string) and
+    acknowledged as torn: the fold DROPS it (alpha stays tracking) and the registry is not torn. A cut citing it was ACCEPTED."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    line = _abandon_for(store, rig, m, words=5)
+    _append_reg(store, line)
+    br.ack_torn(tgt, "repos.jsonl", len(raw(store).splitlines()), "malformed, dropped", "desk 1", author=OP)
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "tracking"
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="the registry did not apply"):
+        bs.decide(tgt, iid, "cut", "x", "seat-1", author=AGENT, now=NOW, cause=hashlib.sha256(line).hexdigest(),
+                  authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_an_old_abandon_replayed_after_the_repo_was_tracked_again_causes_no_cut_gemini_109(tgt, store, tmp_path, mkrepo, rig):
+    """gemini MED 109, reproduced on 664f72209: abandon (cut), abandon-done, a new begin-track, the operator reopens the item
+    signed; an unsigned agent cut citing the OLD abandon was ACCEPTED, overriding the signed decision."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    br.begin_track(tgt, "alpha", manifest(tmp_path), "again", "desk 1", author=OP, seal=rig.seal())
+    bs.decide(tgt, iid, "reopen", "reopened", "desk 1", author=OP, seal=rig.seal())
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match=f"alpha is tracking .*not aborting {m}"):
+        bs.decide(tgt, iid, "cut", "revert", "seat-1", author=AGENT, now=NOW, cause=cause, authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_a_crashed_abandon_still_recovers_its_cuts_through_the_applied_current_check_fix4_1(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """The recovery path fix 1 must keep: a crash leaves alpha aborting M with its cut owed; the cut citing the recorded abandon
+    holds (applied, and alpha is aborting M now), and an unsigned re-run with an authority source finishes it."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    assert sg.cut_cause_problem(cause, iid, bs._store_lines(tgt), rig.snapshot()) is None
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, authority=rig.source())
+    assert cut == [iid]
+
+
+def test_an_acknowledged_torn_add_is_never_the_items_add_gemini_104_case_1(tgt, store, tmp_path, mkrepo, rig):
+    """gemini 104 case 1, reproduced on 664f72209: a torn ``add alpha#1`` (keyed elsewhere) acknowledged, then the live
+    alpha#1 keyed to M: the cause check matched the DEAD line ("not keyed to it") and the abandon refused forever."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    _torn_add(store, "alpha#1", "elsewhere:a")
+    br.ack_torn(tgt, "items.jsonl", 1, "a torn add, dropped", "desk 1", author=OP)
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    assert iid == "alpha#1"
+    _, cut = br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert cut == [iid]
+    br.abandon_done(tgt, "alpha", "", "desk 1", author=OP)
+    assert br.read_registry(tgt).fold.repos["alpha"].mode == "untracked"
+
+
+def test_an_acknowledged_torn_add_before_the_anchor_does_not_place_a_later_live_add_gemini_104_case_2(tgt, store, tmp_path, mkrepo, rig):
+    """gemini 104 case 2, reproduced on 664f72209: a torn ``add alpha#1`` keyed to M, acknowledged, before the abandon; the
+    live alpha#1 lands AFTER the abandon's anchor. The cut matched the dead line (before the anchor) and was ACCEPTED."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    _torn_add(store, "alpha#1", f"{m}:a")
+    br.ack_torn(tgt, "items.jsonl", 1, "a torn add, dropped", "desk 1", author=OP)
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())         # nothing owed: no live item of M
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    _lockfree_add(store, "alpha#1", f"{m}:late")
+    before = items_raw(store)
+    with pytest.raises(bs.BoardError, match="alpha#1 was added after the cited abandon-track"):
+        bs.decide(tgt, "alpha#1", "cut", "x", "seat-1", author=AGENT, now=NOW, cause=cause, authority=rig.source())
+    assert items_raw(store) == before
+
+
+def test_a_torn_items_file_refuses_the_cause_with_the_ack_torn_instruction_gemini_105(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """gemini 105, reproduced on 664f72209: the cause check never folded the items file; on a torn one it held."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+    lines = bs._store_lines(tgt)
+    torn = bs.StoreLines(lines.items + (b"garbage",), lines.repos, lines.store_id, lines.repos_unterminated)
+    problem = sg.cut_cause_problem(cause, iid, torn, rig.snapshot())
+    assert problem and "items" in problem and "torn" in problem and "ack-torn --file items.jsonl --line" in problem
+
+
+class _Cancelled(sg.Seal):
+    """A ceremony the operator cancels."""
+    via = "terminal"
+
+    def __init__(self, rig):
+        self.authority = rig.source()
+
+    def __call__(self, record: dict) -> dict:
+        raise bs.BoardError("Touch ID cancelled: nothing was written")
+
+
+def test_a_refused_signed_write_on_a_fresh_store_leaves_no_file_codex_46(bare_store, mkrepo, rig):
+    """codex MED 46 / gemini 118 / complement 20, reproduced on 664f72209: a cancelled ``register --sign`` on a store with
+    no registry left an EMPTY repos.jsonl, which activated the registry: the legacy add that worked before then refused."""
+    tgt = bs.resolve_store(None)
+    repo = mkrepo("alpha")
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=_Cancelled(rig))
+    assert not (bare_store / "repos.jsonl").exists()
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=_Cancelled(rig))
+    assert not (bare_store / "items.jsonl").exists()
+    stranger = Rig(bare_store.parent / "gone", label="gone")                  # earn refuses: a key the log does not enrol
+    with pytest.raises(bs.BoardError, match="not written"):
+        bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP, seal=rig.seal(authority=stranger.source()))
+    assert not (bare_store / "items.jsonl").exists()
+    p = sg.prepare(tgt, "add", repo="alpha", title="t", origin="o", by="desk 1", author=OP, authority=rig.source())
+    assert p.prev and not (bare_store / "items.jsonl").exists()             # prepare writes nothing, not even a file
+    assert bs.add(tgt, "alpha", "t", "o", "desk 1", author=OP)[1]            # the legacy add an inactive registry allows
+
+
+def test_a_refused_write_keeps_a_file_it_did_not_create_fix4_3(tgt, store, tmp_path, mkrepo, rig):
+    """The unlink is only of the file THIS write created: an existing empty repos.jsonl stays."""
+    assert (store / "repos.jsonl").read_bytes() == b""
+    repo = mkrepo("alpha")
+    with pytest.raises(bs.BoardError, match="cancelled"):
+        br.register(tgt, "alpha", str(repo), "first", "desk 1", author=OP, seal=_Cancelled(rig))
+    assert (store / "repos.jsonl").exists()
+
+
+def test_decide_cause_with_no_authority_log_reports_its_own_refusal_gemini_124(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """gemini MED 124, reproduced on 664f72209: ``decide --cause`` on an install with no authority log refused with
+    NO_AUTHORITY before the decide judged anything (a cause on a non-cut, an unsigned cut)."""
+    tgt = bs.resolve_store(None)
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    cause = hashlib.sha256(abandon_line(store).encode()).hexdigest()
+
+    def none(**kw):
+        raise bs.BoardError(sg.NO_AUTHORITY)
+    monkeypatch.setattr(sg, "resolve_authority", none)
+    agent = ["--by", "seat-1", "--author-kind", "agent", "--cause", cause]
+    rc, out, err = run(capsys, "decide", "--id", iid, "--decision", "parked", "--words", "w", *agent)
+    assert rc != 0 and "cause belongs to a decide of cut only" in err
+    rc, out, err = run(capsys, "decide", "--id", iid, "--decision", "cut", "--words", "w", *agent)
+    assert rc != 0 and "decision-class write" in err and "no authority log to verify it against" in err
+
+
+def test_an_unreadable_cockpit_is_named_not_reported_as_no_authority_log_deepseek_78(store, tmp_path, mkrepo, rig, capsys, monkeypatch):
+    """deepseek 78, reproduced on 664f72209: ``_source`` swallowed every refusal of resolve_authority, so an unreadable
+    cockpit read as "no authority log". It is passed through now (and ``decide --cause`` does the same)."""
+    tgt = bs.resolve_store(None)
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+
+    def unreadable(**kw):
+        raise sg.AuthorityUnreadable(f"{sg.NO_AUTHORITY} (the consent hooks or the cockpit could not be read: boom)")
+    monkeypatch.setattr(sg, "resolve_authority", unreadable)
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no", *A)
+    assert rc != 0 and "could not be read: boom" in err
+    rc, out, err = run(capsys, "decide", "--id", iid, "--decision", "cut", "--words", "w", "--by", "seat-1", "--author-kind", "agent",
+                       "--cause", "0" * 64)
+    assert rc != 0 and "could not be read: boom" in err
+
+
+def test_the_recovery_verifies_the_abandon_once_not_once_per_owed_item_complement_15(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """complement MED 15 / deepseek 64, reproduced on 664f72209: the recovery ran the whole cause check (a signature
+    verification, a registry fold) once PER owed item while holding the exclusive lock: three items, three verifications."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a", "b", "c"))
+    for k in "abc":
+        keyed(tgt, "alpha", f"{m}:{k}")
+    real = _crash_cuts(monkeypatch)
+    with pytest.raises(bs.BoardError, match="simulated crash"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    monkeypatch.setattr(bs, "decide", real)
+    calls = []
+    real_verify = sg.verify_record
+
+    def counted(record, snapshot):
+        calls.append(record.get("op"))
+        return real_verify(record, snapshot)
+    monkeypatch.setattr(sg, "verify_record", counted)
+    problem, uncut = br._latest_abandon_problem(raw(store), bs.read_store_id(store), "alpha", m, rig.snapshot(), store)
+    assert problem is None and len(uncut) == 3 and calls == ["abandon-track"]
+
+
+def test_a_move_of_an_aborting_repo_that_changes_its_origin_is_decision_class_complement_28(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """complement 28, reproduced on 664f72209: an aborting repo could be re-pointed at another repository unsigned before
+    abandon-done reads its charter compensation there."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    fork = tmp_path / "fork"
+    git(tmp_path, "clone", "-q", br.read_registry(tgt).fold.repos["alpha"].path, str(fork))
+    before = raw(store)
+    with pytest.raises(bs.BoardError, match="move of a tracking, tracked or aborting repo that changes its origin"):
+        br.move(tgt, "alpha", str(fork), "m", "seat-1", author=AGENT)
+    assert raw(store) == before
+
+
+def _signer_doing(rig, during):
+    """A terminal seal over the throwaway key whose signer runs ``during()`` inside the ceremony (no lock held)."""
+    from levain.cockpit import keys as ckeys
+
+    def factory(path, bound):
+        fp, sign = ckeys.ssh_signer(path, namespace=sg.NAMESPACE, timeout=bound)
+
+        def doing(message):
+            during()
+            return sign(message)
+        return fp, doing
+    return sg.terminal_seal(key_dir=rig.dir, signer_factory=factory, remote=lambda: None, in_agent_session=lambda: False,
+                            authority=rig.source())
+
+
+def test_a_store_file_touched_but_unchanged_during_the_prompt_does_not_refuse_the_signed_write_complement_23(tgt, store, tmp_path, mkrepo, rig):
+    """complement 23, reproduced on 664f72209: a sync client (or ``touch``) bumping the mtime of either store file during the
+    prompt refused the signed write after the operator had touched the sensor; the bytes and the inode were the same."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+
+    def touch():
+        for name in ("items.jsonl", "repos.jsonl"):
+            st = os.stat(store / name)
+            os.utime(store / name, ns=(st.st_atime_ns, st.st_mtime_ns + 7_000_000_000))
+    bs.decide(tgt, iid, "parked", "later", "desk 1", author=OP, seal=_signer_doing(rig, touch))
+    assert json.loads(items_raw(store).splitlines()[-1])["decision"] == "parked"
+    with pytest.raises(bs.BoardError, match="the board changed while you signed: sign again"):
+        bs.decide(tgt, iid, "parked", "later", "desk 1", author=OP,
+                  seal=_signer_doing(rig, lambda: _lockfree_add(store, "alpha#7", f"{m}:z")))
+
+
+def test_an_unsigned_write_whose_store_keeps_changing_names_what_changed_complement_26(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """complement 26: the unsigned path said "was replaced N times (a git operation?)" when no file was replaced."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    n = iter(range(10 ** 6))
+    monkeypatch.setattr(bs, "_store_seen", lambda d: (("items.jsonl", next(n)), ("repos.jsonl",)))
+    with pytest.raises(bs.BoardError) as got:
+        bs.amend(tgt, iid, "retitled", "desk 1", {"title": "another"}, author=OP)
+    assert "replaced" not in str(got.value) and "changed" in str(got.value) and "nothing was written" in str(got.value)
+
+
+def test_a_store_change_during_a_signed_build_rebuilds_before_the_one_prompt_gemini_130(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """gemini LOW 130, reproduced on 664f72209: a sealed write broke out for the ceremony BEFORE the change check, so a
+    lock-free write during the build cost the operator a prompt that was then refused."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    iid = keyed(tgt, "alpha", f"{m}:a")
+    real, builds, prompts = bs._graded, [], []
+
+    def graded(*a, **kw):
+        builds.append(1)
+        if len(builds) == 1:
+            _lockfree_add(store, "alpha#7", f"{m}:z")
+        return real(*a, **kw)
+    monkeypatch.setattr(bs, "_graded", graded)
+    bs.decide(tgt, iid, "parked", "later", "desk 1", author=OP, seal=_signer_doing(rig, lambda: prompts.append(1)))
+    assert len(builds) == 2 and len(prompts) == 1
+    assert json.loads(items_raw(store).splitlines()[-1])["decision"] == "parked"
+
+
+def test_a_seal_with_an_agent_author_is_refused_up_front_even_when_nothing_would_be_written_gemini_136(tgt, store, tmp_path, mkrepo, rig):
+    """gemini LOW 136, reproduced on 664f72209: the operator check ran only inside the build's ``_graded``, so a write that
+    builds nothing (an idempotent add to prepare, a fully cut abandon) took an agent author with a seal without refusing."""
+    repo, m = tracking(tgt, tmp_path, mkrepo, rig, plan=("a",))
+    key = f"{m}:a"
+    keyed(tgt, "alpha", key)
+    with pytest.raises(bs.BoardError, match="author kind must be operator"):
+        sg.prepare(tgt, "add", repo="alpha", title="an item", origin="desk 1", by="seat-1", author=AGENT, now=NOW, key=key,
+                   payload_hash=hashlib.sha256(key.encode()).hexdigest(), authority=rig.source())
+    br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    with pytest.raises(bs.BoardError, match="author kind must be operator"):
+        br.abandon_track(tgt, "alpha", "no", "seat-1", author=AGENT, seal=rig.seal())
+
+
+def test_abandon_track_on_a_torn_registry_says_ack_torn_first_deepseek_71(tgt, store, tmp_path, mkrepo, rig, monkeypatch):
+    """deepseek 71: abandon-track on a torn registry refuses naming the ack-torn first, before any write."""
+    m, iid, held = _owed_after_crash(tgt, store, tmp_path, mkrepo, rig, monkeypatch)
+    _append_reg(store, b"garbage")
+    before = raw(store), items_raw(store)
+    n = len(raw(store).splitlines())
+    with pytest.raises(bs.BoardError, match=f"registry is torn.*ack-torn first.*--file repos.jsonl --line {n}"):
+        br.abandon_track(tgt, "alpha", "no", "desk 1", author=OP, seal=rig.seal())
+    assert (raw(store), items_raw(store)) == before
