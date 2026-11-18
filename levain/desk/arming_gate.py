@@ -27,9 +27,9 @@ __all__ = ["CLOSED_FACTS", "FACTS", "arming_refusal", "missing_facts"]
 
 # the three facts, in the order he does them, each with what it records; the gate reads only this tuple
 _FACT_WORDS: tuple[tuple[str, str], ...] = (
-    ("nd7_ruled", "his ruling on ND-7's result (the phone notice table)"),
+    ("nd7_ruled", "the operator's ruling on ND-7's result (the phone notice table)"),
     ("nd8_done", "ND-8 done (the night key on the server)"),
-    ("nd9_read", "his read of ND-9's disagreement table"),
+    ("nd9_read", "the operator's read of ND-9's disagreement table"),
 )
 
 #: the three facts, read-only; a view for callers, never what the gate decides from

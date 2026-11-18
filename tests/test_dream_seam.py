@@ -149,7 +149,7 @@ def test_a_running_desk_is_told_when_a_dream_saved_after_it_started(desk, capsys
     out = _open(desk, capsys, "--light")
     line = next(ln for ln in out.splitlines() if ln.startswith("Dream seam:"))
     assert "saved new memory at" in line and "after this desk started" in line
-    assert "never while he is typing" in line and "never in the middle of work" in line
+    assert "never while the operator is typing" in line and "never in the middle of work" in line
     assert "coord close --kind dream" in line and "Nothing rotates you on its own" in line
 
 

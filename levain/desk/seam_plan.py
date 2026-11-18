@@ -76,7 +76,7 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             if not band_items:
                 return "band: 0 open"
             names = [f"#{it['n']}" if it.get("n") else "new" for it in band_items]
-            return (f"band: {len(band_items)} open ({_ids(names)}): each is answered by him, or carried in in_flight "
+            return (f"band: {len(band_items)} open ({_ids(names)}): each is answered by the operator, or carried in in_flight "
                     "by its number")
 
         def card_part(name: str, count: Callable[[dict[str, Any]], str]) -> Callable[[], str]:
@@ -99,7 +99,7 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             if crossed:
                 bits.append(f"{len(crossed)} crossed budget(s) ({_ids([str(b['thread_id']) for b in crossed])})")
             return ("undecided SIGNs and crossed budgets: " + "; ".join(bits) +
-                    f": they wait for his morning card ({lv} coord morning)")
+                    f": they wait for the operator's morning card ({lv} coord morning)")
 
         def drops() -> str:
             got = drop_reply.unreplied(conn, read_at, every=True)      # the walk counts every one, not the panel's window
@@ -168,7 +168,7 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             on = [a for a, s in states.items() if s.get("away")]
             if on:
                 return f"away: on ({', '.join(on)})"
-            return (f"away: off: when he is leaving, the drop that says so goes first: {lv} coord away DROP_ID "
+            return (f"away: off: when the operator is leaving, the drop that says so goes first: {lv} coord away DROP_ID "
                     "--token N")
 
         def body() -> str:
@@ -177,7 +177,7 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
                 else None
             prev = f" --prev-handoff-id {latest[0]}" if latest else " (no earlier handoff: omit --prev-handoff-id)"
             return ("body: state_line, in_flight, next and contingencies (the night plan) and notes; attested_walked "
-                    "is true only after this list was walked with him present; then "
+                    "is true only after this list was walked with the operator present; then "
                     f"{lv} coord close --kind operator --body-file PATH --request-id ID{prev} --token N")
 
         lines = [

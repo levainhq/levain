@@ -220,7 +220,7 @@ def brief_section(store_dir: Path, now: datetime, *, data_root: Path | str | Non
 
 def _brief_section(store_dir: Path, now: datetime, data_root: Path | str | None) -> list[str]:
     rules = [
-        "Standing orders are what he signed for you to do on judgement: his words, the restatement of what you will and "
+        "Standing orders are what the operator signed for you to do on judgement: their words, the restatement of what you will and "
         "will NOT do, typed effect lines with budgets, kills and an expiry. Only the orders quoted below answer. An "
         "order not quoted here is expired, revoked, stopped, unknown or outside the order rules, and answers nothing. Anything no quoted order "
         "covers is a ping, never a choice you make. An effect runs only through its typed verb, which replays the "

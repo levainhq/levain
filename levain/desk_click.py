@@ -173,7 +173,7 @@ def _read_click(body: Any) -> tuple[dict[str, str], str | None, str | None, str]
     if "pick" in body and (not isinstance(pick, str) or len(pick) != 1):
         return None, "pick is one displayed letter"
     if "text" in body and (not isinstance(text, str) or not text.strip() or len(text) > 2000):
-        return None, "text is his words, 1 to 2000 characters"
+        return None, "text is the operator's words, 1 to 2000 characters"
     return {"id": subject["id"], "version": subject["version"]}, pick, text, txn
 
 
