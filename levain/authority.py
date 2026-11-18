@@ -2981,8 +2981,22 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 rank = 1 if op == "revoke_agent" else _DELTA_RANK[delta]
                 if op == "revoke_agent":
                     agent_revoked[(rec["agent_id"], rec["agent_store_id"])] = seq
-                grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
-                    _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
+                changed = {gid for gid, g in need.grants.items() if gid in policy.grants
+                           and _canonical(_thaw(policy.grants[gid])) != _canonical(_thaw(g))}
+                # the stop is absorbing (row 190): a change to a grant stopped in the predecessor, whatever the op (a
+                # renew, or a loosen that extends it beside another change and so computes to LOOSEN), never moves its
+                # current link, so it never brings the grant back under its old incarnation. Refused for a new link;
+                # a link already in the log is taken (refusing it would wedge the log) and the grant stays stopped
+                held = {gid for gid in changed if grant_stop_reason(state, gid) is not None}
+                if held and new_link:
+                    gid = min(held)
+                    held_grant = policy.grants[gid]         # the kind names the way back (stopped_way_with)
+                    held_kind = held_grant.get("kind") if isinstance(held_grant, Mapping) else None
+                    raise AuthorityError(f"grant {gid[:80]} stopped when {grant_stop_reason(state, gid)}; a {op} does "
+                                         f"not bring it back: {stopped_way_with(held_kind, 'with a key you hold')}")
+                grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and (gid not in changed
+                                                                                         or gid in held) else seq)
+                              for gid in need.grants}
                 grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
                 if signer.custody == PASSKEY and op == "create_grant":
                     rank = GRADUATION_OPT_IN_RANK       # _passkey_act let it through only as the opt-in names it
@@ -3380,13 +3394,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
-    # one place for every renew writer: a renew by a key still held would otherwise move the current link back to an
-    # active signer and bring a stopped grant back
-    stopped = grant_stop_reason(state, rec["grant_id"])
-    if stopped is not None:
-        stopped_kind = grant.get("kind") if isinstance(grant, Mapping) else None
-        raise AuthorityError(f"grant {str(rec['grant_id'])[:80]} stopped when {stopped}; a renew does not bring it "
-                             f"back: {stopped_way_with(stopped_kind, 'with a key you hold')}")
+    # a renew of a stopped grant is refused by _step (new_link), for every op that changes a grant, before this runs
     kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")

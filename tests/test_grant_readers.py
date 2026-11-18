@@ -80,9 +80,12 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/authority.py::_link_format":
         (1, "replay", "the format a link needs, from the policy the replay holds"),
     "levain/authority.py::_step":
-        (4, "replay", "the replay itself: grant_seqs and grant_born are computed from every grant the log holds"),
+        (6, "replay", "the replay itself: grant_seqs and grant_born are computed from every grant the log holds, and a "
+                      "change to a stopped grant is refused (new link, its kind naming the way back) or leaves its "
+                      "current link unmoved"),
     "levain/authority.py::_append_only_checks":
-        (2, "rule", "the append rules: a renew of a stopped grant is refused here, which needs the raw policy"),
+        (2, "rule", "the append rules: the consent-workspace and per-kind checks of the grants a loosen changes, and "
+                    "the renew's own grant lookup"),
     # --- agent links: the use paths that judge the signers themselves ---------------------------------------------
     "levain/agent_authority.py::AgentAuthority.peek":
         (1, "use", "after agent_link_arms it requires the signers of the born AND current links to be active keys "

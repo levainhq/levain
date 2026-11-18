@@ -102,6 +102,23 @@ def world(tmp_path: Path):
     def liveness() -> keys.AuthorityLiveness:
         return keys.AuthorityLiveness(source, clock=_now, timeout_s=30.0)
 
+    def plant(make_policy, by: str) -> None:
+        """A loosen no append judged (a foreign or older writer): ``make_policy(state)`` builds the policy from the
+        head snapshot; the record is built by hand, signed by ``by``'s real key and inserted raw at the head."""
+        state = source()
+        by_path, by_fp = paths[by]
+        conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+        try:
+            seq, prev = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
+            record_text = auth._canonical({"op": "loosen", "policy": make_policy(state), "format": auth.FORMAT,
+                                           "store_id": state.store_id, "seq": seq + 1, "at": auth._stamp(_now())})
+            sig = _signer(by_path)(auth._message(prev, record_text))
+            conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
+                         "VALUES (?, ?, ?, ?, ?, ?)", (seq + 1, prev, record_text, by_fp, sig,
+                                                       auth._link_hash(prev, record_text)))
+        finally:
+            conn.close()
+
     def setup(by: str, **kw):
         """`levain chat key setup` for entity `ent` on example.com, key ``by`` signing, a fake keychain of one item."""
         by_path, by_fp = paths[by]
@@ -112,7 +129,7 @@ def world(tmp_path: Path):
         return key_setup.setup_key(root, **{**args, **kw})
 
     return SimpleNamespace(source=source, create=create, renew=renew, revoke_key=revoke_key, launch=launch,
-                           liveness=liveness, setup=setup)
+                           liveness=liveness, setup=setup, plant=plant)
 
 
 def _route(routes: keys.RouteSet) -> keys.RouteSnapshot:
@@ -174,6 +191,30 @@ def test_t13_a_revoke_of_a_key_that_signed_nothing_of_the_record_stops_nothing(w
     assert after.record_id == RID
     assert live.check(before.record_id, before.incarnation) is True
     assert live.check(after.record_id, after.incarnation) is True
+
+
+def test_a_loosen_that_extends_a_stopped_record_beside_a_new_one_does_not_bring_its_route_back(world) -> None:
+    """Review round 1 (codex HIGH): A creates, B renews, B is revoked; a loosen A signs extends the record and adds
+    another, so it computes to LOOSEN and no renew rule reads it. Planted past the append, the replay takes it but the
+    record's current link stays B's renew: the launch builds no route for it and a route built before the revoke still
+    fails its check (its incarnation is unchanged, so a moved current link would have let it attach again)."""
+    world.create()
+    world.renew(RID, "b")
+    before = _route(world.launch())
+    live = world.liveness()
+    world.revoke_key("b", by="a")
+
+    def policy(state):
+        p = state.policy
+        grants = auth._thaw(p.grants)
+        grants[RID] = {**grants[RID], "expires_at": auth._stamp(_now() + timedelta(days=20))}
+        grants["ek-000000000002"] = record("ek-000000000002", "other.example.com")
+        return {"raise_to": auth._thaw(p.raise_to), "timeouts": auth._thaw(p.timeouts), "grants": grants}
+
+    world.plant(policy, "a")
+    assert auth.grant_stop_reason(world.source(), RID) == auth.STOPPED_CURRENT
+    assert set(world.launch().routes) == {"other.example.com"}
+    assert live.check(before.record_id, before.incarnation) is False
 
 
 def test_t13_a_stopped_record_is_not_a_second_live_record_for_its_host(world, monkeypatch) -> None:
