@@ -13,7 +13,8 @@ never made is ``queue: "none"`` ("no queue yet"). ``build`` never raises."""
 from __future__ import annotations
 
 import argparse
-import os
+import copy
+import threading
 import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -25,11 +26,6 @@ from levain.desk import ready
 
 BOARD_PATH = "/cockpit/board.json"
 UNKNOWN = "unknown"
-#: Until the board config that ``levain board use`` is to write exists, the two things ``levain board state`` is told on its
-#: command line (the external evidence producers to expect, and that this install runs no land waiter) are told to the cockpit
-#: here: comma-separated producer names, and any non-empty value. Unset, every item that rests on an absence reads unknown.
-PRODUCERS_ENV = "LEVAIN_BOARD_PRODUCERS"
-NO_LAND_WAITER_ENV = "LEVAIN_BOARD_NO_LAND_WAITER"
 TEXT_MAX = 1000        # the kernel's board validator refuses a longer card field (engine.BOARD_TEXT_MAX; one test pins them equal)
 CATEGORIES = ready.CATEGORIES
 COLUMNS = (UNKNOWN, *CATEGORIES)        # the columns a board value can carry, in drawing order: unknown first (v2 draws it above the rest),
@@ -82,6 +78,56 @@ def _card(item: Mapping[str, Any], rec: Mapping[str, Any] | None) -> dict[str, A
     return card
 
 
+# A repo's git evidence is ~99% of a board build (a real two-repo install: ~5.5 s of ~5.6 s; the panel is read on every
+# cockpit poll, 30 s), so it is kept while the repo's refs have not moved. NOT a time-only TTL: the key is every ref and sha
+# (`for-each-ref`), the stamps of FETCH_HEAD / packed-refs / config in the git dir and the common dir (fetched_at, the repo's
+# shallow/partial flags), and the read's own arguments. Everything else the board derives (items, the registry, seats, the
+# band, waiters, documents) is read live on every build, so a card never waits for a cache. One entry per repo path.
+_EVIDENCE_CACHE: dict[str, tuple[Any, Any, Any]] = {}
+_EVIDENCE_LOCK = threading.Lock()
+
+
+def _stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _refs_state(repo: Path) -> Any:
+    """What the evidence read depends on in the repo, or None when that cannot be read (then nothing is cached)."""
+    from levain.desk import board_evidence as be
+
+    try:
+        refs = be._git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+        dirs = [x.strip() for x in be._git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n") if x.strip()]
+    except be.GitFailed:
+        return None
+    stamps = tuple((d, name, _stamp(Path(d) / name)) for d in dict.fromkeys(dirs) for name in ("FETCH_HEAD", "packed-refs", "config", "shallow"))
+    return (refs, stamps)
+
+
+def _cached_read_evidence(repo: Path, *, repo_name: str | None = None, since: str | None = None, **kw: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``board_evidence.read_git_evidence``, kept while the repo's refs state is the same (see above)."""
+    from levain.desk import board_evidence as be
+
+    args = {"repo_name": repo_name, **({"since": since} if since is not None else {}), **kw}
+    state = _refs_state(Path(repo))
+    key = str(Path(repo))
+    arg_key = tuple(sorted(args.items()))
+    if state is not None:
+        with _EVIDENCE_LOCK:
+            hit = _EVIDENCE_CACHE.get(key)
+        if hit is not None and hit[0] == state and hit[1] == arg_key:
+            return copy.deepcopy(hit[2])
+    out = be.read_git_evidence(repo, **args)
+    if state is not None and _refs_state(Path(repo)) == state:      # a ref that moved while it was read is not kept
+        with _EVIDENCE_LOCK:
+            _EVIDENCE_CACHE[key] = (state, arg_key, copy.deepcopy(out))
+    return out
+
+
 def _v2_target(items: Path | str | None) -> Any:
     """The board store to read, or None when this install has none yet (a store with a registry; else the dispatch queue is read). A store that is
     named but cannot be resolved raises ``bs.BoardError``: that is an unreadable board, never a quiet fall back."""
@@ -125,7 +171,7 @@ def _v2(items: Path | str | None, *, now: str | None, producers: Sequence[str] =
     args = argparse.Namespace(json=True, items=str(items) if items else None, evidence_extra=None, producers=list(producers),
                               no_land_waiter=no_land_waiter, repo=None, repo_name=None, also_repo=[], since=be.BOARD_EPOCH, now=now)
     try:
-        rc, doc = bc.state_doc(args, lambda _text: None)
+        rc, doc = bc.state_doc(args, lambda _text: None, _cached_read_evidence)
     except Exception:  # noqa: BLE001 - never a 500: the board is named unreadable
         rc, doc = bc.EXIT_USAGE, None
     if doc is None:
@@ -210,11 +256,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     queue = "none"
     v2cards: list[dict[str, Any]] | None = None
     off_count = 0
-    if producers is None:
-        producers = [x.strip() for x in os.environ.get(PRODUCERS_ENV, "").split(",") if x.strip()]
-    if no_land_waiter is None:
-        no_land_waiter = bool(os.environ.get(NO_LAND_WAITER_ENV))
-    v2 = _v2(board_items, now=generated, producers=producers, no_land_waiter=no_land_waiter)
+    v2 = _v2(board_items, now=generated, producers=producers or (), no_land_waiter=bool(no_land_waiter))
     if v2 is not None:
         v2cards, off_count, bad, as_of = v2
         unreadable.extend(bad)

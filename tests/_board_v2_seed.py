@@ -77,7 +77,7 @@ def _item(repo: str, title: str, *, done: str | None = "green", tier: str | None
 def seed(root: Path) -> dict[str, str]:
     """Build the store under ``root`` (the levain home is already set to ``root / 'lhome'``); returns ``{intent: item id}``."""
     store = root / "store"
-    board("use", str(store))
+    board("use", str(store), "--no-land-waiter")       # the config this install runs: no land waiter (the board reads it, not the env)
     store = Path(os.path.realpath(store))
     (store / "repos.jsonl").touch()
     ids: dict[str, str] = {}

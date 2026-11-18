@@ -163,6 +163,12 @@ def register(subparsers: Any) -> None:
                    help="Import a focus.json as register/pause records, replace it by a tombstone, then write the pointer (re-runnable).")
     u.add_argument("--briefcase", type=Path, metavar="DIR", help="Where the focus entries' directories are (default: three levels above FILE).")
     u.add_argument("--by", default="levain board use", help="Who writes the imported records (default: the verb).")
+    u.add_argument("--producer", dest="producers", action="append", default=[], metavar="NAME",
+                   help="An external evidence producer this install runs (repeatable); saved in the store's board config, which "
+                        "`board state` and the cockpit read. Given at all, the saved config is replaced by the flags given.")
+    u.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
+                   help="This install runs no land waiter; saved in the board config. Given at all, the saved config is replaced "
+                        "by the flags given (a flag left off is off).")
     author_args(u)
     u.set_defaults(func=run_use)
     br.register_cli(sub, author_args, _author, items_help)
@@ -419,9 +425,15 @@ def run_use(args: argparse.Namespace) -> int:
         if args.import_focus is not None:
             store_dir, changed, note = br.import_focus_use(args.dir, args.import_focus, by=args.by, author=_author(args),
                                                            briefcase=args.briefcase)
+            if args.producers or args.no_land_waiter:
+                if bs.write_config(store_dir, args.producers, args.no_land_waiter):
+                    changed = True
             print(f"{'using' if changed else 'already using'} {store_dir} ({note})")
             return 0
         store_dir, changed = bs.use(args.dir)
+        if args.producers or args.no_land_waiter:
+            if bs.write_config(store_dir, args.producers, args.no_land_waiter):
+                changed = True
     except bs.BoardError as exc:
         return _refused(exc)
     print(f"{'using' if changed else 'already using'} {store_dir}")
@@ -449,9 +461,11 @@ def run_state(args: argparse.Namespace) -> int:
     return rc
 
 
-def state_doc(args: argparse.Namespace, say: Any = None) -> tuple[int, dict[str, Any] | None]:
+def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = None) -> tuple[int, dict[str, Any] | None]:
     """``(exit code, the Board document or None)`` of ``levain board state --json``, with no printing of the document: a refusal is
-    handed to ``say`` (a line of text; default stderr). The cockpit board reads the board through this, so it never captures a stream."""
+    handed to ``say`` (a line of text; default stderr). ``read_evidence`` replaces :func:`board_evidence.read_git_evidence` (same signature):
+    the cockpit hands it a reader that keeps a repo's evidence while that repo's refs are unchanged. The cockpit board reads the board through this, so it never captures a stream."""
+    read_git = read_evidence or be.read_git_evidence
     if say is None:
         say = lambda text: print(text, file=sys.stderr)  # noqa: E731
     try:
@@ -537,15 +551,21 @@ def state_doc(args: argparse.Namespace, say: Any = None) -> tuple[int, dict[str,
         reads = [(args.repo_name, args.repo if args.repo is not None else Path(".")), *[_split_also(x) for x in args.also_repo]]
         cross = bool(args.also_repo)
     repo = Path(reads[0][1]).expanduser()
-    evidence, summary = be.read_git_evidence(repo, repo_name=reads[0][0], since=args.since)
+    evidence, summary = read_git(repo, repo_name=reads[0][0], since=args.since)
     # One repo reads every item, as before; with --also-repo each repo reads the items that belong to it.
     mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
     evidence["documents"] = be.read_documents(mine, repo)
     store_dir = target.store_dir
-    producers = list(dict.fromkeys(args.producers))              # a name given twice is one producer
+    try:
+        config = bs.read_config(store_dir)
+    except bs.BoardError as exc:
+        return _srefused(say, exc)
+    # The flags override the store's board config (tests, one-off runs); with none given the config is what this install runs.
+    producers = list(dict.fromkeys(args.producers or config["producers"]))   # a name given twice is one producer
+    no_land_waiter = bool(args.no_land_waiter or config["no_land_waiter"])
     if bp.NATIVE_PRODUCER in producers:
         return _sfail(say, f"--producer {bp.NATIVE_PRODUCER}: that is Levain's own producer, always read; --producer names an external one")
-    native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=args.no_land_waiter)
+    native = bp.native_blocks(now=now, store_id=store_id, no_land_waiter=no_land_waiter)
     external, failures = bp.read_external(store_dir, producers)
     if store_id is None and any(isinstance(b, dict) and b.get("store_id") for bl in external.values() for b in bl):
         say(f"levain board state: the store {store_dir} has no id, so an external block naming one is taken as this store's")
@@ -569,7 +589,7 @@ def state_doc(args: argparse.Namespace, say: Any = None) -> tuple[int, dict[str,
             return _sfail(say, f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
         repo_evidence = {summary["repo"]: primary}
         for given, other in reads[1:]:
-            ev2, sum2 = be.read_git_evidence(other, repo_name=given, since=args.since)
+            ev2, sum2 = read_git(other, repo_name=given, since=args.since)
             name = sum2["repo"]
             if not name or name in repo_evidence:
                 return _sfail(say, f"--also-repo {other}: its repo name ({name!r}) is empty or already read; say it with NAME=PATH")

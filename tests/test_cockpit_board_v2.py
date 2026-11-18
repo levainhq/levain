@@ -26,7 +26,6 @@ def store(tmp_path_factory):
     mp.delenv("LEVAIN_LAUNCH_KEY", raising=False)
     ids = seed.seed(root)
     mp.setenv("LEVAIN_BOARD_ITEMS", str(root / "store"))
-    mp.setenv(board.NO_LAND_WAITER_ENV, "1")
     yield ids
     mp.undo()
 
@@ -66,7 +65,7 @@ def test_off_is_a_count_and_never_a_column_of_cards(store):
 def test_an_empty_unknown_column_is_left_out_and_the_rest_is_the_six(store, monkeypatch):
     doc = {"as_of": "2026-11-17T00:00:00Z", "items": [{"id": "a#1", "repo": "a", "title": "T", "tier": None, "state": "ready", "column": "ready",
                                                       "reason": "r", "refs": [], "as_of": None, "kind": "work"}]}
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None: (0, doc))
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None: (0, doc))
     v = board.build(None, None)
     assert [c["category"] for c in v["columns"]] == list(board.CATEGORIES) and v["off_count"] == 0
 
@@ -76,7 +75,7 @@ def test_every_state_lands_in_its_columns_and_needs_you_stays_the_bands(store, m
 
     items = [{"id": f"a#{n}", "repo": "a", "title": s, "tier": None, "state": s, "column": col, "reason": f"{s} reason", "refs": [], "as_of": None,
               "kind": None} for n, (s, col) in enumerate(STATE_COLUMN.items(), 1)]
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None: (3, {"as_of": None, "items": items}))
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None: (3, {"as_of": None, "items": items}))
     v = board.build(None, None)
     cols = {c["category"]: [k["title"] for k in c["cards"]] for c in v["columns"]}
     assert cols["unknown"] == ["unknown"] and cols["running"] == ["in_flight"] and cols["waiting"] == ["landing"]
@@ -91,7 +90,7 @@ def test_the_needs_you_column_is_the_bands_alone(store, monkeypatch, tmp_path):
 
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh2"))
     (tmp_path / "lh2" / "consent").mkdir(parents=True, mode=0o700)
-    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None: (0, {"as_of": None, "items": [
+    monkeypatch.setattr(board_cli, "state_doc", lambda args, say=None, read_evidence=None: (0, {"as_of": None, "items": [
         {"id": "a#1", "repo": "a", "title": "in the band", "tier": None, "state": "needs_you", "column": "needs_you", "reason": "band 1",
          "refs": [], "as_of": None, "kind": None}]}))
     v = board.build(None, QuestionStore(tmp_path / "lh2" / "consent"))
@@ -132,3 +131,115 @@ def test_the_page_draws_the_unknown_column_while_it_holds_a_card_and_the_off_cou
     assert got["with"]["heads"][:2] == ["unknown 1", "backlog 0"] and "ready 1" in got["with"]["heads"] and "3 off the board (cut, parked or out of 1.0)." in got["with"]["notes"][0]
     assert got["with"]["held"] == ["held: item:a#9 is not in the store"]
     assert "unknown" not in " ".join(got["without"]["heads"]) and "ready 1" in got["without"]["heads"] and got["without"]["notes"] == []
+
+
+# ---- the board config: `levain board use --producer/--no-land-waiter` writes it, `board state` and the cockpit read it ----
+
+import argparse
+import os
+
+from levain.desk import board_evidence, board_producers, board_store
+
+
+def _args(items, **kw):
+    base = dict(json=True, items=str(items), evidence_extra=None, producers=[], no_land_waiter=False, repo=None, repo_name=None,
+                also_repo=[], since=board_evidence.BOARD_EPOCH, now=None)
+    return argparse.Namespace(**{**base, **kw})
+
+
+def _unknown_ids(doc):
+    return sorted(i["id"] for i in doc["items"] if i["state"] == "unknown")
+
+
+@pytest.fixture()
+def bare_copy(store, tmp_path):
+    """The module's store copied with NO board config (its registry still names the same repos): today's flagless install."""
+    src = Path(os.environ["LEVAIN_BOARD_ITEMS"])
+    dst = tmp_path / "noconf"
+    shutil.copytree(src, dst)
+    (dst / board_store.CONFIG_NAME).unlink()
+    return dst
+
+
+def test_use_writes_the_config_atomically_and_a_second_use_changes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    d = tmp_path / "s"
+    assert seed.board("use", str(d), "--producer", "flow", "--producer", "ci", "--no-land-waiter").startswith("using")
+    assert board_store.read_config(d) == {"producers": ["flow", "ci"], "no_land_waiter": True}
+    assert seed.board("use", str(d), "--producer", "flow", "--producer", "ci", "--no-land-waiter").startswith("already using")
+    assert [p.name for p in d.iterdir() if p.name.startswith(".")] == []                  # no temp file left behind
+    seed.board("use", str(d))                                                              # no flag: the saved config is left alone
+    assert board_store.read_config(d)["producers"] == ["flow", "ci"]
+    seed.board("use", str(d), "--producer", "flow")                                        # flags given: they replace it
+    assert board_store.read_config(d) == {"producers": ["flow"], "no_land_waiter": False}
+
+
+def test_a_store_with_no_config_reads_as_the_flagless_cli(tmp_path):
+    assert board_store.read_config(tmp_path) == {"producers": [], "no_land_waiter": False}
+
+
+def test_a_config_that_is_not_a_config_is_refused_not_defaulted(tmp_path):
+    (tmp_path / board_store.CONFIG_NAME).write_text("{not json")
+    with pytest.raises(board_store.BoardError):
+        board_store.read_config(tmp_path)
+    (tmp_path / board_store.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [3], "no_land_waiter": True}))
+    with pytest.raises(board_store.BoardError):
+        board_store.read_config(tmp_path)
+
+
+def test_state_reads_the_config_and_the_flag_adds_nothing_the_config_did_not_say(store, bare_copy):
+    items = os.environ["LEVAIN_BOARD_ITEMS"]
+    rc, from_config = board_cli.state_doc(_args(items))
+    rc2, from_flag = board_cli.state_doc(_args(bare_copy, no_land_waiter=True))
+    rc3, none = board_cli.state_doc(_args(bare_copy))
+    assert rc in (0, board_cli.EXIT_AUDIT) and rc2 in (0, board_cli.EXIT_AUDIT) and from_config is not None and from_flag is not None and none is not None
+    assert _unknown_ids(from_config) == _unknown_ids(from_flag)                             # config == the flag it stands for
+    assert _unknown_ids(none) != _unknown_ids(from_config)                                  # no config: waiters unknown, as today's CLI
+    assert len(_unknown_ids(none)) > len(_unknown_ids(from_config))
+
+
+def test_the_cockpit_reads_the_same_config_the_same_way(store, bare_copy):
+    items = os.environ["LEVAIN_BOARD_ITEMS"]
+    _rc, doc = board_cli.state_doc(_args(items))
+    v = board.build(None, None)
+    unk = [k["id"] for c in v["columns"] if c["category"] == "unknown" for k in c["cards"]]
+    assert sorted(unk) == _unknown_ids(doc)
+    bare = board.build(None, None, board_items=bare_copy)
+    assert len([k for c in bare["columns"] if c["category"] == "unknown" for k in c["cards"]]) > len(unk)
+
+
+def test_flags_override_the_config(store, monkeypatch):
+    items = os.environ["LEVAIN_BOARD_ITEMS"]
+    board_store.write_config(items, ["from-config"], True)
+    seen = []
+    real = board_producers.read_external
+    monkeypatch.setattr(board_producers, "read_external", lambda d, names: (seen.append(list(names)), real(d, names))[1])
+    board_cli.state_doc(_args(items))
+    board_cli.state_doc(_args(items, producers=["from-flag"]))
+    assert seen == [["from-config"], ["from-flag"]]
+    board_store.write_config(items, [], True)
+
+
+def test_a_broken_config_makes_the_board_unreadable_never_the_default(store, bare_copy):
+    (bare_copy / board_store.CONFIG_NAME).write_text("garbage")
+    said = []
+    rc, doc = board_cli.state_doc(_args(bare_copy), said.append)
+    assert rc != 0 and doc is None and "board config" in said[0]
+    v = board.build(None, None, board_items=bare_copy)
+    assert v["queue"] == "unreadable" and "desk" in v["unreadable"]
+
+
+def test_the_evidence_is_kept_while_the_refs_are_the_same_and_read_again_when_one_moves(store, monkeypatch):
+    board._EVIDENCE_CACHE.clear()
+    calls = []
+    real = board_evidence.read_git_evidence
+    monkeypatch.setattr(board_evidence, "read_git_evidence", lambda *a, **k: (calls.append(a[0]), real(*a, **k))[1])
+    first = board.build(None, None)
+    n = len(calls)
+    assert n == 2                                                                          # alpha, beta
+    again = board.build(None, None)
+    assert len(calls) == n and _by_col(again) == _by_col(first)                            # refs unmoved: nothing re-read
+    repo = Path(calls[0])
+    seed.git(repo, "commit", "-q", "--allow-empty", "-m", "a ref moves")                   # the checked-out branch's ref moves
+    board.build(None, None)
+    assert len(calls) == n + 1 and Path(calls[-1]) == repo                                 # that repo alone is read again

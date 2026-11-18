@@ -48,7 +48,7 @@ from levain.desk import board_chain, work_attach
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
     "TWO_STORES", "add", "amend", "build_record", "canonical_bytes", "chain_prev", "decide", "next_id", "read_item_lines", "read_pointer",
-    "resolve_store", "store_lock", "use",
+    "resolve_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config",
 ]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
@@ -57,6 +57,7 @@ APPEND_FILES = ("items.jsonl", "repos.jsonl")
 LOCK_NAME = "store.lock"
 POINTER_NAME = "STORE"
 STORE_ID_NAME = "store.id"
+CONFIG_NAME = "board.json"
 NO_STORE = "no board store: run `levain board use`"
 TWO_STORES = "two stores: --items names {a}, this install's store is {b} (levain board use)"
 OPEN_RETRIES = 5
@@ -801,6 +802,72 @@ def _write_pointer(home: Path, store_dir: Path) -> None:
             pass
         raise
     _fsync_dir_or_warn(home, "the store pointer")
+
+
+def _config_doc(producers: Any, no_land_waiter: Any) -> dict[str, Any]:
+    names = list(producers or ())
+    if not all(isinstance(n, str) and n and "\n" not in n for n in names):
+        raise BoardError("the board config's producers must be non-empty one-line names")
+    return {"config_v": 1, "producers": list(dict.fromkeys(names)), "no_land_waiter": bool(no_land_waiter)}
+
+
+def read_config(store_dir: Path | str) -> dict[str, Any]:
+    """The board config ``levain board use --producer/--no-land-waiter`` wrote in the store dir: ``{producers: [..],
+    no_land_waiter: bool}``. No file is the default (no external producer named, a land waiter assumed). A file that cannot be
+    read or is not this shape raises ``BoardError``: a config that cannot be read is never silently the default."""
+    path = Path(store_dir) / CONFIG_NAME
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {"producers": [], "no_land_waiter": False}
+    except OSError as exc:
+        raise BoardError(f"the board config {path} cannot be read: {exc}") from None
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise BoardError(f"the board config {path} is not JSON") from None
+    if (not isinstance(doc, dict) or doc.get("config_v") != 1 or not isinstance(doc.get("producers"), list)
+            or not isinstance(doc.get("no_land_waiter"), bool)):
+        raise BoardError(f"the board config {path} is not a v1 config (config_v, producers, no_land_waiter)")
+    try:
+        clean = _config_doc(doc["producers"], doc["no_land_waiter"])
+    except BoardError:
+        raise BoardError(f"the board config {path} names a producer that is not a one-line name") from None
+    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"]}
+
+
+def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any) -> bool:
+    """Write the board config atomically (a temp file in the store dir, fsynced, renamed, directory fsynced). Returns whether the
+    config changed. The store dir is locked while it is written."""
+    store_dir = Path(store_dir)
+    doc = _config_doc(producers, no_land_waiter)
+    payload = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    try:
+        with store_lock(store_dir, exclusive=True, setup=True):
+            target = store_dir / CONFIG_NAME
+            try:
+                if target.read_bytes() == payload:
+                    return False
+            except OSError:
+                pass
+            tmp = store_dir / f".{CONFIG_NAME}.{os.getpid()}.{secrets.token_hex(4)}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                try:
+                    _write_bytes(fd, payload)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, target)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            _fsync_dir_or_warn(store_dir, CONFIG_NAME)
+    except OSError as exc:
+        raise BoardError(f"cannot write the board config in {store_dir}: {exc}") from None
+    return True
 
 
 def use(directory: Path | str, environ: Mapping[str, str] | None = None) -> tuple[Path, bool]:
