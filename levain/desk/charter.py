@@ -220,7 +220,7 @@ def check_text(text: str, *, repo_name: str | None = None,
     # No status, by structure: shapes a machine can check without refusing an ordinary word. The scan does not see the
     # charter's own NAME (the title) or an item id (`NAME#N`, a Plan row, an `[item: ...]` tag): a repo named `2026-11-18` or
     # `cafe123` is date- or sha-shaped by name, and its charter must still be able to pass. Prose is scanned as ever.
-    own_id = re.compile(r"(?<![a-z0-9_-])(?<![a-z0-9]\.)" + re.escape(name) + r"#\d+(?![a-z0-9_-]|\.[a-z0-9])") if name else None
+    own_id = re.compile(r"(?<![A-Za-z0-9_-])(?<![A-Za-z0-9]\.)" + re.escape(name) + r"#\d+(?![A-Za-z0-9_-]|\.[A-Za-z0-9])") if name else None
     for i, ln in enumerate(lines):
         n = i + 1
         if i == 0 and title is not None:
@@ -577,11 +577,13 @@ def register(subparsers: Any) -> None:
         "check", help="Check a repository's CHARTER.md (warn mode: exits 0; 2 on another repository's name, an unreadable registry, or a bad command line).",
         description=("Check that CHARTER.md holds the prescribed shape. Reads it from origin/main by default. In this "
                      "release it only WARNS: it prints what a valid charter needs and exits 0 either way. It exits "
-                     "non-zero in these cases, all exit 2, and it reads nothing then: --repo-name names a repo registered in "
+                     "non-zero in these cases, all exit 2 and it reads nothing then, but only when the guard runs (NAME given "
+                     "with --repo-name; not under --file, where the guard does not run and a bad --items gives 0 or 1): "
+                     "--repo-name names a repo registered in "
                      "the board registry and --repo is a different repository from the registered one (a worktree of it is "
                      "fine); the registry, the store pointer or the registered checkout cannot be read, so that cannot be "
                      "told; --items names something that is neither a store directory nor a file called items.jsonl; "
-                     "--items names one store while the pointer names another (two stores); or the command line is unusable."))
+                     "--items names one store while the pointer names another (two stores). An unusable command line exits 2 always."))
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids (default: the directory that holds the repository's .git).")
@@ -599,11 +601,12 @@ def register(subparsers: Any) -> None:
         "init", help="Write a CHARTER.md skeleton for a repository.",
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
                      "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2, and writes "
-                     "nothing, when NAME is registered in the board registry at a different repository than the one it would "
+                     "nothing, only when the guard runs (init writing into a repository; not under --stdout, where it does not "
+                     "run and a bad --items gives 0 or 1), when NAME is registered in the board registry at a different repository than the one it would "
                      "write to (a worktree of the registered repo is fine); when the registry, the store pointer or the "
                      "registered checkout cannot be read, so that cannot be told; when --items names something that is neither a store "
                      "directory nor a file called items.jsonl; when --items names one store while the pointer names another "
-                     "(two stores); or when the command line is unusable."))
+                     "(two stores). An unusable command line exits 2 always."))
     q.add_argument("name", metavar="NAME", help="The repo's name in item ids (lowercase).")
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
