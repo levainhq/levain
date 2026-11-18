@@ -991,3 +991,46 @@ def test_a_bundle_key_of_the_wrong_shape_is_a_damaged_bundle(world, capsys):
 def test_safe_escapes_the_unicode_line_separators_by_codepoint():
     """complement LOW: the pattern names U+2028/U+2029 by escape, and a plain space is never escaped."""
     assert bt.safe("a\u2028b\u2029c d") == "a\\u2028b\\u2029c d"
+
+
+def test_an_asserted_decision_class_record_before_the_cutover_is_not_a_break_and_after_it_is(world, capsys):
+    """complement raw 43 / codex 86 / gemini 124 / deepseek 166: a grandfathered record is judged by the pre-cutover rules."""
+    first = json.loads(world.lines("items.jsonl")[0])
+    first.pop("prev", None)
+    first.pop("grade", None)
+    parked = {"v": 1, "op": "decide", "id": first["id"], "at": NOW, "by": "desk 24", "decision": "parked", "date": "2026-12-01",
+              "words": "later", "author": DESK, "grade": "asserted"}
+    dump = lambda *rs: [json.dumps(r, separators=(",", ":")).encode() for r in rs]       # noqa: E731
+    world.write("items.jsonl", dump(first, parked))                                       # no chained record: all pre-cutover
+    rc, out, err = run(capsys, "verify")
+    assert "a decision-class decide recorded asserted" not in out, out
+    world.write("items.jsonl", dump(first, {**parked, "prev": bc.line_hash(dump(first)[0])}))   # the cutover is line 2: it is after
+    rc, out, err = run(capsys, "verify")
+    assert "a decision-class decide recorded asserted" in out, out
+    rl = world.lines("repos.jsonl")
+    reg, track = json.loads(rl[0]), json.loads(next(x for x in rl if b'"begin-track"' in x and b'"alpha"' in x))
+    for r in (reg, track):
+        for k in ("prev", "grade", "sig", "source"):
+            r.pop(k, None)
+    mv = {k: v for k, v in reg.items() if k not in ("prev", "grade")}
+    mv.update(op="move", words="moved", origin="/elsewhere/alpha.git", author=OP, grade="asserted")   # the repo is tracking
+    world.write("repos.jsonl", dump(reg, track, mv))                                      # unchained throughout: all pre-cutover
+    rc, out, err = run(capsys, "verify")
+    assert "a decision-class move" not in out, out
+    world.write("repos.jsonl", dump(reg, track, {**mv, "prev": bc.line_hash(dump(reg, track)[1])}))   # the cutover is line 3
+    rc, out, err = run(capsys, "verify")
+    assert "a decision-class move" in out, out
+
+
+def test_the_control_pattern_holds_no_literal_line_separator_characters():
+    """complement raw 42: the pattern is written with escapes; an editor that normalised them would be caught here."""
+    src = Path(bt.__file__).read_text("utf-8")
+    line = next(x for x in src.splitlines() if x.startswith("_CONTROL = re.compile"))
+    assert " " not in line and " " not in line and "\\u2028\\u2029" in line
+    assert " " not in bt._CONTROL.pattern and " " not in bt._CONTROL.pattern
+
+
+def test_stray_signer_fp_under_a_non_signed_state_is_a_break(world):
+    world.band.signs[Q1] = {"sign_state": "unsigned", "signer_fp": "x"}
+    r = _relay_report(world)
+    assert not r.ok and "carries signature material under sign_state 'unsigned'" in r.verdict

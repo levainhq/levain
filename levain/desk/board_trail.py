@@ -36,6 +36,12 @@ hold the same way is a break). With no authority log of his own, a signature tha
 "signature valid under a key the bundle names; not checked against an authority you hold", and no anchor is claimed. Given the
 same trust root, a bundle and the live store give the same verdicts.
 
+KNOWN EDGE (measured, left): each asserted ``move`` in ``repos.jsonl`` is judged on the registry as it stood BEFORE it, by folding
+lines ``1..n-1`` again (the writer's own view: a later ack must not change what it judged on), so a registry of M asserted moves
+costs O(M^2) folds. Measured on a scratch store of 2,000 asserted path-only moves: ``verify`` takes about 28 s. Carrying one
+running fold forward would read the whole file's acks and so judge on a different view than the writer, and would need a fold of
+its own; neither is built. A registry that long is not a real store (a move is a rare, deliberate act).
+
 ``export`` writes a bundle (one JSON file): the records as written, the public keys the authority log holds, every cited band
 answer, and prints ``items=<hash> repos=<hash>``, the two heads to keep.
 
@@ -100,7 +106,7 @@ NO_AUTHORITY_FOR = "cannot be checked: no authority log to verify a signature ag
 TRUST_LIVE = "live"
 TRUST_BUNDLE = "bundle"
 _HEAD_RE = re.compile(r"[0-9a-f]{64}")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")      # escapes, never the literal separators (an editor eats them)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")   # the separators are named by escape, never written literally (an editor eats them)
 _SIGNED_ROW_GRADES = ("signed", "signed-phone", "signed-terminal")
 _ANSWER_KEY_CLASS = "laptop-presence"          # levain.authority.LAPTOP: the badge's trust root is the laptop's terminal key
 
@@ -455,7 +461,7 @@ class AnswerSig:
 def _material(sign: Any) -> AnswerSig | tuple[str, str, str]:
     """The signing record's material ``(sig, message, signer_fp)``, or the verdict when there is none to check: absent, or a
     record that states unsigned and carries nothing, is unsigned; a record that says ``signed`` without complete material, or
-    carries signature material under another state, is a break (it claims what it cannot show)."""
+    carries signature material (sig, message or signer_fp) under another state, is a break (it claims what it cannot show)."""
     if sign is None:
         return AnswerSig()
     if not isinstance(sign, Mapping):
@@ -467,7 +473,7 @@ def _material(sign: Any) -> AnswerSig | tuple[str, str, str]:
             return AnswerSig(problem="the answer's signature record says signed and does not carry a complete signature "
                                      "(sig, message and signer_fp)")
         return sig, message, fp
-    if sig or message:
+    if sig or message or fp:
         return AnswerSig(problem=f"the answer's signature record carries signature material under sign_state {state!r}")
     return AnswerSig()
 
@@ -765,7 +771,9 @@ def verify_file(name: str, trail: Trail, heads: Mapping[str, str]) -> FileReport
                 problems.insert(0, "asserted, but the record names no author")
             else:
                 verdict_text = f"asserted by {who}, unsigned"
-                if sg.POLICY.get(rec.get("op")) == sg.DECISION_CLASS and not cause_holds:
+                if pre_cutover:                         # a grandfathered record is judged by the pre-cutover rules
+                    pass
+                elif sg.POLICY.get(rec.get("op")) == sg.DECISION_CLASS and not cause_holds:
                     problems.append(f"a decision-class {rec.get('op')} recorded asserted: the writer refuses this (it needs a "
                                     f"signature or a relayed answer)")
                 elif rec.get("op") == "move" and name == "repos.jsonl":
