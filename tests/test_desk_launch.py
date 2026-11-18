@@ -2383,11 +2383,15 @@ def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_h
 # --- the turn's last line, and a drop that needs nothing (1030-42 brief lane) ------------------------------------
 def test_the_written_brief_ends_the_turn_on_a_desk_status_line(store, fake, live_hook):
     """Shadow 10-30: a desk that ended on "escalated questions #2-#5 ... each waits on you" sat in the agent
-    view as waiting for the operator. The brief carries the end-of-turn rule, quoted."""
+    view as waiting for the operator. The brief carries the end-of-turn rule: the line is a status record and an
+    escalation goes through the verb that pings, never through the line (the rule binds the act, no phrase is banned)."""
     got = cl.launch_session(store, woken(store))
     text = cl.brief_path(store.launch(got.launch_id)).read_text()
     assert "ONE status line beginning `desk:`" in text
-    assert "never a question, never \"waits on you\"" in text
+    turn_end = text.split("## How your turn ends")[1].split("##")[0]
+    assert "a status record, not a message or a question to the operator" in turn_end
+    assert "never through your last line" in turn_end
+    assert "waits on you" not in turn_end
     assert "coord escalate" in text.split("## How your turn ends")[1].split("##")[0]
     assert "release the lease" in text
 
