@@ -619,28 +619,30 @@ def _seen_changed(before: tuple, after: tuple) -> str:
     return " and ".join(names) or "the store"
 
 
-def _created_by(path: Path, existed: bool, fd: int, created: tuple | None) -> tuple | None:
-    """``(dev, inode)`` of the file at ``path`` when THIS write created it (it was not there before the open), else None; a
-    re-open of the inode an earlier pass of the same write created keeps it."""
-    st = os.fstat(fd)
-    ident = (st.st_dev, st.st_ino)
-    if not existed:
-        return ident
-    return created if created == ident else None
+def _open_existing(path: Path) -> int:
+    """The store file at ``path`` opened for append under its own LOCK_EX with the inode re-check, WITHOUT ``O_CREAT``; -1
+    when it is not there. A write never creates a store file until it appends its record (:func:`_create_for_record`), so
+    a write that ends without one (refused, cancelled, nothing to write, ``prepare``'s capture) leaves nothing behind
+    (codex 116, fix 6: the file's existence activates the registry)."""
+    return _open_checked(path, os.O_RDWR | os.O_APPEND, fcntl.LOCK_EX, missing_ok=True)
 
 
-def _drop_created(path: Path, created: tuple | None) -> None:
-    """Unlink ``path`` when it is still the EMPTY inode this write created: a write that ends without writing a record
-    (refused, cancelled, nothing to write, ``prepare``'s capture) leaves no file behind (codex 46, gemini 118, fix 4); a
-    file's existence activates the registry. The caller holds the exclusive store lock. Best effort: never raises."""
-    if created is None:
-        return
+def _create_for_record(path: Path) -> int | None:
+    """Create the store file at ``path`` to append the first record to it: ``O_CREAT|O_EXCL``, so the file is this write's
+    own; None when a file is there now (a writer that takes no lock made one since the check: the store moved). The caller
+    holds the exclusive store lock and has just checked that the file is absent, as it was when the record was built."""
     try:
-        st = os.stat(path)
-        if (st.st_dev, st.st_ino) == created and st.st_size == 0:
-            os.unlink(path)
-    except OSError:
-        pass
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return None
+    except OSError as exc:
+        raise BoardError(f"cannot create {path}: {exc}") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _write_record(target: Target, fd: int, path: Path, raw: bytes, rec: dict, empty: bool) -> None:
@@ -676,79 +678,76 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     prompt is never shown for one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed
     record must verify, or BoardError is raised and nothing is written.
 
-    A write that ends without writing a record (refused, cancelled, nothing to write, ``prepare``'s capture) leaves no file
-    it created: the ``O_CREAT`` open of a file that was not there is undone while that file is still the same empty inode."""
+    No open before the append creates the file: a missing file reads as no bytes, and only the final locked step, the one
+    that appends the record, creates it (``O_CREAT|O_EXCL``, after the last re-check found it still absent). A write that
+    ends without writing a record (refused, cancelled, nothing to write, ``prepare``'s capture) therefore leaves nothing it
+    has to clean up, and never unlinks anything (codex 116, fix 6). Absent when built and absent now is unchanged; absent
+    then and present now (or the reverse) is the store moving."""
     if filename not in APPEND_FILES:
         raise BoardError(f"{filename!r} is not a store file this writer appends to ({', '.join(APPEND_FILES)})")
     _require_pointered(target)
     path = target.store_dir / filename
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
-    created: tuple | None = None                    # (dev, inode) of the file THIS write created, while no record is in it
-    with store_lock(target.store_dir, exclusive=True) as held:
-        try:
-            changed = ""
-            for _ in range(OPEN_RETRIES):
-                existed = path.exists()             # under the exclusive lock: no writer that takes it creates the file now
-                fd = held.open(filename, flags, fcntl.LOCK_EX)
-                try:
-                    created = _created_by(path, existed, fd, created)
-                    empty = os.fstat(fd).st_size == 0       # a write into a zero-length file may have just created it
-                    raw = _read_fd(fd)
-                    if not _same_file(fd, path):
-                        changed = f"{path} was replaced (a git operation?)"
-                        continue                # replaced before anything was written: open, read and build again
-                    seen = _store_seen(target.store_dir)
-                    rec, write = build(parse(raw))
-                    if not write:
-                        _drop_created(path, created)
-                        return rec, False
-                    rec = _with_prev(rec, chain_prev(raw))  # recomputed on every rebuild: it is the bytes of THIS inode
-                    now_seen = _store_seen(target.store_dir)
-                    if os.fstat(fd).st_size != len(raw) or now_seen != seen:
-                        changed = (f"{filename} grew" if os.fstat(fd).st_size != len(raw)
-                                   else f"{_seen_changed(seen, now_seen)} changed") + " under a writer that takes no lock"
-                        continue                # a lock-free writer changed a store file since the read: re-read and re-build
-                    if seal is not None:        # (bounded); checked BEFORE a sealed write leaves for its one prompt (gemini 130)
-                        break                   # the ceremony runs with no lock held (below)
-                    _write_record(target, fd, path, raw, rec, empty)
-                    return rec, True
-                finally:
+    with store_lock(target.store_dir, exclusive=True):
+        changed = ""
+        for _ in range(OPEN_RETRIES):
+            fd = _open_existing(path)               # -1: absent (no O_CREAT: nothing is created before the record)
+            try:
+                absent = fd < 0
+                raw = b"" if absent else _read_fd(fd)
+                if (path.exists() if absent else not _same_file(fd, path)):
+                    changed = f"{path} was {'created' if absent else 'replaced'} (a git operation?)"
+                    continue                # moved before anything was written: open, read and build again
+                seen = _store_seen(target.store_dir)
+                rec, write = build(parse(raw))
+                if not write:
+                    return rec, False
+                rec = _with_prev(rec, chain_prev(raw))  # recomputed on every rebuild: it is the bytes of THIS inode
+                now_seen = _store_seen(target.store_dir)
+                grew = not absent and os.fstat(fd).st_size != len(raw)
+                if grew or now_seen != seen:        # seen holds this file too: absent then and present now differs
+                    changed = (f"{filename} grew" if grew
+                               else f"{_seen_changed(seen, now_seen)} changed") + " under a writer that takes no lock"
+                    continue                # a lock-free writer changed a store file since the read: re-read and re-build
+                if seal is not None:        # (bounded); checked BEFORE a sealed write leaves for its one prompt (gemini 130)
+                    break                   # the ceremony runs with no lock held (below)
+                if absent:
+                    fd = _create_for_record(path)
+                    if fd is None:
+                        fd = -1
+                        changed = f"{path} was created under a writer that takes no lock"
+                        continue
+                _write_record(target, fd, path, raw, rec, absent or not raw)
+                return rec, True
+            finally:
+                if fd >= 0:
                     os.close(fd)
-            else:
-                raise BoardError(f"the store changed between the read and the write {OPEN_RETRIES} times (the last time: "
-                                 f"{changed}); nothing was written, retry")
-        except BaseException:
-            _drop_created(path, created)
-            raise
+        else:
+            raise BoardError(f"the store changed between the read and the write {OPEN_RETRIES} times (the last time: "
+                             f"{changed}); nothing was written, retry")
 
     from levain.desk import board_sign
-    try:
-        sealed = board_sign.ceremony(seal, rec)     # signs the bytes that include prev; raises on any failure; NO lock held
-    except BaseException:
-        if created is not None:
-            try:
-                with store_lock(target.store_dir, exclusive=True):
-                    _drop_created(path, created)
-            except (BoardError, OSError):
-                pass                            # the refusal that is raising is the one to report
-        raise
-    with store_lock(target.store_dir, exclusive=True) as held:
-        existed = path.exists()
-        fd = held.open(filename, flags, fcntl.LOCK_EX)
+    sealed = board_sign.ceremony(seal, rec)         # signs the bytes that include prev; raises on any failure; NO lock held
+    with store_lock(target.store_dir, exclusive=True):
+        fd = _open_existing(path)
         try:
-            created = _created_by(path, existed, fd, created)  # a file removed during the ceremony is re-created here: not left
-            if (not _same_file(fd, path) or _read_fd(fd) != raw or _store_seen(target.store_dir) != seen):
+            if (fd < 0) != absent:                  # absent then and present now, or present then and gone now: moved
+                raise BoardError(SIGNED_CHAIN_MOVED)
+            if (not absent and (not _same_file(fd, path) or _read_fd(fd) != raw)) or _store_seen(target.store_dir) != seen:
                 raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
             sealed = board_sign.earn(target, seal, sealed)     # the authority log replayed now; the signed record must verify
-            if not _same_file(fd, path) or os.fstat(fd).st_size != len(raw) or _store_seen(target.store_dir) != seen:
+            if _store_seen(target.store_dir) != seen or (
+                    path.exists() if absent else (not _same_file(fd, path) or os.fstat(fd).st_size != len(raw))):
                 raise BoardError(SIGNED_CHAIN_MOVED)        # every post-seal mismatch refuses: a re-build would seal again
-            _write_record(target, fd, path, raw, sealed, empty)
+            if absent:
+                fd = _create_for_record(path)
+                if fd is None:
+                    fd = -1
+                    raise BoardError(SIGNED_CHAIN_MOVED)    # a file appeared since the check: the store moved
+            _write_record(target, fd, path, raw, sealed, absent or not raw)
             return sealed, True
-        except BaseException:
-            _drop_created(path, created)
-            raise
         finally:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
 
 
 def _check_repo_mode(store_dir: Path, repo: str, key: str | None) -> None:
@@ -836,11 +835,11 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
 
 def _preflight(seal, author: Mapping[str, object] | None = None) -> None:
     """A seal's refusals that need no lock, before it is taken: the author must be the operator (``board_sign.check_signable``,
-    up front even for a write that will build nothing: gemini 136, fix 4), then the seal's own ``preflight``."""
+    up front even for a write that will build nothing: gemini 136, fix 4; a missing author refuses as ``prepare`` does: gemini
+    168, fix 6), then the seal's own ``preflight``."""
     if seal is not None:
-        if author is not None:
-            from levain.desk import board_sign
-            board_sign.check_signable({"author": _author(author)})
+        from levain.desk import board_sign
+        board_sign.check_signable({"author": _author(author)})
         seal.preflight()
 
 
