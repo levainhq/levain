@@ -76,7 +76,7 @@ from levain.desk import repos_fold as rf
 from levain.desk.board_store import BoardError
 
 __all__ = ["REPOS_NAME", "STUB_MARKER", "TRACKING_AUDIT_HOURS", "ack_torn", "abandon_done", "abandon_track", "begin_track",
-           "check_add", "import_focus_use", "move", "pause", "read_registry", "register", "register_for_launch", "report",
+           "check_add", "import_focus_use", "launch_protocol", "move", "pause", "read_registry", "register", "register_for_launch", "report",
            "resume", "stale_audit", "track", "untrack"]
 
 REPOS_NAME = "repos.jsonl"
@@ -1115,6 +1115,39 @@ def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] 
 
     _, written = _reg_write(target, build)
     return written
+
+
+def launch_protocol(cwd: str | os.PathLike[str] | None, migration: str | None = None,
+                    environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
+    """``(protocol, migration)``: the close protocol a worker launched in ``cwd`` runs under, from its repository's mode in the
+    registry now (design 6, "The close, chosen by the LAUNCH protocol"). An untracked or unknown repository, a directory with no
+    registry or no commit, gives ``legacy``; ``tracked`` gives ``tracked``; a launch carrying the migration id of a ``tracking`` or
+    ``aborting`` repository gives ``ceremony`` and keeps that id. Any other launch on a ``tracking`` or ``aborting`` repository
+    raises BoardError: the repository is locked to new work until ``track`` or ``abandon-done``. A migration id on a launch whose
+    repository is not in a ceremony is ignored, as is one on a ``tracked`` repository (the ceremony's stub seat, after ``track``)."""
+    store_dir = bs.read_pointer(environ)
+    if store_dir is None or not cwd:
+        return "legacy", None
+    rc, top = _git(os.path.expanduser(str(cwd)), "rev-parse", "--show-toplevel")
+    if rc != 0:
+        return "legacy", None
+    try:
+        ident = identity(top)
+    except NoCommit:
+        return "legacy", None
+    view = read_registry(bs.Target(store_dir, store_dir / bs.ITEMS_NAME, True), allow_inactive=True)
+    if not view.active:
+        return "legacy", None
+    cur = next((r for r in view.fold.repos.values()
+                if r.path == ident["path"] or (tuple(ident["root"]) == r.root and ident["origin"] == r.origin)), None)
+    if cur is None or cur.mode == "untracked":
+        return "legacy", None
+    if cur.mode == "tracked":
+        return "tracked", None
+    if migration is not None and migration == cur.migration:
+        return "ceremony", migration
+    raise BoardError(f"{cur.name} is {cur.mode} (migration {cur.migration}) and locked to new work: a seat on it carries that "
+                     f"migration id, or waits for `levain board track {cur.name}` / `abandon-done {cur.name}`")
 
 
 # ----------------------------------------------------------------------------------------------------- report and audit
