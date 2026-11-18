@@ -282,27 +282,35 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
     was = da.install_kind(store.directory)
-    # the spec binds a shadow install's facts (the facts this call writes, or the file as it stands without
-    # --store-dir), so a link signed for one install never covers changed facts
-    binding = da.current_binding(store.directory)
-    # a live install's program and model are bound the same way (None: the defaults, the unbound live spec); facts
-    # that are there but cannot be read are refused, never registered as the defaults
-    live = None
+    # ONE facts document is read (or, with --store-dir, built) and carried through the binding the spec registers, the
+    # facts this call writes and the card: two reads of a file a concurrent enable rewrites could disagree. The spec
+    # binds a shadow install's facts, and a live install's program and model (None: the defaults, the unbound live
+    # spec); facts that are there but cannot be read are refused, never registered as the defaults.
+    kwargs = None
     if args.store_dir is None:
         try:
-            live = da.current_live_binding(store.directory)
+            facts = da.current_install_doc(store.directory)
+            binding = None if facts is None else da.install_binding(facts)
+        except (KeyError, TypeError) as exc:
+            print(f"levain dream enable: the shadow install facts lack {exc}; nothing was registered or written (pass "
+                  "--store-dir to write the facts again)", file=sys.stderr)
+            return 1
         except da.InstallRefused as exc:
             print(f"levain dream enable: {exc}; nothing was registered or written (pass --store-dir to write the "
                   "facts again)", file=sys.stderr)
             return 1
-    if args.store_dir is not None:
+    else:
         try:
-            _write_install_facts(args, store, str(zone), da, check_only=True)
-            doc = da.install_doc(store.directory, **_install_kwargs(args, str(zone), da))
-            binding, live = da.install_binding(doc), da.install_live_binding(doc)
+            kwargs = _install_kwargs(args, str(zone), da)
+            facts = da.install_doc(store.directory, **kwargs)
+            # the merged program, model and facts path are pinned, so the write writes what the spec binds
+            kwargs.update({k: facts.get(k) for k in ("facts_path", "model", "claude_bin")})
+            _write_install_facts(args, store, str(zone), da, check_only=True, kwargs=kwargs)
+            binding = da.install_binding(facts)
         except (da.InstallRefused, OSError) as exc:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
+    live = None if facts is None else da.install_live_binding(facts)
     try:
         reg = da.register_dream(store, revise=args.revise, binding=binding, time=when, live=live)
     except da.EnableRefused as exc:
@@ -311,7 +319,8 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         if binding is not None and not isinstance(exc.__cause__, AgentStoreRefused):
             why += ("; a shadow install's facts are bound into the dream's spec, so changed facts are a new version "
                     "(--revise), which needs a new signed link; nothing was written")
-        elif not isinstance(exc.__cause__, AgentStoreRefused) and (live is not None or _held_live_bound(store, da)):
+        elif (not args.revise and not isinstance(exc.__cause__, AgentStoreRefused)
+              and _held_live_bound_differs(store, da, live)):
             why += ("; this install's dream program and model are bound into the dream's spec, so a changed one is a "
                     "new version (--revise), which needs a new signed link; nothing was written")
         print(f"levain dream enable: {why}", file=sys.stderr)
@@ -322,19 +331,19 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     install_path = None
     if args.store_dir is not None:
         try:
-            install_path = _write_install_facts(args, store, str(zone), da)
+            install_path = _write_install_facts(args, store, str(zone), da, kwargs=kwargs)
         except (da.InstallRefused, OSError) as exc:
             print(f"levain dream enable: registered, but the install facts were not written: {exc}", file=sys.stderr)
             return 1
-    # the card describes the install the link would run: the facts file as it stands now, written by this call or not
-    now = da.install_kind(store.directory)
+    # the card describes the install the spec binds: the one facts document above, never a second read of the file
+    now = None if facts is None else ("shadow" if facts.get("shadow_flow_root") is not None else "live")
     replaced = f"replaced the {was} install with a {now} install (--replace-install)" if (
         install_path is not None and was is not None and was != now) else None
     r = ex.PER_RUN_LIMIT_USD_MICROS / 1_000_000
     expires = "the link's expires_at (a link lasts at most 29 days)"
     if now == "shadow":
         try:
-            inst = da.read_install(store.directory)
+            inst = da.install_of_doc(store.directory, facts)
             card = da.shadow_signing_card_text(str(zone), flow_root=inst.shadow_flow_root,
                                                scratch=inst.store_path.parent, coord_dir=inst.coord_dir,
                                                agent_dir=store.directory, flow_instructions=inst.flow_instructions,
@@ -345,7 +354,7 @@ def run_dream_enable(args: argparse.Namespace) -> int:
                    "writes them again."
     else:
         try:                                    # the Undo command carries the install's store when its facts are written
-            install_store = da.read_install(store.directory).store_path.parent
+            install_store = None if facts is None else da.install_of_doc(store.directory, facts).store_path.parent
         except _INSTALL_READ_ERRORS:
             install_store = None
         # the program and model the card names are the ones registered into the spec, never a second read of the file
@@ -372,11 +381,16 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     return 0
 
 
-def _held_live_bound(store: object, da: object) -> bool:
-    """True when the dream spec registered in ``store`` binds a program or model (False when it cannot be read: the
-    refusal is then printed without the advice)."""
+def _held_live_bound_differs(store: object, da: object, live: str | None) -> bool:
+    """True when a dream spec is registered in ``store`` and the program and model it binds are not ``live`` (the
+    facts' :func:`~levain.dream.agent.live_binding`): only then is the refusal about them. False when none is
+    registered or it cannot be read: the refusal is then printed without the advice."""
+    from levain.agents import spec as _spec
+
     try:
-        return da.stored_live_bound(store) is not None
+        if _spec.stored_specs(store).get(da.NAME) is None:
+            return False
+        return da.stored_live_bound(store) != live
     except Exception:  # noqa: BLE001 - advice only; the refusal itself is printed either way
         return False
 
@@ -410,12 +424,13 @@ def _orphan_floor_line(hours: float | None, problem: str | None, da: object) -> 
 
 
 def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da: object, *,
-                         check_only: bool = False) -> Path:
+                         check_only: bool = False, kwargs: dict | None = None) -> Path:
     """Resolve the install this verb names to absolute paths and write the facts file in the agent store's directory
     (``check_only``: make every check :func:`levain.dream.agent.write_install` makes and write nothing). The live store
-    is allowed for a live install (the scheduled dream targets it); only ``run`` is for copies."""
-    return da.write_install(store.directory, **_install_kwargs(args, zone, da), replace_install=args.replace_install,
-                            check_only=check_only)
+    is allowed for a live install (the scheduled dream targets it); only ``run`` is for copies. ``kwargs``: the
+    :func:`_install_kwargs` the caller already resolved (and pinned), written as given."""
+    return da.write_install(store.directory, **(kwargs if kwargs is not None else _install_kwargs(args, zone, da)),
+                            replace_install=args.replace_install, check_only=check_only)
 
 
 def _install_kwargs(args: argparse.Namespace, zone: str, da: object) -> dict:

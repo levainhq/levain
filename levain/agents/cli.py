@@ -416,8 +416,13 @@ def run_show(args: argparse.Namespace) -> int:
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("show", f"the store refused it: {exc}")
     _recover_quietly(store)
+    # advisory, and the same in both forms: a fire of this spec that the install facts as they stand would refuse
+    refusal = None
+    if a["name"] == "dream":
+        from levain.dream import agent as _da
+        refusal = _da.bound_refusal_now(store.directory, a["spec_hash"])
     if args.json:
-        return _show_json(store, a)
+        return _show_json(store, a, dream_install_refusal=refusal)
     try:
         role, why = role_by_hash(store, a["spec"]["role"]["role_hash"]), "role not resolvable"
     except RoleError as exc:
@@ -429,11 +434,8 @@ def run_show(args: argparse.Namespace) -> int:
             + (f"review: {'required' if flags['review_required'] else 'not required'} "
                f"(calls_model={flags['calls_model']}, acts_outward={flags['acts_outward']}); the date is the link's "
                f"expires_at\n" if flags else f"review: {why}\n"))
-    if a["name"] == "dream":
-        from levain.dream import agent as _da
-        why = _da.bound_refusal_now(store.directory, a["spec_hash"])
-        if why is not None:
-            head += f"dream install: a fire of this spec refuses with the facts as they stand: {why}\n"
+    if refusal is not None:
+        head += f"dream install: a fire of this spec refuses with the facts as they stand: {refusal}\n"
     try:
         print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
@@ -458,10 +460,11 @@ def _recover_quietly(store) -> None:
         return
 
 
-def _show_json(store, a: dict) -> int:
+def _show_json(store, a: dict, *, dream_install_refusal: str | None = None) -> int:
     """``show --json``: the agent, its occurrences (newest first), and the episodes stored under its agent id in the
     install's episodic store (``session_install.json``). An install with no episodic store says why, never an empty
-    list that reads as "no episodes"."""
+    list that reads as "no episodes". ``dream_install_refusal`` is always present: the refusal a fire of the dream's
+    spec meets under the install facts as they stand (null when none, and for every other agent)."""
     from datetime import datetime, timezone
     from levain.agents import recall as _recall, session_wire
     try:
@@ -494,7 +497,8 @@ def _show_json(store, a: dict) -> int:
             note = f"episodes unreadable ({type(exc).__name__})"
     doc = {"agent": {k: a[k] for k in ("name", "agent_id", "version", "versions", "spec_hash", "registration",
                                        "operation", "failure_streak") if k in a},
-           "spec": a["spec"], "occurrences": occ, "episodes": episodes, "episodes_note": note}
+           "spec": a["spec"], "occurrences": occ, "episodes": episodes, "episodes_note": note,
+           "dream_install_refusal": dream_install_refusal}
     try:
         print(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False, default=str))
     except UnicodeEncodeError as exc:

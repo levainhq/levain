@@ -328,3 +328,193 @@ def test_a_tick_that_cannot_state_the_exposure_still_names_the_binding_refusal(t
     assert "cannot state its exposure" in err
     assert "The exposure is judged first; the install facts are refused too: " + REFUSED in err
     assert spawn.calls == []
+
+
+# ------------------------------------------------------------------------------------------- 1118-27 fix round 2
+
+def _store(env):
+    from levain.agents.store import open_agent_store
+
+    return open_agent_store(env["ag"])
+
+
+def _register_with_source(env, source: str) -> str:
+    """A dream spec whose ``input.source`` is ``source``, registered as the next version; its spec_hash."""
+    from levain.agents import role as _role, spec as _spec
+
+    store = _store(env)
+    spec = da.dream_spec(_role.role_hash(_role.parse_role(da.dream_role())))
+    spec["input"]["source"] = source
+    return _spec.register_spec(store, _spec.parse_spec(spec), ZONE, revise=True)[1]
+
+
+@pytest.mark.parametrize("source", ["another input", da.LIVE_SOURCE + " (edited)",
+                                    da.LIVE_SOURCE + da.LIVE_BOUND + "not json",
+                                    da.LIVE_SOURCE + da.LIVE_BOUND + '{"claude_bin": "claude", "model": "claude-opus-5-5"}'])
+def test_a_live_source_this_build_does_not_write_is_refused_under_the_default_install(env, capsys, source):
+    # codex MED1, reproduced on dbaccc28e: every source but a parseable bound one read as "binds nothing", which the
+    # default install's facts match, so the dream ran under a spec whose source was never one a live install has
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    why = _refusal(env, _row(_register_with_source(env, source)))
+    assert "changed after" not in why
+
+
+def _commands(why: str) -> list[list[str]]:
+    import re
+    import shlex
+
+    return [shlex.split(c)[1:] for c in re.findall(r"`(levain [^`]*)`", why)]
+
+
+def _run_advice(env, capsys, why: str) -> None:
+    from levain.cli import main
+
+    cmds = _commands(why)
+    assert cmds, why
+    for argv in cmds:
+        capsys.readouterr()
+        assert main(argv) == 0, (argv, capsys.readouterr().err)
+
+
+@pytest.mark.parametrize("back", ["defaults", "a"])
+def test_the_advice_after_a_revert_to_an_earlier_version_is_a_command_that_works(env, capsys, back):
+    # codex MED2, reproduced on dbaccc28e: the refusal said `levain dream enable --revise`, which register_spec refuses
+    # because the spec for these facts is an earlier version of the agent (a revert is never the next version)
+    a, b = str(env["tmp"] / "a" / "claude"), str(env["tmp"] / "b" / "claude")
+    first = None if back == "defaults" else a
+    da.write_install(env["ag"], **env["kw"], claude_bin=first)
+    _enabled(env, capsys)
+    da.write_install(env["ag"], **env["kw"], claude_bin=b)
+    second = _enabled(env, capsys, "--revise")
+    if first is None:
+        _hand_edit(env, claude_bin=None)
+    else:
+        _hand_edit(env, claude_bin=first)
+    why = _refusal(env, _row(second))
+    assert "earlier version" in why
+    _run_advice(env, capsys, why)
+    from levain.agents import spec as _spec
+
+    now = _spec.get_agent(_store(env), "dream")["spec_hash"]
+    da.check_bound(env["ag"], _row(now), da.read_install(env["ag"]))
+
+
+def test_the_advice_for_new_facts_is_still_revise_and_works(env, capsys):
+    da.write_install(env["ag"], **env["kw"], claude_bin=str(env["tmp"] / "a" / "claude"))
+    signed = _enabled(env, capsys)
+    _hand_edit(env, claude_bin=str(env["tmp"] / "b" / "claude"))
+    why = _refusal(env, _row(signed))
+    assert "--revise" in why and "earlier version" not in why
+    _run_advice(env, capsys, why)
+
+
+def test_enable_reads_the_facts_once_so_a_rewrite_between_reads_is_never_a_raw_error(env, capsys, monkeypatch):
+    # codex MED3 + deepseek MED2, reproduced on dbaccc28e: the binding and the live binding came from two reads of the
+    # file; a shadow read on one and a live custom one on the other made both set, and dream_spec's ValueError escaped
+    # as "cannot register (ValueError ...)"
+    from pathlib import Path
+
+    prog = str(env["tmp"] / "a" / "claude")
+    da.write_install(env["ag"], **env["kw"], claude_bin=prog)
+    path = env["ag"] / da.INSTALL_FILE
+    live_text = path.read_text(encoding="utf-8")
+    shadow = dict(json.loads(live_text), shadow_flow_root=str(env["tmp"]), flow_instructions=str(env["tmp"] / "i.md"))
+    real = Path.read_text
+    reads = []
+
+    def flip(self, *a, **k):
+        if self == path:                    # every other read sees a shadow install a concurrent enable wrote
+            reads.append(1)
+            return json.dumps(shadow) if len(reads) % 2 == 0 else live_text
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", flip)
+    code = _enable(env, "--json")
+    out, err = capsys.readouterr()
+    assert "ValueError" not in err
+    assert code == 0, err
+    from levain.agents import spec as _spec
+
+    held = _spec.stored_specs(_store(env))[da.NAME]["input"]["source"]
+    # the card's install is the one read the spec binds, whichever of the two it was
+    assert json.loads(out)["install_kind"] == ("shadow" if held.startswith(da.SHADOW_SOURCE) else "live")
+
+
+def test_register_dream_turns_both_bindings_into_a_refusal(env):
+    with pytest.raises(da.EnableRefused):
+        da.register_dream(_store(env), binding="{}", live='{"claude_bin": "x", "model": "y"}')
+
+
+def test_bound_refusal_now_never_raises(env, capsys, monkeypatch):
+    # deepseek MED1, reproduced on dbaccc28e: an OSError from the spec-store read escaped the advisory reader, which
+    # the tick calls inside an `except ExposureRefused` handler, so the pass lost its other rows
+    da.write_install(env["ag"], **env["kw"])
+    signed = _enabled(env, capsys)
+
+    def broken(*a, **k):
+        raise OSError("the store is not there")
+
+    monkeypatch.setattr(da, "_spec_source", broken)
+    assert da.bound_refusal_now(env["ag"], signed) is None
+    monkeypatch.setattr(da, "check_bound", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    assert da.bound_refusal_now(env["ag"], signed) is None
+
+
+def _show_json(env, capsys) -> dict:
+    from levain.cli import main
+
+    capsys.readouterr()
+    assert main(["agents", "--store-dir", str(env["ag"]), "show", "dream", "--json"]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_agents_show_json_carries_the_install_refusal(env, capsys):
+    # codex LOW4, reproduced on dbaccc28e: --json returned before the refusal was computed
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    assert _show_json(env, capsys)["dream_install_refusal"] is None
+    da.write_install(env["ag"], **env["kw"], claude_bin=str(env["tmp"] / "a" / "claude"))
+    assert _show_json(env, capsys)["dream_install_refusal"].startswith(REFUSED)
+
+
+def test_a_zone_refusal_on_a_live_bound_install_carries_no_program_advice(env, capsys):
+    # gemini MED, reproduced on dbaccc28e: the program-and-model advice was added to any refusal once a binding existed
+    from levain.agents.store import set_default_zone
+
+    da.write_install(env["ag"], **env["kw"], claude_bin=str(env["tmp"] / "a" / "claude"))
+    _enabled(env, capsys)
+    set_default_zone(_store(env), "Europe/Paris")
+    p = argparse.ArgumentParser()
+    add_parsers(p.add_subparsers())
+    args = p.parse_args(["dream", "enable", "--agent-store-dir", str(env["ag"])])
+    assert args.func(args) == 1
+    err = capsys.readouterr().err
+    assert "rule 4" in err
+    assert "dream program and model are bound" not in err
+
+
+def test_an_old_occurrence_under_facts_the_current_version_binds_names_the_current_version(env, capsys):
+    da.write_install(env["ag"], **env["kw"])
+    first = _enabled(env, capsys)
+    da.write_install(env["ag"], **env["kw"], claude_bin=str(env["tmp"] / "a" / "claude"))
+    _enabled(env, capsys, "--revise")
+    why = _refusal(env, _row(first))
+    assert "current version 2 already binds these facts" in why
+    _run_advice(env, capsys, why)
+
+
+@pytest.mark.parametrize("key", ["model", "claude_bin"])
+@pytest.mark.parametrize("value", ["", "  "])
+def test_a_blank_program_or_model_is_refused_by_every_reader(env, capsys, key, value):
+    # complement LOW: one rule for a blank model or program, at enable, at read_install and at the live binding
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    _hand_edit(env, **{key: value})
+    with pytest.raises(da.InstallRefused, match="not a non-empty string"):
+        da.read_install(env["ag"])
+    with pytest.raises(da.InstallRefused, match="not a non-empty string"):
+        da.current_live_binding(env["ag"])
+    assert _enable(env) == 1
+    with pytest.raises(da.InstallRefused, match="not a non-empty string"):
+        da.write_install(env["ag"], **env["kw"], **{key: value})

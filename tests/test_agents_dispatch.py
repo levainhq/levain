@@ -379,7 +379,7 @@ def test_a_never_created_default_dir_says_never_created_not_stale(tmp_path):
 
 
 def _fire_row_rig(tmp_path):
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path, source=da.LIVE_SOURCE)
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")
@@ -406,7 +406,7 @@ def test_fire_factory_gives_a_scheduled_card_its_window_key_as_the_slot(tmp_path
     # C1: the occurrence row carries window_key, never a "key" column named slot
     from levain.dream import executor as _ex
     monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path, source=da.LIVE_SOURCE)
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     with rig.store.write() as c:
@@ -458,7 +458,7 @@ def _real_authority_fire(tmp_path, monkeypatch, *, anchor_unreadable_at_build=Fa
     authority anchor is corrupted before the factory runs, so the factory's own refresh is the one that fails."""
     from levain.dream import executor as _ex
     monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path, source=da.LIVE_SOURCE)
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")

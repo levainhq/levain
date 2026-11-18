@@ -596,9 +596,13 @@ def test_d3_enable_survives_an_install_file_whose_read_raises_something_other_th
 
 
 def test_d3_the_shadow_branch_falls_back_on_the_same_broader_errors(tmp_path, capsys, monkeypatch):
+    # the card is built from the one facts document enable read (levain#126), so the shadow is that document
     args = _enable_args(tmp_path)
-    monkeypatch.setattr(da, "install_kind", lambda d: "shadow")
-    monkeypatch.setattr(da, "read_install", lambda d: (_ for _ in ()).throw(OSError("unreadable")))
+    t = str(tmp_path)
+    shadow = {"schema": da.INSTALL_SCHEMA, "shadow_flow_root": t, "store_path": t + "/scratch/memory.db",
+              "coord_dir": t, "cockpit_root": t, "flow_instructions": t + "/i.md", "zone": ZONE}
+    monkeypatch.setattr(da, "current_install_doc", lambda d: dict(shadow))
+    monkeypatch.setattr(da, "install_of_doc", lambda d, doc: (_ for _ in ()).throw(OSError("unreadable")))
     assert args.func(args) == 0
     assert "facts cannot be read" in json.loads(capsys.readouterr().out)["signing_card"]
 

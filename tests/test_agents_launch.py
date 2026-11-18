@@ -59,21 +59,28 @@ class Exec:
         return StopResult(False, "stub")
 
 
-def _spec(cron="*/30 * * * *", name=None):
+def _spec(cron="*/30 * * * *", name=None, source=None):
     d = copy.deepcopy(SPECS["job_push_check"])
     d["role"]["role_hash"] = role_hash(ROLES[d["role"]["name"]])
     d["trigger"]["cron"] = cron
     if name is not None:
         d["name"] = name
+    if source is None and name == "dream":
+        # a live dream fire runs only under the exact source a live dream spec has (levain#126: any other is refused)
+        from levain.dream.agent import LIVE_SOURCE as source
+    if source is not None:
+        d["input"]["source"] = source
     return parse_spec(d)
 
 
 class Rig:
-    def __init__(self, tmp: Path, name: str | None = None) -> None:
-        # ``name``: the name the agent's spec is SIGNED under (default the fixture's); a run reads the signed name
+    def __init__(self, tmp: Path, name: str | None = None, source: str | None = None) -> None:
+        # ``name``: the name the agent's spec is SIGNED under (default the fixture's); a run reads the signed name.
+        # ``source``: the spec's input source (default the fixture's; a dream-named spec gets the live dream's)
         self.world = World(tmp)
         self.store = open_agent_store(tmp / "s")
-        self.agent, self.spec_hash, *_ = register_spec(self.store, _spec(name=name), "America/New_York")
+        spec = _spec(name=name) if source is None else _spec(name=name, source=source)    # a stand-in _spec takes no source
+        self.agent, self.spec_hash, *_ = register_spec(self.store, spec, "America/New_York")
         with self.store.read() as c:
             self.sid = c.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0]
         self.authority = AgentAuthority(self.world.root)
