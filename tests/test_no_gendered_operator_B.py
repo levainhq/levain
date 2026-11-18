@@ -10,7 +10,7 @@ import re
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PAT = re.compile(r"\b(his|him|he)\b", re.I)
+PAT = re.compile(r"\b(his|him|himself|he)\b", re.I)
 
 FILES = [
     "levain/cockpit/authority.py",
@@ -43,11 +43,11 @@ FILES = [
 
 # (file, quoted phrase): why it is kept.
 KEPT = [
-    # levain/keep_migrate.py is not in FILES: its literals are rewritten by the levain#88 T11 link (levain 37's seat/1118-6-t11code),
-    # which lands that file; add it here, with its stopword list as a KEPT entry, once that link is on main.
+    # levain/keep_migrate.py is not in FILES: its literals are rewritten by the levain#88 T11 code link, which lands that file;
+    # add it here, with its stopword list as a KEPT entry, once that link is on main.
 ]
 
-# (file, the whole literal): a stored dict key or field name, read by other code and by old data; never shown as text.
+# (file, the whole literal): a stored dict key or field name, read by other code and by old data. It is a compatibility schema key: it may appear in serialized output (dream rollback prints the card), it is not a sentence said to anyone.
 KEPT_KEYS = [
     ("levain/desk/review.py", "his", "an item body field name ('his' on an agent card) that item_text reads"),
     ("levain/dream/card.py", "his", "the card body's 'his' list key, stored in cards and read by the desk"),

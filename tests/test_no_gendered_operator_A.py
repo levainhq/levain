@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = ("levain/desk/launch.py", "levain/desk/cli.py")
-PAT = re.compile(r"\b(his|him|he)\b", re.I)
+PAT = re.compile(r"\b(his|him|himself|he)\b", re.I)
 
 #: (file, quoted phrase, reason): a literal that names someone other than the operator. Empty: lane A kept none.
 KEPT: list[tuple[str, str, str]] = []

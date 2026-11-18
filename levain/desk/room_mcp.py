@@ -152,7 +152,7 @@ ENVELOPE_TOOL: dict[str, Any] = {
         "they want a worker allowed to do (where, how long, what it may land). Name the operator's OWN messages that say so (quote_ids, "
         "in order), the open work thread (th-...) it is for, and the spec you read from the operator's words. The operator sees their words, the "
         "thread, YOUR spec in an editable field, a plain-words reading of it and your summary; they tap to make an "
-        "UNSIGNED draft on that thread, and signs it separately. This authorises nothing and signs nothing. The spec is an "
+        "UNSIGNED draft on that thread, and sign it separately. This authorises nothing and signs nothing. The spec is an "
         "OBJECT (never text) with keys among where [{repo: ABSOLUTE_PATH, paths: [...]}], lands [{repo, onto}], pushes, "
         "publishes, budget {tool_calls, tokens, dollars_cents, hours} and stop (a duration such as \"2h\"): name only "
         "what the operator said. A launch grant is never part of a draft. Name the repo and branch explicitly."),

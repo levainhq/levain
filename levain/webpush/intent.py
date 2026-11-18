@@ -959,7 +959,7 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -
     standing = ov is not None and overlay_active(rec, ts, _last_input(ts, reading), msg_at)
     if by is not None and standing and ov["preset"] == "loud":
         raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
-                            "(the operator says `loud off` himself)")
+                            "(only the operator says `loud off`)")
     note = ""
     if by is not None:
         ev = ev or (False, None, "no transcript check ran")
@@ -1131,7 +1131,7 @@ def apply_settings(queue_dir: Path | str, *, devices: str | None = None, follow_
     if by is not None:
         who = "the desk" if isinstance(by, dict) and by.get("role") == ROLE_DESK else "a seat"
         msg = (f"the presence settings are the operator's own: {who} may not change them "
-               "(the operator sets them himself, from a terminal outside any agent session)")
+               "(only the operator sets them, from a terminal outside any agent session)")
         with presence._locked(queue_dir, strict=False):
             t = time.time() if now is None else now
             presence._log_best_effort(queue_dir, {**presence._log_row(t, word, None, by, None, None), "outcome": "refused", "why": msg})

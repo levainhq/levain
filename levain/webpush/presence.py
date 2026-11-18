@@ -521,7 +521,7 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
     if word not in allowed:
         who = "the desk" if role == ROLE_DESK else "a seat"
         raise PresenceError(f"`{word}` is the operator's own word: {who} may set only {', '.join(f'`{w}`' for w in allowed)}"
-                            " (the operator says it himself; from a terminal outside any agent session the operator sets any word)")
+                            " (only the operator says it, from a terminal outside any agent session; the operator sets any word)")
     raw = said if isinstance(said, str) else ""
     if len(raw) > _SAID_MAX:
         raise PresenceError(f"--said is too long: quote the sentence the operator said, at most {_SAID_MAX} characters")
