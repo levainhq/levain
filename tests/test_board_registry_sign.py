@@ -221,7 +221,8 @@ def test_the_cli_refuses_each_decision_class_verb_without_sign_naming_both_ways(
     for argv in (("begin-track", "beta", "--manifest", mf, "--words", "y"), ("track", "alpha", "--words", "go"),
                  ("abandon-track", "gamma", "--words", "no"), ("untrack", "delta", "--words", "no")):
         rc, _, err = run(capsys, *argv, *A)
-        assert rc == 2 and "--sign" in err and "--source" in err, (argv, err)
+        relayable = argv[0] != "untrack"                                  # untrack takes no --source, so its refusal does not name it
+        assert rc == 2 and "--sign" in err and ("--source" in err) == relayable, (argv, err)
     assert raw(store) == before
 
 

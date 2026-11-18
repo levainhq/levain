@@ -78,14 +78,14 @@ GRADE_RELAYED = "relayed"
 RELAY_AND_SIGN = "--source and --sign cannot be used together: a record is relayed (the desk quotes his answer) or signed (his own key), never both"
 
 
+class BoardError(RuntimeError):
+    """A read or write the store refuses. Nothing was written."""
+
+
 def _relay_or_sign(relay, seal) -> None:
     """A record is relayed OR signed: both on one write is refused here, before any band is read or any prompt shown."""
     if relay is not None and seal is not None:
         raise BoardError(RELAY_AND_SIGN)
-
-
-class BoardError(RuntimeError):
-    """A read or write the store refuses. Nothing was written."""
 
 
 # ----------------------------------------------------------------------------------------------------------- location
@@ -513,15 +513,40 @@ def build_record(op: str, item_id: str, by: str, body: Mapping[str, object], now
     return rec
 
 
-def _read_relay(relay, words, manifest_sha256: str | None = None) -> dict | None:
+def _read_relay(relay, words, manifest_sha256: str | None = None, *, require_manifest: bool = False) -> dict | None:
     """The ``source`` for a record relaying ``relay`` = ``(np id, band source)``, read NOW (at write time), or None for no
-    relay. Refuses an unknown or unanswered row and words that are not a verbatim excerpt of the answer. ``manifest_sha256``
-    (``begin-track`` and ``track``) also holds the question to that digest (``board_relay.check_manifest``)."""
+    relay. Refuses an unknown or unanswered row and words that are not a verbatim excerpt of the answer.
+    ``require_manifest`` (``begin-track`` and ``track``) also holds the question to ``manifest_sha256``
+    (``board_relay.check_manifest``), and fails closed when there is no digest to hold it to."""
     if relay is None:
         return None
     from levain.desk import board_relay
     np_id, band = relay
-    return board_relay.relay_source(np_id, words, band, manifest_sha256)
+    return board_relay.relay_source(np_id, words, band, manifest_sha256, require_manifest=require_manifest)
+
+
+def _relay_hit(relay, words, landed: Mapping[str, Any] | None, author: Mapping[str, object] | None, what: str,
+               manifest_sha256: str | None = None, *, require_manifest: bool = False) -> None:
+    """A write that lands nothing (an idempotent hit, a no-op re-run) under ``--source`` still answers for it: the author is
+    an agent (a relay is the desk's act), the band row is read NOW and ``words`` must be a verbatim excerpt of its answer
+    (with the manifest digest where the verb holds one), and the record already there (``landed``, the ``what``) must be
+    ``relayed`` citing the SAME id; else it refuses, naming what is there. No relay: nothing to check."""
+    if relay is None:
+        return
+    if _author(author)["kind"] != "agent":
+        raise BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
+    _read_relay(relay, words, manifest_sha256, require_manifest=require_manifest)
+    src = landed.get("source") if isinstance(landed, Mapping) else None
+    if isinstance(landed, Mapping) and landed.get("grade") == GRADE_RELAYED and isinstance(src, Mapping) \
+            and src.get("np") == relay[0]:
+        return
+    if not isinstance(landed, Mapping):
+        there = "no record of it was found"
+    elif landed.get("grade") == GRADE_RELAYED and isinstance(src, Mapping):
+        there = f"it is relayed citing {src.get('np')}"
+    else:
+        there = f"it is {landed.get('grade')!r}"
+    raise BoardError(f"the {what} already landed is not a relayed record citing {relay[0]} ({there}): nothing was written")
 
 
 def canonical_bytes(rec: Mapping[str, object]) -> bytes:
@@ -885,7 +910,9 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
     blocking step follows this check; a sealed one is checked again by ``earn`` against the log replayed after the
     ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write). ``cause_band`` is the band a RELAYED
     abandon-track's cause is re-read through (``board_sign.abandon_problem``); an unsigned write only (a sealed one is checked
-    again by ``earn``, which has no band, so a sealed cut of a relayed abandon is refused here and never prompts)."""
+    again by ``earn``, which has no band, so a sealed cut of a relayed abandon is refused here, by name, and never prompts).
+    The authority log is read only when the cited abandon is SIGNED (``board_sign.cause_snapshot``): a relayed cause needs
+    only the band, so a log that cannot be read never refuses it."""
     from levain.desk import board_sign
     if seal is not None:
         board_sign.check_signable(rec)
@@ -894,8 +921,11 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
     store, snapshot = None, None
     if "cause" in rec and rec["op"] == "decide" and rec.get("decision") == "cut":
         store = _store_lines(target)
-        source = seal.authority if seal is not None else authority
-        snapshot = board_sign.read_authority(source) if source is not None else None
+        cited = board_sign.cited_record(rec["cause"], store.repos)
+        if seal is not None and isinstance(cited, Mapping) and cited.get("op") == "abandon-track" \
+                and cited.get("grade") == GRADE_RELAYED:
+            raise BoardError(board_sign.SIGNED_CUT_OF_RELAYED)
+        snapshot = board_sign.cause_snapshot(cited, seal.authority if seal is not None else authority)
     board_sign.require_policy(rec["op"], grade, rec, store=store, snapshot=snapshot, decision=decision,
                               band=cause_band if seal is None else None)
     return rec
@@ -948,11 +978,15 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                     if r.get("repo") != repo:
                         raise BoardError(f"key {key!r} was already used for {r['id']} in repo {r.get('repo')!r}; this add is for repo {repo!r}")
                     if r.get("payload_hash") == payload_hash:
-                        if relay is not None:           # a key hit under --source is only the same relay: relayed, citing this id
+                        if relay is not None:           # a key hit under --source is only the same relay: relayed, citing this id, these words
                             src = r.get("source")
                             if r.get("grade") != GRADE_RELAYED or not isinstance(src, Mapping) or src.get("np") != relay[0]:
                                 raise BoardError(f"key {key!r} was already used for {r['id']}, which is not a relayed record citing "
                                                  f"{relay[0]}; this add relays it")
+                            if r.get("words") != fields["words"]:
+                                raise BoardError(f"key {key!r} was already used for {r['id']} relaying other words "
+                                                 f"({r.get('words')!r}); this add relays {fields['words']!r}")
+                            _relay_hit(relay, fields["words"], r, author, f"add {r['id']}")
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")

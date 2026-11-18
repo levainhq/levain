@@ -550,3 +550,57 @@ def test_the_native_row_grade_is_board_producers_one_grade_function(tmp_path):
     qs.answer(q.id, text="yes", channel="phone")
     assert not hasattr(br, "native_grade")
     assert br.NativeBandSource(qs).row(q.id).answer_grade == bp._grade(qs, qs.get(q.id)) == "unknown"
+
+
+# ------------------------------------------------------------------------------------------- P3 fix 4 (L3 round 4)
+
+
+def test_f4_4_a_relayed_record_carrying_a_sig_is_not_relayed(band):
+    rec = relayed_rec(band)
+    assert br.verify_relayed(rec, band).ok
+    v = br.verify_relayed({**rec, "sig": {"sshsig": "x", "fingerprint": "y", "via": "terminal"}}, band)
+    assert not v.ok and "carries a signature" in v.text and v.grade is None
+
+
+def test_f4_2_an_add_key_hit_under_source_reads_the_band_and_compares_the_words(store, band, capsys):
+    argv = ["add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "desk 24", "--key", "k2", "--payload-hash",
+            "b" * 64]
+    rc, out, err = run(capsys, *argv, "--words", EXCERPT, "--source", NP)
+    assert rc == 0, err
+    n = len(records(store))
+    rc, _, err = run(capsys, *argv, "--words", "yes, track it", "--source", NP)
+    assert rc == 2 and "words" in err and "already used" in err
+    row = band.rows.pop(NP)
+    rc, _, err = run(capsys, *argv, "--words", EXCERPT, "--source", NP)
+    assert rc == 2 and "not a row this band holds" in err
+    band.rows[NP] = row
+    assert run(capsys, *argv, "--words", EXCERPT, "--source", NP)[:2] == (0, out)
+    assert len(records(store)) == n
+
+
+def test_f4_5_the_manifest_requirement_is_explicit_and_fails_closed(band):
+    with pytest.raises(bs.BoardError, match="no manifest sha256"):
+        bs._read_relay((NP, band), EXCERPT, None, require_manifest=True)
+    assert bs._read_relay((NP, band), EXCERPT, MANIFEST, require_manifest=True)["np"] == NP
+    with pytest.raises(ValueError):
+        br.relay_source(NP, EXCERPT, band, MANIFEST)            # a digest with no requirement is a caller's mistake, never ignored
+
+
+def test_f4_7_check_manifest_refuses_a_non_mapping_and_verify_relayed_holds_the_one_line_rule(band):
+    assert not br.check_manifest(["not", "a", "record"], band.rows[NP], MANIFEST).ok
+    band.rows[NP] = signed_row("line one\nline two")
+    rec = relayed_rec(band, "one\nline")
+    v = br.verify_relayed(rec, band)
+    assert not v.ok and "one line" in v.text
+
+
+@pytest.mark.parametrize("np_id", ["np-1b3dd088", "np-1234", "np-1b3dd0881b3dd088"])
+def test_f4_7_every_np_id_width_gets_the_np_message(np_id):
+    with pytest.raises(bs.BoardError, match="np- rows are flow's band"):
+        br.check_source_id(np_id)
+
+
+def test_f4_7_board_error_is_defined_before_its_first_user():
+    import inspect
+    src = inspect.getsource(bs)
+    assert src.index("class BoardError") < src.index("def _relay_or_sign")
