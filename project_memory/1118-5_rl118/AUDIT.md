@@ -4,7 +4,7 @@ Result: no affected site beyond the one r117 fixed (row 1). Verdict codes: (a) a
 
 Method: `git grep -n -i -E "RLIMIT_|setrlimit|nproc|pids.max|pids_max|clone_limits|_run_bounded|_clone_under_limits|ulimit|prlimit|preexec_fn"` over `levain` and `tests` at b91469486 (excluding this file), then every caller of `clone_limits` / `_run_bounded` followed. Reading only; nothing was run against a real key, and no failure was reproduced because no site has the shape.
 
-The shape that fails: a relative limit (count measured now + margin) applied in a child, with a window in which a same-uid process can take the headroom. `_uid_task_count` is the only live count that feeds an rlimit (other live uid process lists, such as the `pgrep -U` reads in the firing hands code, feed no limit); it has one consumer, `clone_limits`, and that has one caller, `_clone_under_limits`.
+The shape that fails: a relative limit (count measured now + margin) applied in a child, with a window in which a same-uid process can take the headroom. `_uid_task_count` is the only live count that feeds an rlimit (other live uid process lists, the `pgrep -U` reads in levain/firing/hands.py and hands_chat.py read a process list and apply no rlimit); it has one consumer, `clone_limits`, and that has one caller, `_clone_under_limits`.
 
 | # | file | symbol (quoted) | verdict | reason | checked |
 |---|------|-----------------|---------|--------|---------|
@@ -19,7 +19,7 @@ The shape that fails: a relative limit (count measured now + margin) applied in 
 | 9 | levain/slot/export_run.py | `write("pids.max", str(pids_max))` | b | cgroup pids.max, not an rlimit; value from the fixed spec, not a snapshot | read |
 | 10 | levain/slot/probe.py | `a fork failure (RLIMIT_NPROC, §8) is one unknown, never the wall` | b | no limit is derived here; a refused spawn is already mapped to a bounded UNKNOWN verdict (fail-safe by design) | read |
 | 11 | levain/slot/proc.py | `A ``fork`` refused with EAGAIN` (`signal_child`) | b | already retries EAGAIN until its deadline; limit not derived from a snapshot | read |
-| 12 | levain/slot/end.py, install_helper.py, stage.py, proc.py | `nproc=None` (the "no RLIMIT_NPROC (the reader never forks)" comment is in end.py; install_helper.py and stage.py word it differently; proc.py `_drop_to` has none and its signalling child does not fork) | b | no NPROC set, child never forks | read |
+| 12 | levain/slot/end.py, install_helper.py, stage.py | `nproc=None` (the "no RLIMIT_NPROC (the reader never forks)" comment is in end.py; install_helper.py and stage.py word it differently) | b | no NPROC set, child never forks. proc.py `_drop_to` is not an `nproc=None` site: it sets no limit, and its signalling child does not fork | read |
 | 13 | levain/broker/keys.py | `resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))` | b | NOFILE raised to a constant target (min(hard, NOFILE_TARGET)), not count-plus-margin, and not applied to a child | read |
 
 Other `preexec_fn` users (canary, hands_chat, ws_git, supervisor, tests) set ctty, cwd or signals, no limits. Test helpers that set rlimits (`test_repair_handover`, `test_slot_s2c_end`) raise or squeeze NOFILE in the test's own process and restore it; they start no child under a measured count. tests/test_shell_oob_status.py mentions RLIMIT_NPROC only in a docstring about zombie reaping.
