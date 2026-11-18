@@ -776,18 +776,68 @@ def only_repo(doc: dict[str, Any], repo_name: str | None) -> dict[str, Any]:
     def mine(i: Any) -> bool:
         return isinstance(i, str) and i.startswith(repo_name + "#")
 
-    def other_problem(p: Any) -> bool:      # "repo X not read: ..." names one repo; any other problem is the store's
-        m = re.match(r"repo (\S+) ", p) if isinstance(p, str) else None
-        return m is not None and m.group(1) != repo_name
-
-    out = {**doc, "items": [i for i in doc["items"] if mine(i["id"])],
-           "audit": [a for a in doc["audit"] if a["id"] is None or mine(a["id"])],
-           "problems": [p for p in doc.get("problems", []) if not other_problem(p)]}
     reader = doc.get("reader")
-    if isinstance(reader, dict) and isinstance(reader.get("diverged"), list):
-        out["reader"] = {**reader, "diverged": [d for d in reader["diverged"]
-                                                if ":" not in str(d) or str(d).startswith(repo_name + ":")]}
+    known = _reader_repos(reader)
+
+    def other_repo_text(p: Any) -> bool:    # text that names ANOTHER repo: "repo X not read: ..." or "<X>: <why>" for a repo X read
+        if not isinstance(p, str):
+            return False
+        m = re.match(r"repo (\S+) ", p)
+        if m is not None and m.group(1) != repo_name:
+            return True
+        head = p.split(": ", 1)[0]
+        return ": " in p and head in known and head != repo_name
+
+    # An id-less audit entry that names another repo goes; one that names no repo stays (it is the store's).
+    out = {**doc, "items": [i for i in doc["items"] if mine(i["id"])],
+           "audit": [a for a in doc["audit"] if mine(a["id"]) or (a["id"] is None and not other_repo_text(a.get("why")))],
+           "problems": [p for p in doc.get("problems", []) if not other_repo_text(p)]}
+    if isinstance(reader, dict):
+        out["reader"] = _reader_only(reader, repo_name)
     return out
+
+
+def _reader_repos(reader: Any) -> set[str]:
+    """Every repo name a ``reader`` block names: its own, the per-repo summaries', the ``also`` summaries'."""
+    if not isinstance(reader, dict):
+        return set()
+    names = {str(sm["repo"]) for sm in [*(reader.get("repos") or []), *(reader.get("also") or [])]
+             if isinstance(sm, dict) and sm.get("repo")}
+    if isinstance(reader.get("repo"), str) and reader["repo"] and not reader.get("repos"):
+        names.add(reader["repo"])
+    return names
+
+
+def _reader_only(reader: dict[str, Any], repo_name: str) -> dict[str, Any]:
+    """The ``reader`` block of one repo: only its summary under ``repos`` (or ``also``), and the aggregate counts (and
+    ``diverged``, as ``<repo>:<branch>``) recomputed over what is kept."""
+    repos = reader.get("repos")
+    if isinstance(repos, list):                      # a whole-board read: the counts were summed over every repo
+        kept = [sm for sm in repos if isinstance(sm, dict) and sm.get("repo") == repo_name]
+        out: dict[str, Any] = {}
+        for key, val in reader.items():
+            if key in ("repo", "repos"):
+                continue
+            if isinstance(val, bool) or not isinstance(val, (int, list)):
+                out[key] = val
+            elif isinstance(val, int):
+                out[key] = sum(sm.get(key, 0) for sm in kept)
+            else:
+                out[key] = [f"{repo_name}:{n}" for sm in kept for n in sm.get(key, [])]
+        out["repo"] = repo_name if kept else ""
+        out["repos"] = kept
+        return out
+    also = reader.get("also")
+    if isinstance(also, list):                       # one primary repo and the others read beside it
+        if reader.get("repo") == repo_name:
+            return {**reader, "also": []}
+        match = [sm for sm in also if isinstance(sm, dict) and sm.get("repo") == repo_name]
+        if match:
+            return {**match[0], "also": []}
+    if isinstance(reader.get("diverged"), list):
+        return {**reader, "diverged": [d for d in reader["diverged"]
+                                       if ":" not in str(d) or str(d).startswith(repo_name + ":")]}
+    return reader
 
 
 def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
