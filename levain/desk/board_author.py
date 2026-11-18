@@ -20,26 +20,28 @@ Where the close comes from:
   (for a directory, the first such commit that added a file under it);
 * a ``merged`` close carried by the commit's own ``Board-Closes`` trailer takes its author from that commit.
 
-"Valid at the commit's time" uses the committer date, which the signer controls: a key that is now revoked and was
-enrolled before the commit's date reads ``signed``, with the revocation named in ``how`` ("the commit's own time is the
-signer's claim"), never silently valid. A key enrolled AFTER the commit's date, or revoked before it, is not tier 1.
+"Valid at the commit's time": the key's ENROL time (the authority log's enrol link) is read from the snapshot; a key enrolled
+AFTER the commit's date is not tier 1. The snapshot carries no time for a REVOCATION (only its seq), so a key that is revoked
+or compromised in the log is never credited as tier 1: the commit falls to its git author and the note names the key and
+the revoked seq (a verdict never stronger than the evidence).
 
 The surfaced field is ``closed_by`` on a done item of ``levain board state --json`` (and a ``closed by:`` line of
 ``levain board context``): ``{"tier": signed|trailer|git|unattributed, "who": str|null, "how": str, "commit": sha|null}``.
 
-The two lookups are the caller's, named by flags (``--data-root`` the cockpit whose authority log holds the operator's keys,
-``--desk-dir`` the desk store whose launch records map a durable key to a seat); with neither named the tiers that need them
-are not available and the verdict says so rather than guessing.
+The two lookups DEFAULT to this install's own: the cockpit whose authority log the board's signed verbs verify against
+(:func:`levain.desk.board_sign.resolve_authority`, the one reader: ``read_authority`` over the verified replay, anchor
+checked) and the desk store the board's native producer reads (:func:`levain.desk.work_attach.live_consent_dir`).
+``--data-root`` / ``--desk-dir`` override. Both are read-only. A default that is absent or unreadable reads "not checked" with
+the reason in the verdict's note (never an error, never a silent tier-3 claim presented as checked).
 """
 from __future__ import annotations
 
 import contextlib
 import os
 import re
-import sqlite3
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,11 @@ _US, _RS, _GS = "\x1f", "\x1e", "\x1d"
 _FACTS_FMT = ("%x1e%H%x1f%an%x1f%cI%x1f%(trailers:key=Board-Seat,valueonly,unfold,separator=%x1d)"
               "%x1f%(trailers:key=Board-Closes,valueonly,unfold,separator=%x1d)")
 _SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _clip(text: str, n: int = 220) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 3] + "..."
 
 
 @dataclass(frozen=True)
@@ -88,114 +95,97 @@ def describe(c: Closer | Mapping[str, Any]) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ the two lookups
-_DEFAULT = object()
+class NotChecked(Exception):
+    """A lookup that could not be made (absent, unreadable): its text is the reason the verdict's note carries."""
 
 
 class CockpitAuthority:
-    """The authority log of the cockpit at ``data_root``, replayed once (:class:`levain.consent.queue.AuthoritySource`: the
-    verified replay, anchor checked) and asked which key was valid when. ``anchor`` defaults to the cockpit's own; ``None``
-    checks none (a scratch log). A log that cannot be read raises on the first question; :func:`closer_of_item` turns that
-    into a hint, never a refusal."""
+    """The authority log of the cockpit at ``data_root`` (default: the one the board's own signed verbs resolve,
+    :func:`levain.desk.board_sign.resolve_authority`), replayed once through the ONE reader
+    (:func:`levain.desk.board_sign.read_authority`: verified replay, anchor checked) and asked which key was valid when.
+    A log that cannot be resolved or read raises :class:`NotChecked` on the first question; :class:`_Reader` turns that into a
+    note, never a refusal."""
 
-    def __init__(self, data_root: Path | str, *, anchor: Any = _DEFAULT) -> None:
-        from levain.authority import anchor_path
-
-        self.root = Path(data_root).expanduser()
-        self._anchor = anchor_path(self.root) if anchor is _DEFAULT else anchor
+    def __init__(self, data_root: Path | str | None = None) -> None:
+        self.root = None if data_root is None else Path(data_root).expanduser()
         self._snap: Any = None
-        self._times: dict[int, datetime] | None = None
 
-    def _load(self) -> None:
+    def _load(self) -> Any:
         if self._snap is not None:
-            return
-        from levain.consent.queue import authority_source
+            return self._snap
+        from levain.desk import board_sign as bsign
 
-        db = self.root / "cockpit.db"
-        if not db.is_file():
-            raise FileNotFoundError(f"{self.root} holds no cockpit (no cockpit.db)")
-        self._snap = authority_source(db, anchor=self._anchor)()
-        times: dict[int, datetime] = {}
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=10.0)
         try:
-            import json
+            source = bsign.resolve_authority(data_root=self.root)
+            self._snap = bsign.read_authority(source)
+        except (bsign.bs.BoardError, OSError, ValueError) as exc:
+            text = str(exc)       # board_sign's refusal wraps the reason in parentheses after its "nothing was written" text
+            raise NotChecked(text[text.index("(") + 1:text.rindex(")")] if "(" in text and ")" in text else text) from None
+        return self._snap
 
-            for seq, record in conn.execute("SELECT seq, record FROM authority_log ORDER BY seq"):
-                try:
-                    at = parse_timestamp(json.loads(record).get("at"))
-                except (ValueError, AttributeError, TypeError):
-                    at = None
-                if at is not None:
-                    times[int(seq)] = at
-        finally:
-            conn.close()
-        self._times = times
+    def key_state(self, fingerprint: str) -> Any:
+        """The log's key for ``fingerprint`` (None when it holds none)."""
+        return self._load().key(fingerprint)
 
     def valid_at(self, fingerprint: str, when: datetime) -> tuple[str, str] | None:
-        """``(principal, note)`` when ``fingerprint`` is a key of the log that was valid at ``when`` (``note`` names a later
-        revocation, "" when the key is still active), else None."""
-        self._load()
-        key = self._snap.key(fingerprint)
-        if key is None:
+        """``(principal, note)`` when ``fingerprint`` is a key of the log, never revoked or compromised there, and enrolled
+        at or before ``when``; else None. The snapshot carries no revocation time, so a revoked key is never valid here."""
+        key = self.key_state(fingerprint)
+        if key is None or key.revoked_seq is not None or key.compromised_since is not None:
             return None
         start = parse_timestamp(key.enrolled_at or key.legacy_enrolled_at)
         if start is None or when < start:
             return None
-        ends = [self._times.get(s) for s in (key.revoked_seq, key.compromised_since) if s is not None]
-        if any(s is not None and self._times.get(s) is None for s in (key.revoked_seq, key.compromised_since)):
-            return None                             # a revocation whose time cannot be read: not valid, never silently valid
-        end = min((e for e in ends if e is not None), default=None)
-        if end is not None and when >= end:
-            return None
-        note = ""
-        if end is not None:
-            note = (f"the key was revoked at {end.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}; the commit's own "
-                    "time is the signer's claim")
-        return key.principal, note
+        return key.principal, ""
 
 
 @dataclass
 class Resolvers:
     """What the verdict may ask beyond git. ``authority`` None: tier 1 unavailable. ``seat_of(key)`` returns the seat's name
-    for a durable key or None; None itself: tier 2 unavailable."""
+    for a durable key or None, and raises :class:`NotChecked` when the launch records cannot be read; None itself: tier 2
+    unavailable."""
     authority: CockpitAuthority | None = None
     seat_of: Callable[[str], str | None] | None = None
 
 
 def add_resolver_args(parser: Any) -> None:
     parser.add_argument("--data-root", dest="data_root", type=Path, default=None, metavar="DIR",
-                        help="The cockpit data root whose authority log holds the operator's keys: a close's author is read "
-                             "as 'operator ...' only when its signing key is there. Without it a signature is not checked.")
+                        help="The cockpit data root whose authority log holds the operator's keys (default: this install's "
+                             "own cockpit, the one the board's signed verbs use): a close's author is read as 'operator ...' "
+                             "only when its signing key is there. A cockpit that is absent reads 'not checked'.")
     parser.add_argument("--desk-dir", dest="desk_dir", type=Path, default=None, metavar="DIR",
-                        help="The desk store whose launch records map a Board-Seat durable key to a seat. Without it a "
-                             "Board-Seat trailer is not resolved.")
+                        help="The desk store whose launch records map a Board-Seat durable key to a seat (default: this "
+                             "install's own, the one the board's seat producer reads). An absent store reads 'not checked'.")
 
 
 def resolvers_from_args(args: Any) -> Resolvers:
-    res = Resolvers()
+    """The install's own cockpit and desk store unless a flag names another; both read-only and lazy (an absent default is
+    said when a commit needs it, never an error)."""
     root = getattr(args, "data_root", None)
-    if root is not None:
-        res.authority = CockpitAuthority(root)
     desk = getattr(args, "desk_dir", None)
-    if desk is not None:
-        res.seat_of = _desk_seat_of(Path(desk).expanduser())
-    return res
+    return Resolvers(authority=CockpitAuthority(root), seat_of=_desk_seat_of(None if desk is None else Path(desk).expanduser()))
 
 
-def _desk_seat_of(directory: Path) -> Callable[[str], str | None]:
-    """A seat-name lookup over the launch records of the desk store in ``directory`` (read-only; a store that cannot be read
-    answers None for every key)."""
+def _desk_seat_of(directory: Path | None) -> Callable[[str], str | None]:
+    """A seat-name lookup over the launch records of the desk store in ``directory`` (default: the install's own,
+    :func:`levain.desk.work_attach.live_consent_dir`). Read-only. An absent or unreadable store raises :class:`NotChecked`;
+    a readable one that holds no such key answers None."""
     def seat_of(key: str) -> str | None:
-        from levain.desk import lease
+        from levain.desk import lease, work_attach
         from levain.desk.envelopes import EnvelopeStore
+        from levain.desk.store import StoreAbsent
 
         try:
-            conn = EnvelopeStore(directory).open_readonly()
-        except Exception:  # noqa: BLE001 - no launch record is readable: the trailer stays unresolved, the close stands
-            return None
+            where = directory if directory is not None else work_attach.live_consent_dir()
+            conn = EnvelopeStore(where).open_readonly()
+        except StoreAbsent as exc:
+            raise NotChecked(str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 - the default home cannot even be named, or the store cannot be opened
+            raise NotChecked(f"the desk store cannot be read ({type(exc).__name__}: {exc})") from None
         try:
             ln = lease._launch_by_key(conn, key)
-        except Exception:  # noqa: BLE001
-            return None
+        except Exception as exc:  # noqa: BLE001
+            raise NotChecked(f"the launch records cannot be read ({type(exc).__name__})") from None
         finally:
             conn.close()
         return None if ln is None else f"{ln.role} {ln.launch_id}"
@@ -264,32 +254,46 @@ class _Reader:
             sig = signing.verify_commit(self.repo, sha)
         if sig is not None and sig.kind == "signed":
             if self.res.authority is None:
-                notes.append("the commit is signed but no authority log was named (--data-root), so the signature is not checked")
+                notes.append("the commit is signed but no authority log is consulted, so the signature is not checked")
             elif f.when is None:
                 notes.append("the commit is signed but its date cannot be read, so the key's validity cannot be judged")
             else:
+                got = None
                 try:
                     got = self.res.authority.valid_at(sig.fingerprint or "", f.when)
-                except Exception as exc:  # noqa: BLE001 - an authority log that cannot be read: not tier 1, said, never a refusal
-                    got = None
-                    notes.append(f"the commit is signed but the authority log cannot be read ({type(exc).__name__})")
-                else:
                     if got is None:
-                        notes.append("the commit is signed by a key that was not valid in the authority log at its date")
+                        key = self.res.authority.key_state(sig.fingerprint or "")
+                        if key is None:
+                            notes.append("the commit is signed by a key that is not in the authority log")
+                        elif key.revoked_seq is not None or key.compromised_since is not None:
+                            notes.append(f"the commit is signed by a key the authority log revoked (seq {key.revoked_seq}); the log "
+                                         "carries no revocation time, so the signature is not credited")
+                        else:
+                            notes.append("the commit is signed by a key enrolled after the commit's date")
+                except NotChecked as exc:  # an authority log that is absent or unreadable: not checked, said, never a refusal
+                    notes.append(f"the commit is signed but the authority log was not checked ({_clip(str(exc))})")
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"the commit is signed but the authority log cannot be read ({type(exc).__name__})")
                 if got is not None:
                     principal, note = got
                     return self._remember(sha, Closer("signed", f"operator {principal}", "signed commit", sha, note))
         if len(f.seats) == 1:
             if self.res.seat_of is None:
-                notes.append("a Board-Seat trailer is present but no launch records were named (--desk-dir)")
+                notes.append("a Board-Seat trailer is present but no launch records are consulted")
             else:
                 try:
                     name = self.res.seat_of(f.seats[0])
+                except NotChecked as exc:
+                    name = None
+                    notes.append(f"a Board-Seat trailer is present but the launch records were not checked ({_clip(str(exc))})")
                 except Exception:  # noqa: BLE001
                     name = None
+                    notes.append("a Board-Seat trailer is present but the launch records cannot be read")
+                else:
+                    if not name:
+                        notes.append("its Board-Seat trailer maps to no launch record")
                 if name:
                     return self._remember(sha, Closer("trailer", f"agent {name}", "asserted (trailer)", sha, "; ".join(notes)))
-                notes.append("its Board-Seat trailer maps to no launch record")
         elif len(f.seats) > 1:
             notes.append("the commit carries several different Board-Seat trailers, so none is read")
         return self._remember(sha, Closer("git", f.author or "(no author name)", "asserted by git author", sha, "; ".join(notes)))
