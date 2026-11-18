@@ -89,7 +89,7 @@ EXEMPT: dict[str, str] = {
     "operator_views": "its gseq column holds the viewer's read cursor, copied from an existing gseq, NOT allocated by "
                       "next_gseq (work_delta.py); never an allocator-fed table",
     "ready_items": "a DERIVED state row; ready_journal is the record",
-    "ready_journal": "the v1 ready queue is retired (T7, levain#101): it takes no more rows, and board changes are not in "
+    "ready_journal": "the v1 ready queue is retired (levain#101): it takes no more rows, and board changes are not in "
                      "the ordered stream (the board is a JSONL store no SQLite snapshot can join); the open's one board "
                      "block reads the board itself",
     "sqlite_sequence": "SQLite's own",

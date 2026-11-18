@@ -289,7 +289,7 @@ def _propose(row: Mapping[str, Any], *, handoff_to: str, agenda_date: str | None
     if d == "handoff":
         if handoff_to == "agenda":
             return ({"kind": DEST_INTENTION, "disposition": "agenda", "next": agenda_date},
-                    f"legacy handoff to a dated agenda ({agenda_date}), so it reaches him once as a band row (T10b)")
+                    f"legacy handoff to a dated agenda ({agenda_date}), so it reaches the operator once as a band row")
         return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
                 "legacy handoff to a someday: the agent sees it in the Tray at session start (T10a)")
     return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
