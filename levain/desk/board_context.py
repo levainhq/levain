@@ -263,7 +263,7 @@ def _item_part(item: Any, derived: Derived | None) -> Part:
     return Part("item", out, truncated=cut)
 
 
-def _state_part(item_id: str, derived: Derived, repo_note: str = "") -> Part:
+def _state_part(item_id: str, derived: Derived, repo_note: str = "", closed_line: str | None = None) -> Part:
     if derived.why:
         return _unreadable("state", derived.why)
     st = derived.states.get(item_id)
@@ -271,6 +271,8 @@ def _state_part(item_id: str, derived: Derived, repo_note: str = "") -> Part:
         return _unreadable("state", "the derive did not return the item")
     ev = derived.evidence
     lines = [f"state: {_s(st.state)} ({_s(st.column)}): {_s(st.reason)}"]
+    if closed_line:
+        lines.append(_clip(closed_line, 400))
     if repo_note:
         lines.append(repo_note)
     if ev is None:
@@ -600,9 +602,16 @@ def run_context(args: argparse.Namespace) -> int:
     repo_note = ""
     if repo is None and repo_path is not None:
         repo_note = f"git evidence was read from {repo_path}, given by --repo; the path's identity is not checked"
+    closed_line = None
+    if dv is not None and repo_path is not None and item_id in dv.states:
+        try:       # P4: who authored the close; a verdict on every close, never a refusal
+            from levain.desk import board_author as ba
+            closed_line = ba.closer_line(repo_path, item, dv.states[item_id], ba.resolvers_from_args(args))
+        except Exception as exc:  # noqa: BLE001 - said, never raised: the state part still prints
+            closed_line = f"closed by: unreadable ({type(exc).__name__}: {_clip(str(exc), 120)})"
     parts = [_guarded("charter", lambda: _charter_part(repo, name, item_id, folded, dv, repo_why)),
              _guarded("item", lambda: _item_part(item, dv)),
-             _guarded("state", lambda: _state_part(item_id, derived, repo_note)),
+             _guarded("state", lambda: _state_part(item_id, derived, repo_note, closed_line)),
              _guarded("record", lambda: _record_part(repo, name, item_id, args, now)),
              _guarded("conventions", lambda: _conventions_part(repo))]
     mode_line = _clip(mode_line, MARK_CHARS) if mode_line else ""
@@ -630,6 +639,8 @@ def register(sub: Any) -> None:
     p.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter (as `levain board state --no-land-waiter`): waiters are then declared absent.")
     p.add_argument("--now", metavar="ISO", help="Judge at this instant (default: the clock).")
+    from levain.desk import board_author
+    board_author.add_resolver_args(p)
     p.set_defaults(func=run_context)
     from levain.desk.door import door_ok_author
 
