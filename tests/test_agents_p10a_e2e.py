@@ -6,8 +6,10 @@ operator's own command line (``levain agents ...``, ``levain dream ...``) agains
 ``tests/_p10a_rig.py``. The gates are named in ``tests/_p10a_entry.py`` and are only these: the clock a tick or hand start
 reads, and the one door to a model-calling child (a launched row stays launched, with no fire).
 
-Session 1 builds four cases: edit + re-sign mid-run, a manual run against the ceiling, an unreadable store, DST.
-The rest are listed in ``project_memory/1118-12_lanes/ret_D_121_build.md`` as UNBUILT.
+Session 1: edit + re-sign mid-run, a manual run against the ceiling, an unreadable store, DST. Session 2: stale link
+after a revoke, expiry and renewal mid-run, revoke c1-c5 by SIGKILL (the entry's P10A_KILL gate), c6/c8, c7, open
+reservation at a crash (c9), counters at their ceilings, a manual run counting against a scheduled one, duplicate
+delivery. UNBUILT (need a fire that reaches its settle or heartbeat): ``project_memory/1118-12_lanes/ret_D2_121_build.md``.
 """
 from __future__ import annotations
 
@@ -664,3 +666,66 @@ def test_p10a_counters_at_their_ceiling(tmp_path):
     assert third.rc == 1 and third.err.endswith(" ended skipped-budget: budget_window; nothing was started\n")
     assert len(dollars.rows("SELECT * FROM agent_reservations")) == 2 and dollars.rows("SELECT * FROM agent_slots") == []
     assert dollars.spawned() == []
+
+
+def test_p10a_a_manual_run_counts_against_a_scheduled_one(tmp_path):
+    """invariant 7, the other half of 'a manual run against the ceiling': with run_ceiling 1, a hand run in the night
+    holds the scheduled slot off (``skipped-overlap``) while it is in flight and, once it is ended, still COUNTS: the next
+    scheduled slot is refused ``skipped-budget: ceiling`` (the manual run's window key is its own, the count is the
+    agent's). Only the hand run was ever given a fire."""
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=1))
+    assert inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 0, 0)).rc == 0         # the first tick claims no slot (observed)
+    assert inst.rows() == []
+    hand = inst.cli("dream", "start", now=utc(2026, 11, 19, 5, 5, 0))
+    assert hand.rc == 0 and "claimed and launched oc-" in hand.out
+    assert inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 20, 0)).rc == 0         # the 00:20 slot, with the hand run live
+    manual, slot = inst.rows("SELECT * FROM agent_occurrences ORDER BY admitted_at, key")
+    assert (manual["kind"], manual["state"], manual["window_key"]) == ("manual", "launched", "m:2026-11-19")
+    assert (slot["kind"], slot["state"], slot["reason"], slot["key"]) == (
+        "scheduled", "skipped-overlap", "overlap", "2026-11-19T05:20:00Z")
+    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 40, 0))                   # the hand run lapses; the 00:40 slot
+    assert tick.rc == 6 and f"{manual['occurrence_id']} (hand-2026-11-19T05:05:00Z-" in tick.err
+    assert "its slot freed and its reservation settled\n" in tick.err and \
+        tick.err.endswith(" did not launch: skipped-budget (ceiling)\n")
+    rows = {r["key"]: r for r in inst.rows()}
+    assert rows[manual["key"]]["state"] == "stopped"
+    refused = rows["2026-11-19T05:40:00Z"]
+    assert (refused["kind"], refused["state"], refused["reason"], refused["launched_at"]) == (
+        "scheduled", "skipped-budget", "ceiling", None)
+    assert inst.rows(f"SELECT * FROM agent_slots WHERE owner_id = '{refused['occurrence_id']}'") == []
+    assert inst.rows(f"SELECT * FROM agent_reservations WHERE occurrence_id = '{refused['occurrence_id']}'") == []
+    assert inst.spawned() == [manual["occurrence_id"]]
+
+
+# ------------------------------------------------------------------------------------------------ duplicate delivery
+
+def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
+    """invariant 7: duplicate delivery. The same scheduled slot delivered to ``levain agents tick`` twice (the same faked
+    instant, then three real tick processes racing for one slot): one occurrence per slot key, ever. The repeat writes
+    nothing, says nothing and exits 0; of the racers exactly one claims, the others report ``not-admitted`` naming the
+    SAME occurrence and exit 0. (The claimed-dream-row / card delivery needs a finished run: UNBUILT.)"""
+    from tests._p10a_rig import finish, popen
+
+    inst = Install(tmp_path, episodes=0)                                   # every claimed slot ends skipped-no-input
+    assert inst.enable("--time", "00:00").rc == 0
+    inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=9))
+    assert inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 0, 0)).rc == 0
+    first = inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 20, 0))
+    (slot,) = inst.rows()
+    assert (first.rc, first.err) == (0, f"levain agents tick: {slot['occurrence_id']} did not launch: skipped-no-input (no_input)\n")
+    again = inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 20, 0))
+    assert (again.rc, again.out, again.err) == (0, "", "") and inst.rows() == [slot]
+
+    racers = [finish(p) for p in [popen(inst, "agents", "tick", now=utc(2026, 11, 19, 5, 40, 0), spawn_gate=True)
+                                  for _ in range(3)]]
+    _clean(*racers)
+    assert [r.rc for r in racers] == [0, 0, 0]
+    rows = inst.rows("SELECT * FROM agent_occurrences ORDER BY key")
+    assert [r["key"] for r in rows] == ["2026-11-19T05:20:00Z", "2026-11-19T05:40:00Z"]
+    new = rows[1]["occurrence_id"]
+    assert all(f"levain agents tick: {new} did not launch: " in r.err for r in racers if r.err)
+    assert sum("skipped-no-input (no_input)" in r.err for r in racers) == 1
+    assert all(("skipped-no-input (no_input)" in r.err or "not-admitted (the occurrence ended while its input was checked)" in r.err)
+               for r in racers if r.err)
