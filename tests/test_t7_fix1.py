@@ -17,6 +17,16 @@ from levain.desk.store import CoordError, CoordStore
 from tests import v1_seed
 
 
+def _records(directory) -> list[dict]:
+    """The drain's one file, parsed: one JSON object per line."""
+    return [json.loads(ln) for ln in work_attach.drained_path(directory).read_text().split("\n")[:-1]]
+
+
+def _mark(directory, *keys, torn: str = "") -> None:
+    """A drained-record file as the drain writes it (a planted one for the status tests)."""
+    work_attach.drained_path(directory).write_text("".join(json.dumps({"key": k, "line": k}) + "\n" for k in keys) + torn)
+
+
 def _plant(directory, **kw):
     """A report queued BEFORE the switch, planted around the (now refusing) door."""
     conn = sqlite3.connect(work_attach.reports_path(directory))
@@ -66,7 +76,7 @@ def test_r3a_a_queue_planted_in_the_live_consent_store_is_never_drained_by_the_d
     before = _files(consent_dir)
     lines = launch.watch_once(consent)
     assert _files(consent_dir) == before, lines
-    assert not work_attach.drained_path(consent_dir).exists() and not work_attach.drained_log_path(consent_dir).exists()
+    assert not work_attach.drained_path(consent_dir).exists()
     assert not (home / "board").exists()                    # the home's board was not made either
 
 
@@ -95,7 +105,7 @@ def test_r3a_the_default_watch_still_drains_the_homes_board_once(live_home):
     _plant(board, report_id="r-1")
     lines = launch.watch_once(consent)
     assert any("drained" in line and "r-1" in line for line in lines), lines
-    assert work_attach.drained_path(board).read_text() == "r-1\n"
+    assert [r["key"] for r in _records(board)] == ["r-1"]
     assert not any("r-1" in line for line in launch.watch_once(consent))           # once
 
 
@@ -231,7 +241,7 @@ def test_a_pass_drains_only_the_reports_not_yet_applied_or_refused(desk_board):
         c.close()
     lines = work_attach.watch_apply(d)
     assert len(lines) == 1 and "r-new" in lines[0] and "r-applied" not in lines[0] and "r-refused" not in lines[0]
-    assert work_attach.drained_path(d).read_text() == "r-new\n"
+    assert [r["key"] for r in _records(d)] == ["r-new"]
 
 
 @pytest.fixture
@@ -298,43 +308,63 @@ def test_two_concurrent_passes_name_each_report_once(board, monkeypatch):
     [t.start() for t in ts]
     [t.join() for t in ts]
     assert len(lines) == 1, lines
-    keys = work_attach.drained_path(board).read_text().split("\n")[:-1]
+    keys = [r["key"] for r in _records(board)]
     assert sorted(keys) == sorted(f"r-{i}" for i in range(20)) and len(keys) == len(set(keys))
-    log = work_attach.drained_log_path(board).read_text()
-    assert log.count("board reports:") == 1
 
 
-def test_the_line_is_written_before_the_key_is_recorded_and_a_crash_in_between_drains_again(board, monkeypatch):
+def test_forty_keys_under_concurrent_passes_make_exactly_forty_records(board, monkeypatch):
+    for i in range(40):
+        _plant(board, report_id=f"r-{i}")
+    barrier = threading.Barrier(2)
+    real = work_attach._unresolved
+
+    def both_read_first(directory):
+        got = real(directory)
+        barrier.wait(timeout=10)
+        return got
+
+    monkeypatch.setattr(work_attach, "_unresolved", both_read_first)
+    ts = [threading.Thread(target=lambda: work_attach.watch_apply(board)) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    recs = _records(board)
+    assert len(recs) == 40 and len({r["key"] for r in recs}) == 40
+
+
+def test_one_append_records_the_line_and_the_key_together_and_a_crash_in_it_drains_again(board, monkeypatch):
     _plant(board, report_id="r-1")
     real = work_attach._append_durable
     calls = []
 
-    def crash_on_the_marker(fd, text):
+    def crash_mid_append(fd, text):
         calls.append(text)
-        if len(calls) == 2:
-            raise OSError("killed between the line and the key")
-        real(fd, text)
+        os_write_half = text[: len(text) // 2]
+        real(fd, os_write_half)                           # a crash mid-append: half the record reached the file
+        raise OSError("killed mid-append")
 
     with monkeypatch.context() as m:
-        m.setattr(work_attach, "_append_durable", crash_on_the_marker)
+        m.setattr(work_attach, "_append_durable", crash_mid_append)
         with pytest.raises(OSError):
             work_attach.drain_reports(board)
-    assert "board reports:" in calls[0] and calls[1] == "r-1\n"                # the line first, then the key
-    assert "r-1" in work_attach.drained_log_path(board).read_text()            # the line is not lost
-    assert work_attach.drained_path(board).read_text() == ""                   # the key was not recorded
+    assert len(calls) == 1                                                      # ONE append: no second file, no ordering
+    rec = json.loads(calls[0])
+    assert rec["key"] == "r-1" and "r-1" in rec["line"] and "levain:a" in rec["line"]
+    assert not work_attach.drained_path(board).with_name("reports.drained.log").exists()
+    assert work_attach._drained_keys(board) == set()                            # the torn line names nothing
     again = work_attach.drain_reports(board)
-    assert again.drained == ["r-1"] and work_attach.drained_path(board).read_text() == "r-1\n"
-    assert work_attach.drained_log_path(board).read_text().count("board reports:") == 2        # re-logged, never lost
+    assert again.drained == ["r-1"] and work_attach._drained_keys(board) == {"r-1"}       # re-drained, never lost
 
 
 def test_a_torn_last_marker_line_names_nothing_and_the_next_drain_repairs_it(board):
     _plant(board, report_id="r-a")
     _plant(board, report_id="r-b")
     _plant(board, report_id="r-c")
-    work_attach.drained_path(board).write_text("r-a\nr-b")           # a crash mid-write: r-b has no newline
+    _mark(board, "r-a", torn='{"key": "r-b", "li')                       # a crash mid-append: half of r-b's record
     got = work_attach.drain_reports(board)
     assert got.drained == ["r-b", "r-c"]
     assert work_attach._drained_keys(board) == {"r-a", "r-b", "r-c"}
+    ok = [json.loads(ln)["key"] for ln in work_attach.drained_path(board).read_text().split("\n") if ln.endswith("}")]
+    assert ok == ["r-a", "r-b", "r-c"]                                     # the torn half stays as one ignored line
     assert work_attach.drain_reports(board).drained == []
 
 
@@ -363,7 +393,6 @@ def test_nothing_queued_makes_no_marker(board):
     _plant(board, report_id="r-1")
     work_attach.drain_reports(board)
     work_attach.drained_path(board).unlink()
-    work_attach.drained_log_path(board).unlink()
     # the queue is unchanged, so a lost marker drains it again: the marker is the only memory
     assert work_attach.drain_reports(board).drained == ["r-1"]
 
@@ -390,7 +419,7 @@ def test_report_status_reads_applied_refused_queued_drained_and_unknown(desk_boa
     _seed_outcomes(store, token)
     _plant(d, report_id="r-queued")
     _plant(d, report_id="r-drained")
-    work_attach.drained_path(d).write_text("r-drained\n")
+    _mark(d, "r-drained")
     got = {rid: work_attach.report_status(d, rid) for rid in ("r-applied", "r-refused", "r-queued", "r-drained", "r-nope")}
     assert {k: v["state"] for k, v in got.items()} == {"r-applied": "applied", "r-refused": "refused", "r-queued": "queued",
                                                         "r-drained": "drained", "r-nope": "unknown"}
@@ -405,7 +434,7 @@ def test_levain_desk_reports_says_each_outcome_in_words_and_exits_1_for_unknown(
     _seed_outcomes(store, token)
     _plant(d, report_id="r-queued")
     _plant(d, report_id="r-drained")
-    work_attach.drained_path(d).write_text("r-drained\n")
+    _mark(d, "r-drained")
     for rid, words, code in (("r-applied", "applied (attach, a-1)", 0), ("r-refused", "refused (held-by-other: someone", 0),
                              ("r-queued", "the next watch pass drains it once", 0),
                              ("r-drained", "was drained into the watch's log and was never applied", 0),

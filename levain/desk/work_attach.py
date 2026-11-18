@@ -1,7 +1,7 @@
 """RETIRED as a writer (T7, levain#101): the v1 queue takes no more rows. ``enqueue_report`` raises; ``apply_reports``,
 ``watch_apply`` and ``desk_apply`` write no ``worker_attach`` row, no refusal and no sighting; a report still queued at the
 switch is drained once, read-only toward the v1 tables, into one log line (:func:`drain_reports`; its keys are recorded
-in ``reports.drained``, the line is copied to ``reports.drained.log``). The tables and their append triggers stay, so
+in ``reports.drained``: one JSON line per drained report, carrying its key and what the log line said of it). The tables and their append triggers stay, so
 what they hold stays readable. The rest of this docstring is the design as it was: the ``service`` role, the applier and
 the sightings below no longer run (their code is deleted), and ``levain desk report`` refuses.
 
@@ -70,6 +70,7 @@ Known edges (ruled, one line each):
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 from collections.abc import Collection, Mapping
@@ -298,7 +299,6 @@ def migrate_seen(conn: sqlite3.Connection) -> None:
 # line, and its key recorded in ``reports.drained`` beside the queue, so the next pass does not name it again. The
 # queue and the v1 tables are never written.
 DRAINED_NAME = "reports.drained"
-DRAINED_LOG_NAME = "reports.drained.log"
 
 
 @dataclass
@@ -308,13 +308,9 @@ class ApplyResult:
 
 
 def drained_path(directory: Path | str) -> Path:
-    """The record of the reports already drained, one key a line, beside the queue file."""
+    """The record of the reports already drained, beside the queue file: one JSON object a line (``key`` and ``line``,
+    the text the drain line said of that report)."""
     return Path(directory) / DRAINED_NAME
-
-
-def drained_log_path(directory: Path | str) -> Path:
-    """The durable copy of every drain line, beside the queue file: written before the keys are recorded."""
-    return Path(directory) / DRAINED_LOG_NAME
 
 
 def _open_beside(path: Path) -> int:
@@ -336,9 +332,17 @@ def _read_fd(fd: int) -> str:
 
 
 def _marker_keys(text: str) -> set[str]:
-    """The keys a marker's text records: a line counts once it ends in a newline, so a torn last line (a crash mid-write)
-    names nothing and is drained again."""
-    return set(text.split("\n")[:-1])
+    """The keys a marker's text records: a line counts once it ends in a newline and parses to an object with a string
+    ``key``, so a torn last line (a crash mid-write) names nothing and is drained again."""
+    keys: set[str] = set()
+    for ln in text.split("\n")[:-1]:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+            keys.add(rec["key"])
+    return keys
 
 
 def _drained_keys(directory: Path | str) -> set[str]:
@@ -355,15 +359,16 @@ def _append_durable(fd: int, text: str) -> None:
 
 def drain_reports(directory: Path | str) -> ApplyResult:
     """Read the reports still queued in ``<directory>/reports.db`` that no earlier drain named, name them in the drain
-    line, and record their keys as drained. Read-only toward the queue and the v1 tables; the writes are the log copy
-    and the key record. A queue that cannot be read drains nothing. Never applies a report.
+    line, and record each as drained. Read-only toward the queue and the v1 tables; the one write is the record in
+    ``reports.drained``. A queue that cannot be read drains nothing. Never applies a report.
 
     Once-only under concurrent passes (the watch and ``levain desk apply-reports``, or two watchers): the marker is
     read, filtered and appended to under an exclusive ``flock`` on the marker file itself, so a second pass waits and
-    then finds the keys recorded. ORDER, decided: the line is made durable (``reports.drained.log``, fsynced) BEFORE the
-    keys are recorded (fsynced), so a crash between the two drains again and writes the line again (at-least-once);
-    it never records a key whose line was not written. The marker is made only when there is something to drain,
-    and is opened 0600 and never through a symlink."""
+    then finds the keys recorded. ONE file, ONE append: each drained report is one JSON line in ``reports.drained``
+    (its key and what the drain line said of it), fsynced in a single write, so the line and the key are recorded
+    together and no ordering exists. A crash mid-append leaves a torn last line, which readers ignore, so that report
+    drains again on the next pass (never lost, at worst named twice). The process log line is printed by the caller.
+    The marker is made only when there is something to drain, and is opened 0600 and never through a symlink."""
     d = Path(directory)
     result = ApplyResult()
     candidates = [r for r in _unresolved(d)]
@@ -380,13 +385,8 @@ def drain_reports(directory: Path | str) -> ApplyResult:
         result.drained = keys
         what = {_key(r): f"{_key(r)} ({str(r.get('item_id'))[:60]} {str(r.get('event'))[:20]})" for r in candidates}
         result.described = [what[k] for k in keys]
-        lfd = _open_beside(drained_log_path(d))
-        try:
-            _append_durable(lfd, _drained_line(result) + "\n")
-        finally:
-            os.close(lfd)
         torn = "" if not text or text.endswith("\n") else "\n"
-        _append_durable(fd, torn + "".join(k + "\n" for k in keys))
+        _append_durable(fd, torn + "".join(json.dumps({"key": k, "line": what[k]}) + "\n" for k in keys))
         return result
     finally:
         os.close(fd)
