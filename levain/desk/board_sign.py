@@ -187,26 +187,34 @@ def _keyed_to(item_key: Any, migration: str) -> bool:
 ITEMS_NONE = "none"                       # ``items_last`` of an abandon written when the items file had no line
 
 
-def abandon_problem(held: Mapping[str, Any], snapshot: Any) -> str | None:
-    """Why the ``abandon-track`` record ``held`` cannot be the cause of a cut, or None when it can: it must be signed (a
-    ``relayed`` one is P3's verifier's to check and is refused), :func:`verify_record` must find it ``valid`` against
-    ``snapshot``, and it must name its migration and ``items_last`` (the items file's last line when it was written; an
+def abandon_problem(held: Mapping[str, Any], snapshot: Any, band: Any = None) -> str | None:
+    """Why the ``abandon-track`` record ``held`` cannot be the cause of a cut, or None when it can: it must be signed
+    (:func:`verify_record` must find it ``valid`` against ``snapshot``) or RELAYED (``board_relay.verify_relayed`` re-reads
+    its band row through ``band`` and finds the digests and the words hold; no ``band`` is a refusal, never a trust), and it
+    must name its migration and ``items_last`` (the items file's last line when it was written; an
     abandon from before that field cannot order the items, so it holds no cut). Raises ``VerifierUnavailable`` when
     ssh-keygen cannot run. It is one step of :func:`cut_cause_problem`, the one judgement of a cut's cause; the recovery for
-    a refusal of that is to re-run ``abandon-track`` signed: on an ``aborting`` repo with a cut still owed whose latest
-    abandon does not hold, a signed re-run writes a fresh signed abandon (``board_registry.abandon_track``). A TORN store
-    file is not repaired that way: it is acknowledged first (``ack-torn``), and no abandon is written over it."""
+    any refusal of that is to re-run ``abandon-track`` signed (``--sign``) or relayed (``--source``): on an ``aborting`` repo
+    with a cut still owed whose latest abandon does not hold, that re-run writes a fresh abandon
+    (``board_registry.abandon_track``). A TORN store file is not repaired that way: it is acknowledged first (``ack-torn``),
+    and no abandon is written over it."""
     grade = held.get("grade")
     if grade == GRADE_RELAYED:
-        return ("cause names a relayed abandon-track: a relayed citation is checked by P3's verifier, which this build "
-                "does not have, so it is refused, never trusted")
-    if grade not in SIGNED_GRADES:
-        return f"cause names an abandon-track graded {grade!r}: it must be signed (re-run `abandon-track` with --sign)"
-    if snapshot is None:
-        return "cause names a signed abandon-track and there is no authority log to verify it against"
-    verdict = verify_record(held, snapshot)
-    if verdict.state != "valid":
-        return f"the cited abandon-track's signature is not valid: {verdict.text} (re-run `abandon-track` with --sign)"
+        if band is None:
+            return ("cause names a relayed abandon-track and no band was given to re-read its row: give the band "
+                    "(--band-dir) the abandon cites")
+        from levain.desk import board_relay
+        said = board_relay.verify_relayed(held, band)
+        if not said.ok:
+            return f"the cited relayed abandon-track does not verify: {said.text} (re-run `abandon-track` with --source or --sign)"
+    elif grade not in SIGNED_GRADES:
+        return f"cause names an abandon-track graded {grade!r}: it must be signed or relayed (re-run `abandon-track` with --sign or --source)"
+    else:
+        if snapshot is None:
+            return "cause names a signed abandon-track and there is no authority log to verify it against"
+        verdict = verify_record(held, snapshot)
+        if verdict.state != "valid":
+            return f"the cited abandon-track's signature is not valid: {verdict.text} (re-run `abandon-track` with --sign)"
     migration = held.get("migration")
     if not isinstance(migration, str) or not migration:
         return "the cited abandon-track names no migration"
@@ -221,13 +229,13 @@ def _index_of(lines: Sequence[bytes], digest: str) -> int | None:
     return next((i for i, ln in enumerate(lines) if _record_hash(ln) == digest), None)
 
 
-def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snapshot: Any) -> str | None:
+def verify_cause(record: Mapping[str, Any], store: "bs.StoreLines | None", snapshot: Any, band: Any = None) -> str | None:
     """Why ``record``'s ``cause`` does not hold, or None when it does: :func:`cut_cause_problem` of the record's ``cause``
     and ``id``. Raises ``VerifierUnavailable`` when ssh-keygen cannot run."""
-    return cut_cause_problem(record.get("cause"), record.get("id"), store, snapshot)
+    return cut_cause_problem(record.get("cause"), record.get("id"), store, snapshot, band)
 
 
-def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", snapshot: Any) -> str | None:
+def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", snapshot: Any, band: Any = None) -> str | None:
     """THE one predicate for "can the abandon-track whose line hashes to ``cause`` be the cause of a cut of ``item_id``":
     why not, or None when it can. :func:`verify_cause` (every cut's write) and the abandon recovery
     (``board_registry._latest_abandon_problem``: must a signed re-run write a fresh abandon) both judge it, so the recovery
@@ -248,7 +256,7 @@ def cut_cause_problem(cause: Any, item_id: Any, store: "bs.StoreLines | None", s
     or before the ``items.jsonl`` line whose sha256 is the abandon's ``items_last`` (``none``: the items file was empty then,
     so no item predates it). Both positions are in ``items.jsonl``; nothing is compared across the two files. Raises
     ``VerifierUnavailable`` when ssh-keygen cannot run."""
-    problem, held = cause_problem(cause, store, snapshot)
+    problem, held = cause_problem(cause, store, snapshot, band)
     return problem if problem is not None else cut_item_problem(held, item_id)
 
 
@@ -295,7 +303,7 @@ def _items_kept(store: "bs.StoreLines") -> tuple[str | None, frozenset[int]]:
     return None, frozenset(n - 1 for n, _ in folded.dropped)
 
 
-def cause_problem(cause: Any, store: "bs.StoreLines | None", snapshot: Any) -> tuple[str | None, CauseHeld | None]:
+def cause_problem(cause: Any, store: "bs.StoreLines | None", snapshot: Any, band: Any = None) -> tuple[str | None, CauseHeld | None]:
     """The item-independent half of :func:`cut_cause_problem`: ``(why the cited abandon cannot cause a cut, None)`` or
     ``(None, what holds)``. Everything but the item's own place is here: the line, its store and ``prev``, a registry that is
     not torn, the fold having applied it, its repo aborting its migration now, :func:`abandon_problem` (the signature), and
@@ -331,7 +339,7 @@ def cause_problem(cause: Any, store: "bs.StoreLines | None", snapshot: Any) -> t
         now = "not registered" if cur is None else f"{cur.mode} (migration {cur.migration})"
         return (f"the cited abandon-track's repo {repo} is {now}, not aborting {migration}: an abandon causes cuts only "
                 f"while its repo is aborting that migration"), None
-    problem = abandon_problem(held, snapshot)
+    problem = abandon_problem(held, snapshot, band)
     if problem is not None:
         return problem, None
     problem, dropped = _items_kept(store)
@@ -368,7 +376,7 @@ def cut_item_problem(held: CauseHeld, item_id: Any) -> str | None:
 
 
 def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None, *,
-                   store: "bs.StoreLines | None" = None, snapshot: Any = None, decision: str = "") -> None:
+                   store: "bs.StoreLines | None" = None, snapshot: Any = None, decision: str = "", band: Any = None) -> None:
     """Refuse (:class:`~levain.desk.board_store.BoardError`) a record the fixed 1.0 policy does not accept at ``grade``. An op
     not in :data:`POLICY` is refused (fail closed). ``grade`` is the WRITER's (a signed grade is then earned by :func:`earn`;
     ``relayed`` is P3's). A decision-class op needs ``signed-*`` or ``relayed``; the one exception (P2-d) is a ``decide`` of
@@ -385,7 +393,7 @@ def require_policy(op: str, grade: str, record: Mapping[str, Any] | None = None,
         if not (op == "decide" and record.get("decision") == "cut"):
             raise bs.BoardError("cause belongs to a decide of cut only")
         try:
-            problem = verify_cause(record, store, snapshot)
+            problem = verify_cause(record, store, snapshot, band)
         except VerifierUnavailable as exc:
             raise bs.BoardError(f"the cause cannot be checked now ({exc}): nothing was written") from None
         if problem is not None:

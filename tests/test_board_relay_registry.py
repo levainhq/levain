@@ -160,3 +160,89 @@ def test_the_writers_refuse_a_relay_and_a_seal_together_whatever_the_cli(world):
         brg.begin_track(target, "alpha", mf, "y", "desk 24", author=author, relay=relay, seal=seal)
     with pytest.raises(bs.BoardError, match="never both"):
         brg.track(target, "alpha", "y", "desk 24", author=author, relay=relay, seal=seal)
+
+
+# ------------------------------------------------------------------------------------- a relayed abandon is a cut's cause
+
+
+def _begun(world, capsys):
+    """begin-track relayed, two items of the ceremony added; returns (store, mf, sha, band, migration)."""
+    store, _, mf, sha, band = world
+    band.rows[Q1] = br.BandRow(f"Begin? manifest sha256 {sha}", "yes begin", "unsigned-terminal", "native")
+    assert run(capsys, "begin-track", "alpha", "--manifest", str(mf), "--words", "yes begin", "--source", Q1, *BY)[0] == 0
+    m = [r for r in reg(store) if r["op"] == "begin-track"][-1]["migration"]
+    for k in "ab":
+        assert run(capsys, "add", "--repo", "alpha", "--title", k, "--origin", "d", "--key", f"{m}:{k}", "--payload-hash", k * 64, *BY)[0] == 0
+    band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "no, abandon it", "unsigned-terminal", "native")
+    return store, mf, sha, band, m
+
+
+def items(store: Path) -> list[dict]:
+    return [json.loads(x) for x in (store / "items.jsonl").read_text("utf-8").splitlines()]
+
+
+def test_a_relayed_abandon_track_is_a_cut_cause_through_the_one_predicate(world, capsys):
+    store, _, _, band, _ = _begun(world, capsys)
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)
+    assert rc == 0, err
+    assert out.startswith("aborting alpha; cut 2 items")
+    ab = reg(store)[-1]
+    assert ab["op"] == "abandon-track" and ab["grade"] == "relayed" and ab["source"]["np"] == Q2 and "sig" not in ab
+    cuts = [r for r in items(store) if r["op"] == "decide"]
+    line = (store / "repos.jsonl").read_text("utf-8").splitlines()[-1]
+    assert len(cuts) == 2 and all(c["cause"] == hashlib.sha256(line.encode()).hexdigest() and c["grade"] == "asserted" for c in cuts)
+    # the same predicate judges a cut written by hand: with the band it holds, without it (or a band that no longer says it) it does not
+    cause = cuts[0]["cause"]
+    base = ("decide", "--id", "alpha#1", "--decision", "cut", "--words", "again", *BY, "--cause", cause)
+    rc, _, err = run(capsys, *base)
+    assert rc == 0, err                                               # the CLI hands the cut the band lazily: the fake band here holds it
+    band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "no, keep it", "unsigned-terminal", "native")
+    rc, _, err = run(capsys, *base)
+    assert rc == 2 and "relayed abandon-track does not verify" in err and "digest mismatch" in err
+
+
+def test_a_relayed_cause_with_no_band_is_refused_not_trusted(world):
+    from levain.desk import board_sign as sg
+    from levain.desk import board_store as bs
+    store = world[0]
+    cut = {"op": "decide", "id": "alpha#1", "decision": "cut", "cause": "0" * 64}
+    held = {"op": "abandon-track", "grade": "relayed"}
+    assert "no band was given" in sg.abandon_problem(held, None)
+    with pytest.raises(bs.BoardError, match="cause names no abandon-track|cause cannot be checked"):
+        sg.require_policy("decide", "asserted", cut, store=None, snapshot=None)
+
+
+def test_a_cut_owed_after_a_relayed_abandon_needs_the_band_to_finish(world, capsys, monkeypatch):
+    from levain.desk import board_store as bs
+    store, _, _, band, _ = _begun(world, capsys)
+    real = bs.decide
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise bs.BoardError("a crash after the abandon landed")
+        return real(*a, **kw)
+    monkeypatch.setattr(bs, "decide", flaky)
+    rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)
+    assert rc == 2 and "a crash" in err and reg(store)[-1]["op"] == "abandon-track" and not [r for r in items(store) if r["op"] == "decide"]
+    rc, _, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", *BY)       # unsigned, no band: the cut is refused, by name
+    assert rc == 2 and "no band was given" in err
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)
+    assert rc == 0 and out.startswith("aborting alpha; cut 2 items"), err
+    assert sum(r["op"] == "abandon-track" for r in reg(store)) == 1                           # the relayed abandon held: no fresh one
+
+
+def test_a_relayed_abandon_whose_answer_changed_is_rewritten_by_a_relayed_rerun(world, capsys, monkeypatch):
+    from levain.desk import board_store as bs
+    store, _, _, band, _ = _begun(world, capsys)
+    real = bs.decide
+    monkeypatch.setattr(bs, "decide", lambda *a, **kw: (_ for _ in ()).throw(bs.BoardError("crash")))
+    assert run(capsys, "abandon-track", "alpha", "--words", "no, abandon it", "--source", Q2, *BY)[0] == 2
+    monkeypatch.setattr(bs, "decide", real)
+    band.rows[Q2] = br.BandRow("Abandon alpha's ceremony?", "no, abandon it, and say so twice", "unsigned-terminal", "native")
+    rc, out, err = run(capsys, "abandon-track", "alpha", "--words", "x", "--source", Q2, *BY)   # the first abandon no longer verifies: a fresh one
+    assert rc == 0, err
+    assert sum(r["op"] == "abandon-track" for r in reg(store)) == 2
+    assert reg(store)[-1]["source"]["answer_sha256"] == br.digest("no, abandon it, and say so twice")
+    assert out.startswith("aborting alpha; cut 2 items")

@@ -407,8 +407,8 @@ def _relay(args: argparse.Namespace):
     if args.source is not None and args.sign:
         raise bs.BoardError(bs.RELAY_AND_SIGN)
     if args.source is None:
-        if args.band_dir is not None:
-            raise bs.BoardError("--band-dir only means something with --source")
+        if args.band_dir is not None and getattr(args, "cause", None) is None:
+            raise bs.BoardError("--band-dir only means something with --source (or --cause: the band a relayed abandon-track is re-read through)")
         return None
     if args.author_kind == "operator":
         raise bs.BoardError("--source makes a relayed record, and a relay is the desk's act: the author kind must be agent, not operator")
@@ -475,6 +475,14 @@ def _cause_authority(args: argparse.Namespace, seal: Any):
         return None
 
 
+def _cause_band(args: argparse.Namespace, seal: Any):
+    """The band an unsigned ``--cause`` re-reads a RELAYED abandon-track's row through (built on first use; None otherwise)."""
+    if args.cause is None or seal is not None:
+        return None
+    from levain.desk import board_relay
+    return board_relay.LazyBand(args.band_dir)
+
+
 def run_decide(args: argparse.Namespace) -> int:
     try:
         author = _author(args)
@@ -482,7 +490,8 @@ def run_decide(args: argparse.Namespace) -> int:
         seal = _seal(args, author)
         target = bs.resolve_store(args.items)
         print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
-                                   cause=args.cause, seal=seal, authority=_cause_authority(args, seal), relay=relay))
+                                   cause=args.cause, seal=seal, authority=_cause_authority(args, seal), relay=relay,
+                                   cause_band=_cause_band(args, seal)))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0

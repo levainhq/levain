@@ -874,7 +874,7 @@ def _with_store(rec: dict, store_id: str) -> dict:
     return rec if "store" in rec else {**rec, "store": store_id}
 
 
-def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = "") -> dict:
+def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = "", cause_band=None) -> dict:
     """The writer's word on a built record, before ``prev`` and before any prompt: the grade the seal's ``via`` claims
     (``asserted`` with none; a claimed grade is earned only by ``board_sign.earn`` after the ceremony), a signed record's
     author must be the operator, and the fixed policy (:func:`levain.desk.board_sign.require_policy`) must accept it. A
@@ -883,7 +883,9 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
     another store is refused there (``earn`` refuses a ``store`` that is not this one). A record carrying ``cause`` has
     it checked here against the authority log read now (the seal's source, else ``authority``): for an unsigned record no
     blocking step follows this check; a sealed one is checked again by ``earn`` against the log replayed after the
-    ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write)."""
+    ceremony. ``decision`` is ``require_policy``'s (a state-keyed decision-class write). ``cause_band`` is the band a RELAYED
+    abandon-track's cause is re-read through (``board_sign.abandon_problem``); an unsigned write only (a sealed one is checked
+    again by ``earn``, which has no band, so a sealed cut of a relayed abandon is refused here and never prompts)."""
     from levain.desk import board_sign
     if seal is not None:
         board_sign.check_signable(rec)
@@ -894,7 +896,8 @@ def _graded(target: Target, rec: dict, seal, authority=None, *, decision: str = 
         store = _store_lines(target)
         source = seal.authority if seal is not None else authority
         snapshot = board_sign.read_authority(source) if source is not None else None
-    board_sign.require_policy(rec["op"], grade, rec, store=store, snapshot=snapshot, decision=decision)
+    board_sign.require_policy(rec["op"], grade, rec, store=store, snapshot=snapshot, decision=decision,
+                              band=cause_band if seal is None else None)
     return rec
 
 
@@ -1028,11 +1031,11 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
 
 
 def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None,
-           authority=None, relay=None) -> str:
+           authority=None, relay=None, cause_band=None) -> str:
     """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
     ``abandon-track``'s cuts carry it); it is written after ``date`` only when given. A cut's cause (P2-d) is checked against
     ``authority``, an authority SOURCE read under the lock (``board_sign.resolve_authority``); a sealed decide checks it
-    against the seal's source instead."""
+    against the seal's source instead. A cause that is a RELAYED abandon-track is re-read through ``cause_band``."""
     _relay_or_sign(relay, seal)
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
@@ -1048,7 +1051,8 @@ def decide(target: Target, item_id, decision, words, by, when=None, now=None, *,
     def build(recs):
         _require_known(recs, item_id)
         source = _read_relay(relay, words)
-        return _graded(target, build_record("decide", item_id, by, body, now, author=author, source=source), seal, authority), True
+        return _graded(target, build_record("decide", item_id, by, body, now, author=author, source=source), seal, authority,
+                       cause_band=cause_band), True
 
     _preflight(seal, author)
     return _append(target, build, seal=seal)[0]["id"]

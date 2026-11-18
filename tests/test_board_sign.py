@@ -590,7 +590,7 @@ def test_a_cut_whose_cause_does_not_hold_is_refused(target, rig, tmp_path):
         (item, good, rig.source(revoked_seq=2), "revoked at seq 2"),
         (item, good, Rig(tmp_path / "s", label="s").source(), "not a key in the authority log"),
         (item, good, None, "no authority log"),
-        (item, signed_abandon(target, rig, grade="relayed", sign=False), rig.source(), "P3's verifier"),
+        (item, signed_abandon(target, rig, grade="relayed", sign=False), rig.source(), "no band was given"),
     ]
     for it, cause, source, why in cases:
         with pytest.raises(bs.BoardError, match="--sign") as exc:
