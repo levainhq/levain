@@ -627,10 +627,11 @@ def test_abandon_track_rerun_after_a_crash_writes_only_the_missing_cuts_t2d(deci
     monkeypatch.setattr(bs, "decide", real)
     before = len(reg_lines(store))
     out = ok(capsys, "abandon-track", "alpha", "--words", "no", *A)
-    assert out == f"aborting alpha; cut 2 items: {ids[1]}, {ids[2]}" and len(reg_lines(store)) == before        # no second registry record
+    assert out.splitlines()[0] == f"aborting alpha; cut 2 items: {ids[1]}, {ids[2]}" and len(reg_lines(store)) == before        # no second registry record
+    assert out.splitlines()[1].endswith(") stands")                     # P3 fix 5: the re-run names the abandon that stands
     cuts = [r for r in item_lines(store) if r["op"] == "decide"]
     assert len(cuts) == 3 and len({c["cause"] for c in cuts}) == 1
-    assert ok(capsys, "abandon-track", "alpha", "--words", "no", *A) == "aborting alpha; cut 0 items"
+    assert ok(capsys, "abandon-track", "alpha", "--words", "no", *A).splitlines()[0] == "aborting alpha; nothing to cut"
 
 
 def test_abandon_track_refuses_other_modes_and_keeps_the_repo_locked(decision_seal, store, tmp_path, mkrepo, capsys):
