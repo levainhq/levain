@@ -88,6 +88,8 @@ table jobs
 CREATE TABLE jobs (id TEXT PRIMARY KEY, digest TEXT NOT NULL, contract TEXT NOT NULL, filed_at TEXT NOT NULL, filer_session TEXT NOT NULL, capability_sha256 TEXT NOT NULL, idem_key TEXT, repo TEXT NOT NULL, expires_at TEXT NOT NULL, unsigned_until TEXT NOT NULL, writer_format TEXT, UNIQUE (filer_session, idem_key));
 table know_deliveries
 CREATE TABLE know_deliveries (reply_id TEXT PRIMARY KEY REFERENCES replies(reply_id), agent_session_id TEXT NOT NULL, at TEXT NOT NULL);
+table launch_board_items
+CREATE TABLE launch_board_items (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, items TEXT NOT NULL, at TEXT NOT NULL);
 table launch_events
 CREATE TABLE launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('pending', 'active', 'failed', 'expired', 'ended')), until TEXT, harness_session_id TEXT, argv_sha256 TEXT, pinned_envelope_id TEXT, cause TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (launch_id, seq));
 table launch_handoffs
@@ -350,6 +352,12 @@ trigger know_deliveries_kept
 CREATE TRIGGER know_deliveries_kept BEFORE DELETE ON know_deliveries BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once is append-only'); END;
 trigger know_deliveries_no_replace
 CREATE TRIGGER know_deliveries_no_replace BEFORE INSERT ON know_deliveries WHEN EXISTS (SELECT 1 FROM know_deliveries WHERE reply_id = NEW.reply_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once'); END;
+trigger launch_board_items_frozen
+CREATE TRIGGER launch_board_items_frozen BEFORE UPDATE ON launch_board_items BEGIN SELECT RAISE(ABORT, 'a launch board claim is append-only'); END;
+trigger launch_board_items_kept
+CREATE TRIGGER launch_board_items_kept BEFORE DELETE ON launch_board_items BEGIN SELECT RAISE(ABORT, 'a launch board claim is append-only'); END;
+trigger launch_board_items_no_replace
+CREATE TRIGGER launch_board_items_no_replace BEFORE INSERT ON launch_board_items WHEN EXISTS (SELECT 1 FROM launch_board_items WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a launch claims its board items once'); END;
 trigger launch_events_edges
 CREATE TRIGGER launch_events_edges BEFORE INSERT ON launch_events WHEN (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IN ('failed', 'expired', 'ended') OR (NEW.kind = 'pending' AND EXISTS (SELECT 1 FROM launch_events WHERE launch_id = NEW.launch_id)) OR (NEW.kind != 'pending' AND NOT EXISTS (SELECT 1 FROM launch_events WHERE launch_id = NEW.launch_id)) OR (NEW.kind IN ('failed', 'expired') AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'pending') OR (NEW.kind = 'active' AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'pending') OR (NEW.kind = 'ended' AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'active') BEGIN SELECT RAISE(ABORT, 'a launch moves pending -> active -> ended, or ends failed or expired'); END;
 trigger launch_events_frozen

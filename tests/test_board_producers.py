@@ -358,7 +358,7 @@ def test_a_launch_without_a_board_items_list_makes_native_seats_incomplete_namin
     the seat it can see still goes in."""
     _seats_world(monkeypatch, tmp_path, [_Launch(1, "a", items)], [([{"sessionId": "a"}], 0)])
     got = bp.native_blocks(now=NOW, store_id=None, consent_dir=tmp_path)["seats"]
-    assert got["complete"] is False and "launch ln-1 carries no board_items (T7 writes it)" in got["why"]
+    assert got["complete"] is False and "launch ln-1 carries no board_items (it was started without --item)" in got["why"]
     assert [r["name"] for r in got["rows"]] == ["ln-1"] and got["rows"][0]["items"] == []
 
 
