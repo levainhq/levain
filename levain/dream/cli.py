@@ -285,8 +285,16 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     # the spec binds a shadow install's facts (the facts this call writes, or the file as it stands without
     # --store-dir), so a link signed for one install never covers changed facts
     binding = da.current_binding(store.directory)
-    # a live install's program and model are bound the same way (None: the defaults, the unbound live spec)
-    live = da.current_live_binding(store.directory)
+    # a live install's program and model are bound the same way (None: the defaults, the unbound live spec); facts
+    # that are there but cannot be read are refused, never registered as the defaults
+    live = None
+    if args.store_dir is None:
+        try:
+            live = da.current_live_binding(store.directory)
+        except da.InstallRefused as exc:
+            print(f"levain dream enable: {exc}; nothing was registered or written (pass --store-dir to write the "
+                  "facts again)", file=sys.stderr)
+            return 1
     if args.store_dir is not None:
         try:
             _write_install_facts(args, store, str(zone), da, check_only=True)
@@ -296,14 +304,14 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
     try:
-        reg = da.register_dream(store, revise=args.revise, binding=binding, time=when, live_binding=live)
+        reg = da.register_dream(store, revise=args.revise, binding=binding, time=when, live=live)
     except da.EnableRefused as exc:
         why = str(exc)
         # the advice is about a changed spec; a refusal that is the agent store's own (its schema marker) is printed alone
         if binding is not None and not isinstance(exc.__cause__, AgentStoreRefused):
             why += ("; a shadow install's facts are bound into the dream's spec, so changed facts are a new version "
                     "(--revise), which needs a new signed link; nothing was written")
-        elif live is not None and not isinstance(exc.__cause__, AgentStoreRefused):
+        elif not isinstance(exc.__cause__, AgentStoreRefused) and (live is not None or _held_live_bound(store, da)):
             why += ("; this install's dream program and model are bound into the dream's spec, so a changed one is a "
                     "new version (--revise), which needs a new signed link; nothing was written")
         print(f"levain dream enable: {why}", file=sys.stderr)
@@ -336,16 +344,13 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."
     else:
-        bound = None
         try:                                    # the Undo command carries the install's store when its facts are written
-            inst = da.read_install(store.directory)
-            install_store = inst.store_path.parent
-            if da.live_binding(model=inst.model, claude_bin=inst.claude_bin) is not None:
-                bound = (inst.claude_bin, inst.model)
+            install_store = da.read_install(store.directory).store_path.parent
         except _INSTALL_READ_ERRORS:
             install_store = None
+        # the program and model the card names are the ones registered into the spec, never a second read of the file
         card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when,
-                                    store_dir=install_store, bound=bound)
+                                    store_dir=install_store, bound=None if live is None else da.bound_pair(live))
     floor_hours, floor_problem = da.orphan_floor_state(store.directory)
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
            "created": reg.created, "zone": reg.zone, "time": when, "signing_card": card,
@@ -365,6 +370,15 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         print(card)
         print("Not signed. The dream launches only under a live signed agent link for this spec_hash.")
     return 0
+
+
+def _held_live_bound(store: object, da: object) -> bool:
+    """True when the dream spec registered in ``store`` binds a program or model (False when it cannot be read: the
+    refusal is then printed without the advice)."""
+    try:
+        return da.stored_live_bound(store) is not None
+    except Exception:  # noqa: BLE001 - advice only; the refusal itself is printed either way
+        return False
 
 
 def _parse_orphan_floor(text: str, da: object) -> float | str:

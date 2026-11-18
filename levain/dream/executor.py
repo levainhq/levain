@@ -101,6 +101,8 @@ PER_RUN_LIMIT_USD_MICROS = 20_000_000
 MIN_COMPOSE_USD_MICROS = 1_620_000
 #: Flow's dream's pinned model (``DEFAULT_MODEL``).
 DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
+#: The compose's program when the install names none: a bare name, so it resolves through PATH when the fire runs.
+DEFAULT_CLAUDE_BIN = "claude"
 MAX_COMPOSES = 3
 #: Flow's ``SAVE_RESERVE_S``: a compose starts only if ``max_seconds - elapsed`` leaves this for the save.
 SAVE_RESERVE_S = 960.0
@@ -473,7 +475,7 @@ class ClaudeMind:
     has_child = True
     needs_budget = True
 
-    def __init__(self, model: str = DEFAULT_CLAUDE_MODEL, *, claude_bin: str = "claude",
+    def __init__(self, model: str = DEFAULT_CLAUDE_MODEL, *, claude_bin: str = DEFAULT_CLAUDE_BIN,
                  env: Mapping[str, str] | None = None) -> None:
         self.model = model
         self.claude_bin = claude_bin

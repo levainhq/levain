@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.dream import card as _card
+from levain.dream.executor import DEFAULT_CLAUDE_BIN, DEFAULT_CLAUDE_MODEL
 from levain.dream import ready as _ready
 from levain.dream import snapshot as _snap
 
@@ -133,6 +134,16 @@ def stored_time(store: Any) -> str | None:
     if held is None:
         return None
     return time_from_cron((held.get("trigger") or {}).get("cron"))
+
+
+def stored_live_bound(store: Any) -> str | None:
+    """The :func:`live_binding` the dream spec registered in ``store`` carries (None: none registered, or it binds no
+    program or model)."""
+    from levain.agents import spec as _spec
+
+    held = _spec.stored_specs(store).get(NAME)
+    source = ((held or {}).get("input") or {}).get("source")
+    return live_bound_of(source) if isinstance(source, str) else None
 STOP_AT_S = 3600
 PAUSE_AFTER = 2
 WIN_CHECK = "dream.win"
@@ -176,32 +187,46 @@ SHADOW_SOURCE = ("a SHADOW of flow's dream, bound to these install facts (a chan
 LIVE_BOUND = (", bound to this dream program and model (a change is a new spec, which needs a new signed link): ")
 
 
-def live_source(live_binding: str | None) -> str:
-    """``input.source`` of a live install's spec for its :func:`live_binding` (None: the defaults)."""
-    return LIVE_SOURCE if live_binding is None else LIVE_SOURCE + LIVE_BOUND + live_binding
+def live_source(live: str | None) -> str:
+    """``input.source`` of a live install's spec for its :func:`live_binding` ``live`` (None: the defaults)."""
+    return LIVE_SOURCE if live is None else LIVE_SOURCE + LIVE_BOUND + live
+
+
+def live_bound_of(source: str) -> str | None:
+    """The :func:`live_binding` a live spec's ``input.source`` carries (None: it binds no program or model)."""
+    lead = LIVE_SOURCE + LIVE_BOUND
+    return source[len(lead):] if source.startswith(lead) else None
+
+
+def bound_pair(live: str | None) -> tuple[str, str]:
+    """``(claude_bin, model)`` of a :func:`live_binding` ``live``; the defaults for None."""
+    if live is None:
+        return DEFAULT_CLAUDE_BIN, DEFAULT_CLAUDE_MODEL
+    doc = json.loads(live)
+    return str(doc["claude_bin"]), str(doc["model"])
 
 
 def dream_spec(role_hash: str, binding: str | None = None, time: str = DEFAULT_TIME, *,
-               live_binding: str | None = None) -> dict[str, Any]:
+               live: str | None = None) -> dict[str, Any]:
     """The AgentSpec template (§1.2). The zone is left unset: the install's default zone fills it (rule 6), and an
     install with none refuses, naming ``levain agents zone``. One ``output`` is the spec's shape; it carries the
     morning card (the push output). The corpus and recovery outputs of §1.3 have no field in a spec.
 
     ``binding`` (:func:`shadow_binding`) makes it a SHADOW install's spec: the install facts are part of the signed
     object, so a link signed for one shadow install never covers another, nor a live one (and the reverse).
-    ``live_binding`` (:func:`live_binding`) binds a LIVE install's compose program and model the same way; passing
-    both is a ``ValueError``.
+    ``live`` (:func:`live_binding`) binds a LIVE install's compose program and model the same way; passing both is a
+    ``ValueError``.
 
     ``time`` (:func:`validate_time`) is the dream's time of night, an install setting; it is written into the spec as the
     trigger's cron (:func:`cron_for`), so it is part of the signed object too: the link names the spec's hash, and the
     launch takes only a link whose ``spec_hash`` is the occurrence's, so a changed time is a new spec (``enable --revise``)
     and an old signature no longer covers it. A time that is refused raises :class:`TimeRefused`."""
-    if binding is not None and live_binding is not None:
+    if binding is not None and live is not None:
         raise ValueError("a dream spec binds a shadow install or a live one, never both")
     return {
         "name": NAME,
         "role": {"name": NAME, "role_hash": role_hash},
-        "input": {"source": live_source(live_binding) if binding is None else SHADOW_SOURCE + binding,
+        "input": {"source": live_source(live) if binding is None else SHADOW_SOURCE + binding,
                   "liveness": LIVENESS},
         "output": {"class": "push",
                    "destination": "the desk review queue, feed agent: one card per consolidating occurrence",
@@ -229,18 +254,18 @@ class Registered:
 
 
 def register_dream(store: Any, *, revise: bool = False, binding: str | None = None,
-                   time: str = DEFAULT_TIME, live_binding: str | None = None) -> Registered:
+                   time: str = DEFAULT_TIME, live: str | None = None) -> Registered:
     """Register the role and the spec in ``store`` (an :class:`~levain.agents.store.AgentStore`) and attach the spec to the
     store's operator agent, on every exit including the same-content one (that is how an install whose dream was registered
     before K2b gets attached). Idempotent: the same content registers nothing twice and attaches once. Raises :class:`EnableRefused` with every refusal; nothing is written when a
-    rule refuses the spec, but a refusal in the spec write itself can leave the content-addressed, idempotent role on file. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install); ``live_binding`` is a live install's :func:`live_binding`."""
+    rule refuses the spec, but a refusal in the spec write itself can leave the content-addressed, idempotent role on file. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install); ``live`` is a live install's :func:`live_binding`."""
     from levain.agents import refuse, role as _role, spec as _spec
     from levain.agents.store import AgentStoreRefused, get_default_zone
 
     role = _role.parse_role(dream_role())
     try:
         parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding, time=time,
-                                             live_binding=live_binding))    # pure: a defect in the shipped spec is a bug, not a refusal
+                                             live=live))    # pure: a defect in the shipped spec is a bug, not a refusal
     except TimeRefused as exc:
         raise EnableRefused(str(exc)) from exc
     try:    # any store call can meet a moved marker, so none sits outside the guard
@@ -287,10 +312,13 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
     command needs it (``levain dream rollback`` requires ``--store-dir``), so the caller says it. ``None`` is the
     caller saying the install's facts are not written yet; the card then names the verb and no command line, so it
     never prints a stand-in for a path. A blank string is refused. ``bound`` is ``(claude_bin, model)`` when the spec
-    binds a program or model that is not the default (:func:`live_binding`), so the card says what the link covers."""
+    binds a program or model that is not the default (:func:`live_binding`), so the card says what the link covers:
+    the program's name, never the file it leads to."""
     program = "" if bound is None else (
-        f"The dream program {bound[0]} and the model {bound[1]} are part of what you sign: a fire whose install facts "
-        "name another refuses, and a change needs a new signed link. ")
+        f"The dream program and the model are part of what you sign: the program by its name, {bound[0]}, and the "
+        f"model {bound[1]}. A fire whose install facts name another program or model refuses, and a change needs a new "
+        "signed link. The program is bound by its name only: whatever file that name leads to when the dream runs (the "
+        "file at that path, or the first one found on PATH for a bare name) is what runs. ")
     if store_dir is None:
         undo = ("`levain dream rollback` (each morning card names the exact command, with this install's store in it)")
     else:
@@ -1341,8 +1369,8 @@ class DreamInstall:
     coord_dir: Path
     zone: str
     facts_path: Path | None = None
-    model: str = "claude-opus-5-5"
-    claude_bin: str = "claude"
+    model: str = DEFAULT_CLAUDE_MODEL
+    claude_bin: str = DEFAULT_CLAUDE_BIN
     #: a SHADOW install (D1_EXECUTOR section 8): flow's ``state/dream`` root this install reads as input. Set, the
     #: install's ``store_path`` is a scratch copy re-seeded each night, ``flow_instructions`` is flow's instructions
     #: file, and ``instructions_path`` is the read-only copy of it (``SHADOW_INSTRUCTIONS`` in the agent store's
@@ -1496,15 +1524,16 @@ def shadow_binding(*, shadow_flow_root: Path | str, store_path: Path | str, coor
                        "cockpit_root": p(cockpit_root), "flow_instructions": p(flow_instructions),
                        "zone": str(zone), "facts_path": None if facts_path is None else p(facts_path),
                        "instructions_policy": "re-copied read-only at each seed",
-                       "model": model or "claude-opus-5-5", "claude_bin": claude_bin or "claude"}, sort_keys=True)
+                       "model": model or DEFAULT_CLAUDE_MODEL, "claude_bin": claude_bin or DEFAULT_CLAUDE_BIN},
+                      sort_keys=True)
 
 
 def live_binding(*, model: str | None, claude_bin: str | None) -> str | None:
     """The facts a LIVE install's spec binds (:func:`live_source`): the compose's program, exactly the string the fire
     runs as its argv[0], and its model, canonical JSON. None when both are the defaults, so the default install's spec
     keeps the bytes it had before this binding existed. The program is bound by name, not by content."""
-    m, b = model or "claude-opus-5-5", claude_bin or "claude"
-    if m == "claude-opus-5-5" and b == "claude":
+    m, b = model or DEFAULT_CLAUDE_MODEL, claude_bin or DEFAULT_CLAUDE_BIN
+    if m == DEFAULT_CLAUDE_MODEL and b == DEFAULT_CLAUDE_BIN:
         return None
     return json.dumps({"claude_bin": b, "model": m}, sort_keys=True)
 
@@ -1517,16 +1546,27 @@ def install_live_binding(doc: Mapping[str, Any]) -> str | None:
 
 
 def current_live_binding(agent_dir: Path | str) -> str | None:
-    """:func:`install_live_binding` of the facts file in ``agent_dir`` as it stands (None: no file or unreadable too)."""
+    """:func:`install_live_binding` of the facts file in ``agent_dir`` as it stands (None: no file). A file that is
+    there but cannot be read, or whose ``model`` or ``claude_bin`` is not a non-empty string, raises
+    :class:`InstallRefused`: reading it as "the defaults" would register the unbound spec for an install that names
+    something else."""
+    path = Path(agent_dir) / INSTALL_FILE
     try:
-        doc = json.loads((Path(agent_dir) / INSTALL_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise InstallRefused(f"the dream install facts cannot be read from {path} ({type(exc).__name__}), so the "
+                             "dream program and model cannot be bound into the spec") from exc
     if not isinstance(doc, dict):
+        raise InstallRefused(f"{path} is not a JSON object, so the dream program and model cannot be bound into the "
+                             "spec")
+    if doc.get("shadow_flow_root") is not None:
         return None
-    m, b = doc.get("model"), doc.get("claude_bin")
-    if not isinstance(m, (str, type(None))) or not isinstance(b, (str, type(None))):
-        return None
+    for key in ("model", "claude_bin"):
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
     return install_live_binding(doc)
 
 
@@ -1580,24 +1620,59 @@ def _spec_source(agent_dir: Path | str, spec_hash: object) -> str:
     return source
 
 
+def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str | None) -> str:
+    """The words of :func:`check_bound`'s refusal of a live install whose program or model is not what its spec binds
+    (``signed``: the spec's :func:`live_binding`, None when it binds none)."""
+    facts = f"this install's facts name the program {inst.claude_bin!r} and the model {inst.model!r}"
+    if signed is None:
+        spec_side = (f"the occurrence's spec binds no dream program or model, so its link covers only the defaults "
+                     f"({DEFAULT_CLAUDE_BIN!r} and {DEFAULT_CLAUDE_MODEL!r}): it was registered with the defaults, or "
+                     "before the dream program and model were bound into the spec")
+    else:
+        try:
+            sb, sm = bound_pair(signed)
+            spec_side = f"the occurrence's spec binds the program {sb!r} and the model {sm!r}"
+        except (ValueError, KeyError, TypeError):
+            spec_side = f"the occurrence's spec binds {signed!r}"
+        spec_side += ": the facts changed after that spec was registered"
+    flags = _enable_flags(agent_dir, inst)
+    line = (f"`levain dream enable --revise{flags}`" if flags is not None else
+            "`levain dream enable --revise` (with the --agent-store-dir, --cockpit-root and --coord-dir enable was "
+            "given, if any)")
+    return (f"the dream program and model are not what the occurrence's spec binds: {facts}, but {spec_side}. Every "
+            f"fire of that spec refuses. Run {line} to register a spec for these facts, then sign a new link for it")
+
+
+def bound_refusal_now(agent_dir: Path | str, spec_hash: object) -> str | None:
+    """Read only: :func:`check_bound`'s refusal of a fire of the spec ``spec_hash`` under the install facts in
+    ``agent_dir`` as they stand, or None when it passes. None too when the facts cannot be read: that refusal is
+    :func:`read_install`'s, and this says only what the binding check would say."""
+    try:
+        inst = read_install(agent_dir)
+    except Exception:  # noqa: BLE001 - not this check's refusal to state
+        return None
+    try:
+        check_bound(agent_dir, {"spec_hash": spec_hash}, inst)
+    except InstallRefused as exc:
+        return str(exc)
+    return None
+
+
 def check_bound(agent_dir: Path | str, row: Mapping[str, Any], inst: DreamInstall) -> None:
     """Refuse (:class:`InstallRefused`) an occurrence whose spec does not bind ``inst``: a shadow install runs only
     under the spec whose source is :data:`SHADOW_SOURCE` + its own :func:`shadow_binding`, and a live install never
     runs under a shadow spec. A live install runs only under a spec that binds its own :func:`live_binding`: the one
     :func:`live_source` writes, or, for the default program and model, a spec that binds none. The link signs the
-    spec, so this is what makes a signature cover these facts only."""
+    spec, so this is what makes a signature cover these facts only. A live refusal names both sides and the
+    ``levain dream enable --revise`` line of this install (its non-default directories included)."""
     source = _spec_source(agent_dir, row.get("spec_hash"))
     if inst.shadow_flow_root is None:
         if source.startswith(SHADOW_SOURCE):
             raise InstallRefused("this install's facts are a live install, and the occurrence runs under a shadow "
                                  "install's spec: a link signed for a shadow never runs a live dream")
-        lead = LIVE_SOURCE + LIVE_BOUND
-        signed = source[len(lead):] if source.startswith(lead) else None
+        signed = live_bound_of(source)
         if signed != live_binding(model=inst.model, claude_bin=inst.claude_bin):
-            raise InstallRefused(f"the dream program or model in this install's facts ({inst.claude_bin!r}, "
-                                 f"{inst.model!r}) is not the one the occurrence's spec binds (they changed after that "
-                                 "spec was registered): run `levain dream enable --revise` with these facts, and sign "
-                                 "the new link")
+            raise InstallRefused(_live_bound_refusal(agent_dir, inst, signed))
         return
     want = SHADOW_SOURCE + shadow_binding(shadow_flow_root=inst.shadow_flow_root, store_path=inst.store_path,
                                           coord_dir=inst.coord_dir, cockpit_root=inst.cockpit_root,
@@ -1732,7 +1807,7 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
                                  "to clear it") from exc
     return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
-                        doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude",
+                        doc.get("model") or DEFAULT_CLAUDE_MODEL, doc.get("claude_bin") or DEFAULT_CLAUDE_BIN,
                         shadow_root, instr, src, floor)
 
 

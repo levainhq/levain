@@ -576,7 +576,8 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
             return                      # no dream registered: nothing to launch
         with st.read() as conn:
             rows = conn.execute(
-                "SELECT occurrence_id, window_key FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
+                "SELECT occurrence_id, window_key, spec_hash FROM agent_occurrences WHERE agent_id = ?"
+                " AND kind = 'scheduled'"
                 " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()
         trigger = agent["spec"]["trigger"]
     except Exception as exc:  # noqa: BLE001 - the set-up is guarded as each row is: named, and the notices still run
@@ -594,7 +595,7 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
                      f"launched ({type(exc).__name__}: {exc})")
         seen["launch"] = "install"
         return
-    for oid, window_key in rows:
+    for oid, window_key, spec_hash in rows:
         try:
             # the span a SCHEDULED launch counts manual runs over is the window its own key names, in the signed
             # trigger's zone (accounting.Limits: "the window for a scheduled launch"), never the manual launch's day
@@ -607,8 +608,13 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
                               launch_over=launch_over, session_alive=session_alive,
                               on_input=_da.install_on_input(st.directory, clock=clock))
         except _ex.ExposureRefused as exc:
+            # the exposure is judged first (building the executor) and the binding of the install facts to the spec
+            # second (the launch's input hook), so a binding refusal the launch never reached is named here too
+            bound = _da.bound_refusal_now(st.directory, spec_hash)
             notes.append(f"{oid} was not launched: the dream cannot state its exposure ({exc}); it is retried until its "
-                         "grace is gone")
+                         "grace is gone"
+                         + ("" if bound is None else
+                            f". The exposure is judged first; the install facts are refused too: {bound}"))
             seen["launch"] = "exposure"
             continue
         except Exception as exc:  # noqa: BLE001 - one row's failure is named and never costs the pass its other work

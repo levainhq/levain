@@ -429,6 +429,11 @@ def run_show(args: argparse.Namespace) -> int:
             + (f"review: {'required' if flags['review_required'] else 'not required'} "
                f"(calls_model={flags['calls_model']}, acts_outward={flags['acts_outward']}); the date is the link's "
                f"expires_at\n" if flags else f"review: {why}\n"))
+    if a["name"] == "dream":
+        from levain.dream import agent as _da
+        why = _da.bound_refusal_now(store.directory, a["spec_hash"])
+        if why is not None:
+            head += f"dream install: a fire of this spec refuses with the facts as they stand: {why}\n"
     try:
         print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
