@@ -733,7 +733,7 @@ def test_a_bundled_close_of_an_item_the_repo_does_not_show_closed_is_a_break(cw,
     doc["closes"][cw.open] = doc["closes"][cw.merged]
     bundle.write_text(json.dumps(doc), "utf-8")
     rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {cw.open}: " in out and "which its own records show open" in out
+    assert rc == 3 and f"BREAK close {cw.open}: " in out and "the repo does not show the item closed" in out
 
 
 def test_a_close_the_repo_shows_that_the_bundle_does_not_record_is_said_and_not_a_break(cw, capsys):
@@ -1413,7 +1413,7 @@ def _rows(tw: TierWorld, base: dict) -> list[tuple[str, str, Any, set[str]]]:
         ("vacuous: committer added", G, lambda r: (r.clear(), r.update(_VACUOUS, committer="Evil <e@e>")), set()),
         ("vacuous: email added", G, lambda r: (r.clear(), r.update(_VACUOUS, email="evil@x")), set()),
         ("open item: a git close added, unheld sha", tw.cw.open,
-         lambda r: r.update(tier="git", who="Op Person", how="asserted by git author", commit="ab" * 20, email="x@x"), {"other-repo"}),
+         lambda r: r.update(tier="git", who="Op Person", how="asserted by git author", commit="ab" * 20, email="x@x"), set(CAPS)),   # fix 8: git-kind, repo-derived: unheld is undetermined
     ]
 
 
@@ -1545,7 +1545,7 @@ def test_a_repo_that_holds_the_recorded_commit_and_does_not_show_the_close_is_a_
     bundle = exported(tw.cw, capsys)
     edit_bundle(bundle, lambda d: d["closes"].__setitem__(tw.cw.open, d["closes"][tw.signed]))
     rc, out, err = run(capsys, "verify", str(bundle))
-    assert rc == 3 and f"BREAK close {tw.cw.open}: " in out and "which its own records show open" in out
+    assert rc == 3 and f"BREAK close {tw.cw.open}: " in out and "the repo does not show the item closed" in out
 
 
 def test_the_bundle_s_note_is_labelled_as_the_bundle_s_and_never_compared(tw, capsys, monkeypatch):
@@ -1671,7 +1671,7 @@ def test_fix7_a_close_for_an_item_the_records_show_open_or_band_closed_is_a_brea
     band = bs.add(cw.target, "alpha", "band one", "desk 1", "desk 1", done="np-q1", done_kind="band", author=OPD, now=NOW)[0]
     bundle = exported(cw, capsys)
     base = json.loads(bundle.read_text("utf-8"))["closes"][cw.merged]
-    for item_id, sha in ((cw.open, "ab" * 20), (cw.open, base["commit"]), (band, "ab" * 20)):
+    for item_id, sha in ((band, "ab" * 20), (band, base["commit"])):         # fix 8: a git-kind open item is repo-derived, not here
         edit_bundle(bundle, lambda d: d["closes"].__setitem__(item_id, {**base, "commit": sha}))
         rc, out, err = run(capsys, "verify", str(bundle))
         assert rc == 3, (item_id, sha, out)
@@ -1724,3 +1724,59 @@ def test_fix7_a_malformed_or_empty_fingerprint_is_a_signature_that_cannot_be_jud
         rc, out, err = run(capsys, "verify", str(bundle))
         assert rc == 0, out + err
         assert "its fingerprint cannot be read" in close_lines(out)[tw.signed]
+
+
+# ---------------------------------------------------------------- P6 fix 8 (levain#104): L3 round 3's delete and bound fixes
+def test_fix8_a_stale_clone_of_the_right_repo_never_reads_a_git_kind_item_as_open_in_its_own_records(cw, capsys):
+    """Deleting fix 7's 'this repo derives other closes' proxy (RED on 227678b19: BREAK "its own records show open"). The repo
+    derives other closes and lacks this item's close commit: UNDETERMINED, rc 0."""
+    stale = bs.add(cw.target, "alpha", "stale one", "desk 1", "desk 1", done="docs/stale.md", done_kind="document", author=OPD, now=NOW)[0]
+    bundle = exported(cw, capsys)
+    base = json.loads(bundle.read_text("utf-8"))["closes"][cw.doc]
+    edit_bundle(bundle, lambda d: d["closes"].__setitem__(stale, {**base, "commit": "ab" * 20}))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err
+    line = close_lines(out)[stale]
+    assert not line.startswith("BREAK") and "its own records show" not in out
+    assert "does not hold commit abababababab" in line
+
+
+def test_fix8_a_recorded_close_the_repo_does_not_show_with_its_commit_held_is_still_a_break(cw, capsys):
+    stale = bs.add(cw.target, "alpha", "stale two", "desk 1", "desk 1", done="docs/stale2.md", done_kind="document", author=OPD, now=NOW)[0]
+    bundle = exported(cw, capsys)
+    base = json.loads(bundle.read_text("utf-8"))["closes"][cw.doc]            # base["commit"] is a commit this repo holds
+    edit_bundle(bundle, lambda d: d["closes"].__setitem__(stale, dict(base)))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and close_lines(out)[stale].startswith(f"BREAK close {stale}: ") and "the repo does not show the item closed" in out
+
+
+def test_fix8_the_repo_unavailable_path_refutes_a_record_shape_violation(tw, capsys):
+    bundle = exported(tw.cw, capsys)
+    os.rename(tw.cw.repo, str(tw.cw.repo) + ".away")
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 0, out + err                                                   # unaltered: recorded, not re-derived
+    assert "repo not available" in close_lines(out)[tw.signed]
+    for change in ({"email": "x@x"}, {"how": "signed by the operator"}, {"email": None}):
+        edit_bundle(bundle, lambda d: d["closes"][tw.signed].update(change))
+        rc, out, err = run(capsys, "verify", str(bundle))
+        assert rc == 3, (change, out)
+        line = close_lines(out)[tw.signed]
+        assert line.startswith(f"BREAK close {tw.signed}: ") and "repo is not available" in line
+        assert ("email:" in line) == ("email" in change) and ("how:" in line) == ("how" in change)
+        edit_bundle(bundle, lambda d: [d["closes"][tw.signed].pop(k, None) for k in ("email",)] and d["closes"][tw.signed].update(
+            how="signed by an operator key"))
+
+
+def test_fix8_a_null_email_key_is_a_shape_violation_under_full_capability(tw, capsys):
+    from levain.desk import board_author as ba
+    assert "email" not in ba.Closer("signed", "k", "signed by an operator key").to_dict()       # this install never emits a null key
+    bundle = edit_bundle(exported(tw.cw, capsys), lambda d: d["closes"][tw.signed].update(email=None))
+    rc, out, err = run(capsys, "verify", str(bundle))
+    assert rc == 3 and "email: a signed close carries no email" in close_lines(out)[tw.signed]
+
+
+def test_fix8_one_predicate_name_is_printed_once():
+    from levain.desk.board_trail import _Pred, _joined
+    got = _joined([_Pred("how", "refuted", "first"), _Pred("who", "refuted", "w"), _Pred("how", "refuted", "second"),
+                   _Pred("x", "holds", "")])
+    assert got == "how: first; who: w"

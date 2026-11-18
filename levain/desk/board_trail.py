@@ -52,6 +52,9 @@ a file, and a failed write removes the file it created.
 
 Known edges, stated rather than hidden:
 
+* A non-empty but malformed signature fingerprint string is not syntax-checked: the fingerprint is ssh-keygen's verified output,
+  never a bundle field, so it is not reachable.
+
 * A trailer close's ``who`` while its launch record is undetermined (the launch id needs the record) is judged on what is read:
   the shape (``agent ...``) is refuted where wrong, the name itself stays undetermined with the trailer predicate.
 * ``board_author._Reader.evidence()``'s exception path keeps the verdict it derived (the facts read failing after the close read
@@ -565,16 +568,16 @@ def _shape(rec: Mapping[str, Any], tier: str, prefix: str | None) -> list[_Pred]
     if tier == "unattributed":
         if who is not None:
             out.append(_Pred("who", REFUTED, "an unattributed close names no one"))
-        if rec.get("email") is not None:
+        if "email" in rec:                              # presence, not value: a null key is a violation too
             out.append(_Pred("email", REFUTED, "an unattributed close carries no email"))
-        if rec.get("committer") is not None:
+        if "committer" in rec:
             out.append(_Pred("committer", REFUTED, "an unattributed close carries no committer"))
         return out
     if not isinstance(who, str):
         out.append(_Pred("who", REFUTED, f"a {tier} close names who made it"))
     elif tier == "trailer" and not who.startswith("agent "):
         out.append(_Pred("who", REFUTED, "a trailer close names an agent"))
-    if tier != "git" and rec.get("email") is not None:
+    if tier != "git" and "email" in rec:
         out.append(_Pred("email", REFUTED, f"a {tier} close carries no email"))
     base = _BASE_HOW[tier]
     if prefix is not None:
@@ -585,6 +588,22 @@ def _shape(rec: Mapping[str, Any], tier: str, prefix: str | None) -> list[_Pred]
     if not ok:
         out.append(_Pred("how", REFUTED, f"the {tier} tier reads {want!r} here"))
     return out
+
+
+def _shape_refuted(rec: Mapping[str, Any]) -> str:
+    """The record-shape violations of ``rec`` alone, as ``name: why`` joined; "" when none. For a path that has no evidence."""
+    tier = rec.get("tier")
+    preds = [_Pred("tier", REFUTED, f"{tier!r} is not a tier")] if tier not in _RANK else _shape(rec, tier, None)
+    return _joined(preds)
+
+
+def _joined(preds: Sequence[_Pred]) -> str:
+    """``name: why`` of each REFUTED predicate, one per name (the first), so the printer never shows a name twice."""
+    seen: dict[str, str] = {}
+    for p in preds:
+        if p.result == REFUTED:
+            seen.setdefault(p.name, p.why)
+    return "; ".join(f"{n}: {w}" for n, w in seen.items())
 
 
 def _judge(rec: Mapping[str, Any], ev: Any, path: str | None) -> list[_Pred]:
@@ -720,7 +739,7 @@ def _close_line(item_id: str, rec: Mapping[str, Any], now: Mapping[str, Any] | N
     undet = [p for p in preds if p.result == UNDETERMINED]
     words = _rec_words(rec)
     if refuted:
-        why = "; ".join(f"{p.name}: {p.why}" for p in refuted)
+        why = _joined(refuted)
         if now is None:
             return f"BREAK close {item_id}: the bundle records [{words}] and the repo does not show the item closed", True
         return f"BREAK close {item_id}: the bundle records [{words}] and the repo derives [{ba.describe(now)}] (refuted: {why})", True
@@ -784,13 +803,17 @@ def close_verdicts(trail: Trail, reports: Sequence[FileReport]) -> tuple[list[st
         if item_id not in closes:                       # the bundle's own records show no git close of it (needs no capability)
             if ids is not None and ids[item_id] not in _GIT_KINDS:
                 state = "closed by the band" if item_id in bands else "open"
-            elif repo in read and any(i.rpartition("#")[0] == repo for i in closes):    # a repo that shows this registry's other closes
-                state = "closed by the band" if item_id in bands else "open"
         if state is not None:
             breaks += 1
             lines.append(f"BREAK close {item_id}: the bundle records a git close for {item_id}, which its own records show {state}")
             continue
         if item_id not in closes and repo not in read:
+            bad = _shape_refuted(rec)
+            if bad:                                     # the record's own shape needs no capability
+                breaks += 1
+                lines.append(f"BREAK close {item_id}: the bundle records [{_rec_words(rec)}] and the repo is not available "
+                             f"(refuted: {bad})")
+                continue
             lines.append(f"close {item_id}: {_rec_words(rec)} (recorded in the bundle, not re-derived (repo not available))")
             continue
         now = closes.get(item_id)
