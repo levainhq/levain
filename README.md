@@ -523,9 +523,9 @@ A consent request keeps its own kind and its own rung; the desk cannot raise it.
 
 ## Projects: tracked and untracked
 
-A repo in Levain is untracked or tracked. **Untracked** is the default: the repo keeps its own state in its own files, and a seat reads them. **Tracked** moves the repo's state onto Levain's work board, and its `CHARTER.md` becomes the one file that says what the repo is for. Both modes are supported, and a tracked repo still builds and tests the same way.
+A repo in Levain is untracked or tracked. **Untracked** is the default: the repo keeps its own state in its own files, and a seat reads them. **Tracked** moves the repo's state onto Levain's work board, and its `CHARTER.md` becomes the one file that says what the repo is for. Both modes are supported. Tracking changes where the repo's state lives, not its build or test commands.
 
-Moving a repo to tracked is a conversation with the desk, then a ceremony in a fixed order. Nothing is written before you say yes. `levain board state` shows the derived state of the items, and `levain board repos` shows what is in play and what is wrong. The modes, the ceremony, the grades a record can carry and the known edges are in [docs/projects.md](docs/projects.md).
+Moving a repo to tracked is a conversation with the desk, then a ceremony in a fixed order. Nothing that tracks the repo is written before you say yes. `levain board state` shows the derived state of the items, and `levain board repos` shows what is in play and what is wrong. The modes, the ceremony, the grades a record can carry and the known edges are in [docs/projects.md](docs/projects.md).
 
 ## Keep it running (macOS and Linux)
 
@@ -600,8 +600,6 @@ Every verb `levain --help` lists, each with the one line it gives. `levain <verb
 | `levain drops` | Your drops: list, show, and split (the desk's door). |
 | `levain thread` | The threads your drops became. |
 | `levain desk` | The desk lease: who holds the desk role, and the sessions launched for it. |
-| `levain board` | The work board: items, repos in play, and the tracking ceremony (docs/projects.md). |
-| `levain charter` | A repo's CHARTER.md: init writes the skeleton, check reads it (warn mode). |
 | `levain envelope` | Thread envelopes: what the desk may do for a thread, signed by you. |
 | `levain observe` | Observe-mode PermissionRequest logger: aggregate counts only, answers nothing. |
 | `levain agents` | Named agents on the autonomic store (the store check, then one verb per act; see `levain agents --help`). |
