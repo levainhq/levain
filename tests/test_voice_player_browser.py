@@ -67,7 +67,8 @@ def _init(fixture: dict[str, Any] | None) -> str:
 
 
 URL = "http://127.0.0.1:%d/#write_token=" + T
-READY_BLOCK = "(() => { const p = document.querySelector('.vc-panel'); return !!p && !p.hidden && !!window.LevainVoice; })()"
+# the voice block is drawn on the Settings place only (levain#141 polish): the page is taken there while it is awaited
+READY_BLOCK = "(() => { document.querySelector('.ia-places [data-ia-place-btn=settings]').click(); const p = document.querySelector('.vc-panel'); return !!p && !p.hidden && !!window.LevainVoice; })()"
 SPEAK_CALLS = "window.__calls.filter((c) => c.path === '/cockpit/voice/speak')"
 # the paths the PLAYER used: the calls whose stack runs through voice.js (the panel's own polls and voice.json read are not)
 PLAYER_PATHS = "JSON.stringify([...new Set(window.__calls.filter((c) => c.fromVoice).map((c) => c.path))])"

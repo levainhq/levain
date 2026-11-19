@@ -14,7 +14,7 @@ CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / 
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
 # the places bar holds places only (levain#141); the actions are masthead buttons and the drivers the bar presses are hidden
-PLACES = ["home", "desk", "room", "memory"]
+PLACES = ["home", "desk", "room", "memory", "settings"]
 JUMPS = ["grants", "drop", "notifications", "room", "desk"]
 
 # where things sit and how the strip draws, as one JSON string
