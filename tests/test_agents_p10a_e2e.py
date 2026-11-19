@@ -517,7 +517,7 @@ def test_p10a_revoke_racing_a_renewal(tmp_path):
     """invariant 7 (c7): ``levain agents renew`` and ``levain agents revoke`` as two real processes on the same log.
     Renew started first, revoke 0.15 s later: the renew lands at seq 6 and the revoke one seq later at 7 (the revoke
     re-prepares on the moved head); started together the revoke can win, and the renew then ends with ONE of the honest
-    refusals ``_renew_refusals`` lists in full (which one depends on where in its own steps the renew saw the landing:
+    refusals the ``revoke_vs_renew`` entry of ``tests/_p10a_races.py`` RACES lists in full (which one depends on where in its own steps the renew saw the landing:
     the open bar, the link already gone, a moved head, the log's own refusal on the new head). Never an error from the
     store, never two revokes, and a revoke always stands at the end."""
     import time
