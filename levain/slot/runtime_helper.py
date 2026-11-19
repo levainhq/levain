@@ -3755,6 +3755,20 @@ def _pf_unbuilt(uid: int) -> bool:
                   "adopt-verify refuses rather than run the verifier unchecked")
 
 
+def verifier_uid(ctx: Ctx) -> int:
+    """``_levain_verify``'s uid, the account the confined verifier runs as. Absent = ``account-missing`` with
+    :data:`wall.VERIFIER_UNPROVISIONED` as the detail (levain#134): setup does not provision it while adopt-verify is
+    gated on 5g (PREL3_RULINGS 2a-12), so the refusal names that precondition instead of the bare account name. The
+    refusal NAME stays ``account-missing`` (the wire name the gate was ruled to fail closed with). Any other refusal
+    from the lookup passes through unchanged."""
+    try:
+        return ctx.seams.account_uid(wall.EXPORT_ACCOUNT["verifier"])
+    except Refused as e:
+        if e.name != "account-missing":
+            raise
+        raise Refused("account-missing", wall.VERIFIER_UNPROVISIONED) from None
+
+
 @dataclass
 class VerifySeams:
     """adopt-verify's own injected facts: ``git_version()`` (root's git's ``git --version``, read against the floor);
@@ -3932,7 +3946,7 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
 
     at, host, s = ctx.seams.at, ctx.seams.host, front.alloc.session
     export_dir = str(ctx.seams.L / "export")
-    uid = ctx.seams.account_uid(wall.EXPORT_ACCOUNT["verifier"])
+    uid = verifier_uid(ctx)
     fmt = str(front.base["object_format"])
     base_bytes = int(front.base["bundle_bytes"])   # type: ignore[call-overload]
     held: List[int] = []                           # root's fds OUTSIDE the image, closed last
@@ -4073,7 +4087,8 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
 
 def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """``adopt-verify <session> --bundle-digest sha256:<hex>`` (CONTRACT §5.1; DESIGN §6.0): the caller by class
-    (:func:`verify_caller`), the alloc session lock (TRY, ``session-busy``), the alloc re-read under it and the caller
+    (:func:`verify_caller`), the verifier's account (:func:`verifier_uid`, ``account-missing`` naming the setup
+    precondition, levain#134), the alloc session lock (TRY, ``session-busy``), the alloc re-read under it and the caller
     re-checked (:func:`verify_caller_locked`: a changed alloc = ``no-session``), the root facts as adopt-open step 3
     (RETAINED, SCRUBBED, ``alloc.base``), the adopt lock (adopt-open's bounded wait, ``adopt-busy``: one sealed run
     machine-wide, importer or verifier), the git floor (``git-below-floor:<version>``), then the sealed verify run
@@ -4088,6 +4103,11 @@ def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]
     at, s = ctx.seams.at, req.session
     deadline = ctx.seams.monotonic() + vseams.lock_wait_s
     a, export_class = verify_caller(ctx, s)
+    # levain#134: the verifier's account before any lock, root fact or wait, so an install without it is told so at
+    # once (the caller is bound first: a stranger still learns only ``no-session``). verify_sealed_run reads the uid
+    # again for the run itself.
+    verifier_uid(ctx)
+    at("verify:account")
     at("verify:2")
     try:
         with session_lock(ctx, s):

@@ -159,6 +159,18 @@ EXPORT_GROUPS = {("importer", "operator"): "levain-export", ("importer", "dispat
                  ("verifier", None): "levain-verify"}
 EXPORT_ENTRY = {"importer": "export-importer", "verifier": "export-verifier"}
 
+#: levain#134 (VM sitting 11-18, J06): the precondition adopt's verify names when ``_levain_verify`` is absent.
+#: Setup does not provision it: PREL3_RULINGS 2a-12 (levain 74, 11-08) keeps adopt-verify GATED, failing closed on
+#: ``account-missing``, until the macOS pf verifier check (5g) is built, and only then adds the account (a singleton,
+#: its own primary group, ``levain-verify`` appended last to the shared groups). ``--verifier-slots`` sizes the
+#: none-class session pairs ``_levain_v<n>`` / ``_levain_c<n>``, a different thing; the text says so, because that
+#: flag's name is what made the J06 refusal read as a setup fault.
+VERIFIER_UNPROVISIONED = (
+    "_levain_verify: adopt runs its confined verifier as this account, and setup does not create it in this "
+    "release, so adopt (its preview and its take) is not available on this install yet. --verifier-slots makes the "
+    "verifier session accounts (_levain_v<n>, _levain_c<n>), not this one. Nothing was adopted and the session is "
+    "unchanged: discard or restore it as usual")
+
 
 def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mapping[str, int], *,
                      export_class: Optional[str] = None) -> Principal:
@@ -1720,7 +1732,8 @@ if __name__ == "__main__":
 
 __all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "EXPORT_ACCOUNT", "EXPORT_CAPS", "EXPORT_DEVICES", "EXPORT_ENTRY",
            "EXPORT_GROUPS", "EXPORT_MACH_ALLOW", "EXPORT_NPROC", "EXPORT_READ_DENIED", "EXPORT_TARGETS",
-           "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFY_WRITABLE", "WallFacts",
+           "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFIER_UNPROVISIONED",
+           "VERIFY_WRITABLE", "WallFacts",
            "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
            "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_pf_enabled", "check_profile_text",
            "clone_argv",
