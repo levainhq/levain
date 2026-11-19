@@ -2644,7 +2644,7 @@ class Cockpit:
             return self._attached_head(spec, snap, cred, ctx.today, auth, ctx.now, rkey)
         for spec, head in zip(composed, self._parallel(read_head, composed)):
             heads[spec.id] = head
-        return heads, meta
+        return {spec.id: heads[spec.id] for spec in specs}, meta
 
     def _stream_health(self) -> dict[str, Any]:
         """The derive loop's input-watch stream as the manifest's ``freshness.stream``: ``state`` (ok or degraded) and

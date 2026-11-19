@@ -765,3 +765,18 @@ def test_a_bare_cockpits_serve_composed_panel_carries_no_freshness_fields(tmp_pa
     ck.register(composed_spec("mine", box))
     ck.mark_serve_composed(["mine"])
     assert not (set(_FRESH_KEYS) & set(ck.panel("mine"))) and not (set(_FRESH_KEYS) & set(ck.manifest(CRED)["panels"]["mine"]))
+
+
+def test_a_manifests_panels_are_in_drawing_order_whatever_reads_them(tmp_path: Path) -> None:
+    r = Rig(tmp_path, ("aaa", "alpha", "beta"), specs={"aaa": composed_spec("aaa", {})})
+    try:
+        r.ck.mark_serve_composed(["aaa"])
+        r.derive()
+        drawing = [s.id for s in r.ck._ordered_specs(r.ck._specs)]
+        assert drawing[0] == "aaa"                                # the composed panel draws before the row-backed ones
+        assert list(r.ck.manifest(CRED)["panels"]) == drawing
+        auth = r.ck.authority()
+        heads, _meta = r.ck._attached_heads(r.ck._ordered_specs(r.ck._specs), "none", auth, ReadContext(auth.now, authority=auth))
+        assert list(heads) == drawing                              # and the head layer hands them over in that order itself
+    finally:
+        r.close()
