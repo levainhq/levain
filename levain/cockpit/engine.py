@@ -2170,7 +2170,7 @@ class Cockpit:
         panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
         A read is scoped by its key: a panel read by its panel id, everything else (the manifest) by one shared scope that
         every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
-        caller's; ``refresh=False`` skips that (the server's second call for the same write)."""
+        caller's; ``refresh=False`` skips that."""
         if panel_ids is None:
             with self._rc_lock:
                 self._rc_gen += 1
