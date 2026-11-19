@@ -432,6 +432,7 @@ class _State:
     failing_since: str | None = None
     last_completion: datetime | None = None
     pflight: "_Flight | None" = None          # the read in flight: ONE owner commits it, joiners share its result
+    epoch: int = 0                            # advanced under ``lock`` by every write that names this panel (``invalidate_reads``)
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
     fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
@@ -442,6 +443,8 @@ class _Flight:
     """One provider read. The OWNER (the caller that started it) alone commits the outcome; joiners
     wait for ``out`` and receive that same outcome. At most one is in flight per state, so commits
     happen in start order by construction. One deadline, ``started + timeout``, governs everyone."""
+
+    epoch = 0                            # the state's write epoch when this flight started (set by its owner): a caller of a later epoch never joins it
 
     def __init__(self, timeout_s: float) -> None:
         self.timeout_s = timeout_s       # the budget THIS flight was started with: owner, joiners and messages use it
@@ -1316,18 +1319,28 @@ class Cockpit:
         counts as a timeout, so an owner and its joiners can never disagree about the same read."""
         result: Any = None
         committed_ok = False
-        with st.lock:
-            fl = st.pflight
-            if fl is None:
-                fl = st.pflight = _Flight(timeout_s)
-                if on_start:
-                    on_start()
-                owner = True
-            elif not fl.committed:
+        while True:
+            with st.lock:
+                fl = st.pflight
+                if fl is None:
+                    fl = st.pflight = _Flight(timeout_s)
+                    fl.epoch = st.epoch
+                    if on_start:
+                        on_start()
+                    owner = True
+                    break
+                if fl.committed:
+                    return refused("previous read still running past its timeout (source hung?)")
                 owner = False
                 wait = max(0.0, fl.started + fl.timeout_s + PROCESS_GRACE_S - time.monotonic())
-            else:
-                return refused("previous read still running past its timeout (source hung?)")
+                if fl.epoch == st.epoch:
+                    break                  # a read begun since the last write to this state: share it
+            # a read begun before a write to this state: its answer is never ours, and a second provider read does
+            # not start beside it, so wait for it to end and look again
+            try:
+                fl.out.result(timeout=wait)
+            except FutureTimeout:
+                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
         if not owner:
             try:
                 return fl.out.result(timeout=wait)
@@ -2170,13 +2183,26 @@ class Cockpit:
         panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
         A read is scoped by its key: a panel read by its panel id, everything else (the manifest) by one shared scope that
         every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
-        caller's; ``refresh=False`` skips that."""
+        caller's; ``refresh=False`` skips that.
+
+        Either way the named panels' write epoch advances: a provider read begun before this call is never joined by a
+        reader arriving after it (``_single_flight`` waits it out and reads afresh), so what the older read saw cannot
+        be handed to, or stored for, a reader of the new generation."""
+        states = self._state
         if panel_ids is None:
+            for st in list(states.values()):
+                with st.lock:
+                    st.epoch += 1
             with self._rc_lock:
                 self._rc_gen += 1
                 self._rc.clear()
             return
         ids = [p for p in dict.fromkeys(panel_ids) if isinstance(p, str)]
+        for pid in ids:
+            st = states.get(pid)
+            if st is not None:
+                with st.lock:
+                    st.epoch += 1
         scopes = [("panel", p) for p in ids] + [_RC_SHARED_SCOPE]
         with self._rc_lock:
             for sc in scopes:
