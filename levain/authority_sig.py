@@ -161,12 +161,17 @@ def sk_ecdsa_signature_empty(armored: str) -> bool:
     length (an 8-byte blob, two length words and nothing after them), though the flags byte and counter that follow
     look like a good signature's. This is what the Touch ID provider returned on 2026-11-19 (levain#153; 13 recorded
     failures): the flags were not the discriminator, the blob is. False for anything else, a signature that is
-    non-empty and fails to verify included, and for anything malformed (the caller's own parse names that)."""
+    non-empty and fails to verify included, and for anything malformed or not ending exactly after the flags and
+    counter (the caller's own parse names that)."""
     try:
+        # the strict parse first: the whole signature string must be well formed and end exactly after the flags byte
+        # and counter (the one parser the callers use), so trailing bytes or a short tail are never called empty
+        sig_type, flags, _counter = _sshsig_type_flags_counter(armored)
+        if not sig_type.startswith("sk-ecdsa-") or flags is None:
+            return False
         _public_key_blob, sig_blob = _sshsig_fields(armored)
         inner = _Wire(sig_blob)
-        if not inner.string().decode("ascii").startswith("sk-ecdsa-"):
-            return False
+        inner.string()
         ecdsa = _Wire(inner.string())
         r, s = ecdsa.string(), ecdsa.string()
         ecdsa.end()

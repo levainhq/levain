@@ -883,10 +883,15 @@ class _SkRefusal:
     detail: str
     evidence: str                # the evidence file's path, or "evidence not written (<why>)"
     empty: bool = False          # the ECDSA signature inside has empty r and s: the key returned no signature (levain#153)
+    touch: bool = False          # the signer is a Touch ID one (its sidecar says so, or the Apple provider signed it)
 
 
 # what a person reads when the key's answer carried no signature at all (levain#153): the key said "done" and gave nothing back
-_EMPTY_SIG_WORDS = "the key returned no signature (Touch ID gave nothing back)"
+# Touch ID is named only when the sign path knows the signer is one (its sidecar's custody, or the Apple provider)
+def _empty_sig_words(touch: bool) -> str:
+    return "the key returned no signature" + (" (Touch ID gave nothing back)" if touch else "")
+
+
 _EMPTY_SIG_REASON = "empty ECDSA signature (r and s have zero length)"
 _EMPTY_SIG_NEXT = "try again, or answer from your phone instead (open the cockpit sign page)"
 
@@ -1033,7 +1038,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             if left < _SK_RETRY_MIN_S:
                 a = failed[0]
                 if a.empty:
-                    raise KeyError_(f"{_EMPTY_SIG_WORDS} for {fp} ({a.carried}; {a.evidence}), and no second touch was "
+                    raise KeyError_(f"{_empty_sig_words(a.touch)} for {fp} ({a.carried}; {a.evidence}), and no second touch was "
                                     f"asked for: {max(left, 0.0):.1f}s of the {bound:g}s bound was left, under "
                                     f"{_SK_RETRY_MIN_S:g}s, so nothing was signed; {_EMPTY_SIG_NEXT}")
                 raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({a.carried}; {a.detail}; "
@@ -1055,9 +1060,17 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             failed.append(again)
         a, b = failed[0], failed[-1]
         if a.empty and b.empty:
-            raise KeyError_(f"{_EMPTY_SIG_WORDS} for {fp}, twice ({_EMPTY_SIG_REASON}): "
+            raise KeyError_(f"{_empty_sig_words(a.touch or b.touch)} for {fp}, twice ({_EMPTY_SIG_REASON}): "
                             f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.evidence}); "
                             f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.evidence}); "
+                            f"so nothing was signed; {_EMPTY_SIG_NEXT}")
+        if a.empty or b.empty:      # mixed: each attempt is described by its own outcome, and the phone guidance stays
+            which = 1 if a.empty else 2
+            raise KeyError_(f"ssh-keygen did not return a verifiable signature as {fp}, and both attempts failed "
+                            f"(one attempt returned no signature, the other returned a signature that did not verify; "
+                            f"attempt {which} returned no signature): "
+                            f"attempt 1 flags {a.flags:#04x} ({a.carried}; {_EMPTY_SIG_REASON if a.empty else a.detail}; {a.evidence}); "
+                            f"attempt 2 flags {b.flags:#04x} ({b.carried}; {_EMPTY_SIG_REASON if b.empty else b.detail}; {b.evidence}); "
                             f"so nothing was signed; {_EMPTY_SIG_NEXT}")
         raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp}, and both attempts failed "
                         f"(the key's answer did not check out, and touching again did not help): "
@@ -1136,7 +1149,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 evidence = _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
                                                flags=flags, counter=counter, detail=detail, namespace=namespace,
                                                attempt=attempt, empty=empty)
-                return _SkRefusal(flags, carried, detail, evidence, empty)
+                return _SkRefusal(flags, carried, detail, evidence, empty, is_touch)
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
                             "so nothing was signed")
         return signature

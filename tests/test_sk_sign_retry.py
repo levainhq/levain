@@ -122,7 +122,7 @@ class FakeKeygenSign:
             if written == "cancel":
                 return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
             if written == "empty":      # the recorded 11-19 answer: flags 0x21, counter 1, r and s of zero length
-                return subprocess.CompletedProcess(argv, 0, stdout=_RECORDED["empty-0944"].encode(), stderr=b"")
+                return subprocess.CompletedProcess(argv, 0, stdout=_RECORDED["empty"].encode(), stderr=b"")
             ns = argv[argv.index("-n") + 1]
             out = self.key.sign(kw["input"], ns, counter=self.signs, sig_flags=written)
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
@@ -545,13 +545,39 @@ def test_classify_reads_only_the_first_line(rig):
 
 # ---- levain#153: the EMPTY signature (r and s of zero length), named -------------------------------------------------
 
-def test_the_classifier_says_empty_for_the_two_recorded_failures_and_not_for_the_good_signature():
+def _resigned(armored: str, sig_blob: bytes) -> str:
+    """``armored`` with its signature string replaced by ``sig_blob`` (public key, namespace and the rest kept)."""
+    body = base64.b64decode("".join(armored.strip().splitlines()[1:-1]))
+    pos = 10                                        # "SSHSIG" + uint32 version
+    for _ in range(4):                              # publickey, namespace, reserved, hash_algorithm
+        pos += 4 + struct.unpack(">I", body[pos:pos + 4])[0]
+    b64 = base64.b64encode(body[:pos] + _s(sig_blob)).decode()
+    return "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70)) \
+        + "\n-----END SSH SIGNATURE-----\n"
+
+
+def _sk_blob(r: bytes, s: bytes, tail: bytes = b"\x21\x00\x00\x00\x01") -> bytes:
+    return _s(SK.encode()) + _s(_s(r) + _s(s)) + tail
+
+
+def test_the_classifier_says_empty_for_the_recorded_failure_and_not_for_the_good_signature():
     from levain.authority_sig import _sshsig_type_flags_counter, sk_ecdsa_signature_empty
-    for name in ("empty-0944", "empty-0209"):       # 08:44 ET at a terminal; 02:09 ET, nobody there
-        assert sk_ecdsa_signature_empty(_RECORDED[name]), name
-        assert _sshsig_type_flags_counter(_RECORDED[name]) == (SK, 0x21, 1)     # flags and counter look good: not the tell
+    # two records, 08:44 ET at a terminal and 02:09 ET with nobody there, were these same bytes: one is kept
+    assert sk_ecdsa_signature_empty(_RECORDED["empty"])
+    assert _sshsig_type_flags_counter(_RECORDED["empty"]) == (SK, 0x21, 1)      # flags and counter look good: not the tell
     assert _sshsig_type_flags_counter(_RECORDED["good"]) == (SK, 0x21, 1)
     assert not sk_ecdsa_signature_empty(_RECORDED["good"])
+
+
+def test_the_classifier_is_true_only_for_a_well_formed_empty_signature_that_ends_after_flags_and_counter():
+    from levain.authority_sig import sk_ecdsa_signature_empty
+    assert sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"")))      # the hand-built twin: True
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"\x01" * 32)))   # empty r, real s
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"\x01" * 32, b"")))   # real r, empty s
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"", b"\x21\x00\x00\x00\x01junk")))
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"", b"")))          # no flags/counter
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"", b"\x21\x00\x00")))   # truncated
+    assert not sk_ecdsa_signature_empty(_resigned(_RECORDED["empty"], _sk_blob(b"", b"", b"\x21")))          # truncated
 
 
 def test_the_classifier_is_false_for_a_non_empty_unverifiable_or_malformed_signature(rig):
@@ -568,7 +594,7 @@ def test_two_empty_answers_say_the_key_returned_no_signature_and_the_evidence_sa
         rig.sign(MESSAGE)
     text = str(err.value)
     assert rig.fake.signs == 2                       # the retry count is as it was
-    assert text.startswith("the key returned no signature (Touch ID gave nothing back)")
+    assert text.startswith("the key returned no signature for ")      # no sidecar here: Touch ID is not named
     assert "empty ECDSA signature (r and s have zero length)" in text and "nothing was signed" in text
     assert "try again" in text and "phone" in text
     assert "libcrypto" not in text and "does not verify" not in text
@@ -600,3 +626,34 @@ def test_an_empty_answer_with_no_time_for_a_second_touch_is_named_too(rig):
     with pytest.raises(KeyError_) as err:
         rig.sign(MESSAGE)
     assert "the key returned no signature" in str(err.value) and "no second touch was asked for" in str(err.value)
+
+
+def test_the_words_name_touch_id_only_for_a_touch_id_signer(rig, monkeypatch):
+    from levain.cockpit.custody import APPLE_PROVIDER
+    rig.fake.plan = ["empty", "empty"]
+    with pytest.raises(KeyError_) as plain:         # no sidecar, no Apple provider: the code cannot know it is Touch ID
+        rig.sign(MESSAGE)
+    assert str(plain.value).startswith("the key returned no signature for ") and "Touch ID" not in str(plain.value)
+    monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)
+    rig.fake.plan, rig.fake.signs = ["empty", "empty"], 0
+    with pytest.raises(KeyError_) as touch:
+        rig.sign(MESSAGE)
+    assert str(touch.value).startswith("the key returned no signature (Touch ID gave nothing back) for ")
+
+
+@pytest.mark.parametrize("plan", [["empty", 0x21], [0x21, "empty"]], ids=["empty-then-bad", "bad-then-empty"])
+def test_a_mixed_outcome_names_both_and_keeps_the_phone_guidance(rig, plan):
+    rig.fake.plan = list(plan)
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 2
+    assert "one attempt returned no signature" in text and "the other returned a signature that did not verify" in text
+    first_empty = plan[0] == "empty"
+    assert ("attempt 1 returned no signature" in text) == first_empty
+    assert ("attempt 2 returned no signature" in text) == (not first_empty)
+    assert "empty ECDSA signature (r and s have zero length)" in text         # the empty one's own diagnosis
+    assert "try again" in text and "phone" in text and "nothing was signed" in text
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 2 and all(str(f) in text for f in files)
+    assert sorted(json.loads(f.read_text())["reason"] is None for f in files) == [False, True]
