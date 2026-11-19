@@ -1,4 +1,4 @@
-"""S2 route pinning at render (CONTRACT §3.3 / §3.5 ROUTE PINNING, T:3c/test_route_pinned_across_new_generation).
+"""S2 route pinning at render (CONTRACT §3.5 ROUTE PINNING, T:3c/test_route_pinned_across_new_generation).
 
 A ticketed brokered session's front policy (``R/gw/slot<n>/session.json``) is written from the generation file its
 ticket is pinned to (``L/routes/dispatch/<gen>.json``), never the base map and never a later generation: the entry's

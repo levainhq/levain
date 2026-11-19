@@ -851,7 +851,7 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     routes (:func:`front_session_routes` over ``L/routes/base.json``) and the incarnation, the lease's ``lease_seq``
     (render (2)'s DECISION). The front's own parser (``levain.broker.front.load_policy``) reads them here first: a
     file it would refuse is ``front-policy-refused``. A ticketed brokered session's route entry is its PINNED generation's
-    (CONTRACT §3.3 ROUTE PINNING, :func:`pinned_route_entry`), the rest of its routes the base map's."""
+    (CONTRACT §3.5 ROUTE PINNING, :func:`pinned_route_entry`), the rest of its routes the base map's."""
     # on the call: the front's import closure (asyncio, h11) stays out of every other verb's start
     from levain.broker import front as FR
 
@@ -929,7 +929,7 @@ class TicketPin:
 
 
 def ticket_pin(a: R.Alloc) -> Optional[TicketPin]:
-    """CONTRACT §3.3 ROUTE PINNING: the pin of a ticketed egress session (dispatch or planner) from alloc's ticket
+    """CONTRACT §3.5 ROUTE PINNING: the pin of a ticketed egress session (dispatch or planner) from alloc's ticket
     facts; None for a session with no ticket and for a PASSTHROUGH ticket (c7.14), which names no dispatch-map route,
     so there is nothing to pin (its front file is the base map's passthrough entry plus the ticket's limits). Facts
     that do not carry the pin whole are ``ticket-facts-missing``."""
