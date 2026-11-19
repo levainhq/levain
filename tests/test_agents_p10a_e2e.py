@@ -482,10 +482,10 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
             assert r.out.endswith("revoke landed at seq 6; the bar is closed\n")
             if a.rc == 1:
                 assert a.err == f"levain agents revoke: no open revoke for {agent_id}; nothing to abandon\n"
-                seen.add(honest("revoke_vs_abandon", races.REVOKE_FIRST))
+                seen.add(honest("revoke_vs_abandon", name=races.REVOKE_FIRST))
             else:
                 assert (a.rc, a.out) == (0, "the revoke had already landed at seq 6; nothing to abandon\n"), a
-                seen.add(honest("revoke_vs_abandon", races.ABANDON_LOST_CLOSE))
+                seen.add(honest("revoke_vs_abandon", name=races.ABANDON_LOST_CLOSE))
             assert inst.cli("dream", "start").rc == 1                      # the revoke stands: nothing arms
         else:
             assert bar["reason"] == "abandoned" and bar["revoke_seq"] is None
@@ -494,7 +494,7 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
                 assert r.out.endswith("the revoke was abandoned; nothing was appended; the agent is NOT revoked\n")
                 assert a.out.endswith(("is closed; nothing was appended\n",
                                        "a revoke that already landed stands, and the next tick records it\n")), a
-                seen.add(honest("revoke_vs_abandon", races.ABANDON_FIRST))
+                seen.add(honest("revoke_vs_abandon", name=races.ABANDON_FIRST))
                 assert inst.cli("dream", "start").rc == 0                  # the links stand as signed
             else:
                 # the abandon closed the bar after the revoke's append and before its close (agent_authority._landed,
@@ -502,7 +502,7 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
                 assert ops == [(5, "create_grant"), (6, "revoke_agent")], ops
                 assert r.out.endswith("revoke landed at seq 6; the bar had been abandoned; it is recorded from_log at the "
                                       "next tick (R5)\n"), r
-                seen.add(honest("revoke_vs_abandon", races.ABANDON_BETWEEN))
+                seen.add(honest("revoke_vs_abandon", name=races.ABANDON_BETWEEN))
                 assert inst.cli("dream", "start").rc == 1                  # the revoke stands: nothing arms
         if seen - {races.REVOKE_FIRST}:
             break
@@ -543,11 +543,11 @@ def test_p10a_revoke_racing_a_renewal(tmp_path):
             assert ops == [(5, "create_grant"), (6, "renew"), (7, "revoke_agent")] and bar["revoke_seq"] == 7
             assert rn.out.startswith(f"renewed: {link} at seq 6, until ") and rv.out.endswith(
                 "revoke landed at seq 7; the bar is closed\n")
-            outcomes.append(honest("revoke_vs_renew", races.RENEW_THEN_REVOKE))
+            outcomes.append(honest("revoke_vs_renew", name=races.RENEW_THEN_REVOKE, link=link))
         else:
             assert ops == [(5, "create_grant"), (6, "revoke_agent")] and bar["revoke_seq"] == 6
             assert rn.rc == 1, rn
-            outcomes.append(honest("revoke_vs_renew", rn.err, link=link))             # one of the honest refusals, in full
+            outcomes.append(honest("revoke_vs_renew", text=rn.err, link=link))             # one of the honest refusals, in full
             assert rn.out == "" and rv.out.endswith("revoke landed at seq 6; the bar is closed\n"), (rn, rv)
         assert inst.cli("dream", "start").rc == 1                           # the revoke stands whichever landed first
     # no runner can be made to land the renew first (or second): every try asserted the end state of whichever
@@ -742,7 +742,7 @@ def test_p10a_counters_at_their_ceiling(tmp_path):
     # the loser's text is one of the honest set of race "start_for_the_one_place" (tests/_p10a_races.py), all "started
     # nothing"; only the skipped-overlap claim leaves a second row (its own), every other member leaves none
     oid = launched["occurrence_id"]
-    loser = honest("start_for_the_one_place", losses[0].err, oid=oid)
+    loser = honest("start_for_the_one_place", text=losses[0].err, oid=oid)
     assert losses[0].out == "", losses[0]
     states = sorted(r["state"] for r in inst.rows())
     assert states == (["launched", "skipped-overlap"] if loser == races.OVERLAP else ["launched"]), states
@@ -837,7 +837,7 @@ def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
     new = rows[1]["occurrence_id"]
     # each racer's stderr is one member of the honest set of race "tick_duplicate_delivery" (tests/_p10a_races.py);
     # exactly one racer ends the row itself
-    named = [honest("tick_duplicate_delivery", r.err, oid=new) for r in racers]
+    named = [honest("tick_duplicate_delivery", text=r.err, oid=new) for r in racers]
     assert named.count(races.TICK_WON) == 1, [r.err for r in racers]
     assert [r.out for r in racers] == ["", "", ""]
     assert [r["state"] for r in rows] == ["skipped-no-input", "skipped-no-input"]       # every branch: both slots ended, none launched

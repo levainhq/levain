@@ -9,8 +9,14 @@ THE RULE FOR THE SETS: every member is DERIVED from what the product code can re
 one). A set is never widened to make a red pass: a member needs a code path. A real defect (two cards, a double debit,
 a lost claim, a second revoke in the log) is in no set; those stay the tests' own non-outcome assertions.
 
-An observation is the member's ``name`` (for a race whose outcome the test classifies from the end state) or the text a
-process printed (matched in full against the member's ``text``, which may use the race's ``ctx``, e.g. the occurrence id).
+Two kinds of observation, two calls, never mixed: ``assert_honest(race, name=...)`` for an outcome the test classifies
+from the end state (only a member with no ``text`` can answer it), and ``assert_honest(race, text=..., **ctx)`` for what
+a process printed (matched in full against a member's ``text``, which may use the race's ``ctx``, e.g. the occurrence
+id). A printed line equal to a member's name is therefore not an outcome. A race whose members are all name-classified
+(revoke_vs_abandon) is guarded by the end-state asserts of its test, not by this table: the name a test passes there is
+a member's own, so the table pins the set and its producing symbols, not the classification.
+
+Known limit: a ``where`` token proves the symbol exists in the file, not that the path is reachable.
 """
 from __future__ import annotations
 
@@ -28,13 +34,14 @@ class Outcome:
     where: tuple[Where, ...]
     text: Text | None = None
 
-    def matches(self, observed: str, ctx: dict) -> bool:
-        if observed == self.name:
-            return True
+    def matches_name(self, name: str) -> bool:
+        return self.text is None and name == self.name
+
+    def matches_text(self, text: str, ctx: dict) -> bool:
         if self.text is None:
             return False
         want = self.text(ctx)
-        return bool(want.fullmatch(observed)) if isinstance(want, re.Pattern) else observed == want
+        return bool(want.fullmatch(text)) if isinstance(want, re.Pattern) else text == want
 
 
 # ------------------------------------------------------------------------------- revoke racing an abandon (c6/c8)
@@ -142,15 +149,36 @@ RACES: dict[str, tuple[Outcome, ...]] = {
 }
 
 
-def assert_honest(race: str, observed: str, **ctx) -> str:
-    """Pass when ``observed`` (a member's name, or a printed text) is in ``race``'s set; return the member's name so a
-    test can check the end state that member implies. Fail naming the race, the observation and the full set."""
+# the ctx keys a race's member texts read: a call for the race must supply all of them
+NEEDS: dict[str, tuple[str, ...]] = {
+    "revoke_vs_abandon": (),
+    "revoke_vs_renew": ("link",),
+    "start_for_the_one_place": ("oid",),
+    "tick_duplicate_delivery": ("oid",),
+}
+assert NEEDS.keys() == RACES.keys()
+
+
+def assert_honest(race: str, *, name: str | None = None, text: str | None = None, **ctx) -> str:
+    """Pass when the observation is in ``race``'s set; return the member's name so a test can check the end state that
+    member implies. Give exactly one of ``name`` (an outcome the test classified; a text member refuses it) or ``text``
+    (what a process printed; a name-only member refuses it, and so does a member's name). Fail naming the race, the
+    observation and the full set."""
     if race not in RACES:
         raise AssertionError(f"p10a race {race!r} has no honest-outcome set: add it to tests/_p10a_races.py RACES "
                              f"(known: {sorted(RACES)})")
+    if (name is None) == (text is None):
+        raise AssertionError(f"p10a race {race!r}: give exactly one of name= (a classified outcome) or text= (printed "
+                             f"output), got name={name!r} text={text!r}")
+    missing = [k for k in NEEDS[race] if k not in ctx]
+    if missing:
+        raise AssertionError(f"p10a race {race!r}: missing ctx key(s) {missing}; the race needs {list(NEEDS[race])}, "
+                             f"got {sorted(ctx)}")
     for member in RACES[race]:
-        if member.matches(observed, ctx):
+        if (member.matches_name(name) if name is not None else member.matches_text(text, ctx)):
             return member.name
     shown = [m.name if m.text is None else f"{m.name}: {m.text(ctx)!r}" for m in RACES[race]]
-    raise AssertionError(f"p10a race {race!r}: observed {observed!r}, which is not one of its {len(shown)} honest "
+    observed = name if name is not None else text
+    kind = "name" if name is not None else "text"
+    raise AssertionError(f"p10a race {race!r}: observed {kind} {observed!r}, which is not one of its {len(shown)} honest "
                          f"outcomes:\n  " + "\n  ".join(shown))
