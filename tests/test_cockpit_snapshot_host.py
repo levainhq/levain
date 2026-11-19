@@ -713,6 +713,19 @@ class TestAttachTellsTheCadence:
         finally:
             host.stop()
 
+    def test_the_down_threshold_scales_with_the_cadence_so_a_slow_host_still_reads_stale_between_live_and_down(
+        self, tmp_path: Path
+    ) -> None:
+        from datetime import timedelta
+
+        ck, host, box, t0 = self._attached(tmp_path, 5.0)
+        try:
+            for gap, worker in ((15, "live"), (16, "stale"), (100, "stale"), (150, "stale"), (151, "down")):
+                box["now"] = t0 + timedelta(seconds=gap)
+                assert ck.worker_health()["worker"] == worker, gap
+        finally:
+            host.stop()
+
     def test_the_default_cadence_is_the_engine_s_and_reads_stale_after_three_of_its_beats(self, tmp_path: Path) -> None:
         from datetime import timedelta
 

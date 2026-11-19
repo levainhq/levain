@@ -1477,12 +1477,17 @@ class Cockpit:
                 if self._reader is reader:
                     return
                 raise RuntimeError("this cockpit is already attached to a snapshot reader")
+            # validated and normalised before anything is assigned: a refused attach leaves the cockpit as it was
+            cadence: float | None = None
+            if heartbeat_cadence_s is not None:
+                if (isinstance(heartbeat_cadence_s, bool) or not isinstance(heartbeat_cadence_s, (int, float))
+                        or not math.isfinite(heartbeat_cadence_s) or heartbeat_cadence_s <= 0):
+                    raise ValueError("a heartbeat cadence is a finite positive number of seconds")
+                cadence = float(heartbeat_cadence_s)
             self._host_deriving, self._host_pending = deriving, pending
             self._host_dirty, self._host_state = dirty, host_state
-            if heartbeat_cadence_s is not None:
-                if not (isinstance(heartbeat_cadence_s, (int, float)) and heartbeat_cadence_s > 0):
-                    raise ValueError("a heartbeat cadence is a positive number of seconds")
-                self._heartbeat_cadence_s = float(heartbeat_cadence_s)
+            if cadence is not None:
+                self._heartbeat_cadence_s = cadence
             self._reader = reader
 
     @property
@@ -1596,7 +1601,13 @@ class Cockpit:
         cadence = HEARTBEAT_CADENCE_S if self._heartbeat_cadence_s is None else self._heartbeat_cadence_s
         if age <= WORKER_LIVE_FACTOR * cadence:
             return "live", age
-        return ("stale" if age <= WORKER_DOWN_AFTER_S else "down"), age
+        return ("stale" if age <= self._down_after_s() else "down"), age
+
+    def _down_after_s(self) -> float:
+        """The heartbeat age past which a worker is down. It grows with a cadence slower than the default, so a slow host
+        still has a stale band between live and down; a quicker one never shortens it."""
+        cadence = HEARTBEAT_CADENCE_S if self._heartbeat_cadence_s is None else self._heartbeat_cadence_s
+        return max(WORKER_DOWN_AFTER_S, WORKER_DOWN_AFTER_S * cadence / HEARTBEAT_CADENCE_S)
 
     def _fresh_of(self, spec: ProviderSpec, row: Any, meta: Mapping[str, str], now_s: float) -> _Fresh:
         """Whether a published row is stale. The rule is the contract's reader rule plus the cold-start one: serving a

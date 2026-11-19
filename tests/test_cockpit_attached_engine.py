@@ -313,6 +313,29 @@ def test_the_worker_is_live_within_three_beats_stale_to_the_bound_then_down(rig:
         assert rig.snap("alpha").fresh_info.stale == (worker != "live")
 
 
+def test_the_default_cadence_keeps_its_bands_a_larger_cadence_scales_the_down_threshold_with_it(rig: Rig) -> None:
+    assert rig.ck._down_after_s() == engine.WORKER_DOWN_AFTER_S
+    rig.ck._heartbeat_cadence_s = engine.HEARTBEAT_CADENCE_S / 4        # a quicker beat never shortens the bound
+    assert rig.ck._down_after_s() == engine.WORKER_DOWN_AFTER_S
+    rig.ck._heartbeat_cadence_s = engine.HEARTBEAT_CADENCE_S * 5
+    assert rig.ck._down_after_s() == engine.WORKER_DOWN_AFTER_S * 5
+
+
+@pytest.mark.parametrize("cadence", [0, -1.0, True, False, float("inf"), float("nan"), "2", object()])
+def test_a_rejected_heartbeat_cadence_leaves_the_cockpit_exactly_as_it_was(tmp_path: Path, cadence: Any) -> None:
+    r = Rig(tmp_path, attach=False)
+    try:
+        names = [n for n in vars(r.ck) if n.startswith("_host_")] + ["_reader", "_heartbeat_cadence_s"]
+        before = {n: getattr(r.ck, n) for n in names}
+        assert len(before) >= 6
+        with pytest.raises(ValueError):
+            r.ck.attach_snapshots(r.reader, deriving=lambda: [], pending=lambda p: False, dirty=lambda i, g: None,
+                                  host_state=lambda: {}, heartbeat_cadence_s=cadence)
+        assert {n: getattr(r.ck, n) for n in names} == before and not r.ck.attached
+    finally:
+        r.close()
+
+
 def test_a_host_that_states_its_health_is_believed_and_a_garbled_answer_falls_back_to_the_file(tmp_path: Path) -> None:
     told: dict[str, Any] = {"worker": "down", "heartbeat_age_s": 99.0}
     r = Rig(tmp_path, host_state=lambda: told)
