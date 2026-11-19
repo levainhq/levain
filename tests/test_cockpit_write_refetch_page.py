@@ -291,6 +291,30 @@ cases.two_native_panels_ask_one_board_read = async () => {
   ok(env.manifestGets(getsBefore) === 1, "one board read for two native panels: " + JSON.stringify(env.gets.slice(getsBefore)));
 };
 
+// L2#5: every touched panel repaints in place, no fallback is asked, yet a board read that began before the write is still out
+// and would draw the pre-write board over the rows: one re-read is owed after it.
+cases.a_board_read_in_flight_when_the_write_lands_is_re_read_after_it = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
+  const getsBefore = env.gets.length;
+  env.holdManifest();
+  env.startPassiveLoad();
+  await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read is in flight");
+  await env.snooze();
+  await env.tick();
+  env.releaseManifest();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 2, "a second board read followed the in-flight one: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+cases.no_board_read_in_flight_means_no_board_read_for_an_in_place_write = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 0, "no board read: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
 (async () => {
   for (const name of Object.keys(cases)) {
     if (only && name !== only) continue;
@@ -316,6 +340,8 @@ CASES = [
     "a_write_from_an_open_form_reads_the_board_non_passively",
     "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
     "two_native_panels_ask_one_board_read",
+    "a_board_read_in_flight_when_the_write_lands_is_re_read_after_it",
+    "no_board_read_in_flight_means_no_board_read_for_an_in_place_write",
 ]
 
 

@@ -1122,9 +1122,14 @@
   }
 
   // after a landed write: with the panels it touched, an in-place background refetch of those (resolves at once, true when
-  // started); without (an older server), the reload of the whole board, deferring while an async job polls (as postWrite does)
+  // started); without (an older server), the reload of the whole board, deferring while an async job polls (as postWrite does).
+  // A board read already out when the write lands began before it and may draw the pre-write board over the rows the refetches
+  // paint, so one re-read is latched after it (the latch a non-passive load sets when it finds one in flight).
   async function afterWrite(touched) {
-    if (touched) return refetchTouched(touched);
+    if (touched) {
+      if (inflight) pendingReload = true;
+      return refetchTouched(touched);
+    }
     if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
       deferredReload = true;
       return undefined;
