@@ -437,8 +437,11 @@ class _State:
     fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
     read: Any = None                              # the registering spec's provider: a state belongs to ONE generation
     # an on-demand panel's last good snapshot, shared by every read that arrives soon after it: (snap, monotonic time the
-    # read COMMITTED, the read-cache generation when that read STARTED). ``_snap_for`` alone reads it.
-    recent: "tuple[_Snap, float, int] | None" = None
+    # read BEGAN, monotonic time it COMMITTED, the read-cache generation when it began). ``_recent_snap`` alone reads it.
+    recent: "tuple[_Snap, float, float, int] | None" = None
+    # every committed read, good or not: (snap, monotonic time it began), so a caller can tell which flight it joined
+    last_read: "tuple[_Snap, float] | None" = None
+    commits: int = 0      # committed reads so far: part of the panel route's cache key (``Cockpit.panel``)
 
 
 class _Flight:
@@ -1426,7 +1429,9 @@ class Cockpit:
         """Read a panel's source through the one flight (design §3.4). ``produce`` runs the provider and
         turns its output into a snapshot (or a Fault) in the worker; ``commit`` is the owner's
         bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
-        gen = self._rc_gen       # taken before the read starts: a write after this point makes the read's snapshot unsharable
+        # both taken before the read starts: a write after this point makes the read's snapshot unsharable, and a reader that
+        # needs a read begun after some instant (``_snap_for``'s ``read_after``) compares against ``begun``
+        gen, begun = self._rc_gen, time.monotonic()
 
         def produce() -> Any:
             if spec is self._dec.spec:
@@ -1451,7 +1456,9 @@ class Cockpit:
                 st.snap = snap
                 st.last_completion = done_at or ctx.now
                 st.fresh = (snap.as_of, snap.status)
-                st.recent = (snap, time.monotonic(), gen) if shared else None
+                st.recent = (snap, begun, time.monotonic(), gen) if shared else None
+                st.last_read = (snap, begun)
+                st.commits += 1
             return snap
 
         def start() -> None:
@@ -1469,18 +1476,19 @@ class Cockpit:
         st = self._state.get(spec.id)
         return st if st is not None and st.read is spec.read else None
 
-    def _recent_snap(self, st: _State) -> _Snap | None:
+    def _recent_snap(self, st: _State, read_after: float | None = None) -> _Snap | None:
         """The on-demand panel's last good snapshot if a read may share it, else None (the caller reads afresh).
 
         One provider read serves every reader that arrives within ``read_cache_ttl_s`` after it COMMITTED: the manifest
-        that read it, the panel route a page sends right after that manifest, the change stream's watcher, and every
-        other open page whatever its credential (a snapshot holds no credential: heads, provenance and actions are
-        applied per request). The window is counted from the commit, not the start, so a read that took longer than
-        the window under load still serves the reads its own manifest triggers. It never outlives a write: the read
-        cache generation is taken when the read STARTS and must still be current, so a write admitted after that
-        start (``invalidate_reads``) sends every later reader to the provider, the same read-your-writes rule as the
-        shared read cache. Off where that cache is off (``read_cache_ttl_s`` None or 0). A failed read is never
-        shared (``_SHARED_STATUSES``)."""
+        that read it, the panel route a page sends right after that manifest, and every other open page whatever its
+        credential (a snapshot holds no credential: heads, provenance and actions are applied per request). The window
+        is counted from the commit, not the start, so a read that took longer than the window under load still serves
+        the reads its own manifest triggers. It never outlives a write: the read cache generation is taken when the read
+        STARTS and must still be current, so a write admitted after that start (``invalidate_reads``) sends every later
+        reader to the provider, the same read-your-writes rule as the shared read cache. A reader passing ``read_after``
+        (the change stream's watcher: a change another process made is visible to it only through a read begun after
+        its token moved) shares only a read that began at or after that instant. Off where that cache is off
+        (``read_cache_ttl_s`` None or 0). A failed read is never shared (``_SHARED_STATUSES``)."""
         ttl = self.read_cache_ttl_s or 0.0
         if ttl <= 0:
             return None
@@ -1488,18 +1496,29 @@ class Cockpit:
             recent = st.recent
         if recent is None:
             return None
-        snap, done, gen = recent
-        if gen != self._rc_gen or time.monotonic() - done > ttl:
+        snap, begun, done, gen = recent
+        if gen != self._rc_gen or time.monotonic() - done > ttl or (read_after is not None and begun < read_after):
             return None
         return snap
 
-    def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
+    def _snap_for(self, spec: ProviderSpec, ctx: ReadContext, read_after: float | None = None) -> _Snap:
+        """``read_after`` (a ``time.monotonic()`` instant) asks for an on-demand read BEGUN at or after it: no snapshot
+        read earlier is shared, and a call that joined a flight begun earlier reads once more (one flight runs at a time
+        per panel, so the second read cannot join an older one). A refresher panel serves its cycle's snapshot as ever."""
         st = self._state_of(spec)
         if st is None:
             return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
         if spec.refresh_every_s is None:
-            recent = None if ctx.fresh else self._recent_snap(st)    # a read that asked for a fresh look gets one
-            return recent if recent is not None else self._read_panel(spec, st, ctx)
+            recent = None if ctx.fresh else self._recent_snap(st, read_after)    # a read that asked for a fresh look gets one
+            if recent is not None:
+                return recent
+            snap = self._read_panel(spec, st, ctx)
+            if read_after is not None:
+                with st.lock:
+                    rec = st.last_read
+                if rec is not None and rec[0] is snap and rec[1] < read_after:
+                    snap = self._read_panel(spec, st, ctx)       # it joined a flight begun before ``read_after``
+            return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
         if snap is None:
@@ -2247,8 +2266,12 @@ class Cockpit:
         return compute()        # the owner failed or hung: this caller reads for itself
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None,
-                 transport: dict[str, Any] | None = None) -> dict[str, Any]:
-        """The manifest, shared. KEY = every input this composition reads from the request: the whole credential
+                 transport: dict[str, Any] | None = None, read_after: float | None = None) -> dict[str, Any]:
+        """``read_after`` (a ``time.monotonic()`` instant; the change stream's watcher passes its build's start) asks for
+        a manifest built only from on-demand reads BEGUN at or after it (``_snap_for``): it is never shared from or into
+        the cache below, and the reads it makes are the ones later page reads share.
+
+        Otherwise the manifest, shared. KEY = every input this composition reads from the request: the whole credential
         dict (class, name, device_class: it is also hashed into the etag and echoed in the body), ``install_class``
         and ``transport`` (both published in the body and hashed into the etag). Everything else it reads
         (authority, labels, verb view, the specs, the panel sources) is server-global state, not request state,
@@ -2256,16 +2279,18 @@ class Cockpit:
         request before it got here (a refused request never reaches the engine), so the cache never decides who
         may read; it only avoids repeating a compute for an identical, already-authorised asker. The returned dict
         is shared: read-only for every caller."""
-        if (self.read_cache_ttl_s or 0.0) <= 0:
-            return self._manifest_compute(credential, install_class=install_class, transport=transport)
+        if read_after is not None or (self.read_cache_ttl_s or 0.0) <= 0:
+            return self._manifest_compute(credential, install_class=install_class, transport=transport,
+                                          read_after=read_after)
         key = ("manifest", _read_key(credential), install_class, _read_key(transport))
         return self._shared_read(key, lambda: self._manifest_compute(credential, install_class=install_class,
                                                                      transport=transport))
 
     def _manifest_compute(self, credential: dict[str, Any], *, install_class: str | None = None,
-                          transport: dict[str, Any] | None = None) -> dict[str, Any]:
+                          transport: dict[str, Any] | None = None, read_after: float | None = None) -> dict[str, Any]:
         """``transport`` is the serving transport's write capability (``writable``,
-        ``write_token_required``), which only the server knows; it is published when given."""
+        ``write_token_required``), which only the server knows; it is published when given. ``read_after``: see
+        :meth:`manifest`."""
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         errors = self._ensure_discovered(ctx)
@@ -2279,7 +2304,7 @@ class Cockpit:
         # already its own bounded single flight over the one ReadContext, so nothing here shares more than a serial pass did).
         # Results are placed in drawing order; a read that raises propagates as it did when this ran in a loop.
         def read_head(spec: ProviderSpec) -> tuple[_Snap, dict[str, Any]]:
-            snap = self._snap_for(spec, ctx)
+            snap = self._snap_for(spec, ctx, read_after)
             return snap, self._head(spec, snap, credential["class"], ctx.today, auth, ctx.now)
         for spec, (snap, head) in zip(specs, self._parallel(read_head, specs)):
             snaps[spec.id], heads[spec.id] = snap, head
@@ -2394,7 +2419,11 @@ class Cockpit:
         # refuse a bad one, so it is checked here (the same QueryError, before the table is touched) and left out
         # of the key, instead of letting every distinct value mint its own entry
         check_query(None, limit)
-        key = ("panel", panel_id, profile, row, credential_class)
+        # and the panel's committed-read count: a read committed since an entry was stored (the change stream's watcher
+        # read the change it is about to announce) is a new key, so the page's refetch of an announced panel inside the
+        # window never gets the older body it cached itself
+        st = self._state.get(panel_id)
+        key = ("panel", panel_id, profile, row, credential_class, st.commits if st is not None else None)
         return self._shared_read(key, lambda: self._panel_compute(
             panel_id, profile=profile, q=q, row=row, credential_class=credential_class, limit=limit, at=at),
             keep=lambda v: v is not None)      # an unknown id is not stored: ids are caller-chosen

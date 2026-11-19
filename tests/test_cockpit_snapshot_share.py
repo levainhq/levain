@@ -108,6 +108,84 @@ def test_the_window_counts_from_the_commit_and_then_ends(ck, monkeypatch) -> Non
     assert n[PID] == 2
 
 
+def _external_cockpit(tmp_path: Path):
+    """A served-style cockpit (window on) with one on-demand panel ``od`` whose rows change WITHOUT a write through the
+    server (another process: a phone answer, a seat's log line), so nothing calls ``invalidate_reads``. ``hold`` parks a
+    provider call after it took its rows, until set."""
+    from levain.cockpit.engine import Read
+    from tests.test_cockpit_k1 import _install as _k1_install
+    from tests.test_cockpit_k1 import _simple
+
+    _r, src = _k1_install(tmp_path)
+    c = build_default_cockpit(src)
+    c.read_cache_ttl_s = 1.5
+    state = {"rows": [_row(1)], "reads": 0, "hold": None, "in_read": threading.Event()}
+
+    def read(ctx):
+        state["reads"] += 1
+        took = tuple(state["rows"])
+        hold = state["hold"]
+        if hold is not None:
+            state["in_read"].set()
+            assert hold.wait(10)
+        return Read(rows=took)
+
+    c.register(_simple("od", rows=(), read=read))
+    return c, state
+
+
+def _row(n: int):
+    from levain.cockpit.engine import RowIn
+    return RowIn(f"r{n}", f"row {n}", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": f"r{n}"})
+
+
+def test_the_watcher_build_never_answers_with_a_read_begun_before_it(tmp_path: Path) -> None:
+    # the stale-band-row timeline: a page read seeds the window, another process changes the store, the token moves and
+    # the watcher builds ONCE. Sharing the page's snapshot there would leave the etag where it was: no event until the
+    # next token move or the backstop
+    c, state = _external_cockpit(tmp_path)
+    page = c.panel("od", credential_class="none")
+    state["rows"] = [_row(1), _row(2)]
+    built = c.manifest(NONE, read_after=time.monotonic())
+    assert state["reads"] == 2
+    assert built["panels"]["od"]["etag"] != page["etag"]
+    # the page refetches what was announced, inside the panel cache's window of its own first read: it gets the
+    # watcher's read (a newer committed read is a new cache key), never its own cached older body, and no new read
+    assert c.panel("od", credential_class="none")["etag"] == built["panels"]["od"]["etag"]
+    assert state["reads"] == 2
+
+
+def test_a_watcher_that_joins_a_flight_begun_before_it_reads_again(tmp_path: Path) -> None:
+    c, state = _external_cockpit(tmp_path)
+    state["hold"] = hold = threading.Event()
+    page_out: list = []
+    page = threading.Thread(target=lambda: page_out.append(c.panel("od", credential_class="none")))
+    page.start()
+    assert state["in_read"].wait(10)                        # the page's read took the old rows and is still running
+    state["rows"] = [_row(1), _row(2)]                      # the other process's change lands
+    real, watcher_reads, joined = c._read_panel, [], threading.Event()
+
+    def watching(spec, st, ctx):
+        if spec.id == "od" and threading.current_thread().name != page.name:
+            watcher_reads.append(1)
+            joined.set()
+        return real(spec, st, ctx)
+
+    c._read_panel = watching                                 # type: ignore[method-assign]
+    out: list = []
+    w = threading.Thread(target=lambda: out.append(c.manifest(NONE, read_after=time.monotonic())))
+    w.start()
+    assert joined.wait(10)
+    time.sleep(0.2)                                          # the watcher is inside the page's flight now
+    state["hold"] = None
+    hold.set()
+    page.join(10)
+    w.join(10)
+    assert len(watcher_reads) == 2 and state["reads"] == 2
+    fresh = c.manifest(NONE, read_after=time.monotonic())["panels"]["od"]["etag"]
+    assert out[0]["panels"]["od"]["etag"] == fresh != page_out[0]["etag"]
+
+
 @pytest.mark.parametrize("ttl", [None, 0])
 def test_nothing_is_shared_where_the_read_cache_is_off(ck, monkeypatch, ttl) -> None:
     ck.read_cache_ttl_s = ttl

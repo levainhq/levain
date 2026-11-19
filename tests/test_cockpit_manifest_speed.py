@@ -18,9 +18,9 @@ def _timed_manifest(tmp_path: Path, monkeypatch, readers: int) -> tuple[float, i
     ck = build_default_cockpit(src)
     real = ck._snap_for
 
-    def slow(spec, ctx):
+    def slow(spec, ctx, read_after=None):
         time.sleep(PER_PANEL_S)      # a panel whose source takes its time
-        return real(spec, ctx)
+        return real(spec, ctx, read_after)
 
     monkeypatch.setattr(ck, "_snap_for", slow)
     monkeypatch.setattr(cockpit_engine, "_MANIFEST_READERS", readers)
