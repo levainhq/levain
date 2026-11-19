@@ -657,3 +657,29 @@ class TestConstructionFailure:
         with pytest.raises(RuntimeError, match="no plans"):
             SnapshotHost(Cockpit(), tmp_path)
         assert len(made) == 1 and made[0].was_closed
+
+
+class TestServerProbeTokenFault:
+    def test_a_watch_token_that_raises_does_not_stop_the_counter_following_the_engine(self) -> None:
+        eng = _EngineProbe()
+
+        def token() -> Any:
+            raise OSError("the store is gone")
+
+        probe = ServerProbe(lambda: eng, token, lambda: ({"bare": "1"}, None), slow_s=5.0, clock=lambda: 0.0)
+        a = probe.change_seq()
+        assert probe.change_seq() == a
+        eng.seq += 1
+        assert probe.change_seq() != a                  # publish_seq moved: the stream still sees it at once
+
+    def test_a_token_that_raises_is_read_as_no_token_so_the_counter_also_moves_once_per_slow_interval(self) -> None:
+        eng = _EngineProbe()
+        box = {"now": 0.0}
+
+        def token() -> Any:
+            raise OSError("the store is gone")
+
+        probe = ServerProbe(lambda: eng, token, lambda: ({"bare": "1"}, None), slow_s=5.0, clock=lambda: box["now"])
+        a = probe.change_seq()
+        box["now"] = 5.5
+        assert probe.change_seq() != a

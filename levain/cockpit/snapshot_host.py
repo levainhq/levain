@@ -457,7 +457,10 @@ class ServerProbe:
     def change_seq(self) -> int:
         probe = self._engine_probe()
         seq = probe.change_seq() if probe is not None else 0
-        token = self._token_fn()
+        try:
+            token = self._token_fn()
+        except Exception:  # noqa: BLE001 - a token that cannot be read is no token: the counter still follows the snapshots
+            token = None
         bucket = int(self._clock() // self._slow_s) if token is None else None
         return hash((seq, token, bucket))
 
