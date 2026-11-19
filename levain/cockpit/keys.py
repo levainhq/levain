@@ -898,7 +898,7 @@ _EMPTY_SIG_NEXT = "try again, or answer from your phone instead (open the cockpi
 
 def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
                         counter: int | None, detail: str, namespace: str, attempt: int,
-                        empty: bool = False, elapsed: float = 0.0) -> str:
+                        empty: bool = False, elapsed: float) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
     (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
