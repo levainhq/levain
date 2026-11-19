@@ -2176,8 +2176,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
 
     def _open_snapshot_host(self, cockpit: "Cockpit") -> None:
         """Attach ``cockpit`` to a snapshot host when attached mode is on and this server has a data root. A store that
-        cannot be opened leaves the cockpit on its own provider path, said once on stderr. The host is attached here and
-        started by the caller."""
+        cannot be opened leaves the cockpit on its own provider path, said once on stderr. The host is attached and
+        started here, then the open waits (bounded) for the host's first discovery cycle."""
         if not self.snapshots_on:
             return
         if getattr(cockpit, "attached", False):
@@ -2199,14 +2199,16 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             print(f"cockpit: snapshots not attached ({reason}); serving from the providers", file=sys.stderr, flush=True)
             return
         try:
-            # discovery runs once, bounded, before the cockpit reads this host's rows: a relaunched serve answers a
-            # discovered panel from the last run's row at once rather than "unknown panel" until the first cycle
-            host.prime_discovery()
             host.attach()
+            host.start()
         except BaseException:
             host.stop()         # the host holds the store's writer lock from its construction: a failed attach gives it back
             raise
         self._snapshot_host = host
+        # the host's own first discovery cycle is the only discovery. Waiting for it, bounded, lets a relaunched serve
+        # answer a discovered panel from the last run's row at once rather than "unknown panel" until that cycle lands;
+        # a discoverer slower than the bound does not hold the open, and the cycle takes its panels in when it finishes
+        host.wait_first_discovery()
 
     def _watch_manifest(self) -> dict[str, Any]:
         # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token), so the
@@ -2313,8 +2315,6 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 self._open_snapshot_host(built)     # attached before start: an attached cockpit starts no refreshers
                 try:
                     built.start()
-                    if self._snapshot_host is not None:
-                        self._snapshot_host.start()
                 except BaseException:
                     if self._snapshot_host is not None:
                         self._snapshot_host.stop()
@@ -6697,9 +6697,7 @@ def make_server(
                 notes=httpd.note_store,                         # and what they tell him (notes)
                 # the Work board, unless a provider brings its own or the embedder asked for none (work_board=False)
                 board=(lambda: _board_value(httpd, stamped=False)) if httpd.work_board else None)
-            httpd._open_snapshot_host(cockpit)      # the caller starts its own cockpit; the host starts here
-            if httpd._snapshot_host is not None:
-                httpd._snapshot_host.start()
+            httpd._open_snapshot_host(cockpit)      # the caller starts its own cockpit; the host starts inside the open
     except BaseException:
         # the cockpit put itself back (attach_server); this server's pin is released: it never served
         try:

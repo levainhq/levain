@@ -600,13 +600,15 @@ class TestServerProbeWiring:
 
 
 class TestTheServerDiscoversOnceBeforeItAttaches:
-    def _serve(self, tmp_path: Path, monkeypatch, gate: "threading.Event | None" = None):
+    def _serve(self, tmp_path: Path, monkeypatch, gate: "threading.Event | None" = None, runs: "list[int] | None" = None):
         _env(monkeypatch, "1")
         _root, src = _install(tmp_path)
         httpd = make_server(src, host="127.0.0.1", port=0)
         ck = Cockpit()
 
         def discoverer(ctx: Any) -> list:
+            if runs is not None:
+                runs.append(1)
             if gate is not None:
                 gate.wait(30)
             return [_simple("found", rows=[_row(1)])]
@@ -623,17 +625,20 @@ class TestTheServerDiscoversOnceBeforeItAttaches:
         finally:
             httpd.server_close()
 
-    def test_a_slow_discoverer_does_not_hold_the_open_past_the_bound(self, tmp_path: Path, monkeypatch) -> None:
+    def test_a_slow_discoverer_does_not_hold_the_open_past_the_bound_and_runs_once(self, tmp_path: Path, monkeypatch) -> None:
         from levain.cockpit import snapshot_host as sh
 
         monkeypatch.setattr(sh, "FIRST_DISCOVERY_BOUND_S", 0.2)
         gate = threading.Event()
-        httpd, ck = self._serve(tmp_path, monkeypatch, gate)
+        runs: list[int] = []
+        httpd, ck = self._serve(tmp_path, monkeypatch, gate, runs)
         try:
             began = time.monotonic()
             httpd._open_snapshot_host(ck)
             assert time.monotonic() - began < 5.0
             assert httpd._snapshot_host is not None and ck.attached and "found" not in ck.panel_ids
+            assert not [t for t in threading.enumerate() if "first-discovery" in t.name]
         finally:
             gate.set()
             httpd.server_close()
+        assert len(runs) == 1

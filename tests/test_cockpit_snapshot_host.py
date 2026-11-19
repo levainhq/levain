@@ -727,14 +727,17 @@ class TestAttachTellsTheCadence:
 
 
 class TestFirstDiscovery:
-    """After a restart the discovered panels must answer at once from the last run's rows, not wait for the first cycle."""
+    """After a restart the discovered panels must answer at once from the last run's rows. The host's own first discovery
+    cycle is the only discovery; opening waits for it, bounded."""
 
-    def _cockpit(self, calls: Calls, gate: "threading.Event | None" = None) -> Cockpit:
+    def _cockpit(self, calls: Calls, gate: "threading.Event | None" = None, runs: "list[int] | None" = None) -> Cockpit:
         ck = Cockpit()
         ck.register(_recorded("fixed", calls))
         found = _recorded("found", calls)
 
         def discoverer(ctx: Any) -> list:
+            if runs is not None:
+                runs.append(1)
             if gate is not None:
                 gate.wait(30)
             return [found]
@@ -750,43 +753,59 @@ class TestFirstDiscovery:
         assert first.reader.read("found") is not None
         first.stop()
 
-    def test_a_restarted_host_answers_a_discovered_panel_at_once_after_the_first_discovery(self, tmp_path: Path) -> None:
+    def test_a_restarted_host_answers_a_discovered_panel_at_once_after_the_wait(self, tmp_path: Path) -> None:
         self._a_run_that_left_a_row_for_the_discovered_panel(tmp_path)
         ck = self._cockpit(Calls())
         host = SnapshotHost(ck, tmp_path)
         try:
             assert "found" not in ck.panel_ids                 # before: the panel is not known yet
-            assert host.prime_discovery() is True
             host.attach()
+            host.start()
+            assert host.wait_first_discovery(10.0) is True
             assert "found" in ck.panel_ids and "found" in _plan_map(host)
             answer = ck.panel("found")
             assert answer is not None and answer["rows"]       # the last run's row, served at once
         finally:
             host.stop()
 
-    def test_a_discoverer_slower_than_the_bound_does_not_hold_the_open(self, tmp_path: Path, monkeypatch) -> None:
-        from levain.cockpit import snapshot_host as sh
+    def test_a_discoverer_slower_than_the_bound_does_not_hold_the_wait_and_runs_once(self, tmp_path: Path) -> None:
+        gate = threading.Event()
+        runs: list[int] = []
+        ck = self._cockpit(Calls(), gate, runs)
+        host = SnapshotHost(ck, tmp_path)
+        try:
+            host.attach()
+            host.start()
+            began = time.monotonic()
+            assert host.wait_first_discovery(0.3) is False
+            assert time.monotonic() - began < 5.0
+            assert "found" not in ck.panel_ids                 # the open goes on; the cycle finds the panel later
+        finally:
+            gate.set()
+            host.stop()
+        assert len(runs) == 1                                  # the one discovery the host's own cycle makes
 
-        monkeypatch.setattr(sh, "FIRST_DISCOVERY_BOUND_S", 0.2)
+    def test_no_thread_named_for_the_old_primer_exists(self, tmp_path: Path) -> None:
         gate = threading.Event()
         ck = self._cockpit(Calls(), gate)
         host = SnapshotHost(ck, tmp_path)
         try:
-            began = time.monotonic()
-            assert host.prime_discovery() is False
-            assert time.monotonic() - began < 5.0
-            host.attach()                                      # the open goes on; the cycle finds the panel later
-            assert "found" not in ck.panel_ids
+            assert not hasattr(host, "prime_discovery")
+            host.attach()
+            host.start()
+            assert host.wait_first_discovery(0.2) is False
+            assert not [t for t in threading.enumerate() if "first-discovery" in t.name]
         finally:
             gate.set()
             host.stop()
 
-    def test_a_discoverer_that_raises_does_not_stop_the_open(self, tmp_path: Path) -> None:
+    def test_a_discoverer_that_raises_still_ends_the_wait(self, tmp_path: Path) -> None:
         ck = Cockpit()
         ck.discover(lambda ctx: 1 / 0)
         host = SnapshotHost(ck, tmp_path)
         try:
-            assert host.prime_discovery() is True
             host.attach()
+            host.start()
+            assert host.wait_first_discovery(10.0) is True
         finally:
             host.stop()

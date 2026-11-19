@@ -262,10 +262,9 @@ DISCOVER_ID = PSEUDO_PREFIX + "discover"
 ENTITY_ID = PSEUDO_PREFIX + "entity"
 # Every thread a host starts has a name with this prefix, so a test can tell derive threads from request threads.
 DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
-# How long opening a host waits for the first discovery (seconds). A discoverer slower than this is left to finish on its
-# own and the host's own cycle picks its panels up: opening never waits longer for it.
+# How long opening a host waits for its loop's first discovery cycle (seconds). A discoverer slower than this is left to
+# finish inside that cycle, which picks its panels up when it lands: opening never waits longer for it.
 FIRST_DISCOVERY_BOUND_S = 3.0
-FIRST_DISCOVERY_THREAD_NAME = "levain-cockpit-first-discovery"
 
 
 def _one_line(exc: BaseException) -> str:
@@ -297,6 +296,7 @@ class SnapshotHost:
         self._lock = threading.Lock()
         self._started = False
         self._closed = False
+        self._first_discovery = threading.Event()
         self._poll_s = _engine().HEARTBEAT_CADENCE_S if poll_s is None else poll_s
         path = Path(data_root) / DB_FILENAME
         self._writer = SnapshotWriter(path)
@@ -370,9 +370,12 @@ class SnapshotHost:
         return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None)
 
     def _derive_discovery(self) -> DeriveResult:
-        ids = self._cockpit.run_discovery()
-        self._loop.set_plans(self._plans())     # the panel set may have changed: new plans in, retired ones out
-        return DeriveResult("ok", {"v": BODY_VERSION, "panels": sorted(ids)})
+        try:
+            ids = self._cockpit.run_discovery()
+            self._loop.set_plans(self._plans())     # the panel set may have changed: new plans in, retired ones out
+            return DeriveResult("ok", {"v": BODY_VERSION, "panels": sorted(ids)})
+        finally:
+            self._first_discovery.set()             # the first run's end, success or failure, is what opening waits for
 
     def _derive_entity(self) -> DeriveResult:
         value = self._cockpit.read_entity()
@@ -397,27 +400,13 @@ class SnapshotHost:
             heartbeat_cadence_s=self._poll_s if self._poll_s > 0 else None,      # the reader judges the worker live by the beat this host really keeps
         )
 
-    def prime_discovery(self, bound_s: "float | None" = None) -> bool:
-        """Run the cockpit's discovery once, waiting at most ``bound_s`` (``FIRST_DISCOVERY_BOUND_S``), and plan the panels it
-        registered. A relaunched serve then knows its discovered panels, and answers them from the last run's rows, before the
-        loop's first discovery cycle. True when discovery finished inside the bound. A discoverer that is slower is left
-        running on its own thread and the loop's cycle takes its panels in later; one that fails is the cycle's to report."""
+    def wait_first_discovery(self, bound_s: "float | None" = None) -> bool:
+        """Wait at most ``bound_s`` (``FIRST_DISCOVERY_BOUND_S``) for the loop's own first discovery cycle to finish, whether
+        it succeeded or failed. The host never runs discovery anywhere else, so it runs once. True when the cycle finished
+        inside the bound: a relaunched serve then knows its discovered panels and answers them from the last run's rows.
+        False when a slower discoverer is still running: the cycle takes its panels in when it lands."""
         bound = FIRST_DISCOVERY_BOUND_S if bound_s is None else bound_s
-        done = threading.Event()
-
-        def run() -> None:
-            try:
-                self._cockpit.run_discovery()
-            except Exception:  # noqa: BLE001 - the loop's own discovery cycle runs it again and says what failed
-                pass
-            finally:
-                done.set()
-
-        threading.Thread(target=run, name=FIRST_DISCOVERY_THREAD_NAME, daemon=True).start()
-        if not done.wait(bound):
-            return False
-        self._loop.set_plans(self._plans())
-        return True
+        return self._first_discovery.wait(bound)
 
     def _deriving_panels(self) -> list[str]:
         # the loop is busy with the host's two pseudo-plans too; the cockpit's word is about panels
