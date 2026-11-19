@@ -216,12 +216,25 @@ def test_unreadable_usage_cause_iii_a_fire_sigkilled_mid_compose_settles_whole_p
     assert pic["stub_calls"] == 1
 
 
+def _make_child_unprovable(inst: Install, row: dict) -> None:
+    """The fire is dead, so progress.json has no writer: record a command line the live child does not have (same pid,
+    same start time, other argv), the case recovery refuses to call ended or to signal (levain#131: a ``#!`` stub
+    child whose recorded argv IS what ``ps`` shows behind its interpreter is now provable, so this is how a child the
+    recovery cannot prove is made)."""
+    prog = inst.anneal / "dream" / row["occurrence_id"] / "progress.json"
+    doc = json.loads(prog.read_text())
+    doc["child_argv"] = [*doc["child_argv"], "--not-the-recorded-argument"]
+    prog.write_text(json.dumps(doc))
+
+
 def test_unreadable_usage_cause_iii_with_the_compose_child_still_alive_nothing_is_debited_until_it_is_ended(tmp_path):
-    """The fire is SIGKILLed but the stub (compose child) keeps running. The tick past ``stop_at`` cannot prove the
+    """The fire is SIGKILLed but the compose child keeps running, and its identity cannot be proven (the recorded
+    command line is not the one it has). The tick past ``stop_at`` cannot prove the
     child ended, so it settles NOTHING: the row stays launched holding its slot, the reservation stays open (no zero is
     debited), and an attention line names the group. Once the group is gone the next tick settles it whole, unreadable."""
     inst, row, child = _sigkill_mid_compose(tmp_path)
     occ = row["occurrence_id"]
+    _make_child_unprovable(inst, row)
     try:
         first = _tick(inst, 61)
         print("\n[alive] tick 1:", first.rc, repr(first.text))
@@ -245,6 +258,26 @@ def test_unreadable_usage_cause_iii_with_the_compose_child_still_alive_nothing_i
     finally:
         _kill_group(child)
     assert f"attention resolved [agent-stop-unconfirmed:{occ}]" in second.text
+    assert pic["row"] == ("stopped", "stop_at")
+    assert pic["res"] == ("settled", RESERVED, RESERVED, "unreadable")
+    assert pic["agent"][0] == "active" and pic["slots"] == [] and pic["usage"] is None
+    assert pic["cards"]["items"] == []
+
+
+def test_unreadable_usage_cause_iii_with_a_provable_compose_child_the_tick_ends_it_and_settles_whole_at_once(tmp_path):
+    """levain#131: the stub is a ``#!`` script, and ``ps`` lists it behind its interpreter. Its recorded argv now proves
+    it is the recorded compose child, so the tick past ``stop_at`` ends its group and settles the row whole, unreadable,
+    in that one tick (the counterpart of the unprovable case above, which settles nothing)."""
+    inst, row, child = _sigkill_mid_compose(tmp_path)
+    occ = row["occurrence_id"]
+    try:
+        tick = _tick(inst, 61)
+        print("\n[provable] tick:", tick.rc, repr(tick.text))
+        _wait(inst, "the compose group to be gone", lambda: not _group_alive(child))
+        pic = _picture(inst, "provable")
+    finally:
+        _kill_group(child)
+    assert "not confirmed ended" not in tick.text and "not-confirmed" not in tick.text and occ not in tick.out
     assert pic["row"] == ("stopped", "stop_at")
     assert pic["res"] == ("settled", RESERVED, RESERVED, "unreadable")
     assert pic["agent"][0] == "active" and pic["slots"] == [] and pic["usage"] is None

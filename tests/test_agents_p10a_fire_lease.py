@@ -193,16 +193,26 @@ def test_a_fire_that_finishes_after_the_lapse_lands_done(live):
     assert f.usage()["readable"] is True and f.usage()["actual_usd_micros"] == 20_000
 
 
+def _make_child_unprovable(f: "Fire") -> None:
+    """With the fire SIGSTOPped (it cannot write), record a command line the live child does not have: same pid and
+    start time, other argv, the case recovery will neither signal nor call ended."""
+    path = f.inst.anneal / "dream" / f.oid / "progress.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["child_argv"] = [*doc["child_argv"], "--not-the-recorded-argument"]
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
 def test_a_stopped_fire_is_killed_but_its_unprovable_child_keeps_the_row_launched(live):
     """SIGSTOP the fire, then the stop_at tick. The SIGTERM stays pending; observed, ``stop()`` escalates inside its
     deadline: SIGKILL to the fire (identity and phase re-checked), so the FIRE ends, but the compose child is
-    'not-confirmed' (the stub is an ``sh`` script: ``ps`` shows ``/bin/sh <stub> ...``, not the recorded argv, so no
-    signal is sent to it). The row therefore stays launched, holding its slot, with an attention line naming how to end
+    'not-confirmed' (its recorded command line is not the one ``ps`` shows, so no signal is sent to it: the progress
+    file is rewritten with another argv while the fire is stopped, as levain#131 made a ``#!`` stub provable). The row therefore stays launched, holding its slot, with an attention line naming how to end
     the child by hand. Once the child's group is ended, the next tick settles it. (Differs from the design text: the
     fire is not left alive pending SIGCONT; SIGCONT of a killed fire has nothing to resume.)"""
     f = live()
     held = f.row
     os.kill(f.fire_pid, signal.SIGSTOP)
+    _make_child_unprovable(f)
     t0 = time.monotonic()
     cut = f.inst.cli("agents", "tick", now=_at(61))
     took = time.monotonic() - t0
@@ -223,6 +233,23 @@ def test_a_stopped_fire_is_killed_but_its_unprovable_child_keeps_the_row_launche
     res = f.reservation()                            # the SIGKILLed fire wrote no usage.json: unreadable, debited whole
     assert (res["state"], res["settled_reason"], res["debited_usd_micros"]) == ("settled", "unreadable", 20_000_000)
     assert _quiet_of_unconfirmed(settle.err, f.oid)
+
+
+def test_a_stopped_fire_is_killed_and_its_provable_stub_child_is_ended_and_the_row_settles_at_once(live):
+    """levain#131 counterpart: the stub is a ``#!`` script whose recorded argv is what ``ps`` shows behind its
+    interpreter, so it is provable. SIGSTOP the fire, then the stop_at tick: the fire is killed, the child's group is
+    ended by recovery, no stop-unconfirmed attention is raised and the row ends stopped/stop_at."""
+    f = live()
+    os.kill(f.fire_pid, signal.SIGSTOP)
+    cut = f.inst.cli("agents", "tick", now=_at(61))
+    _say("provable stopped tick", cut.rc, repr(cut.err))
+    assert cut.rc == 0 and _quiet_of_unconfirmed(cut.err, f.oid)
+    _wait(lambda: not f.group_alive(), "the child's group to end", timeout=15)
+    rows = [r for r in f.inst.rows() if r["occurrence_id"] == f.oid]
+    assert [(r["state"], r["reason"]) for r in rows] == [("stopped", "stop_at")]
+    assert f.slots() == []
+    res = f.reservation()
+    assert (res["state"], res["settled_reason"], res["debited_usd_micros"]) == ("settled", "unreadable", 20_000_000)
 
 
 # ------------------------------------------------------------------------ (4) the executor's stop at link expiry
