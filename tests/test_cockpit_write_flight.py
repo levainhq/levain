@@ -83,6 +83,48 @@ def test_a_read_after_a_write_does_not_join_the_provider_read_begun_before_it(in
     assert store.max_active == 1                         # and only after the older one had ended
 
 
+def test_a_caller_that_keeps_finding_a_flight_older_than_a_write_gives_up_at_its_own_deadline(monkeypatch) -> None:
+    import levain.cockpit.engine as eng
+    from levain.cockpit.engine import _Flight, _State
+
+    monkeypatch.setattr(eng, "PROCESS_GRACE_S", 0.0)
+    ck, st = Cockpit(), _State()
+    st.epoch = 1
+
+    def stale() -> _Flight:
+        fl = _Flight(0.3)
+        fl.epoch = 0                                       # begun before the write the state has seen
+        return fl
+
+    st.pflight = stale()
+    stop = threading.Event()
+
+    def churn() -> None:                                   # each stale flight ends and the next one is already in place
+        end = time.monotonic() + 1.5
+        while time.monotonic() < end and not stop.is_set():
+            time.sleep(0.05)
+            nxt = stale()
+            with st.lock:
+                old, st.pflight = st.pflight, nxt
+            old.out.set_result(None)
+        with st.lock:
+            old, st.pflight = st.pflight, None
+        old.out.set_result(None)
+
+    ran: list[int] = []
+    t = threading.Thread(target=churn)
+    t.start()
+    t0 = time.monotonic()
+    try:
+        out = ck._single_flight(st, 0.3, lambda: ran.append(1) or "read", lambda raw: raw, lambda m: ("refused", m))
+        took = time.monotonic() - t0
+    finally:
+        stop.set()
+        t.join(10)
+    assert out[0] == "refused" and ran == [], out
+    assert took < 1.0, took                                # the caller's own budget (0.3s), not the churn's length
+
+
 def test_a_write_to_another_panel_leaves_the_flight_shared() -> None:
     store, early, late, after = _read_across_a_write(lambda ck: ck.invalidate_reads(["other"]))
     assert store.calls == ["OLD"] and early == late == after == "OLD"

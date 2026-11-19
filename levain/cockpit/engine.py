@@ -1320,6 +1320,7 @@ class Cockpit:
         counts as a timeout, so an owner and its joiners can never disagree about the same read."""
         result: Any = None
         committed_ok = False
+        give_up = time.monotonic() + timeout_s + PROCESS_GRACE_S      # one bound on every wait this caller makes below
         while True:
             with st.lock:
                 fl = st.pflight
@@ -1338,8 +1339,11 @@ class Cockpit:
                     break                  # a read begun since the last write to this state: share it
             # a read begun before a write to this state: its answer is never ours, and a second provider read does
             # not start beside it, so wait for it to end and look again
+            left = give_up - time.monotonic()
+            if left <= 0:
+                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
             try:
-                fl.out.result(timeout=wait)
+                fl.out.result(timeout=min(wait, left))
             except FutureTimeout:
                 return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
         if not owner:
