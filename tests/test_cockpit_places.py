@@ -489,3 +489,31 @@ def test_the_work_row_is_one_row_with_the_head_above_the_three_panels(tmp_path: 
         if w >= 1101:
             assert g["board"]["y"] == g["tray"]["y"] and g["inbox"]["y"] == g["tray"]["y"], (w, g)   # three across, one row
     assert not rows[0]["reset"] and rows[4]["reset"], (rows[0], rows[4])
+
+
+@needs_browser
+def test_the_keys_reach_every_place_and_leave_the_desk_and_room_without_a_retired_mode(tmp_path: Path) -> None:
+    """Keys 2 and 3 reach the Desk and the Room, and from either one the Home click, key 1 and key 4 leave it; no mode but board and memory is ever written."""
+    def at(step: dict) -> list:
+        return [step, SETTLE, {"eval": STATE}]
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": WATCH},
+            *at({"eval": KEY % "2"}),                                    # 0: Desk
+            *at({"eval": KEY % "3"}),                                    # 1: Room
+            *at({"eval": PRESS % "home"}),                               # 2: Home, left by the click
+            *at({"eval": KEY % "2"}),                                    # 3: Desk
+            *at({"eval": KEY % "1"}),                                    # 4: Home, left by key 1
+            *at({"eval": KEY % "2"}),                                    # 5: Desk
+            *at({"eval": KEY % "4"}),                                    # 6: Memory, left by key 4
+            *at({"eval": KEY % "3"}),                                    # 7: Room
+            *at({"eval": KEY % "4"}),                                    # 8: Memory, from the Room
+            {"eval": "JSON.stringify(window.__modes)"},
+        ])
+    states = [v for v in out["values"] if isinstance(v, dict) and "place" in v]
+    assert [s["place"] for s in states] == ["desk", "room", "home", "desk", "home", "desk", "memory", "room", "memory"], states
+    modes = json.loads(out["values"][-1])
+    assert modes and set(modes) <= {"board", "memory"}, modes
