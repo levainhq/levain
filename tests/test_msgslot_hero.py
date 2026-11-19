@@ -81,13 +81,13 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
              " const box = document.getElementById('ck-drop-words').getBoundingClientRect(); const host = document.getElementById('ck-drop').getBoundingClientRect();"
              " return JSON.stringify({t: 'pos', bandBottom: bot('#ck-band'), drop: top('#ck-drop'), needs: top('#ck-needs'), needsBottom: bot('#ck-needs'), tray: top('.panel[data-ck-panel=\"tray\"]'),"
              " sky: top('#ck-skycard'), boxW: box.width, hostW: host.width, boxH: box.height, over: document.documentElement.scrollWidth > window.innerWidth,"
-             " buttons: [...document.querySelectorAll('#ck-drop button')].map(b => b.textContent), afterNeeds: !!document.querySelector('#ck-needs + #ck-drop'), insideHero: !!document.querySelector('#ck-hero #ck-drop') }); })()")
+             " buttons: [...document.querySelectorAll('#ck-drop button')].map(b => b.textContent), afterNeeds: !!document.querySelector('#ck-needs + #ck-notes + .ia-head[data-ia-head=desk] + #ck-drop'), insideHero: !!document.querySelector('#ck-hero #ck-drop') }); })()")
     with rig.serving():
         out = _drive_view(view, tmp_path, f"{rig.origin}/#write_token={TOK}",
                           [{"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE, {"eval": probe}, _shot(tmp_path, f"{view}_home")])
     p = _tagged(out)["pos"]
     assert p["needs"] is not None and p["bandBottom"] is not None and p["drop"] is not None, p   # a hidden Needs-you row fails here, not as a TypeError below
-    assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # the next element after the strip in the document, outside the hero
+    assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # after the strip and the (usually empty) notes slot in the document (levain#141 polish: the notes and the Desk head sit before the drop, as Home draws them), outside the hero
     assert p["bandBottom"] <= p["needs"] and p["needsBottom"] <= p["drop"], p               # under the band, and under the strip (the document order is the narrow order too)
     assert p["drop"] < p["tray"], p                                                         # above the work regions
     assert p["sky"] is None or p["needs"] < p["sky"], p   # Home draws the sky card with the machine, after the strip, at every width
@@ -447,7 +447,7 @@ def test_the_hero_box_and_its_typed_words_survive_the_cockpit_re_render(tmp_path
     redrawn = "(() => { const w = document.getElementById('ck-when'); return w && w.firstChild && !w.firstChild.__gen; })()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _type("typed, not sent"), {"eval": mark},
              {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": redrawn, "ms": 20000}, SETTLE,
-             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {TXT}, afterNeeds: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
+             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {TXT}, afterNeeds: !!document.querySelector('#ck-needs + #ck-notes + .ia-head[data-ia-head=desk] + #ck-drop')}})"}]
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert _tagged(out)["kept"] == {"t": "kept", "same": True, "value": "typed, not sent", "afterNeeds": True}, _tagged(out)["kept"]

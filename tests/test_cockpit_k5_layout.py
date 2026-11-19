@@ -188,90 +188,59 @@ def test_a_layout_that_only_names_the_retired_now_is_no_saved_layout(tmp_path: P
 
 
 @needs_browser
-def test_the_entity_name_in_the_bar_is_not_truncated_at_1440_with_a_saved_layout(tmp_path: Path) -> None:
+def test_the_entity_name_is_drawn_once_in_the_bar_by_the_brand_at_1440_with_a_saved_layout(tmp_path: Path) -> None:
+    """levain#141 polish: the masthead names the entity once (the brand side's wordmark); #entity stays in the markup, undrawn."""
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
-        {"eval": "const e = document.getElementById('entity'); [e.scrollWidth, e.clientWidth, e.textContent]"}])[-1]
-    assert out[0] <= out[1], out
+        {"eval": "const e = document.getElementById('entity'); [!!e, getComputedStyle(e.closest('.unit')).display, e.getClientRects().length, document.querySelector('.masthead .wordmark').getClientRects().length > 0]"}])[-1]
+    assert out == [True, "none", 0, True], out
 
 
 # a full bar just above the stacked-layout breakpoint, in a font wider than the design's: Verdana forced on every element (inline, a <style> is blocked)
 FULL_BAR = ("(() => { %s"
-            " const n = document.getElementById('entity'); n.textContent = 'WWWWWWWWWWWWWW'; %s"
-            " const q = (s) => document.querySelector(s).getBoundingClientRect(), vw = document.documentElement, ue = document.querySelector('.masthead .unit');"
-            " ue.style.flex = 'none'; const nat = Math.round(q('.masthead .unit').width), natE = n.scrollWidth; ue.style.flex = '';"
-            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .brand'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
-            " const jl = document.querySelector('.jar-label');"
-            " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), brandRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
-            " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
+            " const q = (s) => document.querySelector(s).getBoundingClientRect(), vw = document.documentElement;"
+            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .brand'), ro = q('.masthead .readout');"
+            " return { sw: vw.scrollWidth, cw: vw.clientWidth, readoutLeft: Math.round(ro.left), brandRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right) }; }); })()")
 VERDANA = "for (const e of document.querySelectorAll('*')) e.style.fontFamily = 'Verdana, sans-serif';"
-NO_JAR = "document.getElementById('jar').hidden = true;"
 
 
 @needs_browser
 @pytest.mark.parametrize("font, width", [("", 1180), ("", 1240), (VERDANA, 1280), (VERDANA, 1340)], ids=["native-1180", "native-1240", "verdana-1280", "verdana-1340"])
-def test_a_full_bar_truncates_the_name_with_an_ellipsis_and_never_widens_the_page(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}], width=width)[-1]
+def test_a_full_bar_never_widens_the_page_and_keeps_the_readout_right_of_the_brand(tmp_path: Path, width: int, font: str) -> None:
+    out = _run(tmp_path, [{"eval": FULL_BAR % font}], width=width)[-1]
     assert out["sw"] <= out["cw"], out                                     # nothing widens the page
-    assert out["unitLeft"] >= out["brandRight"], out                       # the readout stays right of the brand
+    assert out["readoutLeft"] >= out["brandRight"], out                    # the readout stays right of the brand
     assert out["readoutRight"] <= out["mastRight"], out
-    assert out["unitW"] <= out["nat"], out
-    assert out["unitW"] == out["nat"] or out["nameCut"], out               # a name the bar cannot hold whole ends in an ellipsis rather than being clipped off the bar
 
 
-# the starter jar as the page draws it (renderJar's 26x34 svg + label), visible; its icon must keep its room beside the indicators
-REAL_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 26 34\"><path d=\"M5 8 H21 V28 H5 Z\"></path></svg>"
-            "<span class=\"jar-label\">starter: 14 today</span>';")
-JAR_ICON = ("(() => { const s = document.querySelector('#jar svg').getBoundingClientRect(), i = document.querySelector('.masthead .indicators').getBoundingClientRect();"
-            " return { svgW: Math.round(s.width), svgRight: Math.round(s.right * 10) / 10, indLeft: Math.round(i.left * 10) / 10 }; })()")
-
-
-@needs_browser
-@pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), (VERDANA, 1101), (VERDANA, 1180)],
-                         ids=["native-1101", "native-1180", "verdana-1101", "verdana-1180"])
-def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width)
-    icon = out[-1]
-    assert icon["svgW"] > 0, icon
-    assert icon["svgRight"] <= icon["indLeft"], icon                       # the icon ends before the live/status cluster begins
-
-
-# the masthead from the stacked layout to a wide bar, with the jar label and font that crowd it most. Each drawn block of the readout is
+# the masthead from the stacked layout to a wide bar, in the font that crowds it most. Each drawn block of the readout is
 # tested against the brand's box on both axes (a stacked layout puts them in different rows, so only a real overlap counts).
-LONG_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.innerHTML = '<svg viewBox=\"0 0 16 20\"></svg><span class=\"jar-label\">'"
-            " + 'a jar label that is far too long to fit beside the name'.repeat(3) + '</span>';")
+# (levain#141 polish: the entity name and the jar left the readout; this holds what is left of it.)
 MID_BAR = ("(() => { %s"
-           " const n = document.getElementById('entity'); n.textContent = 'WWWWWWWWWWWWWW'; %s"
            " const R = (e) => { const r = e.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top, b: r.bottom, w: r.width, h: r.height }; };"
-           " const ue = document.querySelector('.masthead .unit'); ue.style.flex = 'none'; const nat = Math.round(R(ue).w); ue.style.flex = '';"
-           " return new Promise(r => setTimeout(r, 250)).then(() => { const br = R(document.querySelector('.masthead .brand')), tag = document.getElementById('ia-tagline'), jl = document.querySelector('.jar-label');"
+           " return new Promise(r => setTimeout(r, 250)).then(() => { const br = R(document.querySelector('.masthead .brand')), tag = document.getElementById('ia-tagline');"
            " const drawn = (e) => e.getClientRects().length > 0 && R(e).w > 0 && R(e).h > 0;"
-           " const hit = [...document.querySelectorAll('.masthead .unit, .masthead #jar, .masthead #jar svg, .masthead .indicators > *, .masthead .ia-act, .masthead .themesw')]"
+           " const hit = [...document.querySelectorAll('.masthead .indicators > *, .masthead .ia-act, .masthead .themesw')]"
            "   .filter(drawn).filter(e => { const r = R(e); return r.l < br.r - 0.5 && r.r > br.l + 0.5 && r.t < br.b - 0.5 && r.b > br.t + 0.5; }).map(e => e.id || e.className || e.tagName);"
            " const acts = [...document.querySelectorAll('.ia-actions .ia-act')];"
-           " return { sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, hit, entityShown: getComputedStyle(n).display !== 'none', entityW: Math.round(R(n).w),"
-           " unitW: Math.round(R(ue).w), nat, wordW: Math.round(R(document.querySelector('.masthead .wordmark')).w), tagRight: Math.round(R(tag).r), brandRight: Math.round(br.r),"
-           " tagCut: tag.scrollWidth > tag.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null,"
+           " return { sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, hit,"
+           " wordW: Math.round(R(document.querySelector('.masthead .wordmark')).w), tagRight: Math.round(R(tag).r), brandRight: Math.round(br.r),"
+           " tagCut: tag.scrollWidth > tag.clientWidth, tagLines: Math.round(R(tag).h / parseFloat(getComputedStyle(tag).lineHeight)),"
            " labels: acts.map(a => drawn(a.querySelector('.ia-lbl'))), named: acts.map(a => !!a.getAttribute('aria-label') && !!a.title) }; }); })()")
 
 
 @needs_browser
-@pytest.mark.parametrize("font, jar, width", [
-    ("", "long", 820), ("", "long", 1024), ("", "long", 1101), ("", "long", 1180), ("", "long", 1340), ("", "long", 1440), ("", "long", 1501), ("", "long", 1920),
-    (VERDANA, "long", 1101), (VERDANA, "long", 1180), (VERDANA, "long", 1340), (VERDANA, "long", 1501),
-    ("", "real", 1366), (VERDANA, "real", 1366), ("", "none", 1101), (VERDANA, "none", 1101)],
-    ids=lambda v: v if isinstance(v, int) else ("verdana" if v == VERDANA else ("native" if v == "" else v)))
-def test_the_masthead_keeps_the_brand_the_name_and_the_buttons_apart_at_every_width(tmp_path: Path, font: str, jar: str, width: int) -> None:
-    jar_js = {"long": LONG_JAR, "real": REAL_JAR, "none": NO_JAR}[jar]
-    out = _run(tmp_path, [{"eval": MID_BAR % (font, jar_js)}], width=width)[-1]
+@pytest.mark.parametrize("font, width", [
+    ("", 820), ("", 1024), ("", 1101), ("", 1140), ("", 1180), ("", 1340), ("", 1440), ("", 1501), ("", 1920),
+    (VERDANA, 1101), (VERDANA, 1180), (VERDANA, 1340), (VERDANA, 1501)],
+    ids=lambda v: v if isinstance(v, int) else ("verdana" if v == VERDANA else "native"))
+def test_the_masthead_keeps_the_brand_and_the_buttons_apart_at_every_width(tmp_path: Path, font: str, width: int) -> None:
+    out = _run(tmp_path, [{"eval": MID_BAR % font}], width=width)[-1]
     assert out["sw"] <= out["cw"], out                                     # nothing widens the page
     assert out["hit"] == [], out                                           # no block of the readout is drawn over the brand
     assert out["wordW"] > 40 and out["tagRight"] <= out["brandRight"], out  # the brand keeps its name; the tagline ends inside the brand
     assert out["tagCut"] is False, out                                     # and wraps rather than being cut: every word of it is drawn
-    if width > 1100:
-        assert out["entityShown"] and out["entityW"] >= 40, out            # side by side the unit's name is drawn and is never squeezed out
-        assert out["nat"] - out["unitW"] <= 1, out                         # and keeps its whole width: what gives is the tagline, then the jar label
-        if jar == "long":
-            assert out["jarCut"] is True, out                              # the jar label is what shrank (its text overflows its box: ellipsized)
+    if 1100 < width <= 1180:
+        assert out["tagLines"] <= 2, out                                   # levain#141 polish: it was three lines here
     # the buttons' words show where they fit: in the stacked layout and from 1501 up; between, they are icons and keep their names
     assert out["labels"] == [not (1100 < width <= 1500)] * 3, out
     assert out["named"] == [True] * 3, out
@@ -288,10 +257,9 @@ CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundin
                          ids=[f"{n}-{w}" for n, w in [("native", 1101), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
                                                       ("verdana", 1101), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
 def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_icon(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width)
+    out = _run(tmp_path, [{"eval": FULL_BAR % font}, {"eval": CALM}], width=width)
     geo, calm = out[-2], out[-1]
-    assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["brandRight"] and geo["readoutRight"] <= geo["mastRight"], geo
-    assert geo["nameW"] >= 40, geo                                           # the name is not squeezed out (the labelled action buttons took its room at 1100 to 1340)
+    assert geo["sw"] <= geo["cw"] and geo["readoutLeft"] >= geo["brandRight"] and geo["readoutRight"] <= geo["mastRight"], geo
     assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
     if width <= 1280:
         assert calm["label"] == "0px", calm                                  # the icon form: the visible text is gone, the name stays

@@ -184,14 +184,16 @@
   // view closing ends the run in flight, so nothing yanks the view back. Declared here because closeModal ends it.
   let phoneJumpRun = 0;
 
-  // The starter jar (masthead): rise level = today's episodes against the entity's own typical
+  // The starter jar (drawn into #ck-jarbox, the stats box in the Machine section, when the page has one; the masthead no longer
+  // carries it, levain#141 polish): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
   // rises for each episode that arrived since the LAST render of the same day, so a bubble is
   // a true new episode, never decoration. status != "ok" -> an empty jar with its reason.
   let jarLastToday = null, jarLastDay = null;
   function renderJar(jar) {
-    const j = document.getElementById("jar");
-    if (!j) return;
+    const j = document.getElementById("ck-jarbox");
+    if (!j) return;   // no box on the page yet: the jar is not drawn, and nothing throws
+    j.classList.add("jar");   // the jar's own styles (dashboard.css .jar) apply wherever it is drawn
     j.replaceChildren();
     if (!jar) { j.hidden = true; jarLastToday = jarLastDay = null; return; }  // baseline resets while hidden
     j.hidden = false;
