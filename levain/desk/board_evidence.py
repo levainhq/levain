@@ -336,29 +336,108 @@ def stat_stamp(path: Path) -> tuple[int, int] | None:
     return (st.st_size, st.st_mtime_ns)
 
 
+def _config_inputs(repo: Path) -> tuple[tuple[str, ...], str]:
+    """``(git dirs, config --list --show-origin -z)`` of ``repo``: the git dir and the common dir (absolute, deduplicated) and
+    git's own listing of every config file and value it reads for the repo. Raises :class:`GitFailed`."""
+    dirs = tuple(dict.fromkeys(x.strip() for x in _git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n")
+                               if x.strip()))
+    return dirs, _git(repo, "config", "--list", "--show-origin", "-z")
+
+
 def config_stamp(repo: Path) -> tuple[tuple[str, ...], tuple[Any, ...]]:
     """``(git dirs, stamps)``: the git dir and the common dir of ``repo`` (absolute, deduplicated), and the stamp of every file whose
     content changes what git reads of this repo: the config files git itself lists for it (``config --list --show-origin``, so
     the system and global files and any ``include`` are covered), the repo's own ``config`` and ``config.worktree`` (named
     even when absent, so one appearing is a change) and ``objects/info/alternates``. Raises :class:`GitFailed`."""
-    dirs = tuple(dict.fromkeys(x.strip() for x in _git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n")
-                               if x.strip()))
-    listed = _git(repo, "config", "--list", "--show-origin", "-z")
+    dirs, listed = _config_inputs(repo)
     files = sorted({str(Path(repo) / rec[5:]) for rec in listed.split("\0") if rec.startswith("file:")})     # git names a repo file relative to -C
     for d in dirs:
         files += [str(Path(d) / n) for n in ("config", "config.worktree", "objects/info/alternates")]
     return dirs, tuple((f, stat_stamp(Path(f))) for f in dict.fromkeys(files))
 
 
-# A commit's patch-id never changes, so it is kept per process: repo (its common git dir) -> (config stamp, sha -> id, or None for
-# a commit with no patch-id). The diff text depends on the repo's config (diff.*, core.*), so a changed config stamp drops the repo's
+_FILE_DIGEST_MAX = 4_000_000
+_GIT_VERSION: list[str] = []
+
+
+def _file_digest(path: Path) -> str | None:
+    """A digest of a small file's CONTENT (None when it is absent or unreadable); a file past the cap is digested by its size."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_FILE_DIGEST_MAX + 1)
+    except OSError:
+        return None
+    if len(raw) > _FILE_DIGEST_MAX:
+        return f"big:{os.path.getsize(path)}"
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _git_version(repo: Path) -> str:
+    """``git --version``, asked once per process (the diff text can change between git releases)."""
+    if not _GIT_VERSION:
+        cp = _run(repo, "--version")
+        if cp.returncode != 0:
+            return "?"
+        _GIT_VERSION.append(cp.stdout.decode("utf-8", "replace").strip())
+    return _GIT_VERSION[0]
+
+
+def _attributes_file(repo: Path, listed: str) -> Path | None:
+    """The file git reads global attributes from: ``core.attributesFile`` when set (last one listed wins), else the XDG default."""
+    env, found = _env(), None
+    toks = listed.split("\0")
+    for i, rec in enumerate(toks):
+        if rec.startswith("file:") and i + 1 < len(toks):
+            key, _, val = toks[i + 1].partition("\n")
+            if key == "core.attributesfile" and val:
+                found = val
+    home = env.get("HOME", "")
+    if found is not None:
+        if found == "~" or found.startswith("~/"):
+            found = home + found[1:]
+        return Path(found) if os.path.isabs(found) else Path(repo) / found
+    xdg = env.get("XDG_CONFIG_HOME") or (os.path.join(home, ".config") if home else "")
+    return Path(xdg) / "git" / "attributes" if xdg else None
+
+
+def _worktree_root(repo: Path) -> Path | None:
+    """The nearest directory at or above ``repo`` that holds a ``.git`` (None for a bare repo): where git finds the top ``.gitattributes``."""
+    for d in (Path(repo).absolute(), *Path(repo).absolute().parents):
+        if os.path.lexists(d / ".git"):
+            return d
+    return None
+
+
+def diff_stamp(repo: Path) -> tuple[tuple[str, ...], str]:
+    """``(git dirs, digest)``: the digest of everything that changes the text ``git diff-tree -p`` makes (so the patch-id) of a
+    commit in this repo, by CONTENT and never by path or time, so the main checkout and its linked worktrees of one repo agree:
+    the config git lists, ``objects/info/alternates`` and ``shallow`` and ``info/attributes`` of the common dir, the global
+    attributes file, the work tree's top ``.gitattributes`` and the git version. Raises :class:`GitFailed`."""
+    dirs, listed = _config_inputs(repo)
+    common = Path(dirs[-1])
+    parts: list[Any] = [_git_version(repo)]
+    for rec in listed.split("\0"):
+        if rec.startswith("file:"):
+            parts.append(_file_digest(Path(repo) / rec[5:]))              # git names a repo file relative to -C
+    parts.append(("config.worktree", _file_digest(Path(dirs[0]) / "config.worktree")))
+    for rel in ("config", "objects/info/alternates", "shallow", "info/attributes"):
+        parts.append((rel, _file_digest(common / rel)))
+    gattr = _attributes_file(repo, listed)
+    parts.append(("global attributes", _file_digest(gattr) if gattr is not None else None))
+    root = _worktree_root(repo)
+    parts.append((".gitattributes", _file_digest(root / ".gitattributes") if root is not None else None))
+    return dirs, hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
+# A commit's patch-id does not change under one diff stamp, so it is kept per process: repo (its common git dir) -> (diff stamp, sha -> id, or None for
+# a commit with no patch-id). The diff text depends on the repo's config and attributes (see :func:`diff_stamp`), so a changed stamp drops the repo's
 # memo. A miss of the board's evidence read then diffs only the commits it has not seen.
 _PID_MEMO: dict[str, tuple[Any, dict[str, str | None]]] = {}
 _PID_MEMO_MAX = 200_000
 _PID_LOCK = threading.Lock()
 
 
-# The same fact kept ON DISK, so that every ``levain board state`` process does not pay for the whole history again. A commit's patch-id is a pure function of its content under the repo's diff config: the KEY is the
+# The same fact kept ON DISK, so that every ``levain board state`` process does not pay for the whole history again. A commit's patch-id is a function of its content under the stamped diff config (:func:`diff_stamp`): the KEY is the
 # commit's full sha and nothing else, the VALUE its patch-id (null: a commit with none). One file per repo (named by a hash of its
 # common git dir) under ``<levain home>/cache/board``, holding a digest of the config stamp it was made under: a file made under
 # another config is not read. It holds no message text, path, name or secret. A file that is absent, unreadable, over the size
@@ -381,10 +460,6 @@ def _pid_cache_path(key: str) -> Path | None:
         return board_store_dir().parent / "cache" / "board" / f"patch-ids-{hashlib.sha256(key.encode()).hexdigest()[:24]}.json"
     except Exception:  # noqa: BLE001 - no cache is a slower read, never a failed one
         return None
-
-
-def _stamp_digest(stamps: Any) -> str:
-    return hashlib.sha256(repr(stamps).encode()).hexdigest()
 
 
 def _pid_cache_load(path: Path | None, digest: str) -> dict[str, str | None]:
@@ -428,7 +503,10 @@ def _pid_cache_store(path: Path | None, digest: str, fresh: dict[str, str | None
             held = set(keep)
             order = [k for k in merged if k not in held] + [k for k in merged if k in held]
             merged = {k: merged[k] for k in order[len(merged) - PID_CACHE_MAX:]}
+        made_parent = not path.parent.parent.exists()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if made_parent:
+            os.chmod(path.parent.parent, 0o700)                  # mkdir's mode is the leaf's only: the parent made with it is private too
         fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)      # 0600, unique per writer
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"v": PID_CACHE_V, "stamps": digest, "ids": merged}, fh, separators=(",", ":"))
@@ -448,7 +526,7 @@ def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
     if not shas:
         return {}
     try:
-        dirs, stamps = config_stamp(repo)
+        dirs, stamps = diff_stamp(repo)
         key = dirs[-1]
     except GitFailed:
         key, stamps = None, None                  # no stamp, no memo: every id is computed
@@ -460,12 +538,12 @@ def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
                 known = {s: held[1][s] for s in shas if s in held[1]}
     todo = [s for s in shas if s not in known]
     cache_path = _pid_cache_path(key) if key is not None and todo else None
-    digest = _stamp_digest(stamps) if cache_path is not None else ""
+    digest = stamps if cache_path is not None and stamps is not None else ""
     if todo and cache_path is not None:
         disk = _pid_cache_load(cache_path, digest)
         for s in todo:
             if s in disk:
-                known[s] = disk[s]
+                known[s] = disk[s]                      # a stored None is a commit that had no patch-id when it was diffed (a merge, an empty diff)
         todo = [s for s in todo if s not in disk]
         if key is not None and len(known) > 0:
             with _PID_LOCK:

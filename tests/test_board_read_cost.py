@@ -186,16 +186,17 @@ def test_a_new_commit_is_the_only_one_diffed_and_is_added_to_the_file(tmp_path, 
 
 
 @pytest.mark.parametrize("damage", ["not json", "[]", '{"v": 2, "stamps": "x", "ids": {}}', '{"v": 1}', "", "\x00\x01\x02",
-                                    '{"v": 1, "stamps": "STAMP", "ids": {"zz": "aa"}}',            # one malformed key: the whole file goes
-                                    '{"v": 1, "stamps": "STAMP", "ids": {"%s": "not-an-id"}}' % ("a" * 40),
-                                    '{"v": 1, "stamps": "other config", "ids": {}}'])
+                                    # a liar id for a sha the read asks for, beside ONE malformed entry: the whole file goes, the liar is never read
+                                    '{"v": 1, "stamps": "STAMP", "ids": {"SHA0": "%s", "zz": "aa"}}' % ("f" * 40),
+                                    '{"v": 1, "stamps": "STAMP", "ids": {"SHA0": "%s", "SHA1": "not-an-id"}}' % ("f" * 40),
+                                    '{"v": 1, "stamps": "other config", "ids": {"SHA0": "%s"}}' % ("f" * 40)])
 def test_a_damaged_cache_file_is_ignored_and_rewritten(tmp_path, cache, damage):
     repo = _history(tmp_path)
     shas = _all_shas(repo)
     want = be._patch_ids(repo, shas)
     be._PID_MEMO.clear()
     digest = json.loads(cache.read_text())["stamps"]
-    cache.write_text(damage.replace("STAMP", digest))
+    cache.write_text(damage.replace("STAMP", digest).replace("SHA0", shas[0]).replace("SHA1", shas[1]))
     got = be._patch_ids(repo, shas)                                        # never raises, never a wrong answer
     assert got == want
     doc = json.loads(cache.read_text())                                    # and the file is whole again
@@ -218,6 +219,12 @@ def test_a_cache_that_is_a_link_a_directory_or_too_big_is_not_read(tmp_path, cac
     monkeypatch.setattr(be, "PID_CACHE_MAX_BYTES", 10)                     # over the size cap
     be._PID_MEMO.clear()
     assert be._patch_ids(repo, shas) == want
+    monkeypatch.undo()
+    monkeypatch.setattr(be, "_pid_cache_path", lambda key: cache)
+    cache.unlink()
+    cache.mkdir()                                                          # a directory where the file should be
+    be._PID_MEMO.clear()
+    assert be._patch_ids(repo, shas) == want and cache.is_dir()
 
 
 def test_a_config_change_drops_the_file(tmp_path, cache, monkeypatch):
@@ -248,13 +255,23 @@ def test_the_file_is_keyed_by_sha_only_and_holds_no_text(tmp_path, cache):
 def test_the_file_is_bounded_and_keeps_what_this_read_used(tmp_path, cache, monkeypatch):
     repo = _history(tmp_path)
     shas = _all_shas(repo)
+    assert len(shas) >= 8
     monkeypatch.setattr(be, "PID_CACHE_MAX", 5)
-    be._patch_ids(repo, shas[:12])
+    be._patch_ids(repo, shas[:5])                                          # the file is full
     be._PID_MEMO.clear()
-    be._patch_ids(repo, shas[12:])                                         # more than the bound: the older entries go first
+    be._patch_ids(repo, shas[5:8])                                         # three more: the three OLDEST entries go, the new ones stay
     ids = json.loads(cache.read_text())["ids"]
-    assert len(ids) == 5 and set(ids) <= set(shas[12:] if len(shas) > 17 else shas)
-    assert all(s in ids for s in shas[-5:]) or len(shas) < 17
+    assert set(ids) == set(shas[3:8])
+
+
+def test_a_read_keeps_the_ids_it_used_even_when_older_ones_are_newer_in_the_file(tmp_path, cache, monkeypatch):
+    repo = _history(tmp_path)
+    shas = _all_shas(repo)
+    monkeypatch.setattr(be, "PID_CACHE_MAX", 5)
+    be._patch_ids(repo, shas[:5])
+    be._PID_MEMO.clear()
+    be._patch_ids(repo, [shas[0], *shas[5:7]])                            # asks for the OLDEST entry again, plus two new
+    assert {shas[0], *shas[5:7]} <= set(json.loads(cache.read_text())["ids"])
 
 
 def test_the_cache_lives_under_the_levain_home_and_no_home_is_no_cache(tmp_path, monkeypatch):
@@ -304,3 +321,76 @@ def test_processes_writing_at_once_never_tear_the_file(tmp_path):
     assert doc["v"] == be.PID_CACHE_V and doc["ids"]
     assert be._pid_cache_load(path, "d") == doc["ids"]                      # and passes every check a reader makes
     assert [p.name for p in path.parent.iterdir()] == ["p.json"]            # no temp file left behind
+
+
+# ------------------------------------------------------------------------------------------------ what the stamp covers
+def _rerun(repo, shas, monkeypatch):
+    be._PID_MEMO.clear()
+    runs = _diff_trees(monkeypatch)
+    return be._patch_ids(repo, shas), runs
+
+
+def test_a_shallow_change_drops_the_file(tmp_path, cache, monkeypatch):
+    repo = _history(tmp_path)
+    shas = _all_shas(repo)
+    be._patch_ids(repo, shas)
+    be._PID_MEMO.clear()
+    (repo / ".git" / "shallow").write_text(shas[-1] + "\n")                # the oldest commit becomes a shallow boundary
+    _, runs = _rerun(repo, shas, monkeypatch)
+    assert "diff-tree" in runs
+
+
+@pytest.mark.parametrize("where", ["info", "worktree", "global"])
+def test_an_attributes_change_drops_the_file_and_the_answer_is_the_fresh_one(tmp_path, cache, monkeypatch, where):
+    repo = _history(tmp_path)
+    (repo / "blob.dat").write_text("x\n")
+    last = _commit(repo, "a dat file")
+    (repo / "blob.dat").write_text("y\n")
+    last = _commit(repo, "a dat file again")
+    shas = _all_shas(repo)
+    before = be._patch_ids(repo, shas)
+    assert last in before
+    be._PID_MEMO.clear()
+    if where == "info":
+        (repo / ".git" / "info").mkdir(exist_ok=True)
+        (repo / ".git" / "info" / "attributes").write_text("*.dat -diff\n")
+    elif where == "worktree":
+        (repo / ".gitattributes").write_text("*.dat binary\n")
+    else:
+        glob = tmp_path / "my_attributes"
+        glob.write_text("*.dat -diff\n")
+        seed.git(repo, "config", "core.attributesFile", str(glob))
+    got, runs = _rerun(repo, shas, monkeypatch)
+    assert "diff-tree" in runs and got[last] != before[last]               # not served from the file: it is a different diff now
+    be._PID_MEMO.clear()
+    monkeypatch.setattr(be, "_pid_cache_path", lambda key: None)
+    assert be._patch_ids(repo, shas) == got
+
+
+def test_a_linked_worktree_reads_what_the_main_checkout_cached(tmp_path, cache, monkeypatch):
+    repo = _history(tmp_path)
+    wt = tmp_path / "linked"
+    seed.git(repo, "worktree", "add", "-q", str(wt), "-b", "wt-branch")
+    shas = _all_shas(repo)
+    want = be._patch_ids(repo, shas)
+    got, runs = _rerun(wt, shas, monkeypatch)                              # same repo, another checkout: one digest, one file
+    assert got == want and "diff-tree" not in runs
+    seed.git(wt, "config", "diff.algorithm", "patience")                    # a shared config change drops it for both
+    got, runs = _rerun(repo, shas, monkeypatch)
+    assert "diff-tree" in runs
+    got, runs = _rerun(wt, shas, monkeypatch)
+    assert "diff-tree" not in runs                                         # and the main checkout's rewrite serves the worktree
+
+
+def test_the_cache_dirs_made_for_the_file_are_private(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    repo = _history(tmp_path)
+    be._PID_MEMO.clear()
+    assert be._patch_ids(repo, _all_shas(repo))
+    assert oct((home / "cache").stat().st_mode & 0o777) == "0o700" and oct((home / "cache" / "board").stat().st_mode & 0o777) == "0o700"
+    be._PID_MEMO.clear()
+
+
+# A concurrent READER while a writer replaces the file is not tested here: os.replace is atomic, so a reader sees one whole file or the other,
+# and the writers test above covers the file being whole after many writers.
