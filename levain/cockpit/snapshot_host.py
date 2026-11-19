@@ -309,10 +309,18 @@ class SnapshotHost:
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
-            # whatever was opened before the failure is released: the writer's lock and the reader's connection
-            if reader is not None:
-                reader.close()
-            self._writer.close()
+            # whatever was opened before the failure is released: the writer's lock and the reader's connection. Each close
+            # is tried whatever the other does, and neither's failure replaces the error that got us here.
+            try:
+                if reader is not None:
+                    reader.close()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    self._writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
             raise
 
     @classmethod

@@ -762,6 +762,12 @@ def test_set_version_moves_with_the_entity_and_with_a_discovery_error_while_the_
     assert probe.snapshot()[1] != version_b
 
 
+def test_the_probe_works_on_a_fresh_cockpit_that_has_had_neither_an_entity_nor_a_discovery(rig: Rig) -> None:
+    assert rig.ck._entity_value is None and rig.ck._discovery_errors == []
+    etags, version = rig.ck.change_probe().snapshot()
+    assert isinstance(version, str) and version
+
+
 @pytest.mark.parametrize("inputs", [([],), [File("/x/y")], (File("/x/y"), "/x/z"), "File", (object(),)])
 def test_a_panel_whose_inputs_are_not_a_tuple_of_the_input_types_is_refused_at_registration_naming_it(inputs) -> None:
     ck = Cockpit()

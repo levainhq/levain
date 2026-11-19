@@ -658,6 +658,28 @@ class TestConstructionFailure:
             SnapshotHost(Cockpit(), tmp_path)
         assert len(made) == 1 and made[0].was_closed
 
+    def test_a_reader_whose_close_raises_still_releases_the_writer_lock_and_the_first_error_is_the_one_raised(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from levain.cockpit import snapshot_host as sh
+
+        class Stubborn(sh.SnapshotReader):
+            def close(self) -> None:
+                super().close()
+                raise OSError("close failed")
+
+        def refuse(*a: Any, **k: Any) -> None:
+            raise RuntimeError("no loop")
+
+        monkeypatch.setattr(sh, "SnapshotReader", Stubborn)
+        monkeypatch.setattr(sh, "DeriveLoop", refuse)
+        with pytest.raises(RuntimeError, match="no loop"):
+            SnapshotHost(Cockpit(), tmp_path)
+        monkeypatch.undo()
+        again, reason = SnapshotHost.try_open(Cockpit(), tmp_path)
+        assert again is not None, reason
+        again.stop()
+
 
 class TestServerProbeTokenFault:
     def test_a_watch_token_that_raises_does_not_stop_the_counter_following_the_engine(self) -> None:
