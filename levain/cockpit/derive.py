@@ -6,6 +6,11 @@ writer API). It decides when a panel is due from declared inputs (change detecti
 are pure functions over plain state (`due_panels`) so a test drives them with a fake clock; the threads only
 carry out what those functions decide.
 
+The set of panels is not fixed for the loop's life: a host whose panels appear and vanish (discovered ones) hands the
+loop the whole current set with `set_plans`, or drops one with `retire`; a panel that left the set is never published
+again, even by a derive that was already running. A host that must wake readers when a row lands passes `on_publish`.
+`deriving` and `pending` tell a caller which panels are queued or running without exposing the loop's own state.
+
 Stdlib only. This module does not import the engine: the writer is passed in, and the canonical body encoding is
 snapshots.encode_body (the one encoder), so equal values give equal bytes and an equal body sha.
 """
@@ -18,11 +23,12 @@ import sqlite3
 import threading
 import time
 from collections import namedtuple
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
-from levain.cockpit.snapshots import KEEP_BODY_STATUSES, encode_body
+from levain.cockpit.snapshots import KEEP_BODY_STATUSES, KNOWN_STATUSES, encode_body
 
 # Concurrent derives (one panel is never derived twice at once, whatever this is).
 DERIVE_THREADS = 3
@@ -144,6 +150,17 @@ class _Fingerprinter:
         with self._lock:
             conns, self._conns = [c for c, _ in self._conns.values()], {}
         for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    def keep_sqlite(self, paths: set[str]) -> None:
+        """Close the held connections of Sqlite paths that no input uses any more."""
+        with self._lock:
+            gone = [path for path in self._conns if path not in paths]
+            dropped = [self._conns.pop(path)[0] for path in gone]
+        for conn in dropped:
             try:
                 conn.close()
             except sqlite3.Error:
@@ -291,6 +308,9 @@ class PanelState:
     run_fp: str = ""  # the inputs fingerprint the running derive started from
     run_write_gen: int = 0  # the write_gen the running derive was taken for
     timed_out: bool = False  # the running derive passed its deadline and a timeout was published
+    detached: bool = False  # the panel left the plan set while its derive was running (the result is discarded)
+    pub_gen: int | None = None  # the gen the last publish of this loop answered; None before the first
+    pub_write_gen: int = 0  # the highest write_gen this loop has published for the panel
 
 
 def due_reason(
@@ -353,6 +373,7 @@ class _Job:
     reason: str
     fp: str
     token: Any
+    st: PanelState  # the state the job was made for: a panel retired and added again is a different state
 
 
 # --------------------------------------------------------------------------------------------------- the loop
@@ -364,8 +385,9 @@ class DeriveLoop:
     Single use: start() once, stop() once at the end. A second start(), or one after stop(), raises RuntimeError; a
     restart is a new DeriveLoop.
 
-    Locks: `_lock` (states, queue, stop flag) and `_write_lock` (every writer call). Code holding `_lock` never takes
-    `_write_lock`; code holding `_write_lock` may take `_lock` for a short state update.
+    Locks: `_lock` (plans, states, queue, stop flag) and `_write_lock` (every writer call). Code holding `_lock` never
+    takes `_write_lock`; code holding `_write_lock` may take `_lock` for a short state update. `on_publish` runs with
+    neither held.
     """
 
     def __init__(
@@ -379,6 +401,7 @@ class DeriveLoop:
         backstop_s: float = 30.0,
         token_fn: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.time,
+        on_publish: Callable[[str, int, int], None] | None = None,
     ) -> None:
         self._writer = writer
         self._plans = dict(plans)
@@ -388,6 +411,7 @@ class DeriveLoop:
         self._backstop_s = backstop_s
         self._token_fn = token_fn
         self._clock = clock
+        self._on_publish = on_publish
         self._fingerprinter = _Fingerprinter()
         self._states = {pid: PanelState() for pid in self._plans}
         self._lock = threading.Lock()  # states, queue, stop flag
@@ -406,12 +430,29 @@ class DeriveLoop:
         self._write_errors: dict[str, BaseException] = {}
         self._last_event_at: float | None = None
         self._last_views: dict[Any, str | None] | None = None
+        self._plans_version = 0  # bumped by every change of the plan set
+        self._pruned_version = 0  # the plans version the fingerprinter's held connections were last trimmed for
+        self._detached_n: dict[str, int] = {}  # per panel id: retired derives still running
+        self._hook_error: BaseException | None = None
+        self._hook_errors = 0
 
     @property
     def last_publish_error(self) -> BaseException | None:
         """The most recently failed write source's exception, or None when every source is clean."""
         with self._lock:
             return next(reversed(self._write_errors.values()), None)
+
+    @property
+    def last_hook_error(self) -> BaseException | None:
+        """The exception of the last `on_publish` call if it raised, None once a later call succeeded."""
+        with self._lock:
+            return self._hook_error
+
+    @property
+    def hook_errors(self) -> int:
+        """How many `on_publish` calls have raised (they are swallowed, never stop the loop)."""
+        with self._lock:
+            return self._hook_errors
 
     def _fail(self, key: str, exc: BaseException) -> None:
         with self._lock:
@@ -433,6 +474,74 @@ class DeriveLoop:
                     continue
                 st.dirty_gen = write_gen if st.dirty_gen is None else max(st.dirty_gen, write_gen)
         self._wake.set()
+
+    def set_plans(self, plans: Iterable[PanelPlan]) -> None:
+        """Replace the plan set with `plans`; safe from any thread, before or after start().
+
+        A new id is derived on the next poll. A kept id keeps its derive history (when it last derived, its dirty
+        mark, its token); its inputs fingerprint is kept when its inputs are equal and dropped when they changed. An id that is not in `plans` is retired (see `retire`). The swap
+        is one step: a poll sees the old set or the new one, never a mixture. Two plans with one id raise ValueError
+        before anything changes.
+        """
+        new: dict[str, PanelPlan] = {}
+        for plan in plans:
+            if plan.id in new:
+                raise ValueError(f"two plans for panel id {plan.id!r}")
+            new[plan.id] = plan
+        self._swap_plans(lambda _current: new)
+
+    def retire(self, panel_id: str) -> None:
+        """Drop one panel from the plan set (no effect when it is not in it); safe from any thread.
+
+        A job queued for it is dropped. A derive already running finishes but its result is discarded, and nothing
+        is published for the id once this returns. The id is not derived again until the running one has ended, even
+        if it is added back. May wait for the publish in progress, because it takes the writer lock to be sure.
+        """
+        self._swap_plans(lambda current: {pid: plan for pid, plan in current.items() if pid != panel_id})
+
+    def _swap_plans(self, make: Callable[[dict[str, PanelPlan]], dict[str, PanelPlan]]) -> None:
+        """Install the plan set `make(current)` returns. The writer lock is held when any panel leaves: a publish is
+        checked against the plan set under that lock, so none can land after the retiring call returns."""
+        hold_write = False
+        while True:
+            with (self._write_lock if hold_write else nullcontext()):
+                with self._lock:
+                    new = make(self._plans)
+                    gone = [pid for pid in self._plans if pid not in new]
+                    if gone and not hold_write:
+                        hold_write = True
+                        continue  # take the writer lock first, then look again
+                    old = self._plans
+                    for pid in gone:
+                        st = self._states.pop(pid)
+                        if self._queue.pop(pid, None) is not None:
+                            st.busy = False
+                        if st.running_since is not None:
+                            st.detached = True
+                            self._detached_n[pid] = self._detached_n.get(pid, 0) + 1
+                        self._write_errors.pop(f"publish:{pid}", None)
+                        self._write_errors.pop(f"timeout:{pid}", None)
+                    for pid, plan in new.items():
+                        st = self._states.get(pid)
+                        if st is None:
+                            self._states[pid] = PanelState()
+                        elif old[pid].inputs != plan.inputs:
+                            st.inputs_fp = None
+                    self._plans = new
+                    self._plans_version += 1
+                break
+        self._wake.set()
+
+    def deriving(self) -> list[str]:
+        """The ids queued or running right now, sorted (a copy)."""
+        with self._lock:
+            return sorted(pid for pid, st in self._states.items() if st.busy)
+
+    def pending(self, panel_id: str) -> bool:
+        """Whether a derive of this panel is queued or running (False for an id the loop does not hold)."""
+        with self._lock:
+            st = self._states.get(panel_id)
+            return st is not None and st.busy
 
     def start(self) -> None:
         with self._lock:
@@ -457,8 +566,8 @@ class DeriveLoop:
         """
         with self._cv:
             self._stopping = True
-            for pid in self._queue:
-                self._states[pid].busy = False
+            for job in self._queue.values():
+                job.st.busy = False
             self._queue.clear()
             threads = list(self._threads)
             self._cv.notify_all()
@@ -495,7 +604,9 @@ class DeriveLoop:
         ran = []
         for job in jobs:
             with self._lock:
-                self._states[job.pid].busy = True
+                if self._states.get(job.pid) is not job.st:
+                    continue  # retired since the poll
+                job.st.busy = True
             fatal = self._run_job(job, now)
             ran.append(job.pid)
             if fatal is not None:
@@ -504,10 +615,10 @@ class DeriveLoop:
 
     # ---- the poll
 
-    def _views(self) -> tuple[dict[str, InputsView], dict[Any, str | None]]:
+    def _views(self, plans: Mapping[str, PanelPlan]) -> tuple[dict[str, InputsView], dict[Any, str | None]]:
         seen: dict[Any, str | None] = {}
         views: dict[str, InputsView] = {}
-        for pid, plan in self._plans.items():
+        for pid, plan in plans.items():
             parts, unknown, locked, stale = [], [], False, []
             for inp in plan.inputs:
                 if isinstance(inp, Poll):
@@ -532,6 +643,7 @@ class DeriveLoop:
 
     def _publish_timeouts(self, now: float) -> None:
         """Publish status "timeout" (stored body kept) for each running derive past its deadline, once."""
+        notices = []
         with self._lock:
             late = [
                 (pid, st.running_since)
@@ -544,12 +656,12 @@ class DeriveLoop:
         for pid, since in late:
             with self._write_lock:
                 with self._lock:
-                    st = self._states[pid]
-                    if st.running_since != since or st.timed_out:
-                        continue  # it finished (and published) meanwhile
+                    st = self._states.get(pid)
+                    if st is None or st.running_since != since or st.timed_out:
+                        continue  # it finished (and published) or was retired meanwhile
                     run_fp, run_gen = st.run_fp, st.run_write_gen
                 try:
-                    self._writer.publish(
+                    gen = self._writer.publish(
                         pid, status="timeout", body=None, started_at=since, derived_at=now,
                         duration_ms=max(0, int(round((now - since) * 1000))), inputs_fp=run_fp, write_gen=run_gen,
                         error=f"derive still running after {now - since:.0f} s",
@@ -561,17 +673,28 @@ class DeriveLoop:
                         self._write_errors.pop(f"timeout:{pid}", None)
                         if st.running_since == since:
                             st.timed_out = True  # only once the timeout row is in the store
+                    notices.append(self._note_publish(pid, st, gen, run_gen))
+        for notice in notices:
+            self._fire_hook(notice)
 
     def _evaluate(self, now: float) -> list[_Job]:
         """One poll: heartbeat, the inputs stream, then the due panels not already busy, as jobs in order."""
-        views, seen = self._views()
+        with self._lock:
+            plans = dict(self._plans)
+            version = self._plans_version
+        if version != self._pruned_version:
+            self._pruned_version = version
+            self._fingerprinter.keep_sqlite({inp.path for p in plans.values() for inp in p.inputs if isinstance(inp, Sqlite)})
+        views, seen = self._views(plans)
         token: Any = _UNSET
         if self._token_fn is not None:
             try:
                 token = self._token_fn()
             except Exception:
                 token = _UNSET
-        if self._last_views is not None and self._last_views != seen:
+        if self._last_views is not None and any(
+            self._last_views[inp] != fp for inp, fp in seen.items() if inp in self._last_views
+        ):
             self._last_event_at = now  # the last change seen; the first poll's fingerprints are not a change
         self._last_views = seen
         self._publish_timeouts(now)
@@ -585,16 +708,22 @@ class DeriveLoop:
                 writer_ok = True
                 self._succeed("heartbeat")
         with self._lock:
-            due = due_panels(self._plans, self._states, views, token, now, self._backstop_s)
+            # Only panels whose plan is still the one the views were read for, and with no retired derive still running.
+            current = {
+                pid: plan for pid, plan in plans.items()
+                if self._plans.get(pid) == plan and not self._detached_n.get(pid)
+            }
+            due = due_panels(current, self._states, views, token, now, self._backstop_s)
             # A panel that is neither due nor busy owes no publish (its input went back): its failure no longer counts.
-            owing = {pid for pid, _ in due}
+            # One left out of `current` is not judged this poll.
+            owing = {pid for pid, _ in due} | (set(self._states) - set(current))
             for pid in self._states:
                 if pid not in owing and not self._states[pid].busy:
                     self._write_errors.pop(f"publish:{pid}", None)
                 if self._states[pid].running_since is None:
                     self._write_errors.pop(f"timeout:{pid}", None)  # the derive ended: no timeout row is owed
-            jobs = [_Job(pid, reason, views[pid].fp, token) for pid, reason in due]
-            degraded = [name for v in views.values() for name in (*v.unknown_names, *v.stale_locks)]
+            jobs = [_Job(pid, reason, views[pid].fp, token, self._states[pid]) for pid, reason in due]
+            degraded = [name for pid, v in views.items() if pid in self._states for name in (*v.unknown_names, *v.stale_locks)]
             degraded += [f"{pid}: derive timeout" for pid, st in self._states.items() if st.timed_out]
             degraded += [f"write error {key}: {type(e).__name__}: {e}" for key, e in self._write_errors.items()]
         if writer_ok:
@@ -629,9 +758,8 @@ class DeriveLoop:
                 if self._stopping:
                     return
                 for job in jobs:
-                    st = self._states[job.pid]
-                    if not st.busy:
-                        st.busy = True
+                    if self._states.get(job.pid) is job.st and not job.st.busy:  # not retired since the poll
+                        job.st.busy = True
                         self._queue[job.pid] = job
                 if jobs:
                     self._cv.notify_all()
@@ -662,9 +790,9 @@ class DeriveLoop:
         derive raised (the caller decides whether to re-raise), else None.
         """
         pid = job.pid
+        st = job.st
         with self._lock:
-            st = self._states[pid]
-            if self._stopping:
+            if self._stopping or self._states.get(pid) is not st:  # stopping, or retired after the job was taken
                 st.busy = False
                 return None
             write_gen = st.dirty_gen if st.dirty_gen is not None else 0
@@ -674,6 +802,8 @@ class DeriveLoop:
         status, error, valid_until = "error", None, None
         finished: float | None = None
         published = False
+        notice: tuple[str, int, int] | None = None
+        wake = False
         fatal: BaseException | None = None
         try:
             try:
@@ -681,6 +811,9 @@ class DeriveLoop:
                 if result.status not in KEEP_BODY_STATUSES:
                     body = encode_body(result.body)  # a failed or timed-out result never carries a body to the store
                 status, error, valid_until = result.status, result.error, result.valid_until
+                if status not in KNOWN_STATUSES:  # the store's vocabulary is closed: keep the row, say what it was
+                    error = error or f"unknown derive status {status!r}"
+                    status = "partial"
             except BaseException as exc:
                 body = None
                 error = f"{type(exc).__name__}: {exc}"
@@ -695,22 +828,26 @@ class DeriveLoop:
                 with self._write_lock:
                     with self._lock:
                         st.running_since = None  # the timeout publisher checks this under the write lock
-                    # An error or timeout row carries the write_gen too: a reader waiting for that write is answered
-                    # (with that status) instead of waiting out its bound. It is not derived again for it.
-                    self._writer.publish(
-                        pid,
-                        status=status,
-                        body=body,
-                        started_at=started,
-                        derived_at=finished,
-                        duration_ms=duration_ms,
-                        valid_until=valid_until,
-                        inputs_fp=job.fp,
-                        write_gen=write_gen,
-                        error=error,
-                    )
-                    published = True
-                    self._succeed(f"publish:{pid}")
+                        current = self._states.get(pid) is st
+                    # Retiring a panel takes this lock too, so a panel still current here stays so until the publish ends.
+                    if current:
+                        # An error or timeout row carries the write_gen too: a reader waiting for that write is answered
+                        # (with that status) instead of waiting out its bound. It is not derived again for it.
+                        gen = self._writer.publish(
+                            pid,
+                            status=status,
+                            body=body,
+                            started_at=started,
+                            derived_at=finished,
+                            duration_ms=duration_ms,
+                            valid_until=valid_until,
+                            inputs_fp=job.fp,
+                            write_gen=write_gen,
+                            error=error,
+                        )
+                        published = True
+                        self._succeed(f"publish:{pid}")
+                        notice = self._note_publish(pid, st, gen, write_gen)
             except Exception as exc:
                 self._fail(f"publish:{pid}", exc)
         finally:
@@ -726,6 +863,44 @@ class DeriveLoop:
                     st.token = job.token
                     st.valid_until = valid_until
                 st.busy = False
-            if late_dirty:
+                if st.detached:  # a retired panel's derive has ended: its id may be derived again
+                    st.detached = False
+                    left = self._detached_n.get(pid, 0) - 1
+                    if left > 0:
+                        self._detached_n[pid] = left
+                    else:
+                        self._detached_n.pop(pid, None)
+                    wake = True  # an id added back meanwhile was held for this derive
+            if late_dirty or wake:
                 self._wake.set()
-        return fatal
+        hook_fatal = self._fire_hook(notice)
+        return fatal if fatal is not None else hook_fatal
+
+    def _note_publish(self, pid: str, st: PanelState, gen: int, write_gen: int) -> tuple[str, int, int] | None:
+        """Record a landed publish; the (panel, gen, write_gen) to tell `on_publish` when the gen or the write_gen moved.
+
+        The first publish this loop makes for a panel counts as a move, since what the store held before is not known.
+        """
+        with self._lock:
+            moved = st.pub_gen is None or gen is None or gen != st.pub_gen or write_gen > st.pub_write_gen
+            st.pub_gen = gen
+            st.pub_write_gen = max(st.pub_write_gen, write_gen)
+            seen = st.pub_write_gen
+        return (pid, gen, seen) if moved and self._on_publish is not None else None
+
+    def _fire_hook(self, notice: tuple[str, int, int] | None) -> BaseException | None:
+        """Call `on_publish` with no lock held. An Exception is counted and swallowed; any other BaseException is
+        recorded too and returned, so run_once raises it as it does for a derive's."""
+        if notice is None:
+            return None
+        try:
+            self._on_publish(*notice)
+        except BaseException as exc:
+            with self._lock:
+                self._hook_error = exc
+                self._hook_errors += 1
+            return None if isinstance(exc, Exception) else exc
+        with self._lock:
+            self._hook_error = None
+        return None
+
