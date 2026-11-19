@@ -9,8 +9,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,18 +30,6 @@ def ck(tmp_path: Path) -> Cockpit:
     c.read_cache_ttl_s = 1.5
     assert c._specs[PID].refresh_every_s is None
     return c
-
-
-@pytest.fixture(autouse=True)
-def _close_patched_manifest_pools():
-    """A test that patches the pool size makes a pool of that size; shut down any pool this test added."""
-    from levain.cockpit import engine as eng
-    before = set(eng._manifest_pools)
-    yield
-    with eng._manifest_pools_lock:
-        made = [eng._manifest_pools.pop(k) for k in list(eng._manifest_pools) if k not in before]
-    for pool in made:
-        pool.shutdown(wait=True)
 
 
 def _provider_reads(monkeypatch, ck: Cockpit, *, hold: threading.Event | None = None,
@@ -332,9 +320,16 @@ def test_a_manifest_stuck_on_its_panels_does_not_hold_another_credentials_manife
     _r, src, _ids = _install(tmp_path)
     stuck, healthy = build_default_cockpit(src), build_default_cockpit(src)
     release = threading.Event()
+    parked = threading.Event()
+    parked_n = [0]
+    lock = threading.Lock()
     real = stuck._snap_for
 
     def hang(spec, ctx, read_after=None):
+        with lock:
+            parked_n[0] += 1
+            if parked_n[0] >= 16:           # the old pool's whole 16-thread cap is held by this one manifest
+                parked.set()
         assert release.wait(30)
         return real(spec, ctx, read_after)
 
@@ -351,7 +346,7 @@ def test_a_manifest_stuck_on_its_panels_does_not_hold_another_credentials_manife
     tb = threading.Thread(target=run, args=("healthy", healthy, {**TOKEN, "name": "device-b"}))
     try:
         ta.start()
-        time.sleep(0.3)                     # the stuck manifest has its panel reads parked
+        assert parked.wait(10), "the stuck manifest never parked enough panel reads to saturate the old 16-thread cap"
         tb.start()
         tb.join(10)
         assert not tb.is_alive() and "healthy" in out, "the healthy manifest queued behind the stuck one"

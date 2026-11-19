@@ -44,6 +44,24 @@ def _vendor_installed(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _close_patched_manifest_pools():
+    """A test that patches ``_MANIFEST_POOL_THREADS`` makes a pool of that size in ``_manifest_pools``; shut down any pool
+    this test added. The shutdown is bounded (cancel queued work, joined on a daemon thread) so a hung worker fails the
+    test's own assertion instead of hanging pytest."""
+    import threading
+
+    from levain.cockpit import engine as eng
+    before = set(eng._manifest_pools)
+    yield
+    with eng._manifest_pools_lock:
+        made = [eng._manifest_pools.pop(k) for k in list(eng._manifest_pools) if k not in before]
+    for pool in made:
+        t = threading.Thread(target=pool.shutdown, kwargs={"wait": True, "cancel_futures": True}, daemon=True)
+        t.start()
+        t.join(10)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_terminal_key(tmp_path):
     """First wall of the keyguard: a test that forgot ``key_dir`` sees "no key" (a nonexistent per-test directory,
     ``<tmp_path>/nohome/.levain/keys``), never the operator's Secure Enclave key whose Touch ID sheet opened on the
