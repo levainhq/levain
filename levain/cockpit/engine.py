@@ -31,7 +31,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import hashlib
-from collections import Counter
+from collections import Counter, OrderedDict
 import itertools
 import json
 import math
@@ -66,7 +66,9 @@ from levain.cockpit.registry import (
 from levain import unshowable
 from levain.cockpit.display_safe import visible
 from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
+from levain.cockpit.derive import Dir, File, GitRefs, Poll, Sqlite
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
+from levain.cockpit.snapshot_host import SnapshotBodyError, decode_snap
 from levain.intention_legacy import OLD_KIND_TO_NEW
 
 SCHEMA = "levain.cockpit/2"
@@ -215,6 +217,23 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _epoch(dt: datetime) -> float:
+    """Seconds since the epoch of a clock reading; a naive one is read as UTC, the way ``_parse_iso`` reads its text."""
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def _iso_epoch(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+def _meta_float(meta: Mapping[str, str], key: str) -> float | None:
+    try:
+        out = float(meta[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 class RowNotFound(LookupError):
     """``?row=<id>`` named a row the panel does not currently hold."""
 
@@ -290,6 +309,10 @@ class ProviderSpec:
     # its head carries no ``replay`` flag and ``?at=`` on it is refused. A provider may also carry it on its read
     # function as ``read.read_at`` (how the topology provider offers it); an explicit field wins.
     read_at: Callable[["ReadContext", str], Result] | None = None
+    # what the panel reads, declared so a derive host re-derives it when one of these moves instead of on a timer (the
+    # input types are derive.py's). Empty: the host keeps the panel on its clock. Carried by ``replaced`` and
+    # ``with_verbs`` like every field.
+    inputs: "tuple[File | Dir | Sqlite | GitRefs | Poll, ...]" = ()
 
     def __post_init__(self) -> None:
         # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
@@ -393,6 +416,18 @@ class ReadContext:
             raise TimeoutError(f"shared read {key!r} did not finish in {self._memo_timeout_s:g}s") from None
 
 
+@dataclass(frozen=True)
+class _Fresh:
+    """What an attached cockpit knows about how current a snapshot row is, for the head layer to render. ``derived_at`` and
+    ``valid_until`` are ISO strings (None: no row yet, or no bound); ``stale`` is the reader's verdict (``Cockpit._fresh_of``);
+    ``pending`` is the host's word that a derive of the panel is queued or running."""
+
+    derived_at: str | None
+    valid_until: str | None
+    stale: bool
+    pending: bool
+
+
 @dataclass
 class _Snap:
     status: str
@@ -417,6 +452,9 @@ class _Snap:
     # kept text of one read's rows is never served to the other.
     hidden_skipped: list[dict[str, Any]] = field(default_factory=list)
     hidden_note: str = ""
+    # the freshness facts of a snapshot an attached cockpit read from its row; None on a snapshot a provider read made. An
+    # init field so ``dataclasses.replace`` carries it; it is no part of what the snapshot says, so it never takes part in equality
+    fresh_info: "_Fresh | None" = field(default=None, compare=False)
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
@@ -732,6 +770,19 @@ _MANIFEST_POOL_THREADS = 64   # threads of the one process-wide manifest pool: a
 _manifest_pools: dict[int, ThreadPoolExecutor] = {}
 _manifest_pools_lock = threading.Lock()
 
+# --- attached mode: a cockpit whose panels are rows a derive host wrote (``Cockpit.attach_snapshots``) ---
+# The panels that stay on the request path whatever the mode: they read stores under the request's own authority, which a
+# credential-free snapshot cannot hold (a downstream adds its own with ``mark_serve_composed``)
+SERVE_COMPOSED_IDS = frozenset({DECISIONS_ID, "edits"})
+NOT_DERIVED_YET = "not derived yet"     # the error text of a panel the host has not published a row for
+WORKER_STATES = ("live", "stale", "down")
+# the heartbeat cadence this reader expects of its host; a host that beats at another rate says so through ``host_state``
+HEARTBEAT_CADENCE_S = 1.0
+WORKER_LIVE_FACTOR = 3          # a heartbeat no older than this many cadences is a live worker
+WORKER_DOWN_AFTER_S = 30.0      # a heartbeat older than this (or none at all) is a worker that is down; between, stale
+STALE_CADENCE_FACTOR = 2        # a row older than this many of its panel's cadences is stale though the worker lives
+ATTACHED_SNAP_CACHE_MAX = 256   # decoded snapshots kept, one per (panel, generation)
+
 
 def _manifest_pool(size: int) -> ThreadPoolExecutor:
     """The process's manifest-read pool of ``size`` threads, made on first use (keyed by size, so a test that patches
@@ -762,6 +813,25 @@ class _SharedRead:
 
     def __init__(self, at: float) -> None:
         self.at, self.done, self.value, self.ok = at, threading.Event(), None, None
+
+
+class _ChangeProbe:
+    """What the change stream asks an attached cockpit (see ``Cockpit.change_probe``): a counter that moves when a panel's
+    snapshot changed, cheap enough to look at every second, and the panels' current class-none etags to diff when it did."""
+
+    def __init__(self, cockpit: "Cockpit") -> None:
+        self._cockpit = cockpit
+
+    def change_seq(self) -> int:
+        # the publish counter: a heartbeat is no panel change, so the file's own change token (which a heartbeat moves) is not used
+        meta = self._cockpit._reader.meta()
+        try:
+            return int(meta.get("publish_seq", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def snapshot(self) -> "tuple[dict[str, str], str]":
+        return self._cockpit._probe_snapshot()
 
 
 class Cockpit:
@@ -817,6 +887,21 @@ class Cockpit:
         self._rc_refreshing: set[str] = set()       # refresher panels with a write-triggered refresh still running
         self._rc_refresh_dirty: set[str] = set()    # of those, the ones a later write reached while it ran
         self._rc_lock = threading.Lock()
+        # attached mode (``attach_snapshots``): None while this cockpit is bare and reads its providers on the request path
+        self._reader: Any = None
+        self._host_deriving: Callable[[], Iterable[str]] | None = None
+        self._host_pending: Callable[[str], bool] | None = None
+        self._host_dirty: Callable[[Iterable[str], int], None] | None = None
+        self._host_state: Callable[[], Mapping[str, Any]] | None = None
+        self._serve_composed: frozenset[str] = SERVE_COMPOSED_IDS
+        # what the host cycle last read for the manifest: the entity (with its faults) and the discovery faults. Each is one
+        # whole value swapped in, never changed in place
+        self._entity_value: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
+        self._discovery_errors: list[dict[str, Any]] = []
+        # decoded snapshots by (panel, gen, body sha, status, error): a request reads a row, never decodes or serialises it twice
+        self._attached_snaps: "OrderedDict[tuple, _Snap]" = OrderedDict()
+        self._attached_lock = threading.Lock()
+        self._probe: "_ChangeProbe | None" = None
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -1307,8 +1392,11 @@ class Cockpit:
 
     # --- lifecycle -------------------------------------------------------------------
     def start(self) -> None:
-        """Take the first read of every refresher panel, then start its refresher thread."""
+        """Take the first read of every refresher panel, then start its refresher thread. An attached cockpit starts none:
+        its host derives every panel, so a refresher thread here would run a provider the request side must not."""
         with self._life:
+            if self._reader is not None:
+                return
             for pid in [p for p, r in self._refreshers.items() if not r.thread.is_alive()]:
                 del self._refreshers[pid]    # a halted refresher that has since died is restartable
             for spec in list(self._specs.values()):
@@ -1338,6 +1426,198 @@ class Cockpit:
 
     def refresher(self, panel_id: str) -> _Refresher | None:
         return self._refreshers.get(panel_id)
+
+    # --- attached mode ---------------------------------------------------------------
+    def attach_snapshots(self, reader: Any, *, deriving: Callable[[], Iterable[str]] | None = None,
+                         pending: Callable[[str], bool] | None = None,
+                         dirty: Callable[[Iterable[str], int], None] | None = None,
+                         host_state: Callable[[], Mapping[str, Any]] | None = None) -> None:
+        """Switch this cockpit to attached mode: every panel but the serve-composed ones is read from the row a derive host
+        published (``reader``, a ``SnapshotReader``), never from its provider; a bare cockpit stays as it is. Attach before
+        ``start()``: an attached cockpit starts no refresher threads, and one already running keeps running.
+
+        ``deriving()`` and ``pending(panel_id)`` are the host's busy accessors; ``dirty(panel_ids, write_gen)`` is the
+        host's write hook, kept for the write path and not called here; ``host_state()`` answers ``{"worker": "live" |
+        "stale" | "down", "heartbeat_age_s": float | None}`` for a host that knows its own health better than the
+        file's heartbeat does. All optional. Once only: a second reader is refused (the same reader again is a no-op)."""
+        with self._lock:
+            if self._reader is not None:
+                if self._reader is reader:
+                    return
+                raise RuntimeError("this cockpit is already attached to a snapshot reader")
+            self._host_deriving, self._host_pending = deriving, pending
+            self._host_dirty, self._host_state = dirty, host_state
+            self._reader = reader
+
+    @property
+    def attached(self) -> bool:
+        return self._reader is not None
+
+    def serve_composed(self, panel_id: str) -> bool:
+        """True for a panel that keeps running its provider on the request path in attached mode (D4: it reads stores under
+        the request's authority, which a credential-free snapshot cannot carry): ``SERVE_COMPOSED_IDS`` and whatever a
+        downstream added with ``mark_serve_composed``."""
+        return panel_id in self._serve_composed
+
+    def mark_serve_composed(self, panel_ids: Iterable[str]) -> None:
+        """Add panels to the serve-composed set (they read per request under the request's authority)."""
+        ids = frozenset(panel_ids)
+        if not all(type(i) is str for i in ids):
+            raise TypeError("a panel id is a string")
+        with self._lock:
+            self._serve_composed = self._serve_composed | ids
+
+    def derive_panel(self, panel_id: str) -> _Snap:
+        """One derive-side read of a registered panel: what a refresher cycle does (``refresh``), returning the snapshot it
+        made. No request authority: the result holds nothing a credential decides. KeyError for an id that is not
+        registered or was retired."""
+        spec = self._specs[panel_id]
+        st = self._state_of(spec)
+        if st is None:
+            raise KeyError(panel_id)
+        return self._read_panel(spec, st, ReadContext(self._clock()))
+
+    def run_discovery(self) -> list[str]:
+        """Run every discoverer once, outside any request (what a manifest does first when this cockpit is bare), and return
+        the ids of the panels discovery has registered. A discoverer's fault is kept for the manifest's ``errors``."""
+        self._discovery_errors = self._ensure_discovered(ReadContext(self._clock()))
+        return list(self._discovered)
+
+    def read_entity(self) -> Any:
+        """The entity read once, outside any request, as ``(entity, errors)``: the entity with every field present (the
+        empty one when there is no entity function or it failed) and the manifest ``errors`` entries its read made. A
+        host stores the answer with ``set_entity_value``."""
+        return self._entity(ReadContext(self._clock()))
+
+    def set_entity_value(self, value: Any) -> None:
+        """Store what ``read_entity`` returned: the entity an attached cockpit's manifest carries until the next one."""
+        entity, errors = value
+        self._entity_value = (entity, list(errors))
+
+    def worker_health(self) -> dict[str, Any]:
+        """The derive host's health for a freshness line: ``worker`` (live, stale or down), ``heartbeat_age_s`` (None when
+        there is no heartbeat) and ``deriving`` (the panels the host has queued or running). Attached only."""
+        reader = self._reader
+        if reader is None:
+            raise RuntimeError("this cockpit is not attached to a snapshot reader")
+        worker, age = self._worker_health(reader.meta(), _epoch(self._clock()))
+        return {"worker": worker, "heartbeat_age_s": age, "deriving": self._deriving_ids()}
+
+    def change_probe(self) -> "_ChangeProbe | None":
+        """The probe the change stream watches (``change_seq()`` and ``snapshot()``), or None for a bare cockpit."""
+        if self._reader is None:
+            return None
+        if self._probe is None:
+            self._probe = _ChangeProbe(self)
+        return self._probe
+
+    def _probe_snapshot(self) -> "tuple[dict[str, str], str]":
+        """Every registered panel's class-none head etag, built the way the change stream's manifest read builds them, and a
+        version of the panel set: the ids, the verb revision and the calendar day, each of which changes what a page
+        draws with no snapshot moving. A serve-composed panel reads its stores here, as it does in a manifest."""
+        auth = self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
+        etags: dict[str, str] = {}
+        for spec in self._ordered_specs(self._specs):
+            if self._state_of(spec) is None:
+                continue
+            snap = self._snap_for(spec, ctx.child())
+            etags[spec.id] = self._head(spec, snap, "none", ctx.today, auth, ctx.now)["etag"]
+        version = _sha({"panels": sorted(etags), "verbs": self._verb_rev(auth), "date": ctx.today.isoformat()})[:16]
+        return etags, version
+
+    def _deriving_ids(self) -> list[str]:
+        try:
+            return sorted(self._host_deriving()) if self._host_deriving is not None else []
+        except Exception:  # noqa: BLE001 - a host's busy list is a hint to the page, never a fault of the read
+            return []
+
+    def _is_pending(self, panel_id: str) -> bool:
+        try:
+            return bool(self._host_pending(panel_id)) if self._host_pending is not None else False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _worker_health(self, meta: Mapping[str, str], now_s: float) -> "tuple[str, float | None]":
+        """``(worker, heartbeat_age_s)``: the host's own word when it gave one that is well formed, else the heartbeat the
+        worker stamps in the file: live within ``WORKER_LIVE_FACTOR`` cadences of it, stale up to ``WORKER_DOWN_AFTER_S``,
+        down beyond that or with none."""
+        if self._host_state is not None:
+            try:
+                told = self._host_state()
+                worker, age = told.get("worker"), told.get("heartbeat_age_s")
+                if worker in WORKER_STATES:
+                    return worker, (float(age) if age is not None else None)
+            except Exception:  # noqa: BLE001 - a host that cannot say is read through the file
+                pass
+        beat = _meta_float(meta, "heartbeat_at")
+        if beat is None:
+            return "down", None
+        age = max(0.0, now_s - beat)
+        if age <= WORKER_LIVE_FACTOR * HEARTBEAT_CADENCE_S:
+            return "live", age
+        return ("stale" if age <= WORKER_DOWN_AFTER_S else "down"), age
+
+    def _fresh_of(self, spec: ProviderSpec, row: Any, meta: Mapping[str, str], now_s: float) -> _Fresh:
+        """Whether a published row is stale. The rule is the contract's reader rule plus the cold-start one: serving a
+        snapshot that may no longer be true is allowed, serving one that looks current is not, so a row is stale when the
+        worker that should be refreshing it is not live; when its own ``valid_until`` has passed; when it is older than
+        twice its panel's refresh cadence (``refresh_every_s``, else ``stale_after_s``), a derive that has stopped
+        landing under a worker that still beats; or when it was derived before the worker now running started (D10: a
+        relaunched serve answers from the last run's rows at once, each stale until the new worker has re-derived it)."""
+        worker, _age = self._worker_health(meta, now_s)
+        started = _meta_float(meta, "worker_started_at")
+        cadence = spec.refresh_every_s if spec.refresh_every_s is not None else spec.stale_after_s
+        stale = (worker != "live"
+                 or (row.valid_until is not None and now_s >= row.valid_until)
+                 or (cadence > 0 and now_s - row.derived_at > STALE_CADENCE_FACTOR * cadence)
+                 or (started is not None and row.derived_at < started))
+        return _Fresh(_iso_epoch(row.derived_at), _iso_epoch(row.valid_until) if row.valid_until is not None else None,
+                      bool(stale), self._is_pending(spec.id))
+
+    def _attached_error(self, spec: ProviderSpec, message: str, as_of: str | None, fresh: _Fresh, *,
+                        hint: bool = False) -> _Snap:
+        return _Snap("error", None, None, [], [], as_of, message, spec.note, hint, fresh_info=fresh)
+
+    def _attached_snap(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
+        """The snapshot of a panel in attached mode: its published row, decoded, with the freshness facts. A provider is
+        never run. A panel with no row yet, or whose store cannot be read, is an error snapshot that says so and is marked
+        stale; a row whose derive failed or timed out reads as an error carrying the host's message (the kept last-good
+        body is not served as if current)."""
+        pending = self._is_pending(spec.id)
+        try:
+            row = self._reader.read(spec.id)
+            meta = self._reader.meta()
+        except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
+            return self._attached_error(spec, f"the snapshot store could not be read: {type(exc).__name__}: {_safe_str(exc)}",
+                                        None, _Fresh(None, None, True, pending), hint=True)
+        if row is None:
+            return self._attached_error(spec, NOT_DERIVED_YET, None, _Fresh(None, None, True, pending), hint=True)
+        fresh = self._fresh_of(spec, row, meta, _epoch(ctx.now))
+        as_of = fresh.derived_at
+        if row.status in ("error", "timeout"):
+            return self._attached_error(spec, row.error or ("the derive timed out" if row.status == "timeout"
+                                                            else "the derive failed"), as_of, fresh)
+        key = (row.id, row.gen, row.body_sha, row.status, row.error)
+        with self._attached_lock:
+            base = self._attached_snaps.get(key)
+            if base is not None:
+                self._attached_snaps.move_to_end(key)
+        if base is None:
+            try:
+                base = decode_snap(row.status, self._reader.decoded(row), as_of=None, error=row.error)
+                base.etag_frags()
+            except (SnapshotBodyError, ValueError, TypeError) as exc:
+                return self._attached_error(spec, f"the snapshot could not be read: {_safe_str(exc)}", as_of, fresh)
+            with self._attached_lock:
+                self._attached_snaps[key] = base
+                while len(self._attached_snaps) > ATTACHED_SNAP_CACHE_MAX:
+                    self._attached_snaps.popitem(last=False)
+        # one decoded snapshot serves every read of its generation; each read gets its own copy for the facts that move
+        # without the content moving (when it was derived, how stale it is), and the kept etag text rides along
+        snap = dataclasses.replace(base, as_of=as_of, fresh_info=fresh)
+        snap._etag_frags = base.etag_frags()
+        return snap
 
     # --- reading ---------------------------------------------------------------------
     def _single_flight(
@@ -1584,6 +1864,8 @@ class Cockpit:
         st = self._state_of(spec)
         if st is None:
             return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
+        if self._reader is not None and not self.serve_composed(spec.id):
+            return self._attached_snap(spec, ctx)
         if spec.refresh_every_s is None:
             gen = self._rc_gen
             recent = self._recent_snap(st, read_after)
@@ -2152,8 +2434,13 @@ class Cockpit:
             "searchable": searchable, "window": spec.window,
         }
 
+    @staticmethod
+    def _entity_base() -> dict[str, Any]:
+        """The entity of a cockpit that has none to read, or whose read failed: every field present and empty."""
+        return {"name": None, "governance": None, "brand": {"wordmark": None, "model": None}}
+
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        base = {"name": None, "governance": None, "brand": {"wordmark": None, "model": None}}
+        base = self._entity_base()
         if self._entity_fn is None:
             return base, []
         res = self._bounded(self._entity_timeout_s, self._entity_state, self._entity_call, ctx)
@@ -2451,9 +2738,16 @@ class Cockpit:
         :meth:`manifest`."""
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
-        errors = self._ensure_discovered(ctx)
-        entity, entity_errors = self._entity(ctx)
-        errors += entity_errors
+        if self._reader is not None:
+            # the host cycle discovers and reads the entity; a manifest only reports what it last stored (the empty entity
+            # before it stored one), so no discoverer or entity function runs on a request
+            stored = self._entity_value
+            entity, entity_errors = stored if stored is not None else (self._entity_base(), [])
+            errors = [*self._discovery_errors, *entity_errors]
+        else:
+            errors = self._ensure_discovered(ctx)
+            entity, entity_errors = self._entity(ctx)
+            errors += entity_errors
         heads: dict[str, dict[str, Any]] = {}
         snaps: dict[str, _Snap] = {}
         specs_map = self._specs      # one snapshot for the whole manifest
@@ -2541,12 +2835,24 @@ class Cockpit:
         aged against ``stale_after_s``. A refresher
         panel that was never started reads ``error``, as in its head; an on-demand panel not yet served is
         ``status: "unread"`` with ``as_of: null``. Panels found by discovery appear
-        after the first manifest read. No rows, no etag, never 304."""
+        after the first manifest read. No rows, no etag, never 304.
+
+        Attached: a panel but the serve-composed ones answers from its published row (``as_of`` is when it was derived,
+        ``status`` the row's, ``stale`` the reader's verdict), ``unread`` while it has no row."""
         ctx = ReadContext(self._clock())
         unread = {"as_of": None, "status": "unread"}
         out: dict[str, dict[str, Any]] = {}
         specs_map = self._specs          # ONE registry snapshot for the whole call
         for spec in self._ordered_specs(specs_map):
+            if self._reader is not None and not self.serve_composed(spec.id):
+                # attached: the row's own age and verdict, from the file; a panel with no row yet is unread
+                snap = self._attached_snap(spec, ctx)
+                if snap.error == NOT_DERIVED_YET:
+                    out[spec.id] = dict(unread, stale=True)
+                else:
+                    out[spec.id] = {"as_of": snap.as_of, "status": snap.status,
+                                    "stale": bool(snap.fresh_info and snap.fresh_info.stale)}
+                continue
             if spec.refresh_every_s is not None:
                 snap = self._snap_for(spec, ctx)
                 out[spec.id] = {"as_of": snap.as_of, "status": snap.status}
@@ -2608,8 +2914,8 @@ class Cockpit:
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs
-        if panel_id not in specs_map:
-            self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since
+        if panel_id not in specs_map and self._reader is None:
+            self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since (an attached cockpit's host did)
             specs_map = self._specs
         spec = specs_map.get(panel_id)
         if spec is None:
