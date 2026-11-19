@@ -3919,7 +3919,7 @@ body.ia[data-ia-place="home"] #ck-band, body.ia[data-ia-place="home"] #ck-skycol
 body.ia[data-ia-place="home"] .deck > :is(.masthead, .ia-places) {
   margin-inline: calc(-1 * var(--gutter-ke)); }
 body.ia[data-ia-place="home"] :is(main.frame, #board, .ck-zone[data-zone="operate"],
-  .ck-zone[data-zone="operate"] > .ck-zgrid, .ck-zone[data-zone="operate"] .ck-col, .hero) { display: contents !important; }
+  .ck-zone[data-zone="operate"] > .ck-zgrid, .ck-zone[data-zone="operate"] .ck-col, .hero:not([hidden])) { display: contents !important; }
 body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head { display: none; }
 /* The zone head is not drawn on Home, but the Reset layout control lives in it and only shows while a layout is saved: it is the one
    child kept, placed in the Work head's row (the Work head takes the rest of the row from 721 px; below that it has a row of its own). */
