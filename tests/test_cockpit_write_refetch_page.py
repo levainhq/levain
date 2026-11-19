@@ -12,6 +12,7 @@ fetch, held open by a gate the test releases, so the order "row repainted, then 
   itself; another panel is read at once, and once the read has settled (answered or faulted) a later refetch reads for itself;
 * a panel the page cannot repaint in place (answers false) asks one board read (not passive), however many of a write's
   panels answer false, and a board read already in flight is re-read once it ends;
+* a touched write that lands while a job polls still refetches in place and owes one board read for the job's end;
 * a refetch that faults or throws asks that same board read (once per write), and when that read fails the page's own
   failed-read line shows it;
 * the row repaint is visible before the panel read returns (a snooze into the future hides the row, a text edit changes the
@@ -83,7 +84,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
                   querySelector: (sel) => (sel === ".clause" ? clauseEl : null), appendChild() {},
                   style: {}, title: "", attrs, setAttribute: (k, v) => { attrs[k] = String(v); }, getAttribute: (k) => (k in attrs ? attrs[k] : null) };
   const ls = store(); ls.setItem("levain_write_token", "tok");
-  const env = { posts, gets, renders, marks, rowEl, clauseEl, refetchCalls: [], releaseGate: () => {}, releaseManifest: () => {}, settled: [], editing: false };
+  const env = { posts, gets, renders, marks, rowEl, clauseEl, refetchCalls: [], releaseGate: () => {}, releaseManifest: () => {}, settled: [], editing: false, jobs: false };
   const V = Object.assign({}, View, opts.real ? {} : {
     refetchPanel: (pid) => {
       env.refetchCalls.push(pid);
@@ -99,7 +100,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
   });
   const win = { LevainCockpitView: V, localStorage: ls, sessionStorage: store(), location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
-    LevainDashboard: { render: (view, o) => renders.push({ view, opts: o }), hasUnsavedEdit: () => env.editing, jobsActive: () => false }, dispatchEvent() {} };
+    LevainDashboard: { render: (view, o) => renders.push({ view, opts: o }), hasUnsavedEdit: () => env.editing, jobsActive: () => env.jobs }, dispatchEvent() {} };
   env.stampEl = { textContent: "" };    // the page's status line (#stamp), where a failed board read says so
   const doc = { getElementById: (id) => (id === "stamp" ? env.stampEl : null), addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
                 createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
@@ -340,6 +341,33 @@ cases.a_failing_fallback_board_read_leaves_the_pages_failed_read_line = async ()
   ok(/^read failed/.test(env.stampEl.textContent), "the status line says the read failed: " + JSON.stringify(env.stampEl.textContent));
 };
 
+// A write that lands while a job polls (a job verb's response is the job started: the data changes when it ends) refetches in
+// place AND owes the board a re-read for when the last job ends, the latch the whole-board path sets. The render core calls
+// `onJobsIdle` then; that flushes the latch as one passive board read.
+cases.a_touched_write_during_a_job_refetches_and_owes_a_re_read_when_the_job_ends = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
+  const getsBefore = env.gets.length;
+  env.jobs = true;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.refetchCalls.length === 1 && env.refetchCalls[0] === "tray", "the touched panel was refetched in place: " + JSON.stringify(env.refetchCalls));
+  ok(env.manifestGets(getsBefore) === 0, "no board read while the job polls: " + JSON.stringify(env.gets.slice(getsBefore)));
+  env.jobs = false;
+  env.opts().onJobsIdle();              // the last job ended
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read followed the job's end: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+cases.a_touched_write_with_no_job_owes_no_re_read_at_idle = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  env.opts().onJobsIdle();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 0, "no board read: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
 // H1: the save's own re-read must rebuild the board (closing the form it came from) even though an edit is open, as the old
 // whole-board reload did; a passive read is refused for an open edit and the form would sit on "saving..." forever.
 cases.a_write_from_an_open_form_reads_the_board_non_passively = async () => {
@@ -436,6 +464,8 @@ CASES = [
     "a_refetch_that_throws_asks_the_board_read",
     "a_write_with_two_faulting_panels_asks_the_board_read_once",
     "a_failing_fallback_board_read_leaves_the_pages_failed_read_line",
+    "a_touched_write_during_a_job_refetches_and_owes_a_re_read_when_the_job_ends",
+    "a_touched_write_with_no_job_owes_no_re_read_at_idle",
     "a_write_from_an_open_form_reads_the_board_non_passively",
     "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
     "two_native_panels_ask_one_board_read",

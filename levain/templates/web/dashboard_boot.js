@@ -1146,10 +1146,13 @@
   // after a landed write: with the panels it touched, an in-place background refetch of those (resolves at once, true when
   // started); without (an older server), the reload of the whole board, deferring while an async job polls (as postWrite does).
   // A board read already out when the write lands began before it and may draw the pre-write board over the rows the refetches
-  // paint, so one re-read is latched after it (the latch a non-passive load sets when it finds one in flight).
+  // paint, so one re-read is latched after it (the latch a non-passive load sets when it finds one in flight). While an async
+  // job polls, the refetch still runs (the write's own change is real now) but the data a job verb changes moves when the job
+  // ends, so the same deferral the whole-board path sets is set too: the board is read once more when the last job ends.
   async function afterWrite(touched) {
     if (touched) {
       if (inflight) pendingReload = true;
+      if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) deferredReload = true;
       return refetchTouched(touched);
     }
     if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
