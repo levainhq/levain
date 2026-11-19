@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<!-- GENERATED from dashboard.html by the levain#141 preview generator; a preview, not the live page. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Levain · preview B</title>
+<link rel="stylesheet" href="/dashboard.css" />
+<link rel="stylesheet" href="/preview_ia.css" />
+<!-- OS-4: the Home Screen web app a phone turns pings on in -->
+<link rel="manifest" href="/app.webmanifest" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Levain" />
+<!-- cockpit_view.js loads here, not at the end of the body: its first act is to set the chosen theme, so a stored light theme never
+     flashes dark (the CSP forbids an inline script). Everything else in it runs when the document is ready. -->
+<script src="/cockpit_view.js"></script>
+<script src="/legacy_phone_link.js"></script>
+<script src="/sw_open.js"></script>
+<script src="/pwa_resume.js"></script>
+<script src="/pwa_update.js"></script>
+<script src="/topology_view.js"></script>
+<script src="/agents_view.js"></script>
+</head>
+<body class="ia ia-b">
+  <div class="deck">
+    <div class="ia-ribbon frame" id="ia-ribbon" role="note">
+      <b>Preview B</b><span class="ia-rib-t">your real data, read live · nothing you press here is sent</span>
+      <span class="ia-rib-tags" role="group" aria-label="Tagline">tagline <button type="button" data-ia-tag="0">1</button><button type="button" data-ia-tag="1">2</button><button type="button" data-ia-tag="2">3</button></span>
+      <span class="ia-rib-nav"><a href="/preview/home">see A</a><a href="/">today's page</a></span>
+    </div>
+    <!-- The masthead (brand and tagline, the action buttons, readout, theme); no Modes bar. preview_ia.css places the rest. -->
+    <header class="masthead frame">
+      <div class="brand">
+        <div class="wordmark">Levain</div>
+        <div class="ia-tagline" id="ia-tagline"></div>
+      </div>
+      <div class="readout">
+        <div class="unit">
+          <span class="unit-label">Unit</span>
+          <span class="entity" id="entity">—</span>
+        </div>
+        <div class="jar" id="jar" hidden></div>
+        <div class="indicators">
+          <span class="ia-actions" role="group" aria-label="Actions">
+            <button type="button" class="ia-act" data-phone-jump="drop" aria-label="Drop to the desk" title="Drop to the desk"><span class="ia-ico" aria-hidden="true">&#9998;</span><span class="ia-lbl">Drop</span></button>
+            <button type="button" class="ia-act" data-phone-jump="grants" aria-label="Grants" title="Grants"><span class="ia-ico" aria-hidden="true">&#9919;</span><span class="ia-lbl">Grants</span></button>
+            <button type="button" class="ia-act" data-phone-jump="notifications" aria-haspopup="dialog" aria-label="Notifications" title="Notifications"><span class="ia-ico" aria-hidden="true">&#9673;</span><span class="ia-lbl">Notifications</span><span class="ck-tabcount ck-pill" data-nc-unread hidden></span></button>
+          </span>
+          <span class="stamp" id="stamp"></span>
+          <button id="presencebtn" class="pr-chip" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-controls="pr-sheet" aria-label="Presence"><span class="pr-dot" aria-hidden="true"></span><span class="pr-chip-t"></span></button>
+          <button id="refresh" type="button">Sync</button>
+          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
+          <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
+        </div>
+        <div class="themesw" role="group" aria-label="Theme">
+          <button type="button" data-theme-set="system" aria-pressed="false" aria-label="Follow the system theme" title="System">&#9680;</button>
+          <button type="button" data-theme-set="dark" aria-pressed="false" aria-label="Dark theme" title="Dark">&#9790;</button>
+          <button type="button" data-theme-set="light" aria-pressed="false" aria-label="Light theme" title="Light">&#9788;</button>
+        </div>
+      </div>
+    </header>
+    <!-- The places bar: places only. Its buttons drive the page through the hidden drivers below (preview_ia.js). -->
+    <nav class="ck-phonetabs ia-places" id="ck-phonetabs" aria-label="Places">
+      <button type="button" data-ia-place-btn="home">Home<span class="ia-needs"><span class="ia-needs-w">Needs</span><span class="ck-tabcount ck-needs-count" data-nc-needs hidden></span></span></button>
+      <button type="button" data-ia-place-btn="room">Room</button>
+      <button type="button" data-ia-place-btn="memory">Memory</button>
+    </nav>
+    <!-- The places bar drives the page's own wiring through these (data-mode-tab: cockpit_view.js; data-phone-jump: dashboard_boot.js). -->
+    <div class="ia-drivers" hidden>
+      <button type="button" data-mode-tab="board" data-ia-mode="board" tabindex="-1">board</button>
+      <button type="button" data-mode-tab="memory" data-ia-mode="memory" tabindex="-1">memory</button>
+      <button type="button" data-phone-jump="desk" data-ia-jump="desk" tabindex="-1">desk</button>
+      <button type="button" data-phone-jump="room" data-ia-jump="room" tabindex="-1">room</button>
+    </div>
+    <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
+      <div class="band frame" id="ck-band">
+        <button id="calmphone" type="button" data-calm-toggle aria-pressed="false">Calm off</button>
+        <div class="when" id="ck-when"></div>
+        <div class="band-state" id="ck-state-slot"></div>
+        <div class="band-meta" id="ck-wrapline"></div>
+      </div>
+      <div class="skycol frame" id="ck-skycol">
+        <div class="skycard" id="ck-skycard">
+          <div class="ck-hlens" id="ck-hlens" hidden></div>
+          <div id="ck-sky"></div>
+          <div class="ck-legend" id="ck-legend" hidden></div>
+        </div>
+      </div>
+    </section>
+    <nav class="ia-drills frame" id="ia-drills" aria-label="Open">
+      <button type="button" data-ia-drill-btn="work"><b>Work</b><span>the board and the List</span></button>
+      <button type="button" data-ia-drill-btn="machine"><b>Machine</b><span>agents, fleet, calls, stream, jobs</span></button>
+      <button type="button" data-ia-place-btn="memory"><b>Memory</b><span>crystals, graph, episodes, intentions</span></button>
+    </nav>
+    <div class="ia-back frame" id="ia-back"><button type="button" data-ia-place-btn="home">&larr; Home: the desk</button><span id="ia-back-t"></span></div>
+    <section class="ck-needs frame" id="ck-needs" aria-label="Needs you" hidden></section>
+    <!-- The desk drop: directly under the Needs-you row in every view (Phill 10-30; filled by renderDropHero; never replaced by an install). -->
+    <section class="ck-drop frame" id="ck-drop" aria-label="Drop to the desk" hidden></section>
+    <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
+    <div class="ck-secthead frame" id="ck-h-brief" hidden><h3>Today</h3></div>
+    <section class="ck-brief frame" id="ck-brief" data-ck-region="brief" hidden></section>
+    <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
+    <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
+    <p class="stateline frame" id="state" hidden></p>
+    <p class="sub frame" id="store" data-cold>connecting…</p>
+    <!-- Modes 1-4 show subsets of the board; the keys are ignored while typing. -->
+    <main class="frame"><div class="grid" id="board"></div></main>
+    <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
+  </div>
+
+<!-- The canonical render core (shared, transport-agnostic) + this surface's thin
+     fetch lifecycle shim. Both served by `levain serve` from package data — no
+     CDN, no framework, runs offline. -->
+<script src="/card_format.js"></script>
+<script src="/dashboard_core.js"></script>
+<script src="/sky.js"></script>
+<script src="/pwa_install.js"></script>
+<script src="/pair_card.js"></script>
+<script src="/dashboard_boot.js"></script>
+<script src="/cockpit_stream.js"></script>
+<script src="/dashboard_chat.js"></script>
+<script src="/devices_panel.js"></script>
+<script src="/voice_icons.js"></script>
+<script src="/voice.js"></script>
+<script src="/card_voice.js"></script>
+<script src="/mic.js"></script>
+<script src="/thread_view.js"></script>
+<script src="/room_view.js"></script>
+<script src="/desk_tab_view.js"></script>
+<script src="/board_view.js"></script>
+<script src="/preview_ia.js"></script>
+</body>
+</html>
