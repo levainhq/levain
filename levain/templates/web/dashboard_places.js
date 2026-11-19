@@ -128,7 +128,7 @@
     b.type = "button";
     b.className = "ia-graph-toggle";
     b.setAttribute("data-ia-graph-toggle", "");
-    b.setAttribute("aria-controls", "ck-sky");   // the graph it shows; the text flip is the state (a screen reader hears "Hide the graphs", not also "expanded")
+    b.setAttribute("aria-controls", "ck-skycard");   // the card it opens (the lens bar and the graph); the text flip is the state (a screen reader hears "Hide the graphs", not also "expanded")
     b.textContent = "Show the graphs";
     var row = document.getElementById("ck-mctl") || col;   // the Machine control row: Show/Hide the graphs, Calm, Ambient
     row.insertBefore(b, row.firstChild);

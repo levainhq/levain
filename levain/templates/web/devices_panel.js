@@ -1418,11 +1418,14 @@
   // the token look in start(), and when the page is focused or shown again.
   let vcDone = false, vcBusy = false, vcTries = 0;
   const VC_MAX_TRIES = 6;
+  // A probe skipped because another is still out (vcBusy: a voice.json slower than the retry) has learned nothing, so it does not
+  // settle the Settings empty line; the probe that is out settles it when its answer comes (L3 r1: codex, gemini, deepseek).
   async function voiceProbe() {
-    try { await voiceProbeInner(); } finally { settle("vc"); }
+    let ran = false;
+    try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || vcTries >= VC_MAX_TRIES) settle("vc"); }
   }
   async function voiceProbeInner() {
-    if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return;
+    if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return false;
     vcBusy = true; vcTries++;
     let state = null, final = false;
     try {
@@ -1440,6 +1443,7 @@
     }
     vcBusy = false;
     if (final) vcDone = true;
+    return true;
   }
   // After the first read the spend would freeze at that moment, so a focus or a return to the tab reads voice.json again and
   // repaints from the answer. A failed or odd answer leaves what is on screen as it was.

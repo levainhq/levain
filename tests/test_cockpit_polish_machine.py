@@ -71,12 +71,12 @@ def test_closed_shows_no_selector_open_stacks_row_selector_graph_and_remembers_t
                 {"eval": STATE},                                                                      # 3: open with the stored lens
             ])
             shut, opened, again, back = _states(out)
-            assert shut["open"] is False and shut["btn"] == "Show the graphs" and shut["expanded"] is None and shut["controls"] == "ck-sky", (w, shut)   # fix4: the text flip is the state
+            assert shut["open"] is False and shut["btn"] == "Show the graphs" and shut["expanded"] is None and shut["controls"] == "ck-skycard", (w, shut)   # fix4: the text flip is the state
             assert not (shut["seg"] and shut["seg"]["shown"]), (w, shut)                              # the selector is not drawn while closed
             assert not (shut["sky"] and shut["sky"]["shown"]), (w, shut)
             assert shut["calmIn"] and shut["ambIn"] and not shut["mastCalm"] and not shut["phoneCalm"], (w, shut)
             assert shut["row"]["bottom"] <= shut["card"]["top"] + 1, (w, shut)                        # the row is above the card, nothing over it
-            assert opened["open"] is True and opened["btn"] == "Hide the graphs" and opened["expanded"] is None and opened["controls"] == "ck-sky", (w, opened)
+            assert opened["open"] is True and opened["btn"] == "Hide the graphs" and opened["expanded"] is None and opened["controls"] == "ck-skycard", (w, opened)
             assert opened["seg"]["shown"] and opened["sky"]["shown"], (w, opened)
             # no overlap: the control row ends where the selector begins, and the graph is below the selector
             assert opened["toggle"]["bottom"] <= opened["seg"]["top"] + 1 and opened["calm"]["bottom"] <= opened["seg"]["top"] + 1, (w, opened)

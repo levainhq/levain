@@ -204,11 +204,11 @@ def test_every_masthead_control_and_the_machine_row_are_44_px_on_touch_at_every_
 
 def test_the_graphs_toggle_names_its_state_in_its_text_and_controls_the_graph() -> None:
     """The visible text flips ("Show the graphs" / "Hide the graphs"); aria-expanded is gone (the name already says the state) and
-    aria-controls names the graph it shows."""
-    assert 'b.setAttribute("aria-controls", "ck-sky")' in PLACES_JS
+    aria-controls names the card it opens (the lens bar and the graph, L3 r1 codex)."""
+    assert 'b.setAttribute("aria-controls", "ck-skycard")' in PLACES_JS
     assert "aria-expanded" not in PLACES_JS
     assert 'g.textContent = open ? "Hide the graphs" : "Show the graphs"' in PLACES_JS
-    assert 'id="ck-sky"' in HTML
+    assert 'id="ck-skycard"' in HTML
 
 
 # --------------------------------------------------------------------------------------------------------- 8: the empty line
@@ -232,8 +232,11 @@ def test_the_empty_line_is_not_shown_before_the_settings_reads_answer(tmp_path: 
 
 def test_every_settings_read_marks_itself_settled_whatever_it_answered() -> None:
     js = (WEB / "devices_panel.js").read_text(encoding="utf-8")
-    for inner, which in (("readOnceInner", "dev"), ("readPresenceInner", "pr"), ("voiceProbeInner", "vc")):
+    for inner, which in (("readOnceInner", "dev"), ("readPresenceInner", "pr")):
         assert f'try {{ return await {inner}(); }} finally {{ settle("{which}"); }}' in js or f'try {{ await {inner}(); }} finally {{ settle("{which}"); }}' in js, inner
+    # the voice probe settles only when it ran its read (L3 r1: a probe skipped because another is out has learned nothing)
+    assert 'try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || vcTries >= VC_MAX_TRIES) settle("vc"); }' in js
+    assert "if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return false;" in js
 
 
 # --------------------------------------------------------------------------------------------------------- 9, 10: comments and dead CSS

@@ -2127,7 +2127,7 @@
     // for Home first (the places' own go() clears ia-settings-on); the tab logic below then moves on to Memory if the panel lives there
     const cl0 = document.body.classList;
     let leftSettings = false;
-    if (cl0.contains("ia-settings-on") && !(node && node.closest && node.closest(".dev-zone"))) {
+    if (cl0.contains("ia-settings-on") && !(node && node.closest && node.closest(".dev-zone, .ck-thiscockpit"))) {
       if (root.LevainPlaces && typeof root.LevainPlaces.go === "function") root.LevainPlaces.go("home"); else cl0.remove("ia-settings-on");
       leftSettings = true;
     }
