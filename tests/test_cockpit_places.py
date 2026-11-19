@@ -320,7 +320,7 @@ def test_choosing_a_panel_in_the_jump_box_on_the_desk_leaves_the_desk(tmp_path: 
 def test_drop_on_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
     """The masthead Drop button was a no-op on Memory (the box is not drawn there): it goes Home, then scrolls to and focuses the box."""
     ST = ("(() => { const d = document.getElementById('ck-drop'); const a = document.activeElement;"
-          " return JSON.stringify({place: document.body.dataset.iaPlace, drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), y: Math.round(scrollY), inBox: !!a && d.contains(a)}); })()")
+          " return JSON.stringify({place: document.body.dataset.iaPlace, drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom), y: Math.round(scrollY), inBox: !!a && d.contains(a)}); })()")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -334,7 +334,7 @@ def test_drop_on_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
     on_memory, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{")]
     assert on_memory["place"] == "memory" and not on_memory["drawn"] and on_memory["y"] == 0, on_memory
     assert after["place"] == "home" and after["drawn"], after
-    assert after["y"] > 0 and abs(after["top"]) <= 2, after                       # the page's own jump ran: the box is scrolled to the top of the view
+    assert after["y"] > 0 and after["mast"] - 1 <= after["top"] <= after["mast"] + 40, after   # the page's own jump ran: the box is scrolled to just under the sticky masthead (levain#141 polish)
 
 
 @needs_browser
@@ -391,7 +391,7 @@ def test_the_places_keys_under_an_open_dialog_leave_the_desk_alone(tmp_path: Pat
 def test_drop_on_the_desk_over_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
     """Memory, then the Desk (the page still holds Memory underneath), then Drop: the box is not drawn under Memory, so Drop goes Home."""
     ST = ("(() => { const d = document.getElementById('ck-drop'); return JSON.stringify({place: document.body.dataset.iaPlace, mode: document.body.dataset.mode,"
-          " drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top)}); })()")
+          " drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom)}); })()")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -405,7 +405,7 @@ def test_drop_on_the_desk_over_memory_goes_home_and_reaches_the_box(tmp_path: Pa
         ])
     on_desk, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"place"')]
     assert on_desk["place"] == "desk" and on_desk["mode"] == "memory" and not on_desk["drawn"], on_desk
-    assert after["place"] == "home" and after["mode"] == "board" and after["drawn"] and abs(after["top"]) <= 2, after
+    assert after["place"] == "home" and after["mode"] == "board" and after["drawn"] and after["mast"] - 1 <= after["top"] <= after["mast"] + 40, after   # just under the sticky masthead
 
 
 @needs_browser

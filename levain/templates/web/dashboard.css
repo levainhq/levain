@@ -3925,7 +3925,7 @@ body.ia[data-ia-place="home"] :is(#ck-band, #ck-skycol) { padding-inline: 0; mar
 body.ia[data-ia-place="home"] .ck-zone:not([data-zone="operate"]) { order: 90; margin: 0; }
 body.ia[data-ia-place="home"] .deck-foot { order: 99; }
 body.ia .ia-head { display: none; }
-/* the order: the chrome, the now line, what needs him, the desk, the work, the machine, the glance */
+/* the order: the chrome, the now line, what needs him, the desk, the glance, the work, the machine (the glance moved up: levain#141 polish, below) */
 body.ia .deck > .masthead { order: -8; }
 body.ia .deck > .ia-places { order: -7; }
 body.ia[data-ia-place="home"] #store { order: -5; }
@@ -4008,7 +4008,7 @@ body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="
 body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !important; min-height: 0; }
 body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
 
-/* ── the glance: the widgets small, at the bottom ────────────────────────────────────────────────────────────────────── */
+/* ── the glance: the widgets small, between the Desk and Work ────────────────────────────────────────────────────────────────────── */
 body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
 body.ia[data-ia-place="home"] #ck-widgets > * { min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
 body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-size: var(--fs-h) !important; }
@@ -4106,4 +4106,69 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 6 !important; }
   body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; flex-wrap: wrap; }
   body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - 2 * var(--sp-4)) / 3 - 1px); min-width: 0; }
+
+/* ── levain#141 polish: header, now line, drop, Home order ── */
+/* Phill's list after using layout A (1119-10). Everything below overrides a layout A rule by coming after it; the only existing
+   rules edited in place are two comments (the order line and the glance heading above), which named the old order. */
+
+/* the masthead names the entity once: the brand side's name is the one drawn, at every width. #entity stays in the markup (the page's
+   writer and the rename affordance in dashboard_core.js still find it); it is not drawn. The jar left the masthead: it is drawn in
+   #ck-jarbox (the Machine section's stats box) when the page has one. */
+body.ia .masthead .unit { display: none; }
+body.ia .masthead .readout { align-items: center; }
+body.ia .masthead .indicators, body.ia .ia-actions { align-items: center; }
+
+/* the masthead stays reachable. In the flow (every place but Home) it sticks to the top; Home's deck is a grid, where a sticky item
+   only sticks inside its own row, so there it is fixed and the deck pads by its measured height (--ia-mast-h, dashboard_places.js).
+   Below a dialog (modal 50, presence sheet 40, jump palette 20) and above the page's own sticky bars. */
+body.ia .deck > .masthead { position: sticky; top: 0; z-index: 15; background: var(--bg); padding-top: calc(var(--sp-5) + env(safe-area-inset-top, 0px)); }
+body.ia .deck { padding-top: 0; }   /* the bar carries the status-bar inset itself (it stays at the top, and its content stays below the clock) */
+body.ia .deck > .ia-places { top: var(--ia-mast-h, 0px); }
+html.ia-mast-measured body.ia[data-ia-place="home"] .deck { padding-top: var(--ia-mast-h, 0px); }
+html.ia-mast-measured body.ia[data-ia-place="home"] .deck > .masthead {
+  position: fixed; top: 0; left: 0; right: 0; margin: 0 auto; max-width: var(--page-max); box-sizing: border-box; width: 100%; }
+/* a jump (Drop, the Needs count, the List) lands below the bar, never under it */
+body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel[data-ck-panel="tray"], .panel[data-ck-panel="notifications"]) { scroll-margin-top: calc(var(--ia-mast-h, 0px) + var(--sp-4)); }
+
+/* the brand keeps room for a two-line tagline beside the readout (at 1101-1180 it fell to three lines); the line wraps, never cut */
+@media (min-width: 1101px) {
+  body.ia .masthead .brand { min-width: 15rem; }
+}
+/* a touch screen at the widths where the header buttons are icons only: every one of them is a 44 px target */
+@media (pointer: coarse) and (min-width: 1101px) and (max-width: 1500px) {
+  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #calmbtn, #presencebtn) { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
+  body.ke .masthead .themesw, body.ke .masthead .indicators button { height: auto; }
+}
+
+/* the phone's header: Drop, Grants, Notifications, Sync and Jump are one row (the presence chip takes its own row after them, and the
+   read-time line the one after that), where the chip used to sit between them and push Sync and Jump onto a row of their own */
+@media (max-width: 720px) {
+  body.ia .masthead .indicators > .ia-actions, body.ia .masthead #refresh, body.ia .masthead #jumpbtn { order: 3; }
+  body.ia .masthead #presencebtn { order: 4; }
+  body.ia .masthead #stamp { order: 5; }
+}
+
+/* the now line: the clock and date, the state line and the wrap line share one baseline where they share a row; the state line's
+   own top padding (the page's block rule) is what hung it below the clock. Where they wrap, each is its own row. */
+body.ia[data-ia-place="home"] #ck-band { align-items: baseline; }
+body.ia[data-ia-place="home"] #ck-band #ck-state-slot { align-self: baseline; }   /* the page's own rule pins it to the start of the row */
+body.ia[data-ia-place="home"] #ck-band .stateline { padding: 0; margin: 0; }
+body.ia[data-ia-place="home"] #ck-band .band-state .ftext { line-height: 1.2; }
+
+/* Drop to the desk: the card's head (the heading and the sign-in note) and the box take the card's inner padding. Home flattens every
+   frame to padding-inline: 0 (the grid supplies the gutter), which left this card's content against its edge. */
+body.ia[data-ia-place="home"] #ck-drop.frame { padding-inline: var(--sp-6); }
+@media (max-width: 720px) {
+  body.ia[data-ia-place="home"] #ck-drop.frame { padding-inline: var(--sp-5); }
+  body.ia .ck-drop :is(.drop-receipt, .drop-earlier, .drop-note, .drop-fault) { padding-left: var(--sp-2); }
+}
+
+/* HOME ORDER: needs, the Desk (head, drop, desk panel), At a glance, Work, Machine. The glance moved from last to between the Desk
+   and Work; the document order of these blocks matches (dashboard.html, dashboard_places.js), so Tab walks the drawn order. */
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="glance"] { order: 24; }
+body.ia[data-ia-place="home"] #ck-widgets { order: 25; }
+
+/* Work at tablet width: the List takes the row, Board and Inbox sit side by side under it (it was three cards at two-up, Inbox alone) */
+@media (min-width: 721px) and (max-width: 1100px) {
+  body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { grid-column: 1 / -1 !important; }
 }

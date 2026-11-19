@@ -95,11 +95,11 @@ def test_the_drop_tab_scrolls_to_the_hero_box_and_focuses_it_with_no_view_opened
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, {"until": "document.querySelector('#ck-drop-words:not([aria-disabled=true])')", "ms": 30000}, SETTLE,
              {"eval": "window.scrollTo(0, 2500); 1"}, {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},
              {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
-             {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), modal: !!document.getElementById('levain-modal'),"
+             {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom), modal: !!document.getElementById('levain-modal'),"
                       " focused: document.activeElement === document.getElementById('ck-drop-words') })"}]
     with rig.serving():
         got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")][-1]
-    assert got["modal"] is False and got["focused"] is True and 40 <= got["top"] < 140, got   # below the sticky strip, box focused
+    assert got["modal"] is False and got["focused"] is True and got["mast"] <= got["top"] < got["mast"] + 140, got   # below the sticky masthead (levain#141 polish: it stays on screen, so the box lands under it), box focused
 
 
 @needs_browser

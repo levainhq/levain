@@ -139,6 +139,11 @@
     ["work", "Work", "the board and the List"],
     ["machine", "Machine", "agents, fleet, calls, stream, jobs"],
     ["glance", "At a glance", "ops, backup, memory"]];
+  // levain#141 polish: each head is put in the DOCUMENT where Home draws it (the Desk head before the drop, the glance head before the
+  // glance tiles, Work and Machine before the board), not at the deck's end, so the document order of the Home blocks is the drawn
+  // order and Tab walks the page top to bottom. (dashboard.css still places them by `order`; the two agree.) A block missing from the
+  // page leaves its head at the end, as before.
+  var HEAD_BEFORE = { desk: "#ck-drop", glance: "#ck-widgets", work: "main.frame", machine: "main.frame" };
   function addHeads() {
     var deck = document.querySelector(".deck");
     if (!deck || deck.querySelector(".ia-head")) return;
@@ -152,8 +157,27 @@
       s.textContent = h[2];
       d.appendChild(t);
       d.appendChild(s);
-      deck.appendChild(d);
+      var anchor = HEAD_BEFORE[h[0]] ? deck.querySelector(":scope > " + HEAD_BEFORE[h[0]]) : null;
+      if (anchor) deck.insertBefore(d, anchor); else deck.appendChild(d);
     });
+  }
+
+  // levain#141 polish: the masthead stays reachable while the page scrolls. Home's deck is a grid, and a sticky grid item only sticks
+  // inside its own grid area (its row), so on Home dashboard.css fixes the masthead and the deck pads by its height. That height is
+  // measured here (--ia-mast-h on the root) because the bar wraps differently at every width. `html.ia-mast-measured` is the switch:
+  // without it (no script) the masthead stays in the flow as it was.
+  function trackMasthead() {
+    var m = document.querySelector(".deck > .masthead");
+    if (!m) return;
+    var root = document.documentElement;
+    function set() {
+      var h = Math.ceil(m.getBoundingClientRect().height);
+      if (h > 0) root.style.setProperty("--ia-mast-h", h + "px");
+    }
+    set();
+    root.classList.add("ia-mast-measured");
+    if (typeof ResizeObserver === "function") new ResizeObserver(set).observe(m);
+    window.addEventListener("resize", set);
   }
 
   // The Notifications button's aria-label replaces its content for assistive tech, so the unread count in the pill (written by the
@@ -177,6 +201,7 @@
 
   function start() {
     addHeads();
+    trackMasthead();
     addGraphToggle();
     watchNotifyLabel();
     new MutationObserver(paint).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });

@@ -39,7 +39,6 @@
           <span class="unit-label">Unit</span>
           <span class="entity" id="entity">—</span>
         </div>
-        <div class="jar" id="jar" hidden></div>
         <div class="indicators">
           <span class="ia-actions" role="group" aria-label="Actions">
             <button type="button" class="ia-act" data-phone-jump="drop" aria-label="Drop to the desk" title="Drop to the desk"><span class="ia-ico" aria-hidden="true">&#9998;</span><span class="ia-lbl">Drop</span></button>
@@ -93,9 +92,10 @@
       </div>
     </section>
     <section class="ck-needs frame" id="ck-needs" aria-label="Needs you" hidden></section>
+    <!-- The notes sit before the drop in the document, as Home draws them (needs, notes, the Desk head, the drop), so Tab walks the page top to bottom. -->
+    <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <!-- The desk drop (filled by renderDropHero; never replaced by an install): dashboard.css places it by place; Memory does not draw it (the Drop button goes Home first, then to the box). -->
     <section class="ck-drop frame" id="ck-drop" aria-label="Drop to the desk" hidden></section>
-    <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
     <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <p class="stateline frame" id="state" hidden></p>
