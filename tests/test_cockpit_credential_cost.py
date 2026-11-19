@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -260,3 +261,156 @@ def test_http_a_re_enrolled_device(src, monkeypatch) -> None:
         assert _manifest(port, tok2, conn) == 200
         assert _manifest(port, tok1, conn) == 403
         conn.close()
+
+
+# --- the last_seen stamp leaves the request thread (D15b) ---------------------------------------------------------------
+
+def _until(cond: Any, timeout: float = 10.0) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return bool(cond())
+
+
+def _stamp_spy(monkeypatch: pytest.MonkeyPatch, gate: "threading.Event | None" = None) -> list[tuple[str, str]]:
+    """Every ``stamp_last_seen`` call: (device, the thread's name). With ``gate``, the call waits for it first."""
+    calls: list[tuple[str, str]] = []
+    real = CockpitDB.stamp_last_seen
+
+    def spy(self: CockpitDB, device_id: str, *, now: datetime) -> bool:
+        calls.append((device_id, threading.current_thread().name))
+        if gate is not None:
+            gate.wait(30)
+        return real(self, device_id, now=now)
+
+    monkeypatch.setattr(CockpitDB, "stamp_last_seen", spy)
+    return calls
+
+
+def test_http_paired_reads_open_the_journal_next_to_never(src, monkeypatch) -> None:
+    """MEASURED before D15 (25 paired reads on one keep-alive connection): 50 cockpit.db opens, two per request (the
+    credential lookup, the stamp's due-check). After: the opens do not grow with the reads."""
+    with _serve(src) as (port, httpd):
+        _dev, tok = _pair(port)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        assert _manifest(port, tok, conn) == 200            # warm: the first request pays the held connection once
+        assert _until(lambda: httpd.last_seen_stamper._pending == {})
+        spy = _OpenSpy(monkeypatch)
+        for _ in range(N_READS):
+            assert _manifest(port, tok, conn) == 200
+        conn.close()
+        journal = spy.of("cockpit.db")
+        print(f"MEASURE: {N_READS} paired reads -> {len(journal)} cockpit.db opens, {len(spy.opens)} sqlite opens in all")
+        assert len(journal) <= 2, journal       # nothing per request; the stamper thread's own stamp may open
+
+
+def test_http_many_requests_one_stamp_per_device_and_never_on_the_request_thread(src, monkeypatch) -> None:
+    calls = _stamp_spy(monkeypatch)
+    with _serve(src) as (port, httpd):
+        dev, tok = _pair(port)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+        for _ in range(N_READS):
+            assert _manifest(port, tok, conn) == 200
+        assert _until(lambda: len(calls) >= 1)
+        time.sleep(0.2)
+        conn.close()
+        assert [d for d, _t in calls] == [dev], "one write for N requests inside the window"
+        assert calls[0][1] == "levain-last-seen"
+        assert _until(lambda: httpd.broker.active_db().list_devices()[0]["last_seen"] is not None)
+
+
+def test_http_a_slow_stamp_holds_no_request(src, monkeypatch) -> None:
+    gate = threading.Event()
+    calls = _stamp_spy(monkeypatch, gate)
+    try:
+        with _serve(src) as (port, _httpd):
+            _dev, tok = _pair(port)
+            t0 = time.monotonic()
+            for _ in range(5):
+                assert _manifest(port, tok) == 200
+            assert _until(lambda: len(calls) == 1)       # the thread is inside the stamp, and is not done
+            assert time.monotonic() - t0 < 10.0
+    finally:
+        gate.set()
+
+
+def test_stamper_coalesces_by_device_and_stamps_again_after_the_window(db: CockpitDB, monkeypatch) -> None:
+    import types
+
+    from levain.cockpit import last_seen
+
+    clock = [1000.0]
+    monkeypatch.setattr(last_seen, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = _stamp_spy(monkeypatch)
+    a, _ = _enrol(db, "a")
+    b, _ = _enrol(db, "b")
+    st = last_seen.LastSeenStamper()
+    window = firejournal.LAST_SEEN_EVERY.total_seconds()
+    try:
+        assert [st.note(db, a, NOW), st.note(db, a, NOW), st.note(db, b, NOW)] == [True, False, True]
+        assert _until(lambda: len(calls) == 2)
+        assert sorted(d for d, _t in calls) == sorted([a, b])
+        clock[0] += window - 1
+        assert st.note(db, a, NOW) is False             # still inside the window
+        clock[0] += 2
+        assert st.note(db, a, NOW) is True              # the window is over
+        assert _until(lambda: len(calls) == 3)
+    finally:
+        st.close()
+
+
+def test_a_failing_stamp_is_fail_soft_and_the_thread_goes_on(db: CockpitDB, monkeypatch) -> None:
+    from levain.cockpit.last_seen import LastSeenStamper
+
+    calls: list[str] = []
+    real = CockpitDB.stamp_last_seen
+
+    def flaky(self: CockpitDB, device_id: str, *, now: datetime) -> bool:
+        calls.append(device_id)
+        if len(calls) == 1:
+            raise RuntimeError("journal gone")
+        return real(self, device_id, now=now)
+
+    monkeypatch.setattr(CockpitDB, "stamp_last_seen", flaky)
+    a, _ = _enrol(db, "a")
+    b, _ = _enrol(db, "b")
+    st = LastSeenStamper()
+    try:
+        assert st.note(db, a, NOW) is True
+        assert _until(lambda: calls == [a])
+        assert st.note(db, b, NOW) is True
+        assert _until(lambda: calls == [a, b])
+        assert _until(lambda: {d["id"]: d["last_seen"] for d in db.list_devices()}[b] is not None)
+    finally:
+        st.close()
+
+
+def test_closing_the_stamper_does_not_hang_on_a_stamp_in_flight(db: CockpitDB, monkeypatch) -> None:
+    from levain.cockpit import last_seen
+
+    gate = threading.Event()
+    calls = _stamp_spy(monkeypatch, gate)
+    monkeypatch.setattr(last_seen, "_JOIN_S", 0.2)
+    a, _ = _enrol(db)
+    st = last_seen.LastSeenStamper()
+    try:
+        assert st.note(db, a, NOW) is True
+        assert _until(lambda: len(calls) == 1)
+        t0 = time.monotonic()
+        st.close()
+        assert time.monotonic() - t0 < 5.0
+        assert st.note(db, "d-000000000000", NOW) is False      # closed: nothing queues
+    finally:
+        gate.set()
+
+
+def test_http_server_close_stops_the_stamper(src) -> None:
+    with _serve(src) as (port, httpd):
+        _dev, tok = _pair(port)
+        assert _manifest(port, tok) == 200
+        thread = httpd.last_seen_stamper._thread
+        assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive()
