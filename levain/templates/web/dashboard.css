@@ -3886,12 +3886,13 @@ body.ia .ia-ico { font-size: 13px; line-height: 1; color: var(--accent); }
   body.ia .ia-actions { margin-right: 0; }
   body.ia .ia-act { padding: 0 var(--sp-3); }
 }
-/* Side by side (above the stacked breakpoint) the readout asks for its whole width and the tagline is what gives: it ends in an
-   ellipsis before the readout is ever drawn over the brand or the entity name is squeezed out. */
+/* Side by side (above the stacked breakpoint) the readout asks for its whole width and the tagline is what gives: it wraps onto a
+   second line before the readout is ever drawn over the brand or the entity name is squeezed out. It wraps and is never cut,
+   because the line is his own sentence and an ellipsis would hide its last words on a tablet held sideways. */
 @media (min-width: 1101px) {
   body.ia .masthead .brand { flex: 0 1000 auto; min-width: 8rem; }
   body.ia .masthead .readout { flex: 1 1 auto; }
-  body.ia .ia-tagline { max-width: min(42ch, 100%); }
+  body.ia .ia-tagline { max-width: min(42ch, 100%); white-space: normal; }
 }
 
 /* ── the places bar: Home, (Desk,) Room, Memory; the Needs count rides Home and is visible from every place ─────────── */

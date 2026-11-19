@@ -265,7 +265,8 @@ def test_the_masthead_keeps_the_brand_the_name_and_the_buttons_apart_at_every_wi
     out = _run(tmp_path, [{"eval": MID_BAR % (font, jar_js)}], width=width)[-1]
     assert out["sw"] <= out["cw"], out                                     # nothing widens the page
     assert out["hit"] == [], out                                           # no block of the readout is drawn over the brand
-    assert out["wordW"] > 40 and out["tagRight"] <= out["brandRight"], out  # the brand keeps its name; the tagline ends inside the brand, in an ellipsis if need be
+    assert out["wordW"] > 40 and out["tagRight"] <= out["brandRight"], out  # the brand keeps its name; the tagline ends inside the brand
+    assert out["tagCut"] is False, out                                     # and wraps rather than being cut: every word of it is drawn
     if width > 1100:
         assert out["entityShown"] and out["entityW"] >= 40, out            # side by side the unit's name is drawn and is never squeezed out
         assert out["nat"] - out["unitW"] <= 1, out                         # and keeps its whole width: what gives is the tagline, then the jar label
