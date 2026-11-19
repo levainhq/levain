@@ -2126,15 +2126,19 @@
     const id = node && node.dataset ? node.dataset.ckPanel : "";
     // a panel the places put on a tab other than the one its table names (Recent episodes sits in Memory) is revealed there
     const placed = id ? PLACED_ON[id] : undefined;
-    if (placed) {
-      if (document.body.dataset.mode === placed) return false;
-      applyMode(placed, true);
+    // a retired tab name is Home ("board"), where the machine draws the panel
+    const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean).map((t) => RETIRED_MODES.indexOf(t) >= 0 ? "board" : t);
+    const cur = document.body.dataset.mode;
+    const want = placed || (cur && tabs.length && tabs.indexOf(cur) < 0 ? (tabs.indexOf("board") >= 0 ? "board" : tabs[0]) : "");
+    if (want && want !== cur) {
+      applyMode(want, true);
       return true;
     }
-    const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean);
-    if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) {
-      applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
-      return true;
+    // the Desk and the Room hide every panel whatever the mode underneath is: the page's own tab for the mode is what leaves them
+    const cl = document.body.classList;
+    if (cl.contains("dv-on") || cl.contains("rv-on")) {
+      const tab = document.querySelector('[data-mode-tab="' + (want || cur) + '"]');
+      if (tab) { tab.click(); return true; }
     }
     return false;
   }

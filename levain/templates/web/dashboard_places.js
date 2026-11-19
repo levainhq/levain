@@ -126,7 +126,8 @@
     var pill = document.querySelector(".ia-act[data-phone-jump=notifications] [data-nc-unread]");
     var btn = pill && pill.closest(".ia-act");
     if (!btn) return;
-    var n = pill.hidden ? "" : (pill.textContent || "").trim();
+    var t = (pill.textContent || "").trim();
+    var n = pill.hidden || t === "0" ? "" : t;
     var label = n ? "Notifications, " + n + " unread" : "Notifications";
     if (btn.getAttribute("aria-label") !== label) btn.setAttribute("aria-label", label);
     if (btn.getAttribute("title") !== label) btn.setAttribute("title", label);
