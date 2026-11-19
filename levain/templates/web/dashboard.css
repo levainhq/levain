@@ -3998,8 +3998,9 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens :is(.tv-lensbody, .t
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-skycard { min-height: 0; padding-block: var(--sp-3); }
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 160px; }
 
+/* the Work head takes the whole row; it gives up its last four columns only while the Reset layout control is drawn beside it */
 @media (min-width: 721px) {
-  body.ia[data-ia-place="home"] .ia-head[data-ia-head="work"] { grid-column: 1 / span 8; }
+  body.ia[data-ia-place="home"] .deck:has(.ck-zone[data-zone="operate"] > .zone-head > [data-layout-reset]) .ia-head[data-ia-head="work"] { grid-column: 1 / span 8; }
   body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head:has(> [data-layout-reset]) { grid-column: 9 / span 4; }
 }
 
