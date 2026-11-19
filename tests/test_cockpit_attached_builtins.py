@@ -22,10 +22,18 @@ CRED = {"class": "none", "device_class": None}
 
 
 @pytest.fixture()
-def attached(tmp_path: Path):
-    """The default cockpit over a real install, attached, every non-serve-composed panel derived once on this thread."""
+def attached(attached_and_bare):
+    ck, derived, _bare = attached_and_bare
+    yield ck, derived
+
+
+@pytest.fixture()
+def attached_and_bare(tmp_path: Path):
+    """The default cockpit over a real install, attached, every non-serve-composed panel derived once on this thread; and a
+    bare one over the same install."""
     _root, src, _ids = _install(tmp_path)
     ck = build_default_cockpit(src, clock=lambda: NOW)
+    bare = build_default_cockpit(src, clock=lambda: NOW)
     path = tmp_path / "snapshots.db"
     writer, reader = SnapshotWriter(path, now=NOW.timestamp()), SnapshotReader(path)
     ck.attach_snapshots(reader)
@@ -38,7 +46,7 @@ def attached(tmp_path: Path):
 
     loop = DeriveLoop(writer, {pid: PanelPlan(pid, on_token=True) for pid in derived}, derive_fn, clock=NOW.timestamp)
     assert sorted(loop.run_once(NOW.timestamp())) == sorted(derived)
-    yield ck, derived
+    yield ck, derived, bare
     reader.close()
     writer.close()
 
@@ -79,3 +87,27 @@ def test_every_built_in_panel_serves_from_its_row_with_the_derive_time_as_its_ag
     for pid in derived:
         got = ck.panel(pid)
         assert got is not None and got["as_of"] == NOW.isoformat(), pid
+
+
+def test_every_built_in_panel_kind_reads_the_same_attached_as_on_a_bare_cockpit_but_for_the_new_fields_and_the_etags(
+        attached_and_bare) -> None:
+    """The cached payload path is exercised for every kind the default cockpit registers (lists, values, logs, boards,
+    briefs, topologies...), whole, compact and by row, against a bare cockpit over the same install."""
+    ck, derived, bare = attached_and_bare
+    new_fields = {"etag", "valid_until", "stale", "pending"}
+    kinds = {ck._specs[pid].kind for pid in derived}
+    assert len(kinds) > 1 and kinds - {"triage-list"}, kinds
+    manifest, want_manifest = ck.manifest(CRED), bare.manifest(CRED)
+    for pid in derived:
+        assert {k: v for k, v in manifest["panels"][pid].items() if k not in new_fields} == \
+            {k: v for k, v in want_manifest["panels"][pid].items() if k not in new_fields}, pid
+        for kw in ({}, {"profile": "compact"}):
+            got, want = ck.panel(pid, **kw), bare.panel(pid, **kw)
+            assert {k: v for k, v in got.items() if k not in new_fields} == \
+                {k: v for k, v in want.items() if k not in new_fields}, (pid, kw)
+            assert ck.panel(pid, **kw) == got, (pid, kw)                 # and the second read is the same answer
+        rows = (ck.panel(pid)["rows"] or [])[:1]
+        for r in rows:
+            got, want = ck.panel(pid, row=r["id"]), bare.panel(pid, row=r["id"])
+            assert {k: v for k, v in got.items() if k not in new_fields} == \
+                {k: v for k, v in want.items() if k not in new_fields}, (pid, r["id"])

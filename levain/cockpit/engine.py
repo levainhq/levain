@@ -1953,7 +1953,9 @@ class Cockpit:
         a write admitted ahead of this call (the read-cache generation moved between that flight's start and this call),
         or begun before ``read_after`` (a ``time.monotonic()`` instant: no snapshot read earlier is shared either), reads
         once more; one flight runs at a time per panel, so the second read cannot join an older one. A refresher panel
-        serves its cycle's snapshot as ever."""
+        serves its cycle's snapshot as ever. An attached cockpit composes a panel from its published row instead
+        (``_attached_snap``); ``stored`` is what one ``read_manifest`` returned (or the exception it raised), so a manifest
+        reads the store once for every panel, and it is unused otherwise."""
         st = self._state_of(spec)
         if st is None:
             return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
@@ -2413,8 +2415,10 @@ class Cockpit:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
-        # rows, value, filtered and skipped enter as the snapshot's kept canonical text (``_Snap.etag_frags``); the
-        # etag is byte for byte what ``_sha`` over the whole dict gave
+        # A bare cockpit's rows, value, filtered and skipped enter as the snapshot's kept canonical text
+        # (``_Snap.etag_frags``), the etag being byte for byte what ``_sha`` over the whole dict gives. An attached head
+        # (``snapshot`` given) puts the row's body hash and its freshness flags in their place and never serialises the
+        # content: its etag is its own value, not a bare one's. The comment below ``light`` says what it hashes.
         light = {"schema": SCHEMA, "status": snap.status,
                      "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),

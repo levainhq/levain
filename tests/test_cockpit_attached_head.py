@@ -118,15 +118,56 @@ def test_the_etag_moves_with_a_new_body_and_only_that_panels(rig: Rig) -> None:
 def test_the_etag_moves_when_stale_flips_and_comes_back(rig: Rig) -> None:
     rig.derive()
     fresh = head(rig)
+    top = rig.ck.manifest(CRED)["etag"]
     assert fresh["stale"] is False
     rig.clock.advance(10)                                         # the worker has not beaten for longer than it may
     gone = head(rig)
     assert gone["stale"] is True and gone["etag"] != fresh["etag"]
-    assert rig.ck.manifest(CRED)["etag"] != ""
+    assert rig.ck.manifest(CRED)["etag"] != top                   # the page's one revalidation sees it
     beat(rig, 1)
-    rig.derive("alpha")
+    rig.derive("alpha", "beta")
     back = head(rig)
     assert back["stale"] is False and back["etag"] == fresh["etag"]
+    assert rig.ck.manifest(CRED)["etag"] == top
+
+
+def _declared(box: dict[str, Any]) -> ProviderSpec:
+    """A panel whose provider declares its own source instant and its own stale word (R10), both changeable by the test."""
+    def read(ctx: ReadContext) -> Read:
+        return Read(rows=(RowIn("p:a", "a", {"at": "2026-11-19"}, stored={"id": "p:a"}),), stale=box["stale"], as_of=box["as_of"])
+
+    return ProviderSpec(id="alpha", kind="triage-list", title="alpha", priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+
+
+def test_a_provider_declared_as_of_and_stale_are_the_heads_and_only_stale_moves_the_etag(tmp_path: Path) -> None:
+    earlier = (T0 - timedelta(seconds=60)).isoformat()
+    box: dict[str, Any] = {"stale": False, "as_of": earlier}
+    r = Rig(tmp_path, ("alpha",), specs={"alpha": _declared(box)})
+    try:
+        r.derive()
+        quiet = head(r, "alpha")
+        assert (quiet["as_of"], quiet["stale"]) == (earlier, False)             # the source's instant, not the derive's
+        box["stale"] = True                                                      # the provider says its read is stale
+        beat(r, 1)
+        r.derive("alpha")
+        told = head(r, "alpha")
+        assert (told["as_of"], told["stale"]) == (earlier, True)
+        assert told["etag"] != quiet["etag"]
+        assert r.ck.panel("alpha")["stale"] is True and r.ck.panel("alpha")["as_of"] == earlier
+        # the head layer itself: the same snapshot with only its as_of moved keeps the etag, with only stale flipped does not
+        ins = Ins(r, "alpha")
+        snap = ins.kw["snap"]
+        later = ins.head(snap=dataclasses.replace(snap, as_of="2026-11-19T16:00:00+00:00"))
+        assert later["as_of"] == "2026-11-19T16:00:00+00:00" and later["etag"] == told["etag"]
+        flipped = ins.head(snap=dataclasses.replace(snap, fresh_info=dataclasses.replace(snap.fresh_info, stale=False)))
+        assert flipped["stale"] is False and flipped["etag"] != told["etag"]
+        box.update(stale=False, as_of=(T0 - timedelta(hours=5)).isoformat())     # a source instant older than the panel allows
+        beat(r, 1)
+        r.derive("alpha")
+        assert head(r, "alpha")["stale"] is True and head(r, "alpha")["as_of"] == box["as_of"]
+    finally:
+        r.close()
 
 
 def test_the_etag_moves_when_pending_flips(tmp_path: Path) -> None:
