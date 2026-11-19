@@ -341,3 +341,98 @@ def test_a_record_that_is_not_a_json_outcome_counts_as_no_record_and_is_said(mak
     _r, out = _refresh(install)
     assert out.count("is not usable") == 1
     assert _record(install)["outcome"] == "migrated"
+
+
+def test_a_new_backup_is_private_and_its_folder_is_0700(make_install):
+    import stat
+
+    install = make_install()
+    _as_pre_106_install(install)
+    folder = install / ".levain" / "backups" / "seed"
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o755)
+    _origin(install).chmod(0o600)
+    _refresh(install)
+    (backup,) = folder.glob("origin.md.*")
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+
+
+def test_a_symlinked_gitignore_is_never_written_through(make_install, tmp_path):
+    install = make_install()
+    old = _as_pre_106_install(install)
+    elsewhere = tmp_path / "dotfile_gitignore"
+    elsewhere.write_text("mine\n", encoding="utf-8")
+    gi = install / ".levain" / ".gitignore"
+    gi.unlink(missing_ok=True)
+    gi.symlink_to(elsewhere)
+    r, out = _refresh(install)
+    assert elsewhere.read_text(encoding="utf-8") == "mine\n"
+    assert _origin(install).read_text(encoding="utf-8") == old
+    assert ".gitignore is a link" in out and "seed/origin.md" in r.review
+    assert not install.joinpath(*ORIGIN_MIGRATION_REL).exists()
+
+
+def test_a_record_behind_a_symlinked_migrations_dir_is_not_trusted(make_install, tmp_path):
+    install = make_install()
+    old = _as_pre_106_install(install)
+    shared = tmp_path / "shared_migrations"
+    shared.mkdir()
+    (shared / ORIGIN_MIGRATION_REL[-1]).write_text(json.dumps({"schema": 1, "outcome": "current"}), encoding="utf-8")
+    mig = install / ".levain" / "migrations"
+    if mig.exists():
+        mig.rmdir()
+    mig.symlink_to(shared)
+    r, out = _refresh(install)
+    assert "is a link" in out and "seed/origin.md" in r.review
+    assert _origin(install).read_text(encoding="utf-8") == old
+
+
+def test_a_record_with_another_schema_is_not_a_record(make_install):
+    install = make_install()
+    _as_pre_106_install(install)
+    rec = install.joinpath(*ORIGIN_MIGRATION_REL)
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"schema": 2, "outcome": "current"}), encoding="utf-8")
+    _r, out = _refresh(install)
+    assert out.count("is not usable") == 1
+    assert _record(install)["outcome"] == "migrated"
+
+
+def test_a_non_regular_origin_is_in_review(make_install):
+    install = make_install()
+    _origin(install).unlink()
+    _origin(install).mkdir()
+    r, out = _refresh(install)
+    assert "seed/origin.md" in r.review and "not a regular file" in out
+
+
+def test_a_save_during_the_run_is_in_review_and_the_orphan_backup_is_removed(make_install, monkeypatch):
+    install = make_install()
+    old = _as_pre_106_install(install)
+    real = install_mod._origin_backup
+
+    def backup_then_operator_saves(inst, raw):
+        b = real(inst, raw)
+        _origin(install).write_text(old + "\nedit\n", encoding="utf-8")
+        return b
+
+    monkeypatch.setattr(install_mod, "_origin_backup", backup_then_operator_saves)
+    r, out = _refresh(install)
+    assert "seed/origin.md" in r.review and r.refreshed == []
+    assert list((install / ".levain" / "backups" / "seed").glob("origin.md.*")) == []
+
+
+def test_an_odd_origin_that_raises_outside_the_usual_errors_fails_this_file_only(make_install, monkeypatch):
+    install = make_install()
+    old = _as_pre_106_install(install)
+    import levain.answers as answers
+
+    def boom(*a, **k):
+        raise KeyError("odd")
+
+    monkeypatch.setattr(answers, "extract_answers", boom)
+    r, out = _refresh(install)
+    assert r.review == ["seed/origin.md"] and "could not be checked" in out
+    assert _origin(install).read_text(encoding="utf-8") == old
+    assert not install.joinpath(*ORIGIN_MIGRATION_REL).exists()

@@ -1095,6 +1095,8 @@ def _ensure_gitignored(levain_dir: Path, name: str) -> None:
     """Ensure ``name`` is listed in ``.levain/.gitignore`` (the operator's private
     answers must never be committed). Creates or appends; best-effort."""
     gi = levain_dir / ".gitignore"
+    if gi.is_symlink():
+        return  # never write through a link
     try:
         existing = gi.read_text(encoding="utf-8").splitlines() if gi.is_file() else []
         if name not in existing:
@@ -5163,14 +5165,21 @@ def _origin_backup(install: Path, raw: bytes) -> Path:
     bytes is reused (a retried attempt does not pile up copies), else a new one is written and fsynced."""
     folder = install.joinpath(".levain", "backups", "seed")
     folder.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(folder, 0o700)  # origin.md holds the operator's private interview answers
+    except OSError:
+        pass
     for old in sorted(folder.glob("origin.md.*")):
         try:
             if old.is_file() and not old.is_symlink() and old.read_bytes() == raw:
+                if old.stat().st_mode & 0o077:
+                    os.chmod(old, 0o600)
                 return old
         except OSError:
             continue
     backup = folder / f"origin.md.{time.time_ns()}"
-    with open(backup, "xb") as fh:
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as fh:
         fh.write(raw)
         fh.flush()
         os.fsync(fh.fileno())
@@ -5187,7 +5196,8 @@ def _origin_record_done(record: Path, lines: list[str]) -> bool:
         if record.is_symlink() or not record.is_file():
             raise ValueError("it is not a regular file")
         data = json.loads(record.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("outcome") not in ORIGIN_MIGRATION_OUTCOMES:
+        if (not isinstance(data, dict) or data.get("schema") != 1
+                or data.get("outcome") not in ORIGIN_MIGRATION_OUTCOMES):
             raise ValueError("it is not a recorded outcome")
     except (OSError, ValueError, RecursionError) as e:
         lines.append(f"  note: the origin.md migration record {'/'.join(ORIGIN_MIGRATION_REL)} is not usable ({e}); "
@@ -5209,7 +5219,9 @@ def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str], out
     record, a failed backup or replace, a symlinked directory on the path, a file saved while this ran) records nothing, is
     said, and is tried again next update. Applied and planned migrations are in ``out.refreshed`` and a failure is in
     ``out.review``, so ``levain update`` treats the file like any other adapter file (``--ack``, dry run, exit code).
-    Known edges, kept: a CRLF origin.md reads as edited; a pack that supplies its own origin.md template is checked
+    Known edges, kept: the compare-and-swap between the live-bytes re-read and the replace is not atomic (an editor save
+    inside those microseconds is overwritten; the backup holds it); a directory-fsync failure is swallowed (power loss
+    only); a CRLF origin.md reads as edited; a pack that supplies its own origin.md template is checked
     against levain's base template and so is kept as edited."""
     from levain.answers import AdoptRefused, extract_answers
     from levain.interview import parse_template, render_template
@@ -5217,17 +5229,21 @@ def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str], out
     rel = "seed/origin.md"
     record = install.joinpath(*ORIGIN_MIGRATION_REL)
     target = install / "seed" / "origin.md"
-    if _origin_record_done(record, lines):
-        return
     if not os.path.lexists(target):
         return  # no rendered origin here to migrate
+    # the link refusals come first: a record reached through a linked directory is not trusted either
     for part in (install / "seed", install / ".levain", install / ".levain" / "backups",
                  install / ".levain" / "backups" / "seed", install / ".levain" / "migrations", target):
         if part.is_symlink():
+            out.review.append(rel)
             lines.append(f"  {rel}: left as it is, because {part.relative_to(install)} is a link and levain does not "
                          "write through links; make it a real file or directory and the next update migrates it.")
             return
+    if _origin_record_done(record, lines):
+        return
     if not target.is_file():
+        out.review.append(rel)
+        lines.append(f"  {rel}: left as it is, because it is not a regular file; the next update looks again.")
         return
     try:
         raw = target.read_bytes()
@@ -5257,7 +5273,7 @@ def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str], out
                 outcome = "migrated"
             except AdoptRefused:
                 outcome = "kept-edited"
-            except (OSError, ValueError, PackError, InitError) as e:
+            except Exception as e:  # an odd origin file fails THIS file, as any adapter file; the update carries on
                 out.review.append(rel)
                 lines.append(f"  {rel}: could not be checked against this release's origin template ({e}); nothing "
                              "was changed or recorded, and the next update tries again.")
@@ -5268,15 +5284,34 @@ def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str], out
             lines.append(f"  {rel}: carries the wording from before levain#106 and is unedited; an update would "
                          "bring it to this release's wording once (the old file is kept under .levain/backups/seed/).")
             return
+        gi = install / ".levain" / ".gitignore"
+        if os.path.lexists(gi) and (gi.is_symlink() or not gi.is_file()):
+            out.refreshed.remove(rel)
+            out.review.append(rel)
+            lines.append(f"  {rel}: left as it is, because .levain/.gitignore is a link or not a regular file and "
+                         "levain does not write through it; make it a real file and the next update migrates it.")
+            return
+        backup = None
+        backups_before: set[str] = set()
         try:
             _ensure_gitignored(install / ".levain", "backups/")
+            try:
+                backups_before = {p.name for p in install.joinpath(".levain", "backups", "seed").iterdir()}
+            except OSError:
+                pass
             backup = _origin_backup(install, raw)
             # the operator may have saved since the read above: the swap is written only over the bytes that were checked
             if target.read_bytes() != raw:
                 raise _EditedSinceRead()
             _atomic_write_text(target, new_text)
         except _EditedSinceRead:
+            if backup is not None and backup.name not in backups_before:
+                try:
+                    backup.unlink()  # an orphan this run made: no retry would match it
+                except OSError:
+                    pass
             out.refreshed.remove(rel)
+            out.review.append(rel)
             lines.append(f"  {rel}: was edited while the update ran, so it is left as it is; nothing was recorded and "
                          "the next update checks it again.")
             return
