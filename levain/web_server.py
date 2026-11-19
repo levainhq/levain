@@ -113,6 +113,7 @@ from levain.cockpit.anneal_effects import (
 from levain.cockpit.effects import INTENTIONS, DownstreamEffect, IntentionEffectStore
 from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
+from levain.cockpit.snapshot_host import ServerProbe, SnapshotHost
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
@@ -1110,6 +1111,10 @@ _ROUTE_PANEL_IDS_MAX = 32  # distinct panel ids counted by name; later ones fold
 # The cockpit's identical concurrent reads (a page load bursts ~28) share one compute for this long (engine
 # ``_shared_read``); a write handled by this server invalidates at once, a write by another process shows within it.
 COCKPIT_READ_CACHE_TTL_S = 1.5
+
+# Attached mode (the cockpit's panels read from snapshots a derive host publishes) is on only when this variable is "1".
+# It is read once, when a server is constructed. Off by default until a write shows in the snapshots it reads.
+COCKPIT_SNAPSHOTS_ENV = "LEVAIN_COCKPIT_SNAPSHOTS"
 
 
 class _RouteStats:
@@ -2129,6 +2134,13 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.room_waiter_gate = threading.BoundedSemaphore(cockpit_room.WAITERS_MAX)
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4),
                                                      token=self._watch_token, probe=self.change_probe)
+        self.snapshots_on = os.environ.get(COCKPIT_SNAPSHOTS_ENV) == "1"
+        if self.snapshots_on and self.change_probe is None:
+            # The probe looks the cockpit up when it is asked, never at construction: the watcher's first look can be
+            # the very call that builds the cockpit, and it holds its own lock then, which installing a probe would need.
+            self.stream_watcher.set_probe(ServerProbe(
+                self._engine_change_probe, self._watch_token, self._bare_watch_snapshot,
+                slow_s=self.stream_watcher.watch_s))
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
@@ -2146,6 +2158,38 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.compose_lock = threading.Lock()
         self.compose_wake = threading.Condition(self.compose_lock)
         super().__init__(*args, **kwargs)
+
+    snapshots_on = False                # attached mode asked for (COCKPIT_SNAPSHOTS_ENV), read at construction
+    _snapshot_host: "SnapshotHost | None" = None
+
+    def _engine_change_probe(self) -> Any:
+        cockpit = self.cockpit if self.cockpit is not None else self.get_cockpit()
+        probe = getattr(cockpit, "change_probe", None)
+        return probe() if callable(probe) else None
+
+    def _bare_watch_snapshot(self) -> "tuple[dict[str, str], str | None]":
+        # a served cockpit that did not attach (no data root, the store refused): the watcher reads its manifest as it always has
+        heads = self._watch_manifest()["panels"]
+        return {pid: head.get("etag") for pid, head in heads.items()}, None
+
+    def _open_snapshot_host(self, cockpit: "Cockpit") -> None:
+        """Attach ``cockpit`` to a snapshot host when attached mode is on and this server has a data root. A store that
+        cannot be opened leaves the cockpit on its own provider path, said once on stderr. The host is attached here and
+        started by the caller."""
+        broker = self.broker
+        if not self.snapshots_on or broker is None or getattr(broker, "data_root", None) is None:
+            return
+        try:
+            Path(broker.data_root).mkdir(parents=True, exist_ok=True)   # the broker makes it on its own start, which is later
+        except OSError as exc:
+            host, reason = None, f"{type(exc).__name__}: {exc}"
+        else:
+            host, reason = SnapshotHost.try_open(cockpit, broker.data_root, token_fn=self._watch_token)
+        if host is None:
+            print(f"cockpit: snapshots not attached ({reason}); serving from the providers", file=sys.stderr, flush=True)
+            return
+        host.attach()
+        self._snapshot_host = host
 
     def _watch_manifest(self) -> dict[str, Any]:
         # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token), so the
@@ -2249,9 +2293,15 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
                     built.discover(discoverer(self.external_panels))
+                self._open_snapshot_host(built)     # attached before start: an attached cockpit starts no refreshers
                 try:
                     built.start()
+                    if self._snapshot_host is not None:
+                        self._snapshot_host.start()
                 except BaseException:
+                    if self._snapshot_host is not None:
+                        self._snapshot_host.stop()
+                        self._snapshot_host = None
                     built.stop()    # a half-started cockpit must not leave refreshers running
                     raise
                 self.default_cockpit = built
@@ -2279,6 +2329,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.last_seen_stamper.close()      # no new stamp queues; its thread is waited for, bounded, never held on
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self._close_voice_streams()
+        host, self._snapshot_host = self._snapshot_host, None
+        if host is not None:
+            host.stop()     # the derive threads end before the watcher and the cockpit they feed are torn down
         self.stream_watcher.stop()
         if self.room_serve is not None:
             # the pump and the room's child end. stop() waits for a send in flight (an open can take the launcher's
@@ -6620,6 +6673,9 @@ def make_server(
                 notes=httpd.note_store,                         # and what they tell him (notes)
                 # the Work board, unless a provider brings its own or the embedder asked for none (work_board=False)
                 board=(lambda: _board_value(httpd, stamped=False)) if httpd.work_board else None)
+            httpd._open_snapshot_host(cockpit)      # the caller starts its own cockpit; the host starts here
+            if httpd._snapshot_host is not None:
+                httpd._snapshot_host.start()
     except BaseException:
         # the cockpit put itself back (attach_server); this server's pin is released: it never served
         try:

@@ -11,20 +11,40 @@ A reader that does not know that version refuses the body (``SnapshotBodyError``
 Two functions are the codec: ``encode_snap`` (a read's result to ``(status, body)``) and ``decode_snap`` (back to the
 result the request layer works on). The change-detection text of a decoded result equals the original's for every value
 that is plain JSON. Values that are not (a datetime, a path, a non-finite number) are turned into JSON the way the
-engine's own canonical text already treats them, so a body always encodes. Pure functions: no cockpit, no threads, no I/O.
+engine's own canonical text already treats them, so a body always encodes. The codec is pure functions: no cockpit, no
+threads, no I/O.
+
+The in-thread host. ``SnapshotHost`` is one of the two homes of the derive loop (the other is a worker process): it
+owns the snapshot store's writer, runs the loop's threads inside the serving process, and has the loop call the
+cockpit's own derive-side reads, so a request never runs a provider. A host is attached to the one cockpit it derives
+for. Besides one plan per registered panel it runs two pseudo-plans, discovery and the entity, because those are read
+once per cycle by the host and not once per manifest request. A pseudo-plan's id starts with an underscore, which no
+panel id may, so the two never meet.
+
+Why discovery publishes a row: the panels a discoverer registers appear and vanish, and the loop must be told. The
+discovery row's body is the sorted set of discovered ids, so the stream's change counter moves exactly when the panel
+set does. The entity row works the same way for the entity's value.
+
+``ServerProbe`` is what the change stream watches in a served cockpit: the engine probe's counter folded with the
+serve's own watch token, since the panels the serve composes itself read stores no derive publishes.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-from typing import TYPE_CHECKING, Any
+import threading
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from levain.cockpit.authority import LabelKey
-from levain.cockpit.snapshots import KNOWN_STATUSES
+from levain.cockpit.derive import DeriveLoop, DeriveResult, PanelPlan
+from levain.cockpit.snapshots import DB_FILENAME, KNOWN_STATUSES, SnapshotReader, SnapshotWriter
 
 if TYPE_CHECKING:
-    from levain.cockpit.engine import _Snap
+    from levain.cockpit.engine import Cockpit, _Snap
 
 # The body schema's major version. A body carrying any other value is refused by ``decode_snap``.
 BODY_VERSION = 1
@@ -223,3 +243,214 @@ def decode_snap(status: str, body: dict[str, Any] | None, *, as_of: str | None, 
         fresh["empty"], fresh["value_version"], fresh["view_order"], label_keys,
         None if vkey is None else _decode_label_key(vkey, "value_label_key"), fresh["hidden_skipped"],
         fresh["hidden_note"])
+
+
+# --------------------------------------------------------------------------------------------------- the host
+
+# Panels whose derive is expensive enough to be told apart from the rest (ids only; a panel absent from a cockpit is skipped).
+HEAVY_PANELS = frozenset({"board", "topology", "sky"})
+# The host's two pseudo-plans. An id with this prefix is never a panel's: ``SnapshotHost._plans`` skips any registered id that has it.
+PSEUDO_PREFIX = "_"
+DISCOVER_ID = PSEUDO_PREFIX + "discover"
+ENTITY_ID = PSEUDO_PREFIX + "entity"
+# Every thread a host starts has a name with this prefix, so a test can tell derive threads from request threads.
+DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
+# How often the host's loop looks at the panels' inputs and writes its heartbeat.
+HOST_POLL_S = 1.0
+
+
+class _HostLoop(DeriveLoop):
+    """The derive loop with its threads named under ``DERIVE_THREAD_PREFIX``. The name is set by the thread itself
+    before it does any work, so no derive ever runs on a thread that still has the loop's plain name."""
+
+    def _thread_main(self, target: Callable[[], None]) -> None:
+        me = threading.current_thread()
+        me.name = "levain-cockpit-" + me.name
+        super()._thread_main(target)
+
+
+def _one_line(exc: BaseException) -> str:
+    return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+class SnapshotHost:
+    """Derives a cockpit's panels on threads of this process and publishes them to a snapshot store under ``data_root``.
+
+    Lifecycle: build (or ``try_open``), ``attach()`` the cockpit to the host's reader, ``start()``, and ``stop()`` at the
+    end. A host starts once. Opening takes the store's writer lock, so a second host on the same directory is refused.
+    """
+
+    def __init__(
+        self,
+        cockpit: "Cockpit",
+        data_root: "str | Path",
+        *,
+        token_fn: "Callable[[], Any] | None" = None,
+        clock: Callable[[], float] = time.time,
+        poll_s: float = HOST_POLL_S,
+        heavy: Iterable[str] = HEAVY_PANELS,
+    ) -> None:
+        self._cockpit = cockpit
+        self._heavy = frozenset(heavy)
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+        path = Path(data_root) / DB_FILENAME
+        self._writer = SnapshotWriter(path)
+        try:
+            self._reader = SnapshotReader(path)
+            self._loop = _HostLoop(
+                self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
+                poll_s=poll_s, token_fn=token_fn, clock=clock, on_publish=None,
+            )
+        except BaseException:
+            self._writer.close()
+            raise
+
+    @classmethod
+    def try_open(cls, cockpit: "Cockpit", data_root: "str | Path", **kw: Any) -> "tuple[SnapshotHost | None, str]":
+        """``(host, "")``, or ``(None, reason)`` when no host can be had here: the store is locked by another writer, is
+        of another contract, or cannot be written, or the cockpit is attached already. Never raises, so a server that
+        asked stays on its own path and says why."""
+        if getattr(cockpit, "attached", False):
+            return None, "this cockpit is already attached to a snapshot reader"
+        try:
+            return cls(cockpit, data_root, **kw), ""
+        except Exception as exc:  # noqa: BLE001 - every way the store can refuse is one answer: no host
+            return None, _one_line(exc)
+
+    # ---- plans
+
+    def _plans(self) -> list[PanelPlan]:
+        """The plan of every registered panel the host derives, then the two pseudo-plans.
+
+        A panel the serve composes itself is left out (it reads stores under the request's authority), and so is any id
+        that starts with ``PSEUDO_PREFIX``. A panel with no declared inputs and no timer re-derives when the global
+        watch token moves (and on the loop's backstop), which is today's cadence for an on-demand panel.
+        """
+        plans = []
+        for pid in self._cockpit.panel_ids:
+            spec = self._cockpit.spec(pid)
+            if spec is None or pid.startswith(PSEUDO_PREFIX) or self._cockpit.serve_composed(pid):
+                continue
+            plans.append(PanelPlan(
+                id=pid, inputs=tuple(spec.inputs), every_s=spec.refresh_every_s,
+                on_token=(not spec.inputs and spec.refresh_every_s is None),
+                heavy=pid in self._heavy, timeout_s=spec.timeout_s,
+            ))
+        plans.append(PanelPlan(id=DISCOVER_ID, on_token=True))
+        plans.append(PanelPlan(id=ENTITY_ID, on_token=True))
+        return plans
+
+    # ---- the derive
+
+    def _derive(self, pid: str) -> DeriveResult:
+        # An exception out of here is the loop's to handle: it publishes an error row and lives on.
+        if pid == DISCOVER_ID:
+            return self._derive_discovery()
+        if pid == ENTITY_ID:
+            return self._derive_entity()
+        try:
+            snap = self._cockpit.derive_panel(pid)
+        except KeyError:
+            if self._cockpit.spec(pid) is not None:
+                raise
+            self._loop.retire(pid)      # unregistered since the plan was made: nothing is published for it again
+            return DeriveResult("error", None, error="the panel is no longer registered")
+        status, body = encode_snap(snap)
+        # a failed derive's row carries its message on the row (the store keeps no body for it)
+        return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None)
+
+    def _derive_discovery(self) -> DeriveResult:
+        ids = self._cockpit.run_discovery()
+        self._loop.set_plans(self._plans())     # the panel set may have changed: new plans in, retired ones out
+        return DeriveResult("ok", {"v": BODY_VERSION, "panels": sorted(ids)})
+
+    def _derive_entity(self) -> DeriveResult:
+        value = self._cockpit.read_entity()
+        self._cockpit.set_entity_value(value)
+        text = json.dumps(value[0], sort_keys=True, separators=(",", ":"), default=str)
+        return DeriveResult("ok", {"v": BODY_VERSION, "sha": hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()})
+
+    # ---- lifecycle
+
+    @property
+    def reader(self) -> SnapshotReader:
+        return self._reader
+
+    @property
+    def loop(self) -> DeriveLoop:
+        return self._loop
+
+    def attach(self) -> None:
+        """Switch the cockpit to reading this host's rows."""
+        self._cockpit.attach_snapshots(
+            self._reader, deriving=self._loop.deriving, pending=self._loop.pending, dirty=self._loop.dirty,
+        )
+
+    def start(self) -> None:
+        """Start the loop's threads; every plan's first derive is due at once. Raises RuntimeError on a second start."""
+        with self._lock:
+            if self._started or self._closed:
+                raise RuntimeError("a SnapshotHost starts once and does not restart after stop(): make a new one")
+            self._started = True
+        self._loop.start()
+
+    def run_once(self, now: "float | None" = None) -> list[str]:
+        """One poll and the derives it finds due, run to completion on the calling thread (for a test to drive)."""
+        return self._loop.run_once(time.time() if now is None else now)
+
+    def stop(self, timeout: "float | None" = None) -> "list[threading.Thread]":
+        """End the loop and release the store. Idempotent. Returns the threads still alive when ``timeout`` ran out; the
+        store is then left open for them and a later ``stop()`` finishes the job."""
+        alive = self._loop.stop(timeout)
+        if alive:
+            return alive
+        with self._lock:
+            if self._closed:
+                return []
+            self._closed = True
+        self._writer.close()
+        self._reader.close()
+        return []
+
+
+# --------------------------------------------------------------------------------------------------- the stream probe
+
+
+class ServerProbe:
+    """What a serve's change stream watches (``change_seq()`` and ``snapshot()``), over an attached cockpit.
+
+    The engine's probe moves when a panel's snapshot did. The panels a serve composes itself (decisions, edits) read
+    stores no derive publishes, and the serve's watch token is how the watcher has always seen those stores move, so the
+    counter folds the two: it changes when either does. A serve with no token cannot see its own stores move at all, so
+    the counter then also changes once per ``slow_s``, and the stream looks at the slow cadence a token-less watcher
+    builds at. ``engine_probe()`` answers the cockpit's probe, or None for a cockpit that is not attached, whose snapshot
+    ``bare_snapshot()`` gives (the same shape: ``({id: etag}, set_version)``).
+    """
+
+    def __init__(
+        self,
+        engine_probe: Callable[[], Any],
+        token_fn: Callable[[], Any],
+        bare_snapshot: Callable[[], "tuple[dict[str, str], str | None]"],
+        *,
+        slow_s: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._engine_probe = engine_probe
+        self._token_fn = token_fn
+        self._bare_snapshot = bare_snapshot
+        self._slow_s = slow_s
+        self._clock = clock
+
+    def change_seq(self) -> int:
+        probe = self._engine_probe()
+        seq = probe.change_seq() if probe is not None else 0
+        token = self._token_fn()
+        bucket = int(self._clock() // self._slow_s) if token is None else None
+        return hash((seq, token, bucket))
+
+    def snapshot(self) -> "tuple[dict[str, str], str | None]":
+        probe = self._engine_probe()
+        return self._bare_snapshot() if probe is None else probe.snapshot()
