@@ -1128,7 +1128,7 @@ def _launch_name(fold: rf.RepoFold, ident: Mapping[str, Any]) -> str:
 
 
 def register_for_launch(cwd: str | os.PathLike[str], environ: Mapping[str, str] | None = None) -> bool:
-    """I5: once the registry is active (the pointer names a store that holds a ``repos.jsonl``), Levain's own seat launch registers the repo it is about to work
+    """I5: once the registry is active (the module docstring; ``read_registry(...).active``), Levain's own seat launch registers the repo it is about to work
     in, if the registry does not know it, BEFORE the launch is written (words: ``first seat launched here``). A directory
     that is not in a git repository, or a repository with no commit yet (nothing identifies it), registers nothing and the
     launch goes on. The decision is made INSIDE the write (under the exclusive lock): a repo another writer registered meanwhile

@@ -259,13 +259,8 @@ def seam_check(conn: sqlite3.Connection, launch_id: str, now: str, *, at_turn_bo
     desk nothing; an acknowledged open whose events are still claimed fails (C) through the claim. (D) is not on the
     store at all, so it is the caller's input ``at_turn_boundary``, read where the caller reads it (the session
     listing, as :func:`levain.desk.lease.replace_done`'s caller reads a done session, or the desk's own ``coord open``
-    before it takes anything new). Only ``True`` (the bool) says "between turns".
-
-    Each False reason is one conjunct failing, in this order (first match wins):
-    (A) no such launch, not an active desk, or its session does not hold the live lease;
-    (B) the save rolled back, all saves rolled back, the save not after the request, or no save at all;
-    (C) a claimed or delivered event, then an open this session has not acknowledged ("mid-work");
-    (D) ``at_turn_boundary`` is not True ("mid-turn")."""
+    before it takes anything new). Only ``True`` (the bool) says "between turns". The False reasons are the body's, one per
+    failing conjunct."""
     from levain.desk import lease as _leases
     from levain.desk.legacy import ROLE_DESK
 
