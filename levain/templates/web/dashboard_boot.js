@@ -1001,7 +1001,9 @@
     const words = resultWords(state);
     notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
     if (notice) paintNow(notice); else clearBusy(base.row_id || null);
-    const redrew = await afterWrite();
+    const touched = touchedOf(d);
+    if (touched && !words) paintRow(base.row_id || null, d.row);
+    const redrew = await afterWrite(touched);
     if (!words && redrew === false && !pendingReload) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
       notice = { key: base.row_id || null, text: "Saved. The page could not refresh; reload to see it.", cls: "note" };
       paintNow(notice);
@@ -1009,8 +1011,78 @@
     return { ok: true, data: d };
   }
 
-  // reload after a landed write, deferring while an async job polls (as postWrite does)
-  async function afterWrite() {
+  // How long a panel the write refetched also answers the change stream's own announcement of it: within this window the
+  // stream's call takes the write's read instead of making a second one.
+  const WRITE_REFETCH_DEDUP_MS = 3000;
+  const writeRefetches = new Map();   // panel id -> { at, done } of the last refetch a write asked for
+  let dedupInstalled = false;
+  let viewRefetch = null;             // the view's own refetch, kept once the de-dup stands in front of it
+
+  // The panels a landed write says it changed: a non-empty list of ids, else null (an older server, which says nothing:
+  // the whole-board path below runs).
+  function touchedOf(d) {
+    if (!d || !Array.isArray(d.touched)) return null;
+    const ids = Array.from(new Set(d.touched.filter((x) => typeof x === "string" && x)));
+    return ids.length ? ids : null;
+  }
+
+  // The row as the write left it, drawn at once and without moving it: the offered actions take the new row version (the next
+  // write on this row must not be refused stale while the panel read is in flight), and the row is marked updated. The panel
+  // read that follows is the truth and replaces whatever is drawn here.
+  function paintRow(key, row) {
+    if (!key) return;
+    const have = row && typeof row === "object" ? row : null;
+    const ver = have && typeof have.row_version === "string" ? have.row_version : null;
+    const target = live && live.rows ? live.rows[key] : null;
+    if (target && ver) {
+      target.row_version = ver;
+      if (Array.isArray(target.actions)) for (const a of target.actions) if (a && a.target && typeof a.target === "object") a.target.row_version = ver;
+    }
+    for (const el of document.querySelectorAll("[data-row-key]")) {
+      if (el.dataset.rowKey !== key) continue;
+      if (ver) el.dataset.rowVersion = ver;
+      if (have && typeof have.next === "string") el.dataset.rowNext = have.next;
+      el.dataset.rowUpdated = "1";
+      if (el.classList && typeof el.classList.add === "function") el.classList.add("row-updated");
+    }
+  }
+
+  // A panel the write refetched is read once for the write and the stream's announcement of the same change: while that read
+  // runs, or for WRITE_REFETCH_DEDUP_MS after it, a refetch of the panel through the view answers with it.
+  function installRefetchDedup() {
+    const V = window.LevainCockpitView;
+    if (dedupInstalled || !V || typeof V.refetchPanel !== "function") return;
+    dedupInstalled = true;
+    viewRefetch = V.refetchPanel;
+    V.refetchPanel = function (pid) {
+      const w = writeRefetches.get(pid);
+      if (w && Date.now() - w.at < WRITE_REFETCH_DEDUP_MS) return w.done;
+      return viewRefetch.apply(V, arguments);
+    };
+  }
+
+  // Refetch ONLY the panels a write touched, in the place they are drawn, in the background: nothing here waits on a read and
+  // no whole-board load is asked for or queued. A panel the page cannot repaint in place (answered false) asks one passive
+  // board read, which a busy or editing page drops rather than queues.
+  function refetchTouched(ids) {
+    installRefetchDedup();
+    const V = window.LevainCockpitView;
+    const read = viewRefetch || (V && V.refetchPanel);
+    if (typeof read !== "function") return false;
+    for (const pid of ids) {
+      let done;
+      try { done = Promise.resolve(read.call(V, pid)); } catch (_) { done = Promise.resolve("fault"); }
+      done = done.catch(() => "fault");
+      writeRefetches.set(pid, { at: Date.now(), done });
+      done.then((r) => { if (r === false) load({ passive: true }); });
+    }
+    return true;
+  }
+
+  // after a landed write: with the panels it touched, an in-place background refetch of those (resolves at once, true when
+  // started); without (an older server), the reload of the whole board, deferring while an async job polls (as postWrite does)
+  async function afterWrite(touched) {
+    if (touched) return refetchTouched(touched);
     if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
       deferredReload = true;
       return undefined;
