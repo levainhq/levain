@@ -302,8 +302,9 @@ def test_a_directory_that_stats_but_cannot_be_opened_is_placed_not_unsure(tree, 
     """The refusal was the spelling step failing on the open, not an overlap: the identity walk places it."""
     assert not pathid.maybe_inside(tree / "root", closed_home)
     assert not pathid.maybe_inside(closed_home, tree / "root")
-    assert not pathid.maybe_same(tree / "root", closed_home)
-    assert pathid._canon(closed_home)[1] is False
+    assert pathid._canon_placed(closed_home)[1] is False            # placed: not unsure for the identity walk
+    # `maybe_same` compares SPELLINGS, and this one's is only the one given, so it stays fail-closed (L3 r1 fix)
+    assert pathid.maybe_same(tree / "root", closed_home) is (pathid._canon_placed(closed_home)[2])
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
@@ -337,3 +338,53 @@ def test_an_unopenable_directory_with_a_failing_stat_stays_unsure(tree, closed_h
     monkeypatch.setattr(pathid.os, "stat", stat)
     assert pathid._canon(closed_home)[1] is True
     assert pathid.maybe_inside(tree / "root", closed_home)
+
+
+# ---------------------------------------------------------------- levain#137 L3 r1: an unopenable path's spelling is never proof
+
+_GETPATH = getattr(pathid._fcntl, "F_GETPATH", None) if pathid._fcntl is not None else None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+@pytest.mark.skipif(_GETPATH is None, reason="no F_GETPATH: the spelling step is a stat, and no open is ever refused")
+def test_an_unopenable_directory_spelled_in_another_case_is_flagged_unspelled_not_proved(tree, closed_home):
+    """Finding 1 (reproduced on macOS before the fix): `_canon` of a case alias of a mode-0 directory returned the alias
+    spelling with unsure False, so a spelling consumer took a guessed case as the filesystem's own."""
+    alias = _case_alias(closed_home)
+    spelled, unsure, unspelled = pathid._canon_placed(alias)
+    assert spelled.name == alias.name and unsure is False and unspelled is True   # placed, but its case is a guess
+    assert pathid._canon(alias)[1] is True                                         # every spelling consumer: unsure
+    assert pathid._canon(closed_home)[1] is True
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+def test_two_spellings_of_one_unopenable_directory_are_maybe_the_same(tree, closed_home):
+    """Finding 2 (reproduced on macOS before the fix: False both ways): one spelling reaches the directory THROUGH
+    itself (`closed_home/never/..`, which `resolve()` folds but a stat cannot search), the other is a case alias.
+    Their spellings differ, `same()` cannot stat the first, and the DENY answer said "different"."""
+    alias = _case_alias(closed_home)
+    through = str(closed_home) + "/never/.."
+    assert pathid.maybe_same(through, alias) and pathid.maybe_same(alias, through)
+    assert pathid.maybe_inside(alias, through) and pathid.maybe_inside(through, alias)
+
+
+def test_an_unspelled_component_is_compared_by_identity_only_on_any_filesystem(tree, monkeypatch):
+    """Findings 1 and 2 where no refused open can be provoked (Linux, or root): the seam raises `_Unopened` for one
+    directory under either case. `maybe_same` of two spellings of it is fail-closed; the identity walk still places it
+    (not unsure, a real case alias on a case-insensitive volume is inside), and the lexical shortcut never uses it."""
+    target = tree / "other"
+    inner = pathid._fs_spelling
+
+    def spelling(p):
+        if p.casefold() == str(target).casefold():
+            raise pathid._Unopened("injected")
+        return inner(p)
+
+    monkeypatch.setattr(pathid, "_fs_spelling", spelling)
+    upper = tree / "OTHER"
+    assert pathid._canon_placed(upper)[1:] == (False, True)
+    assert pathid.maybe_same(target, upper) and pathid.maybe_same(upper, target)
+    assert pathid.maybe_same(target, target)
+    assert not pathid.maybe_inside(tree / "root", target)              # placed by stat: not a refusal of everything
+    assert not pathid.maybe_inside(target, tree / "root")
+    assert pathid.inside(tree, target)                                 # its real parent still contains it, by identity

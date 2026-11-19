@@ -96,8 +96,19 @@ def _fs_spelling(path: str) -> Optional[str]:
 
 def _canon(path) -> Tuple[Path, bool]:
     """``(canonical path, unsure)``: ``unsure`` is True when a resolve or spelling lookup failed on a path that exists,
-    so the spelling returned is the best known and not the filesystem's own."""
-    unsure = False
+    so the spelling returned is the best known and not the filesystem's own. That includes a component whose open was
+    refused (:class:`_Unopened`): its spelling is the one given, so a SPELLING comparison of it is an open question
+    (L3 r1: two spellings of one unopenable directory compared unequal). Only :func:`_decide`, which places a path by
+    identity and never by that spelling, reads the finer answer from :func:`_canon_placed`."""
+    p, unsure, unspelled = _canon_placed(path)
+    return p, unsure or unspelled
+
+
+def _canon_placed(path) -> Tuple[Path, bool, bool]:
+    """``(canonical path, unsure, unspelled)``. ``unsure``: a resolve or spelling lookup failed on a path that exists,
+    so it may not even be placeable by identity. ``unspelled``: some component stats but refused the open that would
+    read its spelling (:class:`_Unopened`), so its letter case is the one given; its place is still known by stat."""
+    unsure = unspelled = False
     try:
         p = Path(path).resolve()
     except (OSError, RuntimeError, ValueError, TypeError):   # a symlink loop, an embedded NUL, a permission error, not a path
@@ -113,7 +124,8 @@ def _canon(path) -> Tuple[Path, bool]:
             spelled = _fs_spelling(str(base))
         except _Unopened:
             # placed by stat, so not unsure: take the spelling of the nearest openable ancestor and join this name as
-            # given; `_decide` compares by identity, which sees a case variant of it as the same directory
+            # given, and say so (`unspelled`): only an identity comparison may use this path, never its text
+            unspelled = True
             spelled = None
         except _Unsure:
             unsure = True
@@ -125,14 +137,18 @@ def _canon(path) -> Tuple[Path, bool]:
             break
         tail.append(base.name)
         base = base.parent
-    return base.joinpath(*reversed(tail)), unsure
+    return base.joinpath(*reversed(tail)), unsure, unspelled
 
 
 def canonical(path) -> Path:
     """``path`` made absolute, resolved, and spelled as the filesystem spells it. ``Path.resolve()`` first (it follows
     links but keeps the case it was given); then the nearest existing ancestor is asked for its own spelling
     (macOS ``F_GETPATH``; identity where that does not exist) and the part that does not exist yet is joined on as
-    given. Never raises for a path that does not exist."""
+    given. Never raises for a path that does not exist.
+
+    The spelling is a best effort, never a proof: a component that could not be read (a resolve or spelling failure,
+    or a directory that refused the open) keeps the letter case it was given. A DENY site must not decide by comparing
+    this text alone: it compares by identity (:func:`maybe_inside`, :func:`maybe_same`) or case-folded."""
     return _canon(path)[0]
 
 
@@ -147,10 +163,10 @@ def _decide(root, path) -> Tuple[bool, bool]:
         Path(root), Path(path)
     except TypeError:                                   # not a path at all (None, an int): nothing can be said of it
         return False, True
-    cr, ur = _canon(root)
-    cp, up = _canon(path)
-    unsure = ur or up
-    if not unsure and (cp == cr or cr in cp.parents):
+    cr, ur, sr = _canon_placed(root)
+    cp, up, sp = _canon_placed(path)
+    unsure = ur or up                                   # an unspelled side is placed by stat below, so it is not unsure
+    if not (unsure or sr or sp) and (cp == cr or cr in cp.parents):   # text only where both spellings were read
         return True, False
     try:
         want = os.stat(cr)
@@ -192,8 +208,9 @@ def maybe_inside(root, path) -> bool:
 
 def maybe_same(a, b) -> bool:
     """True when ``a`` and ``b`` are surely or possibly one path: their canonical spellings are equal, or :func:`same`
-    says one file, or resolving either one was unsure (a stat or resolve error, a bad argument). The direction for a
-    DENY site ("is this the protected path?") that must refuse what it could not check. Never raises."""
+    says one file, or resolving either one was unsure (a stat or resolve error, a bad argument, or a component that
+    refused the open, so its spelling is only the one given). The direction for a DENY site ("is this the protected
+    path?") that must refuse what it could not check. Never raises."""
     ca, ua = _canon(a)
     cb, ub = _canon(b)
     return ua or ub or ca == cb or same(a, b)
