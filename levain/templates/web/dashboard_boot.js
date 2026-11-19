@@ -1011,10 +1011,9 @@
     return { ok: true, data: d };
   }
 
-  // How long a panel the write refetched also answers the change stream's own announcement of it: within this window the
-  // stream's call takes the write's read instead of making a second one.
-  const WRITE_REFETCH_DEDUP_MS = 3000;
-  const writeRefetches = new Map();   // panel id -> { at, done } of the last refetch a write asked for
+  // The refetch each write is waiting on, by panel id: { done } of the last one a write asked for, held only while it is in
+  // flight (its own settling removes it, whatever it answered).
+  const writeRefetches = new Map();
   let dedupInstalled = false;
   let viewRefetch = null;             // the view's own refetch, kept once the de-dup stands in front of it
 
@@ -1081,8 +1080,10 @@
     }
   }
 
-  // A panel the write refetched is read once for the write and the stream's announcement of the same change: while that read
-  // runs, or for WRITE_REFETCH_DEDUP_MS after it, a refetch of the panel through the view answers with it.
+  // A panel the write refetched is read once for the write and a stream announcement that arrives while that read is still in
+  // flight: such a call through the view answers with it. Once the read has settled (answered, faulted or superseded) the entry
+  // is gone and a later call makes its own read, since a later announcement is about a later change and a fault is never kept.
+  // Only the write's own refetch registers an entry, so the shared read is always one that began with the write's response.
   function installRefetchDedup() {
     const V = window.LevainCockpitView;
     if (dedupInstalled || !V || typeof V.refetchPanel !== "function") return;
@@ -1090,7 +1091,7 @@
     viewRefetch = V.refetchPanel;
     V.refetchPanel = function (pid) {
       const w = writeRefetches.get(pid);
-      if (w && Date.now() - w.at < WRITE_REFETCH_DEDUP_MS) return w.done;
+      if (w) return w.done;
       return viewRefetch.apply(V, arguments);
     };
   }
@@ -1107,7 +1108,9 @@
       let done;
       try { done = Promise.resolve(read.call(V, pid)); } catch (_) { done = Promise.resolve("fault"); }
       done = done.catch(() => "fault");
-      writeRefetches.set(pid, { at: Date.now(), done });
+      const mine = { done };
+      writeRefetches.set(pid, mine);
+      done.then(() => { if (writeRefetches.get(pid) === mine) writeRefetches.delete(pid); });
       // A panel the view cannot repaint in place asks for the board read, NOT passive and not awaited here: the rebuild it
       // makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit and
       // would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.

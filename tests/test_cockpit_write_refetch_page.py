@@ -7,8 +7,8 @@ fetch, held open by a gate the test releases, so the order "row repainted, then 
 * touched: one write POST (no dry run: the verb is direct), a GET of ONLY the touched panel, no manifest GET, the row marked
   updated and its next write carrying the response's row version, all before the held GET resolves;
 * no `touched` (an older server): the whole-board path runs (manifest GET, every panel), the view's refetch is never used;
-* de-dup: a stream-style refetch of the same panel right after the write is answered by the write's read, another panel
-  is read for itself;
+* de-dup: a stream-style refetch of the same panel while the write's read is in flight is answered by it, another panel
+  is read for itself, and once the read has settled (answered or faulted) a later refetch reads for itself;
 * a panel the page cannot repaint in place (answers false) asks one board read (not passive), however many of a write's
   panels answer false, and a board read already in flight is re-read once it ends;
 * the row repaint is visible before the panel read returns (a snooze into the future hides the row, a text edit changes the
@@ -235,8 +235,37 @@ cases.the_stream_announcing_a_refetched_panel_reads_it_once = async () => {
   ok(env.refetchCalls.indexOf("inbox") >= 0, "another panel is read for itself: " + JSON.stringify(env.refetchCalls));
   env.releaseGate();
   ok((await a) === "applied", "the stream's call got the write's answer");
-  const b = await env.V.refetchPanel("tray");     // inside the window, after the read settled
-  ok(b === "applied" && env.refetchCalls.filter((p) => p === "tray").length === 1, "still one read inside the window: " + JSON.stringify(env.refetchCalls));
+  await env.tick();
+  // M3: once the write's read has settled, a later announcement is about a later change and reads for itself
+  const b = await env.V.refetchPanel("tray");
+  ok(b === "applied" && env.refetchCalls.filter((p) => p === "tray").length === 2, "a refetch after the write's read settled made its own read: " + JSON.stringify(env.refetchCalls));
+};
+
+cases.a_faulted_write_read_is_not_answered_to_a_later_refetch = async () => {
+  let n = 0;
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => (++n === 1 ? "fault" : "applied")).start();
+  await env.snooze();
+  await env.tick();
+  const gets0 = env.gets.length;
+  const b = await env.V.refetchPanel("tray");
+  ok(b === "applied", "the stream's retry got its own answer, not the cached fault: " + b);
+  ok(env.gets.length === gets0 + 1, "and read the panel: " + JSON.stringify(env.gets.slice(gets0)));
+};
+
+cases.a_second_write_replaces_the_first_writes_in_flight_read_for_the_dedup = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
+  env.hold();
+  await env.snooze();
+  await env.tick();
+  await env.snooze();
+  await env.tick();
+  env.V.refetchPanel("tray");
+  await env.tick();
+  ok(env.refetchCalls.length === 2, "two write reads, and the stream's call joined the second: " + JSON.stringify(env.refetchCalls));
+  env.releaseGate();
+  await env.tick();
+  await env.V.refetchPanel("tray");
+  ok(env.refetchCalls.length === 3, "after both settled the next call reads for itself: " + JSON.stringify(env.refetchCalls));
 };
 
 cases.a_panel_that_cannot_repaint_in_place_asks_one_board_read = async () => {
@@ -336,6 +365,8 @@ CASES = [
     "a_response_without_touched_runs_the_whole_board_path",
     "an_empty_touched_is_no_touched",
     "the_stream_announcing_a_refetched_panel_reads_it_once",
+    "a_faulted_write_read_is_not_answered_to_a_later_refetch",
+    "a_second_write_replaces_the_first_writes_in_flight_read_for_the_dedup",
     "a_panel_that_cannot_repaint_in_place_asks_one_board_read",
     "a_write_from_an_open_form_reads_the_board_non_passively",
     "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
