@@ -97,7 +97,7 @@
     // own jump (which would leave the Desk for a card that Home never shows) does not run
     if (B && deskOn() && act && act.contains(t.closest("[data-phone-jump=drop]"))) {
       var box = document.querySelector(".dv-zone textarea");
-      ev.stopPropagation();
+      ev.stopImmediatePropagation();
       ev.preventDefault();
       actionFromDesk = false;
       if (box) box.focus();
@@ -105,7 +105,7 @@
     }
     actionFromDesk = !!(B && deskOn() && act);
     // choosing a place by hand ends the Desk entry's retries; pressing an action, a theme or Sync does not
-    if (ev.isTrusted && t && !act && t.closest("[data-ia-place-btn],[data-ia-drill-btn],[data-phone-jump],[data-mode-tab]")) userMoved = true;
+    if (ev.isTrusted && t && !act && t.closest("[data-ia-place-btn],[data-ia-drill-btn],[data-phone-jump],[data-mode-tab],#jumpbtn")) userMoved = true;
   }, true);
   var userMoved = false;
 
