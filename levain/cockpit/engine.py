@@ -348,18 +348,30 @@ class ReadContext:
         self._dead: set[str] = set()
         self._memo_timeout_s = memo_timeout_s
         self._lock = threading.Lock()
+        self._keys: set[str] = set()      # the memo keys THIS context asked for (``abandon`` kills only these)
+
+    def child(self) -> "ReadContext":
+        """A context for one of several reads running side by side in this cycle (the manifest's panels): the same
+        instant, authority, memo and dead set, its own record of the keys it asked for, so one read's timeout abandons
+        only the shared reads that read used, never one another read started and is still within its deadline."""
+        c = ReadContext.__new__(ReadContext)
+        c.now, c.fresh, c.authority, c.today = self.now, self.fresh, self.authority, self.today
+        c._memo, c._dead, c._memo_timeout_s, c._lock = self._memo, self._dead, self._memo_timeout_s, self._lock
+        c._keys = set()
+        return c
 
     def abandon(self) -> None:
-        """A bounded call that wraps this cycle's reads timed out: every shared read still running
-        is dead for the rest of the cycle, so the next reader fails at once."""
+        """A bounded call that wraps this context's reads timed out: every shared read it asked for that is still
+        running is dead for the rest of the cycle, so the next reader of it fails at once."""
         with self._lock:
-            self._dead |= {k for k, f in self._memo.items() if not f.done()}
+            self._dead |= {k for k in self._keys if (f := self._memo.get(k)) is not None and not f.done()}
 
     def memo(self, key: str, fn: Callable[[], Any]) -> Any:
         """Run ``fn`` once per cycle and share its result. A waiter gives up after the memo
         timeout, and once one has, the key is dead for the rest of the cycle: every later reader
         fails at once instead of each paying its own timeout behind one hung read."""
         with self._lock:
+            self._keys.add(key)
             if key in self._dead:
                 raise TimeoutError(f"shared read {key!r} did not finish")
             fut = self._memo.get(key)
@@ -413,6 +425,10 @@ class _Snap:
     # hand a snapshot's rows and value to every caller) already do. Not an init field: a copy made with
     # ``dataclasses.replace`` carries it by hand.
     _etag_frags: Mapping[str, str] | None = field(default=None, init=False, repr=False, compare=False)
+    # the on-demand read that made this snapshot: (monotonic time it began, read-cache generation when it began), set
+    # by its owner's commit before any caller sees it, so a caller handed it by a flight it joined can tell whether that
+    # read began before a write or before its ``read_after`` (``Cockpit._snap_for``). None on a snapshot made otherwise.
+    _read_mark: "tuple[float, int] | None" = field(default=None, init=False, repr=False, compare=False)
 
     def etag_frags(self) -> Mapping[str, str]:
         """The kept canonical text of the four heavy parts, as a read-only view (the same view on every call)."""
@@ -441,9 +457,6 @@ class _State:
     # an on-demand panel's last good snapshot, shared by every read that arrives soon after it: (snap, monotonic time the
     # read BEGAN, monotonic time it COMMITTED, the read-cache generation when it began). ``_recent_snap`` alone reads it.
     recent: "tuple[_Snap, float, float, int] | None" = None
-    # every committed read, good or not: (snap, monotonic time it began, read-cache generation when it began), so a
-    # caller can tell whether the flight it joined began before a write or before its ``read_after``
-    last_read: "tuple[_Snap, float, int] | None" = None
     commits: int = 0      # committed reads so far: part of the panel route's cache key (``Cockpit.panel``)
 
 
@@ -770,6 +783,10 @@ class Cockpit:
         self.read_cache_ttl_s: float | None = None
         self._rc: dict[Any, "_SharedRead"] = {}
         self._rc_gen = 0
+        # bumped as each ``read_after`` manifest (the change stream's watcher) returns, before it can announce anything:
+        # part of every manifest and panel cache key, so a page's read after an announcement is never answered from an
+        # entry stored before the build that announced it (an etag can move with no provider read: the day turning)
+        self._obs_gen = 0
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -1455,12 +1472,12 @@ class Cockpit:
             except Exception:  # noqa: BLE001
                 done_at = None
             shared = spec.refresh_every_s is None and snap.status in _SHARED_STATUSES
+            snap._read_mark = (begun, gen)      # every _book outcome is a snapshot this read made, so the mark is its own
             with st.lock:
                 st.snap = snap
                 st.last_completion = done_at or ctx.now
                 st.fresh = (snap.as_of, snap.status)
                 st.recent = (snap, begun, time.monotonic(), gen) if shared else None
-                st.last_read = (snap, begun, gen)
                 st.commits += 1
             return snap
 
@@ -1525,9 +1542,8 @@ class Cockpit:
             if recent is not None:
                 return recent
             snap = self._read_panel(spec, st, ctx)
-            with st.lock:
-                rec = st.last_read
-            if rec is not None and rec[0] is snap and (rec[2] < gen or (read_after is not None and rec[1] < read_after)):
+            mark = snap._read_mark       # None: a refusal made for this caller (a hung flight), never re-read into it
+            if mark is not None and (mark[1] < gen or (read_after is not None and mark[0] < read_after)):
                 snap = self._read_panel(spec, st, ctx)       # it joined a flight begun before the write or ``read_after``
             return snap
         with st.lock:
@@ -2281,7 +2297,7 @@ class Cockpit:
                  transport: dict[str, Any] | None = None, read_after: float | None = None) -> dict[str, Any]:
         """``read_after`` (a ``time.monotonic()`` instant; the change stream's watcher passes its build's start) asks for
         a manifest built only from on-demand reads BEGUN at or after it (``_snap_for``): it is never shared from or into
-        the cache below, and the reads it makes are the ones later page reads share.
+        the cache below, the reads it makes are the ones later page reads share, and its return bumps ``_obs_gen``.
 
         Otherwise the manifest, shared. KEY = every input this composition reads from the request: the whole credential
         dict (class, name, device_class: it is also hashed into the etag and echoed in the body), ``install_class``
@@ -2291,10 +2307,15 @@ class Cockpit:
         request before it got here (a refused request never reaches the engine), so the cache never decides who
         may read; it only avoids repeating a compute for an identical, already-authorised asker. The returned dict
         is shared: read-only for every caller."""
-        if read_after is not None or (self.read_cache_ttl_s or 0.0) <= 0:
-            return self._manifest_compute(credential, install_class=install_class, transport=transport,
-                                          read_after=read_after)
-        key = ("manifest", _read_key(credential), install_class, _read_key(transport))
+        if read_after is not None:
+            out = self._manifest_compute(credential, install_class=install_class, transport=transport,
+                                         read_after=read_after)
+            with self._rc_lock:
+                self._obs_gen += 1
+            return out
+        if (self.read_cache_ttl_s or 0.0) <= 0:
+            return self._manifest_compute(credential, install_class=install_class, transport=transport)
+        key = ("manifest", _read_key(credential), install_class, _read_key(transport), self._obs_gen)
         return self._shared_read(key, lambda: self._manifest_compute(credential, install_class=install_class,
                                                                      transport=transport))
 
@@ -2312,11 +2333,11 @@ class Cockpit:
         snaps: dict[str, _Snap] = {}
         specs_map = self._specs      # one snapshot for the whole manifest
         specs = self._ordered_specs(specs_map)
-        # The panels read side by side: one request pays for its slowest panel, not for the sum of all of them (each read is
-        # already its own bounded single flight over the one ReadContext, so nothing here shares more than a serial pass did).
-        # Results are placed in drawing order; a read that raises propagates as it did when this ran in a loop.
+        # The panels read side by side: one request pays for its slowest panel, not for the sum of all of them. Each read is
+        # its own bounded single flight over a child of the one ReadContext (the cycle's memo shared, the abandon its own).
+        # Results are placed in drawing order; the first read in that order that raised is raised, the others dropped.
         def read_head(spec: ProviderSpec) -> tuple[_Snap, dict[str, Any]]:
-            snap = self._snap_for(spec, ctx, read_after)
+            snap = self._snap_for(spec, ctx.child(), read_after)    # its own child: a timeout abandons only its memos
             return snap, self._head(spec, snap, credential["class"], ctx.today, auth, ctx.now)
         for spec, (snap, head) in zip(specs, self._parallel(read_head, specs)):
             snaps[spec.id], heads[spec.id] = snap, head
@@ -2433,9 +2454,10 @@ class Cockpit:
         check_query(None, limit)
         # and the panel's committed-read count: a read committed since an entry was stored (the change stream's watcher
         # read the change it is about to announce) is a new key, so the page's refetch of an announced panel inside the
-        # window never gets the older body it cached itself
+        # window never gets the older body it cached itself; and the watcher's observation generation (``_obs_gen``), for
+        # a head that moved with no new read
         st = self._state.get(panel_id)
-        key = ("panel", panel_id, profile, row, credential_class, st.commits if st is not None else None)
+        key = ("panel", panel_id, profile, row, credential_class, st.commits if st is not None else None, self._obs_gen)
         return self._shared_read(key, lambda: self._panel_compute(
             panel_id, profile=profile, q=q, row=row, credential_class=credential_class, limit=limit, at=at),
             keep=lambda v: v is not None)      # an unknown id is not stored: ids are caller-chosen

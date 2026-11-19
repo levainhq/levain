@@ -210,6 +210,63 @@ def test_a_reader_after_a_write_never_gets_the_flight_the_write_straddled(tmp_pa
     assert {r["id"] for r in second[0]["rows"]} == {"r1", "r2"}
 
 
+def test_one_parallel_reads_timeout_abandons_only_the_shared_reads_it_used() -> None:
+    # codex L3 r1: the manifest's panels read side by side over one cycle; a panel that times out must not kill a
+    # shared read another panel started and that is still inside its own deadline
+    from datetime import datetime, timezone
+
+    from levain.cockpit.engine import ReadContext
+
+    root = ReadContext(datetime.now(timezone.utc))
+    a, b, c = root.child(), root.child(), root.child()
+    gate, started = threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        assert gate.wait(10)
+        return "x-value"
+
+    t = threading.Thread(target=lambda: a.memo("x", slow))
+    t.start()
+    assert started.wait(10)
+    b.memo("y", lambda: "y-value")
+    b.abandon()                                   # b timed out: it never asked for "x"
+    gate.set()
+    t.join(10)
+    assert c.memo("x", lambda: "recomputed") == "x-value"
+    hung = threading.Event()
+    t2 = threading.Thread(target=lambda: a.memo("z", lambda: hung.wait(10)))
+    t2.start()
+    time.sleep(0.1)
+    a.abandon()                                   # a's own hung read is dead for the rest of the cycle
+    with pytest.raises(TimeoutError):
+        c.memo("z", lambda: None)
+    hung.set()
+    t2.join(10)
+
+
+def test_a_page_manifest_after_a_watcher_build_is_never_the_entry_cached_before_it(ck) -> None:
+    # gemini L3 r1: the watcher's fresh build announced; the page's manifest inside the window must not be the older entry
+    m1 = ck.manifest(NONE)
+    assert ck.manifest(NONE) is m1
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck.manifest(NONE) is not m1
+
+
+def test_a_refresher_panels_refetch_after_a_watcher_build_is_a_new_entry(ck) -> None:
+    # codex L3 r1: a head can move with no provider read (the day turning, a refresher's snapshot ageing): the watcher's
+    # build is what announces it, and the page's refetch must not be the entry cached before that build
+    from levain.cockpit.engine import Read
+    from tests.test_cockpit_k1 import _simple
+
+    ck.register(_simple("cyc", rows=(), read=lambda ctx: Read(rows=(_row(1),)), refresh_every_s=60.0, stale_after_s=120.0))
+    ck.refresh("cyc")
+    p1 = ck.panel("cyc", credential_class="none")
+    assert ck.panel("cyc", credential_class="none") is p1
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck.panel("cyc", credential_class="none") is not p1
+
+
 @pytest.mark.parametrize("ttl", [None, 0])
 def test_nothing_is_shared_where_the_read_cache_is_off(ck, monkeypatch, ttl) -> None:
     ck.read_cache_ttl_s = ttl
