@@ -12,6 +12,8 @@ fetch, held open by a gate the test releases, so the order "row repainted, then 
   itself; another panel is read at once, and once the read has settled (answered or faulted) a later refetch reads for itself;
 * a panel the page cannot repaint in place (answers false) asks one board read (not passive), however many of a write's
   panels answer false, and a board read already in flight is re-read once it ends;
+* a refetch that faults or throws asks that same board read (once per write), and when that read fails the page's own
+  failed-read line shows it;
 * the row repaint is visible before the panel read returns (a snooze into the future hides the row, a text edit changes the
   row's words, another field dims the row).
 """
@@ -68,7 +70,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
       return resp(200, verbAnswer(body));
     }
     gets.push(url);
-    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (manifestGate) await manifestGate; return resp(200, fx.manifest); }
+    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (manifestGate) await manifestGate; return env.failManifest ? resp(500, {}) : resp(200, fx.manifest); }
     const m = /\/cockpit\/panel\/([^?]+)\.json/.exec(url);
     const pid = m ? decodeURIComponent(m[1]) : null;
     if (pid && fx.panels[pid]) return resp(200, fx.panels[pid]);
@@ -98,7 +100,8 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
   const win = { LevainCockpitView: V, localStorage: ls, sessionStorage: store(), location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
     LevainDashboard: { render: (view, o) => renders.push({ view, opts: o }), hasUnsavedEdit: () => env.editing, jobsActive: () => false }, dispatchEvent() {} };
-  const doc = { getElementById: () => null, addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
+  env.stampEl = { textContent: "" };    // the page's status line (#stamp), where a failed board read says so
+  const doc = { getElementById: (id) => (id === "stamp" ? env.stampEl : null), addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
                 createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   env.V = V;
   // a board read already out: the manifest GET is held until released; the page's resume handler asks a passive load
@@ -300,6 +303,43 @@ cases.a_panel_that_cannot_repaint_in_place_asks_one_board_read = async () => {
   ok(manifests.length === 1, "one board read, not a latched second: " + JSON.stringify(env.gets.slice(getsBefore)));
 };
 
+// A refetch that answers "fault" (or throws) leaves the optimistic repaint standing: it asks the board read exactly as an
+// answer of false does, once per write, so the render settles the row.
+cases.a_faulting_refetch_asks_the_board_read = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:i1", row_version: "v2", next: "2999-01-01" } }), () => "fault").start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read after the fault: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+cases.a_refetch_that_throws_asks_the_board_read = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => { throw new Error("boom"); }).start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read after the throw: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+cases.a_write_with_two_faulting_panels_asks_the_board_read_once = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray", "inbox"] }), () => "fault").start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read for two faulting panels: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+// the fallback read is the page's own load: when it fails the page's usual failed-read line says so (no new notice)
+cases.a_failing_fallback_board_read_leaves_the_pages_failed_read_line = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "fault").start();
+  env.failManifest = true;
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "the board read was asked: " + JSON.stringify(env.gets.slice(getsBefore)));
+  ok(/^read failed/.test(env.stampEl.textContent), "the status line says the read failed: " + JSON.stringify(env.stampEl.textContent));
+};
+
 // H1: the save's own re-read must rebuild the board (closing the form it came from) even though an edit is open, as the old
 // whole-board reload did; a passive read is refused for an open edit and the form would sit on "saving..." forever.
 cases.a_write_from_an_open_form_reads_the_board_non_passively = async () => {
@@ -392,6 +432,10 @@ CASES = [
     "a_faulted_write_read_is_not_answered_to_a_later_refetch",
     "a_second_write_replaces_the_first_writes_in_flight_read_for_the_dedup",
     "a_panel_that_cannot_repaint_in_place_asks_one_board_read",
+    "a_faulting_refetch_asks_the_board_read",
+    "a_refetch_that_throws_asks_the_board_read",
+    "a_write_with_two_faulting_panels_asks_the_board_read_once",
+    "a_failing_fallback_board_read_leaves_the_pages_failed_read_line",
     "a_write_from_an_open_form_reads_the_board_non_passively",
     "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
     "two_native_panels_ask_one_board_read",

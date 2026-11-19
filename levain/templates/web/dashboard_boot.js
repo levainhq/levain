@@ -1128,12 +1128,14 @@
       const mine = { done };
       writeRefetches.set(pid, mine);
       done.then(() => { if (writeRefetches.get(pid) === mine) writeRefetches.delete(pid); });
-      // A panel the view cannot repaint in place asks for the board read, NOT passive and not awaited here: the rebuild it
-      // makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit and
-      // would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
-      // One write asks for it once, whatever number of its panels answered false, and not at all when a re-read is already owed.
+      // A panel the view cannot repaint in place (false), or whose read faulted or threw ("fault"; the repaint the write drew
+      // would otherwise stand with nothing to settle it), asks for the board read, NOT passive and not awaited here: the rebuild
+      // it makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit
+      // and would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
+      // One write asks for it once, whatever number of its panels answered so, and not at all when a re-read is already owed.
+      // A board read that fails says so through the page's own failed-read line (load() sets it).
       done.then((r) => {
-        if (r !== false || boardAsked || pendingReload) return;
+        if ((r !== false && r !== "fault") || boardAsked || pendingReload) return;
         boardAsked = true;
         load().catch(() => {});
       });
