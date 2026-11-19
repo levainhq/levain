@@ -156,6 +156,29 @@ def _sshsig_type_flags_counter(armored: str) -> tuple[str, int | None, int | Non
     return sig_type, flags, counter
 
 
+_SK_ECDSA_SIG_TYPE = "sk-ecdsa-sha2-nistp256@openssh.com"
+
+
+def sshsig_ecdsa_lengths(armored: str) -> tuple[int, int] | None:
+    """The byte lengths of the ECDSA ``r`` and ``s`` an armored SSHSIG carries, for an sk-ecdsa or WebAuthn signature
+    (OpenSSH PROTOCOL.u2f: the inner signature string is ``mpint r, mpint s``); ``None`` for any other algorithm, or when
+    the armor, the outer blob's algorithm name, or the inner string (exactly ``r`` then ``s``) does not parse. It reads
+    no further than the inner ``r`` and ``s`` and does not validate anything after them in the blob (the flags byte, the
+    counter, the trailing bytes): a blob that lacks them still returns its lengths. A length of 0 is an empty
+    value: such an envelope cannot verify under any message. Never raises."""
+    try:
+        _public_key_blob, sig_blob = _sshsig_fields(armored)
+        outer = _Wire(sig_blob)
+        if outer.string().decode("ascii") not in (_SK_ECDSA_SIG_TYPE, _WEBAUTHN_SIG_TYPE):
+            return None
+        inner = _Wire(outer.string())
+        r, s = inner.string(), inner.string()
+        inner.end()
+        return len(r), len(s)
+    except (ValueError, UnicodeError, AttributeError, TypeError):
+        return None
+
+
 def presence_missing(signature: str, public_key: str) -> bool:
     """True if a FIDO (sk-*) key or signature lacks the user-presence flag, or ``signature`` cannot be
     read for one: the one presence rule for every levain signature check (authority links here, cockpit

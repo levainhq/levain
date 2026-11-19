@@ -286,12 +286,12 @@ def test_sign_no_key(tmp_path):
 
 
 @pytest.mark.parametrize("message,reason", [
-    ("Touch ID was cancelled or did not complete: no signature was made with SHA256:x, so nothing was signed",
+    ("Touch ID was cancelled or did not complete for SHA256:x (ssh-keygen ran 0.4s); no signature text was returned",
      "cancelled"),
     ("ssh-keygen could not sign (TimeoutExpired)", "timeout"),
     ("ssh-keygen could not sign with /k (exit 1)", "unavailable"),
     ("ssh-keygen could not sign (FileNotFoundError)", "signer-error"),
-    ("ssh-keygen returned no valid signature by SHA256:x (/k), so nothing was signed", "signer-error"),
+    ("ssh-keygen exited 0 for SHA256:x (/k); no signature text was returned", "signer-error"),
     # 11-17: a signature that is there but fails the check is never the cancelled reason
     ("ssh-keygen returned a signature that does not verify as SHA256:x (sk-ecdsa-sha2-nistp256@openssh.com, flags 0x01, "
      "250 chars, ssh-keygen ran 1.2s), so nothing was signed", "signer-error"),

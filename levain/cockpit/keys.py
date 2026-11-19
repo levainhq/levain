@@ -27,11 +27,13 @@ import hashlib
 import json
 import os
 import re
+import select
 import sqlite3
 import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
@@ -870,9 +872,274 @@ _SK_RETRY_MIN_S = 5.0
 # held back from each ssh-keygen sign child's wait (never more than half of what is left), so an answer that comes in the
 # last moment that child is given still leaves its check room to run inside the same deadline
 _VERIFY_RESERVE_S = 1.0
+# an sk sign is run with ssh-keygen's -vvv so a failed one keeps the provider's own debug lines; False runs it exactly as before
+_SIGN_TRACE = True
+_TRACE_KEEP_BYTES = 6000       # of the debug lines, the last stretch (in bytes) kept in a failure's evidence
+_TEE_THREAD_NAME = "levain-sign-stderr-tee"
+_TEE_POLL_S = 0.05             # how often the reader looks for its stop signal while the pipe is quiet
+_TEE_JOIN_S = 0.5              # the longest the sign waits for the reader to finish once ssh-keygen is gone
+_TEE_DRAIN_READS = 64          # reads the reader still makes after its stop signal, so a chatty holder cannot keep it running
+_CONTEXT_BUDGET_S = 2.5        # all of a failure's context probes together, and never past the sign's own deadline
+_CONTEXT_PROBE_S = 0.8         # one probe
+_IOREG = "/usr/sbin/ioreg"
+_LAUNCHCTL = "/bin/launchctl"
+# a dated observation, written into every sk failure's evidence record as that and nothing more
+_FLAGS_NOTE = "observed 2026-11-18 (one sigdiag run, one good signature): flags 0x21, counter 1"
+# the DONE line of levain#125 asks that the evidence file say why no root cause is named: a dated judgement, not a cause
+_CAUSE_NOTE = ("root cause not determined [judged by levain-lanes 2 on 2026-11-18 against the four saved failures, which held a "
+               "byte-identical empty envelope for four different messages, and one good sign of the same key]; what this "
+               "record adds for the next comparison is the context and the provider_trace fields")
 _SIGN_FAILURE_KEEP = 20        # evidence files kept per key directory; older ones are deleted when a new one is written
 _SIGN_FAILURE_DIR = "sign-failures"
 _SIGN_FAILURE_PREFIX = "sigfail-"
+
+
+class _StderrTee:
+    """The stderr of one ``ssh-keygen -vvv -Y sign``: a pipe whose write end (``write_fd``) is the child's stderr and
+    whose reader thread passes every line that does NOT begin with ``debug`` to the real stderr (fd 2) the moment it
+    arrives, so the person sees ssh-keygen's own words (the presence prompt) live, and keeps the ``debug`` lines. A line
+    that has not shown its first bytes yet is held only while those bytes could still spell ``debug``; anything else, a
+    prompt with no newline included, goes out at once.
+
+    The reader ends when :meth:`finish` is called, not when the pipe ends: a helper that outlives ssh-keygen can hold the
+    write end open for good. ``finish`` closes this side's write end, signals the reader, which drains what is already
+    there and stops, and waits at most :data:`_TEE_JOIN_S` for it, so the reader never outlives the sign step it served.
+
+    The read end stays open until ``finish`` even when the reader ends early for any reason (a bug of its own, say): the
+    child keeps a pipe it can write to, and a reader that failed only discards what arrives, so a failed reader never
+    sends ssh-keygen a SIGPIPE."""
+
+    def __init__(self) -> None:
+        self._r, self.write_fd = os.pipe()
+        try:
+            self._stop = threading.Event()
+            self._lock = threading.Lock()          # guards _finished, _reader_done, _r_closed
+            self._mode: str | None = None          # None: this line's first bytes are not enough to tell; "echo"; "debug"
+            self._head = bytearray()
+            self._debug = bytearray()
+            self._cut_before: int | None = None    # the byte just before self._debug[0] once the front was trimmed away
+            self._echoed = bytearray()
+            self._finished = False
+            self._reader_done = False
+            self._r_closed = False
+            self._thread = threading.Thread(target=self._run, name=_TEE_THREAD_NAME, daemon=True)
+            self._thread.start()
+        except BaseException:
+            for fd in (self._r, self.write_fd):    # no thread, no reader: neither end may be left open
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+
+    def _run(self) -> None:
+        try:
+            try:
+                self._read_loop()
+            except Exception:  # noqa: BLE001 - whatever ended the reader, the child must still have a pipe to write to
+                self._discard()
+        finally:
+            try:
+                if self._head:
+                    self._echo(bytes(self._head))
+                    self._head.clear()
+            except Exception:  # noqa: BLE001 - a diagnostic reader never raises out of its thread
+                pass
+            with self._lock:
+                self._reader_done = True
+                close_now = self._finished
+            if close_now:                          # finish() already ran and found this thread still alive
+                self._close_read()
+
+    def _read_loop(self) -> None:
+        poller = select.poll()                     # poll, not select: select raises for a descriptor >= FD_SETSIZE
+        poller.register(self._r, select.POLLIN)
+        drain = _TEE_DRAIN_READS
+        while True:
+            ready = False
+            for _fd, event in poller.poll(int(_TEE_POLL_S * 1000)):
+                if event & select.POLLNVAL:
+                    return
+                ready = True
+            if ready:
+                chunk = os.read(self._r, 65536)
+                if not chunk:
+                    return
+                self._feed(chunk)
+            if self._stop.is_set():
+                drain -= 1
+                if not ready or drain <= 0:
+                    return
+
+    def _discard(self) -> None:
+        """After an unexpected end of the reader: read what the child writes and drop it, until ``finish``."""
+        try:
+            os.set_blocking(self._r, False)
+        except OSError:
+            return
+        while True:
+            try:
+                chunk = os.read(self._r, 65536)
+            except BlockingIOError:
+                if self._stop.wait(_TEE_POLL_S):
+                    return
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return
+
+    def _close_read(self) -> None:
+        with self._lock:
+            if self._r_closed:
+                return
+            self._r_closed = True
+        try:
+            os.close(self._r)
+        except OSError:
+            pass
+
+    def _feed(self, chunk: bytes) -> None:
+        i = 0
+        while i < len(chunk):
+            j = chunk.find(b"\n", i)
+            end = len(chunk) if j < 0 else j + 1
+            self._piece(chunk[i:end], complete=j >= 0)
+            i = end
+
+    def _piece(self, piece: bytes, *, complete: bool) -> None:
+        if self._mode is None:
+            self._head += piece
+            head = bytes(self._head)
+            if head.startswith(b"debug"):
+                self._mode = "debug"
+            elif b"debug".startswith(head) and not complete:
+                return                              # could still be the start of a debug line
+            else:
+                self._mode = "echo"
+            self._head.clear()
+            piece = head
+        if self._mode == "debug":
+            self._debug += piece
+            if len(self._debug) > 2 * _TRACE_KEEP_BYTES:
+                cut = len(self._debug) - _TRACE_KEEP_BYTES
+                self._cut_before = self._debug[cut - 1]
+                del self._debug[:cut]
+        else:
+            self._echo(piece)
+        if complete:
+            self._mode = None
+
+    def _echo(self, data: bytes) -> None:
+        self._echoed += data
+        if len(self._echoed) > 8192:
+            del self._echoed[:len(self._echoed) - 8192]
+        view = memoryview(data)
+        try:
+            while view:
+                view = view[os.write(2, view):]
+        except OSError:
+            pass                                    # fd 2 gone or full: the sign goes on without a live echo
+
+    def _trace(self) -> str:
+        """The last :data:`_TRACE_KEEP_BYTES` bytes of the debug lines, decoded with ``replace``; a first line that the
+        cut left only the end of is dropped, so the evidence starts at the start of a line."""
+        data = bytes(self._debug)
+        before = self._cut_before
+        if len(data) > _TRACE_KEEP_BYTES:
+            before = data[-_TRACE_KEEP_BYTES - 1]
+            data = data[-_TRACE_KEEP_BYTES:]
+        if before is not None and before != 0x0A:
+            newline = data.find(b"\n")
+            data = data[newline + 1:] if newline >= 0 else b""
+        return data.decode("utf-8", "replace")
+
+    def finish(self) -> tuple[str, bool]:
+        """Stop the reader, and return ``(the last stretch of the debug lines, whether ssh-keygen printed its "Confirm user
+        presence" line)``. The second value records only that line having gone by on the pipe: upstream OpenSSH prints it
+        with a bare write to stderr, with no terminal check, and only when ssh-keygen signs directly and not through
+        ssh-agent (source read 2026-11-18). ``False`` does NOT show that no prompt appeared. Safe to call twice."""
+        with self._lock:
+            first = not self._finished
+            self._finished = True
+        if first:
+            try:
+                os.close(self.write_fd)
+            except OSError:
+                pass
+            self._stop.set()
+            self._thread.join(_TEE_JOIN_S)
+            with self._lock:
+                done = self._reader_done
+            if done:                               # else the reader's own end-of-thread closes it (it sees _finished)
+                self._close_read()
+        return self._trace(), b"Confirm user presence" in self._echoed
+
+
+def _probe_output(argv: list[str], end: float, left: Callable[[], float]) -> str | None:
+    """One read-only system tool's stdout, or None on any error: bounded by one probe's time, what is left of the probes'
+    budget (``end`` on ``time.monotonic``) and what is left of the sign's deadline, whichever is least."""
+    room = min(_CONTEXT_PROBE_S, end - time.monotonic(), left())
+    if room <= 0:
+        return None
+    try:
+        cp = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=room, check=False, env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    return cp.stdout.decode("utf-8", "replace") if cp.returncode == 0 else None
+
+
+def _failure_context(left: Callable[[], float]) -> dict:
+    """What the machine and the signer's own process looked like at a failed sign, for the evidence file: the console lock
+    flag, the HID idle seconds, the power state's system capabilities, the launchd session name (each ``"unavailable"``
+    on any error), and booleans for whether SSH_CONNECTION and SSH_TTY are set in this process's environment (names, never
+    values) and whether stdin and stderr are terminals. Facts only: it names no cause. Best effort and bounded: the probes
+    together take at most :data:`_CONTEXT_BUDGET_S`, none runs past ``left()`` (the sign's own deadline), and none is run
+    once nothing is left."""
+    end = time.monotonic() + _CONTEXT_BUDGET_S
+    ctx: dict = {}
+    out = _probe_output([_IOREG, "-n", "Root", "-d1", "-a"], end, left)
+    m = re.search(r"<key>IOConsoleLocked</key>\s*<(true|false)/>", out or "")
+    ctx["console_locked"] = ("unavailable" if out is None or "<plist" not in out
+                             else {"present": True, "value": m.group(1) == "true"} if m
+                             else {"present": False, "value": None})
+    out = _probe_output([_IOREG, "-c", "IOHIDSystem", "-r", "-d1"], end, left)
+    m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out or "")
+    ctx["hid_idle_s"] = round(int(m.group(1)) / 1e9, 1) if m else "unavailable"
+    out = _probe_output([_IOREG, "-r", "-n", "IOPMrootDomain", "-d1"], end, left)
+    m = re.search(r'"System Capabilities"\s*=\s*(\d+)', out or "")
+    ctx["system_capabilities"] = int(m.group(1)) if m else "unavailable"
+    out = _probe_output([_LAUNCHCTL, "managername"], end, left)
+    name = (out or "").strip()
+    ctx["launchctl_manager"] = name if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name) else "unavailable"
+    ctx["ssh_connection_set"] = "SSH_CONNECTION" in os.environ
+    ctx["ssh_tty_set"] = "SSH_TTY" in os.environ
+    for key, fd in (("stdin_tty", 0), ("stderr_tty", 2)):
+        try:
+            ctx[key] = os.isatty(fd)
+        except OSError:
+            ctx[key] = False
+    return ctx
+
+
+def _collect_context(left: Callable[[], float]) -> "dict | str":
+    try:
+        return _failure_context(left)
+    except Exception:  # noqa: BLE001 - the context is a courtesy; a failed sign is reported without it
+        return "unavailable"
+
+
+class EmptySkSignature(KeyError_):
+    """An sk signature envelope whose ECDSA ``r``, ``s`` or both are empty (levain#125): ssh-keygen returned an envelope
+    for which no verifiable signature was returned, so it cannot verify under any message. What produced the envelope is not known and is not
+    said. A typed refusal of its own, apart from a cancelled or timed-out sign and from a signature that is there and fails
+    its check. The attributes are the LAST attempt's: the flags byte in the envelope, the seconds its sign step lasted, the
+    byte lengths of ``r`` and ``s``, and its evidence file's path (or ``evidence not written (<why>)``)."""
+
+    def __init__(self, message: str, *, flags: int, elapsed_s: float, r_len: int, s_len: int, evidence: str) -> None:
+        super().__init__(message)
+        self.flags, self.elapsed_s, self.r_len, self.s_len, self.evidence = flags, elapsed_s, r_len, s_len, evidence
 
 
 @dataclass(frozen=True)
@@ -882,15 +1149,62 @@ class _SkRefusal:
     carried: str
     detail: str
     evidence: str                # the evidence file's path, or "evidence not written (<why>)"
+    elapsed_s: float = 0.0       # the sign step alone
+    r_len: int | None = None     # None: not an ECDSA envelope, or one that does not parse
+    s_len: int | None = None
+    who: str = "the security key"    # which key, from the key's sidecar or the provider in use (configuration, not identity)
+
+    @property
+    def empty(self) -> bool:
+        return self.r_len == 0 or self.s_len == 0
+
+
+def _empty_part(r_len: int | None, s_len: int | None) -> str | None:
+    """Which of the envelope's ECDSA ``r`` and ``s`` are empty, as measured (``None`` when neither is, or when they were
+    not measured)."""
+    if r_len == 0 and s_len == 0:
+        return "r and s empty"
+    if r_len == 0:
+        return "r empty"
+    if s_len == 0:
+        return "s empty"
+    return None
+
+
+def _answer_of(a: _SkRefusal) -> str:
+    """One attempt's own answer, as measured: an envelope with an empty r or s, or a signature that did not verify."""
+    part = _empty_part(a.r_len, a.s_len)
+    return f"a signature envelope with {part}" if part else "a signature that did not check out"
+
+
+def _retry_clause(first: _SkRefusal, retry: _SkRefusal) -> str:
+    """What each of the two attempts returned, each from its own measurement, and how long the retry's sign step lasted.
+    No threshold on the duration and no inference from it: the number is stated, not read."""
+    return (f"attempt 1 returned {_answer_of(first)}; the retry's sign step lasted {retry.elapsed_s:.1f}s and returned "
+            f"{_answer_of(retry)}")
 
 
 def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
-                        counter: int | None, detail: str, namespace: str, attempt: int) -> str:
+                        counter: int | None, detail: str, namespace: str, attempt: int, elapsed_s: float | None = None,
+                        r_len: int | None = None, s_len: int | None = None, provider: str | None = None,
+                        context: Any = None, provider_trace: str | None = None,
+                        stderr_prompt_line: bool | None = None) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
     (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
     ones are deleted (:func:`_prune_sign_failures`). The file holds the armored signature, its flags byte and counter,
-    BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time.
+    BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time; and, added to format 1 without changing a
+    field (levain#125), the sign step's seconds, the byte lengths of the ECDSA r and s (null when the envelope is not
+    one), the signature's sha256 (identical answers show as identical) and the provider path in use (null when none);
+    the failure ``context`` (:func:`_failure_context`, and whether SSH_AUTH_SOCK was in the signer's environment),
+    ``provider_trace`` (the last stretch of ssh-keygen's debug lines; in the one sample read on 2026-11-18 (sigdiag) these
+    held the message's sha512, the auth-socket path and the provider path; no PIN or key material is known to be printed
+    by OpenSSH's own lines (upstream source read 2026-11-18), which is not a guarantee for a provider's own output; the
+    hash carries the same caveat as the message's own hash below), ``stderr_prompt_line`` (whether ssh-keygen printed its
+    "Confirm user presence" line; null when no trace was taken; upstream OpenSSH prints that line with a bare write to
+    stderr, with no terminal check, only when ssh-keygen signs directly and not through ssh-agent (source read
+    2026-11-18), so False does NOT show that no prompt appeared), a dated ``flags_note`` and a dated ``cause_note``
+    (the board row asks that the evidence say why no root cause is named).
 
     The directory is trusted only as this uid's own 0700 directory, opened without following a symlink, and every
     write and prune goes through that one open descriptor; anything else (a symlink, another owner, a looser or
@@ -922,7 +1236,11 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
         record = {"format": "levain-sign-failure/1", "time": now.isoformat(), "fingerprint": fp, "namespace": namespace,
                   "algorithm": sig_type, "flags": format(flags, "#04x"), "counter": counter, "attempt": attempt,
                   "message_sha256": hashlib.sha256(message).hexdigest(), "message_bytes": len(message),
-                  "ssh_keygen": detail, "signature": signature}
+                  "ssh_keygen": detail, "signature": signature,
+                  "elapsed_s": None if elapsed_s is None else round(elapsed_s, 3), "r_len": r_len, "s_len": s_len,
+                  "signature_sha256": hashlib.sha256(signature.encode("utf-8")).hexdigest(), "provider": provider,
+                  "context": context, "provider_trace": provider_trace, "stderr_prompt_line": stderr_prompt_line,
+                  "flags_note": _FLAGS_NOTE, "cause_note": _CAUSE_NOTE}
         body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
         # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
         name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
@@ -975,8 +1293,9 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
     key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
     (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in
-    ``namespace`` (default: the authority log's; a consent answer passes its own) with the terminal's
-    stderr, so a touch or passphrase prompt reaches the operator.
+    ``namespace`` (default: the authority log's; a consent answer passes its own). Its stderr is the terminal's for
+    a plain key, or with ``_SIGN_TRACE = False``; for an sk key it is a pipe (:class:`_StderrTee`) whose non-debug lines
+    are re-emitted to the terminal live, so a touch or passphrase prompt reaches the operator.
 
     The key's sidecar (``levain.cockpit.custody``, written by ``levain cockpit key create``) names its
     provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
@@ -999,7 +1318,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
 
     def sign(message: bytes) -> str:
         """One signature over ``message``. A security-key (sk-*) answer that does not verify is asked for ONCE more (a
-        new sign over the same message, so a second touch); that retry loop is these few lines and nothing else: the
+        new sign over the same message); that retry loop is these few lines and nothing else: the
         bound is :data:`_SK_RETRIES`, a constant, and ``_once`` itself never retries. Everything else (a cancel, a
         timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt.
 
@@ -1021,11 +1340,15 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             left = deadline - time.monotonic()
             if left < _SK_RETRY_MIN_S:
                 a = failed[0]
+                if a.empty:
+                    raise _empty_refusal(a, f"{a.evidence}; no second sign was started: {max(left, 0.0):.1f}s of the "
+                                            f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s")
                 raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({a.carried}; {a.detail}; "
-                                f"{a.evidence}), and no second touch was asked for: {max(left, 0.0):.1f}s of the "
-                                f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s, so nothing was signed")
-            # stderr is the terminal's, where the touch prompt already goes; the words say what happened, not that it is safe
-            print("the key's answer did not check out; touch again", file=sys.stderr, flush=True)
+                                f"{a.evidence}), and no second sign was started: {max(left, 0.0):.1f}s of the "
+                                f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s, so no verifiable signature was returned")
+            # for an sk key stderr is a pipe whose non-debug lines are re-emitted to the terminal live (with _SIGN_TRACE
+            # False, or a plain key, it is the terminal's); the words are true whatever the retry then does
+            print("the key's answer did not check out; signing once more (touch if asked)", file=sys.stderr, flush=True)
             try:
                 again = _once(message, n + 2, deadline)
             except (KeyError_, _authority.VerifierUnavailable) as exc:
@@ -1033,17 +1356,32 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 # attempt 1's ssh-keygen verdicts stay in its evidence file, so no verdict text can misfile this one.
                 # Re-raised as its own type: a caller that tells a verifier failure from a refusal still can
                 a = failed[0]
-                raise type(exc)(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
+                raise type(exc)(f"{exc}; before it, attempt 1 returned {_answer_of(a)} (flags {a.flags:#04x}; "
                                 f"{a.evidence})") from None
             if isinstance(again, str):
                 return again
             failed.append(again)
         a, b = failed[0], failed[-1]
+        clause = _retry_clause(a, b)
+        if b.empty:
+            raise _empty_refusal(b, f"{fp}; attempt 1 flags {a.flags:#04x} ({a.carried}; {a.evidence}); {clause}; "
+                                    f"attempt 2's evidence: {b.evidence}")
         raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp}, and both attempts failed "
-                        f"(the key's answer did not check out, and touching again did not help): "
+                        f"({clause}): "
                         f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.detail}; {a.evidence}); "
                         f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.detail}; {b.evidence}); "
-                        "so nothing was signed")
+                        "so no verifiable signature was returned")
+
+    def _empty_refusal(a: _SkRefusal, rest: str) -> EmptySkSignature:
+        """The named refusal for an envelope with an empty r, s or both: what ssh-keygen returned, as measured, in plain
+        words: no cause, and no claim about what the key or its user did. "No verifiable signature was returned" and "no
+        second sign was started" are the only conclusions, each what the code measured. The failure context is in the evidence
+        file, not here: this text reaches channels an agent reads."""
+        return EmptySkSignature(f"ssh-keygen returned a signature envelope with {_empty_part(a.r_len, a.s_len)} after "
+                                f"{a.elapsed_s:.1f}s for {a.who}: no verifiable signature was returned; flags {a.flags:#04x} are in the "
+                                f"envelope ({rest})",
+                                flags=a.flags, elapsed_s=a.elapsed_s, r_len=a.r_len or 0, s_len=a.s_len or 0,
+                                evidence=a.evidence)
 
     def _once(message: bytes, attempt: int, deadline: float) -> "str | _SkRefusal":
         """One ``ssh-keygen -Y sign`` and its check, every child bounded by ``deadline`` (``sign``'s one deadline, on
@@ -1058,21 +1396,30 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         now_left = left()
         wait_s = now_left - min(_VERIFY_RESERVE_S, now_left / 2)
 
-        # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
-        # security key provider; stderr stays the terminal's, for the touch or passphrase prompt
+        # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured security key
+        # provider; stderr: for an sk key it is a pipe whose non-debug lines are re-emitted to the terminal live, with
+        # _SIGN_TRACE False or for a plain key it is the terminal's, so the touch or passphrase prompt reaches the operator
         env = child_env("SSH_SK_PROVIDER")
         if "SSH_SK_PROVIDER" not in env and sidecar is not None and sidecar.provider is not None:
             env["SSH_SK_PROVIDER"] = sidecar.provider
         if no_agent:
             env.pop("SSH_AUTH_SOCK", None)
+        tee = None
+        if _SIGN_TRACE and public_key.split()[0].startswith("sk-"):
+            try:
+                tee = _StderrTee()
+            except (OSError, RuntimeError):
+                tee = None                          # no pipe or no thread to be had: the sign runs as it always did, untraced
         started = time.monotonic()
         try:
-            cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", namespace],
-                                input=message, stdout=subprocess.PIPE,
+            argv = [str(ssh_keygen)] + (["-vvv"] if tee else []) + ["-Y", "sign", "-f", str(key_path), "-n", namespace]
+            cp = subprocess.run(argv, input=message, stdout=subprocess.PIPE, stderr=tee.write_fd if tee else None,
                                 timeout=wait_s, check=False, env=env)
+            elapsed = time.monotonic() - started   # the sign step alone, never the verify below
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
-        elapsed = time.monotonic() - started       # the sign step alone, never the verify below
+        finally:
+            trace, prompt_seen = tee.finish() if tee else (None, None)
         if cp.returncode != 0:
             raise KeyError_(f"ssh-keygen could not sign with {key_path} (exit {cp.returncode})")
         try:
@@ -1090,20 +1437,25 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             is_touch = touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER
             if not signature:        # empty only: whitespace is output, not a cancel
                 if is_touch:
-                    raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
-                                    f"(ssh-keygen ran {elapsed:.1f}s), so nothing was signed")
-                raise KeyError_(f"ssh-keygen returned no valid signature by {fp} ({key_path}), so nothing was signed")
+                    raise KeyError_(f"Touch ID was cancelled or did not complete for {fp} "
+                                    f"(ssh-keygen ran {elapsed:.1f}s); no signature text was returned")
+                raise KeyError_(f"ssh-keygen exited 0 for {fp} ({key_path}); no signature text was returned")
             try:
                 sig_type, flags = _authority_sig._sshsig_type_and_flags(signature)
             except Exception:  # noqa: BLE001 - whatever the parser raises, the output is named for what it is
                 raise KeyError_(f"ssh-keygen returned output that is not a readable signature for {fp} "
-                                f"({len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s), so nothing was signed") from None
+                                f"({len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s), so no verifiable signature was returned") from None
             carried = (f"{sig_type!r}, flags {'none' if flags is None else format(flags, '#04x')}, "
                        f"{len(signature.strip())} chars, ssh-keygen ran {elapsed:.1f}s")
+            lengths = _authority_sig.sshsig_ecdsa_lengths(signature)
+            r_len, s_len = lengths if lengths is not None else (None, None)
+            part = _empty_part(r_len, s_len)
+            if part:
+                carried += f", with {part}"
             # the presence message only for an sk signature: a plain one carries no flags byte to lack
             if flags is not None and _authority.presence_missing(signature, public_key):
                 raise KeyError_(f"ssh-keygen returned a signature for {fp} without the user-presence flag ({carried}), "
-                                "so nothing was signed")
+                                "so no verifiable signature was returned")
             detail = _authority_sig.verify_failure_detail(message, signature, public_key=public_key,
                                                           namespace=namespace, ssh_keygen=ssh_keygen, left=left)
             if flags is not None and sig_type.startswith("sk-"):
@@ -1111,13 +1463,20 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                     counter = _authority_sig._sshsig_type_flags_counter(signature)[2]
                 except Exception:  # noqa: BLE001 - the counter is evidence only
                     counter = None
+                context = _collect_context(left)
+                if isinstance(context, dict):
+                    # a name-only fact about THIS attempt's child environment (no value, no path)
+                    context["agent_socket_in_child"] = "SSH_AUTH_SOCK" in env
                 # kept as evidence, then handed to ``sign`` for its one retry; the file's path rides in the error text
                 evidence = _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
                                                flags=flags, counter=counter, detail=detail, namespace=namespace,
-                                               attempt=attempt)
-                return _SkRefusal(flags, carried, detail, evidence)
+                                               attempt=attempt, elapsed_s=elapsed, r_len=r_len, s_len=s_len,
+                                               provider=env.get("SSH_SK_PROVIDER"), context=context,
+                                               provider_trace=trace, stderr_prompt_line=prompt_seen)
+                return _SkRefusal(flags, carried, detail, evidence, elapsed, r_len, s_len,
+                                  "the key configured for Touch ID" if is_touch else "the security key")
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
-                            "so nothing was signed")
+                            "so no verifiable signature was returned")
         return signature
 
     return fp, sign
