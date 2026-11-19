@@ -331,9 +331,11 @@ def _day_input(row: str) -> str:
 
 
 def _pick(row: str, day: str) -> dict[str, Any]:
-    """What a person does: put a day in the form's date box (an input event, as picking makes)."""
-    return {"eval": f"(() => {{ const d = {_day_input(row)}; d.value = {json.dumps(day)}; "
-                    "d.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"}
+    """What a person does: put a day in the form's date box (an input event, as picking makes). The row and its box are looked up
+    AND filled in one evaluation that answers null (so the step runs again) while the box is not on the page: a redraw between a
+    separate wait step and this one can swap the row (levain#71, a sixth flake), and a bare lookup then threw on a null box."""
+    return {"until": f"(() => {{ const d = {_day_input(row)}; if (!d) return null; d.value = {json.dumps(day)}; "
+                     "d.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"}
 
 
 def _confirm(row: str) -> dict[str, Any]:
@@ -547,6 +549,18 @@ def test_the_keep_form_with_a_long_line_stays_inside_the_card_at_phone_width(
     assert all(g["sw"] <= g["iw"] for g in got), got
 
 
+def _form_then(row: str, verb: str, day: str | None, over: Any) -> dict[str, Any]:
+    """ONE re-trying step that opens the row's verb form, fills its date box (when ``day`` is given) and measures it, all in one
+    evaluation against a row found afresh each time. A Focus re-render between separate find / until / act steps swaps the row (a
+    null lookup, or a detached node measured as nothing); here a re-render just makes this run again: it clicks the verb only while
+    no form is drawn, so it never toggles an open one shut, and answers only once it has measured a form that is on the page."""
+    fill = ("" if day is None else f"const d = f.querySelector('.verb-date'); if (!d) return null; d.value = {json.dumps(day)}; "
+                                   "d.dispatchEvent(new Event('input', {bubbles: true})); ")
+    return {"until": f"(() => {{ const r = {row}; if (!r) return null; const f = r.querySelector('.verb-form'); "
+                     f"if (!f) {{ const b = r.querySelector('[data-verb={verb}]'); if (b) b.click(); return null; }} {fill}"
+                     f"f.scrollIntoView({{block: 'center'}}); return {over(row)}; }})()"}
+
+
 @needs_browser
 def test_a_snooze_and_a_when_form_still_lay_out_at_both_widths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """L1 finding 7: the `.when-form .intention-back` rule is global, so the existing snooze form (and the `when?` form, which
@@ -576,17 +590,12 @@ def test_a_snooze_and_a_when_form_still_lay_out_at_both_widths(tmp_path: Path, m
         steps += [
             {"emulate": size},
             {"eval": "new Promise(r => setTimeout(() => r(1), 400))"},
-            {"eval": f"{ringing}.querySelector('[data-verb=intention_snooze]').click(); 1"},
-            {"until": f"{ringing}.querySelector('.verb-form .verb-date') && 1"},
-            _pick(ringing, later),
-            {"eval": f"{ringing}.querySelector('.verb-form').scrollIntoView({{block: 'center'}}); " + over(ringing)},
+            _form_then(ringing, "intention_snooze", later, over),
             *([{"shot": str(shots / f"snooze_form_{label}.png")}] if shots else []),
-            {"eval": f"{ringing}.querySelector('.verb-form .verb-cancel').click(); 1"},
-            {"eval": f"{water}.querySelector('[data-verb=intention_surface_at]').click(); 1"},
-            {"until": f"{water}.querySelector('.verb-form .verb-date') && 1"},
-            {"eval": f"{water}.querySelector('.verb-form').scrollIntoView({{block: 'center'}}); " + over(water)},
+            {"eval": f"(() => {{ const f = {ringing}.querySelector('.verb-form .verb-cancel'); if (f) f.click(); return 1; }})()"},
+            _form_then(water, "intention_surface_at", None, over),
             *([{"shot": str(shots / f"when_form_{label}.png")}] if shots else []),
-            {"eval": f"{water}.querySelector('.verb-form .verb-cancel').click(); 1"}]
+            {"eval": f"(() => {{ const f = {water}.querySelector('.verb-form .verb-cancel'); if (f) f.click(); return 1; }})()"}]
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", steps)
     fits = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"over"')]
