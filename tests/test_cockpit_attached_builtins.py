@@ -43,21 +43,24 @@ def attached(tmp_path: Path):
     writer.close()
 
 
-def test_the_head_etag_over_a_decoded_snapshot_equals_the_one_over_the_providers_for_every_built_in_panel(attached) -> None:
+def test_the_head_over_a_decoded_snapshot_says_what_the_head_over_the_providers_does_for_every_built_in_panel(attached) -> None:
+    """The head's etag over a decoded snapshot is built from the row's body hash (D3), so it is no longer the provider path's
+    text-built one; every other field of the head is the same, and the manifest carries the head the decoded snapshot makes."""
     ck, derived = attached
     assert derived and "edits" not in derived
     auth = ck.authority()
     ctx = ReadContext(auth.now, authority=auth)
     manifest = ck.manifest(CRED)["panels"]
+    new_fields = {"etag", "valid_until", "stale", "pending"}
     for pid in derived:
         spec, provider_snap = ck._specs[pid], ck._state[pid].snap       # the snapshot the derive's own read committed
         want = ck._head(spec, provider_snap, "none", ctx.today, auth, ctx.now)
         decoded = ck._snap_for(spec, ctx.child())
         got = ck._head(spec, decoded, "none", ctx.today, auth, ctx.now)
-        assert got["etag"] == want["etag"], pid
-        assert (got["status"], got["count"], got["title"], got["error"], got["note"]) == (
-            want["status"], want["count"], want["title"], want["error"], want["note"]), pid
-        assert manifest[pid]["etag"] == want["etag"], pid
+        assert {k: v for k, v in got.items() if k not in new_fields} == \
+            {k: v for k, v in want.items() if k not in new_fields}, pid
+        assert set(got) - set(want) == {"valid_until", "stale", "pending"}, pid
+        assert manifest[pid]["etag"] == got["etag"] and manifest[pid]["etag"] != want["etag"], pid
         assert decoded.fresh_info is not None and decoded.fresh_info.stale is False, pid
 
 

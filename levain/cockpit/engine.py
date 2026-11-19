@@ -474,6 +474,9 @@ class _Snap:
     # the freshness facts of a snapshot an attached cockpit read from its row; None on a snapshot a provider read made. An
     # init field so ``dataclasses.replace`` carries it; it is no part of what the snapshot says, so it never takes part in equality
     fresh_info: "_Fresh | None" = field(default=None, compare=False)
+    # the row this snapshot was decoded from, ``(gen, body_sha)``; None when no row stands behind it. The attached head's etag
+    # and its caches are keyed on it, so no serialisation of the content is needed to tell one snapshot from another
+    row_key: "tuple[int, str] | None" = field(default=None, compare=False)
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
@@ -802,6 +805,14 @@ WORKER_LIVE_FACTOR = 3          # a heartbeat no older than this many cadences i
 WORKER_DOWN_AFTER_S = 30.0      # a heartbeat older than this (or none at all) is a worker that is down; between, stale
 STALE_CADENCE_FACTOR = 2        # a row older than this many of its panel's cadences is stale though the worker lives
 ATTACHED_SNAP_CACHE_MAX = 256   # decoded snapshots kept, one per (panel, generation)
+# the head layer's caches (attached mode): composed panel heads are small and many (one per panel and request class); whole
+# panel payloads carry rows, so fewer are kept
+HEAD_CACHE_MAX = 256
+PANEL_CACHE_MAX = 64
+# the derive loop's stream row for its input watch, and how long a manifest reuses what it read of it: the row sits in its own
+# table, outside the one read transaction that carries the meta and every panel
+INPUTS_STREAM_ID = "inputs"
+STREAMS_READ_TTL_S = 1.0
 
 
 def _manifest_pool(size: int) -> ThreadPoolExecutor:
@@ -923,6 +934,12 @@ class Cockpit:
         self._attached_snaps: "OrderedDict[tuple, _Snap]" = OrderedDict()
         self._attached_lock = threading.Lock()
         self._probe: "_ChangeProbe | None" = None
+        # the head layer's caches (attached mode only): composed heads and whole panel payloads, each an LRU that keeps the
+        # spec beside its value so a spec's identity in a key cannot be reused while its entry lives
+        self._head_cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]" = OrderedDict()
+        self._panel_cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]" = OrderedDict()
+        self._head_lock = threading.Lock()
+        self._streams_read: "tuple[float, dict[str, Any]] | None" = None
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -1558,12 +1575,9 @@ class Cockpit:
         of which changes what a page draws with no snapshot moving. A serve-composed panel reads its stores here, as it does in a manifest."""
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
-        etags: dict[str, str] = {}
-        for spec in self._ordered_specs(self._specs):
-            if self._state_of(spec) is None:
-                continue
-            snap = self._snap_for(spec, ctx.child())
-            etags[spec.id] = self._head(spec, snap, "none", ctx.today, auth, ctx.now)["etag"]
+        live = [s for s in self._ordered_specs(self._specs) if self._state_of(s) is not None]
+        heads, _meta = self._attached_heads(live, "none", auth, ctx)
+        etags = {spec.id: heads[spec.id]["etag"] for spec in live}
         # the entity and the errors the manifest carries move a page with no panel etag moving, so they are in the version
         stored, discovery_errors = self._entity_value, list(self._discovery_errors)
         version = _sha({"panels": sorted(etags), "verbs": self._verb_rev(auth), "date": ctx.today.isoformat(),
@@ -1630,15 +1644,25 @@ class Cockpit:
                         hint: bool = False) -> _Snap:
         return _Snap("error", None, None, [], [], as_of, message, spec.note, hint, fresh_info=fresh)
 
-    def _attached_snap(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
+    def _attached_snap(self, spec: ProviderSpec, ctx: ReadContext, stored: Any = None) -> _Snap:
         """The snapshot of a panel in attached mode: its published row, decoded, with the freshness facts. A provider is
         never run. A panel with no row yet, or whose store cannot be read, is an error snapshot that says so and is marked
         stale; a row whose derive failed or timed out reads as an error carrying the host's message (the kept last-good
-        body is not served as if current)."""
+        body is not served as if current).
+
+        ``stored`` is what one ``read_manifest`` returned (``(meta, {id: row})``), or the exception it raised: a manifest
+        reads the store once and composes every panel from that, so no panel reads it again. Without it the row and the
+        meta are read here."""
         pending = self._is_pending(spec.id)
         try:
-            row = self._reader.read(spec.id)
-            meta = self._reader.meta()
+            if stored is None:
+                row = self._reader.read(spec.id)
+                meta = self._reader.meta()
+            elif isinstance(stored, Exception):
+                raise stored
+            else:
+                meta, rows = stored
+                row = rows.get(spec.id)
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
             return self._attached_error(spec, f"the snapshot store could not be read: {type(exc).__name__}: {_safe_str(exc)}",
                                         None, _Fresh(None, None, True, pending), hint=True)
@@ -1657,7 +1681,6 @@ class Cockpit:
         if base is None:
             try:
                 base = decode_snap(row.status, self._reader.decoded(row), as_of=None, error=row.error)
-                base.etag_frags()
             except (SnapshotBodyError, ValueError, TypeError) as exc:
                 return self._attached_error(spec, f"the snapshot could not be read: {_safe_str(exc)}", as_of, fresh)
             with self._attached_lock:
@@ -1668,14 +1691,14 @@ class Cockpit:
                 while len(self._attached_snaps) > ATTACHED_SNAP_CACHE_MAX:
                     self._attached_snaps.popitem(last=False)
         # one decoded snapshot serves every read of its generation; each read gets its own copy for the facts that move
-        # without the content moving (when it was derived, how stale it is), and the kept etag text rides along. The
-        # provider's own word that the content is stale makes the served freshness stale, and the instant its source
-        # declared is the as_of; a read that declared none is as of the row's derive time.
+        # without the content moving (when it was derived, how stale it is). The etag of an attached head is built from
+        # the row's ``body_sha`` (``row_key``), so the content is never serialised again. The provider's own word that the
+        # content is stale makes the served freshness stale, and the instant its source declared is the as_of; a read that
+        # declared none is as of the row's derive time.
         if base.stale_hint and not fresh.stale:
             fresh = dataclasses.replace(fresh, stale=True)
-        snap = dataclasses.replace(base, as_of=base.source_as_of or as_of, fresh_info=fresh)
-        snap._etag_frags = base.etag_frags()
-        return snap
+        return dataclasses.replace(base, as_of=base.source_as_of or as_of, fresh_info=fresh,
+                                   row_key=(row.gen, row.body_sha))
 
     # --- reading ---------------------------------------------------------------------
     def _single_flight(
@@ -1921,7 +1944,8 @@ class Cockpit:
             return None
         return snap
 
-    def _snap_for(self, spec: ProviderSpec, ctx: ReadContext, read_after: float | None = None) -> _Snap:
+    def _snap_for(self, spec: ProviderSpec, ctx: ReadContext, read_after: float | None = None,
+                  stored: Any = None) -> _Snap:
         """An on-demand panel: the shared snapshot (``_recent_snap``) or a read. A call that joined a flight begun before
         a write admitted ahead of this call (the read-cache generation moved between that flight's start and this call),
         or begun before ``read_after`` (a ``time.monotonic()`` instant: no snapshot read earlier is shared either), reads
@@ -1931,7 +1955,7 @@ class Cockpit:
         if st is None:
             return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
         if self._reader is not None and not self.serve_composed(spec.id):
-            return self._attached_snap(spec, ctx)
+            return self._attached_snap(spec, ctx, stored)
         if spec.refresh_every_s is None:
             gen = self._rc_gen
             recent = self._recent_snap(st, read_after)
@@ -2382,13 +2406,13 @@ class Cockpit:
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
                  views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
                  face: str = "", compose: dict[str, Any] | None = None, search: dict[str, Any] | None = None,
-                 *, auth: RequestAuthority) -> str:
+                 *, auth: RequestAuthority, snapshot: Any = None) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
         # rows, value, filtered and skipped enter as the snapshot's kept canonical text (``_Snap.etag_frags``); the
         # etag is byte for byte what ``_sha`` over the whole dict gave
-        return _sha_with_frags({"schema": SCHEMA, "status": snap.status,
+        light = {"schema": SCHEMA, "status": snap.status,
                      "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
                      "verbs": self._verb_rev(auth),
@@ -2405,7 +2429,12 @@ class Cockpit:
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
                         if labels is not None and (labels.revision is not None or labels.error is not None)
-                        else {})}, snap.etag_frags())
+                        else {})}
+        if snapshot is not None:
+            # an attached head (D3): what stands for the content is the row's ``body_sha`` (carried in ``snapshot``), never
+            # a serialisation of the rows or the value
+            return _sha({**light, "snapshot": snapshot})
+        return _sha_with_frags(light, snap.etag_frags())
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
               auth: RequestAuthority, now: datetime | None = None, *, with_hidden: bool = False) -> dict[str, Any]:
@@ -2448,11 +2477,16 @@ class Cockpit:
             title += f" ({count})"
         search_head = self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count,
                                         memory=bool(held))
-        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head, auth=auth)
+        fresh = snap.fresh_info
+        # an attached snapshot's etag stands on its row: the body hash, the freshness verdict a page must see change (a 304
+        # would hide a flip of either), what the rows left in the read are and whether the hidden ones were let in. Neither
+        # ``as_of`` nor ``valid_until`` is in it: a derive that changed nothing is no change
+        stands_on = ([snap.row_key[1] if snap.row_key is not None else None, fresh.stale, fresh.pending,
+                      None if snap.rows is None else len(snap.rows), with_hidden] if fresh is not None else None)
+        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head,
+                             auth=auth, snapshot=stands_on)
         if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
-            # a roster's health is read against the clock, so a tone that turns with time is content
-            etag = _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
-                                                  for r in _with_health(snap.value, now)["rows"]]})
+            etag = self._roster_etag(etag, snap.value, now)
         return {
             "id": spec.id, "kind": spec.kind, "title": title, "priority": spec.priority,
             "rank": spec.rank, "status": snap.status,
@@ -2478,7 +2512,153 @@ class Cockpit:
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
             # the panel has a past read (``?at=``): a renderer draws a replay control only when this says so
             **({"replay": True} if spec.read_at is not None and spec.kind not in ROW_ENGINE_KINDS else {}),
+            # D11: how current an attached panel's row is. ``as_of`` above is its derive time (or the instant its source
+            # declared); the rest come from the same freshness facts as the etag's two flags
+            **({"valid_until": fresh.valid_until, "stale": fresh.stale, "pending": fresh.pending}
+               if fresh is not None else {}),
         }
+
+    @staticmethod
+    def _roster_etag(etag: str, value: dict[str, Any], now: datetime) -> str:
+        """A roster's health is read against the clock, so a tone that turns with time is content."""
+        return _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
+                                              for r in _with_health(value, now)["rows"]]})
+
+    # --- attached mode: the head layer ----------------------------------------------------
+    def _request_key(self, cred: str, today: date, auth: RequestAuthority) -> tuple:
+        """What one request contributes to a head's cache key besides the snapshot: the credential class, the calendar
+        day, the authority head and verb revision (which carry the policy every tier and action is rendered under) and the
+        label snapshot's own revision and error (provenance is drawn from it). Built once per request, not per panel."""
+        labels = auth.labels
+        return (cred, today.isoformat(), _canon_text(auth.revision), _canon_text(self._verb_rev(auth)),
+                labels.revision, labels.error)
+
+    @staticmethod
+    def _snap_key(spec: ProviderSpec, snap: _Snap) -> tuple:
+        """What a cached head or panel depends on in the snapshot and its spec. ``row_key`` is the generation and the body
+        hash; the rest are the facts the head shows that move without the content moving (the freshness verdict, the
+        instant it is as of, its bound) and the spec (its identity: a discovery that replaced it is a new spec)."""
+        fresh = snap.fresh_info
+        gen, sha = snap.row_key if snap.row_key is not None else (-1, None)
+        return (spec.id, gen, sha, snap.status, snap.error, fresh.stale, fresh.pending, fresh.valid_until, snap.as_of,
+                id(spec))
+
+    def _cache_get(self, cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]", key: tuple) -> Any:
+        with self._head_lock:
+            hit = cache.get(key)
+            if hit is None:
+                return None
+            cache.move_to_end(key)
+            return hit[1]
+
+    def _cache_put(self, cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]", limit: int, key: tuple,
+                   spec: ProviderSpec, value: Any) -> Any:
+        """Keep ``value`` under ``key`` and return what the cache holds for it (an entry another thread stored first wins,
+        so every caller of one key is handed one object). A panel's entries of an older generation go first: nothing
+        reads them once the row has moved on."""
+        with self._head_lock:
+            held = cache.get(key)
+            if held is not None:
+                cache.move_to_end(key)
+                return held[1]
+            pid, gen = key[1], key[2]
+            for old in [k for k in cache if k[1] == pid and k[2] < gen]:
+                del cache[old]
+            cache[key] = (spec, value)
+            while len(cache) > limit:
+                cache.popitem(last=False)
+            return value
+
+    def _attached_head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date, auth: RequestAuthority,
+                       now: datetime, rkey: tuple | None = None) -> dict[str, Any]:
+        """The head of an attached panel, composed once per distinct key (``_snap_key`` and ``_request_key``) and shared
+        read-only. A snapshot a row did not stand behind (the serve-composed panels, a retired one) is composed every
+        time. A roster's health is a clock function, so its etag is the one thing set per request, on a copy."""
+        if snap.fresh_info is None:
+            return self._head(spec, snap, cred, today, auth, now)
+        key = ("head", *self._snap_key(spec, snap), *(rkey or self._request_key(cred, today, auth)))
+        head = self._cache_get(self._head_cache, key)
+        if head is None:
+            head = self._cache_put(self._head_cache, HEAD_CACHE_MAX, key, spec, self._head(spec, snap, cred, today, auth, None))
+        if spec.kind == "roster" and isinstance(snap.value, dict):
+            head = {**head, "etag": self._roster_etag(head["etag"], snap.value, now)}
+        return head
+
+    def _attached_heads(self, specs: list[ProviderSpec], cred: str, auth: RequestAuthority, ctx: ReadContext,
+                        read_after: float | None = None) -> "tuple[dict[str, dict[str, Any]], Mapping[str, str]]":
+        """Every listed panel's head in one pass over ONE read of the store (``read_manifest``: the meta and every row in
+        one transaction), and that read's meta. A panel that is not serve-composed is composed from its row with no further
+        read of the store; a serve-composed one reads its own stores under the request, in the manifest pool, as a bare
+        cockpit reads every panel, and is told it is fresh (it is read now)."""
+        try:
+            stored: Any = self._reader.read_manifest()
+        except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
+            stored = exc
+        meta: Mapping[str, str] = stored[0] if isinstance(stored, tuple) else {}
+        rkey = self._request_key(cred, ctx.today, auth)
+        heads: dict[str, dict[str, Any]] = {}
+        composed: list[ProviderSpec] = []
+        for spec in specs:
+            if self.serve_composed(spec.id):
+                composed.append(spec)
+                continue
+            snap = self._snap_for(spec, ctx.child(), None, stored)
+            heads[spec.id] = self._attached_head(spec, snap, cred, ctx.today, auth, ctx.now, rkey)
+
+        def read_head(spec: ProviderSpec) -> dict[str, Any]:
+            snap = self._snap_for(spec, ctx.child(), read_after)
+            return self._head(spec, snap, cred, ctx.today, auth, ctx.now)
+        for spec, head in zip(composed, self._parallel(read_head, composed)):
+            heads[spec.id] = head
+        for spec in specs:
+            head = heads[spec.id]
+            if "stale" not in head:
+                heads[spec.id] = {**head, "valid_until": None, "stale": False, "pending": False}
+        return heads, meta
+
+    def _stream_health(self) -> dict[str, Any]:
+        """The derive loop's input-watch stream as the manifest's ``freshness.stream``: ``state`` (ok or degraded) and
+        ``last_event_at`` (ISO). Both None while there is no row or the table cannot be read. The row is in a table of its
+        own, so it is read at most once per ``STREAMS_READ_TTL_S`` and shared."""
+        now = time.monotonic()
+        with self._head_lock:
+            held = self._streams_read
+        if held is not None and now - held[0] < STREAMS_READ_TTL_S:
+            return held[1]
+        row: Mapping[str, Any] = {}
+        try:
+            row = self._reader.streams().get(INPUTS_STREAM_ID) or {}
+        except Exception:  # noqa: BLE001 - a freshness line that cannot read its stream says nothing about it
+            row = {}
+        at = row.get("last_event_at")
+        out = {"state": row.get("state"), "last_event_at": _iso_epoch(at) if isinstance(at, (int, float)) else None}
+        with self._head_lock:
+            self._streams_read = (now, out)
+        return out
+
+    @staticmethod
+    def _stamp_band_age(out: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """A snapshot's rows carry no ``band_age`` (a clock reading is no part of what a derive publishes); the first paint
+        of a band row wants it, so it is set from the row's own ``band_since`` against this request's clock, with the same
+        function the List's first paint uses, on copies. The page recomputes it, and it is in no etag."""
+        rows = out.get("rows")
+        if not isinstance(rows, list):
+            return out
+        from levain.cockpit.list_panel import _age_text
+        stamped: list[Any] = []
+        changed = False
+        for r in rows:
+            facets = r.get("facets") if isinstance(r, dict) else None
+            if isinstance(facets, dict) and facets.get("band_since"):
+                try:
+                    age = _age_text(facets["band_since"], now)
+                except TypeError:     # a clock without an offset cannot be set against an aware instant
+                    age = None
+                if age:
+                    r = {**r, "facets": {**facets, "band_age": age}}
+                    changed = True
+            stamped.append(r)
+        return {**out, "rows": stamped} if changed else out
 
     @staticmethod
     def _search_head(spec: ProviderSpec, count: int | None, *, memory: bool = False) -> dict[str, Any]:
@@ -2785,7 +2965,14 @@ class Cockpit:
         and is bounded by the TTL and by ``invalidate_reads``. The credential was verified by the caller on THIS
         request before it got here (a refused request never reaches the engine), so the cache never decides who
         may read; it only avoids repeating a compute for an identical, already-authorised asker. The returned dict
-        is shared: read-only for every caller."""
+        is shared: read-only for every caller.
+
+        Attached: no read cache, no ``_obs_gen``: the manifest is composed from the heads the head layer keeps (one read
+        of the store per call), so there is no provider read to share or to order after. ``read_after`` reaches only the
+        serve-composed panels, whose reads are the bare ones."""
+        if self._reader is not None:
+            return self._manifest_compute(credential, install_class=install_class, transport=transport,
+                                          read_after=read_after)
         if read_after is not None:
             out = self._manifest_compute(credential, install_class=install_class, transport=transport,
                                          read_after=read_after)
@@ -2819,14 +3006,18 @@ class Cockpit:
         snaps: dict[str, _Snap] = {}
         specs_map = self._specs      # one snapshot for the whole manifest
         specs = self._ordered_specs(specs_map)
-        # The panels read side by side: one request pays for its slowest panel, not for the sum of all of them. Each read is
-        # its own bounded single flight over a child of the one ReadContext (the cycle's memo shared, the abandon its own).
-        # Results are placed in drawing order; the first read in that order that raised is raised, the others dropped.
-        def read_head(spec: ProviderSpec) -> tuple[_Snap, dict[str, Any]]:
-            snap = self._snap_for(spec, ctx.child(), read_after)    # its own child: a timeout abandons only its memos
-            return snap, self._head(spec, snap, credential["class"], ctx.today, auth, ctx.now)
-        for spec, (snap, head) in zip(specs, self._parallel(read_head, specs)):
-            snaps[spec.id], heads[spec.id] = snap, head
+        meta: Mapping[str, str] = {}
+        if self._reader is not None:
+            heads, meta = self._attached_heads(specs, credential["class"], auth, ctx, read_after)
+        else:
+            # The panels read side by side: one request pays for its slowest panel, not for the sum of all of them. Each read is
+            # its own bounded single flight over a child of the one ReadContext (the cycle's memo shared, the abandon its own).
+            # Results are placed in drawing order; the first read in that order that raised is raised, the others dropped.
+            def read_head(spec: ProviderSpec) -> tuple[_Snap, dict[str, Any]]:
+                snap = self._snap_for(spec, ctx.child(), read_after)    # its own child: a timeout abandons only its memos
+                return snap, self._head(spec, snap, credential["class"], ctx.today, auth, ctx.now)
+            for spec, (snap, head) in zip(specs, self._parallel(read_head, specs)):
+                snaps[spec.id], heads[spec.id] = snap, head
         regions = self._regions(specs)
         order = [s.id for s in specs]
         # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
@@ -2842,6 +3033,12 @@ class Cockpit:
             "verbs": self._verb_view.verbs_map(credential["class"], auth=auth) if self._verb_view is not None else {},
             "errors": errors,
         }
+        if self._reader is not None:
+            # the worker's state is a fact about the moment, not about any panel, so it is in no etag: a panel gone stale
+            # moves that panel's etag, and the line is read from the body
+            worker, age = self._worker_health(meta, _epoch(ctx.now))
+            out["freshness"] = {"worker": worker, "heartbeat_age_s": age, "deriving": self._deriving_ids(),
+                                "stream": self._stream_health()}
         if transport is not None:
             out["transport"] = dict(transport)
         return out
@@ -2947,8 +3144,13 @@ class Cockpit:
         profile, row, credential class; ``limit`` only bounds a search, so it is validated, not keyed); the result is a function of those and of server-global state. A search
         (``q``) and a past read (``at``) are never cached: ``q`` is free text the operator types (unbounded keys,
         and a store search is the costly live read), ``at`` has its own replay cache. A QueryError or RowNotFound
-        propagates to every waiter alike (a failed compute is not stored). The result is shared: read-only."""
-        if (self.read_cache_ttl_s or 0.0) <= 0 or q is not None or at is not None:
+        propagates to every waiter alike (a failed compute is not stored). The result is shared: read-only.
+
+        Attached, a panel that is not serve-composed is not read through the shared read cache: the head layer keeps
+        the composed payload under the snapshot's own generation (``_attached_panel``). A serve-composed panel reads its
+        stores under the request, so it is shared as a bare panel is."""
+        if (self._reader is not None and not self.serve_composed(panel_id)) \
+                or (self.read_cache_ttl_s or 0.0) <= 0 or q is not None or at is not None:
             return self._panel_compute(panel_id, profile=profile, q=q, row=row, credential_class=credential_class,
                                        limit=limit, at=at)
         # ``limit`` caps only a search, and a search is never cached: without ``q`` the compose reads it only to
@@ -2988,7 +3190,41 @@ class Cockpit:
         if spec is None:
             return None
         snap = self._snap_for(spec, ctx)
-        head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now, with_hidden=bool(q))
+        if snap.fresh_info is not None:
+            # attached: a read with no ``q`` is the head layer's; a search composes its own head (the hidden rows are let in)
+            # and, like every read, gets the row ages of this request's clock
+            if not q:
+                return self._attached_panel(spec, snap, ctx, auth, panel_id, profile, row, credential_class)
+            return self._stamp_band_age(
+                self._panel_body(spec, snap, None, ctx, auth, panel_id, profile, q, row, credential_class, limit), ctx.now)
+        return self._panel_body(spec, snap, None, ctx, auth, panel_id, profile, q, row, credential_class, limit)
+
+    def _attached_panel(self, spec: ProviderSpec, snap: _Snap, ctx: ReadContext, auth: RequestAuthority, panel_id: str,
+                        profile: str, row: str | None, credential_class: str) -> dict[str, Any]:
+        """The payload of an attached panel read with no ``q``. It is a function of the snapshot (its generation and body
+        hash, its freshness facts, its spec) and of the request's class, day, authority and verb revision, label snapshot,
+        profile and row, and nothing else, so it is composed once per distinct key and shared read-only. That covers the
+        rows' provenance and actions (each is a function of those and of the row), the log sentences (the verb labels
+        of the class under that policy) and the compact projection. Set per request, on copies: a roster's health text
+        (a clock function), and every row's ``band_age``. A row lookup that finds nothing raises and stores nothing."""
+        rkey = self._request_key(credential_class, ctx.today, auth)
+        head = self._attached_head(spec, snap, credential_class, ctx.today, auth, ctx.now, rkey)
+        if spec.kind == "roster":
+            return self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
+        key = ("panel", *self._snap_key(spec, snap), *rkey, profile, row)
+        out = self._cache_get(self._panel_cache, key)
+        if out is None:
+            out = self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
+            out = self._cache_put(self._panel_cache, PANEL_CACHE_MAX, key, spec, out)
+        return self._stamp_band_age(out, ctx.now)
+
+    def _panel_body(self, spec: ProviderSpec, snap: _Snap, head: dict[str, Any] | None, ctx: ReadContext,
+                    auth: RequestAuthority, panel_id: str, profile: str, q: str | None, row: str | None,
+                    credential_class: str, limit: int | None) -> dict[str, Any]:
+        """``_panel_compute`` from the snapshot on. ``head`` is the head to carry when the caller already has it (the head
+        layer's); None composes it here."""
+        if head is None:
+            head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now, with_hidden=bool(q))
         snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
         if snap_rows is not None and spec.hidden_unless_q and not q:
             # rows a read with no query omits are not a row lookup's either: a ``row=`` of one is a RowNotFound, as any absent row
