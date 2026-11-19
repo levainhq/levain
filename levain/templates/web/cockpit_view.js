@@ -1925,10 +1925,11 @@
   // etag, so the stream's manifest diff stops announcing the same change.
   // A panel read in place records the read: its etag and when (the held map), and its own status and read time, which also become its head in the
   // manifest the page keeps. The freshness line reads the heads, so a panel read fresh stops being named stale until the next whole read.
+  // The held record also says whether the panel's last read failed (`err`): a good read clears it, noteFault sets it.
   function noteApplied(pid, raw) {
     const heldMap = root.LevainCockpitHeld;
     if (heldMap && raw && typeof raw.etag === "string") {
-      const rec = { etag: raw.etag, at: Date.now() };
+      const rec = { etag: raw.etag, at: Date.now(), err: "" };
       if (typeof raw.status === "string") rec.status = raw.status;
       if (typeof raw.as_of === "string") rec.as_of = raw.as_of;
       heldMap[pid] = Object.assign({}, heldMap[pid], rec);
@@ -1941,8 +1942,24 @@
       heads[pid] = Object.assign({}, heads[pid], nx);
     }
   }
+  function noteFault(pid, why) {
+    const heldMap = root.LevainCockpitHeld;
+    if (heldMap && heldMap[pid]) heldMap[pid] = Object.assign({}, heldMap[pid], { err: String(why || "read failed") });
+  }
+  // the freshness line is told that a read settled (never from a heartbeat): the one dispatch of `levain:fresh` for a panel read
+  function tellFresh() {
+    try { if (typeof document !== "undefined" && typeof document.dispatchEvent === "function" && typeof root.CustomEvent === "function") document.dispatchEvent(new root.CustomEvent("levain:fresh")); } catch (_) { /* a page without events has no line to tell */ }
+  }
   const briefUndrawn = (pid) => { const r = lastManifest && lastManifest.regions; return !!(r && Array.isArray(r.brief) && pid !== "state" && r.brief.indexOf(pid) >= 0); };
+  // refetchPanel is the ONE place a panel read's outcome is published, for the stream and for every direct caller alike (a write's refetch, the
+  // topology's replay): the held record (noteApplied / noteFault) and the line (tellFresh). A superseded or declined read publishes nothing.
   async function refetchPanel(pid) {
+    let r;
+    try { r = await readInPlace(pid); } catch (e) { noteFault(pid, e && e.message ? e.message : e); r = "fault"; }
+    if (r === "applied" || r === "fault") tellFresh();
+    return r;
+  }
+  async function readInPlace(pid) {
     if (!liveOf(pid).length) {
       if (!briefUndrawn(pid)) return false;
       try {
@@ -1963,7 +1980,7 @@
     if (boardEpoch !== epoch) return false;
     const live = liveOf(pid);
     if (!live.length) return false;
-    if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }
+    if (fault) { for (const s of live) { s.fault = fault; paint(s); } noteFault(pid, fault); return "fault"; }
     const core = root.LevainDashboard;
     if (!lastManifest || !core) return false;
     let view, entry, data;
@@ -1971,7 +1988,12 @@
       view = mapSnapshot({ manifest: lastManifest, panels: { [pid]: raw } }, { elapsedMs: Date.now() - manifestAt });
       entry = view.layout.find((e) => e.id === pid);
       data = view.extra_panels[pid];
-    } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return "fault"; }
+    } catch (e) {
+      const why = "could not be mapped (" + (e && e.message ? e.message : e) + ")";
+      for (const s of live) { s.fault = why; paint(s); }
+      noteFault(pid, why);
+      return "fault";
+    }
     if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
     const shape = shapeOf(entry, data);
     if (live.some((s) => s.shape !== shape)) return false;

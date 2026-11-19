@@ -108,7 +108,9 @@
     var titleOf = typeof inp.titleOf === "function" ? inp.titleOf : function (id) { return id; };
     var panels = ids.map(function (id) {
       var h = heads[id] || {};
-      var kind = h.status === "error" ? "error" : (h.status === "stale" || faulted[id] === true ? "stale" : "");
+      // a panel whose very first read failed has no body to call old: it is unavailable, as an error head is
+      var neverRead = faulted[id] === true && !!held[id] && held[id].etag === null;
+      var kind = h.status === "error" || neverRead ? "error" : (h.status === "stale" || faulted[id] === true ? "stale" : "");
       var stale = kind !== "";
       var asOf = toMs(h.as_of), onServer = true;
       // a panel the page could not read has aged from the page's own last read of it, on the page's clock, not from the server's
@@ -116,9 +118,9 @@
       return { id: id, title: stale ? (titleOf(id) || id) : id, kind: kind, asOfMs: asOf || null, onServerClock: onServer, stale: stale, pending: false };
     });
     var read;
+    // the read state is taken as the facts give it: whether a failure still stands is not decided here
     if (boot.refused) read = { state: "refused", why: "" };
-    // a failure ends at the next good read of any kind (a panel applied in place, a poll): the page is current again as of that read
-    else if (boot.failed && !(boot.failedAt && max(lastRead) > boot.failedAt)) read = { state: "failed", why: String(boot.failed) };
+    else if (boot.failed) read = { state: "failed", why: String(boot.failed) };
     else if (!boot.wholeDrawn) read = { state: "none", why: "" };
     else read = { state: "ok", why: "" };
     read.inflightAt = boot.inflight && boot.inflightAt ? boot.inflightAt : 0;

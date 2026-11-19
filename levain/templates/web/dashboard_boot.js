@@ -23,15 +23,17 @@
 
   // What this shim knows about how current the page is, for the masthead's freshness line (fresh_line.js). The line is told when
   // a read starts, settles or fails (`levain:fresh`) and asks for these facts then; nothing here is a timer.
-  let lastWholeAt = 0, readFailed = "", readFailedAt = 0;
+  // `failure` is the last read that failed ({why, at, refused}); whether it STILL stands is never stored, only derived (failureStands).
+  let lastWholeAt = 0, failure = null;
   function fresh() {
     try { if (typeof document.dispatchEvent === "function" && typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("levain:fresh")); } catch (_) { /* a page without events has no line to tell */ }
   }
   window.LevainBootFacts = function () {
-    return { wholeDrawn: wholeDrawn, lastWholeAt: lastWholeAt, inflight: inflight, inflightAt: inflightAt, refused: refusedStop, failed: readFailed, failedAt: readFailedAt };
+    const f = failureStands() ? failure : null;
+    return { wholeDrawn: wholeDrawn, lastWholeAt: lastWholeAt, inflight: inflight, inflightAt: inflightAt, refused: !!(f && f.refused), failed: f ? f.why : "" };
   };
-  // a panel applied in place or a poll that landed after a failed read ends its text on the stamp (the line has already recovered by then)
-  document.addEventListener("levain:fresh", function () { if (stampFailure && readSince(readFailedAt)) status(""); });
+  // the stamp's failure text ends where the line's failure does: the same derivation
+  document.addEventListener("levain:fresh", function () { if (stampFailure && !failureStands()) status(""); });
 
   let inflight = false;
   // A foreground (pwa_resume.js) after a long freeze: iOS kills the sockets of a frozen page, so a read that was in flight may
@@ -48,7 +50,7 @@
   // What bounds the chain: one timer at a time (retryT), the backoff below (RETRY_MS, its last step repeated for as long as the server keeps
   // failing), and it ends at the next good read of ANY kind (a whole draw, a panel applied in place, a poll) or a refusal; a persistently
   // failing server is read once per last step, never in a tight loop.
-  let wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0, refusedStop = false;
+  let wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0;
   let holdT = 0, holdSpent = false;     // the watchdog on an inert part (boardMark): its timer, and whether it has already released the page
   // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
@@ -56,7 +58,7 @@
   // A draw ends the cold line's fault text and a queued retry; only a WHOLE draw resets the backoff. A part (the shells, or what a read has
   // landed so far) is drawn on every read of a board not yet whole, so if it reset the backoff a read that kept failing after its part (the
   // whole draw throwing, a later step rejecting) would be retried every 2 s for good.
-  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; if (whole === true) { wholeDrawn = true; retryN = 0; } refusedStop = false; clearTimeout(retryT); retryT = 0; }
+  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; if (whole === true) { wholeDrawn = true; retryN = 0; } clearTimeout(retryT); retryT = 0; }
   // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
   // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
   // - `html[data-board-whole]` is the positive "nothing more is coming that would replace this board" signal. It is set by the code that has
@@ -102,8 +104,9 @@
   function releaseShells(why, keep) {
     try { const d = window.LevainDashboard; if (d && typeof d.releaseLoading === "function") d.releaseLoading(why, keep); } catch (_) { /* nothing drawn to release */ }
   }
-  // a read of another kind (a panel applied in place by the stream, a manifest poll) landed after `t`: the page is current again
+  // a read of any kind (a whole draw, a panel applied in place by the stream, a manifest poll) landed after `t`: the page is current again
   function readSince(t) {
+    if (lastWholeAt > t) return true;
     try {
       const S = typeof window.LevainStreamFacts === "function" ? window.LevainStreamFacts() : null;
       if (S && S.pollOkAt > t) return true;
@@ -111,12 +114,15 @@
       return Object.keys(H).some(function (id) { return !!(H[id] && H[id].at > t); });
     } catch (_) { return false; }
   }
+  // THE derivation of "the read failed": a failure stands only while no read of any kind is newer than it. The line's facts, the stamp, the retry
+  // chain and the `online` handler all ask here, so none of them can call the page failed or current on its own.
+  function failureStands() { return !!failure && !readSince(failure.at); }
+  function refusalStands() { return failureStands() && failure.refused; }
   function retryUntilDrawn(why, refused) {
     // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
     // put up the token prompt. Say it and stop; the next foreground reads again. Before a board is drawn the cold line says it; after,
-    // the freshness line does (refusedStop), and the cold line is left alone (nothing would clear it).
+    // the freshness line does (the failure's `refused`), and the cold line is left alone (nothing would clear it).
     if (refused) {
-      refusedStop = true;
       if (!wholeDrawn) {
         if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
         releaseShells("the cockpit refused this device");     // shells drawn before the refusal would otherwise load for good
@@ -132,12 +138,9 @@
   function armRetry(why) {
     retryT = setTimeout(function () {
       retryT = 0;
-      if (refusedStop) return;
-      if (wholeDrawn) {
-        // a drawn board is retried only while its failure stands: a read of another kind since ends the chain
-        if (!readFailed) return;
-        if (readSince(readFailedAt)) { retryN = 0; return; }
-      }
+      if (refusalStands()) return;
+      // a drawn board is retried only while its failure stands: a read of any kind since ends the chain
+      if (wholeDrawn && !failureStands()) { retryN = 0; return; }
       // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead, on the
       // SAME delay (no read failed, so the backoff does not advance)
       if (inflight) { armRetry(why); return; }
@@ -150,7 +153,7 @@
   // part drawn (no watchdog armed).
   function holdingPart(refused) { return !refused && holdT !== 0; }
   // (the node harnesses that load this file hand it a window with no event API)
-  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if ((!wholeDrawn || readFailed) && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
+  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if ((!wholeDrawn || failureStands()) && !refusalStands() && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -1326,15 +1329,18 @@
     }
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
-    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: panels[id] && panels[id].error !== undefined && panels[id].status === undefined ? null : (manifest.panels[id] || {}).etag || null }]));
+    // `err` marks a panel this read could not read (drawn as unavailable): a failure the stream reads again on its bounded schedule
+    heldNext = Object.fromEntries(ids.map((id) => {
+      const p = panels[id], unread = !!p && p.error !== undefined && p.status === undefined;
+      return [id, { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" }];
+    }));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: held }, { elapsedMs: Date.now() - fetchedAt });
   }
 
   async function load(opts) {
     const passive = !!(opts && opts.passive);
-    // a read the operator or the page's own foreground asks for re-opens the retry chain; only the chain's own timer / online
-    // re-reads (auto) stay shut after a refusal
-    if (!(opts && opts.auto)) refusedStop = false;
+    // a refusal is not unsaid by the ASKING for another read (a foreground that is deferred for an edit made no request, one in flight has not
+    // answered): it ends at a read's answer (a good one, or a failure that is not a refusal)
     if (inflight) {
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
@@ -1392,7 +1398,7 @@
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
         }
-        lastWholeAt = Date.now(); readFailed = "";
+        lastWholeAt = Date.now();
         status("");     // the transient line is cleared; the freshness line says how current the page is
         showNotice();
         landed = true; drawnOnce(true);
@@ -1418,7 +1424,7 @@
           // the token-reject branch: a non-token 403 (Host/CSRF — plain-text body) never reaches here,
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
-          refusedStop = true;
+          failure = { why: "off-box token missing or invalid", at: Date.now(), refused: true };
           status("read refused — off-box token missing or invalid");
           boardMark(true);     // refused: no whole draw is coming for this read
           return false;
@@ -1443,7 +1449,7 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       boardMark(true);
-      lastWholeAt = Date.now(); readFailed = "";
+      lastWholeAt = Date.now();
       status("");
       landed = true; drawnOnce(true);
       return true;
@@ -1456,7 +1462,7 @@
       // the reason, and for a refusal the remedy, are written where a touch screen reads them (the stamp), not only in the line's title
       status(refused ? "not signed in: pair this device again" : "read failed: " + (e && e.message ? e.message : e));
       stampFailure = true;
-      readFailed = String(e && e.message ? e.message : e || "read failed"); readFailedAt = Date.now();
+      failure = { why: String(e && e.message ? e.message : e || "read failed"), at: Date.now(), refused: refused };
       // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog
       // releases it); anything else (no part drawn, a refusal, or the watchdog already fired) releases the page as it is, and the retry
       // below still reads again

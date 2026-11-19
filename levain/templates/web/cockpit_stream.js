@@ -15,8 +15,9 @@
  * While the stream is down the page polls the manifest with a validator and refetches what moved.
  *
  * The stream does not paint anything. It keeps the facts the masthead's freshness line needs (its state, the last bytes, the last good
- * manifest read, the panels whose refetch failed) and says `levain:fresh` when one changes; fresh_line.js reads them through
- * window.LevainStreamFacts and writes the line (#freshline). A heartbeat updates `lastChunk` and tells no one. */
+ * manifest read, the heads it carried) and says `levain:fresh` when its own state changes; fresh_line.js reads them through
+ * window.LevainStreamFacts and writes the line (#freshline). A heartbeat updates `lastChunk` and tells no one. The outcome of a PANEL read
+ * (applied, failed) is published by refetchPanel, the one place that knows it; the stream only schedules the retries. */
 (function (root) {
   "use strict";
   var EVENTS = "/cockpit/events";
@@ -36,10 +37,10 @@
   var lastId = null, pollTag = null, lastConnect = 0, lastChunk = 0;
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
-  var faults = Object.create(null);   // panel id -> { n, timer }
-  var failed = Object.create(null);   // panel id -> true: its last refetch faulted and no read has applied since (outlives the retry schedule)
+  var faults = Object.create(null);   // panel id -> { n, timer }: the retry schedule of a panel whose read failed (what failed is the held record's `err`)
   var bytesAt = 0;                    // the last bytes of any connection (lastChunk restarts with each connection; this does not)
-  var pollOkAt = 0, lastHeads = null, lastHeadsAt = 0;   // the last good manifest read (a 304 counts), and the heads it carried
+  var pollOkAt = 0, lastHeads = null, lastHeadsAt = 0;   // the last good manifest read (a 304 counts), the heads it carried and when that read STARTED
+  var headSeq = 0, headApplied = 0;                      // manifest reads are numbered by their start: the newer start holds the heads, whichever answers last
 
   // the stream's state as the line names it: off (gave up waiting for a first draw), paused (hidden tab), down, live, connecting; null when
   // this page never runs a stream (the line then has no stream words to say)
@@ -50,9 +51,24 @@
     if (staleSince) return "down";
     return epoch ? "live" : "connecting";
   }
+  // a panel the page has read since the manifest read that carried its head is described by that read (its status and read time), not by the head
+  function headsNow() {
+    if (!lastHeads) return null;
+    var h = held(), out = {};
+    Object.keys(lastHeads).forEach(function (id) {
+      var rec = h[id], head = lastHeads[id], nx = {};
+      if (rec && !rec.err && rec.at >= lastHeadsAt) {
+        if (typeof rec.status === "string") nx.status = rec.status;
+        if (typeof rec.as_of === "string") nx.as_of = rec.as_of;
+      }
+      out[id] = Object.assign({}, head, nx);
+    });
+    return out;
+  }
   function facts() {
+    var h = held();
     return { state: streamState(), everLive: everLive, since: staleSince ? staleSince.getTime() : null, lastChunk: bytesAt, pollOkAt: pollOkAt,
-      faults: Object.keys(failed), heads: lastHeads, headsAt: lastHeadsAt };
+      faults: Object.keys(h).filter(function (id) { return !!(h[id] && h[id].err); }), heads: headsNow(), headsAt: lastHeadsAt };
   }
   root.LevainStreamFacts = facts;
   // tell the line that a fact moved (a state change, a read that settled): never a heartbeat
@@ -72,7 +88,6 @@
     var f = faults[id];
     if (f) { root.clearTimeout(f.timer); delete faults[id]; }
   }
-  function clearFailed() { var had = Object.keys(failed).length > 0; failed = Object.create(null); if (had) tell(); }
   function cancelFaults() { Object.keys(faults).forEach(clearFault); }
   function scheduleFault(id) {
     var n = faults[id] ? faults[id].n : 0;
@@ -103,37 +118,25 @@
     try { p = T.reload(); } catch (_) { p = false; }
     Promise.resolve(p).then(function (ok) { return ok === true; }, function () { return false; }).then(function (ok) {
       reloading = false;
-      if (ok && startGen === reloadGen) { pending = false; pendingAttempt = 0; cancelFaults(); clearFailed(); return; }
+      if (ok && startGen === reloadGen) { pending = false; pendingAttempt = 0; return; }
       // a request made while this render was under way is not covered by it
       pendingAttempt = ok ? 0 : pendingAttempt + 1;
       wantReload();
     });
   }
 
-  // the settled answer of one refetch: "applied", "superseded" (a newer refetch owns the panel: nothing to clear or record), "fault" or false
+  // the settled answer of one refetch: "applied", "superseded" (a newer refetch owns the panel: nothing to clear), "fault" or false.
+  // refetchPanel has recorded the read and told the line; what is decided here is only the retry
   function refetch(id) {
     var done;
     try { done = V.refetchPanel(id); } catch (_) { done = Promise.resolve("fault"); }
     return Promise.resolve(done).then(function (r) {
       if (r === "superseded") return r;
-      if (r === "applied" || r === true) {
-        clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
-        if (failed[id]) delete failed[id];
-        noteHead(id);
-        tell();
-      } else if (r === "fault") { failed[id] = true; scheduleFault(id); tell(); }
+      if (r === "applied" || r === true) clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
+      else if (r === "fault") scheduleFault(id);
       else wantReload();
       return r;
-    }, function () { failed[id] = true; scheduleFault(id); tell(); return "fault"; });
-  }
-  // the head this stream keeps for a panel follows the panel's own read (the status and read time refetchPanel recorded), as the view's does
-  function noteHead(id) {
-    var rec = held()[id];
-    if (!lastHeads || !lastHeads[id] || !rec) return;
-    var nx = {};
-    if (typeof rec.status === "string") nx.status = rec.status;
-    if (typeof rec.as_of === "string") nx.as_of = rec.as_of;
-    lastHeads[id] = Object.assign({}, lastHeads[id], nx);
+    }, function () { scheduleFault(id); return "fault"; });
   }
   function onEvent(id) { clearFault(id); return refetch(id); }
 
@@ -218,9 +221,9 @@
   }
 
   // ---- the manifest against what the page holds: the poll while the stream is down, and every hello that is not a replay ----
-  function diffManifest(m) {
+  function diffManifest(m, startedAt) {
     var heads = (m && m.panels) || {}, h = held();
-    lastHeads = heads; lastHeadsAt = Date.now();
+    lastHeads = heads; lastHeadsAt = startedAt;
     var ids = Object.keys(heads), have = Object.keys(h);
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
@@ -230,13 +233,18 @@
   }
   function reconcile(conditional) {
     if (paused) return;
-    var headers = readHeaders();
+    var headers = readHeaders(), seq = ++headSeq, startedAt = Date.now();
     if (conditional && pollTag) headers["If-None-Match"] = pollTag;
     fetch(MANIFEST, { cache: "no-store", headers: headers }).then(function (res) {
       if (res.status === 304) { pollOkAt = Date.now(); tell(); return null; }
       if (!res.ok) throw new Error("HTTP " + res.status);
       var tag = res.headers.get("ETag");
-      return res.json().then(function (m) { if (conditional) pollTag = tag; pollOkAt = Date.now(); diffManifest(m); tell(); });
+      return res.json().then(function (m) {
+        pollOkAt = Date.now();     // a good read whichever it answers
+        // an older request answering after a newer one has been applied describes an older manifest: it replaces nothing
+        if (seq > headApplied) { headApplied = seq; if (conditional) pollTag = tag; diffManifest(m, startedAt); }
+        tell();
+      });
     }).catch(function () { /* the next hello or poll tries again */ });
   }
   function pollOnce() { reconcile(true); }
@@ -296,9 +304,11 @@
 
   // the board's first successful draw after the wait gave up (or the view arrived late) starts the stream
   function onDrawn() {
-    clearFailed();     // the board was drawn whole from fresh reads: no panel is left holding a failed one
-    if (!started) { start(); return; }
-    if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
+    cancelFaults();     // the board was drawn whole from fresh reads: the retries it supersedes are cancelled
+    if (!started) start();
+    else if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
+    // a panel that whole read could not read (drawn as unavailable) enters the same bounded retry as a refetch that failed
+    if (started) { var h = held(); Object.keys(h).forEach(function (id) { if (h[id] && h[id].err) scheduleFault(id); }); }
   }
   document.addEventListener("levain:cockpit-held", onDrawn);
 

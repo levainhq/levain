@@ -22,18 +22,23 @@ from tests.test_cockpit_places import READY, SETTLE
 # a panel head can be marked stale (a late collector), and the change stream can be refused so the page's own stream drops. `__reads` counts
 # the manifest reads the PAGE makes, retries included. Every state the line shows is then the page's own code reading its own facts.
 STUB2 = r"""(() => { const real = window.fetch.bind(window); window.__reads = 0; window.__mode = 'drop'; window.__fails = 0; window.__stale = null; window.__eventsDown = false;
+  window.__delay = 0; window.__panelFail = null; window.__wbReads = 0;
   window.fetch = (u, o) => { const url = String(u);
     if (url.indexOf('/cockpit/events') >= 0 && window.__eventsDown) return Promise.reject(new TypeError('Load failed'));
+    if (url.indexOf('/cockpit/panel/work_board') >= 0) { window.__wbReads++; if (window.__panelFail === 'work_board') return Promise.reject(new TypeError('Load failed')); }
     if (url.indexOf('/cockpit/manifest.json') < 0) return real(u, o);
     window.__reads++;
+    const go = () => {
     if (window.__fails > 0) { window.__fails--; return window.__mode === '401' ? Promise.resolve(new Response('{"message":"nope"}', { status: 401, headers: { 'content-type': 'application/json' } })) : Promise.reject(new TypeError('Load failed')); }
     return real(u, o).then(async (r) => { if (!window.__stale || !r.ok || r.status === 304) return r;
       const m = await r.clone().json(), h = m.panels && m.panels[window.__stale];
       if (h) m.panels[window.__stale] = Object.assign({}, h, { status: 'stale', as_of: new Date(Date.now() - 180000).toISOString() });
       return new Response(JSON.stringify(m), { status: r.status, headers: r.headers }); }); };
+    return window.__delay ? new Promise((r) => setTimeout(r, window.__delay)).then(go) : go(); };
   window.__panelTitle = () => document.querySelector('[data-panel-id="work_board"] .phead h2').textContent.trim();
   window.__hide = (on) => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => on }); Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => on ? 'hidden' : 'visible' });
     document.dispatchEvent(new Event('visibilitychange')); };
+  window.__edit = (on) => { window.LevainDashboard.editHoldsRefresh = () => on; };
   return 1; })()"""
 TOLD = "document.dispatchEvent(new CustomEvent('levain:fresh'))"     # what the stream says after it has applied a panel
 
@@ -138,6 +143,92 @@ def test_a_good_read_of_another_kind_ends_the_failure_text_and_the_retry_chain(t
     assert after[-1]["reads"] == failed[-1]["reads"], (after[-1], failed[-1])                                           # and the chain stopped: no whole read followed
 
 
+def _samples(out: dict) -> list[list[dict]]:
+    return [v["rows"] for v in _vals(out) if v.get("probe") == "sample"]
+
+
+REFUSE = "window.__mode = '401'; window.__fails = 1; window.LevainCockpitTransport.reload(); 1"
+
+
+@needs_browser
+def test_a_refusal_stands_until_a_read_answers_a_foreground_that_is_deferred_or_in_flight_does_not_unsay_it(tmp_path: Path) -> None:
+    """A(a): the refusal ends at a read's answer, never at the request for one: a foreground read deferred for an edit makes no request, and one
+    in flight has not answered, so neither may turn 'not signed in' into 'can't reach' (the failure text of a read that never refused)."""
+    steps = [READY, LIVE, SETTLE, _run(STUB2), _sample(3600, REFUSE),
+             _sample(1500, "window.__edit(true); document.dispatchEvent(new CustomEvent('levain:resume', { detail: {} })); 1"),
+             _sample(4000, "window.__edit(false); window.__fails = 1; window.__mode = 'drop'; window.__delay = 1500; document.dispatchEvent(new CustomEvent('levain:resume', { detail: {} })); 1")]
+    refused, deferred, inflight = _samples(_open(tmp_path, steps))
+    assert refused[-1]["state"] == "refused", refused[-1]
+    assert all(r["state"] == "refused" and r["reads"] == refused[-1]["reads"] for r in deferred), [(r["t"], r["state"], r["reads"]) for r in deferred]   # no request was made
+    first = [r for r in inflight if r["t"] < 1200]
+    assert first and all(r["state"] == "refused" for r in first), [(r["t"], r["state"]) for r in inflight]                  # in flight: not answered yet
+    assert inflight[-1]["state"] == "failed" and inflight[-1]["refused"] is False, inflight[-1]                             # its own answer is a failure that is not a refusal
+
+
+@needs_browser
+def test_a_failure_ended_by_a_read_of_another_kind_is_not_read_again_by_the_next_online_event(tmp_path: Path) -> None:
+    """A(b): the line, the shim's facts and the `online` handler read ONE derivation: a failure stands only while no read of any kind is newer."""
+    steps = [READY, LIVE, SETTLE, _run(STUB2),
+             _sample(600, "window.__fails = 1; window.LevainCockpitTransport.reload(); 1"),
+             _sample(600, "window.LevainCockpitView.refetchPanel('work_board'); 1"),
+             _sample(1800, "window.dispatchEvent(new Event('online')); 1")]
+    failed, healed, after = _samples(_open(tmp_path, steps))
+    assert failed[-1]["failed"], failed[-1]
+    assert healed[-1]["failed"] == "" and healed[-1]["state"] == "live", healed[-1]          # the facts the line reads say it is over
+    assert after[-1]["reads"] == healed[-1]["reads"], [(r["t"], r["reads"]) for r in after]     # so `online` starts no whole-board read
+
+
+@needs_browser
+def test_a_late_read_cannot_leave_the_stamp_and_the_line_telling_different_stories_about_a_refusal(tmp_path: Path) -> None:
+    """A(c): after a refusal the stamp carries the remedy and the line says 'not signed in' for as long as the same derivation says the refusal stands."""
+    steps = [READY, LIVE, SETTLE, _run(STUB2), _sample(3600, REFUSE),
+             _sample(1500, "window.LevainCockpitView.refetchPanel('work_board').then(() => " + TOLD + "); 1")]       # TOLD: a caller that says so itself
+    refused, later = _samples(_open(tmp_path, steps))
+    assert refused[-1]["state"] == "refused" and refused[-1]["stamp"].startswith("not signed in"), refused[-1]
+    for r in later:
+        assert (r["state"] == "refused") == r["stamp"].startswith("not signed in"), r          # never one without the other
+
+
+@needs_browser
+def test_a_panel_that_could_not_be_read_at_the_whole_draw_is_named_and_read_again(tmp_path: Path) -> None:
+    """B: a panel drawn as unavailable by a whole read is a failure the line names ('<Panel> unavailable') and the stream's bounded refetch reads again."""
+    title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
+    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+             _sample(4500, "window.__panelFail = 'work_board'; window.__wbReads = 0; window.LevainCockpitTransport.reload(); 1"),
+             _sample(9000, "window.__panelFail = null; 1")]
+    out = _open(tmp_path, steps)
+    named, healed = _samples(out)
+    name = _title(out)
+    assert named[-1]["state"] == "stale" and named[-1]["words"] == f"{name} unavailable", named[-1]
+    assert healed[-1]["state"] == "live" and healed[-1]["words"] == "live", healed[-1]
+    # it was read again on the stream's schedule: a panel drawn as unavailable cannot be redrawn in place, so the retry is one board read (bounded, not a loop)
+    assert healed[-1]["reads"] == named[-1]["reads"] + 1, (healed[-1], named[-1])
+
+
+@needs_browser
+def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_failure(tmp_path: Path) -> None:
+    """B: refetchPanel is the ONE place that says a panel read settled; a caller that does not tell the line (a write's refetch, the topology's replay) is still heard."""
+    title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
+    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+             _sample(4500, "window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
+             _sample(3500, "window.__panelFail = null; window.LevainCockpitView.refetchPanel('work_board'); 1")]
+    out = _open(tmp_path, steps)
+    failed, healed = _samples(out)
+    assert failed[-1]["state"] == "stale" and failed[-1]["words"] == f"{_title(out)} stale", failed[-1]
+    assert healed[-1]["state"] == "live", healed[-1]
+
+
+@needs_browser
+def test_a_failed_read_that_waits_on_an_open_edit_is_read_again_when_the_edit_closes(tmp_path: Path) -> None:
+    """F: the line is honest while an edit holds the read ('can't reach', no request), and the read comes on its own once the edit is gone, with no event to say so."""
+    steps = [READY, LIVE, SETTLE, _run(STUB2),
+             _sample(4500, "window.__fails = 1; window.LevainCockpitTransport.reload(); window.__edit(true); 1"),
+             _sample(13000, "window.__edit(false); 1")]
+    held, freed = _samples(_open(tmp_path, steps))
+    assert held[-1]["state"] == "failed" and held[-1]["reads"] == 1, [(r["t"], r["state"], r["reads"]) for r in held]       # honest, and no request while the edit is open
+    assert freed[-1]["reads"] == 2 and freed[-1]["state"] == "live" and freed[-1]["failed"] == "", [(r["t"], r["state"], r["reads"]) for r in freed]
+
+
 # ---------------------------------------------------------------------------------------------------------------- the stream's facts, in node
 STREAM_DRIVER = r"""
 const fs = require("fs");
@@ -145,7 +236,7 @@ const src = fs.readFileSync(process.argv[2], "utf8");
 const tick = () => new Promise((r) => setImmediate(r));
 const settle = async () => { for (let i = 0; i < 10; i++) await tick(); };
 function boot(opts) {
-  const listeners = {}, fetches = [];
+  const listeners = {}, fetches = [], manifests = [];
   const doc = { readyState: "complete", hidden: false, addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); }, dispatchEvent: () => true };
   const win = {
     LevainCockpitHeld: { a: { etag: "1" } }, location: { search: "" }, document: doc,
@@ -153,6 +244,7 @@ function boot(opts) {
     AbortController: class { constructor() { this.signal = {}; } abort() {} },
     CustomEvent: class { constructor(t) { this.type = t; } },
     fetch: (url) => {
+      if (url === "/cockpit/manifest.json" && opts.manual) return new Promise((r) => manifests.push(r));    // answered by the test, in the order it chooses
       if (url === "/cockpit/manifest.json") return Promise.resolve({ ok: true, status: 200, headers: { get: () => "W/m" }, json: () => Promise.resolve({ panels: { a: { etag: "1", status: "stale", as_of: "2026-11-19T11:00:00Z" } } }) });
       const f = { push: null }; fetches.push(f); let wake = null; const q = [];
       f.push = (t) => { q.push(t); if (wake) { const w = wake; wake = null; w(); } };
@@ -163,7 +255,7 @@ function boot(opts) {
   if (!opts.noView) win.LevainCockpitView = { refetchPanel: async () => "applied" };
   globalThis.window = win; globalThis.document = doc; globalThis.fetch = win.fetch; globalThis.AbortController = win.AbortController; globalThis.URLSearchParams = URLSearchParams;
   new Function("window", "document", src)(win, doc);
-  return { win, fetches };
+  return { win, fetches, manifests };
 }
 const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: " + JSON.stringify(data) + "\n\n";
 (async () => {
@@ -178,6 +270,14 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
   h.win.LevainCockpitHeld.a = { etag: "2", at: Date.now(), status: "ok", as_of: "2026-11-19T12:00:00Z" };
   h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" })); await settle();
   out.applied = h.win.LevainStreamFacts().heads.a;
+  // two manifest reads overlap (a poll and a hello's): the one that STARTED later holds the newer heads whichever answers last
+  const m = boot({ manual: true }); await settle();
+  const manifest = (status, asOf) => ({ ok: true, status: 200, headers: { get: () => "W/m" }, json: () => Promise.resolve({ panels: { a: { etag: "1", status, as_of: asOf } } }) });
+  m.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false })); await settle();
+  m.fetches[0].push(frame("hello", "E.1:1", { epoch: "E.1", resync: false })); await settle();
+  m.manifests[1](manifest("ok", "2026-11-19T12:05:00Z")); await settle();
+  m.manifests[0](manifest("stale", "2026-11-19T11:00:00Z")); await settle();
+  out.overlap = { reads: m.manifests.length, head: m.win.LevainStreamFacts().heads.a };
   console.log(JSON.stringify(out));
 })();
 """
@@ -197,3 +297,4 @@ def test_the_stream_facts_say_no_stream_when_none_runs_and_follow_a_panel_read_i
     assert got["hello"]["state"] == "live" and got["hello"]["everLive"] is True
     assert got["hello"]["head"]["status"] == "stale"                                    # the hello's manifest read is the stream's heads
     assert got["applied"]["status"] == "ok" and got["applied"]["as_of"] == "2026-11-19T12:00:00Z", got["applied"]   # a panel read in place clears its stale head
+    assert got["overlap"]["reads"] == 2 and got["overlap"]["head"]["status"] == "ok", got["overlap"]              # an older read answering last does not overwrite newer heads

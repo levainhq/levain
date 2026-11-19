@@ -51,10 +51,9 @@ out.keys = {
   refusedBeatsFailed: key({ boot: Object.assign({}, base, { refused: true, failed: "x", failedAt: NOW }) }),
   failed: key({ boot: Object.assign({}, base, { failed: "HTTP 502", failedAt: NOW }) }),
   failedColdBeatsConnecting: key({ boot: Object.assign({}, base, { wholeDrawn: false, lastWholeAt: 0, failed: "x", failedAt: NOW }) }),
-  failedThenReadOk: key({ boot: Object.assign({}, base, { failed: "old", failedAt: NOW - 5000 }), held: { a: { at: NOW - 1000 } } }),
   downState: key({ stream: { state: "down", since: NOW - 4000, lastChunk: NOW - 4000 } }),
   downConnecting: key({ stream: { state: "connecting" } }),
-  paused: key({ stream: { state: "paused" } }),
+  paused: key({ stream: { state: "paused", everLive: true } }),
   noStreamScript: key({ stream: {} }),
   stale: key({ heads: { board: { status: "stale", as_of: "2026-11-19T11:57:00Z" } } }),
   fault: key({ stream: Object.assign({}, live, { faults: ["inbox"] }) }),
@@ -101,6 +100,14 @@ out.failedAge = [d(failedLive).words, d(failedLive).age, d(failedLive, NOW + 600
 // the first connection of a stream that was never live waits longer than a reconnect before it speaks
 const holdOf = (st) => d({ stream: st }).holdMs;
 out.hold = [holdOf({ state: "connecting" }), holdOf({ state: "connecting", everLive: true }), holdOf({ state: "down" }), L.HOLD_MS, L.HOLD_FIRST_MS];
+// a total order over the stale panels: those without a read time sort last, in the order given, whichever way they arrive
+const noRead = (ids) => { const h = {}; ids.forEach((i) => { h[i] = { status: "stale" }; }); return h; };
+out.order = [d({ heads: noRead(["a", "b"]) }).words, d({ heads: noRead(["b", "a"]) }).words,
+  d({ heads: Object.assign(noRead(["a", "b"]), { c: { status: "stale", as_of: new Date(NOW - 60000).toISOString() } }) }).words];
+// a panel the page could not read at all (the whole draw held no etag for it) is "unavailable"; one it read once is "stale"
+const unread = d({ stream: Object.assign({}, live, { faults: ["inbox"] }), held: { inbox: { etag: null } } });
+const reread = d({ stream: Object.assign({}, live, { faults: ["inbox"] }), held: { inbox: { etag: "7", at: NOW - 70000 } } });
+out.unread = [unread.words, unread.age, reread.words];
 console.log(JSON.stringify(out));
 """
 
@@ -139,7 +146,6 @@ def test_the_state_is_the_first_match_of_the_table(tmp_path: Path) -> None:
     assert k["live"] == "live" and k["connecting"] == "connecting"
     assert k["refused"] == "refused" and k["refusedBeatsFailed"] == "refused" and k["failed"] == "failed"
     assert k["failedColdBeatsConnecting"] == "failed"              # a refusal or a failure is said before the board has ever been drawn
-    assert k["failedThenReadOk"] == "live"                          # a later good read ends a failure
     assert k["downState"] == "down" and k["downConnecting"] == "down"
     assert k["paused"] == "live" and k["noStreamScript"] == "live"  # a hidden tab and a page without the stream script say nothing
     assert k["stale"] == "stale" and k["fault"] == "stale"          # a stale head, or a panel the page could not read
@@ -185,3 +191,8 @@ def test_a_failed_read_ages_from_the_last_read_never_from_heartbeats(tmp_path: P
 def test_the_first_connection_of_a_stream_waits_longer_than_a_reconnect(tmp_path: Path) -> None:
     first, reconnect, down, hold, hold_first = _run(tmp_path)["hold"]
     assert first == hold_first and reconnect == hold and down == hold and hold_first > hold
+
+
+def test_a_panel_the_page_never_read_is_unavailable_and_one_it_read_once_is_stale(tmp_path: Path) -> None:
+    unread, age, reread = _run(tmp_path)["unread"]
+    assert unread == "INBOX unavailable" and reread == "INBOX stale", (unread, reread)
