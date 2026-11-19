@@ -65,12 +65,16 @@ def test_the_page_runs_the_places_script_after_the_board_painters() -> None:
     assert sheets == ["/dashboard.css"]
 
 
-def test_the_tagline_is_static_text_in_the_visible_element() -> None:
-    """The line under the wordmark sits in its own element (the page hides `.model`, which a manifest's brand also overwrites)."""
+def test_the_header_has_no_tagline_and_the_pages_no_footer() -> None:
+    """levain#151: Phill took the tagline out of the header ("can come out of the header entirely") and signed the footer away
+    (np-6920d6b5 (c), "delete the footer too"), on the cockpit and the init page alike."""
     p = _parse()
     html = (WEB / "dashboard.html").read_text()
-    assert [a for t, a, _ in p.tags if "ia-tagline" in a.get("class", "").split()] == [{"class": "ia-tagline", "id": "ia-tagline"}]
-    assert '<div class="ia-tagline" id="ia-tagline">what needs you, what is moving, what it remembers</div>' in html
+    assert not [a for t, a, _ in p.tags if {"ia-tagline", "model"} & set(a.get("class", "").split())]
+    assert "what needs you, what is moving" not in html
+    for page in ("dashboard.html", "init.html"):
+        text = (WEB / page).read_text()
+        assert "<footer" not in text and "deck-foot" not in text and "sovereign · localhost" not in text, page
 
 
 def test_the_bar_holds_places_only() -> None:
@@ -120,7 +124,7 @@ STATE = """(() => ({
   bar: [...document.querySelectorAll('.ia-places [data-ia-place-btn]')].map(b => b.dataset.iaPlaceBtn),
   current: [...document.querySelectorAll('[aria-current="page"]')].map(b => b.dataset.iaPlaceBtn || b.id || b.tagName),
   mode: document.body.dataset.mode || '',
-  tagline: Math.round(document.querySelector('.ia-tagline').getBoundingClientRect().height),
+  tagline: document.querySelectorAll('.masthead .ia-tagline, .masthead .model').length,
   modeTabsShown: [...document.querySelectorAll('[data-mode-tab]')].filter(b => b.getClientRects().length).length,
 }))()"""
 PRESS = "document.querySelector('.ia-places [data-ia-place-btn=\"%s\"]').click(); 1"
@@ -152,12 +156,12 @@ def test_a_browser_lands_on_home_moves_between_places_and_takes_the_keys(tmp_pat
     landing, memory, home, key4, key1, phone = states
     assert landing["bar"] == ["home", "desk", "room", "memory", "settings"]
     assert landing["place"] == "home" and landing["current"] == ["home"]
-    assert landing["modeTabsShown"] == 0 and landing["tagline"] > 0
+    assert landing["modeTabsShown"] == 0 and landing["tagline"] == 0
     assert memory["place"] == "memory" and memory["current"] == ["memory"] and memory["mode"] == "memory"
     assert home["place"] == "home" and home["current"] == ["home"]
     assert key4["place"] == "memory" and key4["mode"] == "memory"
     assert key1["place"] == "home"
-    assert phone["tagline"] > 0 and phone["bar"] == ["home", "desk", "room", "memory", "settings"], phone
+    assert phone["tagline"] == 0 and phone["bar"] == ["home", "desk", "room", "memory", "settings"], phone
 
 
 MODE_KEY = "levain_cockpit_mode"   # cockpit_view.js MODE_KEY: the page keeps the chosen mode in sessionStorage under this key

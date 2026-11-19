@@ -285,14 +285,6 @@ button#submit:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 .file-row .file-path { color: var(--ink-dim); word-break: break-all; }
 
-.deck-foot {
-  margin-top: 34px;
-  text-align: center;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink-faint);
-  letter-spacing: 0.3px;
-}
 
 @media (max-width: 560px) {
   .deck { padding: 28px 16px 56px; }

@@ -165,7 +165,6 @@
   .brand { display: flex; align-items: center; gap: var(--sp-3); }
   .wordmark { font: var(--fw-bold) var(--fs-title)/1 var(--round); letter-spacing: var(--track-tight); color: var(--text); display: flex; align-items: center; gap: var(--sp-3); }
   .wordmark::before { content: ""; width: 10px; height: 10px; border-radius: var(--r-pill); background: var(--accent); display: inline-block; }
-  .model { display: none; }
   .seg { display: flex; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-2); }
   .mode { background: none; border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-body) var(--round); }
   .mode kbd, button#jumpbtn kbd { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--meta); margin-inline: 0 var(--sp-2); }
@@ -525,8 +524,6 @@
   .scope-wrap[data-solo="ch3"] .scope-ch:not(.ch3) { opacity: .4; }
   body[data-vital="dark"] svg.scope { filter: grayscale(.5) brightness(.65); }
 
-  .deck-foot { margin-top: var(--sp-6); padding-bottom: var(--sp-7); text-align: center; color: var(--faint); font-size: var(--fs-micro);
-    letter-spacing: var(--track-caps); text-transform: uppercase; font-family: var(--sans); position: relative; z-index: 1; }
 
   /* ── motion ────────────────────────────────────────────────────────────── */
   /* the settled trace is solid in every engine: with non-scaling-stroke an engine may skip the pathLength
@@ -3860,9 +3857,8 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
    The Modes bar is gone from the markup; Morning and Build are retired modes, their panels placed on Home or in Memory.
    ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════ */
 
-/* ── the masthead: the tagline shows;  the actions are buttons, not places ─────────────────────────────────────────── */
+/* ── the masthead: the wordmark, no tagline;  the actions are buttons, not places ─────────────────────────────────────────── */
 body.ia .brand { flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; }
-body.ia .ia-tagline { font: var(--fw-regular) var(--fs-meta)/1.3 var(--round); color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
 body.ia .ia-actions { display: inline-flex; gap: var(--sp-2); margin-right: var(--sp-3); }
 body.ia .ia-act { display: inline-flex; align-items: center; gap: var(--sp-2); min-height: var(--seg-h); padding: 0 var(--sp-4); border: 1px solid var(--hair);
   border-radius: var(--r-md); background: var(--card); color: var(--text); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
@@ -3876,13 +3872,11 @@ body.ia .ia-ico { font-size: 13px; line-height: 1; color: var(--accent); }
   body.ia .ia-actions { margin-right: 0; }
   body.ia .ia-act { padding: 0 var(--sp-3); }
 }
-/* Side by side (above the stacked breakpoint) the readout asks for its whole width and the tagline is what gives: it wraps onto a
-   second line before the readout is ever drawn over the brand or the entity name is squeezed out. It wraps and is never cut,
-   because the line is his own sentence and an ellipsis would hide its last words on a tablet held sideways. */
+/* Side by side (above the stacked breakpoint) the readout asks for its whole width and the brand (the wordmark alone since
+   levain#151 took the tagline out of the header) is what gives first. */
 @media (min-width: 1101px) {
   body.ia .masthead .brand { flex: 0 1000 auto; min-width: 8rem; }
   body.ia .masthead .readout { flex: 1 1 auto; }
-  body.ia .ia-tagline { max-width: min(42ch, 100%); white-space: normal; }
 }
 
 /* ── the places bar: Home, (Desk,) Room, Memory; the Needs count rides Home and is visible from every place ─────────── */
@@ -3920,7 +3914,6 @@ body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head > :not(
 body.ia[data-ia-place="home"] .deck > .frame:not(.masthead):not(.ia-places),
 body.ia[data-ia-place="home"] :is(#ck-band, #ck-skycol) { padding-inline: 0; margin: 0; }
 body.ia[data-ia-place="home"] .ck-zone:not([data-zone="operate"]) { order: 90; margin: 0; }
-body.ia[data-ia-place="home"] .deck-foot { order: 99; }
 body.ia .ia-head { display: none; }
 /* the order: the chrome, the now line, what needs him, the desk, the glance, the work, the machine (the glance moved up: levain#141 polish, below) */
 body.ia .deck > .masthead { order: -8; }
@@ -4029,7 +4022,6 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia .masthead .themesw { order: 2; flex: none; }
   body.ia .masthead .indicators, body.ia .masthead .indicators > *, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn, #stamp) { order: 3; }
   body.ia .masthead .unit { order: 4; }
-  body.ia .ia-tagline { max-width: 100%; font-size: var(--fs-micro); white-space: normal; }
   body.ia .masthead .indicators { gap: var(--sp-2); }
   body.ia .ia-act { min-width: 38px; min-height: 38px; padding: 0; justify-content: center; }
   body.ia .ia-places { justify-content: space-between; }
@@ -4161,10 +4153,6 @@ body.ia .deck { padding-top: 0; }   /* the masthead carries the status-bar inset
 html { scroll-padding-top: var(--ia-bars-h, 0px); }
 body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .ck-thiscockpit) { scroll-margin-top: var(--sp-4); }
 
-/* the brand keeps room for a two-line tagline beside the readout (at 1101-1180 it fell to three lines); the line wraps, never cut */
-@media (min-width: 1101px) {
-  body.ia .masthead .brand { min-width: 15rem; }
-}
 /* a touch screen, at every width: each masthead control (the presence chip, Sync, Jump, the theme buttons, the three actions) is a 44 px target;
    the actions (in the block above) and the theme buttons, which are icons only, are 44 wide as well */
 @media (pointer: coarse) {
@@ -4218,3 +4206,7 @@ body.ia[data-ia-place="home"] #ck-widgets { order: 25; }
      take a third each, the same span they have from 1101 up. */
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="scheduled_jobs"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 4 !important; }
 }
+
+/* levain#151: the footer is gone (Phill np-6920d6b5 (c)); its margin and padding were the page's bottom room, so the deck carries it.
+   Room and Desk pin the deck to the window with no bottom padding: they are not touched. */
+body.ia:not(.rv-on):not(.dv-on) .deck { padding-bottom: calc(var(--sp-6) + var(--sp-7) + env(safe-area-inset-bottom, 0px)); }

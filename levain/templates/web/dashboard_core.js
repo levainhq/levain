@@ -386,10 +386,6 @@
       // the brand). Keep the " · substrate control" suffix; swap only the wordmark.
       document.title = view.brand_wordmark + " · substrate control";
     }
-    if (view.brand_model) {
-      const md = document.querySelector(".brand .model");
-      if (md) md.textContent = view.brand_model;
-    }
     syncEntityDupe();
     // The operator's state line: their OWN words, reflected back verbatim (no machine
     // interpretation). Hidden when there is no live-context source; "no state set"

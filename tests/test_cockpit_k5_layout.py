@@ -218,14 +218,13 @@ def test_a_full_bar_never_widens_the_page_and_keeps_the_readout_right_of_the_bra
 # (levain#141 polish: the entity name and the jar left the readout; this holds what is left of it.)
 MID_BAR = ("(() => { %s"
            " const R = (e) => { const r = e.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top, b: r.bottom, w: r.width, h: r.height }; };"
-           " return new Promise(r => setTimeout(r, 250)).then(() => { const br = R(document.querySelector('.masthead .brand')), tag = document.getElementById('ia-tagline');"
+           " return new Promise(r => setTimeout(r, 250)).then(() => { const br = R(document.querySelector('.masthead .brand'));"
            " const drawn = (e) => e.getClientRects().length > 0 && R(e).w > 0 && R(e).h > 0;"
            " const hit = [...document.querySelectorAll('.masthead .indicators > *, .masthead .ia-act, .masthead .themesw')]"
            "   .filter(drawn).filter(e => { const r = R(e); return r.l < br.r - 0.5 && r.r > br.l + 0.5 && r.t < br.b - 0.5 && r.b > br.t + 0.5; }).map(e => e.id || e.className || e.tagName);"
            " const acts = [...document.querySelectorAll('.ia-actions .ia-act')];"
            " return { sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, hit,"
-           " wordW: Math.round(R(document.querySelector('.masthead .wordmark')).w), tagRight: Math.round(R(tag).r), brandRight: Math.round(br.r),"
-           " tagCut: tag.scrollWidth > tag.clientWidth, tagLines: Math.round(R(tag).h / parseFloat(getComputedStyle(tag).lineHeight)),"
+           " wordW: Math.round(R(document.querySelector('.masthead .wordmark')).w), brandRight: Math.round(br.r),"
            " labels: acts.map(a => drawn(a.querySelector('.ia-lbl'))), named: acts.map(a => !!a.getAttribute('aria-label') && !!a.title) }; }); })()")
 
 
@@ -238,10 +237,7 @@ def test_the_masthead_keeps_the_brand_and_the_buttons_apart_at_every_width(tmp_p
     out = _run(tmp_path, [{"eval": MID_BAR % font}], width=width)[-1]
     assert out["sw"] <= out["cw"], out                                     # nothing widens the page
     assert out["hit"] == [], out                                           # no block of the readout is drawn over the brand
-    assert out["wordW"] > 40 and out["tagRight"] <= out["brandRight"], out  # the brand keeps its name; the tagline ends inside the brand
-    assert out["tagCut"] is False, out                                     # and wraps rather than being cut: every word of it is drawn
-    if 1100 < width <= 1180:
-        assert out["tagLines"] <= 2, out                                   # levain#141 polish: it was three lines here
+    assert out["wordW"] > 40, out                                          # the brand keeps its name (levain#151: the tagline left the header)
     # the buttons' words show where they fit: in the stacked layout and from 1501 up; between, they are icons and keep their names
     assert out["labels"] == [not (1100 < width <= 1500)] * 3, out
     assert out["named"] == [True] * 3, out
