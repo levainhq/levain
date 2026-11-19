@@ -62,8 +62,11 @@ integer. The string carries a major only; there is no minor in it. The reader co
 what it speaks. On an unknown major, or a different name, it refuses: it serves no snapshots and says so in its own
 health, rather than guessing at a layout it does not know. Minor, additive changes never change the major; a reader
 ignores columns and meta keys it does not know. A writer that opens an existing file whose contract it does not speak
-refuses too and never migrates in place: it reads the contract row before it sets any pragma or writes any table, so a
-refusal leaves the file exactly as it found it. A file with other tables and no contract row is refused as well.
+refuses too and never migrates in place: it reads the contract row on a connection that writes nothing, before it sets
+any pragma or writes any table, so a refusal leaves the file exactly as it found it. A file with other tables and no
+contract row is refused as well. The file is a cache of derivable data: a writer that opens a file of its own major
+whose `meta`, `panel` or `stream` table differs from the schema below drops all three and recreates them in one
+transaction (it says so on stderr), rather than failing its publishes.
 
 A file with no contract row (the writer has not finished opening, or it is some other database) is empty to a
 reader: no panels, no meta, not a mismatch.
@@ -122,7 +125,7 @@ One row per panel, updated in place on every publish.
 | `duration_ms` | how long that derive took, milliseconds |
 | `valid_until` | null means no time limit; else the time after which the content should be re-derived |
 | `inputs_fp` | fingerprint of the panel's inputs at derive time; opaque to readers |
-| `write_gen` | the highest write generation this snapshot reflects (read-your-writes marker); never decreases. An `error` or `timeout` publish carries none: it reflects no write |
+| `write_gen` | the highest write generation this snapshot reflects (read-your-writes marker); never decreases. An `error` or `timeout` publish carries the `write_gen` it was derived for, so a reader waiting for that write is answered by that row and its status |
 | `status` | the outcome: `ok`, `empty`, `partial`, `error`, `timeout`; a reader treats an unknown value as `partial` |
 | `error` | the error text when the derive failed or timed out, else null |
 | `body_sha` | lowercase hex sha256 of `body`; the empty string when `body` is NULL |
@@ -204,3 +207,4 @@ absent file or table reads as "not there": a locked, busy or unreadable database
   anyway and the `inputs` stream names the lock path.
 - Heartbeats commit once per worker poll, so `data_version` moves on an idle store; use `publish_seq` for "a panel
   changed".
+- A foreign file at the snapshot path whose only tables are `meta`, `panel` and `stream`, with a matching `meta` schema, is adopted (nothing but the worker writes that path).

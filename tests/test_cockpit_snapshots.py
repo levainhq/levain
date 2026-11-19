@@ -559,3 +559,77 @@ def test_an_unreadable_path_raises_snapshot_read_error(tmp_path):
     r = S.SnapshotReader(tmp_path / "file" / "x.db")  # stat answers ENOTDIR, not "not found"
     with pytest.raises(S.SnapshotReadError):
         r.read("a")
+
+
+_OLD_PANEL_DDL = (
+    "CREATE TABLE panel (id TEXT PRIMARY KEY, gen INTEGER NOT NULL, derived_at REAL NOT NULL, started_at REAL NOT NULL,"
+    " duration_ms REAL NOT NULL, valid_until REAL, inputs_fp TEXT NOT NULL, write_gen INTEGER NOT NULL,"
+    " status TEXT NOT NULL, error TEXT, body_sha TEXT NOT NULL, body BLOB NOT NULL)"
+)
+
+
+def test_a_cache_with_an_older_panel_schema_is_rebuilt_not_refused(db, capsys):
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    c.execute("INSERT INTO meta VALUES ('contract', 'levain-cockpit-snapshots/1')")
+    c.execute(_OLD_PANEL_DDL)
+    c.execute("INSERT INTO panel VALUES ('old', 1, 1.0, 0.9, 5.0, NULL, '', 0, 'ok', NULL, 'x', x'6e756c6c')")
+    c.commit()
+    c.close()
+    w = S.SnapshotWriter(db)
+    assert "rebuilding" in capsys.readouterr().err
+    w.publish("new", status="error", body=None, started_at=1.0, derived_at=1.1, duration_ms=1.0, error="boom")
+    w.close()
+    r = S.SnapshotReader(db)
+    assert r.read("old") is None  # the old cache rows went with the old tables
+    snap = r.read("new")
+    assert snap.status == "error" and snap.body is None
+
+
+def test_a_current_schema_is_not_rebuilt(db, capsys):
+    w = S.SnapshotWriter(db)
+    _pub(w)
+    w.close()
+    S.SnapshotWriter(db).close()
+    assert "rebuilding" not in capsys.readouterr().err
+    assert S.SnapshotReader(db).read("a") is not None
+
+
+def _unknown_major_wal(db):
+    c = sqlite3.connect(db)
+    assert c.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    c.execute("INSERT INTO meta VALUES ('contract', 'levain-cockpit-snapshots/2')")
+    c.commit()
+    return c
+
+
+def test_an_unknown_major_wal_file_gets_no_new_wal_or_shm_from_the_refusal(db):
+    _unknown_major_wal(db).close()  # the last connection closing removes the -wal/-shm
+    assert not os.path.exists(str(db) + "-wal") and not os.path.exists(str(db) + "-shm")
+    with pytest.raises(S.ContractMismatch):
+        S.SnapshotWriter(db)
+    assert not os.path.exists(str(db) + "-wal") and not os.path.exists(str(db) + "-shm")
+
+
+def test_an_unknown_major_wal_file_in_use_by_another_process_is_left_untouched(db):
+    other = _unknown_major_wal(db)  # still open: its -wal/-shm exist
+    before = {s: os.stat(str(db) + s) for s in ("", "-wal", "-shm")}
+    with pytest.raises(S.ContractMismatch):
+        S.SnapshotWriter(db)
+    after = {s: os.stat(str(db) + s) for s in ("", "-wal", "-shm")}
+    assert {s: (v.st_size, v.st_mtime_ns) for s, v in before.items()} == {s: (v.st_size, v.st_mtime_ns) for s, v in after.items()}
+    other.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_the_refusal_of_an_unknown_major_wal_file_needs_no_write_access_to_its_directory(db):
+    _unknown_major_wal(db).close()
+    open(str(db) + S.LOCK_SUFFIX, "w").close()  # the lock file is the one thing the writer may create
+    d = db.parent
+    os.chmod(d, 0o555)
+    try:
+        with pytest.raises(S.ContractMismatch):
+            S.SnapshotWriter(db)
+    finally:
+        os.chmod(d, 0o755)

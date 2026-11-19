@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -145,6 +146,24 @@ def _close_fd_box(box: list) -> None:
             pass
 
 
+def _preflight(path: str) -> tuple[str | None, set[str]]:
+    """(stored contract value or None, table names) of the file at `path`, read without writing anything."""
+    if not os.path.exists(path):
+        return None, set()
+    uri = _uri(path)
+    if not os.path.exists(path + "-wal"):
+        # No log to read, so the main file is the whole database; a plain read-only open of a WAL file would still
+        # create the -wal/-shm.
+        uri = uri.replace("?mode=ro", "?immutable=1")
+    db = sqlite3.connect(uri, uri=True)
+    try:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        row = db.execute("SELECT value FROM meta WHERE key='contract'").fetchone() if "meta" in tables else None
+        return (row[0] if row else None), tables
+    finally:
+        db.close()
+
+
 class SnapshotWriter:
     """The one writer. Used from one thread at a time; the caller serialises its publishes.
 
@@ -164,24 +183,19 @@ class SnapshotWriter:
         self._fd_finalizer = weakref.finalize(self, _close_fd_box, self._fd_box)
         self._db: sqlite3.Connection | None = None
         try:
+            # The contract is checked on a read-only connection before this one exists: a refusal leaves the file (and
+            # its -wal/-shm) as it was found.
+            stored, tables = _preflight(self.path)
+            _check_contract(stored)
+            if stored is None and tables - set(_OURS):
+                raise ContractMismatch(f"{self.path} is a database with other tables and no snapshot contract")
             self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
-            # The contract is checked before any pragma or schema write: a refusal leaves the file as it was found.
-            try:
-                row = self._db.execute("SELECT value FROM meta WHERE key='contract'").fetchone()
-            except sqlite3.OperationalError as exc:
-                if not _absent(exc):
-                    raise
-                row = None  # no meta table yet: a fresh file, or some other database
-            _check_contract(row[0] if row else None)
-            if row is None:
-                tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if tables - set(_OURS):
-                    raise ContractMismatch(f"{self.path} is a database with other tables and no snapshot contract")
             mode = self._db.execute("PRAGMA journal_mode=WAL").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
                 raise sqlite3.OperationalError(f"journal_mode stayed {mode[0] if mode else None!r}, not wal")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute(f"PRAGMA journal_size_limit={int(JOURNAL_SIZE_LIMIT)}")
+            self._rebuild_if_drifted(tables)
             self._db.executescript(_SCHEMA)
             started = time.time() if now is None else now
             with self._tx():
@@ -196,6 +210,33 @@ class SnapshotWriter:
 
     def _tx(self):
         return _Tx(self._db)
+
+    def _rebuild_if_drifted(self, tables: set[str]) -> None:
+        """The file is a cache of derivable data: a table of ours that differs from the current schema is dropped.
+
+        All three go in one transaction and are recreated by the schema that follows. Only a file already carrying
+        this contract major gets here (another major was refused above).
+        """
+        want = sqlite3.connect(":memory:")
+        try:
+            want.executescript(_SCHEMA)
+            drifted = [
+                t for t in _OURS
+                if t in tables
+                and self._db.execute(f"PRAGMA table_info({t})").fetchall() != want.execute(f"PRAGMA table_info({t})").fetchall()
+            ]
+        finally:
+            want.close()
+        if not drifted:
+            return
+        print(f"cockpit snapshots: {self.path}: {', '.join(drifted)} differ from the current schema; rebuilding the cache",
+              file=sys.stderr)
+        with self._tx():
+            for t in _OURS:
+                self._db.execute(f"DROP TABLE IF EXISTS {t}")
+            for stmt in _SCHEMA.split(";"):
+                if stmt.strip():
+                    self._db.execute(stmt)
 
     def _set_meta(self, key: str, value: str) -> None:
         self._db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
