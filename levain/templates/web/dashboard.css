@@ -4062,3 +4062,39 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
 
 /* Memory is a place of its own and draws no drop box at its top: the Drop button goes Home first (dashboard_places.js), then to the box */
 body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }
+
+/* ── levain#141 polish: Machine ───────────────────────────────────────────────────────────────────────────────────────
+   The Machine card's control row (#ck-mctl): Show/Hide the graphs, Calm, Ambient, and the stats box (#ck-jarbox, drawn by dashboard_core.js).
+   Closed: the headline stats and the one button; the selector (.tv-seg) is not drawn. Open: this row, then the selector, then the graph,
+   at every width (the button no longer floats over the selector). */
+body.ia[data-ia-place="home"] .ck-mctl { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); padding: var(--sp-4) var(--sp-6) var(--sp-3); }
+body.ia[data-ia-place="home"] .ck-mctl .ia-graph-toggle { position: static; z-index: auto; }
+body.ia[data-ia-place="home"] .ck-mctl :is(.ia-graph-toggle, #calmbtn, .sky-toggle) {
+  display: inline-flex; align-items: center; justify-content: center; min-height: var(--seg-h); box-sizing: border-box; padding: 0 var(--sp-4);
+  border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
+  font: var(--fw-semibold) var(--fs-meta) var(--round); white-space: nowrap; }
+body.ia[data-ia-place="home"] .ck-mctl .ia-graph-toggle { color: var(--text); }
+body.ia[data-ia-place="home"] .ck-mctl :is(.ia-graph-toggle, #calmbtn, .sky-toggle):hover { color: var(--text); border-color: var(--hair-2); }
+body.ia[data-ia-place="home"] .ck-mctl :is(#calmbtn, .sky-toggle)[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+body.ia[data-ia-place="home"] .ck-mctl .sky-toggle-ghost { display: none; }
+body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox { margin-left: auto; display: flex; align-items: center; gap: var(--sp-3); color: var(--meta); font-size: var(--fs-meta); }
+body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox:empty { display: none; }
+@media (pointer: coarse) {
+  body.ia[data-ia-place="home"] .ck-mctl :is(.ia-graph-toggle, #calmbtn, .sky-toggle) { min-height: var(--hit-min, 44px); }
+}
+/* closed: no selector, so no hairline beside the figures and no room kept for a button that no longer floats over the bar */
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens .tv-seg { display: none; }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens :is(.tv-bar, .hl-bar) > .tv-metrics { padding-left: 0; border-left: 0; min-height: 0; }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 0; }
+@media (max-width: 720px) {
+  body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 0; }
+  body.ia[data-ia-place="home"] .ck-mctl { padding-inline: var(--gutter, var(--sp-5)); }
+}
+/* board row #144: at 1101-1180 the four-up Machine row and the five At a glance tiles left one panel / tile alone on a row.
+   Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row of three-up tiles that GROW, so whatever the last row holds fills it
+   (a tile the mode hides takes no place, which a counted grid cannot know). */
+@media (1100px < width <= 1180px) {
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 6 !important; }
+  body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; flex-wrap: wrap; }
+  body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - 2 * var(--sp-4)) / 3 - 1px); min-width: 0; }
+}
