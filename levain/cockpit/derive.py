@@ -428,8 +428,8 @@ class DeriveLoop:
                     threading.Thread(target=self._thread_main, args=(self._worker,), name=f"derive-{i}", daemon=True)
                 )
             self._live = len(self._threads)
-        for t in self._threads:
-            t.start()
+            for t in self._threads:  # under the lock stop() takes, so stop() never sees a thread not yet started
+                t.start()
 
     def stop(self, timeout: float | None = None) -> list[threading.Thread]:
         """End the loop for good; wait for the threads (`timeout` seconds in all; None waits as long as it takes).
@@ -558,23 +558,10 @@ class DeriveLoop:
             self._last_event_at = now  # the last change seen; the first poll's fingerprints are not a change
         self._last_views = seen
         self._publish_timeouts(now)
-        degraded = [name for v in views.values() for name in (*v.unknown_names, *v.stale_locks)]
-        with self._lock:
-            degraded += [f"{pid}: derive timeout" for pid, st in self._states.items() if st.timed_out]
-        with self._lock:
-            err = self.last_publish_error
-        if err is not None:
-            degraded.append(f"write error: {type(err).__name__}: {err}")
         writer_ok = False
         with self._write_lock:
             try:
                 self._writer.heartbeat(now)
-                self._writer.set_stream(
-                    "inputs",
-                    state="degraded" if degraded else "ok",
-                    last_event_at=self._last_event_at,
-                    detail="; ".join(degraded),
-                )
             except Exception as exc:  # a failing writer must not kill the loop
                 with self._lock:
                     self.last_publish_error = exc
@@ -587,9 +574,27 @@ class DeriveLoop:
             for pid in [p for p in self._pending_pub if p not in owing and not self._states[p].busy]:
                 del self._pending_pub[pid]
             # the writer answers again; a panel whose publish failed keeps the error until it publishes
-            if writer_ok and err is not None and self.last_publish_error is err and not self._pending_pub:
+            if writer_ok and self.last_publish_error is not None and not self._pending_pub:
                 self.last_publish_error = None
-            return [_Job(pid, reason, views[pid].fp, token) for pid, reason in due]
+            jobs = [_Job(pid, reason, views[pid].fp, token) for pid, reason in due]
+            err = self.last_publish_error
+            degraded = [name for v in views.values() for name in (*v.unknown_names, *v.stale_locks)]
+            degraded += [f"{pid}: derive timeout" for pid, st in self._states.items() if st.timed_out]
+        if err is not None:
+            degraded.append(f"write error: {type(err).__name__}: {err}")
+        if writer_ok:
+            with self._write_lock:
+                try:
+                    self._writer.set_stream(
+                        "inputs",
+                        state="degraded" if degraded else "ok",
+                        last_event_at=self._last_event_at,
+                        detail="; ".join(degraded),
+                    )
+                except Exception as exc:
+                    with self._lock:
+                        self.last_publish_error = exc
+        return jobs
 
     def _poll_loop(self) -> None:
         while True:

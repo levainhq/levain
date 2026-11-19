@@ -1168,9 +1168,35 @@ def test_a_pending_publish_error_clears_when_the_panel_no_longer_owes_one(tmp_pa
     st.inputs_fp = loop._views()[0]["a"].fp
     loop._evaluate(clock.t)
     assert not loop._pending_pub and loop.last_publish_error is None
-    loop._evaluate(clock.t)
-    assert writer.streams[-1]["state"] == "ok"
+    assert writer.streams[-1]["state"] == "ok"  # the same poll that pruned it wrote the stream clean
     loop.stop()
+
+
+def test_stop_racing_start_never_raises():
+    errors = []
+    for _ in range(40):
+        loop, _w, _c, _ = make([PanelPlan("a")], poll_s=0.005, threads=2)
+        go = threading.Barrier(2)
+
+        def starter():
+            go.wait()
+            try:
+                loop.start()
+            except RuntimeError:
+                pass  # stop() won: a stopped loop does not start
+            except Exception as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=starter)
+        t.start()
+        go.wait()
+        try:
+            loop.stop(WAIT)
+        except Exception as exc:  # RuntimeError: cannot join thread before it is started
+            errors.append(exc)
+        t.join(WAIT)
+        loop.stop(WAIT)
+    assert errors == []
 
 
 def test_sqlite_reopen_failure_leaves_no_closed_connection_cached(tmp_path, monkeypatch):

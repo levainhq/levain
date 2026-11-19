@@ -208,3 +208,5 @@ absent file or table reads as "not there": a locked, busy or unreadable database
 - Heartbeats commit once per worker poll, so `data_version` moves on an idle store; use `publish_seq` for "a panel
   changed".
 - A foreign file at the snapshot path whose only tables are `meta`, `panel` and `stream`, with a matching `meta` schema, is adopted (nothing but the worker writes that path).
+- A crashed unknown-major WAL file with a `-wal` file and no `-shm` gets a `-shm` from the read-only preflight, even though it is then refused.
+- The preflight opens `immutable=1` when no `-wal` exists, which is safe only against cooperating writers; the single-writer lock, taken before the preflight, excludes those, and a foreign process writing the path is the foreign-file edge above.
