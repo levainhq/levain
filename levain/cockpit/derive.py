@@ -402,7 +402,9 @@ class DeriveLoop:
         token_fn: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.time,
         on_publish: Callable[[str, int, int], None] | None = None,
+        thread_name_prefix: str = "",
     ) -> None:
+        self._thread_name_prefix = thread_name_prefix  # lets a host tell its loop's threads from others
         self._writer = writer
         self._plans = dict(plans)
         self._derive_fn = derive_fn
@@ -548,10 +550,13 @@ class DeriveLoop:
             if self._started or self._stopping:
                 raise RuntimeError("a DeriveLoop starts once and does not restart after stop(): make a new one")
             self._started = True
-            self._threads = [threading.Thread(target=self._thread_main, args=(self._poll_loop,), name="derive-poll", daemon=True)]
+            pre = self._thread_name_prefix
+            self._threads = [
+                threading.Thread(target=self._thread_main, args=(self._poll_loop,), name=f"{pre}derive-poll", daemon=True)
+            ]
             for i in range(self._threads_n):
                 self._threads.append(
-                    threading.Thread(target=self._thread_main, args=(self._worker,), name=f"derive-{i}", daemon=True)
+                    threading.Thread(target=self._thread_main, args=(self._worker,), name=f"{pre}derive-{i}", daemon=True)
                 )
             self._live = len(self._threads)
             for t in self._threads:  # under the lock stop() takes, so stop() never sees a thread not yet started
