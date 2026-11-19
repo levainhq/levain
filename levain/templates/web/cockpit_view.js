@@ -2658,9 +2658,9 @@
   function landOnPanel(node, scroll) {
     if (handOff) handOff.stop();
     handOff = null;
-    const focusIt = (n) => { if (scroll) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
+    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
     let held = livePanel(node);
-    focusIt(held);
+    focusIt(held, scroll);
     const board = document.getElementById("board");
     if (!held.dataset || !held.dataset.ckPanel || !board || typeof root.MutationObserver !== "function") return;
     const obs = new root.MutationObserver(() => {
@@ -2669,7 +2669,7 @@
       const next = livePanel(held);
       if (next === held) return;
       held = next;
-      focusIt(held);
+      focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
       if (document.activeElement === held) me.stop();
     });
     const timer = root.setTimeout(() => me.stop(), 3000);
