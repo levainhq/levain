@@ -1162,12 +1162,12 @@ def test_a_pending_publish_error_clears_when_the_panel_no_longer_owes_one(tmp_pa
     f.write_text("22")
     _fail_publish_once(writer)
     loop.run_once(clock.t)  # the publish for the moved input fails
-    assert loop._pending_pub and loop.last_publish_error is not None
+    assert "publish:a" in loop._write_errors and loop.last_publish_error is not None
     f.write_text("1")  # the input goes back to what the store already reflects
     st = loop._states["a"]
     st.inputs_fp = loop._views()[0]["a"].fp
     loop._evaluate(clock.t)
-    assert not loop._pending_pub and loop.last_publish_error is None
+    assert not loop._write_errors and loop.last_publish_error is None
     assert writer.streams[-1]["state"] == "ok"  # the same poll that pruned it wrote the stream clean
     loop.stop()
 
@@ -1279,3 +1279,75 @@ def test_a_same_size_atomic_replace_moves_the_refs_walk(tmp_path):
     os.utime(tmp, ns=(ts, ts))
     os.replace(tmp, a)
     assert derive._refs_walk(str(refs)) != before
+
+
+# ------------------------------------------------------------------------------------------ L3 round 4: errors per source
+
+
+def _fail_n(obj, name, n, exc=OSError):
+    real, left = getattr(obj, name), [n]
+
+    def flaky(*a, **k):
+        if left[0]:
+            left[0] -= 1
+            raise exc("boom")
+        return real(*a, **k)
+
+    setattr(obj, name, flaky)
+
+
+def test_a_heartbeat_success_does_not_clear_a_failing_timeout_publish():
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=5.0)])
+    with loop._lock:
+        st = loop._states["a"]
+        st.running_since, st.busy = clock.t, True
+    _fail_n(writer, "publish", 10**6)
+    _fail_n(writer, "heartbeat", 1)
+    clock.t += 6
+    loop._evaluate(clock.t)  # the heartbeat fails, and so does the timeout publish
+    loop._evaluate(clock.t)  # the heartbeat lands; the timeout publish still fails
+    assert writer.streams[-1]["state"] == "degraded" and "timeout:a" in writer.streams[-1]["detail"]
+    loop.stop()
+
+
+def test_a_publish_failure_is_cleared_by_that_panels_publish_not_by_a_heartbeat(tmp_path):
+    fa, fb = tmp_path / "a.txt", tmp_path / "b.txt"
+    fa.write_text("1")
+    fb.write_text("1")
+    loop, writer, clock, _ = make(
+        [PanelPlan("a", inputs=(File(str(fa)),)), PanelPlan("b", inputs=(File(str(fb)),))], backstop_s=1e9
+    )
+    settle(loop, clock)
+    fa.write_text("22")
+    fb.write_text("22")
+    real = writer.publish
+
+    def only_a_fails(pid, **k):
+        if pid == "a" and fail_a[0]:
+            raise OSError("disk full")
+        return real(pid, **k)
+
+    fail_a = [True]
+    writer.publish = only_a_fails
+    loop.run_once(clock.t)  # a's publish fails, b's lands
+    loop._evaluate(clock.t)  # a heartbeat success in between
+    assert writer.streams[-1]["state"] == "degraded" and "publish:a" in writer.streams[-1]["detail"]
+    assert "publish:b" not in writer.streams[-1]["detail"]
+    fail_a[0] = False
+    loop.run_once(clock.t)  # a's publish lands
+    loop._evaluate(clock.t)
+    assert writer.streams[-1]["state"] == "ok"
+    loop.stop()
+
+
+def test_a_set_stream_failure_is_cleared_only_by_a_set_stream_success():
+    loop, writer, clock, _ = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    _fail_n(writer, "set_stream", 1)
+    loop._evaluate(clock.t)  # the stream write fails
+    assert loop.last_publish_error is not None
+    loop._evaluate(clock.t)  # the heartbeat lands; the stream still reads as failed
+    assert writer.streams[-1]["state"] == "degraded" and "stream" in writer.streams[-1]["detail"]
+    loop._evaluate(clock.t)  # the stream write landed on the previous poll
+    assert writer.streams[-1]["state"] == "ok" and loop.last_publish_error is None
+    loop.stop()

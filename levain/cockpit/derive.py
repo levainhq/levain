@@ -400,10 +400,27 @@ class DeriveLoop:
         self._threads: list[threading.Thread] = []
         self._live = 0  # threads started and not yet ended
         self._fp_closed = False
-        self._pending_pub: dict[str, BaseException] = {}  # panels whose last publish failed, until one lands
+        # Write failures by source: "heartbeat", "stream", "poll", "timeout:<pid>", "publish:<pid>". A source sets its own key
+        # when it fails and pops it when it next succeeds (or, for a panel, when it no longer owes the write); nothing
+        # else touches a key. Insertion order is failure order. Guarded by `_lock`.
+        self._write_errors: dict[str, BaseException] = {}
         self._last_event_at: float | None = None
         self._last_views: dict[Any, str | None] | None = None
-        self.last_publish_error: BaseException | None = None
+
+    @property
+    def last_publish_error(self) -> BaseException | None:
+        """The most recently failed write source's exception, or None when every source is clean."""
+        with self._lock:
+            return next(reversed(self._write_errors.values()), None)
+
+    def _fail(self, key: str, exc: BaseException) -> None:
+        with self._lock:
+            self._write_errors.pop(key, None)  # re-inserted last: the most recent failure reads last
+            self._write_errors[key] = exc
+
+    def _succeed(self, key: str) -> None:
+        with self._lock:
+            self._write_errors.pop(key, None)
 
     # ---- control
 
@@ -538,10 +555,10 @@ class DeriveLoop:
                         error=f"derive still running after {now - since:.0f} s",
                     )
                 except Exception as exc:
-                    with self._lock:
-                        self.last_publish_error = exc  # timed_out stays False: the next poll tries again
+                    self._fail(f"timeout:{pid}", exc)  # timed_out stays False: the next poll tries again
                 else:
                     with self._lock:
+                        self._write_errors.pop(f"timeout:{pid}", None)
                         if st.running_since == since:
                             st.timed_out = True  # only once the timeout row is in the store
 
@@ -563,25 +580,23 @@ class DeriveLoop:
             try:
                 self._writer.heartbeat(now)
             except Exception as exc:  # a failing writer must not kill the loop
-                with self._lock:
-                    self.last_publish_error = exc
+                self._fail("heartbeat", exc)
             else:
                 writer_ok = True
+                self._succeed("heartbeat")
         with self._lock:
             due = due_panels(self._plans, self._states, views, token, now, self._backstop_s)
             # A panel that is neither due nor busy owes no publish (its input went back): its failure no longer counts.
             owing = {pid for pid, _ in due}
-            for pid in [p for p in self._pending_pub if p not in owing and not self._states[p].busy]:
-                del self._pending_pub[pid]
-            # the writer answers again; a panel whose publish failed keeps the error until it publishes
-            if writer_ok and self.last_publish_error is not None and not self._pending_pub:
-                self.last_publish_error = None
+            for pid in self._states:
+                if pid not in owing and not self._states[pid].busy:
+                    self._write_errors.pop(f"publish:{pid}", None)
+                if self._states[pid].running_since is None:
+                    self._write_errors.pop(f"timeout:{pid}", None)  # the derive ended: no timeout row is owed
             jobs = [_Job(pid, reason, views[pid].fp, token) for pid, reason in due]
-            err = self.last_publish_error
             degraded = [name for v in views.values() for name in (*v.unknown_names, *v.stale_locks)]
             degraded += [f"{pid}: derive timeout" for pid, st in self._states.items() if st.timed_out]
-        if err is not None:
-            degraded.append(f"write error: {type(err).__name__}: {err}")
+            degraded += [f"write error {key}: {type(e).__name__}: {e}" for key, e in self._write_errors.items()]
         if writer_ok:
             with self._write_lock:
                 try:
@@ -592,8 +607,9 @@ class DeriveLoop:
                         detail="; ".join(degraded),
                     )
                 except Exception as exc:
-                    with self._lock:
-                        self.last_publish_error = exc
+                    self._fail("stream", exc)
+                else:
+                    self._succeed("stream")
         return jobs
 
     def _poll_loop(self) -> None:
@@ -605,9 +621,10 @@ class DeriveLoop:
             try:
                 jobs = self._evaluate(self._clock())
             except Exception as exc:  # one bad poll must not end the loop
-                with self._lock:
-                    self.last_publish_error = exc
+                self._fail("poll", exc)
                 jobs = []
+            else:
+                self._succeed("poll")
             with self._cv:
                 if self._stopping:
                     return
@@ -693,14 +710,9 @@ class DeriveLoop:
                         error=error,
                     )
                     published = True
-                    with self._lock:
-                        self._pending_pub.pop(pid, None)
-                        if not self._pending_pub:
-                            self.last_publish_error = None
+                    self._succeed(f"publish:{pid}")
             except Exception as exc:
-                with self._lock:
-                    self._pending_pub[pid] = exc
-                    self.last_publish_error = exc
+                self._fail(f"publish:{pid}", exc)
         finally:
             with self._cv:
                 st.running_since, st.timed_out = None, False
