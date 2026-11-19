@@ -537,3 +537,27 @@ def test_a_hidden_hero_draws_no_band_and_no_graph_button_on_home(tmp_path: Path)
     drawn, hidden = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"hero"')]
     assert drawn["hero"] is False and drawn["band"] == 1 and drawn["toggle"] == 1, drawn
     assert hidden == {"hero": True, "band": 0, "skycol": 0, "toggle": 0}, hidden
+
+
+@needs_browser
+def test_the_collapsed_graph_strip_hides_the_event_graph_too(tmp_path: Path) -> None:
+    """With the Event lens (or no topology at all) the graph is the page's #ck-sky: collapsed, it is not drawn, and the toggle opens it."""
+    M = ("(() => { const q = (s) => document.querySelector(s); const r = (n) => n ? {shown: n.getClientRects().length > 0, h: Math.round(n.getBoundingClientRect().height), kids: n.children.length} : null;"
+         " const sk = q('#ck-sky'); return JSON.stringify({open: document.body.classList.contains('ia-graph-open'), lens: q('#ck-skycard').dataset.hlens, sky: r(sk), legend: r(q('#ck-legend')),"
+         " hlens: r(q('#ck-hlens')), card: Object.assign(r(q('#ck-skycard')), {y: Math.round(q('#ck-skycard').getBoundingClientRect().top)}),"
+         " toggle: Object.assign(r(q('[data-ia-graph-toggle]')), {y: Math.round(q('[data-ia-graph-toggle]').getBoundingClientRect().top)}), canvas: sk ? sk.querySelectorAll('svg, canvas').length : 0}); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE, SETTLE,
+            {"eval": M},                                                                # 0: collapsed
+            {"eval": "document.querySelector('[data-ia-graph-toggle]').click(); 1"}, SETTLE,
+            {"eval": M},                                                                # 1: opened
+        ])
+    shut, opened = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"open"')]
+    assert shut["open"] is False and opened["open"] is True
+    assert shut["lens"] == "events" and shut["canvas"] > 0, shut                       # the fixture has an Event graph to hide
+    assert not shut["sky"]["shown"] and not shut["legend"]["shown"], shut              # collapsed: it is not drawn
+    assert opened["sky"]["shown"] and opened["sky"]["h"] > 0, opened                   # the toggle opens it
+    assert shut["card"]["h"] >= shut["toggle"]["h"] and shut["toggle"]["y"] + shut["toggle"]["h"] <= shut["card"]["y"] + shut["card"]["h"] + 1, shut   # the toggle stays inside the one-line card
