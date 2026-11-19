@@ -2123,6 +2123,14 @@
   // Returns true when it changed the tab: the places paint on the microtask after the attribute, so a caller that scrolls to the panel
   // waits a frame in that case.
   function revealTab(node) {
+    // Settings draws only the .dev-zone sections: a target drawn anywhere else is hidden while it is up, so the jump leaves Settings
+    // for Home first (the places' own go() clears ia-settings-on); the tab logic below then moves on to Memory if the panel lives there
+    const cl0 = document.body.classList;
+    let leftSettings = false;
+    if (cl0.contains("ia-settings-on") && !(node && node.closest && node.closest(".dev-zone"))) {
+      if (root.LevainPlaces && typeof root.LevainPlaces.go === "function") root.LevainPlaces.go("home"); else cl0.remove("ia-settings-on");
+      leftSettings = true;
+    }
     const id = node && node.dataset ? node.dataset.ckPanel : "";
     // a panel the places put on a tab other than the one its table names (Recent episodes sits in Memory) is revealed there
     const placed = id ? PLACED_ON[id] : undefined;
@@ -2134,6 +2142,7 @@
       applyMode(want, true);
       return true;
     }
+    if (leftSettings) return true;
     // the Desk and the Room hide every panel whatever the mode underneath is: the page's own tab for the mode is what leaves them
     const cl = document.body.classList;
     if (cl.contains("dv-on") || cl.contains("rv-on")) {
