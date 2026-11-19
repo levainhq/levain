@@ -375,3 +375,38 @@ def test_a_coarse_pointer_gets_44_px_actions_and_places(tmp_path: Path) -> None:
         assert g["coarse"] is True, g                                              # the emulation is a touch device, so the rule under test applies
         assert len(g["acts"]) == 3 and len(g["places"]) == 4, g
         assert min(g["acts"] + g["places"]) >= 44, g
+
+
+PANELS = {"until": "document.querySelector('.panel[data-ck-panel=\"tray\"]') && 1", "ms": 30000}
+# this fixture's kernel draws the List only; the Board and the Inbox are a manifest's panels, so two empty ones stand beside it, placed by the same attributes
+WORK_ROW = ("(() => { const t0 = document.querySelector('.panel[data-ck-panel=\"tray\"]');"
+            " for (const k of ['board', 'inbox']) { if (!document.querySelector('.panel[data-ck-panel=\"' + k + '\"]')) { const p = document.createElement('section'); p.className = 'panel'; p.dataset.ckPanel = k; t0.parentNode.appendChild(p); } }"
+            " const r =(n) => { const b = n.getBoundingClientRect(); return {x: Math.round(b.left), y: Math.round(b.top + scrollY), w: Math.round(b.width), h: Math.round(b.height), shown: n.getClientRects().length > 0}; };"
+            " const q = (s) => document.querySelector(s);"
+            " return JSON.stringify({head: r(q('.ia-head[data-ia-head=\"work\"]')), tray: r(q('.panel[data-ck-panel=\"tray\"]')), board: r(q('.panel[data-ck-panel=\"board\"]')),"
+            " inbox: r(q('.panel[data-ck-panel=\"inbox\"]')), reset: !!q('.ck-zone[data-zone=\"operate\"] > .zone-head > [data-layout-reset]')}); })()")
+# the Reset layout control, put where the page puts it (the operate zone head) while a layout is saved
+ADD_RESET = ("(() => { const h = document.querySelector('.ck-zone[data-zone=\"operate\"] > .zone-head'); const b = document.createElement('button'); b.type = 'button';"
+             " b.setAttribute('data-layout-reset', ''); b.textContent = 'Reset layout'; h.appendChild(b); return 1; })()")
+
+
+@needs_browser
+def test_the_work_row_is_one_row_with_the_head_above_the_three_panels(tmp_path: Path) -> None:
+    """With no Reset layout control (the default) the Work head spans the row and the List starts below it, beside Board and Inbox; with the control, it takes the head's row end."""
+    _root, src, _ids = _install(tmp_path)
+    steps: list = []
+    for w in (800, 1180, 1440, 1920):
+        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": WORK_ROW}]
+    steps += [{"eval": ADD_RESET}, SETTLE]
+    for w in (800, 1180, 1440):
+        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": WORK_ROW}]
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, PANELS, SETTLE] + steps)
+    rows = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"head"' in v]
+    assert len(rows) == 7, out["values"]
+    for g, w in zip(rows, (800, 1180, 1440, 1920, 800, 1180, 1440)):
+        assert g["head"]["shown"] and g["tray"]["shown"] and g["board"]["shown"] and g["inbox"]["shown"], (w, g)
+        assert g["tray"]["y"] >= g["head"]["y"] + g["head"]["h"], (w, g)               # the List is below the head, never beside it
+        if w >= 1101:
+            assert g["board"]["y"] == g["tray"]["y"] and g["inbox"]["y"] == g["tray"]["y"], (w, g)   # three across, one row
+    assert not rows[0]["reset"] and rows[4]["reset"], (rows[0], rows[4])
