@@ -849,3 +849,46 @@ def test_l131_an_interpreter_prefix_is_not_accepted_for_a_binary_or_a_wrong_inte
     finally:
         os.killpg(p.pid, signal.SIGKILL)
         p.wait()
+
+
+def _script(tmp_path, first_line, name="s"):
+    f = tmp_path / name
+    f.write_text(first_line + "\nexit 0\n")
+    return str(f)
+
+
+def test_l131_prefixes_for_the_env_form_and_a_shebang_with_args(tmp_path):
+    assert rc._script_prefixes([_script(tmp_path, "#!/usr/bin/env sh", "a")]) == ["/usr/bin/env sh", "sh"]
+    assert rc._script_prefixes([_script(tmp_path, "#!/bin/sh -e", "b")]) == ["/bin/sh -e"]
+    assert rc._script_prefixes([_script(tmp_path, "#!", "c")]) == []
+    assert rc._script_prefixes([_script(tmp_path, "echo hi", "d")]) == []
+
+
+def test_l131_prefixes_are_none_for_anything_unreadable_never_a_traceback(tmp_path):
+    f = tmp_path / "locked"
+    f.write_text("#!/bin/sh\n")
+    f.chmod(0)
+    good = _script(tmp_path, "#!/bin/sh", "good")
+    try:
+        assert rc._script_prefixes([str(f)]) == [] or os.geteuid() == 0
+    finally:
+        f.chmod(0o644)
+    assert rc._script_prefixes([str(tmp_path / "missing")]) == []
+    assert rc._script_prefixes([str(tmp_path)]) == []                       # a directory is not a regular file
+    for bad in (None, "x", [], [None], [1], [b"/bin/sh"], [good + "\0x"], ["/a\udc80b"], ["claude"], ["./s"]):
+        assert rc._script_prefixes(bad) == []
+    assert rc._script_prefixes([good]) == ["/bin/sh"]
+
+
+def test_l131_a_fifo_argv0_returns_promptly_without_blocking(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    assert rc._script_prefixes([str(fifo)]) == []
+    assert time.monotonic() - t0 < 2
+
+
+def test_l131_a_relative_argv0_is_not_confirmed_even_when_the_file_exists(tmp_path, monkeypatch):
+    _script(tmp_path, "#!/bin/sh", "rel")
+    monkeypatch.chdir(tmp_path)
+    assert rc._script_prefixes(["rel"]) == [] and rc._script_prefixes(["./rel"]) == []

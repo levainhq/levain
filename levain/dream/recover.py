@@ -19,6 +19,7 @@ import contextlib
 import os
 import shlex
 import signal
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,9 +97,10 @@ def _until(wait: float, deadline: float | None) -> float:
 
 
 def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path, deadline: float | None = None) -> bool | None:
-    """Does the process at ``pid`` still look like the recorded compose child: same start time, same command line, and
-    this occurrence's dir is the value of the recorded ``--add-dir`` argument (an exact argv element, never a substring
-    or a basename: ``o1`` must not match ``o10``). True = it matches; False = a live process is there that does not
+    """Does the process at ``pid`` still look like the recorded compose child: same start time, the recorded command line
+    (exactly, or behind its ``#!`` interpreter: see
+    ``_script_prefixes``), and this occurrence's dir is the value of the recorded ``--add-dir`` argument (an exact argv
+    element, never a substring or a basename: ``o1`` must not match ``o10``). True = it matches; False = a live process is there that does not
     (the recorded one has ended); None = ``ps`` could not be read (before ``deadline``, when one is given)."""
     ident = _ident(pid, deadline)
     if ident is None:
@@ -122,20 +124,31 @@ def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path, deadline
 def _script_prefixes(argv: Any) -> list[str]:
     """What ``ps`` may list before the recorded argv when ``argv[0]`` is a ``#!`` script: the kernel runs the script's
     interpreter and ``ps`` shows ``<interpreter> <script> <args>``, not the argv the parent passed. Only the script's own
-    shebang line is offered (and, for ``/usr/bin/env <prog>``, ``<prog>`` by name or path): a native binary has none."""
-    if not (isinstance(argv, list) and argv and isinstance(argv[0], str)):
+    shebang line is offered (and, for ``/usr/bin/env <prog>``, ``<prog>`` by name or path): a native binary has none.
+
+    Every failure to read it is "no prefixes" (not confirmed), never an exception and never a wait: ``argv[0]`` must be
+    an absolute path, is opened non-blocking (a FIFO with no writer cannot hang recovery) and must be a regular file.
+    Known edges, all failing closed: a relative or PATH-resolved ``argv[0]`` (bare ``claude``) is not confirmed, and the
+    ``#!/usr/bin/env -S prog --opt`` option forms are not reconstructed (neither is reachable for the recorded absolute
+    ``claude_bin``)."""
+    if not (isinstance(argv, list) and argv and isinstance(argv[0], str) and os.path.isabs(argv[0])):
         return []
     try:
-        with open(argv[0], "rb") as f:
-            first = f.readline(512)
-    except OSError:
+        fd = os.open(argv[0], os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return []
+            first = os.read(fd, 512).split(b"\n", 1)[0]
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
         return []
     if not first.startswith(b"#!"):
         return []
     toks = first[2:].decode("utf-8", "replace").split()
     if not toks:
         return []
-    out = [" ".join(toks[:i]) for i in (len(toks),)]
+    out = [" ".join(toks)]
     if os.path.basename(toks[0]) == "env" and len(toks) > 1:
         out.append(toks[1])                       # `env prog` execs prog: ps lists it as the interpreter
     return out
