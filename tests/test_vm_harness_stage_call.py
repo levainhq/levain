@@ -94,11 +94,18 @@ def test_a_model_with_no_slug_is_refused(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("wp", ["wave3/*.txt", "*", "**", "wave3/[ab].txt", "wave3/a?.txt", "wave3/{a,b}", "/abs/p",
-                                "../x/a", "a//b", "./a", "wave3/", "~/a", "a\\b", ""])
+                                "../x/a", "a//b", "./a", "wave3/", "~/a", "a\\b", "",
+                                "wave3/a\nb", "wave3/a\x07b", "wave3/a​b", "wave3/a\x7fb", "wave3/a b"])
 def test_a_write_path_that_would_widen_the_read_allowlist_is_refused(tmp_path, capsys, wp):
     with pytest.raises(SystemExit):
         SC.build_bodies(_args(tmp_path, write_path=wp))
     assert capsys.readouterr().out.startswith("stage-failed args:")
+
+
+def test_slug_strips_dashes_after_the_truncation():
+    assert SC.slug("a" * 39 + "/b") == "a" * 39           # the 40th character was a '-': it is not left trailing
+    assert not SC.slug("x" * 39 + ".y").endswith("-") and SC.slug("Z-ai/GLM-5.2") == "z-ai-glm-5-2"
+    assert SC.route_ids(["a" * 39 + "/b", "c/d"]) == ["or-" + "a" * 39, "or-c-d"]
 
 
 def test_a_plain_write_path_is_accepted_and_its_read_pattern_is_the_top_directory(tmp_path):
@@ -126,6 +133,18 @@ def test_policy_mode_signs_provider_policy_with_the_bodys_stdin(tmp_path, monkey
 
 # ---- F, D and B (class): prep installs the .pub; the data root is opened, BOUNDED, and every chmod is checked -----------------
 
+def _apply_chmod(mode: str, path: str) -> None:
+    """The two mode forms prep uses, applied to a path inside tmp_path (octal; ``a+x,go-w``). Anything else is a test error."""
+    cur = os.stat(path).st_mode & 0o7777
+    if mode == SC.DIR_MODE:
+        new = (cur | 0o111) & ~0o022
+    elif mode.isdigit():
+        new = int(mode, 8)
+    else:
+        raise AssertionError(f"prep used a mode form the test does not model: {mode}")
+    os.chmod(path, new)
+
+
 def _prep_world(tmp_path, monkeypatch, *, fail_chmod=None, anchor=True):
     """mode_prep with every chmod/sudo/ledger call faked (recorded, never run); ssh-keygen is real, into tmp_path."""
     a = _args(tmp_path)
@@ -138,7 +157,10 @@ def _prep_world(tmp_path, monkeypatch, *, fail_chmod=None, anchor=True):
         if argv[0] == "/usr/bin/ssh-keygen":
             return real(argv, stdin=stdin, env=env, timeout=timeout)
         if argv[0] == "/bin/chmod":
-            return (1, "", "Operation not permitted") if fail_chmod and fail_chmod(argv) else (0, "", "")
+            if fail_chmod and fail_chmod(argv):
+                return 1, "", "Operation not permitted"
+            _apply_chmod(argv[1], argv[2])          # inside tmp_path only (SCRATCH is patched into it)
+            return 0, "", ""
         if "ledger" in argv:
             root = Path(a.data_root)
             (root / "cockpit.db").write_text("x")
@@ -168,12 +190,55 @@ def test_prep_installs_the_pub_and_opens_only_the_data_root_never_the_host(tmp_p
     chmods = [c[1:] for c in calls if c[0] == "/bin/chmod"]
     # the ancestor prep made (scratch/w3) is made searchable; the data root is the one writable (sticky) dir; its subdirectory
     # searchable; the authority log and the anchor readable, never writable; the private lock file and the prep dir untouched
-    assert chmods == [["a+rx", str(scratch)], ["1777", str(root)], ["a+rx", str(root / "anchor")],
-                      ["a+r", str(root / "cockpit.db")], ["a+r", str(root / "anchor" / "authority.anchor")]]
+    assert chmods == [["a+x,go-w", str(scratch)], ["1777", str(root)], ["a+x,go-w", str(root / "anchor")],
+                      ["0644", str(root / "cockpit.db")], ["0644", str(root / "anchor" / "authority.anchor")]]
     assert all(SC._within(Path(c[-1]), scratch) for c in chmods)       # nothing above the scratch tree is ever changed
-    assert not any("-R" in c or "w" in c[0].split("+")[-1] for c in chmods if c[0] != "1777")
-    assert calls.index(["/bin/chmod", "a+r", str(root / "anchor" / "authority.anchor")]) < calls.index(installs[0])
+    assert not any("-R" in c or "a+r" in c[0] for c in chmods)
+    assert calls.index(["/bin/chmod", "0644", str(root / "anchor" / "authority.anchor")]) < calls.index(installs[0])
     assert capsys.readouterr().out.splitlines()[-1].startswith("prepped ")
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_prep_removes_a_world_write_bit_an_earlier_mode_left(tmp_path, monkeypatch, capsys):
+    """codex OPEN: ``a+r`` on a 0666 cockpit.db stayed 0666. The explicit modes end at 0644 / searchable-not-writable, and the
+    result is stat-ed, so a chmod that left a write bit would fail prep."""
+    a, calls = _prep_world(tmp_path, monkeypatch)
+    root = Path(a.data_root)
+    inner = SC.run
+
+    def fake_run(argv, **kw):
+        res = inner(argv, **kw)
+        if "ledger" in argv:
+            (root / "cockpit.db").chmod(0o666)
+            (root / "anchor").chmod(0o777)
+            (root / "anchor" / "authority.anchor").chmod(0o666)
+        return res
+
+    monkeypatch.setattr(SC, "run", fake_run)
+    assert SC.mode_prep(a) == 0
+    assert (root / "cockpit.db").stat().st_mode & 0o777 == 0o644
+    assert (root / "anchor" / "authority.anchor").stat().st_mode & 0o777 == 0o644
+    assert (root / "anchor").stat().st_mode & 0o022 == 0 and (root / "anchor").stat().st_mode & 0o001
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_prep_fails_when_a_chmod_that_exits_zero_leaves_a_write_bit(tmp_path, monkeypatch, capsys):
+    a, calls = _prep_world(tmp_path, monkeypatch)
+    inner = SC.run
+
+    def fake_run(argv, **kw):
+        if argv[0] == "/bin/chmod" and argv[1] == "0644" and argv[2].endswith("cockpit.db"):
+            return 0, "", ""                  # claims success, changes nothing: the file stays what the ledger made it
+        res = inner(argv, **kw)
+        if "ledger" in argv:
+            (Path(a.data_root) / "cockpit.db").chmod(0o666)
+        return res
+
+    monkeypatch.setattr(SC, "run", fake_run)
+    with pytest.raises(SystemExit):
+        SC.mode_prep(a)
+    out = capsys.readouterr().out
+    assert "stage-failed prep-chmod:" in out and "cockpit.db is mode 0666" in out and "prepped" not in out
 
 
 @pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -325,6 +390,17 @@ def test_stage_signs_every_kind_on_an_empty_store(tmp_path, monkeypatch):
     assert SC.mode_stage(a) == 0 and signed == ["provider_policy", "verifier", "templates"]
 
 
+def test_a_freshly_initialised_empty_store_is_configured_true_with_no_kinds(tmp_path, monkeypatch, capsys):
+    """gemini MED, checked against the code: ``levain dispatch config show`` answers ``configured: False`` ONLY when no control.db
+    exists (levain/dispatch/cli.py _run_config, ``if not os.path.lexists(path)``). ``config init`` has just made it, so the first
+    stage after prep reads ``configured: True`` with ``kinds: {}`` and the real shape below, and signs all three kinds."""
+    real_shape = {"configured": True, "store": "/private/var/levain/dispatch/control.db", "store_id": "s1", "trust_root": "SHA256:x",
+                  "generation": 0, "head": "", "kinds": {}}
+    a, signed = _stage_world(tmp_path, monkeypatch, {}, show=real_shape)
+    assert SC.mode_stage(a) == 0 and signed == ["provider_policy", "verifier", "templates"]
+    assert "stage-failed" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("case", ["rc", "unconfigured"])
 def test_a_failed_config_show_is_fatal_and_signs_nothing(tmp_path, monkeypatch, capsys, case):
     bodies = SC.build_bodies(_args(tmp_path))
@@ -370,6 +446,28 @@ def test_the_store_script_digest_is_the_built_bodys_digest(tmp_path):
     assert got == {"provider_policy": {"generation": 4, "sha256": SC.body_sha(bodies["provider_policy"])},
                    "verifier": {"generation": 2, "sha256": SC.body_sha(bodies["verifier"])},
                    "templates": {"generation": 3, "sha256": SC.body_sha(bodies["templates"])}}
+
+
+def test_the_store_script_skips_a_legacy_verifiers_item(tmp_path):
+    """A 0.11 ``verifiers`` item stays in the append-only chain; its body is not one this stage builds and must not kill the read."""
+    from levain.dispatch import control as dctl
+    bodies = SC.build_bodies(_args(tmp_path))
+    d = tmp_path / "ctl"
+    d.mkdir()
+    con = sqlite3.connect(d / "control.db")
+    con.execute("CREATE TABLE meta(key TEXT, value TEXT)")
+    con.execute("CREATE TABLE items(generation INT, kind TEXT, item TEXT, signature TEXT)")
+    prev, now = "", datetime.now(timezone.utc)
+    raw = dctl.item_bytes("verifier", 1, bodies["verifier"], now, prev=prev, store_id="a" * 32).decode("utf-8")
+    con.execute("INSERT INTO items VALUES(?,?,?,?)", (1, "verifier", raw, "sig"))
+    # a 0.11 'verifiers' row the current parser would refuse, newest in the chain
+    con.execute("INSERT INTO items VALUES(?,?,?,?)", (2, "verifiers", "not an item the current parser reads", "sig"))
+    con.commit()
+    con.close()
+    r = subprocess.run([sys.executable, "-I", "-", _args(tmp_path).levain_root, str(d)], input=SC.STORE_SCRIPT, capture_output=True,
+                       text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(r.stdout) == {"verifier": {"generation": 1,"sha256": SC.body_sha(bodies["verifier"])}}
 
 
 # ---- I and A (class): the route map is skipped only on PROOF by content ----------------------------------------------------------
@@ -573,6 +671,46 @@ def _install(tmp_path, *, make_keys=True, stdin='{"a":1}', mode="new"):
                        text=True, env=dict(os.environ, PATH=f"{fb}:{os.environ['PATH']}"))
     log = tmp_path / "chown.log"
     return r, store / "keys" / "cred", log.read_text() if log.exists() else ""
+
+
+def test_the_credential_installer_refuses_a_directory_or_link_named_cred_json(tmp_path):
+    for kind in ("dir", "link"):
+        base = tmp_path / kind
+        base.mkdir()
+        d = base / "store" / "keys" / "cred"
+        d.mkdir(parents=True)
+        os.chmod(d, 0o700)
+        victim = base / "victim"
+        victim.write_text("ROOT FILE")
+        if kind == "dir":
+            (d / "or-key.json").mkdir()
+        else:
+            (d / "or-key.json").symlink_to(victim)
+        r, d, _ = _install(base, mode="replace")
+        assert r.returncode == 0 and r.stdout.startswith("cred-refused or-key:") and "directory or a link" in r.stdout, r.stderr
+        assert victim.read_text() == "ROOT FILE" and not (d / "or-key.json.new").exists()
+        assert (d / "or-key.json").is_dir() == (kind == "dir") and (d / "or-key.json").is_symlink() == (kind == "link")
+
+
+def test_the_credential_installer_answers_a_failed_chown_with_a_refusal_not_a_bare_exit(tmp_path):
+    for stage in ("cred", "new"):
+        base = tmp_path / stage
+        store = base / "store"
+        (store / "keys").mkdir(parents=True)
+        if stage == "new":                                    # cred exists and is ours: only the credential file's chown fails
+            (store / "keys" / "cred").mkdir()
+            os.chmod(store / "keys" / "cred", 0o700)
+        fb = base / "fakebin"
+        fb.mkdir()
+        (fb / "chown").write_text("#!/bin/sh\nexit 1\n")
+        (fb / "id").write_text(f"#!/bin/sh\necho {os.getuid()}\n")
+        for f in ("chown", "id"):
+            os.chmod(fb / f, 0o755)
+        r = subprocess.run(["/bin/sh", "-c", T.INSTALL_SCRIPT, "sh", str(store), "or-key", "new"], input='{"a":1}', capture_output=True,
+                           text=True, env=dict(os.environ, PATH=f"{fb}:{os.environ['PATH']}"))
+        assert r.returncode == 0 and r.stdout.startswith("cred-refused or-key:") and "chown" in r.stdout, (stage, r.stdout, r.stderr)
+        assert "cred-installed" not in r.stdout
+        assert not (store / "keys" / "cred" / "or-key.json.new").exists() and not (store / "keys" / "cred" / "or-key.json").exists()
 
 
 def test_the_credential_installer_makes_keys_cred_0700_when_it_is_absent(tmp_path):

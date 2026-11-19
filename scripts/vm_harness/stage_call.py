@@ -53,6 +53,10 @@ NEVER = ["**/.env*", "**/*.pem", "**/*.key"]
 #: The ONLY tree prep widens permissions in: the guest scratch directory the --data-root default (/private/tmp/w3/cockpit) sits
 #: in. A data root anywhere else (a home, $TMPDIR, a relative path) is refused before anything is made or changed.
 SCRATCH = Path("/private/tmp/w3")
+#: explicit modes prep applies (never ``a+r``/``a+rx``, which keep a write bit already set): directories searchable by every
+#: account and writable by no other; files exactly 0644
+DIR_MODE = "a+x,go-w"
+FILE_MODE = "0644"
 #: the record of the route map this stage last submitted, in the dispatch account's own 0700 directory (see IDEMPOTENCE)
 STAGED_RECORD = "w3-staged.json"
 #: characters a --write-path may not hold: each is glob syntax in the provider policy's read pattern (or a home/escape form),
@@ -101,7 +105,7 @@ def as_dispatch_script(a, script_args):
 # --------------------------------------------------------------------------------------------------------------------
 
 def slug(model: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")[:40]
+    return re.sub(r"[^a-z0-9]+", "-", model.lower())[:40].strip("-")
 
 
 def write_path_problem(write_path: str) -> "str | None":
@@ -113,6 +117,9 @@ def write_path_problem(write_path: str) -> "str | None":
         return f"--write-path {write_path!r} is absolute; it is repo-relative"
     if any(p in ("", ".", "..") for p in write_path.split("/")):
         return f"--write-path {write_path!r} has an empty, '.' or '..' component"
+    unprintable = sorted(c for c in set(write_path) if not c.isprintable())
+    if unprintable:
+        return f"--write-path {write_path!r} holds a character that is not printable ({unprintable[0]!r})"
     bad = sorted(WRITE_PATH_REFUSED & set(write_path))
     if bad:
         return f"--write-path {write_path!r} holds {''.join(bad)!r}: glob syntax would widen the provider's read allowlist"
@@ -306,7 +313,8 @@ try:
     con = sqlite3.connect((Path(d) / "control.db").as_uri() + "?mode=ro", uri=True)
     latest = {}
     for gen, kind, item in con.execute("SELECT generation, kind, item FROM items ORDER BY generation"):
-        latest[kind] = (gen, item)
+        if kind in ("provider_policy", "verifier", "templates"):      # a legacy 'verifiers' item (0.11) is no longer read here
+            latest[kind] = (gen, item)
     out = {k: {"generation": g, "sha256": "sha256:" + hashlib.sha256(canon.canonical_bytes(dctl.parse_item(t).body)).hexdigest()}
            for k, (g, t) in latest.items()}
     print(json.dumps(out, sort_keys=True))
@@ -489,15 +497,15 @@ def open_data_root(data_root: Path, made: list) -> None:
     """Let the dispatch account replay the authority log (config init/sign --data-root), and no more. sqlite needs a writable
     DIRECTORY even to read a WAL database (it makes ``-shm``; "attempt to write a readonly database", finding D), so the data root
     itself is 1777: every account may add a file, and the sticky bit keeps any of them from replacing or removing one it does not
-    own (the authority log among them). Its subdirectories are made searchable (a+rx); the authority log and the anchor are made
-    readable (a+r) and NEVER writable; no other file is touched (no private file is widened). Of the ancestors, only those prep
+    own (the authority log among them). Its subdirectories are made searchable (a+x, go-w); the authority log and the anchor are
+    set to exactly 0644 (readable, NEVER writable by another account); no other file is touched (no private file is widened). Of the ancestors, only those prep
     itself made (``made``, all inside SCRATCH) are made searchable; a pre-existing ancestor that is not searchable is refused,
     never widened. Every chmod's result is checked: a failed one fails prep before the key is installed."""
     from levain.authority import anchor_path
     argvs = []
     for parent in sorted(made, key=lambda p: len(p.parts)):
         if parent != data_root:
-            argvs.append(["/bin/chmod", "a+rx", str(parent)])
+            argvs.append(["/bin/chmod", DIR_MODE, str(parent)])
     for parent in data_root.parents:
         if not _within(parent, SCRATCH):
             break
@@ -510,14 +518,25 @@ def open_data_root(data_root: Path, made: list) -> None:
             if os.path.islink(os.path.join(dirpath, name)):
                 die("prep", f"{os.path.join(dirpath, name)} is a symbolic link: prep changes no mode through a link")
         if dirpath != str(data_root):
-            argvs.append(["/bin/chmod", "a+rx", dirpath])
+            argvs.append(["/bin/chmod", DIR_MODE, dirpath])
     for f in (data_root / "cockpit.db", anchor_path(data_root)):
         if f.is_file():
-            argvs.append(["/bin/chmod", "a+r", str(f)])
+            argvs.append(["/bin/chmod", FILE_MODE, str(f)])
     for argv in argvs:
         rc, out, err = run(argv)
         if rc:
             die("prep-chmod", f"{' '.join(argv)}: rc={rc} {(out + err).strip()[-300:]}")
+    # verify the RESULT, not the command: a world-write bit an earlier mode left must be gone, and nothing is left unreadable
+    for argv in argvs:
+        mode = os.stat(argv[2]).st_mode & 0o7777
+        if argv[1] == "1777":
+            ok = mode == 0o1777
+        elif argv[1] == DIR_MODE:
+            ok = (mode & 0o001) == 0o001 and (mode & 0o022) == 0
+        else:
+            ok = (mode & 0o044) == 0o044 and (mode & 0o022) == 0
+        if not ok:
+            die("prep-chmod", f"{argv[2]} is mode {mode:04o} after {' '.join(argv)}")
 
 
 def mode_prep(a) -> int:
