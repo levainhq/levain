@@ -360,6 +360,22 @@ def test_signin_adds_pins_the_port_logs_in_as_hands_and_keeps_the_token_in_a_060
     assert rec["outcome"] == "login-exited-0" and rec["entry_id"] == e["id"] and rec["url"] == e["url"]
 
 
+def test_signin_makes_the_hands_keychain_first_and_refuses_a_foreign_one(rig, capsys):
+    # levain#139: an MCP token is a Claude login; the sealed keychain is made before anything is added
+    rig.register()
+    assert signin(rig) == 0
+    kc = rig.hands_home / "Library" / "Keychains" / hands_login.HANDS_KEYCHAIN
+    assert kc.is_file() and "Made the hands account's own keychain" in capsys.readouterr().out
+    # a default keychain Levain did not make: refused before any add, and left as it was
+    other = rig.hands_home / ".fake-security-default"
+    other.write_text("/elsewhere/login.keychain-db")
+    rig.log.write_text("")
+    rig.register("notion")
+    assert signin(rig, "notion") == 1
+    assert "not adopted or replaced" in capsys.readouterr().out
+    assert rig.calls() == [] and other.read_text() == "/elsewhere/login.keychain-db"
+
+
 def test_a_second_signin_does_not_add_the_server_again(rig, capsys):
     rig.register()
     assert signin(rig) == 0

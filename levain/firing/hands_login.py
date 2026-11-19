@@ -9,8 +9,10 @@ the SAME path; which account exists is decided where it is for everything else, 
 What runs, always as the hands user through :func:`~levain.firing.confinement.hands_prefix` (so its fixed
 ``env -i`` environment and PATH from ``_hands_env``), with the config home pinned inside the hands home:
 
-- Claude: ``claude auth login`` (paste-code), ``CLAUDE_CONFIG_DIR=<hands home>/.claude``. With no keychain the
-  vendor stores ``.credentials.json`` in that directory (its documented fallback, not a setting we can pin).
+- Claude: ``claude auth login`` (paste-code), ``CLAUDE_CONFIG_DIR=<hands home>/.claude``. When the keychain rejects
+  the write the vendor stores ``.credentials.json`` in that directory (its documented fallback, not a setting we can
+  pin). On macOS that needs a keychain that EXISTS and rejects (with none at all the login fails, levain#139), so the
+  login first gives the hands account its own sealed keychain (:func:`ensure_hands_keychain`).
 - Codex: ``codex login --device-auth``, ``CODEX_HOME=<hands home>/.codex``, whose ``config.toml`` pins
   ``cli_auth_credentials_store = "file"`` (the pin :func:`levain.slot.render.codex_config` writes for a slot).
 
@@ -590,6 +592,88 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
         raise
 
 
+# --- the hands account's own keychain (levain#139) -------------------------------------------------------------
+#
+# A macOS hands account made by ``setup-isolation`` (dscl, DisabledUser, no password) never logs in, so it has NO
+# keychain, and Claude then fails ("Couldn't save your login ...") instead of using its documented 0600-file fallback
+# (1118-vm/RESULTS.md R). The fallback runs when a keychain EXISTS and rejects the write; a default keychain not named
+# ``login`` rejects it (1023-30/runs/arm14, measured 10-24: the login went to the file and the keychain stayed empty).
+# So the hands account gets one such keychain, as itself, before a Claude login: a random password that is never
+# written anywhere, nothing ever unlocks it, it holds nothing. The login stays where V1 put it: the 0600 file.
+# UNMEASURED on a fresh install (levain#140): the file read with the keychain locked, and no GUI keychain dialog.
+SECURITY = "/usr/bin/security"
+HANDS_KEYCHAIN = "levain-hands.keychain-db"
+_NO_DEFAULT = "could not be found"
+
+
+def keychain_path(hands: HandsIdentity) -> str:
+    return f"{hands.home}/Library/Keychains/{HANDS_KEYCHAIN}"
+
+
+def keychain_needed(vendor: str) -> bool:
+    """Whether a login of ``vendor`` needs the hands keychain here: Claude on macOS (Codex is pinned to its file)."""
+    return vendor == "claude" and platform.system() == "Darwin"
+
+
+def _security(hands: HandsIdentity, vendor: str, *args: str, entity_dir: Path | str
+              ) -> "subprocess.CompletedProcess[bytes]":
+    return run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, SECURITY, *args), entity_dir=entity_dir,
+                                held=True, what=f"security {args[0]}")
+
+
+def _default_keychain(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str | None:
+    """The hands user's default keychain path as ``security`` prints it, or None when it says there is none. Any other
+    answer raises: an unreadable state is never taken for an absent one."""
+    r = _security(hands, vendor, "default-keychain", "-d", "user", entity_dir=entity_dir)
+    out = r.stdout.decode("utf-8", "replace").strip()
+    if r.returncode == 0:
+        path = out.strip().strip('"')
+        if path and "\n" not in path:
+            return path
+        raise HandsLoginError(f"`security default-keychain` as {hands.user} printed {out[:200]!r}")
+    if _NO_DEFAULT in _text(r):
+        return None
+    raise HandsLoginError(f"could not read {hands.user}'s default keychain: {_brief(_text(r)) or f'exit {r.returncode}'}")
+
+
+def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> str:
+    """Under the caller's hands lock, as the hands user: the hands account's default keychain is Levain's sealed one.
+    Returns ``"present"`` or ``"made"``. A default keychain that is not Levain's is refused, never adopted or replaced
+    (its password is someone's: adopting it would make Levain its holder). Never unlocks a keychain, never keeps or
+    prints the password, never touches the operator's keychain (every call runs as hands with HOME = the hands home)."""
+    ours = keychain_path(hands)
+    if not ours.startswith(hands.home.rstrip("/") + "/") or not hands.home.startswith("/"):
+        raise HandsLoginError(f"the keychain path {ours} is not inside the hands home")
+    current = _default_keychain(hands, vendor, entity_dir)
+    if current == ours:
+        return "present"
+    if current is not None:
+        raise HandsLoginError(f"{hands.user}'s default keychain is {current}, not Levain's {ours}; it is not adopted or "
+                              "replaced (remove it by hand)")
+    _ensure_dir(hands, vendor, f"{hands.home}/Library", entity_dir)
+    _ensure_dir(hands, vendor, f"{hands.home}/Library/Keychains", entity_dir)
+    st = _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True)
+    if st is None:
+        # The password is used here once and never written: nothing ever unlocks this keychain.
+        r = _security(hands, vendor, "create-keychain", "-p", secrets.token_urlsafe(32), ours, entity_dir=entity_dir)
+        if r.returncode != 0:
+            raise HandsLoginError(f"could not make {ours} as {hands.user}: {_brief(_text(r))}")
+    elif not st[0].startswith("regular") or st[1] != hands.uid:
+        raise HandsLoginError(f"{ours} is a {st[0]} of {st[2]}, not a keychain file of {hands.user}; remove it by hand")
+    for args in (("default-keychain", "-d", "user", "-s", ours), ("list-keychains", "-d", "user", "-s", ours)):
+        r = _security(hands, vendor, *args, entity_dir=entity_dir)
+        if r.returncode != 0:
+            raise HandsLoginError(f"`security {args[0]}` as {hands.user} failed: {_brief(_text(r))}")
+    after = _default_keychain(hands, vendor, entity_dir)
+    if after != ours:
+        raise HandsLoginError(f"{hands.user}'s default keychain is {after or 'none'} after it was set to {ours}")
+    return "made"
+
+
+KEYCHAIN_MADE_NOTE = ("Made the hands account's own keychain ({path}). It holds nothing and its password was not kept: "
+                      "it exists so that Claude keeps this login in its 0600 file in the hands home.")
+
+
 def credential_state(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, held: bool = False,
                      sweep: bool = True) -> str | None:
     """``"<owner> <mode>"`` of the credential file, read AS the hands user, or None when stat says it is absent.
@@ -713,16 +797,19 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     refusal = login_refusal()
     if refusal:
         raise HandsRefused(refusal)
+    say = emit or _write_out
     with hands_lock(entity_dir, "a login"):
         try:
             ensure_config_home(hands, vendor, entity_dir=entity_dir)
+            if keychain_needed(vendor) and ensure_hands_keychain(hands, vendor, entity_dir=entity_dir) == "made":
+                say(KEYCHAIN_MADE_NOTE.format(path=keychain_path(hands)) + "\n")
         except HandsRefused:
             raise
         except HandsLoginError as exc:
             # Before the vendor login launches nothing about the login has changed, so a failure here is a
             # refusal and the last recorded outcome stands (L3 r2 of V1/V2, complement + codex MED).
             raise HandsRefused(f"{exc}; the login was not started") from None
-        res = _run_login(hands, vendor, entity_dir, emit or _write_out, LOGIN_TIMEOUT if timeout is None else timeout)
+        res = _run_login(hands, vendor, entity_dir, say, LOGIN_TIMEOUT if timeout is None else timeout)
         st = run_status(hands, vendor, entity_dir=entity_dir, held=True) if res.returncode == 0 else None
     return res, st
 

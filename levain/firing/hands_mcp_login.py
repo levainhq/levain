@@ -323,6 +323,9 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
         with hl.hands_lock(entity_dir, "an MCP sign-in"):
             try:
                 hl.ensure_config_home(hands, VENDOR, entity_dir=entity_dir)
+                # levain#139: an MCP token is a Claude login too; with no keychain at all its save fails the same way
+                if hl.keychain_needed(VENDOR) and hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir) == "made":
+                    (emit or hl._write_out)(hl.KEYCHAIN_MADE_NOTE.format(path=hl.keychain_path(hands)) + "\n")
                 held = vendor_servers(hands, entity_dir, held=True)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None

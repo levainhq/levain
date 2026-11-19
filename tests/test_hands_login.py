@@ -27,6 +27,7 @@ from levain.firing.hands_login import HandsLoginError
 
 #: The module's own refusal, kept before any rig replaces it (None on a build without one).
 _REAL_LOGIN_REFUSAL = getattr(hands_login, "login_refusal", None)
+_REAL_KEYCHAIN_NEEDED = hands_login.keychain_needed
 
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
@@ -83,6 +84,30 @@ esac
 exit 2
 """
 
+#: levain#139: the stand-in for /usr/bin/security (the rig points ``hands_login.SECURITY`` at it, so no test ever runs
+#: the real one or touches a real keychain). The "keychain" is files under $HOME (the hands home): the default
+#: keychain's path in .fake-security-default, the search list in .fake-security-list, and the keychain file itself
+#: (create-keychain writes a marker, never the password). Knobs: SEC_READ_FAIL (every read fails with that text),
+#: SEC_SET_NOOP (setting the default is accepted but changes nothing), SEC_CREATE_FAIL (create-keychain fails).
+SECURITY_SHIM = """#!/bin/sh
+echo "$HOME|$*" >> "$SHIM_SECLOG"
+D="$HOME/.fake-security-default"
+case "$1" in
+  default-keychain)
+    if [ "$4" = "-s" ]; then [ -n "$SEC_SET_NOOP" ] || printf '%s' "$5" > "$D"; exit 0; fi
+    if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDefault: $SEC_READ_FAIL" >&2; exit 1; fi
+    if [ -f "$D" ]; then printf '    "%s"\\n' "$(cat "$D")"; exit 0; fi
+    echo "security: SecKeychainCopyDefault: A default keychain could not be found." >&2; exit 1;;
+  list-keychains)
+    printf '%s' "$5" > "$HOME/.fake-security-list"; exit 0;;
+  create-keychain)
+    if [ -n "$SEC_CREATE_FAIL" ]; then echo "security: SecKeychainCreate: $SEC_CREATE_FAIL" >&2; exit 1; fi
+    if [ -e "$4" ]; then echo "security: SecKeychainCreate $4: A keychain with the same name already exists." >&2; exit 48; fi
+    umask 077; echo "fake keychain" > "$4"; exit 0;;
+esac
+exit 2
+"""
+
 #: The prefix when the operator's sudo rule for the hands user is missing: every run as hands fails like sudo -n.
 BROKEN_PREFIX = ["/bin/sh", "-c", 'echo "sudo: a password is required" >&2; exit 1', "sudo"]
 
@@ -91,10 +116,14 @@ class Rig:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         self.bindir = tmp_path / "bin"
         self.bindir.mkdir()
-        for name, body in (("claude", CLAUDE_SHIM), ("codex", CODEX_SHIM)):
+        for name, body in (("claude", CLAUDE_SHIM), ("codex", CODEX_SHIM), ("security", SECURITY_SHIM)):
             p = self.bindir / name
             p.write_text(body)
             p.chmod(0o755)
+        self.seclog = tmp_path / "security.log"
+        # levain#139: never the real /usr/bin/security; the keychain step runs on every host so the rig is the same
+        monkeypatch.setattr(hands_login, "SECURITY", str(self.bindir / "security"))
+        monkeypatch.setattr(hands_login, "keychain_needed", lambda vendor: vendor == "claude")
         self.hands_home = tmp_path / "hands-home"
         self.hands_home.mkdir()
         self.operator_home = tmp_path / "operator-home"
@@ -121,6 +150,7 @@ class Rig:
         env["PATH"] = f"{self.bindir}:{env['PATH']}"
         env["SHIM_LOG"] = str(self.log)
         env["SHIM_PIDS"] = str(self.pids)
+        env["SHIM_SECLOG"] = str(self.seclog)
         env.update(self.knobs)
         return ["/usr/bin/env", "-i", *(f"{k}={v}" for k, v in env.items())]
 
@@ -564,3 +594,136 @@ def test_cli_registers_login_and_status():
     assert (b.hands_cmd, b.vendor) == ("status", None)
     with pytest.raises(SystemExit):
         p.parse_args(["hands", "login", "gemini"])
+
+
+# --- levain#139: the hands account's own sealed keychain (the `security` program is the rig's shim) -------------
+
+def _sec_calls(r: Rig) -> list[str]:
+    return [ln.split("|", 1)[1] for ln in r.seclog.read_text().splitlines()] if r.seclog.exists() else []
+
+
+def _kc(r: Rig) -> Path:
+    return r.hands_home / "Library" / "Keychains" / hands_login.HANDS_KEYCHAIN
+
+
+def test_keychain_needed_is_claude_on_macos_only(monkeypatch):
+    monkeypatch.setattr(hands_login, "keychain_needed", _REAL_KEYCHAIN_NEEDED)
+    for system, vendor, want in (("Darwin", "claude", True), ("Darwin", "codex", False),
+                                 ("Linux", "claude", False), ("Linux", "codex", False)):
+        monkeypatch.setattr(hands_login.platform, "system", lambda s=system: s)
+        assert hands_login.keychain_needed(vendor) is want
+
+
+def test_the_rig_never_runs_the_real_program_and_the_product_never_unlocks(rig):
+    assert hands_login.SECURITY == str(rig.bindir / "security")
+    src = Path(hands_login.__file__).read_text()
+    assert 'SECURITY = "/usr/bin/security"' in src
+    assert "lock-keychain" not in src and "find-generic-password" not in src
+
+
+def test_claude_login_first_makes_the_hands_keychain_then_the_login_lands_in_the_file(rig):
+    said: list[str] = []
+    res, st = _login(rig, "claude", emit=said.append)
+    assert res.returncode == 0 and st.logged_in
+    kc = _kc(rig)
+    calls = _sec_calls(rig)
+    assert [c.split(" ")[0] for c in calls] == ["default-keychain", "create-keychain", "default-keychain",
+                                                 "list-keychains", "default-keychain"]
+    assert calls[0] == "default-keychain -d user"
+    create = calls[1].split(" ")
+    assert create[1] == "-p" and len(create[2]) >= 40 and create[3] == str(kc)
+    assert calls[2] == f"default-keychain -d user -s {kc}" and calls[3] == f"list-keychains -d user -s {kc}"
+    # the keychain is the hands account's, inside its home, in a 700 directory; the password is kept nowhere
+    assert kc.is_file() and _mode(kc.parent) == 0o700 and _mode(rig.hands_home / "Library") == 0o700
+    pw = create[2]
+    for p in rig.hands_home.rglob("*"):
+        if p.is_file():
+            assert pw not in p.read_text(errors="replace"), p
+    for p in rig.entity.rglob("*"):
+        if p.is_file():
+            assert pw not in p.read_text(errors="replace"), p
+    assert not any(pw in s for s in said)
+    # every call ran with HOME = the hands home, never the operator's
+    homes = {ln.split("|", 1)[0] for ln in rig.seclog.read_text().splitlines()}
+    assert homes == {str(rig.hands_home)}
+    # the note says it was made, and the login itself is the 0600 file as before
+    assert any(hands_login.KEYCHAIN_MADE_NOTE.format(path=kc) in s for s in said)
+    assert (rig.hands_home / ".claude" / ".credentials.json").is_file()
+    # the note comes before the vendor's own output
+    joined = "".join(said)
+    assert joined.index("Made the hands account's own keychain") < joined.index("Open https://claude.ai")
+
+
+def test_a_second_login_finds_the_keychain_and_makes_nothing(rig):
+    _login(rig, "claude")
+    rig.seclog.unlink()
+    said: list[str] = []
+    res, st = _login(rig, "claude", emit=said.append)
+    assert res.returncode == 0 and st.logged_in
+    assert _sec_calls(rig) == ["default-keychain -d user"]
+    assert not any("Made the hands account" in s for s in said)
+
+
+def test_codex_login_makes_no_keychain(rig):
+    res, st = _login(rig, "codex")
+    assert res.returncode == 0 and st.logged_in
+    assert _sec_calls(rig) == [] and not (rig.hands_home / "Library").exists()
+
+
+def test_a_foreign_default_keychain_is_refused_and_never_replaced(rig):
+    other = rig.hands_home / "Library" / "Keychains" / "login.keychain-db"
+    (rig.hands_home / ".fake-security-default").write_text(str(other))
+    with pytest.raises(hands_login.HandsRefused, match="not adopted or replaced.*the login was not started"):
+        _login(rig, "claude")
+    assert _sec_calls(rig) == ["default-keychain -d user"]
+    assert (rig.hands_home / ".fake-security-default").read_text() == str(other)
+    assert rig.calls() == []                               # the vendor login never started
+
+
+def test_an_unreadable_keychain_state_is_refused_never_taken_for_absent(rig):
+    rig.knobs["SEC_READ_FAIL"] = "The user name or passphrase you entered is not correct."
+    with pytest.raises(hands_login.HandsRefused, match="could not read .*default keychain"):
+        _login(rig, "claude")
+    assert [c.split(" ")[0] for c in _sec_calls(rig)] == ["default-keychain"]
+    assert not _kc(rig).exists() and rig.calls() == []
+
+
+def test_a_failed_create_is_refused_and_the_login_not_started(rig):
+    rig.knobs["SEC_CREATE_FAIL"] = "disk full"
+    with pytest.raises(hands_login.HandsRefused, match="could not make .*disk full"):
+        _login(rig, "claude")
+    assert rig.calls() == [] and not (rig.hands_home / ".fake-security-default").exists()
+
+
+def test_a_default_that_does_not_stick_is_refused(rig):
+    rig.knobs["SEC_SET_NOOP"] = "1"
+    with pytest.raises(hands_login.HandsRefused, match="is none after it was set"):
+        _login(rig, "claude")
+    assert rig.calls() == []
+
+
+def test_a_keychain_file_left_by_an_earlier_run_is_reused_not_recreated(rig):
+    kc = _kc(rig)
+    kc.parent.mkdir(parents=True)
+    kc.write_text("earlier")
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+    assert "create-keychain" not in " ".join(_sec_calls(rig))
+    assert kc.read_text() == "earlier"
+
+
+def test_a_keychain_path_that_is_not_a_file_is_refused(rig):
+    kc = _kc(rig)
+    kc.mkdir(parents=True)
+    with pytest.raises(hands_login.HandsRefused, match="not a keychain file"):
+        _login(rig, "claude")
+    assert rig.calls() == []
+
+
+def test_the_cli_login_reports_a_keychain_refusal_without_recording_a_failure(rig, capsys):
+    other = "/Users/x/Library/Keychains/login.keychain-db"
+    (rig.hands_home / ".fake-security-default").write_text(other)
+    assert hands_login.cmd_hands_login(rig.entity, "claude") == 1
+    out = capsys.readouterr().out
+    assert "not adopted or replaced" in out and "the login was not started" in out
+    assert hands_login.read_outcomes(rig.entity).get("claude") is None
