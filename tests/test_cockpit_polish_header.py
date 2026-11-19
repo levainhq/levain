@@ -166,7 +166,7 @@ def test_icon_only_header_buttons_are_44_px_on_touch_from_1101_to_1500(tmp_path:
     rows = _vals(out)
     assert len(rows) == 3, out["values"]
     for g in rows:
-        assert g["coarse"] is True and g["n"] >= 8, g
+        assert g["coarse"] is True and g["n"] >= 7, g      # Drop, Grants, Notifications, Jump and the three theme buttons
         assert g["small"] == [], g
 
 

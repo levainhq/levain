@@ -4180,6 +4180,8 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead .indicators > .ia-actions, body.ia .masthead #jumpbtn { order: 3; }
   /* a zero basis keeps it on the buttons' row whatever it says (it takes the row's remaining room and cuts with an ellipsis), and right-aligned */
   body.ia .masthead #freshline { order: 4; flex: 1 1 0; min-width: 7ch; max-width: none; justify-content: flex-end; }
+  /* the state words keep their room and the age takes what is left of the row (an ellipsis on the age first, then on the words) */
+  body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
   body.ia .masthead #presencebtn { order: 5; }
   body.ia .masthead #stamp { order: 6; }
 }
