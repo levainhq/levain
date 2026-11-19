@@ -898,7 +898,7 @@ _EMPTY_SIG_NEXT = "try again, or answer from your phone instead (open the cockpi
 
 def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
                         counter: int | None, detail: str, namespace: str, attempt: int,
-                        empty: bool = False) -> str:
+                        empty: bool = False, elapsed: float = 0.0) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
     (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
@@ -906,6 +906,7 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
     BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time, and ``reason``: the exact classification
     when there is one (:data:`_EMPTY_SIG_REASON`: the signature's r and s are empty), else null. ``reason`` is a field
     added to ``levain-sign-failure/1``; every earlier key is unchanged, and a record from before it has no ``reason``.
+    ``elapsed_s`` (seconds the ssh-keygen sign step took, 3 decimals) is likewise added; an older record has none.
 
     The directory is trusted only as this uid's own 0700 directory, opened without following a symlink, and every
     write and prune goes through that one open descriptor; anything else (a symlink, another owner, a looser or
@@ -938,7 +939,8 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
                   "algorithm": sig_type, "flags": format(flags, "#04x"), "counter": counter, "attempt": attempt,
                   "message_sha256": hashlib.sha256(message).hexdigest(), "message_bytes": len(message),
                   "ssh_keygen": detail, "signature": signature,
-                  "reason": _EMPTY_SIG_REASON if empty else None}
+                  "reason": _EMPTY_SIG_REASON if empty else None,
+                  "elapsed_s": round(float(elapsed), 3)}
         body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
         # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
         name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
@@ -1148,7 +1150,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 empty = _authority_sig.sk_ecdsa_signature_empty(signature)
                 evidence = _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
                                                flags=flags, counter=counter, detail=detail, namespace=namespace,
-                                               attempt=attempt, empty=empty)
+                                               attempt=attempt, empty=empty, elapsed=elapsed)
                 return _SkRefusal(flags, carried, detail, evidence, empty, is_touch)
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
                             "so nothing was signed")
