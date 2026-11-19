@@ -241,7 +241,8 @@ def test_the_jump_box_reveals_episodes_in_memory_and_lists_no_panel_that_no_plac
 const modes = [];
 document.body.dataset = new Proxy({ mode: "board" }, { set(t, k, v) { if (k === "mode") modes.push(v); t[k] = v; return true; } });
 globalThis.location = { hash: "", search: "", pathname: "/" };
-globalThis.history = { replaceState() {} };
+const written = [];
+globalThis.history = { replaceState: (a, b, url) => written.push(url) };
 const panel = (id, title, modes) => { const p = new N("section"); p.dataset.ckPanel = id; if (modes) p.dataset.modes = modes; p.title = title; return p; };
 const ids = [["episodes", "Recent episodes", "board"], ["tray", "List", "morning board"], ["notifications", "Notifications", "board"],
   ["topology", "Topology", "build"], ["agents", "Agents", "build"], ["crystals", "Crystals", "memory"]];
@@ -253,13 +254,16 @@ const by = (id) => panels.find((p) => p.dataset.ckPanel === id);
 out.fromHome = [K.revealTab(by("episodes")), document.body.dataset.mode];
 out.fromMemory = [K.revealTab(by("episodes")), document.body.dataset.mode];       // already there: no change
 document.body.dataset.mode = "board";
-out.agents = [K.revealTab(by("agents")), document.body.dataset.mode];             // its tab is retired: Home, where the machine draws it
+written.length = 0;
+out.agents = [K.revealTab(by("agents")), document.body.dataset.mode];             // its tab is retired: Home already draws it, so nothing moves
+out.agentsWrote = written.slice();
 out.crystals = [K.revealTab(by("crystals")), document.body.dataset.mode];
 """, tmp_path)
     assert "Recent episodes" in out["listed"] and "Agents" in out["listed"], out
     assert "Notifications" not in out["listed"] and "Topology" not in out["listed"], out
     assert out["fromHome"] == [True, "memory"] and out["fromMemory"] == [False, "memory"], out
-    assert out["agents"] == [True, "board"] and out["crystals"] == [True, "memory"], out
+    assert out["agents"] == [False, "board"] and out["agentsWrote"] == [], out         # choosing Agents on Home writes no address and remounts nothing
+    assert out["crystals"] == [True, "memory"], out
 
 
 @needs_browser
@@ -288,6 +292,28 @@ def test_choosing_recent_episodes_in_the_jump_box_ends_on_the_drawn_panel(tmp_pa
     assert not [t for t in listed if t in ("Notifications", "Topology")], listed
     assert shown1 == {"place": "memory", "shown": True}, shown1
     assert shown2 == {"place": "memory", "shown": True}, shown2
+
+
+@needs_browser
+def test_choosing_a_panel_in_the_jump_box_on_the_desk_leaves_the_desk(tmp_path: Path) -> None:
+    """Memory under the Desk already is the mode Recent episodes needs, so no attribute changes; the page's own Memory tab is what leaves the Desk."""
+    SHOWN = "(() => { const p = document.querySelector('.panel[data-ck-panel=\"episodes\"]'); return JSON.stringify({place: document.body.dataset.iaPlace, shown: !!p && p.getClientRects().length > 0}); })()"
+    CHOOSE = ("(() => { document.getElementById('jumpbtn').click(); const i = document.querySelector('.palette-input'); i.value = 'recent episodes';"
+              " i.dispatchEvent(new Event('input')); i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return 1; })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": PRESS % "memory"}, SETTLE,
+            {"eval": PRESS % "desk"}, SETTLE,
+            {"eval": SHOWN},                                                            # 0: on the Desk, the panel hidden
+            {"eval": CHOOSE}, SETTLE, SETTLE,
+            {"eval": SHOWN},                                                            # 1: chosen from the Desk
+        ])
+    on_desk, chosen = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"place"')]
+    assert on_desk == {"place": "desk", "shown": False}, on_desk
+    assert chosen == {"place": "memory", "shown": True}, chosen
 
 
 @needs_browser
@@ -396,9 +422,10 @@ def test_the_notifications_button_name_carries_the_unread_count(tmp_path: Path) 
             {"eval": SET % ("false", "3")}, {"eval": NAME},
             {"eval": SET % ("false", "99+")}, {"eval": NAME},
             {"eval": SET % ("true", "0")}, {"eval": NAME},
+            {"eval": SET % ("false", "0")}, {"eval": NAME},
         ])
     names = [v for v in out["values"] if isinstance(v, str) and v.startswith("Notifications")]
-    assert names == ["Notifications", "Notifications, 3 unread", "Notifications, 99+ unread", "Notifications"], out["values"]
+    assert names == ["Notifications", "Notifications, 3 unread", "Notifications, 99+ unread", "Notifications", "Notifications"], out["values"]
 
 
 def test_the_places_buttons_name_their_key() -> None:
