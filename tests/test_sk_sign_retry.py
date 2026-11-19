@@ -81,9 +81,14 @@ class FakeClock:
 
     def __init__(self) -> None:
         self.t = 1000.0
+        self.sleeps: list[float] = []
 
     def monotonic(self) -> float:
         return self.t
+
+    def sleep(self, s: float) -> None:      # a wait between attempts: recorded and advanced, never slept for real
+        self.sleeps.append(s)
+        self.t += s
 
     def __getattr__(self, name):
         return getattr(time, name)
@@ -588,22 +593,38 @@ def test_the_classifier_is_false_for_a_non_empty_unverifiable_or_malformed_signa
         assert not sk_ecdsa_signature_empty(junk)
 
 
-def test_two_empty_answers_say_the_key_returned_no_signature_and_the_evidence_says_why(rig):
-    rig.fake.plan = ["empty", "empty"]
+def test_three_empty_answers_say_the_key_returned_no_signature_and_the_evidence_says_why(rig):
+    rig.fake.plan = ["empty", "empty", "empty"]
     with pytest.raises(KeyError_) as err:
         rig.sign(MESSAGE)
     text = str(err.value)
-    assert rig.fake.signs == 2                       # the retry count is as it was
+    assert rig.fake.signs == 3
     assert text.startswith("the key returned no signature for ")      # no sidecar here: Touch ID is not named
     assert "empty ECDSA signature (r and s have zero length)" in text and "nothing was signed" in text
     assert "try again" in text and "phone" in text
     assert "libcrypto" not in text and "does not verify" not in text
     files = sorted(rig.dir.iterdir())
-    assert len(files) == 2 and all(str(f) in text for f in files)
+    assert len(files) == 3 and all(str(f) in text for f in files)
     for f in files:
         ev = json.loads(f.read_text())
         assert ev["format"] == "levain-sign-failure/1" and ev["reason"] == "empty ECDSA signature (r and s have zero length)"
         assert ev["flags"] == "0x21" and ev["counter"] == 1 and "ssh_keygen" in ev and "message_sha256" in ev
+
+
+def test_every_sign_failure_record_carries_the_sign_step_elapsed_seconds_and_every_old_key(rig):
+    rig.fake.plan = ["empty", "empty", "empty"]
+    rig.fake.durations = [1.2344, 2.3456, 0.5]  # known touches on the fake clock: a hardcoded or dropped elapsed fails
+    with pytest.raises(KeyError_):
+        rig.sign(MESSAGE)
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 3
+    evs = [json.loads(f.read_text()) for f in files]
+    assert {e["attempt"]: e["elapsed_s"] for e in evs} == {1: 1.234, 2: 2.346, 3: 0.5}
+    for ev in evs:
+        assert isinstance(ev["elapsed_s"], float) and not isinstance(ev["elapsed_s"], bool)
+        for key in ("format", "time", "fingerprint", "namespace", "algorithm", "flags", "counter", "attempt",
+                    "message_sha256", "message_bytes", "ssh_keygen", "signature", "reason"):
+            assert key in ev
 
 
 def test_an_empty_first_answer_is_retried_and_a_good_second_is_returned(rig):
@@ -630,12 +651,12 @@ def test_an_empty_answer_with_no_time_for_a_second_touch_is_named_too(rig):
 
 def test_the_words_name_touch_id_only_for_a_touch_id_signer(rig, monkeypatch):
     from levain.cockpit.custody import APPLE_PROVIDER
-    rig.fake.plan = ["empty", "empty"]
+    rig.fake.plan = ["empty"] * 3
     with pytest.raises(KeyError_) as plain:         # no sidecar, no Apple provider: the code cannot know it is Touch ID
         rig.sign(MESSAGE)
     assert str(plain.value).startswith("the key returned no signature for ") and "Touch ID" not in str(plain.value)
     monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)
-    rig.fake.plan, rig.fake.signs = ["empty", "empty"], 0
+    rig.fake.plan, rig.fake.signs = ["empty"] * 3, 0
     with pytest.raises(KeyError_) as touch:
         rig.sign(MESSAGE)
     assert str(touch.value).startswith("the key returned no signature (Touch ID gave nothing back) for ")
@@ -659,6 +680,22 @@ def test_a_mixed_outcome_names_both_and_keeps_the_phone_guidance(rig, plan):
     assert sorted(json.loads(f.read_text())["reason"] is None for f in files) == [False, True]
 
 
+def test_empty_empty_bad_describes_every_attempt_by_its_own_outcome(rig):
+    rig.fake.plan = ["empty", "empty", 0x21]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 3 and rig.clock.sleeps == [1.0, 2.0]
+    assert "both attempts" not in text and "all 3 attempts failed" in text
+    assert "attempt 1 returned no signature" in text and "attempt 2 returned no signature" in text
+    assert "attempt 3 returned a signature that did not verify" in text and "attempt 3 returned no signature" not in text
+    assert all(f"attempt {i} flags" in text for i in (1, 2, 3)) and "attempt 4" not in text
+    assert text.count("empty ECDSA signature (r and s have zero length)") == 2
+    assert "try again" in text and "phone" in text and "nothing was signed" in text
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 3 and all(str(f) in text for f in files)
+
+
 def test_the_classifier_never_raises_whatever_a_malformed_signature_does(monkeypatch):
     """L3 r2 (complement LOW): it classifies EVIDENCE for the sign path, so no exception type may escape it."""
     from levain import authority_sig as sig
@@ -667,3 +704,75 @@ def test_the_classifier_never_raises_whatever_a_malformed_signature_does(monkeyp
             raise _exc
         monkeypatch.setattr(sig, "_sshsig_type_flags_counter", boom)
         assert sig.sk_ecdsa_signature_empty("-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----") is False
+
+
+# levain#158: an EMPTY answer is the provider answering without a usable touch (probe2_run1_1119.txt); the retry waits for it
+
+def test_empty_empty_ok_waits_one_then_two_seconds_and_returns_the_signature(rig):
+    rig.fake.plan = ["empty", "empty", None]
+    assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
+    assert rig.fake.signs == 3 and rig.clock.sleeps == [1.0, 2.0]
+
+
+def test_empty_then_ok_waits_one_second_once(rig):
+    rig.fake.plan = ["empty", None]
+    assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
+    assert rig.fake.signs == 2 and rig.clock.sleeps == [1.0]
+
+
+def test_three_empties_name_all_three_attempts_and_sign_no_fourth_time(rig):
+    rig.fake.plan = ["empty"] * 4
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 3 and rig.clock.sleeps == [1.0, 2.0]
+    assert "three times" in text and all(f"attempt {i} flags" in text for i in (1, 2, 3)) and "attempt 4" not in text
+    assert "try again" in text and "phone" in text and "nothing was signed" in text
+    assert all(str(f) in text for f in rig.dir.iterdir())
+
+
+def test_an_empty_answer_with_a_deadline_too_short_for_the_wait_does_not_sleep_past_it(rig):
+    sign = _bounded(rig, keys._SK_RETRY_MIN_S + 0.5)         # 5.5 s: enough for a touch, not for a 1 s wait and a touch
+    rig.fake.plan = ["empty", None]
+    with pytest.raises(KeyError_) as err:
+        sign(MESSAGE)
+    assert rig.fake.signs == 1 and rig.clock.sleeps == []
+    assert "no second touch was asked for" in str(err.value) and "try again" in str(err.value)
+    # no wait happened here, so the words say what WOULD remain after it, not what was left after it
+    assert "bound would remain after the 1s wait, under 5s" in str(err.value) and "was left after" not in str(err.value)
+
+
+def test_a_wait_that_leaves_no_room_for_the_third_attempt_is_refused_without_sleeping(rig):
+    sign = _bounded(rig, 20.0)
+    rig.fake.plan, rig.fake.durations = ["empty", "empty", None], [0.5, 20.0 - 0.5 - 1.0 - 2.0 - keys._SK_RETRY_MIN_S + 0.5]
+    with pytest.raises(KeyError_) as err:
+        sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 2 and rig.clock.sleeps == [1.0]
+    assert "no third touch was asked for" in text and "attempt 1 flags" in text and "attempt 2 flags" in text
+
+
+def test_a_non_empty_bad_signature_keeps_the_single_immediate_retry(rig):
+    rig.fake.plan = [0x21, 0x21, None]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    assert rig.fake.signs == 2 and rig.clock.sleeps == []
+    assert "both attempts failed" in str(err.value)
+    rig.fake.plan, rig.fake.signs = [0x21, None], 0
+    assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
+    assert rig.fake.signs == 2 and rig.clock.sleeps == []
+
+
+def test_empty_then_bad_ends_at_two_attempts_after_one_wait(rig):
+    rig.fake.plan = ["empty", 0x21, None]
+    with pytest.raises(KeyError_):
+        rig.sign(MESSAGE)
+    assert rig.fake.signs == 2 and rig.clock.sleeps == [1.0]
+
+
+def test_each_failed_attempt_writes_its_evidence_with_attempt_number_and_elapsed(rig):
+    rig.fake.plan, rig.fake.durations = ["empty"] * 3, [0.4, 1.1, 2.1]
+    with pytest.raises(KeyError_):
+        rig.sign(MESSAGE)
+    evs = sorted((json.loads(f.read_text()) for f in rig.dir.iterdir()), key=lambda e: e["attempt"])
+    assert [(e["attempt"], e["elapsed_s"]) for e in evs] == [(1, 0.4), (2, 1.1), (3, 2.1)]

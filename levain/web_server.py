@@ -2145,8 +2145,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     def _watch_manifest(self) -> dict[str, Any]:
         # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token), so the
         # etags it announces are class-none ones; a page reading under a token holds class-token etags and
-        # records the one its own panel read returned, never the announced one
-        return self.get_cockpit().manifest({"class": "none", "device_class": None})
+        # records the one its own panel read returned, never the announced one. ``read_after``: a change another process
+        # made reaches the diff only through reads begun after the token moved, so this build never shares an earlier one
+        return self.get_cockpit().manifest({"class": "none", "device_class": None}, read_after=time.monotonic())
 
     # What the change token covers beyond the install's own stores: files or directories a downstream's panels read.
     # A server given a cockpit or extra panels of its own has no token until it names them here, because the kernel
