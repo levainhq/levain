@@ -276,28 +276,53 @@ class TestDiscovery:
         token[0] += 1
         host.run_once(t + 2)        # discovery drops the panel and the plan with it
         assert "found" not in ck.panel_ids and "found" not in _plan_map(host)
-        row = host.reader.read("found")
-        before, seen = (row.gen, row.derived_at), calls.count("found")
+        assert host.reader.read("found") is None        # the row left with the panel
+        seen = calls.count("found")
         for i in range(3, 8):
             token[0] += 1
             host.run_once(t + i)
-        after = host.reader.read("found")
-        assert (after.gen, after.derived_at) == before and calls.count("found") == seen
+        assert host.reader.read("found") is None and calls.count("found") == seen
         assert host.loop.pending("found") is False
+
+    def test_a_discovered_panel_that_vanishes_and_returns_reads_not_derived_until_its_first_derive(self, make_host) -> None:
+        calls = Calls()
+        ck = Cockpit()
+        answer: list[Any] = []
+        ck.discover(lambda ctx: list(answer), retire=True)
+        token = [0]
+        host = make_host(ck, token_fn=lambda: token[0])
+        host.attach()
+        answer[:] = [_recorded("found", calls)]
+        t = time.time()
+        host.run_once(t)
+        host.run_once(t + 1)
+        assert host.reader.read("found") is not None
+        answer[:] = []
+        token[0] += 1
+        host.run_once(t + 2)
+        assert "found" not in ck.panel_ids
+        answer[:] = [_recorded("found", calls)]     # a new read callable: the engine matches a retired panel's state by it
+        token[0] += 1
+        host.run_once(t + 3)                        # re-registered and planned; its first derive is the next poll's
+        assert "found" in ck.panel_ids and "found" in _plan_map(host)
+        assert host.reader.read("found") is None    # the previous life's row is not served for the new registration
+        assert ck.freshness()["found"] == {"as_of": None, "status": "unread", "stale": True}
+        host.run_once(t + 4)
+        assert host.reader.read("found") is not None and ck.freshness()["found"]["status"] == "ok"
 
     def test_a_panel_unregistered_under_a_running_plan_is_retired_not_published_as_an_error(self, make_host, monkeypatch) -> None:
         ck = Cockpit()
         ck.register(_simple("gone", rows=[_row(1)]))
         host = make_host(ck)
         host.run_once()
-        kept = host.reader.read("gone")
+        assert host.reader.read("gone") is not None
         ck.unregister("gone")           # the plan was made while it was registered
         retired: list[str] = []
         real = host.loop.retire
         monkeypatch.setattr(host.loop, "retire", lambda pid: (retired.append(pid), real(pid)))
         result = host._derive("gone")
         assert retired == ["gone"] and result.status == "error"
-        assert host.reader.read("gone") == kept         # nothing was published over the last row
+        assert host.reader.read("gone") is None         # the row left with the panel, and no error row replaced it
 
 
 # ---------------------------------------------------------------------------------------------- (d) the entity

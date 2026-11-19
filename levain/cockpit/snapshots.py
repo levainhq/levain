@@ -304,6 +304,18 @@ class SnapshotWriter:
                 )
         return gen
 
+    def drop(self, panel_id: str) -> bool:
+        """Delete one panel's row; True when there was one. The panel set changed, so ``publish_seq`` goes up in the same
+        transaction: a reader's change counter moves for a removal as it does for a publish."""
+        with self._tx():
+            gone = self._db.execute("DELETE FROM panel WHERE id=?", (panel_id,)).rowcount > 0
+            if gone:
+                self._db.execute(
+                    "INSERT INTO meta(key, value) VALUES ('publish_seq', '1')"
+                    " ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                )
+        return gone
+
     def heartbeat(self, now: float) -> None:
         with self._tx():
             self._set_meta("heartbeat_at", repr(float(now)))

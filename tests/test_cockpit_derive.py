@@ -47,6 +47,7 @@ class FakeWriter:
         self.publishes: list[dict] = []
         self.heartbeats: list[float] = []
         self.streams: list[dict] = []
+        self.drops: list[str] = []
         self.published = threading.Condition(self.lock)
 
     def publish(self, panel_id, *, status, body, started_at, derived_at, duration_ms, valid_until=None,
@@ -61,6 +62,11 @@ class FakeWriter:
     def heartbeat(self, now):
         with self.lock:
             self.heartbeats.append(now)
+
+    def drop(self, panel_id):
+        with self.lock:
+            self.drops.append(panel_id)
+            return True
 
     def set_stream(self, stream_id, *, state, last_event_at, detail=""):
         with self.lock:
@@ -1510,8 +1516,7 @@ def test_a_derive_running_when_its_panel_is_retired_finishes_but_is_never_publis
     finally:
         gate.set()
         loop.stop()
-    snap = reader.read("a")
-    assert snap.gen == 1 and snap.write_gen == 0 and snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME).decoded(snap) == {"n": 1}
+    assert reader.read("a") is None  # the row went with the panel at retire, and the finished derive did not bring it back
     assert loop.last_publish_error is None
     w.close()
 
@@ -1934,4 +1939,22 @@ def test_an_unknown_token_re_derives_a_no_input_panel_on_the_slow_tick_not_the_b
     clock.t += 60                                       # well past it and far short of the backstop
     assert loop.run_once(clock.t) == ["a"]
     assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_retire_and_set_plans_drop_the_rows_of_the_panels_that_leave_and_a_failing_drop_does_not_break_the_plan_change():
+    loop, writer, clock, calls = make([PanelPlan("a"), PanelPlan("b"), PanelPlan("c")])
+    loop.retire("a")
+    assert writer.drops == ["a"]
+    loop.set_plans([PanelPlan("c")])
+    assert writer.drops == ["a", "b"]
+    loop.retire("nope")
+    assert writer.drops == ["a", "b"]           # an id that was never planned has no row to drop
+
+    def boom(pid):
+        raise OSError("disk")
+
+    writer.drop = boom
+    loop.set_plans([])                           # the plan change lands though the row could not be dropped
+    assert loop.deriving() == [] and not loop._plans
     loop.stop()

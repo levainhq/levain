@@ -148,6 +148,17 @@ def test_publish_seq_moves_with_gen_bumps_only_and_heartbeat_moves_data_version(
     assert r.data_version() != v and r.meta()["publish_seq"] == "3"
 
 
+def test_drop_deletes_a_panel_row_and_moves_publish_seq_only_when_there_was_one(db):
+    w = S.SnapshotWriter(db)
+    r = S.SnapshotReader(db)
+    _pub(w, "a")
+    assert r.meta()["publish_seq"] == "1"
+    assert w.drop("nope") is False and r.meta()["publish_seq"] == "1"
+    assert w.drop("a") is True
+    assert r.read("a") is None and r.meta()["publish_seq"] == "2"
+    assert _pub(w, "a") == 1                    # a returning panel starts a new life at gen 1
+
+
 def test_set_stream_writes_only_on_a_change(db):
     w = S.SnapshotWriter(db)
     r = S.SnapshotReader(db)

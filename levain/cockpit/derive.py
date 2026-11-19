@@ -499,8 +499,8 @@ class DeriveLoop:
     def retire(self, panel_id: str) -> None:
         """Drop one panel from the plan set (no effect when it is not in it); safe from any thread.
 
-        A job queued for it is dropped. A derive already running finishes but its result is discarded, and nothing
-        is published for the id once this returns. The id is not derived again until the running one has ended, even
+        A job queued for it is dropped, and its row is deleted from the store. A derive already running finishes but its
+        result is discarded, and nothing is published for the id once this returns. The id is not derived again until the running one has ended, even
         if it is added back. May wait for the publish in progress, because it takes the writer lock to be sure.
         """
         self._swap_plans(lambda current: {pid: plan for pid, plan in current.items() if pid != panel_id})
@@ -531,10 +531,20 @@ class DeriveLoop:
                         st = self._states.get(pid)
                         if st is None:
                             self._states[pid] = PanelState()
+                            self._write_errors.pop(f"retire:{pid}", None)   # a panel that is planned again owes no row drop
                         elif old[pid].inputs != plan.inputs:
                             st.inputs_fp = None
                     self._plans = new
                     self._plans_version += 1
+                # the writer lock is still held when a panel left: its row goes with it, so a panel that returns reads
+                # "not derived yet" until its own first derive and never serves a previous life's row as current
+                for pid in gone:
+                    try:
+                        self._writer.drop(pid)
+                    except Exception as exc:  # a failing writer must not break a plan change
+                        self._fail(f"retire:{pid}", exc)
+                    else:
+                        self._succeed(f"retire:{pid}")
                 break
         self._wake.set()
 
