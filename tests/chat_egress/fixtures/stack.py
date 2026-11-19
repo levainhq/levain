@@ -41,6 +41,22 @@ class Ports:
     def tcp(self) -> list[int]:
         return [self.http, self.tls, self.off_http, self.off_tls, self.raw]
 
+    def repick(self, *fields: str) -> None:
+        """Fresh ports for just these fields (a start lost the allocate-then-bind race); the rest belong to live pieces."""
+        tcp = [f for f in fields if f != "dns"]
+        if tcp:
+            for f, port in zip(tcp, free_tcp_ports(len(tcp))):
+                setattr(self, f, port)
+        if "dns" in fields:
+            self.dns = free_udp_port()
+
+
+START_TRIES = 3
+
+
+def _addr_in_use(exc: BaseException) -> bool:
+    return "address already in use" in str(exc).lower()
+
 
 def make_pki(root: Path) -> Path:
     """mkcerts.py: an ORIGIN CA + a BAD CA, the good wildcard leaf (*.rb.test) and the bad leaf (bad.rb.test)."""
@@ -89,14 +105,19 @@ class Rig:
         import json
         sched = self.root / "dns_schedule.json"
         sched.write_text(json.dumps(default_dns_schedule() if schedule is None else schedule))
-        self.dns = Managed([PY, str(envmod.TOOLS_DIR / "dns_local.py"), str(self.ports.dns), str(sched),
-                            str(self.dns_log.path), "86400"], workdir=self.root, name="dns", ready="DNS READY").start()
+        self.dns = self._start_fresh_ports(("dns",), lambda: Managed(
+            [PY, str(envmod.TOOLS_DIR / "dns_local.py"), str(self.ports.dns), str(sched), str(self.dns_log.path), "86400"],
+            workdir=self.root, name="dns", ready="DNS READY").start())
         self.managed.append(self.dns)
 
     def start_origin(self, kind: str = "bytes") -> None:
         """kind 'bytes': round 3's origin.py (every byte of every connection, TLS bad.rb.test gets the BAD leaf).
         kind 'git': round 4's git_origin.py (per-request log, smart HTTP through git http-backend, `fakeadv`)."""
         assert self.pki is not None, "start_pki() first"
+        self.origin = self._start_fresh_ports(("http", "tls", "off_http", "off_tls"), lambda: self._start_origin_once(kind))
+        self.managed.append(self.origin)
+
+    def _start_origin_once(self, kind: str) -> Managed:
         p = self.ports
         if kind == "bytes":
             argv = [PY, str(envmod.TOOLS_DIR / "origin.py"), str(self.pki), str(self.origin_log.path), "86400",
@@ -108,13 +129,27 @@ class Rig:
             argv = [PY, str(envmod.TOOLS_DIR / "git_origin.py"), str(self.pki), str(self.repo_root),
                     str(self.origin_log.path), "86400", f"plain:{p.http}", f"plain:{p.off_http}", f"tls:{p.tls}", f"tls:{p.off_tls}"]
             ready = "GIT ORIGIN READY"
-        self.origin = Managed(argv, workdir=self.root, name=f"origin-{kind}", ready=ready).start()
-        self.managed.append(self.origin)
+        return Managed(argv, workdir=self.root, name=f"origin-{kind}", ready=ready).start()
+
+    def _start_fresh_ports(self, fields: tuple[str, ...], start):
+        """The ports were free when allocated, not when the child binds (another process can take one in between): when a
+        start dies on EADDRINUSE, re-pick just those ports and start again, 3 tries."""
+        for attempt in range(1, START_TRIES + 1):
+            try:
+                return start()
+            except RuntimeError as e:
+                if attempt == START_TRIES or not _addr_in_use(e):
+                    raise
+                print(f"chat-egress fixture: {fields} lost the port race (try {attempt}), re-picking", file=sys.stderr)
+                self.ports.repick(*fields)
 
     def start_raw_listener(self, port: int | None = None) -> int:
+        def once() -> Managed:
+            p = port or self.ports.raw
+            return Managed([PY, str(envmod.TOOLS_DIR / "rawlisten.py"), str(p), str(self.raw_log.path), "86400"],
+                           workdir=self.root, name=f"rawlisten-{p}", ready="RAWLISTEN READY").start()
+        m = once() if port else self._start_fresh_ports(("raw",), once)
         port = port or self.ports.raw
-        m = Managed([PY, str(envmod.TOOLS_DIR / "rawlisten.py"), str(port), str(self.raw_log.path), "86400"],
-                    workdir=self.root, name=f"rawlisten-{port}", ready="RAWLISTEN READY").start()
         self.raw = m
         self.managed.append(m)
         return port
