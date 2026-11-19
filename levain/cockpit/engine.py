@@ -1518,8 +1518,8 @@ class Cockpit:
 
     def _probe_snapshot(self) -> "tuple[dict[str, str], str]":
         """Every registered panel's class-none head etag, built the way the change stream's manifest read builds them, and a
-        version of the panel set: the ids, the verb revision and the calendar day, each of which changes what a page
-        draws with no snapshot moving. A serve-composed panel reads its stores here, as it does in a manifest."""
+        version of the panel set: the ids, the verb revision, the calendar day, the entity and the discovery errors, each
+        of which changes what a page draws with no snapshot moving. A serve-composed panel reads its stores here, as it does in a manifest."""
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         etags: dict[str, str] = {}
@@ -1528,7 +1528,10 @@ class Cockpit:
                 continue
             snap = self._snap_for(spec, ctx.child())
             etags[spec.id] = self._head(spec, snap, "none", ctx.today, auth, ctx.now)["etag"]
-        version = _sha({"panels": sorted(etags), "verbs": self._verb_rev(auth), "date": ctx.today.isoformat()})[:16]
+        # the entity and the errors the manifest carries move a page with no panel etag moving, so they are in the version
+        stored, discovery_errors = self._entity_value, list(self._discovery_errors)
+        version = _sha({"panels": sorted(etags), "verbs": self._verb_rev(auth), "date": ctx.today.isoformat(),
+                        "entity": stored, "discovery_errors": discovery_errors})[:16]
         return etags, version
 
     def _deriving_ids(self) -> list[str]:

@@ -721,3 +721,19 @@ def test_a_new_generation_of_a_panel_replaces_its_older_ones_in_the_decoded_cach
     gens = sorted(k[1] for k in rig.ck._attached_snaps if k[0] == "alpha")
     assert gens == [rig.reader.read("alpha").gen]
     assert len([k for k in rig.ck._attached_snaps if k[0] == "beta"]) == 1
+
+
+def test_set_version_moves_with_the_entity_and_with_a_discovery_error_while_the_panel_etags_stay_equal(rig: Rig) -> None:
+    rig.derive()
+    probe = rig.ck.change_probe()
+    rig.ck.set_entity_value(({"name": "A"}, []))
+    etags, version = probe.snapshot()
+    rig.ck.set_entity_value(({"name": "B"}, []))
+    etags_b, version_b = probe.snapshot()
+    assert etags_b == etags and version_b != version
+    rig.ck.set_entity_value(({"name": "B"}, [{"source": "entity", "message": "boom"}]))
+    assert probe.snapshot()[1] != version_b
+    rig.ck.set_entity_value(({"name": "B"}, []))
+    assert probe.snapshot()[1] == version_b
+    rig.ck._discovery_errors = [{"source": "discovery:1", "message": "boom"}]
+    assert probe.snapshot()[1] != version_b
