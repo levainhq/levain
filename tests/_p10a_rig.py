@@ -84,6 +84,8 @@ class Install:
             env["PATH"] = "/usr/bin:/bin"
         env.update(LEVAIN_HOME=str(self.home), HOME=str(self.uhome), PYTHONPATH=str(REPO),
                    PYTHONDONTWRITEBYTECODE="1")
+        if os.environ.get("P10A_SHIFT_S"):           # the clock-shift proof (_p10a_entry): every real clock read runs ahead
+            env["P10A_SHIFT_S"] = os.environ["P10A_SHIFT_S"]
         if now:
             env["P10A_NOW"] = now
         if kill:
@@ -96,7 +98,7 @@ class Install:
             timeout: int = 180) -> Ran:
         """``levain <argv>`` as a subprocess. With no gate it is the console script itself; with a gate it is the
         same ``main`` behind ``_p10a_entry.py``. A killed process has a negative return code (-9: SIGKILL)."""
-        gated = now is not None or spawn_gate or kill is not None
+        gated = now is not None or spawn_gate or kill is not None or bool(os.environ.get("P10A_SHIFT_S"))
         exe = levain_bin()
         cmd = [sys.executable, str(ENTRY), *argv] if gated or exe is None else [str(exe), *argv]
         p = subprocess.run(cmd, cwd=self.tmp, env=self.env(now, spawn_gate, kill), capture_output=True, text=True,
@@ -237,7 +239,7 @@ def prepare_link(inst: Install, doc: dict):
 
 def popen(inst: Install, *argv: str, now: str | None = None, spawn_gate: bool = False) -> subprocess.Popen:
     """``levain <argv>`` started and NOT waited for (two of these are a race between two real processes)."""
-    gated = now is not None or spawn_gate
+    gated = now is not None or spawn_gate or bool(os.environ.get("P10A_SHIFT_S"))
     exe = levain_bin()
     cmd = [sys.executable, str(ENTRY), *argv] if gated or exe is None else [str(exe), *argv]
     return subprocess.Popen(cmd, cwd=inst.tmp, env=inst.env(now, spawn_gate), stdout=subprocess.PIPE,

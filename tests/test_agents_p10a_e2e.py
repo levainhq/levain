@@ -28,11 +28,12 @@ from tests._p10a_rig import Install, utc  # noqa: E402
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
-def _after_launch() -> str:
-    """A tick time one hour past the REAL clock: a hand start launches at the real now, and the launch lease is 900 s, so
+def _after_launch(hours: int = 1) -> str:
+    """A tick time ``hours`` past the REAL clock: a hand start launches at the real now, and the launch lease is 900 s, so
     this is always past it. A literal date stopped being past it once the real clock reached it (CI red 11-18 after
-    23:50 UTC, main included); the cases still pinned to literal dates below are the same class."""
-    return (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    23:50 UTC, and 11-19 after 03:00 UTC, main included); a tick that follows a real-clock launch takes this, never a date."""
+    ahead = timedelta(hours=hours, seconds=float(os.environ.get("P10A_SHIFT_S") or 0))   # the shift proof moves the launch too
+    return (datetime.now(timezone.utc) + ahead).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ------------------------------------------------------------------------------------------ edit + re-sign mid-run
@@ -780,12 +781,25 @@ def test_p10a_counters_at_their_ceiling(tmp_path):
     assert inst.spawned() == [launched["occurrence_id"]]
 
     (tmp_path / "two").mkdir()
-    dollars = Install(tmp_path / "two")
+    _dollar_ceiling(tmp_path / "two")
+
+
+@pytest.mark.parametrize("shift_s", [6 * 3600, 30 * 86400], ids=["real_clock_plus_6h", "real_clock_plus_30d"])
+def test_p10a_dollar_ceiling_does_not_depend_on_the_date(tmp_path, monkeypatch, shift_s):
+    """The dollar-ceiling half of the counters case, with every real clock read of the CLI subprocesses (the launch, the
+    sign, the resume) pushed 6 hours and 30 days ahead (``P10A_SHIFT_S``, ``_p10a_entry``): its ticks are relative to the
+    real clock, so it passes at any date. (A literal tick date failed it on CI at 2026-11-19 03:00 UTC.)"""
+    monkeypatch.setenv("P10A_SHIFT_S", str(shift_s))
+    _dollar_ceiling(tmp_path)
+
+
+def _dollar_ceiling(root):
+    dollars = Install(root)
     assert dollars.enable("--time", "00:00").rc == 0
     assert dollars.sign(dollars.link_doc(run_ceiling=5)).rc == 0
-    for hour in (3, 4):
+    for hour in (1, 2):
         _crashed_start(dollars)
-        assert dollars.cli("agents", "tick", now=utc(2026, 11, 19, hour, 0, 0)).rc == 6
+        assert dollars.cli("agents", "tick", now=_after_launch(hour)).rc == 6
     assert [(r["state"], r["debited_usd_micros"]) for r in dollars.rows("SELECT * FROM agent_reservations")] == [
         ("settled", 20_000_000)] * 2
     assert dollars.cli("agents", "resume", "dream", spawn_gate=False).out.endswith(": active\n")     # two failures paused it
@@ -889,3 +903,5 @@ def test_p10a_facts_named_after_the_enable_are_refused_until_revised_and_resigne
     assert inst.sign(inst.link_doc(run_ceiling=3)).rc == 0
     started = inst.cli("dream", "start")
     assert started.rc == 0 and "claimed and launched oc-" in started.out, started.text
+
+

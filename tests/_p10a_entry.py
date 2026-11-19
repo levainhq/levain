@@ -10,6 +10,8 @@ subprocess's ``python <file> <argv...>``. It adds NOTHING to what runs except wh
 * ``P10A_NOW``: an ISO UTC instant. The two wall-clock reads a CLI verb makes before it hands a clock down (the tick
   driver's ``_utc`` and ``levain.dream.start``'s ``datetime.now``) answer it. Everything below those reads is the product
   as it runs: the schedule, the claims, the launch.
+* ``P10A_SHIFT_S``: seconds. Every REAL wall-clock read of the process runs that far ahead (a test-only way to prove a case
+  does not depend on the date it was written on); ``P10A_NOW`` still overrides the reads it names.
 * ``P10A_NO_SPAWN``: a file path. ``controller.spawn_fire`` (the one door to a model-calling child) is replaced by a
   recorder that appends ``<store_dir> <occurrence>`` to that file and starts nothing: a launched row stays launched,
   with no fire, and no case can reach a key.
@@ -21,14 +23,44 @@ import sys
 from datetime import datetime, timezone
 
 
+def _shift_real_clock(seconds: float) -> None:
+    """Move every REAL wall-clock read of this process ``seconds`` forward (``datetime.now``/``utcnow``, ``time.time``), so
+    a case can prove it does not depend on the date it was written on. Runs before ``levain`` is imported, so every module's
+    ``from datetime import datetime`` gets the shifted class. ``monotonic`` is left alone (it is a duration, not a date)."""
+    import datetime as _d
+    import time as _t
+
+    delta = _d.timedelta(seconds=seconds)
+    real = _d.datetime
+
+    class _Shifted(real):
+        @classmethod
+        def now(cls, tz=None):
+            return super().now(tz) + delta           # a _Shifted again, so isinstance(x, datetime) still holds
+
+        @classmethod
+        def utcnow(cls):
+            return super().utcnow() + delta
+
+    _d.datetime = _Shifted
+    _real_time = _t.time
+    _t.time = lambda: _real_time() + seconds
+
+
 def _gates() -> None:
+    shift = os.environ.get("P10A_SHIFT_S")
+    if shift:
+        _shift_real_clock(float(shift))
     now = os.environ.get("P10A_NOW")
     if now:
-        fixed = datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        import datetime as _dm
+
+        dt = _dm.datetime                            # the shifted class when the shift is on, so isinstance holds
+        fixed = dt.strptime(now, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         from levain.agents import tick_driver
         from levain.dream import start as dstart
 
-        class _At(datetime):
+        class _At(dt):
             @classmethod
             def now(cls, tz=None):
                 return fixed.astimezone(tz) if tz else fixed
