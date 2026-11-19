@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 pytest.importorskip("cryptography")
-from tests._p10a_rig import Install, utc  # noqa: E402
+from tests._p10a_rig import ZONE, Install, real_now, utc  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -200,7 +200,7 @@ def _night(tmp_path, signed_at: datetime, first_tick: datetime, last_tick: datet
     """A dream with NO new episodes (every slot the tick claims ends ``skipped-no-input``: nothing launches, so nothing
     fails and nothing pauses the agent), its link signed into the log at ``signed_at``, then ``levain agents tick`` once
     per 20 minutes of the faked clock across a DST edge."""
-    inst = Install(tmp_path, episodes=0)
+    inst = Install(tmp_path, episodes=0, zone=ZONE)
     assert inst.enable("--time", "00:00").rc == 0
     inst.sign_in_log_at(signed_at, inst.link_doc(run_ceiling=40))
     for at in _slots(first_tick, last_tick):
@@ -267,7 +267,7 @@ def test_p10a_stale_link_after_a_revoke(tmp_path):
 
     try:
         with pytest.raises(auth.StaleHead, match="the authority log's head moved to seq 6 since this link was prepared"):
-            auth.append(conn, pending, signature, now=datetime.now(timezone.utc),
+            auth.append(conn, pending, signature, now=real_now(),
                         anchor=auth.anchor_path(inst.world.root), cache=auth.ReplayCache())
         assert conn.execute("SELECT MAX(seq) FROM authority_log").fetchone()[0] == 6
         # by hand, into the file: the stale link claims seq 7 on the head it was signed against (seq 5's hash)
@@ -296,7 +296,7 @@ T0 = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)          # the link is sign
 def _mid_run(tmp_path):
     """A dream whose link (signed at T0, expiring 2026-11-24T12:00Z) has a hand run launched at 11-23 12:00Z: the run is
     in flight when the link's last day passes."""
-    inst = Install(tmp_path)
+    inst = Install(tmp_path, zone=ZONE)
     assert inst.enable("--time", "00:00").rc == 0
     link = inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=3))
     started = inst.cli("dream", "start", now=utc(2026, 11, 23, 12, 0, 0))
@@ -338,7 +338,7 @@ def test_p10a_renewal_mid_run(tmp_path):
     REAL clock (the renew is a real-clock call, and the log refuses to renew a link that has lapsed, so a literal
     expiry stops working the day the real clock passes it; its ``until`` is real now + 29 days, so a literal year-month
     prefix stops matching at a year's turn)."""
-    base = datetime.now(timezone.utc).replace(microsecond=0)
+    base = real_now().replace(microsecond=0)
     inst = Install(tmp_path)
     assert inst.enable("--time", "00:00").rc == 0
     link = inst.sign_in_log_at(base - timedelta(days=2), inst.link_doc(run_ceiling=3))      # expires base + 27 d
@@ -349,7 +349,7 @@ def test_p10a_renewal_mid_run(tmp_path):
     assert (run["state"], run["link_id"], run["launched_at"]) == ("launched", link, launched)
     renewed = inst.cli("agents", "renew", link, "--data-root", str(inst.world.root), "--signing-key", str(inst.key),
                        "--days", "29", spawn_gate=False)
-    after = datetime.now(timezone.utc)
+    after = real_now()
     # the CLI prints utc_stamp(real now + 29 d): the prefix up to the minute is one of the two instants around the call
     prefixes = {_stamp(base + timedelta(days=29))[:13], _stamp(after + timedelta(days=29))[:13]}
     assert renewed.rc == 0 and renewed.err == "Signing data on standard input\n" and re.fullmatch(
@@ -814,7 +814,7 @@ def test_p10a_a_manual_run_counts_against_a_scheduled_one(tmp_path):
     holds the scheduled slot off (``skipped-overlap``) while it is in flight and, once it is ended, still COUNTS: the next
     scheduled slot is refused ``skipped-budget: ceiling`` (the manual run's window key is its own, the count is the
     agent's). Only the hand run was ever given a fire."""
-    inst = Install(tmp_path)
+    inst = Install(tmp_path, zone=ZONE)
     assert inst.enable("--time", "00:00").rc == 0
     inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=1))
     assert inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 0, 0)).rc == 0         # the first tick claims no slot (observed)
@@ -849,7 +849,7 @@ def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
     SAME occurrence and exit 0. (The claimed-dream-row / card delivery needs a finished run: UNBUILT.)"""
     from tests._p10a_rig import finish, popen
 
-    inst = Install(tmp_path, episodes=0)                                   # every claimed slot ends skipped-no-input
+    inst = Install(tmp_path, episodes=0, zone=ZONE)                                   # every claimed slot ends skipped-no-input
     assert inst.enable("--time", "00:00").rc == 0
     inst.sign_in_log_at(T0, inst.link_doc(run_ceiling=9))
     assert inst.cli("agents", "tick", now=utc(2026, 11, 19, 5, 0, 0)).rc == 0

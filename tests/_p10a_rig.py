@@ -22,7 +22,7 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -50,11 +50,12 @@ def levain_bin() -> Path | None:
 
 
 class Install:
-    def __init__(self, tmp: Path, *, episodes: int = 3, stub: bool = False) -> None:
+    def __init__(self, tmp: Path, *, episodes: int = 3, stub: bool = False, zone: str | None = None) -> None:
         from tests.test_authority_graduation_kind import World
         from levain.cockpit.firejournal import CockpitDB
 
         self.tmp = tmp
+        self.zone = zone or quiet_zone()             # ZONE for a case that ticks at fixed dates (DST); else see quiet_zone
         self.episodes = episodes
         self.world = World(tmp)                      # tmp/keys, tmp/cockpit (the authority log)
         CockpitDB(self.world.root).set_install_class("reported")
@@ -117,7 +118,7 @@ class Install:
     def enable(self, *extra: str) -> Ran:
         """``levain dream enable`` (the zone first, once): registers the dream and writes the install facts."""
         if not (self.store_dir / "autonomic.db").exists():
-            assert self.cli("agents", "zone", ZONE).rc == 0
+            assert self.cli("agents", "zone", self.zone).rc == 0
         if not self.anneal.exists():
             self.make_anneal()
         self._bind_stub()                            # before the enable, so the spec the enable registers binds it
@@ -133,7 +134,7 @@ class Install:
         from levain.dream import agent as da
 
         da.write_install(self.store_dir, store_path=self.anneal / "memory.db", cockpit_root=self.world.root,
-                         coord_dir=self.desk, zone=ZONE, claude_bin=str(self.stub.path))
+                         coord_dir=self.desk, zone=self.zone, claude_bin=str(self.stub.path))
 
     def _write_facts(self) -> None:
         """The first-run facts file the install names: the operator's own file (no flag writes it). By default named
@@ -149,7 +150,7 @@ class Install:
         ex.write_first_run_facts(facts, model=MODEL, models_charged=[MODEL], m_usd_micros=ex.one_call_ceiling(MODEL))
         self.store_dir.mkdir(parents=True, exist_ok=True)
         da.write_install(self.store_dir, store_path=self.anneal / "memory.db", cockpit_root=self.world.root,
-                         coord_dir=self.desk, zone=ZONE, facts_path=facts)    # claude_bin, if bound, is merged
+                         coord_dir=self.desk, zone=self.zone, facts_path=facts)    # claude_bin, if bound, is merged
 
     def agent(self) -> dict:
         """``levain agents show dream --json``: the ``agent`` object (agent_id, spec_hash, version, ...)."""
@@ -217,6 +218,33 @@ class Install:
         return [ln.split()[1] for ln in self.spawns.read_text().splitlines()] if self.spawns.exists() else []
 
 
+_QUIET: dict[tuple[str, float], str] = {}
+
+
+def quiet_zone() -> str:
+    """The install zone of a case that ticks relative to the REAL clock: a fixed-offset zone whose wall clock reads about
+    12:30 at the (shifted) real now. The dream's slots live in 22:00-05:00 of that zone (the window does not move), so no
+    tick made within hours of the real clock can cross one. In America/New_York a tick 61 min past a real-clock launch
+    admitted a second occurrence whenever the case ran from 22:55 to 04:40 local (CI red 11-19 04:14 UTC = 23:14 ET).
+    One zone per process and shift (P10A_QUIET_AT, a wall-clock hour, moves the target: a proof knob, 23.5 is the
+    hour the old zone failed at). A case that ticks at fixed dates keeps ``ZONE`` (``Install(zone=ZONE)``)."""
+    shift = os.environ.get("P10A_SHIFT_S") or "0"
+    target = float(os.environ.get("P10A_QUIET_AT") or 12.5)
+    if (shift, target) not in _QUIET:
+        now = real_now()
+        hours = now.hour + now.minute / 60
+        offset = round(target - hours)                 # whole hours east of UTC that put the wall clock near 12:30
+        offset = (offset + 12) % 24 - 12             # -12 .. +11, both of which Etc/GMT names
+        _QUIET[shift, target] = "UTC" if offset == 0 else f"Etc/GMT{'-' if offset > 0 else '+'}{abs(offset)}"
+    return _QUIET[shift, target]
+
+
+def real_now() -> datetime:
+    """The real clock as the CLI subprocesses read it: P10A_SHIFT_S ahead of the test process's own (every clock read the
+    test process makes that must agree with a subprocess's goes through this, so a shifted run stays one timeline)."""
+    return datetime.now(timezone.utc) + timedelta(seconds=float(os.environ.get("P10A_SHIFT_S") or 0))
+
+
 def utc(*a: int) -> str:
     return datetime(*a, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -229,7 +257,7 @@ def prepare_link(inst: Install, doc: dict):
     from levain.cockpit.consent import utc_stamp
 
     inst._n += 1
-    now = datetime.now(timezone.utc)
+    now = real_now()
     grant = {"id": f"al-{inst._n:012x}", "kind": "agent-link", "expires_at": utc_stamp(now + timedelta(days=29)), **doc}
     conn = sqlite3.connect(inst.world.db, isolation_level=None)
     pending = auth.prepare(conn, {"op": "create_grant", "grant": grant}, signer_fp=inst.world.fp("laptop"), now=now,
