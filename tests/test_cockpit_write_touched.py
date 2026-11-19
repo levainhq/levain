@@ -370,19 +370,43 @@ def test_a_keep_over_a_real_install_touches_what_it_changed(tmp_path: Path) -> N
     assert {"episodes", "health", "activity", "memory_glance", "begin", "tray", "edits"} <= set(out["touched"])
 
 
-# --- a handler's own ``touched`` is believed only for registered panels --------------------------------------------
+# --- a handler's own ``touched`` adds to the registry's answer, for registered panels ------------------------------
 
 
-def test_a_handlers_own_touched_keeps_only_registered_panels(ck) -> None:
+def test_a_handlers_own_touched_adds_to_the_registrys_answer_for_registered_panels(ck) -> None:
     from levain.cockpit.verbs import _landed
 
     reg = VerbRegistry()
     verb = reg.get("intention_surface_at")
+    base = reg.touched(ck, verb, "tray")
+    assert "health" not in base
     mixed = _landed(reg, ck, verb, "tray", {"ok": True, "touched": ["health", "no-such-panel", 7, "health"]})
-    assert mixed["touched"] == ["health"]
+    assert set(mixed["touched"]) == set(base) | {"health"}         # added to, never narrowed to, the registry's set
+    assert mixed["touched"] == [p for p in ck.panel_ids if p in mixed["touched"]]
+    assert len(mixed["touched"]) == len(set(mixed["touched"]))
     for bad in (["no-such-panel"], [], "tray", None, 3):
         got = _landed(reg, ck, verb, "tray", {"ok": True, "touched": bad})["touched"]
-        assert got == reg.touched(ck, verb, "tray"), bad
+        assert got == base, bad
+    # a supplied set that names a panel the registry already reports changes nothing
+    assert _landed(reg, ck, verb, "tray", {"ok": True, "touched": ["tray"]})["touched"] == base
+
+
+def test_a_downstream_dry_run_carries_no_touched_and_fires_nothing(tmp_path: Path) -> None:
+    from levain.cockpit import ProviderSpec, Read
+    from levain.cockpit.verbs import VerbSpec
+    from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, dispatch
+
+    fired: list = []
+    spec = VerbSpec("note_it", "note", "records a note", "panel", fields=("text",), floor="C1",
+                    tier_fn=lambda *a: "C1", idempotent=True,
+                    fire=lambda scope, p, target, confirm: fired.append(p) or {"touched": ["health"]})
+    r = Rig(tmp_path, extra={"note_it": spec})
+    r.ck.register(ProviderSpec("ext:notes", "line", "Notes", "feed", lambda ctx: Read(value={"lines": []}),
+                               verbs=("note_it",)))
+    out = dispatch(registry=r.reg, cockpit=r.ck, scope=r.src.write_scope, credential=CRED, install_class=INSTALL_CLASS,
+                   route="cockpit", req={"verb": "note_it", "panel_id": "ext:notes", "params": {"text": "hi"},
+                                         "dry_run": True})
+    assert out["dry_run"] is True and "touched" not in out and fired == []
 
 
 def _note(ck, result) -> "frozenset[str] | None":

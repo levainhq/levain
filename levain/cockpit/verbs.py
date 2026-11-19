@@ -2045,17 +2045,16 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
 def _landed(registry: VerbRegistry, cockpit: "Cockpit", verb: VerbSpec, panel_id: str,
             result: dict[str, Any]) -> dict[str, Any]:
     """A C1 fire's result with the panels it changed (``touched``, never empty). The effect's own ``row`` (the row as the
-    write left it, when the write held it) passes through untouched. A handler that names its own ``touched`` is kept only for
-    the ids that are registered panels; none left (or not a list) and the registry's answer stands."""
+    write left it, when the write held it) passes through untouched. A handler that names its own ``touched`` ADDS to the
+    registry's answer, for the ids that are registered panels: the set is never narrower than what the registry reports."""
     if not isinstance(result, dict):
         return result
+    got = registry.touched(cockpit, verb, panel_id)
     supplied = result.get("touched")
     if isinstance(supplied, list):
-        have = set(cockpit.panel_ids)
-        known = [p for p in dict.fromkeys(supplied) if isinstance(p, str) and p in have]
-        if known:
-            return {**result, "touched": known}
-    return {**result, "touched": registry.touched(cockpit, verb, panel_id)}
+        want = {*got, *(p for p in supplied if isinstance(p, str))}
+        got = [p for p in cockpit.panel_ids if p in want]
+    return {**result, "touched": got}
 
 
 def _check_seen(req: dict[str, Any], intent: str | None) -> None:
