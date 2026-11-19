@@ -1306,6 +1306,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
     # The change stream's client: one fetch-read stream per page, through the page's own read transport.
     "/cockpit_stream.js": ("cockpit_stream.js", "text/javascript; charset=utf-8"),
+    # The masthead's freshness line (levain#159): paints the one .livechip from the shim's and the stream's facts.
+    "/fresh_line.js": ("fresh_line.js", "text/javascript; charset=utf-8"),
     # Per-device pairing's browser half (RP-4: the static-shell exception serves these token-free; the claim script is an
     # external file for the CSP): the new device's page, its script, and the cockpit's Devices panel.
     "/pair": ("pair.html", "text/html; charset=utf-8"),

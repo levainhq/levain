@@ -355,7 +355,7 @@ def _asset(name: str) -> str:
 
 def test_the_page_carries_the_chip_and_the_script_the_sheet_and_no_client_name():
     html = _asset("dashboard.html")
-    assert 'id="presencebtn"' in html and html.index('id="presencebtn"') < html.index('id="refresh"')
+    assert 'id="presencebtn"' in html and html.index('id="presencebtn"') < html.index('id="freshline"')
     js = _asset("devices_panel.js")
     for needle in ("/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new", "/webpush/presence/token/revoke",
                    "Tap tokens", "X-Levain-Presence-Token", "Copy", "presence-settings", "pr-settings-grid",
