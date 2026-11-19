@@ -142,7 +142,10 @@
       return r;
     }, function () { scheduleFault(id); return "fault"; });
   }
-  function onEvent(id) { clearFault(id); delete tries[id]; return refetch(id); }
+  // a stream event frame for a panel is a new cause: its retry budget starts over
+  function onEvent(id) { delete tries[id]; return reread(id); }
+  // a read the page chose to make (a manifest diff, the visible edge) is not a cause: it spends from the budget it finds
+  function reread(id) { clearFault(id); return refetch(id); }
 
   // ---- the frame parser: events are blank-line separated; `:` lines are comments (the heartbeat) ----
   function onFrame(text) {
@@ -232,7 +235,9 @@
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
       if (h[id] && h[id].etag === heads[id].etag) return;
-      onEvent(id);
+      // a panel never read (held `err`, no etag) differs from every head: once its budget is spent it waits for an event or a recovery
+      if (h[id] && h[id].err && !h[id].etag && (tries[id] || 0) >= FAULT_RETRY_MS.length) return;
+      reread(id);
     });
   }
   function reconcile(conditional) {
@@ -276,7 +281,7 @@
     staleSince = null;
     tell();
     var o = owed; owed = [];
-    o.forEach(function (id) { onEvent(id); });
+    o.forEach(function (id) { reread(id); });
     if (pending) wantReload();
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
     connect();

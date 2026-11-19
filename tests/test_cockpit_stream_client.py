@@ -44,10 +44,11 @@ function boot(opts) {
       }
       const f = { url, headers: o.headers, ctl: null, push: null };
       fetches.push(f);
-      let wake = null, q = [];
+      let wake = null, q = [], broken = false;
       f.push = (text) => { q.push(text); if (wake) { const w = wake; wake = null; w(); } };
+      f.fail = () => { broken = true; if (wake) { const w = wake; wake = null; w(); } };
       return Promise.resolve({ ok: true, status: 200, body: { getReader: () => ({ read: () => {
-        const next = () => q.length ? Promise.resolve({ done: false, value: Buffer.from(q.shift()) }) : new Promise((r) => { wake = r; }).then(next);
+        const next = () => broken ? Promise.reject(new Error("dropped")) : q.length ? Promise.resolve({ done: false, value: Buffer.from(q.shift()) }) : new Promise((r) => { wake = r; }).then(next);
         return next();
       } }) } });
     },
@@ -333,6 +334,47 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     h.win.LevainCockpitView.refetchPanel = async (id) => { retried.push(id); return "applied"; };
     h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
     ok(retried.join() === "a", "the owed panel is read once when the tab returns: " + retried);
+  }
+  // ---- reconciliation is not a cause: a never-read panel under a stream-down poll whose manifest keeps changing reads the board the schedule's times, not once per change ----
+  {
+    let n = 0;
+    const h = boot({ manifest: () => ({ panels: { a: { etag: "m" + (++n) }, b: { etag: "1" } } }) });
+    delete h.win.LevainCockpitHeld.a.etag;
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    let reloads = 0;
+    h.win.LevainCockpitView.refetchPanel = async (id) => (id === "a" ? false : "applied");
+    h.win.LevainCockpitTransport.reload = () => { reloads++; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: true }));
+    await settle();
+    h.fetches[0].fail();
+    await settle();
+    const poll = h.live().find((x) => x.every);
+    ok(!!poll, "the stream is down: the manifest poll runs");
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    for (let i = 0; i < 40 && poll; i++) {
+      poll.fn(); await settle();
+      for (const t of h.live().filter((x) => !x.every && ![1000, 8000, 32000].includes(x.ms))) { t.off = true; t.fn(); await settle(); }
+    }
+    ok(n >= 30, "the manifest changed on every poll: " + n);
+    ok(reloads <= 3, "reconciliation reloads the board at most the retry steps, not once per change: " + reloads);
+  }
+  // ---- the visible edge reads an owed panel without giving it a fresh budget ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    let t = h.live().find((x) => x.ms === 5000);
+    t.off = true; t.fn(); await settle();
+    ok(h.live().some((x) => x.ms === 15000), "two steps taken, the third (15 s) is pending");
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    ok(!h.live().some((x) => x.ms === 5000), "the owed read after a hide does not start the schedule over");
+    for (let i = 0; i < 6; i++) { t = h.live().find((x) => [5000, 15000, 60000].includes(x.ms)); if (!t) break; t.off = true; t.fn(); await settle(); }
+    ok(calls.length === 4, "the event, two retries and the owed read, then it waits: " + calls.length);
   }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
