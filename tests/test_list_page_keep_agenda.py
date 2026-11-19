@@ -554,8 +554,8 @@ def _form_then(row: str, verb: str, day: str | None, over: Any) -> dict[str, Any
     evaluation against a row found afresh each time. A Focus re-render between separate find / until / act steps swaps the row (a
     null lookup, or a detached node measured as nothing); here a re-render just makes this run again: it clicks the verb only while
     no form is drawn, so it never toggles an open one shut, and answers only once it has measured a form that is on the page."""
-    fill = ("" if day is None else f"const d = f.querySelector('.verb-date'); if (!d) return null; d.value = {json.dumps(day)}; "
-                                   "d.dispatchEvent(new Event('input', {bubbles: true})); ")
+    fill = ("const d = f.querySelector('.verb-date'); if (!d) return null; "      # the date box is drawn before any measure
+            + ("" if day is None else f"d.value = {json.dumps(day)}; d.dispatchEvent(new Event('input', {{bubbles: true}})); "))
     return {"until": f"(() => {{ const r = {row}; if (!r) return null; const f = r.querySelector('.verb-form'); "
                      f"if (!f) {{ const b = r.querySelector('[data-verb={verb}]'); if (b) b.click(); return null; }} {fill}"
                      f"f.scrollIntoView({{block: 'center'}}); return {over(row)}; }})()"}

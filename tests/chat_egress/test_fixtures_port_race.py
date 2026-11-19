@@ -6,7 +6,7 @@ import socket
 import pytest
 
 from .fixtures.procs import tcp_listening
-from .fixtures.stack import Rig
+from .fixtures.stack import START_TRIES, Rig
 
 
 def _hold_tcp(port: int) -> socket.socket:
@@ -66,3 +66,40 @@ def test_the_retry_is_bounded_and_an_explicit_port_is_not_re_picked(tmp_path):
     finally:
         rig.stop()
         holder.close()
+
+
+def test_the_retry_gives_up_after_start_tries_and_re_raises(tmp_path):
+    rig = Rig(tmp_path / "rig")
+    calls = []
+
+    def always_taken():
+        calls.append(1)
+        raise RuntimeError("rawlisten: no 'RAWLISTEN READY' line (rc=1); stderr tail: OSError: Address already in use")
+
+    with pytest.raises(RuntimeError, match="(?i)address already in use"):
+        rig._start_fresh_ports(("raw",), always_taken)
+    assert len(calls) == START_TRIES
+
+
+def test_a_non_port_failure_is_not_retried(tmp_path):
+    rig = Rig(tmp_path / "rig")
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError("rawlisten: no 'RAWLISTEN READY' line (rc=1); stderr tail: ImportError")
+
+    with pytest.raises(RuntimeError, match="ImportError"):
+        rig._start_fresh_ports(("raw",), broken)
+    assert len(calls) == 1
+
+
+def test_a_re_pick_never_hands_back_a_kept_sibling_port(tmp_path, monkeypatch):
+    from .fixtures import stack
+    rig = Rig(tmp_path / "rig")
+    kept = rig.ports.raw                                    # allocated, not bound: the OS may offer it again
+    real = stack.free_tcp_ports
+    monkeypatch.setattr(stack, "free_tcp_ports", lambda n: [kept] + real(n - 1))
+    rig.ports.repick("http", "tls")
+    assert kept not in (rig.ports.http, rig.ports.tls) and rig.ports.raw == kept
+    assert len(set(rig.ports.tcp())) == 5

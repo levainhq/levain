@@ -45,7 +45,11 @@ class Ports:
         """Fresh ports for just these fields (a start lost the allocate-then-bind race); the rest belong to live pieces."""
         tcp = [f for f in fields if f != "dns"]
         if tcp:
-            for f, port in zip(tcp, free_tcp_ports(len(tcp))):
+            # a sibling that is allocated but not yet bound (raw, before start_raw_listener) is not in use, so the OS can hand
+            # its number back: draw enough extra to drop any that equals a field kept
+            kept = {getattr(self, f) for f in ("http", "tls", "off_http", "off_tls", "raw") if f not in tcp}
+            fresh = [x for x in free_tcp_ports(len(tcp) + len(kept)) if x not in kept]
+            for f, port in zip(tcp, fresh):
                 setattr(self, f, port)
         if "dns" in fields:
             self.dns = free_udp_port()
