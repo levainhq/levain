@@ -1002,7 +1002,7 @@
     notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
     if (notice) paintNow(notice); else clearBusy(base.row_id || null);
     const touched = touchedOf(d);
-    if (touched && !words) paintRow(base.row_id || null, d.row);
+    if (touched && !words) paintRow(base.row_id || null, d.row, base.verb);
     const redrew = await afterWrite(touched);
     if (!words && redrew === false && !pendingReload) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
       notice = { key: base.row_id || null, text: "Saved. The page could not refresh; reload to see it.", cls: "note" };
@@ -1026,24 +1026,58 @@
     return ids.length ? ids : null;
   }
 
-  // The row as the write left it, drawn at once and without moving it: the offered actions take the new row version (the next
-  // write on this row must not be refused stale while the panel read is in flight), and the row is marked updated. The panel
-  // read that follows is the truth and replaces whatever is drawn here.
-  function paintRow(key, row) {
+  // Whether a snooze's new `next` ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM") is after now on this page's own clock: a day-only date
+  // is in the future from the day after today, a timed one when its minute is ahead. Anything else (a clear, a past date, a
+  // string that is no date) is not.
+  function isFutureNext(next) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/.exec(typeof next === "string" ? next : "");
+    if (!m) return false;
+    const now = new Date();
+    if (m[4] !== undefined) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime() > now.getTime();
+    return Date.UTC(+m[1], +m[2] - 1, +m[3]) > Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  }
+
+  // The row as the write left it, drawn at once from the write's own answer (the panel read after it can take seconds): the
+  // offered actions take the new row version (the next write on this row must not be refused stale meanwhile), and the person
+  // SEES the change. A snooze to a future date takes the row out of the List's now-view: it is collapsed and hidden from
+  // assistive tech, never removed, so the panel read that follows settles it. Otherwise the new words go into the row's clause
+  // where the row has one, and any other changed field dims the row with a title that says it was updated. Inline styles and
+  // attributes only. A `row` that names another row than the one written is not painted.
+  function paintRow(key, row, verb) {
     if (!key) return;
     const have = row && typeof row === "object" ? row : null;
+    if (have && typeof have.id === "string" && have.id !== key) return;
     const ver = have && typeof have.row_version === "string" ? have.row_version : null;
     const target = live && live.rows ? live.rows[key] : null;
     if (target && ver) {
       target.row_version = ver;
       if (Array.isArray(target.actions)) for (const a of target.actions) if (a && a.target && typeof a.target === "object") a.target.row_version = ver;
     }
+    const leaves = verb === "intention_surface_at" && !!have && isFutureNext(have.next);
+    const words = have && typeof have.text === "string" ? have.text : null;
+    const others = have ? Object.keys(have).filter((k) => k !== "id" && k !== "row_version" && k !== "text") : [];
     for (const el of document.querySelectorAll("[data-row-key]")) {
       if (el.dataset.rowKey !== key) continue;
       if (ver) el.dataset.rowVersion = ver;
       if (have && typeof have.next === "string") el.dataset.rowNext = have.next;
       el.dataset.rowUpdated = "1";
       if (el.classList && typeof el.classList.add === "function") el.classList.add("row-updated");
+      if (!have || !el.style) continue;
+      if (leaves) {
+        el.style.display = "none";
+        if (typeof el.setAttribute === "function") el.setAttribute("aria-hidden", "true");
+        continue;
+      }
+      let placed = false;
+      if (words !== null && typeof el.querySelector === "function") {
+        const clause = el.querySelector(".clause");
+        if (clause) { clause.textContent = words; placed = true; }
+      }
+      // a text the row has no clause for, or any other changed field (the row has no obvious place for it): dim the row
+      if (others.length || (words !== null && !placed)) {
+        el.style.opacity = "0.55";
+        el.title = "Updated; the list is refreshing";
+      }
     }
   }
 

@@ -30,17 +30,19 @@ const bootSrc = fs.readFileSync(process.argv[3], "utf8");
 const only = process.argv[4] || null;
 
 const SNOOZE = { verb: "intention_surface_at", tier: "T1", gesture: "direct", escalates: [], target: { panel_id: "tray", row_id: "intention:i1", row_version: "v1" } };
+const UPDATE = { verb: "intention_update", tier: "T1", gesture: "direct", escalates: [], target: { panel_id: "tray", row_id: "intention:i1", row_version: "v1" } };
 const head = (id, kind, extra) => Object.assign({ id, kind, title: id, status: "ok", as_of: "2026-10-12T12:00:00+00:00" }, extra || {});
 
 function fixture() {
   const manifest = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} },
     generated_at: "2026-10-12T12:00:00+00:00", regions: { header: [], zones: [{ id: "operate", title: "Operate", panels: ["tray", "inbox"] }] },
     panels: { tray: head("tray", "list"), inbox: head("inbox", "list") },
-    verbs: { intention_surface_at: { label: "Snooze", tier: "T1", confirm: false, idempotent: false, job: false, fields: ["date"], effect: "moves the date", gesture: "direct" } },
+    verbs: { intention_surface_at: { label: "Snooze", tier: "T1", confirm: false, idempotent: false, job: false, fields: ["date"], effect: "moves the date", gesture: "direct" },
+             intention_update: { label: "Edit", tier: "T1", confirm: false, idempotent: false, job: false, fields: ["text", "tier"], effect: "changes the row", gesture: "direct" } },
     errors: [], transport: { writable: true, write_token_required: false } };
   const row = (id, actions) => ({ id, version: "v1", title: id, body: id, group: null, badges: [], facets: {}, actions });
   const panels = {
-    tray: Object.assign(head("tray", "list"), { rows: [row("intention:i1", [SNOOZE])], actions: [] }),
+    tray: Object.assign(head("tray", "list"), { rows: [row("intention:i1", [SNOOZE, UPDATE])], actions: [] }),
     inbox: Object.assign(head("inbox", "list"), { rows: [row("m1", [])], actions: [] }),
   };
   return { manifest, panels };
@@ -65,9 +67,14 @@ function makeEnv(verbAnswer, refetchAnswer) {
     if (pid && fx.panels[pid]) return resp(200, fx.panels[pid]);
     return resp(404, {});
   }
-  const rowEl = { dataset: { rowKey: "intention:i1" }, classList: { add: (c) => marks.push(c) }, querySelectorAll: () => [], querySelector: () => null, appendChild() {} };
+  // the row as the page draws it: a clause (the row's words) and the inline style and attributes a repaint may set
+  const clauseEl = { textContent: "old words" };
+  const attrs = {};
+  const rowEl = { dataset: { rowKey: "intention:i1" }, classList: { add: (c) => marks.push(c) }, querySelectorAll: () => [],
+                  querySelector: (sel) => (sel === ".clause" ? clauseEl : null), appendChild() {},
+                  style: {}, title: "", attrs, setAttribute: (k, v) => { attrs[k] = String(v); }, getAttribute: (k) => (k in attrs ? attrs[k] : null) };
   const ls = store(); ls.setItem("levain_write_token", "tok");
-  const env = { posts, gets, renders, marks, rowEl, refetchCalls: [], releaseGate: () => {}, settled: [] };
+  const env = { posts, gets, renders, marks, rowEl, clauseEl, refetchCalls: [], releaseGate: () => {}, settled: [] };
   const V = Object.assign({}, View, {
     refetchPanel: (pid) => {
       env.refetchCalls.push(pid);
@@ -93,7 +100,8 @@ function makeEnv(verbAnswer, refetchAnswer) {
     return env;
   };
   env.opts = () => renders[renders.length - 1].opts;
-  env.snooze = () => env.opts().commit({ kind: "intention_surface_at", intention_id: "i1", date: "2026-11-25" });
+  env.snooze = () => env.opts().commit({ kind: "intention_surface_at", intention_id: "i1", date: "2999-01-01" });
+  env.edit = (fields) => env.opts().commit(Object.assign({ kind: "intention_update", intention_id: "i1" }, fields));
   env.tick = () => new Promise((r) => setTimeout(r, 20));
   return env;
 }
@@ -104,7 +112,7 @@ const isManifest = (u) => u.indexOf("/cockpit/manifest.json") >= 0;
 const cases = {};
 
 cases.touched_write_repaints_the_row_then_refetches_only_the_touched_panel = async () => {
-  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { row_version: "v2", next: "2026-11-25" } }), () => "applied").start();
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { row_version: "v2", next: "2999-01-01" } }), () => "applied").start();
   const getsBefore = env.gets.length;
   env.hold();
   const r = await env.snooze();
@@ -116,7 +124,7 @@ cases.touched_write_repaints_the_row_then_refetches_only_the_touched_panel = asy
   ok(mine.length === 1 && /\/cockpit\/panel\/tray\.json/.test(mine[0]), "a GET of only the touched panel: " + JSON.stringify(mine));
   ok(!mine.some(isManifest), "no manifest GET");
   ok(env.marks.indexOf("row-updated") >= 0, "the row is marked updated: " + JSON.stringify(env.marks));
-  ok(env.rowEl.dataset.rowVersion === "v2" && env.rowEl.dataset.rowNext === "2026-11-25", "the row carries the response's version and next: " + JSON.stringify(env.rowEl.dataset));
+  ok(env.rowEl.dataset.rowVersion === "v2" && env.rowEl.dataset.rowNext === "2999-01-01", "the row carries the response's version and next: " + JSON.stringify(env.rowEl.dataset));
   ok(env.marks.indexOf("get-resolved:tray") < 0, "the row repainted while the panel GET was still held");
   env.releaseGate();
   await env.tick();
@@ -126,6 +134,63 @@ cases.touched_write_repaints_the_row_then_refetches_only_the_touched_panel = asy
   await env.snooze();
   const second = env.posts.filter((p) => !p.body.dry_run)[1];
   ok(second && second.body.row_version === "v2", "the next write names v2: " + JSON.stringify(second && second.body));
+};
+
+// What the person SEES within the write's own answer, before the panel read (8-12 s on a loaded bridge) returns.
+cases.a_snooze_into_the_future_hides_the_row_before_the_read_returns = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:i1", row_version: "v2", next: "2999-01-01" } }), () => "applied").start();
+  env.hold();
+  const r = await env.snooze();
+  ok(r && r.ok === true, "the write landed");
+  await env.tick();
+  ok(env.marks.indexOf("get-resolved:tray") < 0, "the panel GET is still held");
+  ok(env.rowEl.style.display === "none", "the snoozed row is collapsed: " + JSON.stringify(env.rowEl.style));
+  ok(env.rowEl.attrs["aria-hidden"] === "true", "and hidden from assistive tech: " + JSON.stringify(env.rowEl.attrs));
+  env.releaseGate();
+  await env.tick();
+};
+
+cases.a_snooze_that_leaves_the_row_in_view_dims_it_with_a_title = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:i1", row_version: "v2", next: "2000-01-01" } }), () => "applied").start();
+  env.hold();
+  await env.snooze();
+  await env.tick();
+  ok(env.marks.indexOf("get-resolved:tray") < 0, "the panel GET is still held");
+  ok(env.rowEl.style.display !== "none", "a date in the past does not hide the row");
+  ok(env.rowEl.style.opacity !== undefined && env.rowEl.style.opacity !== "" && Number(env.rowEl.style.opacity) < 1, "the row is dimmed: " + JSON.stringify(env.rowEl.style));
+  ok(/updated/i.test(env.rowEl.title), "with a title that says it was updated: " + JSON.stringify(env.rowEl.title));
+  env.releaseGate();
+  await env.tick();
+};
+
+cases.an_edit_of_the_text_shows_the_new_words_in_place = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:i1", row_version: "v2", text: "new words" } }), () => "applied").start();
+  env.hold();
+  await env.edit({ text: "new words" });
+  await env.tick();
+  ok(env.marks.indexOf("get-resolved:tray") < 0, "the panel GET is still held");
+  ok(env.clauseEl.textContent === "new words", "the row's words are the new ones: " + env.clauseEl.textContent);
+  ok(env.rowEl.style.display !== "none", "the row stays");
+  env.releaseGate();
+  await env.tick();
+};
+
+cases.an_edit_of_a_field_with_no_place_in_the_row_dims_it = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:i1", row_version: "v2", tier: "parked" } }), () => "applied").start();
+  env.hold();
+  await env.edit({ tier: "parked" });
+  await env.tick();
+  ok(env.marks.indexOf("get-resolved:tray") < 0, "the panel GET is still held");
+  ok(env.clauseEl.textContent === "old words", "the words are untouched");
+  ok(Number(env.rowEl.style.opacity) < 1 && /updated/i.test(env.rowEl.title), "dimmed with a title: " + JSON.stringify([env.rowEl.style, env.rowEl.title]));
+  env.releaseGate();
+  await env.tick();
+};
+
+cases.a_row_for_another_row_paints_nothing = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"], row: { id: "intention:other", row_version: "v9", next: "2999-01-01" } }), () => "applied").start();
+  await env.snooze();
+  ok(env.rowEl.style.display !== "none" && env.rowEl.dataset.rowVersion !== "v9", "a row naming another id is not painted onto this one: " + JSON.stringify([env.rowEl.style, env.rowEl.dataset]));
 };
 
 cases.a_response_without_touched_runs_the_whole_board_path = async () => {
@@ -186,6 +251,11 @@ cases.a_panel_that_cannot_repaint_in_place_asks_one_passive_board_read = async (
 
 CASES = [
     "touched_write_repaints_the_row_then_refetches_only_the_touched_panel",
+    "a_snooze_into_the_future_hides_the_row_before_the_read_returns",
+    "a_snooze_that_leaves_the_row_in_view_dims_it_with_a_title",
+    "an_edit_of_the_text_shows_the_new_words_in_place",
+    "an_edit_of_a_field_with_no_place_in_the_row_dims_it",
+    "a_row_for_another_row_paints_nothing",
     "a_response_without_touched_runs_the_whole_board_path",
     "an_empty_touched_is_no_touched",
     "the_stream_announcing_a_refetched_panel_reads_it_once",
