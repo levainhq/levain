@@ -4104,8 +4104,8 @@ def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]
     deadline = ctx.seams.monotonic() + vseams.lock_wait_s
     a, export_class = verify_caller(ctx, s)
     # levain#134: the verifier's account before any lock, root fact or wait, so an install without it is told so at
-    # once (the caller is bound first: a stranger still learns only ``no-session``). verify_sealed_run reads the uid
-    # again for the run itself.
+    # once (the caller is bound first: a stranger still learns only ``no-session``). This read is the gate;
+    # verify_sealed_run reads the uid for the sealed run itself.
     verifier_uid(ctx)
     at("verify:account")
     at("verify:2")

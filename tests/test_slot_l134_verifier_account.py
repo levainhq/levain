@@ -8,7 +8,8 @@ setup never creates it (``ids.SINGLETONS`` does not list it). That is RULED, not
 
 * root: ``adopt-verify`` checks the account right after binding the caller, before any lock, root fact or wait, and
   its detail is :data:`wall.VERIFIER_UNPROVISIONED` (the wire name stays ``account-missing``);
-* the CLI: ``session adopt`` asks the account database before adopt-open's import, and refuses the same way.
+The CLI has no pre-check of its own: root allows the report-only ``adopt-nothing-new`` path (it exits before any
+adopt-verify call), and a CLI-side lookup would refuse it.
 
 No account is created or touched here: every account lookup is a seam.
 """
@@ -49,7 +50,8 @@ def _absent(name: str) -> int:
 def test_the_precondition_names_the_account_the_setup_gap_and_the_flag_it_is_not():
     t = wall.VERIFIER_UNPROVISIONED
     assert t.startswith(wall.EXPORT_ACCOUNT["verifier"] + ":")
-    assert "setup does not create it" in t and "not available on this install" in t
+    assert "setup does not create it" in t and "cannot run on this install yet" in t
+    assert "Nothing was taken into your repo" in t and "preview" not in t and "unchanged" not in t
     assert "--verifier-slots" in t and "_levain_v<n>" in t and "_levain_c<n>" in t
     assert "\n" not in t and "\r" not in t       # one line on root's stderr and in the CLI's refusal
 
@@ -114,6 +116,29 @@ def test_adopt_verify_without_the_account_refuses_before_any_lock_or_root_fact(t
 
 
 @GIT_ONLY
+def test_adopt_verify_refuses_after_the_caller_is_bound_and_before_any_lock(tmp_path, monkeypatch):
+    order: list = []
+    real = RH.verify_caller
+
+    def caller(ctx, s):
+        order.append("caller")
+        return real(ctx, s)
+
+    def lock(*a, **k):
+        order.append("lock")
+        raise AssertionError("the session lock was taken")
+
+    def lookup(name):
+        order.append("account")
+        return _absent(name)
+    monkeypatch.setattr(RH, "verify_caller", caller)
+    monkeypatch.setattr(RH, "session_lock", lock)
+    L = fx.make_store(tmp_path, "delta")
+    rc, out, err, log = _verb(L, lookup)
+    assert out == {"ok": False, "refused": "account-missing"} and order == ["caller", "account"], order
+
+
+@GIT_ONLY
 def test_adopt_verify_binds_the_caller_before_the_account_check(tmp_path):
     # A uid that operates no such session still learns only no-session, whatever the verifier account's state.
     L = fx.make_store(tmp_path, "delta")
@@ -135,49 +160,33 @@ def test_adopt_verify_with_the_account_runs_on_past_the_check(tmp_path):
 BASE = {"oid": "d" * 40, "object_format": "sha1"}
 
 
-def _cli(tmp_path, monkeypatch, present):
+def test_cli_has_no_account_precheck_and_a_report_only_adopt_exits_0_without_the_account(tmp_path, monkeypatch):
+    # Root allows the report-only path (adopt-nothing-new exits before any adopt-verify call), so the CLI must not
+    # look the account up itself: no pre-check, and no pwd lookup at all on this path.
+    import pwd
+
+    assert not hasattr(AVW, "_account_present") and "account_present" not in AVW.Seams.__dataclass_fields__
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(AssertionError("looked up " + name)))
     calls: list = []
-    asked: list = []
+    store = tmp_path / "store"
 
     def call_helper(seams, *args, err, timeout=None):
         calls.append(args[0])
         if args[0] == "status":
             return {"records": [{"base": dict(BASE)}]}
-        raise Refused("stop-here", args[0])      # past the pre-check: the test has seen what it needs
+        assert args[0] == "adopt-open", args
+        return {"result": "adopt-nothing-new", "base_oid": BASE["oid"], "object_format": "sha1",
+                "repo": str(store / "export" / AVW.EXPORT_CLASS / S), "refs": []}
     monkeypatch.setattr(AVW, "call_helper", call_helper)
     monkeypatch.setattr(AVW, "check_repo", lambda seams, repo, base: Path(os.path.abspath(repo)))
-
-    def account_present(name):
-        asked.append(name)
-        return present
-    seams = AVW.Seams(helper=("FAKE",), store=Path("/nonexistent"), git="git", account_present=account_present,
+    monkeypatch.setattr(AVW, "_copy_report", lambda *a, **k: {})
+    monkeypatch.setattr(AVW.adopt_preview, "report_section", lambda report: ["(report)"])
+    tmpd = tmp_path / "tmp"
+    tmpd.mkdir()
+    seams = AVW.Seams(helper=("FAKE",), store=store, git="git", tmpdir=tmpd,
                       spawn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
     out, err = io.StringIO(), io.StringIO()
-    rc = AVW.main(["adopt", S, "--repo", str(tmp_path), "--take", "head"], seams=seams, out=out, err=err)
-    return rc, out.getvalue(), err.getvalue(), calls, asked
-
-
-def test_cli_adopt_without_the_account_refuses_before_the_import(tmp_path, monkeypatch):
-    # Built red: J06 printed "waiting on a running import", ran adopt-open's import, then the verify line, and only
-    # then "refused account-missing: runtime helper adopt-verify".
-    rc, out, err, calls, asked = _cli(tmp_path, monkeypatch, present=False)
-    assert rc == 1 and calls == ["status"] and asked == ["_levain_verify"]
-    assert err == f"levain session adopt: refused account-missing: {wall.VERIFIER_UNPROVISIONED}\n"
-    assert "waiting on a running import" not in out
-
-
-def test_cli_adopt_with_the_account_goes_on_to_adopt_open(tmp_path, monkeypatch):
-    rc, out, err, calls, asked = _cli(tmp_path, monkeypatch, present=True)
-    assert calls == ["status", "adopt-open"] and "refused stop-here" in err
-    assert "waiting on a running import" in out
-
-
-def test_the_default_account_lookup_reads_the_database_and_never_refuses_on_a_lookup_fault(monkeypatch):
-    import pwd
-
-    assert AVW.Seams(helper=("FAKE",), store=Path("/nonexistent")).account_present is AVW._account_present
-    assert AVW._account_present(pwd.getpwuid(os.getuid()).pw_name) is True
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name)))
-    assert AVW._account_present("_levain_verify") is False
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: (_ for _ in ()).throw(OSError("directory service down")))
-    assert AVW._account_present("_levain_verify") is True     # advisory: root decides
+    rc = AVW.main(["adopt", S, "--repo", str(tmp_path), "--take", "none"], seams=seams, out=out, err=err)
+    assert rc == 0, (out.getvalue(), err.getvalue())
+    assert calls == ["status", "adopt-open"] and "nothing new since its base" in out.getvalue()
+    assert "account-missing" not in err.getvalue()

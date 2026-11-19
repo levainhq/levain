@@ -167,9 +167,9 @@ EXPORT_ENTRY = {"importer": "export-importer", "verifier": "export-verifier"}
 #: flag's name is what made the J06 refusal read as a setup fault.
 VERIFIER_UNPROVISIONED = (
     "_levain_verify: adopt runs its confined verifier as this account, and setup does not create it in this "
-    "release, so adopt (its preview and its take) is not available on this install yet. --verifier-slots makes the "
-    "verifier session accounts (_levain_v<n>, _levain_c<n>), not this one. Nothing was adopted and the session is "
-    "unchanged: discard or restore it as usual")
+    "release, so adopt's verify step (the one that precedes any take) cannot run on this install yet. --verifier-slots "
+    "makes the verifier session accounts (_levain_v<n>, _levain_c<n>), not this one. Nothing was taken into your "
+    "repo")
 
 
 def export_principal(host: str, role: str, ids: Mapping[str, int], shared: Mapping[str, int], *,

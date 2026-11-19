@@ -98,20 +98,6 @@ def _errno_name(e: OSError) -> str:
     return errno.errorcode.get(e.errno or 0, "EIO")
 
 
-def _account_present(name: str) -> bool:
-    """False only when the account database says the name is unknown; anything else (a lookup that fails some other
-    way) is True, so the pre-check never refuses what root itself would have run (root re-checks either way)."""
-    import pwd
-
-    try:
-        pwd.getpwnam(name)
-    except KeyError:
-        return False
-    except Exception:   # noqa: BLE001 - advisory only: root decides
-        return True
-    return True
-
-
 # --- the runtime helper ---------------------------------------------------------------------------------------
 
 
@@ -239,8 +225,6 @@ class Seams:
     log: Log = None
     stdin: Optional[IO[str]] = None                 # his answer to the prompt (None = ``sys.stdin``)
     spawn: Callable[..., "subprocess.CompletedProcess[bytes]"] = field(default_factory=lambda: _run)
-    #: Whether this machine's account database names the account (levain#134's pre-check; root re-checks).
-    account_present: Callable[[str], bool] = field(default_factory=lambda: _account_present)
 
     def __post_init__(self) -> None:
         from levain.slot import layout
@@ -692,14 +676,6 @@ def adopt(session: str, repo: Path, which: Optional[str], seams: Seams, out: IO[
         raise Refused("adopt-answer-malformed", "status: records")
     base = check_base(rec[0].get("base"))
     repo = check_repo(seams, repo, base)
-    # levain#134 (J06, VM sitting 11-18): every adopt ends in root's adopt-verify, which runs as _levain_verify, and
-    # setup does not create that account while adopt-verify is gated (PREL3_RULINGS 2a-12). Say so BEFORE adopt-open's
-    # import runs (that import was the long wait J06 sat through before the bare refusal). Advisory: root's
-    # adopt-verify refuses the same way on its own, whatever this check says.
-    from levain.slot import wall
-
-    if not seams.account_present(wall.EXPORT_ACCOUNT["verifier"]):
-        raise Refused("account-missing", wall.VERIFIER_UNPROVISIONED)
     out.write("waiting on a running import (if one holds the adopt lock)...\n")
     out.flush()
     ans = call_helper(seams, "adopt-open", session, err=err)       # its warnings are printed there
