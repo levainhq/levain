@@ -2585,6 +2585,14 @@ class Cockpit:
         no etag (R13), so a cached head or payload is composed without them and never holds one."""
         return {**out, "as_of": snap.as_of, "valid_until": snap.fresh_info.valid_until if snap.fresh_info is not None else None}
 
+    @staticmethod
+    def _stamp_unrowed(out: dict[str, Any], snap: _Snap) -> dict[str, Any]:
+        """The D11 fields of a head or payload whose snapshot no row stands behind (a serve-composed panel, one retired
+        mid-read), set on a shallow copy: it was read now, so it has no bound and nothing pending, and it is stale when its
+        provider failed or said so. A manifest's head and the panel's own read both take them from here, so they agree.
+        The etag needs nothing added: a failure or a provider's stale word is already the snapshot's ``status``."""
+        return {**out, "valid_until": None, "stale": bool(snap.stale_hint or snap.status == "error"), "pending": False}
+
     def _cached_head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date, auth: RequestAuthority,
                      rkey: tuple | None = None) -> dict[str, Any]:
         """The shared composed head of an attached panel (``_snap_key`` and ``_request_key``), composed without its
@@ -2604,7 +2612,7 @@ class Cockpit:
         serve-composed panels, a retired one) is composed every time. A roster's health is a clock function, so its etag is
         set per request, on the copy."""
         if snap.fresh_info is None:
-            return self._head(spec, snap, cred, today, auth, now)
+            return self._stamp_unrowed(self._head(spec, snap, cred, today, auth, now), snap)
         head = self._stamp_fresh(self._cached_head(spec, snap, cred, today, auth, rkey), snap)
         if spec.kind == "roster" and isinstance(snap.value, dict):
             head["etag"] = self._roster_etag(head["etag"], snap.value, now)
@@ -2633,13 +2641,9 @@ class Cockpit:
 
         def read_head(spec: ProviderSpec) -> dict[str, Any]:
             snap = self._snap_for(spec, ctx.child(), read_after)
-            return self._head(spec, snap, cred, ctx.today, auth, ctx.now)
+            return self._attached_head(spec, snap, cred, ctx.today, auth, ctx.now, rkey)
         for spec, head in zip(composed, self._parallel(read_head, composed)):
             heads[spec.id] = head
-        for spec in specs:
-            head = heads[spec.id]
-            if "stale" not in head:
-                heads[spec.id] = {**head, "valid_until": None, "stale": False, "pending": False}
         return heads, meta
 
     def _stream_health(self) -> dict[str, Any]:
@@ -3223,7 +3227,9 @@ class Cockpit:
                 return self._attached_panel(spec, snap, ctx, auth, panel_id, profile, row, credential_class)
             return self._stamp_band_age(
                 self._panel_body(spec, snap, None, ctx, auth, panel_id, profile, q, row, credential_class, limit), ctx.now)
-        return self._panel_body(spec, snap, None, ctx, auth, panel_id, profile, q, row, credential_class, limit)
+        out = self._panel_body(spec, snap, None, ctx, auth, panel_id, profile, q, row, credential_class, limit)
+        # an attached cockpit's payload says what its manifest head says of the same panel (a serve-composed one, read now)
+        return self._stamp_unrowed(out, snap) if self._reader is not None else out
 
     def _attached_panel(self, spec: ProviderSpec, snap: _Snap, ctx: ReadContext, auth: RequestAuthority, panel_id: str,
                         profile: str, row: str | None, credential_class: str) -> dict[str, Any]:

@@ -24,7 +24,7 @@ from levain.cockpit.derive import DeriveResult
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
 from levain.cockpit.list_panel import _age_text
 from levain.cockpit.results import Read, RowIn
-from tests.test_cockpit_attached_engine import CRED, PANELS, T0, FakeVerbView, Recorder, Rig, list_spec
+from tests.test_cockpit_attached_engine import CRED, PANELS, T0, Clock, FakeVerbView, Recorder, Rig, list_spec
 from tests.test_cockpit_ck1 import ROW
 
 TOKEN = {"class": "token", "device_class": None}
@@ -707,3 +707,61 @@ def test_a_bare_cockpit_makes_no_head_layer_state_and_carries_no_freshness(tmp_p
     assert "freshness" not in manifest
     assert not ({"valid_until", "stale", "pending"} & set(manifest["panels"]["alpha"]))
     assert not ck._head_cache and not ck._panel_cache and ck._reader is None
+
+
+# --- S3b round 1 fixes --------------------------------------------------------------------------------------------------------
+def composed_spec(pid: str, box: dict[str, Any]) -> ProviderSpec:
+    """A serve-composed panel's provider: it reads a store on the request, and the test makes it fail or declare itself stale."""
+    def read(ctx: ReadContext) -> Read:
+        if box.get("fail"):
+            raise RuntimeError("the store cannot be read")
+        return Read(rows=(RowIn(f"{pid}:a", "a", {"at": "2026-11-19"}, stored={"id": f"{pid}:a"}),), stale=bool(box.get("stale")))
+
+    return ProviderSpec(id=pid, kind="triage-list", title=pid, priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+
+
+_FRESH_KEYS = ("valid_until", "stale", "pending")
+
+
+def test_a_serve_composed_panels_manifest_head_and_panel_carry_the_same_freshness_fields(tmp_path: Path) -> None:
+    box: dict[str, Any] = {}
+    r = Rig(tmp_path, ("alpha", "mine"), specs={"mine": composed_spec("mine", box)})
+    try:
+        r.ck.mark_serve_composed(["mine"])
+        r.derive()
+        panel = r.ck.panel("mine")
+        assert {k: panel[k] for k in _FRESH_KEYS} == {k: r.ck.manifest(CRED)["panels"]["mine"][k] for k in _FRESH_KEYS} == {
+            "valid_until": None, "stale": False, "pending": False}
+        etag = panel["etag"]
+        box["stale"] = True                                      # a provider that says its read is stale: status moves, so the etag does
+        told, told_head = r.ck.panel("mine"), r.ck.manifest(CRED)["panels"]["mine"]
+        assert told["stale"] is True and told_head["stale"] is True and told["etag"] == told_head["etag"] != etag
+        box.update(stale=False)
+        assert r.ck.panel("mine")["etag"] == etag
+    finally:
+        r.close()
+
+
+def test_an_erroring_serve_composed_provider_reads_stale_in_the_manifest_and_the_panel(tmp_path: Path) -> None:
+    box: dict[str, Any] = {"fail": True}
+    r = Rig(tmp_path, ("alpha", "mine"), specs={"mine": composed_spec("mine", box)})
+    try:
+        r.ck.mark_serve_composed(["mine"])
+        r.derive()
+        panel, head_ = r.ck.panel("mine"), r.ck.manifest(CRED)["panels"]["mine"]
+        assert panel["status"] == head_["status"] == "error"
+        assert panel["stale"] is True and head_["stale"] is True
+        assert (panel["valid_until"], panel["pending"], head_["valid_until"], head_["pending"]) == (None, False, None, False)
+        assert panel["etag"] == head_["etag"]
+        assert r.ck.change_probe().snapshot()[0]["mine"] == head_["etag"]
+    finally:
+        r.close()
+
+
+def test_a_bare_cockpits_serve_composed_panel_carries_no_freshness_fields(tmp_path: Path) -> None:
+    box: dict[str, Any] = {"fail": True}
+    ck = Cockpit(clock=Clock(T0))
+    ck.register(composed_spec("mine", box))
+    ck.mark_serve_composed(["mine"])
+    assert not (set(_FRESH_KEYS) & set(ck.panel("mine"))) and not (set(_FRESH_KEYS) & set(ck.manifest(CRED)["panels"]["mine"]))
