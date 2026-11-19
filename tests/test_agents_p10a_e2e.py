@@ -28,6 +28,13 @@ from tests._p10a_rig import Install, utc  # noqa: E402
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
+def _after_launch() -> str:
+    """A tick time one hour past the REAL clock: a hand start launches at the real now, and the launch lease is 900 s, so
+    this is always past it. A literal date stopped being past it once the real clock reached it (CI red 11-18 after
+    23:50 UTC, main included); the cases still pinned to literal dates below are the same class."""
+    return (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # ------------------------------------------------------------------------------------------ edit + re-sign mid-run
 
 def test_p10a_edit_and_resign_mid_run(tmp_path):
@@ -63,7 +70,7 @@ def test_p10a_edit_and_resign_mid_run(tmp_path):
     unsigned = inst.cli("dream", "start")
     assert (unsigned.rc, unsigned.out, unsigned.err) == (1, "", refusal)
     assert len(inst.rows()) == 1
-    ended = inst.cli("agents", "tick", now=utc(2026, 11, 18, 23, 50, 0))     # past the launch lease: the run is recovered
+    ended = inst.cli("agents", "tick", now=_after_launch())     # past the launch lease: the run is recovered
     assert ended.rc == 6 and "ended stopped/crash_recovered (takeover)" in ended.err
     assert inst.cli("dream", "start").err == refusal and len(inst.rows()) == 1
 
@@ -99,7 +106,7 @@ def test_p10a_manual_run_against_the_ceiling(tmp_path):
         "occurrence at a time; nothing was claimed\n")
     assert len(inst.rows()) == 1
 
-    recovered = inst.cli("agents", "tick", now=utc(2026, 11, 18, 23, 50, 0))
+    recovered = inst.cli("agents", "tick", now=_after_launch())
     assert recovered.rc == 6 and recovered.err.startswith(f"levain agents tick: {run1['occurrence_id']} (hand-") and (
         "was launched but no fire claimed it within its 900s launch lease: it was ended stopped/crash_recovered "
         "(takeover), its slot freed and its reservation settled\n") in recovered.err
@@ -272,7 +279,7 @@ def test_p10a_stale_link_after_a_revoke(tmp_path):
     start = inst.cli("dream", "start")
     assert start.rc == 1 and start.out == "" and f"(ReplayError: {broken}); nothing is armed this tick" in start.err \
         and start.err.endswith(refusal)
-    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 4, 0, 0))
+    tick = inst.cli("agents", "tick", now=_after_launch())
     assert tick.rc == 5 and f"the authority refresh failed (ReplayError): {broken}" in tick.err \
         and "nothing is armed this tick" in tick.err
     assert inst.rows() == [] and inst.spawned() == []                    # no occurrence claimed, no fire asked for
@@ -600,7 +607,7 @@ def test_p10a_revoke_killed_c2_to_c4_the_agent_stays_barred_and_the_rerun_lands(
                         "attempts": 0 if point == "c2" else 1}
     assert inst.rows("SELECT epoch FROM agent_occurrences")[0]["epoch"] == 1 and _log_ops(inst) == [(5, "create_grant")]
     if point != "c4":
-        inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+        inst.cli("agents", "tick", now=_after_launch())
         assert [b["open"] for b in _bar(inst)] == [1] and _log_ops(inst) == [(5, "create_grant")]
     rerun = inst.cli(*argv, spawn_gate=False)
     assert (rerun.rc, rerun.out, rerun.err) == (0, LANDED, "Signing data on standard input\n")
@@ -645,7 +652,7 @@ def test_p10a_revoke_killed_c4_c5_recovery_by_the_tick(tmp_path, point):
     """The design's recovery for c4 (append the recorded signature, no new gesture) and c5 (close the bar signed): after
     the kill, one tick leaves the bar closed ``signed`` at seq 6 and the revoke in the log."""
     inst, agent_id, argv = _killed_revoke(tmp_path, point)
-    inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    inst.cli("agents", "tick", now=_after_launch())
     (bar,) = _bar(inst)
     assert (bar["open"], bar["reason"], bar["revoke_seq"]) == (0, "signed", 6)
     assert _log_ops(inst) == [(5, "create_grant"), (6, "revoke_agent")]
@@ -699,7 +706,7 @@ def test_p10a_open_reservation_at_a_crash(tmp_path):
     held = inst.cli("dream", "start")
     assert held.err == (f"levain dream start: {run['occurrence_id']} (manual, launched) is still in flight, and the "
                         "dream runs one occurrence at a time; nothing was claimed\n")
-    tick = inst.cli("agents", "tick", now=utc(2026, 11, 19, 3, 0, 0))
+    tick = inst.cli("agents", "tick", now=_after_launch())
     assert tick.rc == 6 and "was launched but no fire claimed it within its 900s launch lease: it was ended " \
         "stopped/crash_recovered (takeover), its slot freed and its reservation settled\n" in tick.err
     (ended,) = inst.rows()
