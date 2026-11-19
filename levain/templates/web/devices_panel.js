@@ -204,7 +204,24 @@
   function syncSection() {
     section.hidden = devPanel.hidden;
     if (prSetSec) prSetSec.hidden = (!prPanel || prPanel.hidden) && (!vcPanel || vcPanel.hidden);
-    if (emptyLine) emptyLine.hidden = !(section.hidden && (!prSetSec || prSetSec.hidden));
+    syncEmpty();
+  }
+  // The Settings empty line says "nothing to set" only once every settings read has answered at least once (drawn, 404, 403 or failed:
+  // each marks its section settled) and the "This cockpit" section has had its first render, so it never flashes while the reads are
+  // still out. It is shown when no section is drawn, "This cockpit" (dashboard_core.js syncCockpitSection) included.
+  const settled = { dev: false, pr: false, vc: false };
+  let ckObserved = false;
+  function settle(which) { if (!settled[which]) { settled[which] = true; syncEmpty(); } }
+  function syncEmpty() {
+    if (!emptyLine) return;
+    const ck = document.getElementById("ck-thiscockpit");
+    if (ck && !ckObserved && typeof MutationObserver === "function") {
+      ckObserved = true;
+      new MutationObserver(syncEmpty).observe(ck, { attributes: true, attributeFilter: ["hidden", "data-settled"] });
+    }
+    const none = section.hidden && (!prSetSec || prSetSec.hidden) && (!ck || ck.hidden);
+    const ready = settled.dev && settled.pr && settled.vc && (!ck || ck.dataset.settled === "1");
+    emptyLine.hidden = !(ready && none);
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
 
@@ -294,6 +311,9 @@
   // One read and one paint. Resolves true when the panel is as current as it can be (including "nothing to show here"),
   // false when the read failed and said so.
   async function readOnce() {
+    try { return await readOnceInner(); } finally { settle("dev"); }
+  }
+  async function readOnceInner() {
     if (gone) return true;
     const tok = token();
     if (!tok) { devShown(false); return true; }
@@ -1231,6 +1251,9 @@
     return prRunning;
   }
   async function readPresenceOnce() {
+    try { await readPresenceInner(); } finally { settle("pr"); }
+  }
+  async function readPresenceInner() {
     if (prGone) return;
     const tok = token();
     if (!tok || tok === prRefused) { prShow(false); return; }
@@ -1396,6 +1419,9 @@
   let vcDone = false, vcBusy = false, vcTries = 0;
   const VC_MAX_TRIES = 6;
   async function voiceProbe() {
+    try { await voiceProbeInner(); } finally { settle("vc"); }
+  }
+  async function voiceProbeInner() {
     if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return;
     vcBusy = true; vcTries++;
     let state = null, final = false;

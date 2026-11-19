@@ -21,7 +21,7 @@ WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 STATE = ("(() => { const q = (s) => document.querySelector(s); const box = (n) => { if (!n) return null; const r = n.getBoundingClientRect();"
          " return {shown: n.getClientRects().length > 0, top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right), h: Math.round(r.height)}; };"
          " const row = q('#ck-mctl'); const amb = [...document.querySelectorAll('#ck-mctl .sky-toggle')].filter(b => !b.classList.contains('sky-toggle-ghost'))[0];"
-         " return JSON.stringify({open: document.body.classList.contains('ia-graph-open'), btn: q('[data-ia-graph-toggle]').textContent, expanded: q('[data-ia-graph-toggle]').getAttribute('aria-expanded'),"
+         " return JSON.stringify({open: document.body.classList.contains('ia-graph-open'), btn: q('[data-ia-graph-toggle]').textContent, expanded: q('[data-ia-graph-toggle]').getAttribute('aria-expanded'), controls: q('[data-ia-graph-toggle]').getAttribute('aria-controls'),"
          " row: box(row), toggle: box(q('[data-ia-graph-toggle]')), calm: box(q('#calmbtn')), calmIn: !!(row && row.contains(q('#calmbtn'))), calmPressed: q('#calmbtn').getAttribute('aria-pressed'),"
          " amb: box(amb), ambIn: !!(amb && row.contains(amb)), ambPressed: amb ? amb.getAttribute('aria-pressed') : null, mastCalm: !!q('header.masthead #calmbtn'), phoneCalm: !!q('#calmphone'),"
          " seg: box(q('#ck-hlens .tv-seg')), hlens: box(q('#ck-hlens')), sky: box([q('#ck-hlens .tv-lensbody'), q('#ck-sky')].find(n => n && n.getClientRects().length) || q('#ck-sky')), card: box(q('#ck-skycard')), jarbox: box(q('#ck-jarbox')),"
@@ -71,12 +71,12 @@ def test_closed_shows_no_selector_open_stacks_row_selector_graph_and_remembers_t
                 {"eval": STATE},                                                                      # 3: open with the stored lens
             ])
             shut, opened, again, back = _states(out)
-            assert shut["open"] is False and shut["btn"] == "Show the graphs" and shut["expanded"] == "false", (w, shut)
+            assert shut["open"] is False and shut["btn"] == "Show the graphs" and shut["expanded"] is None and shut["controls"] == "ck-sky", (w, shut)   # fix4: the text flip is the state
             assert not (shut["seg"] and shut["seg"]["shown"]), (w, shut)                              # the selector is not drawn while closed
             assert not (shut["sky"] and shut["sky"]["shown"]), (w, shut)
             assert shut["calmIn"] and shut["ambIn"] and not shut["mastCalm"] and not shut["phoneCalm"], (w, shut)
             assert shut["row"]["bottom"] <= shut["card"]["top"] + 1, (w, shut)                        # the row is above the card, nothing over it
-            assert opened["open"] is True and opened["btn"] == "Hide the graphs" and opened["expanded"] == "true", (w, opened)
+            assert opened["open"] is True and opened["btn"] == "Hide the graphs" and opened["expanded"] is None and opened["controls"] == "ck-sky", (w, opened)
             assert opened["seg"]["shown"] and opened["sky"]["shown"], (w, opened)
             # no overlap: the control row ends where the selector begins, and the graph is below the selector
             assert opened["toggle"]["bottom"] <= opened["seg"]["top"] + 1 and opened["calm"]["bottom"] <= opened["seg"]["top"] + 1, (w, opened)

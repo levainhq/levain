@@ -101,7 +101,17 @@
     <p class="stateline frame" id="state" hidden></p>
     <p class="sub frame" id="store" data-cold>connecting…</p>
     <!-- The board's panels; dashboard.css places them by place. Keys 1-4 are the places keys (dashboard_places.js), ignored while typing. -->
-    <main class="frame"><div class="grid" id="board"></div></main>
+    <main class="frame">
+      <!-- levain#141 polish (fix4): the Settings place's first section. It holds the entity's name and the rename control (the same
+           wireEntityName the masthead uses), so the rename is reachable where the masthead hides the name (it repeats the wordmark).
+           Drawn on Settings only, and only while it holds the control (dashboard_core.js syncCockpitSection). It is not a .dev-zone
+           (the devices script's own sections are, and tests and code look the first one up); dashboard.css gives it the same rules. -->
+      <section class="ck-thiscockpit" id="ck-thiscockpit" data-zone="cockpit" aria-labelledby="ck-thiscockpit-t" hidden>
+        <div class="zone-head"><h2 class="zone-title" id="ck-thiscockpit-t">This cockpit</h2><span class="zone-gloss">its name, as every device shows it</span></div>
+        <div class="unit ck-unit"><span class="unit-label">Name</span><span class="entity" id="ck-entity">—</span></div>
+      </section>
+      <div class="grid" id="board"></div>
+    </main>
     <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
   </div>
 

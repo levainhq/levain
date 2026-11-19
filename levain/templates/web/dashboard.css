@@ -1213,12 +1213,9 @@ body.ke .masthead .themesw { height: var(--seg-h); box-sizing: border-box; paddi
 body.ke .masthead .themesw button { height: auto; }
 body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
 body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
-body.ke .masthead .unit { gap: 0; flex: 0 1 auto; min-width: 0; }   /* shrink order when the bar is full: the jar (see .jar) first, the name only when nothing else can give, and then with an ellipsis */
+body.ke .masthead .unit { gap: 0; flex: 0 1 auto; min-width: 0; }   /* shrink order when the bar is full: the name gives only when nothing else can, and then with an ellipsis */
 body.ke .masthead .unit-label { display: none; }
 body.ke .masthead .entity { font: var(--fw-bold) var(--fs-lead) var(--round); color: var(--text); max-width: 14ch; }
-body.ke .masthead .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: calc(16px + var(--sp-3)); flex-shrink: 1000; }   /* the 16px icon (flex: none) and its gap keep their room; only the label gives way */
-body.ke .masthead .jar svg { width: 16px; height: 20px; flex: none; }
-body.ke .masthead .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
 body.ke .masthead .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; display: flex; align-items: center; }
 body.ke .masthead .stamp, body.ke .masthead .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
 body.ke .masthead .indicators button { height: var(--seg-h); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
@@ -1547,7 +1544,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .masthead .seg .mode { flex: 1 1 0; justify-content: center; }
   body.ke .masthead .readout, body.ke .masthead .indicators, body.ke .masthead .unit { display: contents; }
   body.ke .masthead .indicators button, body.ke .masthead .themesw, body.ke .masthead .livechip { order: 1; }
-  body.ke .masthead .jar, body.ke .masthead .stamp { order: 3; }
+  body.ke .masthead .stamp { order: 3; }
   body.ke .masthead .entity { display: none; }
 }
 /* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
@@ -1573,7 +1570,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
 }
 @media (max-width: 480px) {
-  body.ke .masthead .jar, body.ke .masthead .stamp, body.ke .masthead .indicators button.sky-toggle { display: none; }   /* the sky's own toggle (a provider adds it) is a desk control */
+  body.ke .masthead .stamp { display: none; }
   body.ke .masthead .livechip { font-size: 0; gap: 0; }
   body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
   body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
@@ -4031,7 +4028,7 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia .masthead .readout { display: contents; }
   body.ia .masthead .themesw { order: 2; flex: none; }
   body.ia .masthead .indicators, body.ia .masthead .indicators > *, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn, #stamp) { order: 3; }
-  body.ia .masthead :is(.unit, .jar) { order: 4; }
+  body.ia .masthead .unit { order: 4; }
   body.ia .ia-tagline { max-width: 100%; font-size: var(--fs-micro); white-space: normal; }
   body.ia .masthead .indicators { gap: var(--sp-2); }
   body.ia .ia-act { min-width: 38px; min-height: 38px; padding: 0; justify-content: center; }
@@ -4060,21 +4057,32 @@ body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }
    draws (devices_panel.js: Paired devices + Notify tokens, Presence & notification settings: Tap tokens + Voice, and any later one
    that carries .dev-zone) is drawn here and nowhere else; the board, the hero and every other block are not drawn while it is up
    (hidden, not removed: their own reads keep running). */
-body.ia:not([data-ia-place="settings"]) .dev-zone { display: none !important; }
+body.ia:not([data-ia-place="settings"]) :is(.dev-zone, .ck-thiscockpit) { display: none !important; }
 body.ia[data-ia-place="settings"] .deck > :not(.masthead):not(#ck-phonetabs):not(.ia-drivers):not(main.frame) { display: none !important; }
-body.ia[data-ia-place="settings"] main.frame > :not(.dev-zone):not(.dev-empty) { display: none !important; }
+body.ia[data-ia-place="settings"] main.frame > :not(.dev-zone):not(.ck-thiscockpit):not(.dev-empty) { display: none !important; }
 /* the Devices head (title, gloss, "Make a passkey on this device") drawn as the Presence head is; the empty line shows on Settings only */
-body.ia[data-ia-place="settings"] .dev-zone .zone-head { display: flex; align-items: baseline; }
+body.ia[data-ia-place="settings"] :is(.dev-zone, .ck-thiscockpit) .zone-head { display: flex; align-items: baseline; }
 body.ia[data-ia-place="settings"] .dev-zone .zone-head .sign-enrol-link { display: inline-flex; align-items: center; min-height: var(--hit-min, 44px); line-height: 1.2; }
 body.ia:not([data-ia-place="settings"]) .dev-empty { display: none !important; }
 body.ia[data-ia-place="settings"] .dev-empty:not([hidden]) { display: block; margin: var(--sp-6) 0 0; color: var(--meta); font-size: var(--fs-meta); }
 body.ia[data-ia-place="settings"] main.frame { display: block; padding-inline: var(--gutter-ke); }
-body.ia[data-ia-place="settings"] .dev-zone:not([hidden]) { display: block !important; width: 100%; min-width: 0; margin: var(--sp-6) 0 0; }
-body.ia[data-ia-place="settings"] .dev-zone .zone-head { flex-wrap: wrap; }
+body.ia[data-ia-place="settings"] :is(.dev-zone, .ck-thiscockpit):not([hidden]) { display: block !important; width: 100%; min-width: 0; margin: var(--sp-6) 0 0; }
+body.ia[data-ia-place="settings"] :is(.dev-zone, .ck-thiscockpit) .zone-head { flex-wrap: wrap; }
+/* "This cockpit": the first Settings section (dashboard.html #ck-thiscockpit). The entity's name and the rename control the masthead
+   also carries (dashboard_core.js wireEntityName); where the masthead hides the name because it repeats the wordmark, this is where
+   the rename lives. Drawn only while it holds the control (syncCockpitSection). */
+body.ia[data-ia-place="settings"] .ck-thiscockpit .ck-unit { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3); min-width: 0; }
+body.ia[data-ia-place="settings"] .ck-thiscockpit .entity { max-width: 100%; }
+body.ia[data-ia-place="settings"] .ck-thiscockpit .name-editor { flex: 1 1 18rem; }
+@media (pointer: coarse) {
+  body.ia[data-ia-place="settings"] .ck-thiscockpit :is(.name-edit, .edit-save, .edit-cancel) { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
+  body.ia[data-ia-place="settings"] .ck-thiscockpit .name-input { min-height: var(--hit-min, 44px); }
+}
 /* Memory draws no Needs-you row at all (the Needs count on the Home button stays); Settings has none either */
 body.ia[data-ia-place="memory"] #ck-needs, body.ia[data-ia-place="settings"] #ck-needs { display: none !important; }
 /* The cause of the 100 px panels, fixed at its root: on Home layout A flattens main.frame (display: contents), so a zone appended to
-   it is a grid item of the 12-column deck and, with no span, one track wide. Every zone spans the whole row. */
+   it would be a grid item of the 12-column deck and, with no span, one track wide. This guards a zone added to main.frame LATER and
+   drawn on Home: today none is (the settings zones are display: none off Settings, and the operate zone is display: contents). */
 body.ia[data-ia-place="home"] .ck-zone { grid-column: 1 / -1 !important; min-width: 0; }
 
 /* ── levain#141 polish: Machine ───────────────────────────────────────────────────────────────────────────────────────
@@ -4125,14 +4133,21 @@ body.ia .masthead[data-entity-dupe] .unit { display: none; }
 body.ia .masthead .readout { align-items: center; }
 body.ia .masthead .indicators, body.ia .ia-actions { align-items: center; }
 
-/* the masthead and the places bar stay reachable ABOVE 720 px. In the flow (every place but Home) they stick to the top; Home's deck is
-   a grid, where a sticky item only sticks inside its own row, so there both are fixed and the deck pads by their measured height
-   (--ia-mast-h: the masthead, --ia-bars-h: both; dashboard_places.js). At 720 px and below nothing is pinned: the masthead scrolls
-   with the page (a pinned one costs a fifth of a phone), and both measures read 0. Below a dialog (modal 50, presence sheet 40,
-   jump palette 20) and above the page's own sticky bars. */
+/* the masthead and the places bar stay reachable on a screen at least 721 px wide AND 600 px tall (a landscape phone is 932 x 430: pinned
+   bars would take 40% of it). Those two numbers are dashboard_places.js's PIN_MIN_W / PIN_MIN_H, the one source; the media queries
+   below mirror them (test_cockpit_polish_fix4 holds the two in agreement). In the flow (every place but Home) the bars stick to the
+   top; Home's deck is a grid, where a sticky item only sticks inside its own row, so there both are fixed and the deck pads by their
+   measured height (--ia-mast-h: the masthead's true height, the places bar's `top`; --ia-bars-h: everything stuck to the top of the
+   viewport; dashboard_places.js). Below the pin (a phone, a short screen) the masthead scrolls with the page and --ia-mast-h reads 0,
+   but the places strip is still sticky where the flow holds it, so --ia-bars-h carries the strip's height (45 px at 390). Below a
+   dialog (modal 50, presence sheet 40, jump palette 20) and above the page's own sticky bars. */
 body.ia .deck > .masthead { background: var(--bg); padding-top: calc(var(--sp-5) + env(safe-area-inset-top, 0px)); }
-body.ia .deck { padding-top: 0; }   /* the bar carries the status-bar inset itself (it stays at the top, and its content stays below the clock) */
-@media (min-width: 721px) {
+body.ia .deck { padding-top: 0; }   /* the masthead carries the status-bar inset itself (it stays at the top, and its content stays below the clock) */
+/* ...except where the masthead is gone: a phone with the keyboard up in the Room or the Desk hides it, and the deck keeps the inset */
+@media (max-width: 720px) {
+  body.rv-on.rv-kb .deck, body.dv-on.dv-kb .deck { padding-top: env(safe-area-inset-top, 0px); }
+}
+@media (min-width: 721px) and (min-height: 600px) {
   body.ia .deck > .masthead { position: sticky; top: 0; z-index: 15; }
   body.ia .deck > .ia-places { top: var(--ia-mast-h, 0px); z-index: 14; }
   html.ia-mast-measured body.ia[data-ia-place="home"] .deck { padding-top: var(--ia-bars-h, 0px); }
@@ -4141,17 +4156,26 @@ body.ia .deck { padding-top: 0; }   /* the bar carries the status-bar inset itse
   html.ia-mast-measured body.ia[data-ia-place="home"] .deck > .ia-places {
     position: fixed; top: var(--ia-mast-h, 0px); left: 0; right: 0; margin: 0 auto; max-width: var(--page-max); box-sizing: border-box; width: 100%; }
 }
-/* a jump (Drop, the Needs count, the List, any panel or section head) lands below the pinned bars, never under them */
-body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head) { scroll-margin-top: calc(var(--ia-bars-h, 0px) + var(--sp-4)); }
+/* focus, a jump and any scrollIntoView (Tab to a control, the Needs count, a Settings link) land below whatever is stuck to the top
+   (WCAG 2.4.11), so the scroll-padding is the bars' height and a section's own margin is only the breathing room under them */
+html { scroll-padding-top: var(--ia-bars-h, 0px); }
+body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .ck-thiscockpit) { scroll-margin-top: var(--sp-4); }
 
 /* the brand keeps room for a two-line tagline beside the readout (at 1101-1180 it fell to three lines); the line wraps, never cut */
 @media (min-width: 1101px) {
   body.ia .masthead .brand { min-width: 15rem; }
 }
-/* a touch screen at the widths where the header buttons are icons only: every one of them is a 44 px target */
-@media (pointer: coarse) and (min-width: 1101px) and (max-width: 1500px) {
-  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn) { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
+/* a touch screen, at every width: each masthead control (the presence chip, Sync, Jump, the theme buttons, the three actions) is a 44 px target;
+   the actions (in the block above) and the theme buttons, which are icons only, are 44 wide as well */
+@media (pointer: coarse) {
+  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn) { min-height: var(--hit-min, 44px); }
+  body.ia .masthead .themesw button { min-width: var(--hit-min, 44px); }   /* the icon-only ones are 44 wide too (the Drop / Grants / Notifications buttons are, in the block above) */
   body.ke .masthead .themesw, body.ke .masthead .indicators button { height: auto; }
+}
+/* the three theme buttons are 44 wide on touch (144 px with their padding, 36 px each before), so on a phone the brand leaves them 164 px
+   on its row, not 140: the brand and the theme switch stay one row and Drop, Grants, Notifications, Sync and Jump keep theirs */
+@media (pointer: coarse) and (max-width: 720px) {
+  body.ia .masthead .brand { flex-basis: calc(100% - 164px); }
 }
 
 /* the phone's header: Drop, Grants, Notifications, Sync and Jump are one row (the presence chip takes its own row after them, and the
@@ -4178,7 +4202,12 @@ body.ia[data-ia-place="home"] #ck-drop.frame { padding-inline: var(--sp-6); }
 }
 
 /* HOME ORDER: needs, the Desk (head, drop, desk panel), At a glance, Work, Machine. The glance moved from last to between the Desk
-   and Work; the document order of these blocks matches (dashboard.html, dashboard_places.js), so Tab walks the drawn order. */
+   and Work; the document order of the section heads, the notes, the drop and the glance matches (dashboard.html, dashboard_places.js),
+   so Tab walks the drawn order through them. Three exceptions, none moved: the Machine controls (#ck-skycol: Show the graphs, Calm,
+   Ambient) are in the hero, so they are the second Tab stop though drawn under Work (moving them out of the hero would need the hero's
+   hidden / inert handling duplicated: dashboard_core.js keShell and renderHero, dashboard_boot.js BOARD_REGIONS); the Desk panel
+   (drawn above At a glance) is a board panel inside main.frame, which comes after the glance in the document; and the board's panels
+   run in the board's own column order, not the order Home draws them (cockpit_view.js). */
 body.ia[data-ia-place="home"] .ia-head[data-ia-head="glance"] { order: 24; }
 body.ia[data-ia-place="home"] #ck-widgets { order: 25; }
 

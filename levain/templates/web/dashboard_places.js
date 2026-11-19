@@ -31,11 +31,12 @@
     if (settingsOn()) return "settings";
     return "home";
   }
+  var remeasure = null;   // trackMasthead's measure: the place decides whether the places bar is stuck (Home's grid holds it in its row)
   function paint() {
     // the flag is only ever true on the board page with no view up: anything else that changed the page's own state ends it
     if (settingsOn() && (roomOn() || deskOn() || mode() !== "board")) document.body.classList.remove(SETTINGS_ON);
     var p = place();
-    if (document.body.dataset.iaPlace !== p) document.body.dataset.iaPlace = p;
+    if (document.body.dataset.iaPlace !== p) { document.body.dataset.iaPlace = p; if (remeasure) remeasure(); }
     // scoped to the places bar: other controls carry aria-current of their own
     var bar = document.querySelectorAll(".ia-places [data-ia-place-btn]");
     for (var i = 0; i < bar.length; i++) {
@@ -96,7 +97,6 @@
     if (g) {
       var open = !document.body.classList.contains("ia-graph-open");
       document.body.classList.toggle("ia-graph-open", open);
-      g.setAttribute("aria-expanded", open ? "true" : "false");
       g.textContent = open ? "Hide the graphs" : "Show the graphs";
       window.dispatchEvent(new Event("resize"));   // the sky mounts at the size its card has; a card that just opened has one now
     }
@@ -128,7 +128,7 @@
     b.type = "button";
     b.className = "ia-graph-toggle";
     b.setAttribute("data-ia-graph-toggle", "");
-    b.setAttribute("aria-expanded", "false");
+    b.setAttribute("aria-controls", "ck-sky");   // the graph it shows; the text flip is the state (a screen reader hears "Hide the graphs", not also "expanded")
     b.textContent = "Show the graphs";
     var row = document.getElementById("ck-mctl") || col;   // the Machine control row: Show/Hide the graphs, Calm, Ambient
     row.insertBefore(b, row.firstChild);
@@ -162,27 +162,38 @@
     });
   }
 
-  // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, ABOVE 720 px. Home's
-  // deck is a grid, and a sticky grid item only sticks inside its own grid area (its row), so on Home dashboard.css fixes both bars and
-  // the deck pads by their height. The heights are measured here (--ia-mast-h: the masthead; --ia-bars-h: masthead + places bar)
-  // because the bars wrap differently at every width. At 720 px and below nothing is pinned (the masthead scrolls with the page: a
-  // pinned one costs a fifth of a phone) and both read 0. `html.ia-mast-measured` is the switch: without script the bars stay in flow.
+  // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, on a screen at least
+  // PIN_MIN_W wide AND PIN_MIN_H tall (a landscape phone is 932 x 430: the bars would take 40% of it). These two numbers are the ONE
+  // source: dashboard.css mirrors them in its `(min-width: 721px) and (min-height: 600px)` pinned blocks (test_cockpit_polish_fix4
+  // holds the two in agreement). Home's deck is a grid, and a sticky grid item only sticks inside its own grid area (its row), so on
+  // Home dashboard.css fixes both bars and the deck pads by their height. The heights are measured here: --ia-mast-h is the masthead's
+  // true height while it is pinned (the places bar's `top`), --ia-bars-h is everything that is stuck to the top of the viewport, which
+  // `html { scroll-padding-top }` keeps focus and jumps clear of. Where nothing pins (a phone, a short screen) the masthead scrolls
+  // away; the places strip is still sticky in the flow there (everywhere but Home on a short wide screen, where the grid holds it in
+  // its row), so it is what --ia-bars-h carries. `html.ia-mast-measured` is the switch: without script the bars stay in flow.
+  var PIN_MIN_W = 721, PIN_MIN_H = 600;
   function trackMasthead() {
     var m = document.querySelector(".deck > .masthead");
     if (!m) return;
     var root = document.documentElement;
     var bar = document.querySelector(".deck > .ia-places");
+    var mq = typeof window.matchMedia === "function" ? window.matchMedia("(min-width: " + PIN_MIN_W + "px) and (min-height: " + PIN_MIN_H + "px)") : null;
     function set() {
-      var pinned = window.innerWidth > 720;
-      var mh = pinned ? Math.ceil(m.getBoundingClientRect().height) : 0;
-      var bh = pinned && bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+      var pinned = mq ? mq.matches : (window.innerWidth >= PIN_MIN_W && window.innerHeight >= PIN_MIN_H);
+      var phone = window.innerWidth < PIN_MIN_W;
+      // the true (fractional) height: the places bar sits at exactly the masthead's bottom, no ceil gap between them
+      var mh = pinned ? m.getBoundingClientRect().height : 0;
+      var barStuck = !!bar && (pinned || phone || document.body.dataset.iaPlace !== "home");
+      var bh = barStuck ? bar.getBoundingClientRect().height : 0;
       root.style.setProperty("--ia-mast-h", mh + "px");
       root.style.setProperty("--ia-bars-h", (mh + bh) + "px");
     }
+    remeasure = set;
     set();
     root.classList.add("ia-mast-measured");
     if (typeof ResizeObserver === "function") { var ro = new ResizeObserver(set); ro.observe(m); if (bar) ro.observe(bar); }
     window.addEventListener("resize", set);
+    if (mq && mq.addEventListener) mq.addEventListener("change", set);
   }
 
   // The Notifications button's aria-label replaces its content for assistive tech, so the unread count in the pill (written by the

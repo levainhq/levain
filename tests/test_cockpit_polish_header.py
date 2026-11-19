@@ -260,7 +260,7 @@ def test_the_masthead_and_the_places_bar_stay_pinned_above_720_and_scroll_away_o
         st, jump, head = rows[3 * i], rows[3 * i + 1], rows[3 * i + 2]
         assert st["scrollY"] > 100, (w, st)
         if w <= 720:                                                                # a phone: the masthead is in the flow and scrolls away
-            assert st["pos"] == "static" and st["top"] < 0 and st["root"] == "0px", (w, st)
+            assert st["pos"] == "static" and st["top"] < 0 and st["root"] != "0px", (w, st)   # fix4: --ia-bars-h carries the stuck places strip (the masthead's own part is 0)
             continue
         assert st["top"] == 0 and st["vis"] and st["pos"] in ("fixed", "sticky"), (w, st)   # scrolled, and the masthead is still at the top
         assert st["bg"] not in ("rgba(0, 0, 0, 0)", "transparent"), (w, st)           # with the page's background under it
@@ -277,7 +277,7 @@ def test_the_pinned_places_bar_is_below_the_dialogs() -> None:
     palette = int(re.search(r"\.palette \{[^}]*z-index: (\d+)", CSS).group(1))
     sheet = int(re.search(r"\.pr-sheet \{[^}]*z-index: (\d+)", CSS).group(1))
     assert 5 < z < palette and z < sheet, (z, palette, sheet)
-    assert re.search(r"@media \(min-width: 721px\) \{\s*body\.ia \.deck > \.masthead \{ position: sticky;", CSS)   # the pin is above 720 only
+    assert re.search(r"@media \(min-width: 721px\) and \(min-height: 600px\) \{\s*body\.ia \.deck > \.masthead \{ position: sticky;", CSS)   # the pin is above 720 and on a screen 600 px tall (fix4)
 
 
 def test_the_entity_name_is_hidden_only_where_it_repeats_the_wordmark(tmp_path: Path) -> None:

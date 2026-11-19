@@ -196,7 +196,7 @@ def test_settings_with_no_section_drawn_says_so_and_the_line_leaves_when_one_is(
         shown = _probes(out, "empty")
     # the line is driven by devices_panel.js syncSection(); the static contract is held here, the live states by the source below
     js = (WEB / "devices_panel.js").read_text()
-    assert "emptyLine.hidden = !(section.hidden && (!prSetSec || prSetSec.hidden))" in js
+    assert "emptyLine.hidden = !(ready && none)" in js and "const none = section.hidden && (!prSetSec || prSetSec.hidden) && (!ck || ck.hidden);" in js   # fix4: settled reads, and "This cockpit" counts
     css = (WEB / "dashboard.css").read_text()
     assert 'body.ia:not([data-ia-place="settings"]) .dev-empty { display: none !important; }' in css
     assert shown and shown[0]["place"] == "settings"
