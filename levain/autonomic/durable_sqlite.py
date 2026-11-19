@@ -199,7 +199,7 @@ class HeldRead:
 
     __slots__ = ("conn", "ident")
 
-    def __init__(self, conn: sqlite3.Connection, ident: "tuple[int, int] | None") -> None:
+    def __init__(self, conn: sqlite3.Connection, ident: "tuple[int, int, int, int] | None") -> None:
         self.conn = conn
         self.ident = ident
 
@@ -221,9 +221,11 @@ class HeldReads:
     and dropped closes its connections by refcounting, with no cycle for the collector to find.
 
     :meth:`run` uses this thread's :class:`HeldRead`, opening it on first use, and reopens it when the file at ``path``
-    is no longer what the connection was opened against: deleted, replaced or moved (device or inode changed). The
-    file is looked at BEFORE the connection is opened, so a change in between makes the next call reopen, never keep a
-    connection to the old file under the new identity.
+    is no longer what the connection was opened against: deleted, replaced or moved (device or inode changed), or
+    written in place (size or modification time changed: a copy over the file keeps its inode, and SQLite keeps the
+    connection's cached pages while the WAL index is unchanged). A checkpoint writes the file too, which costs one
+    reopen. The file is looked at BEFORE the connection is opened, so a change in between makes the next call reopen,
+    never keep a connection to the old contents under the new identity.
 
     The held connection is ``query_only``, so a write through it is refused by SQLite. Each :meth:`run` is one
     ``BEGIN`` .. read .. ``COMMIT``; any exception on the connection, the read's own included, closes it and forgets it
@@ -235,12 +237,12 @@ class HeldReads:
         self._local = threading.local()
 
     @staticmethod
-    def _ident(path: "Path | str") -> "tuple[int, int] | None":
+    def _ident(path: "Path | str") -> "tuple[int, int, int, int] | None":
         try:
             st = os.stat(path)
         except OSError:
             return None
-        return (st.st_dev, st.st_ino)
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
     def get(self, connect: Callable[[], sqlite3.Connection], path: "Path | str") -> HeldRead:
         """This thread's held connection, (re)opened with ``connect`` as the class docstring says."""

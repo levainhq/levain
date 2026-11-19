@@ -165,7 +165,13 @@ def test_the_held_connection_reopens_when_the_db_file_is_replaced(db: CockpitDB,
     spy = _OpenSpy(monkeypatch)
     assert db.verify_device(tok, now=NOW) is None, "answered from the replaced file, not the old connection's"
     assert _held(db) is not first
-    assert len(spy.of("cockpit.db")) == 1
+    # the replacement is not in WAL mode: the reopen's own switch to WAL writes the file after it was looked at, so
+    # the next call reopens once more; then it settles
+    assert len(spy.of("cockpit.db")) <= 2
+    settled = len(spy.of("cockpit.db"))
+    for _ in range(3):
+        assert db.verify_device(tok, now=NOW) is None
+    assert len(spy.of("cockpit.db")) == settled
 
 
 def test_the_held_connection_is_closed_when_its_thread_ends(db: CockpitDB) -> None:
@@ -513,6 +519,29 @@ def test_journal_objects_made_and_dropped_leave_no_open_file_behind(tmp_path: Pa
             gc.enable()
     print(f"MEASURE: 50 CockpitDB made, read and verified, dropped -> {after - before} file descriptors still open")
     assert after - before <= 0, after - before
+
+
+def test_an_in_place_restore_is_seen_by_the_next_credential_check(db: CockpitDB) -> None:
+    """L2 M2: a backup copied over ``cockpit.db`` (same inode, new contents) is what the next verify answers from. A
+    fresh transaction alone does not see it: SQLite keeps the held connection's cached pages while the WAL index is
+    unchanged."""
+    dev, tok = _enrol(db)
+    other = sqlite3.connect(db.path, isolation_level=None)
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)")    # the journal's newest commits are in the main file
+    restored = db.path.with_name("restored.db")
+    w = sqlite3.connect(restored, isolation_level=None)
+    other.backup(w)
+    other.close()
+    w.execute("UPDATE paired_devices SET revoked_at = '2026-11-19T12:00:01Z'")
+    w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    w.close()
+    assert db.verify_device(tok, now=NOW) == dev        # the credential connection has read the journal as it was
+    ino = os.stat(db.path).st_ino
+    with open(restored, "rb") as s, open(db.path, "r+b") as t:
+        t.write(s.read())
+        t.truncate()
+    assert os.stat(db.path).st_ino == ino, "the restore kept the inode"
+    assert db.verify_device(tok, now=NOW) is None, "answered from the old contents"
 
 
 def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
