@@ -72,6 +72,7 @@ updates, no torn audit lines). Not safe across separate processes.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
@@ -169,6 +170,19 @@ _CONTINUITY_SOURCE = "continuity"
 # are rare + human-driven, so a global lock costs nothing; with it, a second edit to
 # a section just-changed by the first re-reads under the lock and gets a clean 409.
 _WRITE_LOCK = threading.Lock()
+
+# When the request that is writing was received (an ISO time), set by the server around a write's dispatch: the edits
+# ledger row carries it as ``received_at`` beside ``ts``, so the gap between them is the time the write waited and ran.
+_RECEIVED_AT: contextvars.ContextVar["str | None"] = contextvars.ContextVar("levain_write_received_at", default=None)
+
+
+@contextmanager
+def request_received(at: "str | None") -> Iterator[None]:
+    token = _RECEIVED_AT.set(at)
+    try:
+        yield
+    finally:
+        _RECEIVED_AT.reset(token)
 
 
 @dataclass(frozen=True)
@@ -629,6 +643,9 @@ def _append_audit(ledger_root: Path, record: dict[str, Any]) -> None:
     Single-writer (the server serializes writes) so a plain append is sufficient."""
     p = ledger_root / _AUDIT_LOG_NAME
     p.parent.mkdir(parents=True, exist_ok=True)
+    received = _RECEIVED_AT.get()
+    if received is not None and "received_at" not in record:
+        record = {**record, "received_at": received}
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -1815,16 +1832,23 @@ def _intention_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any
     return EditError("verb_failed", 422, str(exc))
 
 
-def _refuse_if_ringing(scope: WriteScope, store: Any, intention_id: str) -> None:
+_UNREAD: Any = object()    # ``_refuse_if_ringing``'s ``row`` when the caller has not read the intention
+
+
+def _refuse_if_ringing(scope: WriteScope, store: Any, intention_id: str, row: Any = _UNREAD) -> None:
     """The ONE guard every intention write entry point (the cockpit verbs and the TUI alike) calls: an open agenda whose stamp
     names a band row that is STILL OPEN is that row's intention, moved from the band, not by an intention verb. An intention the store
-    cannot read says nothing (the write's own compare-and-set then refuses what is wrong)."""
+    cannot read says nothing (the write's own compare-and-set then refuses what is wrong). ``row`` is the intention as the
+    caller already read it from this store (None: it holds none): the guard then parses nothing of its own."""
     from levain.intentions import open_question_ids, ringing_ref
 
-    try:
-        intention = store.get(intention_id) or {}
-    except Exception:  # noqa: BLE001
-        return
+    if row is not _UNREAD:
+        intention = row or {}
+    else:
+        try:
+            intention = store.get(intention_id) or {}
+        except Exception:  # noqa: BLE001
+            return
     stamp = intention.get("germinated")
     if not isinstance(stamp, Mapping) or not stamp.get("ref"):
         return
@@ -2534,6 +2558,21 @@ def _validate_surface_at(value: Any) -> str | None:
     return value
 
 
+def _with_row(out: dict[str, Any], intention_id: str, updated: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """``out`` plus ``row``: the intention as the write left it (the record anneal's update returned, so no read is added):
+    its row id, its new ``row_version`` and the fields the verb changed. A record that cannot be versioned adds nothing."""
+    if not isinstance(updated, Mapping):
+        return out
+    try:
+        from levain.cockpit.providers import intention_row_version   # lazy
+
+        version = intention_row_version(updated)
+    except Exception:  # noqa: BLE001 - the row is a convenience; the panel's own read is the truth
+        return out
+    return {**out, "row": {"id": f"intention:{intention_id}", "row_version": version,
+                           **{f: updated.get(f) for f in fields}}}
+
+
 def _apply_intention_surface_at(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
@@ -2554,18 +2593,28 @@ def _apply_intention_surface_at(
     if not paths.intentions_json.is_file():
         raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
-    _refuse_if_ringing(scope, store, intention_id)
+    # one parse of the store before the write (the ringing guard and the event-agenda check share it); the write's own
+    # compare-and-set re-reads it under anneal's lock
+    try:
+        waiting = store.get(intention_id)
+    except IntentionError as exc:
+        if surface_at:
+            raise _intention_refusal(guard, exc, store, intention_id) from exc
+        waiting = _UNREAD                       # a clear says nothing of a store it cannot read: the write refuses
+    except OSError as exc:
+        if surface_at:
+            raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+        waiting = _UNREAD
+    except Exception:  # noqa: BLE001 - as the ringing guard: an unreadable intention says nothing there
+        if surface_at:
+            raise
+        waiting = _UNREAD
+    _refuse_if_ringing(scope, store, intention_id, waiting)
     if surface_at:
         # a read that fails is a refusal, never "not an event agenda": the date must not land on a row that may be one
-        try:
-            waiting = store.get(intention_id)
-        except IntentionError as exc:
-            raise _intention_refusal(guard, exc, store, intention_id) from exc
-        except OSError as exc:
-            raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
         _refuse_date_on_event_agenda(waiting)
     try:
-        store.update(intention_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
+        updated = store.update(intention_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except IntentionError as exc:
@@ -2577,8 +2626,8 @@ def _apply_intention_surface_at(
         scope.ledger_root, kind="intention_surface_at", action="surface_at",
         target=f"intention:{intention_id}", now=now, extra={"surface_at": surface_at or None},
     )
-    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}",
-            "action": "surface_at"}
+    out = {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "surface_at"}
+    return _with_row(out, intention_id, updated, ("next",))
 
 
 def _apply_intention_update(
@@ -2632,8 +2681,8 @@ def _apply_intention_update(
     if not paths.intentions_json.is_file():
         raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
-    _refuse_if_ringing(scope, store, intention_id)
     current = store.get(intention_id)
+    _refuse_if_ringing(scope, store, intention_id, current)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     tier_snapshot = _client_snapshot(req, current, intention_id) if has_tier else _NO_CAS
 
@@ -2674,7 +2723,7 @@ def _apply_intention_update(
     elif tier_snapshot is not _NO_CAS:
         kwargs["expect_disposition"] = tier_snapshot
     try:
-        store.update(intention_id, **kwargs, **_guard_kwargs(guard))
+        updated = store.update(intention_id, **kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except IntentionError as exc:  # unknown id / resolved / drift / CAS mismatch
@@ -2692,7 +2741,8 @@ def _apply_intention_update(
         scope.ledger_root, kind="intention_update", action="update",
         target=f"intention:{intention_id}", now=now, extra=extra,
     )
-    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "update"}
+    out = {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "update"}
+    return _with_row(out, intention_id, updated, tuple(fields))
 
 
 def _apply_episode_tombstone(

@@ -46,7 +46,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from levain.cockpit.registry import (
     FACETS,
@@ -451,6 +451,7 @@ class _State:
     failing_since: str | None = None
     last_completion: datetime | None = None
     pflight: "_Flight | None" = None          # the read in flight: ONE owner commits it, joiners share its result
+    epoch: int = 0                            # advanced under ``lock`` by every write that names this panel (``invalidate_reads``)
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
     fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
@@ -465,6 +466,8 @@ class _Flight:
     """One provider read. The OWNER (the caller that started it) alone commits the outcome; joiners
     wait for ``out`` and receive that same outcome. At most one is in flight per state, so commits
     happen in start order by construction. One deadline, ``started + timeout``, governs everyone."""
+
+    epoch = 0                            # the state's write epoch when this flight started (set by its owner): a caller of a later epoch never joins it
 
     def __init__(self, timeout_s: float) -> None:
         self.timeout_s = timeout_s       # the budget THIS flight was started with: owner, joiners and messages use it
@@ -744,6 +747,16 @@ def _read_key(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), default=str)
 
 
+_RC_SHARED_SCOPE = ("shared",)     # the read scope of every cached read that is not one panel's (the manifest)
+
+
+def _rc_scope(key: Any) -> Any:
+    """The scope a read-cache key belongs to: a panel read is scoped by its panel id, any other read by the shared scope."""
+    if isinstance(key, tuple) and len(key) > 1 and key[0] == "panel":
+        return ("panel", key[1])
+    return _RC_SHARED_SCOPE
+
+
 class _SharedRead:
     __slots__ = ("at", "done", "value", "ok")
 
@@ -800,6 +813,9 @@ class Cockpit:
         # part of every manifest and panel cache key, so a page's read after an announcement is never answered from an
         # entry stored before the build that announced it (an etag can move with no provider read: the day turning)
         self._obs_gen = 0
+        self._rc_scope_gen: dict[Any, int] = {}     # a keyed write's generation per read scope (see ``invalidate_reads``)
+        self._rc_refreshing: set[str] = set()       # refresher panels with a write-triggered refresh still running
+        self._rc_refresh_dirty: set[str] = set()    # of those, the ones a later write reached while it ran
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -1345,23 +1361,40 @@ class Cockpit:
         counts as a timeout, so an owner and its joiners can never disagree about the same read."""
         result: Any = None
         committed_ok = False
-        with st.lock:
-            fl = st.pflight
-            if fl is None:
-                fl = st.pflight = _Flight(timeout_s)
-                if on_start:
-                    on_start()
-                owner = True
-            elif not fl.committed:
+        give_up = time.monotonic() + timeout_s + PROCESS_GRACE_S      # one bound on every wait this caller makes below
+        while True:
+            with st.lock:
+                fl = st.pflight
+                if fl is None:
+                    fl = st.pflight = _Flight(timeout_s)
+                    fl.epoch = st.epoch
+                    if on_start:
+                        on_start()
+                    owner = True
+                    break
+                if fl.committed:
+                    return refused("previous read still running past its timeout (source hung?)")
                 owner = False
                 wait = max(0.0, fl.started + fl.timeout_s + PROCESS_GRACE_S - time.monotonic())
-            else:
-                return refused("previous read still running past its timeout (source hung?)")
-        if not owner:
+                if fl.epoch == st.epoch:
+                    break                  # a read begun since the last write to this state: share it
+            # a read begun before a write to this state: its answer is never ours, and a second provider read does
+            # not start beside it, so wait for it to end and look again
+            left = give_up - time.monotonic()
+            if left <= 0:
+                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
             try:
-                return fl.out.result(timeout=wait)
+                fl.out.result(timeout=min(wait, left))
             except FutureTimeout:
-                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
+                return refused(f"timed out waiting on the read in flight ({(timeout_s if left < wait else fl.timeout_s):g}s budget)")
+        if not owner:
+            left = give_up - time.monotonic()
+            if left <= 0:
+                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
+            try:
+                return fl.out.result(timeout=min(wait, left))
+            except FutureTimeout:
+                return refused(f"timed out waiting on the read in flight ({(timeout_s if left < wait else fl.timeout_s):g}s budget)")
 
         try:                               # the owner's flight ends in the finally below from here on
             def work() -> None:
@@ -2242,14 +2275,89 @@ class Cockpit:
         return sorted(specs_map.values(), key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id))
 
     # --- the shared read cache ---------------------------------------------------------------------
-    def invalidate_reads(self) -> None:
+    def invalidate_reads(self, panel_ids: "Iterable[str] | None" = None, *, refresh: bool = True) -> None:
         """A write happened (the server calls it for an ADMITTED write, before that write's response is sent, and
-        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it): every cached read
-        and every in-flight one is stale from here. A read started before this call is never stored for, nor
-        joined by, a request arriving after it (the generation is part of the key)."""
+        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it).
+
+        No argument: every cached read and every in-flight one is stale from here. A read started before this call is
+        never stored for, nor joined by, a request arriving after it (the generation is part of the key).
+
+        ``panel_ids`` (a write that knows what it changed): only those panels' entries go cold, with the same rule per
+        panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
+        A read is scoped by its key: a panel read by its panel id, everything else (the manifest) by one shared scope that
+        every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
+        caller's; ``refresh=False`` skips that.
+
+        Either way the named panels' write epoch advances: a provider read begun before this call is never joined by a
+        reader arriving after it (``_single_flight`` waits it out and reads afresh), so what the older read saw cannot
+        be handed to, or stored for, a reader of the new generation. The manifest's own entity and discovery reads keep
+        persistent states too, and every write drops the manifest's entries: their epoch advances with it."""
+        states = self._state
+        manifest_states = [self._entity_state, *self._discovery_states]
+        for st in manifest_states:
+            with st.lock:
+                st.epoch += 1
+        if panel_ids is None:
+            for st in list(states.values()):
+                with st.lock:
+                    st.epoch += 1
+            with self._rc_lock:
+                self._rc_gen += 1
+                self._rc.clear()
+            return
+        ids = [p for p in dict.fromkeys(panel_ids) if isinstance(p, str)]
+        for pid in ids:
+            st = states.get(pid)
+            if st is not None:
+                with st.lock:
+                    st.epoch += 1
+        self._drop_scopes([("panel", p) for p in ids] + [_RC_SHARED_SCOPE])
+        if refresh:
+            for pid in ids:
+                self._refresh_in_background(pid)
+
+    def _drop_scopes(self, scopes: list) -> None:
+        """Advance these read scopes' generation and delete their entries, in-flight ones included."""
         with self._rc_lock:
-            self._rc_gen += 1
-            self._rc.clear()
+            for sc in scopes:
+                self._rc_scope_gen[sc] = self._rc_scope_gen.get(sc, 0) + 1
+            gone = [k for k in self._rc if _rc_scope(k[2]) in scopes]
+            for k in gone:
+                del self._rc[k]
+
+    def _refresh_in_background(self, panel_id: str) -> None:
+        """Refresh a refresher panel after a write, on its own short-lived thread (nothing here runs on the caller's).
+        A panel with no refresher is skipped. While a write's refresh is still running, the write is only noted
+        (``_rc_refresh_dirty``) and the running thread reads again once it ends, so every write is followed by a refresh
+        that began after it. When a refresh returns, the panel's cached reads are dropped: an on-demand read that
+        arrived meanwhile was served the snapshot from before it and stored that."""
+        if panel_id not in self._refreshers:
+            return
+        with self._rc_lock:
+            if panel_id in self._rc_refreshing:
+                self._rc_refresh_dirty.add(panel_id)
+                return
+            self._rc_refreshing.add(panel_id)
+
+        def run() -> None:
+            while True:
+                try:
+                    self.refresh(panel_id)
+                except Exception:  # noqa: BLE001 - the refresher's own cycle reports a bad read; this one is a nudge
+                    pass
+                self._drop_scopes([("panel", panel_id), _RC_SHARED_SCOPE])     # the manifest carries this panel's head too
+                with self._rc_lock:
+                    if panel_id not in self._rc_refresh_dirty:
+                        self._rc_refreshing.discard(panel_id)
+                        return
+                    self._rc_refresh_dirty.discard(panel_id)
+
+        try:
+            threading.Thread(target=run, name=f"cockpit-write-refresh-{panel_id}", daemon=True).start()
+        except Exception:  # noqa: BLE001 - a thread that cannot start must not strand the mark or fail the write's response
+            with self._rc_lock:
+                self._rc_refreshing.discard(panel_id)
+                self._rc_refresh_dirty.discard(panel_id)
 
     def _shared_read(self, key: Any, compute: Callable[[], Any], keep: Callable[[Any], bool] = lambda v: True) -> Any:
         """Single-flight plus a short TTL for one identical read. ``key`` must hold EVERYTHING the result
@@ -2261,7 +2369,7 @@ class Cockpit:
         if ttl <= 0:
             return compute()
         with self._rc_lock:
-            full = (self._rc_gen, key)
+            full = (self._rc_gen, self._rc_scope_gen.get(_rc_scope(key), 0), key)
             ent = self._rc.get(full)
             now = time.monotonic()
             if ent is not None and ent.ok is not False and (not ent.done.is_set() or now - ent.at < ttl):

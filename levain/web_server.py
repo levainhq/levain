@@ -142,6 +142,7 @@ from levain.writes import (
     MAX_BODY_BYTES,
     ActionVerb,
     EditError,
+    request_received,
 )
 
 if TYPE_CHECKING:
@@ -2375,7 +2376,13 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _presence_cache: Any = _UNSET   # reset per request in handle_one_request
-    _reads_invalidated = False      # likewise: whether this request has dropped the shared read cache yet
+    _reads_invalidated = False      # likewise: whether this request has invalidated its reads yet
+    # likewise, a cockpit verb POST: the panel ids its fire reported touching (None: drop every read), the verb name once it
+    # reached dispatch, and when do_POST began (monotonic, and as an ISO time for the edits ledger row)
+    _write_touched: "frozenset[str] | None" = None
+    _write_verb: "str | None" = None
+    _post_t0: "float | None" = None
+    _post_received_at: "str | None" = None
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
@@ -2469,6 +2476,10 @@ class _Handler(GuardedHandler):
         self._presence_cache = _UNSET
         self._post_headers = []
         self._reads_invalidated = False
+        self._write_touched = None
+        self._write_verb = None
+        self._post_t0 = None
+        self._post_received_at = None
         self.command = None     # a kept-alive connection's previous verb is not this request's
         try:
             try:
@@ -2479,6 +2490,7 @@ class _Handler(GuardedHandler):
                 # request refused at a gate was never admitted and never invalidates (_admitted_write)
                 if self._reads_invalidated or self._admitted_write(None):
                     self._invalidate_reads()
+                self._log_write_time()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
@@ -2491,7 +2503,7 @@ class _Handler(GuardedHandler):
                 pass        # the client went away first
 
     def _admitted_write(self, code: "int | None") -> bool:
-        """Whether THIS request may have written, so the shared read cache must drop what it holds (1106 solid2 r1).
+        """Whether THIS request may have written, so the reads it made stale must be invalidated (1106 solid2 r1).
         A write method (not GET / HEAD) AND either a verified surface or paired credential resolved on this request
         (a write route admitted it, whatever the write then answered), or a 2xx answer (the routes whose credential
         is not a surface token: the pairing claim's code, a notify token, a push receipt's endpoint hash, the chat
@@ -2506,14 +2518,51 @@ class _Handler(GuardedHandler):
         return code is not None and 200 <= code < 300
 
     def _invalidate_reads(self) -> None:
+        first = not self._reads_invalidated
         self._reads_invalidated = True
         cockpit = getattr(self.server, "cockpit", None)
-        if cockpit is not None:
-            cockpit.invalidate_reads()
+        if cockpit is None:
+            return
+        touched = self._write_touched
+        if touched is None:
+            cockpit.invalidate_reads()          # a write that named no panels: every read goes cold
+        elif touched:
+            # only the panels the fire reported; the background refresh of a refresher panel is asked once per write
+            cockpit.invalidate_reads(touched, refresh=first)
+        # an empty set is a dry run: it wrote nothing, so nothing a read holds is stale
+
+    def _note_fired(self, result: Any) -> None:
+        """Keep what a cockpit verb's answer says it touched, for the invalidation ``send_response`` makes before the status
+        line: a landed fire's ``touched`` panels that are registered, or nothing for a dry run. Any other answer, and a
+        ``touched`` that names no registered panel, leaves the set unset, so every read goes cold."""
+        if not isinstance(result, dict):
+            return
+        touched = result.get("touched")
+        if result.get("dry_run") is True:
+            self._write_touched = frozenset()
+        elif isinstance(touched, list):
+            cockpit = getattr(self.server, "cockpit", None)
+            known = set(cockpit.panel_ids) if cockpit is not None else set()
+            # only registered panels count; none left means the answer named nothing real, so every read goes cold
+            got = frozenset(p for p in touched if isinstance(p, str) and p in known)
+            if got:
+                self._write_touched = got
+
+    def _log_write_time(self) -> None:
+        """One stderr line for a cockpit verb POST that reached dispatch: ``cockpit write <verb> <ms> ms``, the time from
+        do_POST's start to the response written, and a ``slow cockpit write`` warning past the slow-read threshold."""
+        verb, t0 = self._write_verb, self._post_t0
+        if verb is None or t0 is None:
+            return
+        ms = int((time.monotonic() - t0) * 1000)
+        name = "".join(c for c in verb[:64] if c.isprintable() and not c.isspace()) or "?"
+        print(f"cockpit write {name} {ms} ms", file=sys.stderr, flush=True)
+        if ms > _SLOW_READ_MS:
+            _log.warning("slow cockpit write: verb=%s ms=%d", name, ms)
 
     def send_response(self, code: int, message: "str | None" = None) -> None:
-        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write drops the shared read cache BEFORE its status line is
-        written. Every handler answers through here after its write committed (send_error included), so a client
+        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write invalidates the reads it made stale BEFORE its status line is
+        written: every cached read, or only those of the panels a cockpit verb named (``_invalidate_reads``). Every handler answers through here after its write committed (send_error included), so a client
         that holds the response and reads at once, on any connection, never gets a read cached or begun before the
         write. The ``finally`` in :meth:`handle_one_request` is only the fallback."""
         if not self._reads_invalidated and self._admitted_write(code):
@@ -5358,6 +5407,8 @@ class _Handler(GuardedHandler):
         socket. The rate-gate is acquired BEFORE the body read, so the bounded
         read+drain+write phase is itself concurrency-bounded; a slowloris is capped by
         the gate + the 30s socket timeout. The write layer does the actual edit."""
+        self._post_t0 = time.monotonic()
+        self._post_received_at = datetime.now(timezone.utc).isoformat()
         # Same Host allowlist as reads (DNS rebinding), then CSRF layer 1: a write must come from
         # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
         if self._refuse_write_origin():
@@ -5664,12 +5715,17 @@ class _Handler(GuardedHandler):
                     result = self._pending_post(pending[0], pending[1], req)
                 else:
                     # one dispatch for the cockpit route and both legacy aliases (design §4.3)
-                    result = dispatch_verb(
-                        registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
-                        credential=self._credential(), install_class=self._install_class(),
-                        route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
-                        job_runtime=self.server.job_runtime, broker=self.server.broker,
-                        signed_for=self._signed_for, signer=self.server.signer)
+                    if route == _COCKPIT_VERB_PATH and isinstance(req, dict) and isinstance(req.get("verb"), str):
+                        self._write_verb = req["verb"]
+                    with request_received(self._post_received_at):
+                        result = dispatch_verb(
+                            registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
+                            credential=self._credential(), install_class=self._install_class(),
+                            route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
+                            job_runtime=self.server.job_runtime, broker=self.server.broker,
+                            signed_for=self._signed_for, signer=self.server.signer)
+                    if route == _COCKPIT_VERB_PATH:
+                        self._note_fired(result)
             except EditError as exc:
                 self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
