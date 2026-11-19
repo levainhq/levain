@@ -424,7 +424,13 @@ def test_refresh_connections_are_capped_by_the_refresh_semaphore(env, monkeypatc
         ep.hold = asyncio.Event()
         w, s = _writer(d), store()
         waits = [asyncio.ensure_future(C.fresh(w, s, n)) for n in names]
-        await asyncio.sleep(0.5)
+        # Wait on the condition (the cap is reached), not on a fixed sleep: a 0.5 s sleep found no connection up on a
+        # loaded CI runner on 11-19. Then a short settle shows whether a third connection slipped past the semaphore.
+        deadline = time.monotonic() + 20.0
+        while ep.calls < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert ep.calls >= 2, f"the refresh connections never reached the cap of 2 within 20 s (calls={ep.calls})"
+        await asyncio.sleep(0.3)
         held = ep.calls
         ep.hold.set()
         got = await asyncio.gather(*waits)
