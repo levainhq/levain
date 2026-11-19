@@ -235,7 +235,8 @@ def test_every_settings_read_marks_itself_settled_whatever_it_answered() -> None
     for inner, which in (("readOnceInner", "dev"), ("readPresenceInner", "pr")):
         assert f'try {{ return await {inner}(); }} finally {{ settle("{which}"); }}' in js or f'try {{ await {inner}(); }} finally {{ settle("{which}"); }}' in js, inner
     # the voice probe settles only when it ran its read (L3 r1: a probe skipped because another is out has learned nothing)
-    assert 'try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || vcTries >= VC_MAX_TRIES) settle("vc"); }' in js
+    # ...and the exhausted-tries clause counts only with no probe out (L3 r2: the sixth probe is out while vcTries is already at the limit)
+    assert 'try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || (!vcBusy && vcTries >= VC_MAX_TRIES)) settle("vc"); }' in js
     assert "if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return false;" in js
 
 

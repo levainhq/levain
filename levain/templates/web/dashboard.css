@@ -4103,6 +4103,9 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
 @media (max-width: 720px) {
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 0; }
   body.ia[data-ia-place="home"] .ck-mctl { padding-inline: var(--gutter, var(--sp-5)); }
+  /* the stats wrap to a row of their own here; `margin-left: auto` (the laptop rule above) would push that row's text to the right edge.
+     Left, under the buttons (Phill 11-19: "centered or left aligned (right now is right aligned)"). */
+  body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox { margin-left: 0; }
 }
 /* board row #144: at 1101-1180 the four-up Machine row and the five At a glance tiles left one panel / tile alone on a row.
    Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row of three-up tiles that GROW, so whatever the last row holds fills it

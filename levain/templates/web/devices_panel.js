@@ -1419,10 +1419,11 @@
   let vcDone = false, vcBusy = false, vcTries = 0;
   const VC_MAX_TRIES = 6;
   // A probe skipped because another is still out (vcBusy: a voice.json slower than the retry) has learned nothing, so it does not
-  // settle the Settings empty line; the probe that is out settles it when its answer comes (L3 r1: codex, gemini, deepseek).
+  // settle the Settings empty line; the probe that is out settles it when its answer comes (L3 r1: codex, gemini, deepseek). The tries
+  // clause counts only with no probe out: the sixth probe is out while vcTries is already at the limit (L3 r2: deepseek, codex, complement).
   async function voiceProbe() {
     let ran = false;
-    try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || vcTries >= VC_MAX_TRIES) settle("vc"); }
+    try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || (!vcBusy && vcTries >= VC_MAX_TRIES)) settle("vc"); }
   }
   async function voiceProbeInner() {
     if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return false;
@@ -1439,7 +1440,7 @@
       paintVoice();
       vcPanel.hidden = false;
       syncSection();
-      return;
+      return true;
     }
     vcBusy = false;
     if (final) vcDone = true;

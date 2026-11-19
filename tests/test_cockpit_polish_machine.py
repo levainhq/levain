@@ -118,6 +118,21 @@ def test_the_row_targets_are_touch_sized_and_the_stats_box_hides_while_empty(tmp
 
 
 @needs_browser
+def test_the_stats_text_is_left_aligned_under_the_buttons_on_a_phone(tmp_path: Path, monkeypatch) -> None:
+    """Phill 11-19: on a phone the stats wrapped to a row of their own and `margin-left: auto` right-aligned them. The fixture's jar can be
+    empty (the box hides then), so the test writes the real label shape in and measures where it lands."""
+    FILL = ("document.getElementById('ck-jarbox').innerHTML = '<span class=\"jar-label\">74 today \\u00b7 typical 282 (median of 14 d)</span>'; 1")
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = drive_touch(tmp_path, f"{url}/#write_token=T", [{"emulate": {"w": 390, "h": 900, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, SETTLE,
+                                                              {"eval": FILL}, SETTLE, {"eval": STATE}])
+    (s,) = _states(out)
+    jar, row, toggle = s["jarbox"], s["row"], s["toggle"]
+    assert jar and jar["shown"] and jar["top"] >= toggle["bottom"], s          # it wrapped under the buttons: the case he saw
+    assert abs(jar["left"] - toggle["left"]) <= 1, s                          # and starts where the buttons start, not at the right edge
+
+
+@needs_browser
 def test_the_rows_at_1101_to_1180_fill_and_the_wider_widths_keep_their_shape(tmp_path: Path, monkeypatch) -> None:
     COLS = ("(() => { const tops = (sel) => { const m = new Map(); for (const e of document.querySelectorAll(sel)) { if (!e.getClientRects().length) continue;"
             " const t = Math.round(e.getBoundingClientRect().top); m.set(t, (m.get(t) || 0) + 1); } return [...m.entries()].sort((a, b) => a[0] - b[0]).map(x => x[1]); };"
