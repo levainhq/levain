@@ -195,7 +195,9 @@ body.ia-b #ia-back button { min-height: var(--seg-h); padding: 0 var(--sp-4); bo
   color: var(--text); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
 body.ia-b #ia-back span { font: var(--fw-regular) var(--fs-meta) var(--round); color: var(--label); }
 @media (max-width: 720px) {
-  body.ia-b.dv-on .deck > #ck-needs { max-height: 30vh; }
+  body.ia-b.dv-on .deck > #ck-needs:not([hidden]) { max-height: 24vh; padding-block: var(--sp-2); }
+  body.ia-b.dv-on .deck > #ia-drills { padding-block: var(--sp-2); gap: var(--sp-2); }
+  body.ia-b #ia-drills button { padding: var(--sp-2) var(--sp-3); }
   body.ia-b #ia-drills button { min-width: 112px; }
   body.ia-b #ia-drills button span { display: none; }
 }
