@@ -169,6 +169,9 @@ def _count_panel_computes(ck: Cockpit, monkeypatch) -> dict[str, int]:
 
 def test_a_keyed_invalidate_makes_the_touched_panel_re_read_and_keeps_the_others(ck, monkeypatch) -> None:
     n = _count_panel_computes(ck, monkeypatch)
+    ck.panel("tray", credential_class="token")                  # warm-up: a panel's first provider read moves the
+    ck.panel("health", credential_class="token")                # commit count that is part of its cache key (#138)
+    n.clear()
     a = ck.panel("tray", credential_class="token")
     h = ck.panel("health", credential_class="token")
     assert n == {"tray": 1, "health": 1}
@@ -204,7 +207,10 @@ def test_an_in_flight_read_of_a_touched_panel_is_not_shared_after_the_write(ck, 
     assert calls.count("tray") == 2
     gate.set()
     t.join(10)
-    assert ck.panel("tray", credential_class="token") is after  # the pre-write owner's result was never stored
+    assert res and res[0] is not after
+    settled = ck.panel("tray", credential_class="token")        # the post-write read moved the commit count in the key (#138)
+    assert settled is not res[0]                                # the pre-write owner's result was never stored
+    assert ck.panel("tray", credential_class="token") is settled
 
 
 def test_an_in_flight_read_of_an_untouched_panel_is_still_shared(ck, monkeypatch) -> None:

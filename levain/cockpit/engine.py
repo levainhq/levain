@@ -1497,6 +1497,8 @@ class Cockpit:
         bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
         # both taken before the read starts: a write after this point makes the read's snapshot unsharable, and a reader that
         # needs a read begun after some instant (``_snap_for``'s ``read_after``) compares against ``begun``
+        with st.lock:
+            ep = st.epoch      # a keyed write (``invalidate_reads``) moves the epoch, not ``_rc_gen``: it also ends this read's sharing
         gen, begun = self._rc_gen, time.monotonic()
 
         def produce() -> Any:
@@ -1523,7 +1525,7 @@ class Cockpit:
                 st.snap = snap
                 st.last_completion = done_at or ctx.now
                 st.fresh = (snap.as_of, snap.status)
-                st.recent = (snap, begun, time.monotonic(), gen) if shared else None
+                st.recent = (snap, begun, time.monotonic(), gen) if shared and st.epoch == ep else None
                 st.commits += 1
             return snap
 
@@ -2301,6 +2303,7 @@ class Cockpit:
             for st in list(states.values()):
                 with st.lock:
                     st.epoch += 1
+                    st.recent = None
             with self._rc_lock:
                 self._rc_gen += 1
                 self._rc.clear()
@@ -2311,6 +2314,7 @@ class Cockpit:
             if st is not None:
                 with st.lock:
                     st.epoch += 1
+                    st.recent = None      # the shared snapshot predates this write (``_rc_gen`` does not move for a keyed one)
         self._drop_scopes([("panel", p) for p in ids] + [_RC_SHARED_SCOPE])
         if refresh:
             for pid in ids:
