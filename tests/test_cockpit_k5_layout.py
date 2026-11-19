@@ -47,13 +47,13 @@ def test_the_default_board_is_the_kernel_order_with_controls_on_cards_and_none_o
         {"eval": STACKS},
         {"eval": "[...document.querySelectorAll('.ck-zgrid .panel.ck-dash')].map(p => [p.dataset.ckPanel, p.querySelectorAll('.ck-lay-btn').length])"},
         {"eval": "document.querySelectorAll('.ck-zgrid[data-ck-zone=\"operate\"] .panel[data-ck-panel=\"tray\"] .ck-lay-btn').length"},
-        {"eval": "[...document.querySelectorAll('.ck-hero .ck-lay-btn, #ck-skycol .ck-lay-btn, #ck-band .ck-lay-btn, #ck-widgets .ck-lay-btn, #ck-brief .ck-lay-btn')].length"},
+        {"eval": "[...document.querySelectorAll('.ck-hero .ck-lay-btn, #ck-skycol .ck-lay-btn, #ck-band .ck-lay-btn, #ck-widgets .ck-lay-btn')].length"},
     ])
     stacks, dashes, tray_btns, fixed = out
     assert stacks["left"] == ["tray"] and stacks["right"] == [], stacks   # the default the CSS order rules used to draw (no Now, no Keep)
     assert dashes and all(n == 0 for _id, n in dashes), dashes        # an F7 empty line gets no controls
     assert tray_btns == 3, tray_btns                                    # earlier, later, collapse
-    assert fixed == 0, fixed                                            # the now band, the sky, the widgets and the brief are fixed
+    assert fixed == 0, fixed                                            # the now band, the sky and the widgets are fixed
 
 
 @needs_browser

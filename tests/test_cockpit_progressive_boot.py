@@ -210,7 +210,7 @@ _PAGE = r"""
 const fs = require("fs");
 const View = require(process.argv[2]);
 const bootSrc = fs.readFileSync(process.argv[3], "utf8");
-const REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
+const REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-widgets", "state", "board"];
 const real = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
 const sleep = (ms) => new Promise((r) => real.setTimeout(r, ms));
 const settle = () => sleep(80);
@@ -419,13 +419,13 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     out = json.loads(run.stdout)
     # control: nothing fails, so a part is drawn inert and unsigned, then the whole board is drawn live and signed, with no retry ever queued
     cp = out["controlPart"]
-    assert (cp["renders"], cp["whole"], cp["inert"], cp["timers"], cp["hold"]) == (1, False, 7, [], True), cp
+    assert (cp["renders"], cp["whole"], cp["inert"], cp["timers"], cp["hold"]) == (1, False, 6, [], True), cp
     cw = out["controlWhole"]
     # (c) a whole draw before the bound clears the watchdog: no timer is left to release later, and the signal was set exactly once
     assert (cw["renders"], cw["whole"], cw["inert"], cw["timers"], cw["hold"], cw["signals"]) == (2, True, 0, [], False, 1), cw
     # A: supersede + a failed manifest read after a part: a retry is queued, and the part stays inert with the signal UNSET while it waits
-    assert (out["aPart"]["renders"], out["aPart"]["whole"], out["aPart"]["inert"]) == (1, False, 7), out["aPart"]
-    assert out["aFailed"]["whole"] is False and out["aFailed"]["inert"] == 7 and out["aFailed"]["renders"] == 1, out["aFailed"]
+    assert (out["aPart"]["renders"], out["aPart"]["whole"], out["aPart"]["inert"]) == (1, False, 6), out["aPart"]
+    assert out["aFailed"]["whole"] is False and out["aFailed"]["inert"] == 6 and out["aFailed"]["renders"] == 1, out["aFailed"]
     assert out["aFailed"]["timers"] == [2000] and out["aFailed"]["hold"] is True, out["aFailed"]
     assert "can't reach the cockpit yet" in out["aFailed"]["store"], out["aFailed"]
     # the retry is a cold board's second read: it repaints the shells and what had landed at once (render 2) and then draws the whole board
@@ -438,7 +438,7 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     # A2 (a): the same part and failed read held inert and unsigned until the WATCHDOG fires; then it releases and signs, with the part as it
     # is (still one render, the retry still queued), and a later whole draw replaces the board like any redraw
     a2 = out["a2Held"]
-    assert (a2["whole"], a2["inert"], a2["hold"], a2["timers"], a2["signals"]) == (False, 7, True, [2000], 0), a2
+    assert (a2["whole"], a2["inert"], a2["hold"], a2["timers"], a2["signals"]) == (False, 6, True, [2000], 0), a2
     assert out["a2HoldMs"] == 60000
     a2r = out["a2Released"]
     assert (a2r["whole"], a2r["inert"], a2r["hold"], a2r["timers"], a2r["renders"], a2r["signals"]) == (True, 0, False, [2000], 1, 1), a2r
@@ -446,7 +446,7 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     assert (a2w["whole"], a2w["inert"], a2w["hold"], a2w["timers"], a2w["renders"], a2w["store"]) == (True, 0, False, [], 2, ""), a2w
     # B: the whole board's draw throws once after a part: still inert and unsigned, a retry queued, and the retry's whole draw lands live and signed
     assert (out["bPart"]["renders"], out["bPart"]["whole"]) == (1, False), out["bPart"]
-    assert out["bFailed"]["whole"] is False and out["bFailed"]["inert"] == 7 and out["bFailed"]["timers"] == [2000], out["bFailed"]
+    assert out["bFailed"]["whole"] is False and out["bFailed"]["inert"] == 6 and out["bFailed"]["timers"] == [2000], out["bFailed"]
     assert out["bRetryDelay"] == 2000
     assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["inert"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (3, True, 0, [], ""), out["bRetried"]
     # C: a server that keeps failing is retried on the boot's own backoff (2, 4, 8, 15 s, then 30 s), never in a tight loop. The part stays inert
@@ -454,21 +454,21 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     # then releases the page and sets the signal, and the retry chain goes on (the 30 s step is a real timer here, so no fake one shows)
     assert out["cDelays"] == [2000, 4000, 8000, 15000], out["cDelays"]
     for k in range(5):
-        assert (out["cSnaps"][k]["whole"], out["cSnaps"][k]["inert"], out["cSnaps"][k]["hold"]) == (False, 7, True), (k, out["cSnaps"][k])
-    assert (out["cBeforeHold"]["whole"], out["cBeforeHold"]["inert"], out["cBeforeHold"]["signals"]) == (False, 7, 0), out["cBeforeHold"]
+        assert (out["cSnaps"][k]["whole"], out["cSnaps"][k]["inert"], out["cSnaps"][k]["hold"]) == (False, 6, True), (k, out["cSnaps"][k])
+    assert (out["cBeforeHold"]["whole"], out["cBeforeHold"]["inert"], out["cBeforeHold"]["signals"]) == (False, 6, 0), out["cBeforeHold"]
     assert (out["cAfter"]["whole"], out["cAfter"]["inert"], out["cAfter"]["hold"], out["cAfter"]["signals"], out["cAfter"]["timers"]) == (True, 0, False, 1, []), out["cAfter"]
     # G (b): a retry that fires while a read is in flight re-queues with the SAME delay (2 s each time: nothing failed, so the backoff does not
     # advance), and the watchdog releases the page at its bound with that read still hung; the read's later whole draw replaces the board
-    assert (out["gFailed"]["whole"], out["gFailed"]["inert"], out["gFailed"]["timers"], out["gFailed"]["hold"]) == (False, 7, [2000], True), out["gFailed"]
-    assert (out["gHung"]["whole"], out["gHung"]["inert"], out["gHung"]["timers"]) == (False, 7, [2000]), out["gHung"]
+    assert (out["gFailed"]["whole"], out["gFailed"]["inert"], out["gFailed"]["timers"], out["gFailed"]["hold"]) == (False, 6, [2000], True), out["gFailed"]
+    assert (out["gHung"]["whole"], out["gHung"]["inert"], out["gHung"]["timers"]) == (False, 6, [2000]), out["gHung"]
     assert out["gRequeue"] == [2000, [2000]] * 3, out["gRequeue"]
     gs, gr, gw = out["gStillHeld"], out["gReleased"], out["gWhole"]
-    assert (gs["whole"], gs["inert"], gs["hold"], gs["renders"]) == (False, 7, True, 1), gs
+    assert (gs["whole"], gs["inert"], gs["hold"], gs["renders"]) == (False, 6, True, 1), gs
     assert (gr["whole"], gr["inert"], gr["hold"], gr["renders"], gr["signals"]) == (True, 0, False, 1, 1), gr
     assert (gw["whole"], gw["inert"], gw["hold"], gw["renders"], gw["timers"], gw["store"]) == (True, 0, False, 2, [], ""), gw
     # F: the bound runs from the FIRST inert part: after the watchdog has released the page, the same cold read's later partial draw does not
     # make it inert again (and does not redraw it under the reader); its whole draw still lands
-    assert (out["fPart"]["whole"], out["fPart"]["inert"], out["fPart"]["hold"]) == (False, 7, True), out["fPart"]
+    assert (out["fPart"]["whole"], out["fPart"]["inert"], out["fPart"]["hold"]) == (False, 6, True), out["fPart"]
     for k in ("fReleased", "fLater"):
         assert (out[k]["whole"], out[k]["inert"], out[k]["renders"], out[k]["hold"]) == (True, 0, 1, False), (k, out[k])
     assert (out["fWhole"]["whole"], out["fWhole"]["inert"], out["fWhole"]["renders"]) == (True, 0, 2), out["fWhole"]

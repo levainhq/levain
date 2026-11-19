@@ -641,7 +641,7 @@
   // stale modal: the board and the focus modal both draw through this.
   // ---------------------------------------------------------------- the KE page ----
   // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the now band: clock, date,
-  // the state line, the wrap line; the sky as a card under it), the brief, one row of widgets, then each zone as a grid of cards.
+  // the state line, the wrap line; the sky as a card under it), one row of widgets, then each zone as a grid of cards.
   // The masthead above them is the page's bar and stays where the static page put it.
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
@@ -659,9 +659,9 @@
     for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
   }
   function keShell(on) {
-    const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
-    if (!hero || !brief || !widgets) return;
-    hero.hidden = brief.hidden = widgets.hidden = !on;
+    const hero = document.getElementById("ck-hero"), widgets = document.getElementById("ck-widgets");
+    if (!hero || !widgets) return;
+    hero.hidden = widgets.hidden = !on;
     const dropHost = document.getElementById("ck-drop");
     if (dropHost && !on) dropHost.hidden = true;   // the Send box sits under the Needs-you row, outside #ck-hero: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
     const needsHost = document.getElementById("ck-needs");
@@ -672,7 +672,7 @@
     const band = document.getElementById("ck-legend");
     if (band) band.hidden = true;
     // the section headers are page chrome that follows its region: hidden here, set by the region's own render
-    for (const id of ["ck-h-brief", "ck-h-widgets"]) { const h = document.getElementById(id); if (h) h.hidden = true; }
+    for (const id of ["ck-h-widgets"]) { const h = document.getElementById(id); if (h) h.hidden = true; }
     document.body.classList.toggle("ke", on);
     const bd = document.getElementById("board");
     if (bd) bd.classList.toggle("ke", on);
@@ -680,7 +680,7 @@
     // back to the pre-KE page: the state line returns to where the static page put it
     restoreState();
     // what the regions drew is stale once the page is no longer the KE page
-    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {
@@ -695,7 +695,7 @@
     return entry.pkind || (data && data.kind) || entry.kind || "unknown";
   }
 
-  // one bare node (no panel header): the hero's sky, the brief, the widgets. It draws what a zone card draws
+  // one bare node (no panel header): the hero's sky, the widgets. It draws what a zone card draws
   // for the same panel: the banner (stale / partial / held back / an alert), the note, then the content in whichever
   // shape the contract allows (markdown, a typed face, or lines). An alert is content, so it suppresses the empty message.
   // An error sentence from a provider may carry a raw ISO timestamp ("failing since 2026-10-21T22:37:12.126051+00:00"): shown as the local clock
@@ -892,7 +892,7 @@
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const sky = entries.find((e) => kindOf(e) === "ambient");
-    // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
+    // the now band: the clock and date at the left, the state line beside them (placed by moveStateToBand), and at the right the
     // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), and the sky's event count.
     // A bare install has no sky and the band is still whole.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
@@ -923,22 +923,12 @@
     pending = null;
   }
 
-  // TODAY: where to begin, one card. The state line is not in it any more: it lives in the now band (#ck-state-slot), so a
-  // bare install, which has no brief panel, draws no Today card and no heading at all.
-  function renderBriefRegion(view, byId) {
-    const region = document.getElementById("ck-brief");
+  // The brief region is no longer drawn: the page keeps only what the manifest's brief entry "state" carried, the state line,
+  // which lives in the now band (#ck-state-slot). The Next-from-the-List card and its heading went with Morning mode.
+  function moveStateToBand() {
     const state = document.getElementById("state");
     const slot = document.getElementById("ck-state-slot");
-    const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
-    const bodies = entries.map((e) => bareNode(e, view, "ck-brief-body", { region: "brief" }));   // may throw: #state has not moved yet
     if (state && slot) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; slot.appendChild(state); }
-    if (bodies.length) {
-      const card = el("div", "ck-card ck-briefcard");
-      for (const node of bodies) card.appendChild(node);
-      region.replaceChildren(card);
-    } else region.replaceChildren();
-    region.hidden = !entries.length;
-    const hb = document.getElementById("ck-h-brief"); if (hb) hb.hidden = region.hidden;   // page chrome: the section's header follows its region
   }
 
   function renderWidgets(view, byId) {
@@ -1158,7 +1148,7 @@
   const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0 });
   // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
   // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
-  // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
+  // so the layout does not reach them; the now band, sky, widgets and Needs-you strip are not zone cards and have no controls.
   const CK_NO_LAYOUT = new Set(["mind", "identity"]);
   const layoutKit = () => { const K = window.LevainCockpitKinds; return K && K.layoutOrder ? K : null; };
   // the cards in their drawn order (the saved order over the kernel's), their keys left on the zone's grid for the move buttons
@@ -1681,7 +1671,7 @@
   // Each region is drawn on its own, under ONE rule: it builds its fallible content off the page and attaches it last
   // (structural nodes, the masthead and #state, move only then). So a throw leaves the page as it was, the region's
   // `restore` hands any structural node it owns back to its non-KE home, and the catch writes a line into the region's
-  // dedicated error child. `fill` regions (the brief, the widgets) have no structural children and show only the error;
+  // dedicated error child. `fill` regions (the widgets) have no structural children and show only the error;
   // the hero keeps its mounts and gains the error line beside them. A zone passes its own `show`.
   function guardRegion(name, draw, show, restore) {
     try { draw(); } catch (e) {
@@ -1701,7 +1691,7 @@
     for (const e of view.layout) if (e.id !== DROP_THREAD_PANEL) byId.set(e.id, e);   // the drop card hosts that panel: no zone, tile or hero draws it
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
-    guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the state line", moveStateToBand, regionErr("ck-hero", false), restoreState);
     guardRegion("the desk drop", () => renderDropHero(view), regionErr("ck-drop", false));
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
@@ -10274,7 +10264,7 @@
   // above): the draw empties every region listed here, and a node removed from the page takes the keyboard with it. Only a field
   // inside one of those regions counts (the drop box, the chat and the devices sit outside and survive the draw), and only while
   // it holds text or took a key within the idle window, so a box merely left focused never freezes the board.
-  const FOCUS_REBUILT = "#board, #levain-modal, #ck-hero, #ck-brief, #ck-widgets, #ck-needs, #ck-notes";
+  const FOCUS_REBUILT = "#board, #levain-modal, #ck-hero, #ck-widgets, #ck-needs, #ck-notes";
   const FOCUS_IDLE_MS = 10000;
   // recency is kept per element: typing in one field (the chat, an earlier box) says nothing about a different field focused later
   const fieldInputAt = typeof WeakMap !== "undefined" ? new WeakMap() : null;

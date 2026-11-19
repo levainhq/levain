@@ -981,7 +981,7 @@
     for (const pid of headerExtra) placeOnce(pid, "operate");
     if (ke) {
       // the page's own regions, each panel kept in the kernel's order: hero (reading, ambient), brief, widgets, then
-      // the zones as cards. `state` is not a card: it is the operator's line, drawn at the top of the brief.
+      // the zones as cards. `state` is not a card: it is the operator's line, which the page puts in the now band.
       view.ke = { hero: [], brief: [], widgets: [], zones: [] };
       for (const region of ["hero", "brief", "widgets"]) {
         for (const pid of m.regions[region]) {
@@ -1469,69 +1469,13 @@
     host.appendChild(g);
   }
 
-  // In the brief region a label that repeats is a list, not a paragraph: its lines sit in a side column, clamped, and
-  // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
-  const BRIEF_SIDE_LINES = 6;
-  // Where to begin, as the mock draws it: a head (title, what it reads from), the lead in large type with what comes after it,
-  // and the overnight line.
-  function paintBriefCard(host, b) {
-    const head = el("div", "brief-head");
-    // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
-    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the List" : b.title));
-    head.appendChild(el("span", "sp"));
-    if (b.source) head.appendChild(el("span", "stamp", b.source));
-    host.appendChild(head);
-    const body = el("div", "brief-cols");
-    const lead = el("div", "brief-lead");
-    const lines = b.lines || [];
-    if (b.headline) {
-      // nothing set: one line, what is missing and the way to fill it
-      lead.appendChild(el("p", "lead-first", [b.headline, ...lines.map((l) => l.text)].join(". ").replace(/\.\.$/, ".")));
-    } else {
-      if (lines[0]) lead.appendChild(el("p", "lead-first", lines[0].text));
-      if (lines[1]) { const p = el("p", "lead-then"); p.appendChild(el("span", "k", lines[1].label || "then")); p.appendChild(document.createTextNode(" " + lines[1].text)); lead.appendChild(p); }
-      if (lines.length > 2) {
-        const more = el("div", "lead-more");
-        for (const l of lines.slice(2)) { const p = el("p", "lead-item"); p.appendChild(el("span", "k", l.label || "")); p.appendChild(document.createTextNode(" " + l.text)); more.appendChild(p); }
-        lead.appendChild(more);
-      }
-    }
-    const ov = b.overnight;
-    if (isObj(ov) && Number.isInteger(ov.episodes) && typeof ov.since === "string") {
-      const at = new Date(ov.since);
-      if (!Number.isNaN(at.getTime())) {
-        const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
-        const row = el("div", "brief-overnight");
-        row.appendChild(el("span", "k", "Overnight"));
-        row.appendChild(el("span", "mono", ov.episodes + (ov.episodes === 1 ? " episode" : " episodes") + " since the last wrap, " + when));
-        lead.appendChild(row);
-      }
-    }
-    body.appendChild(lead);
-    host.appendChild(body);
-  }
-  function paintBrief(host, b, region) {
-    if (region && b.title && b.source) { host.classList.add("brief-card"); paintBriefCard(host, b); return; }
+  function paintBrief(host, b) {
     if (b.headline) host.appendChild(el("div", "q", b.headline));
-    const count = new Map();
-    for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
-    const side = new Map();
     for (const l of b.lines) {
-      if (region && l.label && count.get(l.label) > 1) { if (!side.has(l.label)) side.set(l.label, []); side.get(l.label).push(l); continue; }
       const row = el("div", "brief-line");
       if (l.label) row.appendChild(el("span", "k", l.label));
       row.appendChild(el("p", "", l.text));
       host.appendChild(row);
-    }
-    if (side.size) {
-      host.classList.add("has-side");
-      const col = el("div", "brief-side");
-      for (const [label, ls] of side) {
-        col.appendChild(el("span", "k", label));
-        for (const l of ls.slice(0, BRIEF_SIDE_LINES)) col.appendChild(el("p", "side-line", l.text));
-        if (ls.length > BRIEF_SIDE_LINES) col.appendChild(el("p", "xnote", "+" + (ls.length - BRIEF_SIDE_LINES) + " more"));
-      }
-      host.appendChild(col);
     }
   }
 
@@ -1820,7 +1764,7 @@
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length && !s.ctx.alerted) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
-    if (d.kind === "brief") { paintBrief(s.body, d.brief, s.ctx.region === "brief"); return; }
+    if (d.kind === "brief") { paintBrief(s.body, d.brief); return; }
     if (d.kind === "ambient") { paintSky(s, s.body, d.sky); return; }
     if (d.kind === "form") {
       // the compose box (mounted by the core when the verb is offered) is the form; without it, say why

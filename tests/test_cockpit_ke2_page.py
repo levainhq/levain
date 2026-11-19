@@ -121,11 +121,11 @@ out.w1empty = draw("ops", "status-dots", { metrics: [] }, { widget: true }, { em
 // W3: the write path read off a widget's own metrics
 const wv = (live) => draw("health", "status-dots", { metrics: [{ label: "write path", value: live, status: "ok" }] }, { widget: true }).v;
 out.w3 = [wv("live").write_path_live, wv("dark").write_path_live, draw("ops", "status-dots", { metrics: [] }, { widget: true }).v.write_path_live, wv("no wraps yet").write_path_live, wv("no wraps yet").write_path_status];
-// W4: a repeated label keeps its own heading and clamp
+// W4: a brief panel draws every line in order; a repeated label gets no side column and no clamp
 const lines = [];
 for (let i = 0; i < 8; i++) lines.push({ label: "Tasks", text: "t" + i });
 for (let i = 0; i < 2; i++) lines.push({ label: "Risks", text: "r" + i });
-const b = draw("brief", "brief", { lines }, { region: "brief" });
+const b = draw("brief", "brief", { lines }, {});
 out.w4 = b.host.all((n) => n.className === "k").map((n) => n.textContent);
 out.w4side = b.host.all((n) => /side-line/.test(n.className)).map((n) => n.textContent);
 out.w4more = b.host.all((n) => n.className === "xnote").map((n) => n.textContent);
@@ -144,12 +144,11 @@ def _run2(tmp_path: Path) -> dict:
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
-def test_widgets_draw_every_metric_and_the_brief_groups_by_label(tmp_path: Path) -> None:
+def test_widgets_draw_every_metric_and_a_brief_panel_draws_every_line_ungrouped(tmp_path: Path) -> None:
     out = _run2(tmp_path)
     for needle in ("load", "3 of 4", "ratio", "0.25", "disk", "ok-ish"):
         assert needle in out["w1"], f"{needle!r} missing from the widget: {out['w1']!r}"
     assert "no dots" in out["w1empty"] and "nothing" not in out["w1"]
     assert out["w3"] == [True, False, None, False, "no-wraps"], "liveness comes from the widget's own write-path metric, or is unknown"
-    assert out["w4"] == ["Tasks", "Risks"]
-    assert out["w4side"] == [f"t{i}" for i in range(6)] + ["r0", "r1"]
-    assert out["w4more"] == ["+2 more"]
+    assert out["w4"] == ["Tasks"] * 8 + ["Risks"] * 2
+    assert out["w4side"] == [] and out["w4more"] == []

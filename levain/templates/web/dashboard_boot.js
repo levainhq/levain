@@ -59,11 +59,11 @@
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
   //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
-  //   the zones, but the hero, the Needs strip, the notes, the brief and the widgets (the tiles) are its siblings, and those are where a
+  //   the zones, but the hero, the Needs strip, the notes and the widgets (the tiles) are its siblings, and those are where a
   //   reader first acts (dashboard.html; renderKe in dashboard_core.js fills them). The drop (#ck-drop) is NOT in the list: renderDropHero
   //   builds its card once and refreshes it in place, so the whole draw never replaces it, and an inert drop would make a tap on the Drop
   //   tab scroll without focusing the box (phoneJump focuses inside a frame callback, which is a no-op on an inert node).
-  const BOARD_REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
+  const BOARD_REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-widgets", "state", "board"];
   function boardMark(whole) {
     try {
       for (const id of BOARD_REGIONS) {
