@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives import serialization
 from levain.consent.grant_phone import GrantRefused
 from levain.consent.passkey import challenge
 from levain.desk.envelope_revoke import NAMESPACE, EnvelopeRevoke, revoke_message
+from tests._cockpit_reread import REREAD
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
 from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
 from tests.test_cockpit_k2a import _install
@@ -349,14 +350,14 @@ def test_a_refusal_lands_on_the_live_envelope_card_when_a_board_read_replaced_th
             {"eval": _HOLD_GET},
             {"eval": f"window.__tapped = {_CARD}; 1"},
             *landed_tap(_REVOKE, "window.__getCalled === true && 1"),
-            {"eval": "document.querySelector('#refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && 1", "ms": 30000},
             {"eval": f"{_REVOKE}.disabled"},
             {"eval": _NOTE},
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_NOTE}) && !{_REVOKE}.disabled && {_NOTE}", "ms": 30000},
             {"eval": f"{_CARD}.querySelector('.sign-note').className"},
-            {"eval": f"window.__shown = {_CARD}; document.querySelector('#refresh').click(); 1"},
+            {"eval": f"window.__shown = {_CARD}; {REREAD}"},
             {"until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
             {"eval": _NOTE},
             {"eval": f"{_REVOKE}.disabled"},
