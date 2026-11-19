@@ -2,9 +2,7 @@
 
 A request that a paired token authenticated calls :meth:`LastSeenStamper.note`, which decides from memory alone (no
 sqlite open, no lock but its own) whether that device is due, and if so hands ``(device, now)`` to ONE background daemon
-thread. That thread coalesces what is waiting (one entry per device) and calls ``CockpitDB.stamp_last_seen``, which keeps
-its own fail-soft write (a connection with ``busy_timeout = 0``) and its own conditional ``UPDATE``, so the journal still
-decides what is due across processes.
+thread. That thread coalesces what is waiting (one entry per device) and calls ``CockpitDB.stamp_last_seen`` for each.
 
 Nothing here reaches an answer: a request never waits on the thread, and a stamp that fails is dropped (the device is
 tried again after the next window). ``last_seen`` is a display field.
@@ -30,8 +28,7 @@ class LastSeenStamper:
     """The per-device throttle (in memory, seeded by a device's first note in this process) and the one writer thread.
 
     The window between two notes that reach the thread for one device is ``firejournal.LAST_SEEN_EVERY``, read at call
-    time. The first note for a device since this process started always goes through; ``stamp_last_seen`` then asks the
-    journal whether the device is due."""
+    time. The first note for a device since this process started always goes through."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

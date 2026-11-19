@@ -2734,8 +2734,7 @@ class _Handler(GuardedHandler):
         finally:
             srv.pair_verify_gate.release()
         # F1 / D15b: the last_seen stamp is queued AFTER the answer and after the verify slot is released; the
-        # stamper's thread writes it (no busy wait: busy_timeout 0), and nothing it does reaches the answer or waits
-        # on this thread
+        # stamper's own thread writes it, and nothing it does reaches the answer or waits on this thread
         if device is not None:
             try:
                 srv.last_seen_stamper.note(db, device, now)
