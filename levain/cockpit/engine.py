@@ -45,7 +45,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from levain.cockpit.registry import (
     FACETS,
@@ -707,6 +707,16 @@ def _read_key(x: Any) -> str:
     return json.dumps(x, sort_keys=True, separators=(",", ":"), default=str)
 
 
+_RC_SHARED_SCOPE = ("shared",)     # the read scope of every cached read that is not one panel's (the manifest)
+
+
+def _rc_scope(key: Any) -> Any:
+    """The scope a read-cache key belongs to: a panel read is scoped by its panel id, any other read by the shared scope."""
+    if isinstance(key, tuple) and len(key) > 1 and key[0] == "panel":
+        return ("panel", key[1])
+    return _RC_SHARED_SCOPE
+
+
 class _SharedRead:
     __slots__ = ("at", "done", "value", "ok")
 
@@ -759,6 +769,8 @@ class Cockpit:
         self.read_cache_ttl_s: float | None = None
         self._rc: dict[Any, "_SharedRead"] = {}
         self._rc_gen = 0
+        self._rc_scope_gen: dict[Any, int] = {}     # a keyed write's generation per read scope (see ``invalidate_reads``)
+        self._rc_refreshing: set[str] = set()       # refresher panels with a write-triggered refresh still running
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -2147,14 +2159,55 @@ class Cockpit:
         return sorted(specs_map.values(), key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id))
 
     # --- the shared read cache ---------------------------------------------------------------------
-    def invalidate_reads(self) -> None:
+    def invalidate_reads(self, panel_ids: "Iterable[str] | None" = None, *, refresh: bool = True) -> None:
         """A write happened (the server calls it for an ADMITTED write, before that write's response is sent, and
-        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it): every cached read
-        and every in-flight one is stale from here. A read started before this call is never stored for, nor
-        joined by, a request arriving after it (the generation is part of the key)."""
+        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it).
+
+        No argument: every cached read and every in-flight one is stale from here. A read started before this call is
+        never stored for, nor joined by, a request arriving after it (the generation is part of the key).
+
+        ``panel_ids`` (a write that knows what it changed): only those panels' entries go cold, with the same rule per
+        panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
+        A read is scoped by its key: a panel read by its panel id, everything else (the manifest) by one shared scope that
+        every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
+        caller's; ``refresh=False`` skips that (the server's second call for the same write)."""
+        if panel_ids is None:
+            with self._rc_lock:
+                self._rc_gen += 1
+                self._rc.clear()
+            return
+        ids = [p for p in dict.fromkeys(panel_ids) if isinstance(p, str)]
+        scopes = [("panel", p) for p in ids] + [_RC_SHARED_SCOPE]
         with self._rc_lock:
-            self._rc_gen += 1
-            self._rc.clear()
+            for sc in scopes:
+                self._rc_scope_gen[sc] = self._rc_scope_gen.get(sc, 0) + 1
+            gone = [k for k in self._rc if _rc_scope(k[2]) in scopes]
+            for k in gone:
+                del self._rc[k]
+        if refresh:
+            for pid in ids:
+                self._refresh_in_background(pid)
+
+    def _refresh_in_background(self, panel_id: str) -> None:
+        """One refresh of a refresher panel on its own short-lived thread, skipped when the panel has no refresher or one
+        started by an earlier write has not finished (that one reads after the write it was started for)."""
+        if panel_id not in self._refreshers:
+            return
+        with self._rc_lock:
+            if panel_id in self._rc_refreshing:
+                return
+            self._rc_refreshing.add(panel_id)
+
+        def run() -> None:
+            try:
+                self.refresh(panel_id)
+            except Exception:  # noqa: BLE001 - the refresher's own cycle reports a bad read; this one is a nudge
+                pass
+            finally:
+                with self._rc_lock:
+                    self._rc_refreshing.discard(panel_id)
+
+        threading.Thread(target=run, name=f"cockpit-write-refresh-{panel_id}", daemon=True).start()
 
     def _shared_read(self, key: Any, compute: Callable[[], Any], keep: Callable[[Any], bool] = lambda v: True) -> Any:
         """Single-flight plus a short TTL for one identical read. ``key`` must hold EVERYTHING the result
@@ -2166,7 +2219,7 @@ class Cockpit:
         if ttl <= 0:
             return compute()
         with self._rc_lock:
-            full = (self._rc_gen, key)
+            full = (self._rc_gen, self._rc_scope_gen.get(_rc_scope(key), 0), key)
             ent = self._rc.get(full)
             now = time.monotonic()
             if ent is not None and ent.ok is not False and (not ent.done.is_set() or now - ent.at < ttl):
