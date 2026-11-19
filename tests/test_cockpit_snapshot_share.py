@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -246,10 +247,18 @@ def test_one_parallel_reads_timeout_abandons_only_the_shared_reads_it_used() -> 
     t2.join(10)
 
 
+def _clock_on(ck: Cockpit, day: int) -> None:
+    ck._clock = lambda: datetime(2026, 11, day, 12, 0, tzinfo=timezone.utc)
+
+
 def test_a_page_manifest_after_a_watcher_build_is_never_the_entry_cached_before_it(ck) -> None:
-    # gemini L3 r1: the watcher's fresh build announced; the page's manifest inside the window must not be the older entry
+    # gemini L3 r1: the watcher's build that announced (here the day turning, no provider value moved); the page's
+    # manifest inside the window must not be the older entry
+    _clock_on(ck, 10)
+    ck.manifest(NONE, read_after=time.monotonic())          # the watcher's baseline
     m1 = ck.manifest(NONE)
     assert ck.manifest(NONE) is m1
+    _clock_on(ck, 11)
     ck.manifest(NONE, read_after=time.monotonic())
     assert ck.manifest(NONE) is not m1
 
@@ -262,10 +271,58 @@ def test_a_refresher_panels_refetch_after_a_watcher_build_is_a_new_entry(ck) -> 
 
     ck.register(_simple("cyc", rows=(), read=lambda ctx: Read(rows=(_row(1),)), refresh_every_s=60.0, stale_after_s=120.0))
     ck.refresh("cyc")
+    _clock_on(ck, 10)
+    ck.manifest(NONE, read_after=time.monotonic())          # the watcher's baseline
     p1 = ck.panel("cyc", credential_class="none")
     assert ck.panel("cyc", credential_class="none") is p1
+    _clock_on(ck, 11)
     ck.manifest(NONE, read_after=time.monotonic())
     assert ck.panel("cyc", credential_class="none") is not p1
+
+
+def test_watcher_builds_that_announce_nothing_leave_the_page_sharing_what_it_cached(ck, monkeypatch) -> None:
+    # the first watcher build is the baseline (nothing to differ from) and an unchanged one announces nothing: neither
+    # may move the generation in the cache keys, or the page's refetch right after the stream starts recomputes
+    n = _provider_reads(monkeypatch, ck)
+    m1 = ck.manifest(NONE)
+    assert n[PID] == 1
+    ck.manifest(NONE, read_after=time.monotonic())           # the first build
+    assert ck._obs_gen == 0
+    ck.manifest(NONE, read_after=time.monotonic())           # nothing moved since
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck._obs_gen == 0
+    reads = n[PID]
+    assert ck.manifest(NONE) is m1                           # still the entry cached before the builds
+    assert n[PID] == reads
+
+
+def test_the_first_watcher_build_is_the_baseline_and_moves_nothing(ck) -> None:
+    m1 = ck.manifest(NONE)
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck._obs_gen == 0
+    assert ck.manifest(NONE) is m1
+
+
+def test_a_watcher_build_whose_etags_differ_moves_the_generation_once(tmp_path: Path) -> None:
+    c, state = _external_cockpit(tmp_path)
+    c.manifest(NONE, read_after=time.monotonic())            # the baseline
+    gen = c._obs_gen
+    state["rows"] = [_row(1), _row(2)]                       # a provider value moves (another process)
+    c.manifest(NONE, read_after=time.monotonic())
+    assert c._obs_gen == gen + 1
+    c.manifest(NONE, read_after=time.monotonic())            # the same etags again: announced once, bumped once
+    assert c._obs_gen == gen + 1
+
+
+def test_a_watcher_build_after_the_day_turns_moves_the_generation_once(ck) -> None:
+    _clock_on(ck, 10)
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck._obs_gen == 0
+    _clock_on(ck, 11)                                        # no provider read moved; the head's date did
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck._obs_gen == 1
+    ck.manifest(NONE, read_after=time.monotonic())
+    assert ck._obs_gen == 1
 
 
 def test_concurrent_manifests_share_one_bounded_pool_of_readers(tmp_path: Path, monkeypatch) -> None:

@@ -796,10 +796,13 @@ class Cockpit:
         self.read_cache_ttl_s: float | None = None
         self._rc: dict[Any, "_SharedRead"] = {}
         self._rc_gen = 0
-        # bumped as each ``read_after`` manifest (the change stream's watcher) returns, before it can announce anything:
-        # part of every manifest and panel cache key, so a page's read after an announcement is never answered from an
-        # entry stored before the build that announced it (an etag can move with no provider read: the day turning)
+        # bumped as a ``read_after`` manifest (the change stream's watcher) returns announcing different panel etags than
+        # the watcher build before it, before it can announce anything: part of every manifest and panel cache key, so a
+        # page's read after an announcement is never answered from an entry stored before the build that announced it (an
+        # etag can move with no provider read: the day turning). The first build is the baseline and an unchanged one
+        # announces nothing, so neither moves it: the page's reads keep sharing what it cached
         self._obs_gen = 0
+        self._obs_etags: dict[str, Any] | None = None       # the previous watcher build's panel id -> head etag
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -2310,7 +2313,8 @@ class Cockpit:
                  transport: dict[str, Any] | None = None, read_after: float | None = None) -> dict[str, Any]:
         """``read_after`` (a ``time.monotonic()`` instant; the change stream's watcher passes its build's start) asks for
         a manifest built only from on-demand reads BEGUN at or after it (``_snap_for``): it is never shared from or into
-        the cache below, the reads it makes are the ones later page reads share, and its return bumps ``_obs_gen``.
+        the cache below, the reads it makes are the ones later page reads share, and its return bumps ``_obs_gen`` when its
+        panel etags differ from the previous watcher build's (the first build only sets that baseline).
 
         Otherwise the manifest, shared. KEY = every input this composition reads from the request: the whole credential
         dict (class, name, device_class: it is also hashed into the etag and echoed in the body), ``install_class``
@@ -2323,8 +2327,12 @@ class Cockpit:
         if read_after is not None:
             out = self._manifest_compute(credential, install_class=install_class, transport=transport,
                                          read_after=read_after)
+            # the same map the Watcher diffs (panel ids and their head etags), so this moves exactly when it could announce
+            seen = {pid: head.get("etag") for pid, head in out["panels"].items()}
             with self._rc_lock:
-                self._obs_gen += 1
+                prev, self._obs_etags = self._obs_etags, seen
+                if prev is not None and prev != seen:
+                    self._obs_gen += 1
             return out
         if (self.read_cache_ttl_s or 0.0) <= 0:
             return self._manifest_compute(credential, install_class=install_class, transport=transport)
