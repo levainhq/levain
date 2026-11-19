@@ -4106,6 +4106,7 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 6 !important; }
   body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; flex-wrap: wrap; }
   body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - 2 * var(--sp-4)) / 3 - 1px); min-width: 0; }
+}
 
 /* ── levain#141 polish: header, now line, drop, Home order ── */
 /* Phill's list after using layout A (1119-10). Everything below overrides a layout A rule by coming after it; the only existing
