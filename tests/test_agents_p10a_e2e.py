@@ -23,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 pytest.importorskip("cryptography")
+from tests import _p10a_races as races  # noqa: E402
+from tests._p10a_races import assert_honest as honest  # noqa: E402
 from tests._p10a_rig import ZONE, Install, real_now, utc  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -393,27 +395,6 @@ def _clean(*ran):
         assert "Traceback" not in r.err and "IntegrityError" not in r.err and "OperationalError" not in r.err, r.err
 
 
-def _renew_refusals(link: str) -> "re.Pattern[str]":
-    """Every full stderr a ``levain agents renew`` can end with when a revoke of the same agent wins the race (rc 1), each
-    an honest refusal that appended nothing, by the point the revoke's landing was seen: the bar open at the check
-    (``agents/signing._refuse_open_bar``: OPEN_BAR_REFUSAL); the link already ended in the replay the check read
-    (``renew_agent_link.check``: "no agent link"); the log moved between that read and the prepare or the append
-    (``signing._sign_op``: StaleHead, both its texts); and the log's own refusal of the renew link on the head the
-    revoke made (``authority._step``: the grant is gone, or the renew's clock, taken before the revoke appended, is
-    earlier than the revoke's: ``_append_only_checks``). Never a bare "renew" or the verb name: the full text."""
-    moved = r" \(the authority log moved: nothing was appended\)"
-    return re.compile(
-        "(?:Signing data on standard input\n)?"                  # ssh-keygen's own line, there when the refusal came after the signature
-        "levain agents renew: (?:"
-        "a revoke is open for this agent: finish or abandon it"
-        f"|no agent link {re.escape(repr(link))}"
-        f"|the authority log moved while this was prepared: look at it again{moved}"
-        f"|the authority log's head moved to seq \\d+ since this link was prepared{moved}"
-        f"|authority log link \\d+: no grant {re.escape(repr(link))}"
-        r"|authority log link \d+: at \S+ is earlier than its predecessor's \S+; the log's times never go back"
-        ")\n")
-
-
 def test_p10a_revoke_that_cannot_sign_is_abandoned(tmp_path):
     """invariant 7 (c2/c3/c6 shape, deterministic): ``levain agents revoke`` with a key the log does not enrol opens the
     bar and then cannot prepare its link: the agent stays barred (a hand start ends ``stopped: barred``, a sign is
@@ -501,10 +482,10 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
             assert r.out.endswith("revoke landed at seq 6; the bar is closed\n")
             if a.rc == 1:
                 assert a.err == f"levain agents revoke: no open revoke for {agent_id}; nothing to abandon\n"
-                seen.add("revoke first")
+                seen.add(honest("revoke_vs_abandon", races.REVOKE_FIRST))
             else:
                 assert (a.rc, a.out) == (0, "the revoke had already landed at seq 6; nothing to abandon\n"), a
-                seen.add("abandon lost the close")
+                seen.add(honest("revoke_vs_abandon", races.ABANDON_LOST_CLOSE))
             assert inst.cli("dream", "start").rc == 1                      # the revoke stands: nothing arms
         else:
             assert bar["reason"] == "abandoned" and bar["revoke_seq"] is None
@@ -513,7 +494,7 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
                 assert r.out.endswith("the revoke was abandoned; nothing was appended; the agent is NOT revoked\n")
                 assert a.out.endswith(("is closed; nothing was appended\n",
                                        "a revoke that already landed stands, and the next tick records it\n")), a
-                seen.add("abandon first")
+                seen.add(honest("revoke_vs_abandon", races.ABANDON_FIRST))
                 assert inst.cli("dream", "start").rc == 0                  # the links stand as signed
             else:
                 # the abandon closed the bar after the revoke's append and before its close (agent_authority._landed,
@@ -521,9 +502,9 @@ def test_p10a_revoke_racing_an_abandon(tmp_path):
                 assert ops == [(5, "create_grant"), (6, "revoke_agent")], ops
                 assert r.out.endswith("revoke landed at seq 6; the bar had been abandoned; it is recorded from_log at the "
                                       "next tick (R5)\n"), r
-                seen.add("abandon closed between the append and the close")
+                seen.add(honest("revoke_vs_abandon", races.ABANDON_BETWEEN))
                 assert inst.cli("dream", "start").rc == 1                  # the revoke stands: nothing arms
-        if seen - {"revoke first"}:
+        if seen - {races.REVOKE_FIRST}:
             break
     # no runner can be made to land the abandon inside the revoke's window, so the test does not require it: every try
     # above asserted the invariants of whichever ordering it saw, and "seen" records which orderings the tries reached
@@ -562,12 +543,12 @@ def test_p10a_revoke_racing_a_renewal(tmp_path):
             assert ops == [(5, "create_grant"), (6, "renew"), (7, "revoke_agent")] and bar["revoke_seq"] == 7
             assert rn.out.startswith(f"renewed: {link} at seq 6, until ") and rv.out.endswith(
                 "revoke landed at seq 7; the bar is closed\n")
-            outcomes.append("renew then revoke at 7")
+            outcomes.append(honest("revoke_vs_renew", races.RENEW_THEN_REVOKE))
         else:
             assert ops == [(5, "create_grant"), (6, "revoke_agent")] and bar["revoke_seq"] == 6
-            assert rn.rc == 1 and _renew_refusals(link).fullmatch(rn.err), rn         # one of the honest refusals, in full
+            assert rn.rc == 1, rn
+            outcomes.append(honest("revoke_vs_renew", rn.err, link=link))             # one of the honest refusals, in full
             assert rn.out == "" and rv.out.endswith("revoke landed at seq 6; the bar is closed\n"), (rn, rv)
-            outcomes.append("revoke first, renew refused")
         assert inst.cli("dream", "start").rc == 1                           # the revoke stands whichever landed first
     # no runner can be made to land the renew first (or second): every try asserted the end state of whichever
     # ordering it saw, so no ordering is required here, only that every try completed
@@ -758,25 +739,13 @@ def test_p10a_counters_at_their_ceiling(tmp_path):
     losses = [r for r in ran if r.rc == 1]
     assert len(wins) == 1 and len(losses) == 1, ran
     (launched,) = [r for r in inst.rows() if r["state"] == "launched"]
-    # the loser has these honest texts, all "started nothing" (``dream/start.start``), by where it met the winner's row:
-    # (1) its claim answered skipped-overlap (its own second row, and the one text that leaves one); (2) its read of the
-    # live rows found the winner's, launched or still admitted, and refused to claim beside it; (3) it resumed the winner's
-    # admitted row and reached it no longer admitted, because the winner had launched it (measured on CI, run
-    # 44353061085, 11-18). (2) and (3) leave no second row.
+    # the loser's text is one of the honest set of race "start_for_the_one_place" (tests/_p10a_races.py), all "started
+    # nothing"; only the skipped-overlap claim leaves a second row (its own), every other member leaves none
     oid = launched["occurrence_id"]
-    overlap_text = ("levain dream start: the claim answered skipped-overlap: another occurrence of the dream is "
-                    "live or this second was already claimed; nothing was started\n")
-    in_flight_text = (f"levain dream start: {oid} (manual, launched) is still in flight, and the dream runs one "
-                      "occurrence at a time; nothing was claimed\n")
-    in_flight_admitted = in_flight_text.replace("(manual, launched)", "(manual, admitted)")
-    gone_texts = tuple(f"levain dream start: {oid} was no longer admitted when this start reached it ({why}): "
-                       "another start launched or ended it, so this one started nothing. "
-                       "`levain agents show dream` says which\n"
-                       for why in ("the occurrence is launched", "the occurrence ended while its input was checked"))
-    assert losses[0].err in (overlap_text, in_flight_text, in_flight_admitted, *gone_texts), losses[0]
+    loser = honest("start_for_the_one_place", losses[0].err, oid=oid)
     assert losses[0].out == "", losses[0]
     states = sorted(r["state"] for r in inst.rows())
-    assert states == (["launched", "skipped-overlap"] if losses[0].err == overlap_text else ["launched"]), states
+    assert states == (["launched", "skipped-overlap"] if loser == races.OVERLAP else ["launched"]), states
     assert len(inst.rows("SELECT * FROM agent_slots")) == 1 and len(inst.rows("SELECT * FROM agent_reservations")) == 1
     assert inst.spawned() == [launched["occurrence_id"]]
 
@@ -866,17 +835,10 @@ def test_p10a_duplicate_delivery_of_a_slot(tmp_path):
     rows = inst.rows("SELECT * FROM agent_occurrences ORDER BY key")
     assert [r["key"] for r in rows] == ["2026-11-19T05:20:00Z", "2026-11-19T05:40:00Z"]
     new = rows[1]["occurrence_id"]
-    # each racer's stderr is empty (it saw the slot claimed and the row already ended) or ONE full line, by where it met
-    # the claimed row (``tick_driver._launch_dream_slots``, ``controller.launch``): it ended the row itself
-    # (skipped-no-input, exactly one racer), or the row was no longer admitted when it got there (``not-admitted``,
-    # with the reason the controller read: the row ended while its input was checked, or is already skipped-no-input;
-    # measured, levain 40, 11-18)
-    won = f"levain agents tick: {new} did not launch: skipped-no-input (no_input)\n"
-    not_admitted = tuple(f"levain agents tick: {new} did not launch: not-admitted ({why})\n"
-                         for why in ("the occurrence ended while its input was checked",
-                                     "the occurrence is skipped-no-input"))
-    assert all(r.err in ("", won, *not_admitted) for r in racers), [r.err for r in racers]
-    assert sum(r.err == won for r in racers) == 1, [r.err for r in racers]
+    # each racer's stderr is one member of the honest set of race "tick_duplicate_delivery" (tests/_p10a_races.py);
+    # exactly one racer ends the row itself
+    named = [honest("tick_duplicate_delivery", r.err, oid=new) for r in racers]
+    assert named.count(races.TICK_WON) == 1, [r.err for r in racers]
     assert [r.out for r in racers] == ["", "", ""]
     assert [r["state"] for r in rows] == ["skipped-no-input", "skipped-no-input"]       # every branch: both slots ended, none launched
     assert inst.rows("SELECT * FROM agent_slots") == [] and inst.spawned() == []
