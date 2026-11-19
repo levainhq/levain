@@ -38,7 +38,7 @@
   function paint() {
     var p = place();
     if (document.body.dataset.iaPlace !== p) document.body.dataset.iaPlace = p;
-    var bar = document.querySelectorAll("[data-ia-place-btn]");
+    var bar = document.querySelectorAll(".ia-places [data-ia-place-btn]");
     for (var i = 0; i < bar.length; i++) {
       var on = bar[i].dataset.iaPlaceBtn === p || (B && p === "drill" && bar[i].dataset.iaPlaceBtn === "home");
       if (on) bar[i].setAttribute("aria-current", "page"); else bar[i].removeAttribute("aria-current");
@@ -91,21 +91,41 @@
   // whether an action button was pressed while the Desk (B's Home) was on: read before the page's own capture listener leaves it
   var actionFromDesk = false;
   window.addEventListener("click", function (ev) {
-    actionFromDesk = !!(B && deskOn() && ev.target && ev.target.closest && ev.target.closest(".ia-actions"));
-    if (ev.isTrusted) userMoved = true;
+    var t = ev.target && ev.target.closest ? ev.target : null;
+    var act = t && t.closest(".ia-actions");
+    // B's Home already holds the line box the Drop button stands for ("A line for the desk"): Drop goes there, and the page's
+    // own jump (which would leave the Desk for a card that Home never shows) does not run
+    if (B && deskOn() && act && act.contains(t.closest("[data-phone-jump=drop]"))) {
+      var box = document.querySelector(".dv-zone textarea");
+      ev.stopPropagation();
+      ev.preventDefault();
+      actionFromDesk = false;
+      if (box) box.focus();
+      return;
+    }
+    actionFromDesk = !!(B && deskOn() && act);
+    // choosing a place by hand ends the Desk entry's retries; pressing an action, a theme or Sync does not
+    if (ev.isTrusted && t && !act && t.closest("[data-ia-place-btn],[data-ia-drill-btn],[data-phone-jump],[data-mode-tab]")) userMoved = true;
   }, true);
   var userMoved = false;
 
   // The places keys (KEYS below). Captured before the page's own mode keys, which would
   // otherwise open the retired Morning and Build modes. Never while typing.
   var KEYS = B ? { 1: "home", 2: "room", 3: "memory" } : { 1: "home", 2: "desk", 3: "room", 4: "memory" };
+  function dialogOpen() {
+    if (document.querySelector(".modal-overlay")) return true;
+    var ps = document.getElementById("pr-sheet");
+    return !!(ps && ps.getClientRects().length);
+  }
   document.addEventListener("keydown", function (ev) {
-    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey || !KEYS[ev.key]) return;
-    if (document.getElementById("levain-modal")) return;   // a dialog is open: its keys are its own
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey || !(KEYS[ev.key] || (B && ev.key === "4"))) return;
+    if (dialogOpen()) return;   // a dialog is open: its keys are its own
     var a = document.activeElement, tag = a && a.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (a && a.isContentEditable)) return;
     ev.stopImmediatePropagation();
     ev.preventDefault();
+    if (!KEYS[ev.key]) return;   // B's key 4: no such place
+    userMoved = true;
     go(KEYS[ev.key]);
   }, true);
 
@@ -165,11 +185,12 @@
     try { i = Number(localStorage.getItem(TAG_KEY) || 0); } catch (_) { i = 0; }
     setTag(i);
     addGraphToggle();
-    new MutationObserver(function () {
+    function offRetired() {
       // the retired modes never show: a hash, the jump box or a stored choice that names one lands on Home's mode instead
       if (mode() === "morning" || mode() === "build") clickHidden("[data-ia-mode=board]");
-      paint();
-    }).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
+    }
+    new MutationObserver(function () { offRetired(); paint(); }).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
+    offRetired();
     paint();
     if (B) {
       // Home is the Desk: enter it once the page has its token and has built the Desk's section (dashboard_boot.js); a page that
