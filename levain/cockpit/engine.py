@@ -407,8 +407,10 @@ class _Snap:
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
-    # serialise its rows again. A snapshot shared across reads owns that data (``Cockpit._own``), so the kept text can
-    # never describe something other than what a read serves. Not an init field: a copy made with
+    # serialise its rows again. A refresher's or a replay's snapshot, shared for a whole cycle, owns that data
+    # (``Cockpit._own``); an on-demand snapshot, shared only inside the read cache window (``Cockpit._recent_snap``), is
+    # not copied: it relies on a provider never changing what it returned, as the shared read cache's payloads (which
+    # hand a snapshot's rows and value to every caller) already do. Not an init field: a copy made with
     # ``dataclasses.replace`` carries it by hand.
     _etag_frags: Mapping[str, str] | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -439,8 +441,9 @@ class _State:
     # an on-demand panel's last good snapshot, shared by every read that arrives soon after it: (snap, monotonic time the
     # read BEGAN, monotonic time it COMMITTED, the read-cache generation when it began). ``_recent_snap`` alone reads it.
     recent: "tuple[_Snap, float, float, int] | None" = None
-    # every committed read, good or not: (snap, monotonic time it began), so a caller can tell which flight it joined
-    last_read: "tuple[_Snap, float] | None" = None
+    # every committed read, good or not: (snap, monotonic time it began, read-cache generation when it began), so a
+    # caller can tell whether the flight it joined began before a write or before its ``read_after``
+    last_read: "tuple[_Snap, float, int] | None" = None
     commits: int = 0      # committed reads so far: part of the panel route's cache key (``Cockpit.panel``)
 
 
@@ -1457,7 +1460,7 @@ class Cockpit:
                 st.last_completion = done_at or ctx.now
                 st.fresh = (snap.as_of, snap.status)
                 st.recent = (snap, begun, time.monotonic(), gen) if shared else None
-                st.last_read = (snap, begun)
+                st.last_read = (snap, begun, gen)
                 st.commits += 1
             return snap
 
@@ -1488,7 +1491,13 @@ class Cockpit:
         reader to the provider, the same read-your-writes rule as the shared read cache. A reader passing ``read_after``
         (the change stream's watcher: a change another process made is visible to it only through a read begun after
         its token moved) shares only a read that began at or after that instant. Off where that cache is off
-        (``read_cache_ttl_s`` None or 0). A failed read is never shared (``_SHARED_STATUSES``)."""
+        (``read_cache_ttl_s`` None or 0). A failed read is never shared (``_SHARED_STATUSES``).
+
+        The bound for a change no write of this server made and no announcement drove the page to: the outer shared
+        read entry (``_shared_read``, ``ttl`` from its own start) may be built from a snapshot near the end of this
+        window, so its content can be about ``2 x ttl`` plus the read's own duration old (``ttl + duration`` before this
+        sharing). Such a change still reaches an open page within one watcher look: the watcher reads with
+        ``read_after`` and the announced panel's refetch is a new ``panel`` key (its committed-read count)."""
         ttl = self.read_cache_ttl_s or 0.0
         if ttl <= 0:
             return None
@@ -1502,22 +1511,24 @@ class Cockpit:
         return snap
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext, read_after: float | None = None) -> _Snap:
-        """``read_after`` (a ``time.monotonic()`` instant) asks for an on-demand read BEGUN at or after it: no snapshot
-        read earlier is shared, and a call that joined a flight begun earlier reads once more (one flight runs at a time
-        per panel, so the second read cannot join an older one). A refresher panel serves its cycle's snapshot as ever."""
+        """An on-demand panel: the shared snapshot (``_recent_snap``) or a read. A call that joined a flight begun before
+        a write admitted ahead of this call (the read-cache generation moved between that flight's start and this call),
+        or begun before ``read_after`` (a ``time.monotonic()`` instant: no snapshot read earlier is shared either), reads
+        once more; one flight runs at a time per panel, so the second read cannot join an older one. A refresher panel
+        serves its cycle's snapshot as ever."""
         st = self._state_of(spec)
         if st is None:
             return _Snap("error", None, None, [], [], None, "this panel was retired while it was being read", spec.note)
         if spec.refresh_every_s is None:
-            recent = None if ctx.fresh else self._recent_snap(st, read_after)    # a read that asked for a fresh look gets one
+            gen = self._rc_gen
+            recent = self._recent_snap(st, read_after)
             if recent is not None:
                 return recent
             snap = self._read_panel(spec, st, ctx)
-            if read_after is not None:
-                with st.lock:
-                    rec = st.last_read
-                if rec is not None and rec[0] is snap and rec[1] < read_after:
-                    snap = self._read_panel(spec, st, ctx)       # it joined a flight begun before ``read_after``
+            with st.lock:
+                rec = st.last_read
+            if rec is not None and rec[0] is snap and (rec[2] < gen or (read_after is not None and rec[1] < read_after)):
+                snap = self._read_panel(spec, st, ctx)       # it joined a flight begun before the write or ``read_after``
             return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
@@ -1543,8 +1554,9 @@ class Cockpit:
     # --- result -> snapshot ----------------------------------------------------------
     @staticmethod
     def _own(spec: ProviderSpec, out: Any) -> Any:
-        """A snapshot that will be shared across reads (a refresher's, a replay's) owns its rows, value, filtered and
-        skipped: ``_value`` and ``_row`` hand back the provider's own nested containers (a row's facet lists, a value's
+        """A snapshot shared for a whole cycle (a refresher's, a replay's) owns its rows, value, filtered and skipped (an
+        on-demand snapshot, shared only inside the read cache window, is not copied: see ``_Snap._etag_frags``):
+        ``_value`` and ``_row`` hand back the provider's own nested containers (a row's facet lists, a value's
         columns), so a provider that kept one and changed it later would change what a read serves while the snapshot's
         kept etag text still described the old one. Deep-copied once, here, in the read worker (provider data is never
         touched on the owner); the body served and the etag are then the same data. A copy that cannot be made is the

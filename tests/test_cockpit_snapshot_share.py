@@ -186,6 +186,30 @@ def test_a_watcher_that_joins_a_flight_begun_before_it_reads_again(tmp_path: Pat
     assert out[0]["panels"]["od"]["etag"] == fresh != page_out[0]["etag"]
 
 
+def test_a_reader_after_a_write_never_gets_the_flight_the_write_straddled(tmp_path: Path) -> None:
+    # read-your-writes at the join (L1 r1): the page answers a row, the write's response reaches it, it reads at once,
+    # and a read begun before the write is still running: the reader must not be handed that read's result
+    c, state = _external_cockpit(tmp_path)
+    state["hold"] = hold = threading.Event()
+    first: list = []
+    t1 = threading.Thread(target=lambda: first.append(c.panel("od", credential_class="none")))
+    t1.start()
+    assert state["in_read"].wait(10)                        # a read began, with the old rows
+    state["rows"] = [_row(1), _row(2)]
+    c.invalidate_reads()                                    # the write is admitted (its own store change above)
+    second: list = []
+    t2 = threading.Thread(target=lambda: second.append(c.panel("od", credential_class="none")))
+    t2.start()
+    time.sleep(0.2)                                         # the second reader is inside the old flight now
+    state["hold"] = None
+    hold.set()
+    t1.join(10)
+    t2.join(10)
+    assert state["reads"] == 2
+    assert [r["id"] for r in second[0]["rows"]] != [r["id"] for r in first[0]["rows"]]
+    assert {r["id"] for r in second[0]["rows"]} == {"r1", "r2"}
+
+
 @pytest.mark.parametrize("ttl", [None, 0])
 def test_nothing_is_shared_where_the_read_cache_is_off(ck, monkeypatch, ttl) -> None:
     ck.read_cache_ttl_s = ttl
