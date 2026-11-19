@@ -3958,7 +3958,7 @@ def _refresh_adapter(
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
                                variants=variants, carrier_name=carrier_name)
         _retire_seed_files(install, apply=apply, lines=lines)
-        _migrate_origin_wording(install, apply=apply, lines=lines)
+        _migrate_origin_wording(install, apply=apply, lines=lines, out=out)
         if adapter == "claude-code" and not cc_aliased:
             if cc_in_local:
                 _migrate_settings_json_hooks(install, apply=apply, carried=carried, out=out, lines=lines)
@@ -4019,7 +4019,7 @@ def _refresh_seeds_only(
         else:
             _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
             _retire_seed_files(install, apply=apply, lines=lines)
-            _migrate_origin_wording(install, apply=apply, lines=lines)
+            _migrate_origin_wording(install, apply=apply, lines=lines, out=out)
     if out.refreshed or lines:
         emit("\n• seed files:")
         verb = "refreshed" if apply else "would refresh"
@@ -5142,71 +5142,162 @@ _ORIGIN_WORDING_SWAPS: tuple[tuple[str, str], ...] = (
 ORIGIN_MIGRATION_REL = (".levain", "migrations", "origin_wording_106.json")
 
 
-def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str]) -> None:
+ORIGIN_MIGRATION_OUTCOMES = ("migrated", "current", "kept-edited")
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _origin_backup(install: Path, raw: bytes) -> Path:
+    """A durable copy of ``raw`` under ``.levain/backups/seed/``: an existing ``origin.md.*`` backup with the very same
+    bytes is reused (a retried attempt does not pile up copies), else a new one is written and fsynced."""
+    folder = install.joinpath(".levain", "backups", "seed")
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in sorted(folder.glob("origin.md.*")):
+        try:
+            if old.is_file() and not old.is_symlink() and old.read_bytes() == raw:
+                return old
+        except OSError:
+            continue
+    backup = folder / f"origin.md.{time.time_ns()}"
+    with open(backup, "xb") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    _fsync_dir(folder)
+    return backup
+
+
+def _origin_record_done(record: Path, lines: list[str]) -> bool:
+    """True when ``record`` holds a recorded outcome. Anything else at that path (a directory, a link, unreadable or not a
+    JSON object with an outcome) counts as no record, and is said so (once per run)."""
+    if not os.path.lexists(record):
+        return False
+    try:
+        if record.is_symlink() or not record.is_file():
+            raise ValueError("it is not a regular file")
+        data = json.loads(record.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("outcome") not in ORIGIN_MIGRATION_OUTCOMES:
+            raise ValueError("it is not a recorded outcome")
+    except (OSError, ValueError, RecursionError) as e:
+        lines.append(f"  note: the origin.md migration record {'/'.join(ORIGIN_MIGRATION_REL)} is not usable ({e}); "
+                     "it is treated as absent and the check runs again.")
+        return False
+    return True
+
+
+def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str], out: AdapterRefresh) -> None:
     """One time per install: bring ``seed/origin.md`` to the levain#106 wording.
 
     The file is changed only when it is provably an unedited rendering from before that release: both old sentences are
-    present exactly once, and the file with them swapped is a render of this release's origin template (the round trip
-    ``answers.extract_answers`` proves, so an edit anywhere outside the interview's own answers refuses it). A file that
-    fails that test is the operator's: it is left as it is, said so once, and never staged or touched later. The outcome
-    (``migrated``, ``current`` or ``kept-edited``) is recorded under ``.levain/migrations/``, and a recorded install is not
-    looked at again. An unreadable file or an unwritable record decides nothing and is tried again next update."""
+    present exactly once (checked before any swap, so a hand-made hybrid is the operator's), and the file with them
+    swapped is a render of this release's origin template (the round trip ``answers.extract_answers`` proves, so an edit
+    anywhere outside the interview's own answers refuses it). A file that fails that test is the operator's: it is left as
+    it is, said so once, and never touched later. The outcome (``migrated``, ``current`` or ``kept-edited``) is recorded
+    under ``.levain/migrations/``, and a recorded install is not looked at again. Only a genuine edit
+    (``AdoptRefused``) records ``kept-edited``; anything that merely could not be done (an unreadable file, template or
+    record, a failed backup or replace, a symlinked directory on the path, a file saved while this ran) records nothing, is
+    said, and is tried again next update. Applied and planned migrations are in ``out.refreshed`` and a failure is in
+    ``out.review``, so ``levain update`` treats the file like any other adapter file (``--ack``, dry run, exit code).
+    Known edges, kept: a CRLF origin.md reads as edited; a pack that supplies its own origin.md template is checked
+    against levain's base template and so is kept as edited."""
     from levain.answers import AdoptRefused, extract_answers
     from levain.interview import parse_template, render_template
 
+    rel = "seed/origin.md"
     record = install.joinpath(*ORIGIN_MIGRATION_REL)
     target = install / "seed" / "origin.md"
-    if record.exists() or target.is_symlink() or not target.is_file():
-        return  # recorded, or no rendered origin here to migrate (a link is never rewritten through)
-    try:
-        text = target.read_text(encoding="utf-8")
-    except (OSError, ValueError) as e:
-        lines.append(f"  seed/origin.md: could not be read ({e}), so its wording was not checked; the next update tries again.")
+    if _origin_record_done(record, lines):
         return
+    if not os.path.lexists(target):
+        return  # no rendered origin here to migrate
+    for part in (install / "seed", install / ".levain", install / ".levain" / "backups",
+                 install / ".levain" / "backups" / "seed", install / ".levain" / "migrations", target):
+        if part.is_symlink():
+            lines.append(f"  {rel}: left as it is, because {part.relative_to(install)} is a link and levain does not "
+                         "write through links; make it a real file or directory and the next update migrates it.")
+            return
+    if not target.is_file():
+        return
+    try:
+        raw = target.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, ValueError) as e:
+        out.review.append(rel)
+        lines.append(f"  {rel}: could not be read ({e}), so its wording was not checked; the next update tries again.")
+        return
+    old_once = all(text.count(old) == 1 for old, _new in _ORIGIN_WORDING_SWAPS)
     new_text = text
-    for old, new in _ORIGIN_WORDING_SWAPS:
-        if new_text.count(old) == 1:
+    old_present = any(old in text for old, _new in _ORIGIN_WORDING_SWAPS)
+    if old_once:
+        for old, new in _ORIGIN_WORDING_SWAPS:
             new_text = new_text.replace(old, new)
-    swapped = new_text != text
-    if not swapped and all(new in text for _old, new in _ORIGIN_WORDING_SWAPS):
+    if not old_present and all(new in text for _old, new in _ORIGIN_WORDING_SWAPS):
         outcome = "current"
     else:
         outcome = "kept-edited"
-        if swapped and all(new in new_text for _old, new in _ORIGIN_WORDING_SWAPS):
+        if old_once and all(new in new_text for _old, new in _ORIGIN_WORDING_SWAPS):
             try:
                 with _templates_root() as templates_root:
                     spec = parse_template(templates_root / "seed" / "origin.md")
                 slots = [sl for sec in spec.sections for sl in sec.slots]
                 optional = [sec.slots for sec in spec.sections if sec.title and sec.optional]
                 extract_answers(new_text, slots=slots, optional_sections=optional,
-                                render=lambda a: render_template(spec, a))
+                                render=lambda a: render_template(spec, a), prior=read_answers(install))
                 outcome = "migrated"
-            except (AdoptRefused, OSError, ValueError, PackError, InitError):
+            except AdoptRefused:
                 outcome = "kept-edited"
+            except (OSError, ValueError, PackError, InitError) as e:
+                out.review.append(rel)
+                lines.append(f"  {rel}: could not be checked against this release's origin template ({e}); nothing "
+                             "was changed or recorded, and the next update tries again.")
+                return
     if outcome == "migrated":
+        out.refreshed.append(rel)
         if not apply:
-            lines.append("  seed/origin.md: carries the wording from before levain#106 and is unedited; an update would "
+            lines.append(f"  {rel}: carries the wording from before levain#106 and is unedited; an update would "
                          "bring it to this release's wording once (the old file is kept under .levain/backups/seed/).")
             return
         try:
             _ensure_gitignored(install / ".levain", "backups/")
-            backup = install.joinpath(".levain", "backups", "seed", f"origin.md.{time.time_ns()}")
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, backup)
+            backup = _origin_backup(install, raw)
+            # the operator may have saved since the read above: the swap is written only over the bytes that were checked
+            if target.read_bytes() != raw:
+                raise _EditedSinceRead()
             _atomic_write_text(target, new_text)
-        except OSError as e:
-            lines.append(f"  seed/origin.md: could not be migrated ({e}); the next update tries again.")
+        except _EditedSinceRead:
+            out.refreshed.remove(rel)
+            lines.append(f"  {rel}: was edited while the update ran, so it is left as it is; nothing was recorded and "
+                         "the next update checks it again.")
             return
-        lines.append(f"  seed/origin.md: unedited, brought to this release's wording (levain#106), once. Your old file is "
+        except OSError as e:
+            out.refreshed.remove(rel)
+            out.review.append(rel)
+            lines.append(f"  {rel}: could not be migrated ({e}); the next update tries again.")
+            return
+        lines.append(f"  {rel}: unedited, brought to this release's wording (levain#106), once. Your old file is "
                      f"kept at {backup.relative_to(install)}.")
     elif outcome == "kept-edited":
         if not apply:
-            lines.append("  seed/origin.md: does not match an unedited origin from before levain#106, so an update would "
+            lines.append(f"  {rel}: does not match an unedited origin from before levain#106, so an update would "
                          "leave it as it is.")
             return
-        lines.append("  seed/origin.md: yours (it differs from levain's origin text outside your interview answers), so it "
-                     "is left as it is. This release reworded two sentences of it; its older wording ('your training will "
-                     "pull you ... Resist it') is yours to keep or to carry across from levain/templates/seed/origin.md.")
+        wording = ""
+        if any(old in text for old, _new in _ORIGIN_WORDING_SWAPS):
+            wording = (" This release reworded two sentences of it; its older wording ('your training will pull you ... "
+                       "Resist it') is yours to keep or to carry across from levain/templates/seed/origin.md.")
+        lines.append(f"  {rel}: yours (it differs from levain's origin text outside your interview answers), so it "
+                     f"is left as it is.{wording}")
     if not apply:
         return
     try:
@@ -5214,6 +5305,10 @@ def _migrate_origin_wording(install: Path, *, apply: bool, lines: list[str]) -> 
         _atomic_write_text(record, json.dumps({"schema": 1, "outcome": outcome}) + "\n")
     except OSError as e:
         lines.append(f"  note: could not record the origin.md migration ({e}); the next update checks again.")
+
+
+class _EditedSinceRead(Exception):
+    pass
 
 
 def _file_text_or_empty(path: Path) -> str:
