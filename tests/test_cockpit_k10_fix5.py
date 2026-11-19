@@ -139,18 +139,18 @@ def test_a_tab_switch_to_memory_drops_replay_and_the_topology_polls_again(tmp_pa
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "(window.__urls = [], 1)"},
                                {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"},
                                {"until": "!window.LevainTopologyView.replaying() && !window.LevainTopologyView.paused()"}, {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
-                               {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"}, {"until": STRIP}, SLEEP(300), {"eval": INFO}])
+                               {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"}, {"until": STRIP}, SLEEP(300), {"eval": INFO}])
     after_tab, after_refetch, back = json.loads(out[-7]), json.loads(out[-5]), json.loads(out[-1])
     assert after_tab["replaying"] is False and after_tab["paused"] is False, after_tab
     assert out[-6] == "applied" and any("at=" not in u for u in after_refetch["urls"]), (out[-6], after_refetch)   # a live read went out
-    assert back["badge"] is None and back["replaying"] is False, back                                           # and Build comes back live, drawn
+    assert back["badge"] is None and back["replaying"] is False, back                                           # and Home comes back live, drawn
 
 
 @needs_browser
 def test_replay_ends_when_the_page_loses_its_replay_path_while_scrubbing(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE,
-                               {"eval": "(() => { window.__tr = window.LevainCockpitTransport; delete window.LevainCockpitTransport; window.LevainCockpitKinds.paintBuildSessions(); return 1; })()"},
+                               {"eval": "(() => { window.__tr = window.LevainCockpitTransport; delete window.LevainCockpitTransport; window.LevainCockpitKinds.paintHeaderLens(); return 1; })()"},
                                {"eval": INFO}])
     got = json.loads(out[-1])
     assert got["replaying"] is False and got["paused"] is False, got

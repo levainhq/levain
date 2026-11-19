@@ -11,6 +11,8 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from levain.cockpit.providers import build_default_cockpit
 from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
@@ -19,6 +21,8 @@ from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _fixture, _put, _stamp
 from tests._h4 import h4_home
 
+RETIRED_BUILD = pytest.mark.skip(reason="the Build mode is retired (levain#141): a stored mode, hash or jump that names it lands on Home, so the view this test drives "
+                                 "is not reachable; it goes with the Build painters")
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 BUILD = "#write_token=T&build"
 ROWS = "[...document.querySelectorAll('#k7-sessions .k7-srow')]"
@@ -244,6 +248,7 @@ def test_a_list_row_carries_its_age_as_the_integer_the_kernel_sends_not_the_badg
 # --- the page ----------------------------------------------------------------------------------------
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -266,6 +271,7 @@ def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, mo
     assert cx["when"].startswith("since ") and cx["repo"] == "codex-work" and cx["cwd"] == "/…/codex-work", cx
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_session_at_the_warn_line_is_marked_over_for_both_agents_and_the_label_says_what_it_is_measured_against(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -282,6 +288,7 @@ def test_a_session_at_the_warn_line_is_marked_over_for_both_agents_and_the_label
     assert cc[1:3] == [True, "OVER"] and cc[3] == "210K of 200K warn", got
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_quiet_session_with_a_pending_request_shows_waiting_and_two_pending_say_so(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -297,6 +304,7 @@ def test_a_quiet_session_with_a_pending_request_shows_waiting_and_two_pending_sa
     assert [True, True, "waiting on a decision (Write +1)"] in rows, rows       # two pending: the newest, and one more
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_present_limits_panel_that_cannot_be_read_draws_not_counting_on_every_row(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -310,6 +318,7 @@ def test_a_present_limits_panel_that_cannot_be_read_draws_not_counting_on_every_
     assert json.loads(out[-1]) == [["limits: not counting", "k7-limits over"]] * 3
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_tick_moves_the_ago_words_in_place_and_keeps_the_focus_on_all_details(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -339,6 +348,7 @@ def test_the_no_results_placeholder_goes_when_a_jobs_panel_appears(tmp_path, mon
     assert (out[-4], out[-1]) == (1, 0), out
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_the_limits_line_is_drawn_amber_over_and_red_not_counting(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -354,6 +364,7 @@ def test_the_limits_line_is_drawn_amber_over_and_red_not_counting(tmp_path, monk
                                            ["tool calls 412/500", "k7-limits amber"]]
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_without_the_limits_panel_the_page_draws_no_limits_line(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -364,6 +375,7 @@ def test_without_the_limits_panel_the_page_draws_no_limits_line(tmp_path, monkey
     assert json.loads(out[-1]) == [3, 0]                 # the three rows are drawn, none carries a limits line
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_sessions_stays_a_count_tile_on_morning_and_is_not_one_on_build(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -377,6 +389,7 @@ def test_sessions_stays_a_count_tile_on_morning_and_is_not_one_on_build(tmp_path
     assert json.loads(build) == {"tile": True, "tileShown": False, "big": "block"}, build
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_the_all_details_button_opens_the_full_list_behind_the_tile(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -412,6 +425,7 @@ def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, 
     assert not any("{" in r[1] for r in got["rows"]), got          # never the raw result body
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_build_places_results_left_and_edits_right_and_the_open_loops_card_is_gone(tmp_path, monkeypatch):
     from levain.jobs import JobRuntime, JobStore
@@ -440,6 +454,7 @@ def test_build_places_results_left_and_edits_right_and_the_open_loops_card_is_go
 # --- a bare install --------------------------------------------------------------------------------
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_bare_install_says_one_line_per_section_and_draws_no_empty_card(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))

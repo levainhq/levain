@@ -51,9 +51,9 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 @needs_browser
 def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path) -> None:
     """K2 r2 (L2-9): brand, status dot, Sync and the theme switch on one row, the four tabs across the width on the next; no horizontal scroll."""
-    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
+    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('#ck-phonetabs') && document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
       const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
-      const bar = q('.masthead'), seg = q('.masthead .seg'), theme = q('.masthead .themesw'), brand = q('.masthead .brand');
+      const bar = q('.masthead'), seg = q('#ck-phonetabs'), theme = q('.masthead .themesw'), brand = q('.masthead .brand');
       return { segTop: box(seg).top, clockTop: box(q('.band .clock')).top, segShare: box(seg).width / innerWidth, barH: box(bar).height,
         oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(seg).top, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
     got = vals[2]
@@ -65,34 +65,15 @@ def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path
 def test_the_theme_switch_stays_on_the_first_row_at_every_phone_width(tmp_path: Path, width: int) -> None:
     """CI's Linux fonts once wrapped the theme switch onto a row of its own at 390px; the old CSS did the same at 375px on any font.
     The brand gives way instead; at 430px (and wider) the default wordmark is never cut."""
-    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 812, "dpr": 3, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.masthead .themesw') && document.querySelector('.masthead .brand .wordmark') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
+    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 812, "dpr": 3, "mobile": True}}, {"until": "document.querySelector('#ck-phonetabs') && document.querySelector('.masthead .themesw') && document.querySelector('.masthead .brand .wordmark') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
       const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
       const theme = q('.masthead .themesw'), brand = q('.masthead .brand'), wm = q('.masthead .brand .wordmark');
-      return { oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(q('.masthead .seg')).top,
+      return { oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(q('#ck-phonetabs')).top,
         whole: wm.scrollWidth <= wm.clientWidth + 1, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
     got = vals[2]
     assert got["oneRow"] and got["sw"] <= got["vw"], got
     if width >= 430:
         assert got["whole"], got
-
-
-@needs_browser
-def test_an_empty_card_with_no_compose_box_is_a_full_width_bar_after_its_zones_cards(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"}, {"until": "document.querySelector('.ck-zgrid .panel.ck-fold')"}, {"eval": """(() => {
-      const bars = [...document.querySelectorAll('.ck-zgrid .panel.ck-fold')].filter(p => getComputedStyle(p).display !== 'none'); if (!bars.length) return null;
-      return bars.map(b => { const g = b.parentElement, gw = g.getBoundingClientRect().width, bt = b.getBoundingClientRect().top;
-        const cards = [...g.querySelectorAll('.panel')].filter(p => p !== b && !p.classList.contains('ck-fold') && getComputedStyle(p).display !== 'none');
-        const placed = g.dataset.ckZone === 'operate' && ['jobs', 'jobs-none', 'edits', 'loops'].includes(b.dataset.ckPanel);
-        return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump'),
-                placed, b.getBoundingClientRect().height]; }); })()"""}])
-    assert vals[3], vals
-    for share, after_cards, has_box, placed, height in vals[3]:
-        if placed:
-            # K4s ruling 10-19 (k-reviews/K7_FOLD_RULING.md): on Build, Results / edits / loops keep their designed slots (K7 grid),
-            # so an empty one stays a one-line bar IN its column and the layout does not move as data arrives
-            assert share < 0.6 and height < 90 and not has_box, vals
-        else:
-            assert share > 0.95 and after_cards and not has_box, vals
 
 
 def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_names_it() -> None:

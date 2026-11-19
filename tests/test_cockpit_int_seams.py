@@ -171,11 +171,11 @@ def test_i10_a_levain_feed_keeps_its_key_when_its_labelled_events_aged_out_also_
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
             {"until": f"document.querySelector('.legendbar') && 1"},
             {"eval": key},
-            {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"},
+            {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"},
             {"eval": f"new Promise(r => setTimeout(() => r([{key}, document.body.dataset.mode]), 600))"},
             {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"},
             {"eval": f"new Promise(r => setTimeout(() => r({key}), 600))"},
         ])["values"]
     assert out[1] is True, f"the Levain key is missing on first paint: {out}"
-    assert out[3] == [True, "build"], f"the Levain key was lost across Board -> Build: {out}"
+    assert out[3] == [True, "memory"], f"the Levain key was lost across Board -> Memory: {out}"
     assert out[5] is True, out

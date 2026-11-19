@@ -3863,3 +3863,162 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 /* what of a long input is not yet shown, beside the answers: Allow opens once it is all seen (card_format.js seenGate) */
 .sheet-unseen, .needs-unseen { margin: var(--sp-2) 0; }
 .sheet-unseen[data-seen="0"], .needs-unseen[data-seen="0"] { color: var(--text); font-weight: var(--fw-semibold); }
+
+/* ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+   levain#141: Home plus a bar of places (Home, Desk, Room, Memory). dashboard_places.js names the place on the body
+   (data-ia-place) from the page's own state; these rules read it. They change WHERE things are, never how a panel draws.
+   The Modes bar is gone from the markup; Morning and Build are retired modes, their panels placed on Home or in Memory.
+   ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* ── the masthead: the tagline shows;  the actions are buttons, not places ─────────────────────────────────────────── */
+body.ia .brand { flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; }
+body.ia .ia-tagline { font: var(--fw-regular) var(--fs-meta)/1.3 var(--round); color: var(--label); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+body.ia .ia-actions { display: inline-flex; gap: var(--sp-2); margin-right: var(--sp-3); }
+body.ia .ia-act { display: inline-flex; align-items: center; gap: var(--sp-2); min-height: var(--seg-h); padding: 0 var(--sp-4); border: 1px solid var(--hair);
+  border-radius: var(--r-md); background: var(--card); color: var(--text); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
+body.ia .ia-act:hover { background: var(--card-2); }
+body.ia .ia-ico { font-size: 13px; line-height: 1; color: var(--accent); }
+
+/* ── the places bar: Home, (Desk,) Room, Memory; the Needs count rides Home and is visible from every place ─────────── */
+body.ia .ia-places { display: flex !important; }
+body.ia .ia-places button { position: relative; }
+body.ia .ia-places button[aria-current="page"] { color: var(--text); background: var(--card-2); }
+body.ia .ia-places button[aria-current="page"]::after { content: ""; position: absolute; left: var(--sp-4); right: var(--sp-4); bottom: -1px; height: 2px; background: var(--accent); border-radius: 2px; }
+body.ia .ia-needs { display: inline-flex; align-items: center; gap: var(--sp-1); margin-left: var(--sp-3); padding: 2px var(--sp-1) 2px var(--sp-2);
+  border-radius: var(--r-pill); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+body.ia .ia-needs-w { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); color: var(--accent); }
+body.ia .ia-needs:has([data-nc-needs][hidden]) { display: none; }
+body.ia .ia-places .ck-tabcount { margin: 0; }
+
+/* HOME: one flat grid of the page's own blocks, in his verbs' order. The deck becomes a grid and the wrappers between it and the
+   panels draw no box (display: contents), so each panel is placed by `order` and a span. A panel the page re-renders stays inside
+   its own wrapper, so the placement holds. */
+body.ia[data-ia-place="home"] .deck {
+  display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--gap); row-gap: var(--gap); align-items: start;
+  padding-inline: var(--gutter-ke); }
+body.ia[data-ia-place="home"] .deck > * { grid-column: 1 / -1; min-width: 0; }
+/* the flattened blocks are grid items too: full width unless a span below names them. `!important` because the live page places the
+   same panels in its two-column board with more specific rules (measured 11-18: a span lost to them until marked important). */
+body.ia[data-ia-place="home"] .panel { grid-column: 1 / -1 !important; min-width: 0; }
+body.ia[data-ia-place="home"] #ck-band, body.ia[data-ia-place="home"] #ck-skycol { grid-column: 1 / -1 !important; }
+body.ia[data-ia-place="home"] .deck > :is(.masthead, .ia-places) {
+  margin-inline: calc(-1 * var(--gutter-ke)); }
+body.ia[data-ia-place="home"] :is(main.frame, #board, .ck-zone[data-zone="operate"],
+  .ck-zone[data-zone="operate"] > .ck-zgrid, .ck-zone[data-zone="operate"] .ck-col, .hero) { display: contents !important; }
+body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head { display: none; }
+body.ia[data-ia-place="home"] .deck > .frame:not(.masthead):not(.ia-places),
+body.ia[data-ia-place="home"] :is(#ck-band, #ck-skycol) { padding-inline: 0; margin: 0; }
+body.ia[data-ia-place="home"] .ck-zone:not([data-zone="operate"]) { order: 90; margin: 0; }
+body.ia[data-ia-place="home"] .deck-foot { order: 99; }
+body.ia .ia-head { display: none; }
+/* the order: the chrome, the now line, what needs him, the desk, the work, the machine, the glance */
+body.ia .deck > .masthead { order: -8; }
+body.ia .deck > .ia-places { order: -7; }
+body.ia[data-ia-place="home"] #store { order: -5; }
+body.ia[data-ia-place="home"] #ck-band { order: -4; }
+body.ia[data-ia-place="home"] #ck-needs { order: 10; }
+body.ia[data-ia-place="home"] #ck-notes { order: 11; }
+body.ia[data-ia-place="home"] .ia-head { display: flex; align-items: baseline; gap: var(--sp-4); margin-top: var(--sp-5); }
+body.ia[data-ia-place="home"] .ia-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); color: var(--text); }
+body.ia[data-ia-place="home"] .ia-head span { font: var(--fw-regular) var(--fs-meta) var(--round); color: var(--label); }
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="desk"] { order: 20; }
+body.ia[data-ia-place="home"] #ck-drop { order: 21; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { order: 22; }
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="work"] { order: 30; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { order: 31; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="board"] { order: 32; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="inbox"] { order: 33; }
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="machine"] { order: 40; }
+body.ia[data-ia-place="home"] #ck-skycol { order: 41; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="roster"] { order: 42; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="agent_calls"] { order: 43; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="stream"] { order: 44; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="scheduled_jobs"] { order: 45; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="jobs"] { order: 46; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="edits"] { order: 47; }
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="glance"] { order: 60; }
+body.ia[data-ia-place="home"] #ck-widgets { order: 61; }
+/* Build is retired: its two panels (jobs, edits) sit with the machine, its topology panel is the hero graph again (the strip stands for
+   it), the notifications panel is the Notifications button, and Recent episodes moves to Memory. */
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { display: flex !important; }
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="notifications"], [data-ck-panel="episodes"], [data-ck-panel="topology"]) { display: none !important; }
+body.ia[data-ia-place="home"] #ck-h-widgets { display: none !important; }
+body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: grid !important; }
+/* the drop box is the desk's reply box: shown on Home in every width (Board mode was the only place it showed before) */
+body.ia[data-ia-place="home"] #ck-drop[hidden] { display: none; }
+
+/* Recent episodes joins Memory (crystals, graph, episodes, intentions) */
+body.ia[data-ia-place="memory"] .panel[data-ck-panel="episodes"] { display: flex !important; }
+body.ia[data-ia-place="memory"] .ck-zone[data-zone="operate"]:has(.panel[data-ck-panel="episodes"]) { display: block !important; }
+body.ia[data-ia-place="memory"] .ck-zone[data-zone="operate"] .panel:not([data-ck-panel="episodes"]) { display: none !important; }
+body.ia[data-ia-place="memory"] .ck-zone[data-zone="operate"] > .zone-head { display: none; }
+
+/* ── the now line: the band's clock, date, state and wrap line on one row, not a 90 px clock ─────────────────────── */
+body.ia[data-ia-place="home"] #ck-band {
+  display: flex !important; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-6); min-height: 0; padding-block: var(--sp-3) 0; border: 0; }
+body.ia[data-ia-place="home"] #ck-band .clockbox { display: flex; align-items: baseline; gap: var(--sp-3); }
+body.ia[data-ia-place="home"] #ck-band .clock { font-size: var(--fs-h) !important; line-height: 1; }
+body.ia[data-ia-place="home"] #ck-band .clock * { font-size: inherit !important; }
+body.ia[data-ia-place="home"] #ck-band .date { font-size: var(--fs-meta); margin: 0; }
+body.ia[data-ia-place="home"] #ck-band .band-state { margin: 0; padding: 0; border: 0; }
+body.ia[data-ia-place="home"] #ck-band .band-meta { margin-left: auto; display: flex; gap: var(--sp-4); align-items: baseline; }
+body.ia[data-ia-place="home"] #ck-band .band-meta .wrapline { display: flex; gap: var(--sp-3); }
+body.ia[data-ia-place="home"] #ck-band #calmphone { display: none; }
+
+/* ── the agents graph, demoted to a one-line strip that opens on a click (never cut) ─────────────────────────────────── */
+body.ia .ia-graph-toggle { display: none; }
+body.ia[data-ia-place="home"] #ck-skycol { position: relative; }
+body.ia[data-ia-place="home"] .ia-graph-toggle {
+  display: inline-flex; position: absolute; right: var(--sp-5); top: var(--sp-4); z-index: 2; min-height: var(--seg-h); align-items: center;
+  padding: 0 var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--text);
+  font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens :is(.tv-lensbody, .tv-legend) { display: none !important; }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-skycard { min-height: 0; padding-block: var(--sp-3); }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 160px; }
+
+/* ── heights: the work row one height, the machine row compact (each panel scrolls inside) ───────────────────────────── */
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) {
+  height: 560px !important; max-height: none; }
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"]) {
+  height: 320px !important; max-height: none; }
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { height: 260px !important; max-height: none; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !important; min-height: 0; }
+body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
+
+/* ── the glance: the widgets small, at the bottom ────────────────────────────────────────────────────────────────────── */
+body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
+body.ia[data-ia-place="home"] #ck-widgets > * { min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
+body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-size: var(--fs-h) !important; }
+
+/* ── the spans: laptop three across, tablet two, phone one ───────────────────────────────────────────────────────────── */
+@media (min-width: 1101px) {
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) { grid-column: span 4 !important; }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"]) { grid-column: span 3 !important; }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 6 !important; }
+}
+@media (min-width: 721px) and (max-width: 1100px) {
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"], [data-ck-panel="roster"],
+    [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 6 !important; }
+}
+@media (max-width: 720px) {
+  body.ia .ia-lbl { display: none; }
+  body.ia .ia-actions { margin-right: 0; }
+  body.ia .masthead { row-gap: var(--sp-3); }
+  body.ia .masthead .brand { flex: 1 1 calc(100% - 140px); order: 1; min-width: 0; }
+  body.ia .masthead .readout { display: contents; }
+  body.ia .masthead .themesw { order: 2; flex: none; }
+  body.ia .masthead .indicators, body.ia .masthead .indicators > *, body.ia .masthead :is(#refresh, #jumpbtn, #calmbtn, #presencebtn, #stamp) { order: 3; }
+  body.ia .masthead :is(.unit, .jar) { order: 4; }
+  body.ia .ia-tagline { max-width: 100%; font-size: var(--fs-micro); white-space: normal; }
+  body.ia .masthead .indicators { gap: var(--sp-2); }
+  body.ia .ia-act { min-width: 38px; min-height: 38px; padding: 0; justify-content: center; }
+  body.ia .ia-places { justify-content: space-between; }
+  body.ia .ia-places button { flex: 1 1 0 !important; justify-content: center; padding: 0 var(--sp-1) !important; }
+  body.ia[data-ia-place="home"] .deck { padding-inline: var(--gutter-ke); }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) { height: 480px !important; }
+  body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
+  body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+}
+
+/* Memory is a place of its own: the drop box is the Drop button there, not a block at its top */
+body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }

@@ -10,6 +10,7 @@ import pytest
 
 from levain.cockpit import threads
 from levain.web_server import make_server
+from tests.test_cockpit_k7_build import RETIRED_BUILD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _get_status
@@ -103,6 +104,7 @@ _COUNT = f"performance.setResourceTimingBufferSize(10000); window.__th = () => {
 _WAIT = "new Promise(r => setTimeout(() => r(window.__th()), 2600))"
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_the_build_tab_zone_reads_only_while_build_is_shown_and_hides_without_a_token(tmp_path, seeded):
     _qdir, world = seeded
@@ -131,6 +133,7 @@ def test_the_build_tab_zone_reads_only_while_build_is_shown_and_hides_without_a_
     assert after_leaving == 0
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path, seeded):
     """``storage`` never fires in the document that changed the token, so the zone listens for the page's own event:

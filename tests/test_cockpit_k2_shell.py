@@ -48,7 +48,10 @@ def test_the_memory_tab_is_the_fourth_and_key_4_reaches_it() -> None:
     assert re.search(r'const MODES = \["morning", "board", "build", "memory"\];', src)
     assert '"1234".indexOf(ev.key)' in src and 'MODES["1234".indexOf(ev.key)]' in src
     html = (WEB / "dashboard.html").read_text(encoding="utf-8")
-    assert 'data-mode-tab="memory"' in html and "<kbd>4</kbd>Memory" in html
+    # the page has no visible mode tab now: key 4 and the Memory place both reach Memory through the places bar (dashboard_places.js)
+    assert 'data-ia-place-btn="memory"' in html and 'aria-label="Modes"' not in html
+    places = (WEB / "dashboard_places.js").read_text(encoding="utf-8")
+    assert '4: "memory"' in places and "[data-ia-mode=memory]" in places
 
 
 def test_deep_links_choose_the_tab_and_an_unknown_one_chooses_nothing(tmp_path: Path) -> None:

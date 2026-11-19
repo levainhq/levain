@@ -1356,6 +1356,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # The board painters (C12): the board-kind panel's grouped tab and its columns draw with these. GET /cockpit/board.json
     # is served for external readers; no page zone reads it.
     "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
+    # The places bar (levain#141): names the place on the body, drives the page's own mode and jump wiring, the 1-4 keys.
+    "/dashboard_places.js": ("dashboard_places.js", "text/javascript; charset=utf-8"),
 }
 
 

@@ -12,11 +12,15 @@ from pathlib import Path
 from levain.consent.listing import read_listing  # noqa: F401  (the fixtures below attach it)
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
-from tests.test_cockpit_k7_build import BUILD, DESKTOP, _sessions_fixture
+from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 
 NARROW = {"emulate": {"w": 390, "h": 800, "dpr": 1, "mobile": True}}
 MID = {"emulate": {"w": 1200, "h": 900, "dpr": 1}}
 TV = "document.querySelector('#ck-hlens .tv')"
+# The graph is one strip on Home that opens on a click (levain#141); the lens draws inside it, so a test that reads the lens opens it first.
+# This is an `until` expression: the click is idempotent, and the value is true once the lens is drawn and the strip is open.
+GRAPH_OPEN = ("(() => { const t = document.querySelector('[data-ia-graph-toggle]'); if (t && !document.body.classList.contains('ia-graph-open')) t.click();"
+              " return !!document.querySelector('#ck-hlens .tv') && document.body.classList.contains('ia-graph-open') && 1; })()")
 
 
 def _intention(root: Path) -> None:
@@ -62,9 +66,9 @@ def _paint(value: dict, lens: str = "work") -> str:
             "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }})); return 1; })()") % (json.dumps(value), json.dumps(lens))
 
 
-def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7-sessions .k7-card') && document.querySelector('#ck-hlens .tv')"):
+def _run(tmp_path, src, steps, first=DESKTOP, until=GRAPH_OPEN):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        return _drive(tmp_path, f"{url}/{BUILD}", [first, {"until": until}, *steps])["values"]
+        return _drive(tmp_path, f"{url}/#write_token=T", [first, {"until": until}, *steps])["values"]
 
 
 # --- the page, through the real provider ---------------------------------------------------------------
@@ -135,11 +139,11 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
     _root, src, _ids = _install(tmp_path)
     src.anneal.intentions_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
     probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#ck-hlens [data-tv]').length, "
-             "quiet: !!document.querySelector('#ck-hlens .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
-    out = _run(tmp_path, src, [{"eval": probe}], until="document.querySelector('#k7-sessions .k7-none')")   # a bare install draws no card and no .tv: its one line is the signal
+             "quiet: !!document.querySelector('#ck-hlens .tv-quiet')})") % TV
+    # a bare install draws no .tv and no switch (the Build tab's Sessions card, which once said so in a line, went with the Build mode)
+    out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"}, {"eval": probe}], until="document.body.dataset.iaPlace === 'home' && 1")
     got = json.loads(out[-1])
     assert got["tv"] is False and got["switch"] == 0, got
-    assert "No agent session yet: start Claude Code or Codex in a workspace." in got["text"], got
     # K10 S5 item 1 (0c45fe2d): a default install now reads the default dispatch store, so nothing is unreadable here and no quiet line is
     # drawn (absence of a note is honest only because every source read); a source that could not be read is said beside the empty
     # line, not instead of it (held by test_what_the_provider_could_not_read_is_one_quiet_line_never_hidden)
@@ -319,7 +323,7 @@ def test_no_horizontal_scroll_at_1440_and_at_390_in_either_lens(tmp_path, monkey
     v["tasks"][5]["label"] = "an unbroken " + "z" * 46
     v["nodes"][0]["label"] = "claude_code · " + "y" * 33
     probe = ("JSON.stringify({page: document.documentElement.scrollWidth - document.documentElement.clientWidth, "
-             "tv: %s.scrollWidth - %s.clientWidth, card: document.querySelector('#k7-sessions .k7-card').scrollWidth - document.querySelector('#k7-sessions .k7-card').clientWidth})") % (TV, TV)
+             "tv: %s.scrollWidth - %s.clientWidth, card: document.querySelector('#ck-skycard').scrollWidth - document.querySelector('#ck-skycard').clientWidth})") % (TV, TV)
     for size in (DESKTOP, NARROW):
         for lens in ("work", "agents"):
             out = _run(tmp_path, src, [{"eval": _paint(v, lens)}, {"eval": probe}], first=size)

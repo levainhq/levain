@@ -209,7 +209,7 @@ _TOKENED = [
 _TOKENLESS = [
     {"until": "document.querySelector('[data-mode-tab=board]') && document.querySelector('.dv-zone') && document.querySelector('[data-phone-jump=desk]')"},
 ]
-_TAP_DESK = {"tap": "document.querySelector('[data-phone-jump=desk]')"}
+_TAP_DESK = {"tap": "document.querySelector('.ia-places [data-ia-place-btn=desk]')"}   # the places bar's Desk, the one a person presses
 _OPEN = {"until": "document.body.classList.contains('dv-on') && document.querySelector('.dv-zone .rv-input')"}
 # a page re-shown reads at once: the way a test makes the view read without waiting its interval
 _NUDGE = "document.dispatchEvent(new Event('visibilitychange')); 1"
@@ -449,7 +449,7 @@ def test_a_word_from_the_host_is_text_and_a_hidden_character_is_drawn_as_a_mark_
 @needs_browser
 def test_the_desk_and_the_room_replace_each_other_and_the_desk_needs_a_token(tmp_path):
     state = ("JSON.stringify({dv: document.body.classList.contains('dv-on'), rv: document.body.classList.contains('rv-on'), "
-             "deskCur: document.querySelector('[data-phone-jump=desk]').getAttribute('aria-current'), roomCur: document.querySelector('[data-phone-jump=room]').getAttribute('aria-current'), "
+             "deskCur: document.querySelector('.ia-places [data-ia-place-btn=desk]').getAttribute('aria-current'), roomCur: document.querySelector('.ia-places [data-ia-place-btn=room]').getAttribute('aria-current'), "
              "deskShown: document.querySelector('.dv-zone').getClientRects().length > 0, roomShown: document.querySelector('.rv-zone').getClientRects().length > 0, "
              "mounted: !!document.querySelector('.dv-zone .rv-input')})")
     click = lambda which: {"eval": f"document.querySelector('[data-phone-jump={which}]').click(); new Promise(r => setTimeout(r, 400)).then(() => 1)"}  # noqa: E731
@@ -488,9 +488,9 @@ def test_the_view_reads_every_four_seconds_open_and_every_twelve_hidden(tmp_path
 @needs_browser
 def test_the_phone_shows_the_desk_tab_whole_and_the_composer_pinned_with_no_sideways_scroll(tmp_path):
     measure = """(() => { const q = s => document.querySelector(s), r = n => n.getBoundingClientRect(), tabs = [...q('#ck-phonetabs').querySelectorAll('button')];
-      const desk = q('[data-phone-jump=desk]');
+      const desk = q('.ia-places [data-ia-place-btn=desk]');
       return JSON.stringify({vw: innerWidth, vh: innerHeight, scrollW: document.documentElement.scrollWidth, scrollH: document.documentElement.scrollHeight,
-        tabs: tabs.map(b => b.dataset.phoneJump), deskWhole: desk.scrollWidth <= desk.clientWidth, deskH: Math.round(r(desk).height),
+        tabs: tabs.map(b => b.dataset.iaPlaceBtn), deskWhole: desk.scrollWidth <= desk.clientWidth, deskH: Math.round(r(desk).height),
         dockBottom: Math.round(r(q('.dv-zone .rv-dock')).bottom), sendW: Math.round(r(q('.dv-zone .rv-send')).width), sendH: Math.round(r(q('.dv-zone .rv-send')).height),
         font: parseFloat(getComputedStyle(q('.dv-zone .rv-input')).fontSize), stateW: Math.round(r(q('.dv-state')).width), stateScroll: q('.dv-state').scrollWidth,
         mainShown: q('main.frame').getClientRects().length > 0, bodyOverflow: getComputedStyle(document.body).overflow}); })()"""
@@ -500,7 +500,7 @@ def test_the_phone_shows_the_desk_tab_whole_and_the_composer_pinned_with_no_side
                                            until("document.querySelector('.dv-lease-held')"), {"eval": measure}])
     g = json.loads(out["values"][-1])
     assert g["scrollW"] <= g["vw"] and g["scrollH"] <= g["vh"] + 1 and g["bodyOverflow"] == "hidden" and not g["mainShown"], g
-    assert g["tabs"][-2:] == ["room", "desk"] and g["deskWhole"] and g["deskH"] >= 44, g
+    assert g["tabs"] == ["home", "desk", "room", "memory"] and g["deskWhole"] and g["deskH"] >= 44, g
     assert abs(g["dockBottom"] - g["vh"]) <= 1 and g["sendW"] >= 44 and g["sendH"] >= 44 and g["font"] >= 16, g
     assert g["stateScroll"] <= g["stateW"] + 1, g                      # a long holder wraps, it does not push the page
 

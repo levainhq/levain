@@ -110,13 +110,13 @@ def _json(out: dict) -> list:
 
 
 @needs_browser
-def test_the_strip_draws_at_every_width_with_its_unread_count_and_opens_the_center(tmp_path: Path) -> None:
-    """Notifications is on the strip at a wide and a narrow width, its pill is the server's unread count (the other buttons carry none),
-    and a tap opens the focus view listing every item, the filter narrowing it, with no sideways scroll."""
+def test_the_places_bar_draws_at_every_width_and_the_notifications_button_carries_the_unread_count(tmp_path: Path) -> None:
+    """The places bar is drawn at a wide and a narrow width, the masthead's Notifications button carries the server's unread count (the
+    other buttons carry none), and a tap opens the focus view listing every item, the filter narrowing it, with no sideways scroll."""
     r = Rig(tmp_path)
     layout = ("(() => { const s = document.querySelector('#ck-phonetabs'), c = getComputedStyle(s); return JSON.stringify({ d: c.display, pos: c.position,"
-              " tabs: [...s.querySelectorAll('button')].map(b => b.dataset.phoneJump), vw: document.documentElement.scrollWidth <= innerWidth + 1,"
-              " pill: s.querySelector('[data-nc-unread]').textContent }); })()")
+              " tabs: [...s.querySelectorAll('button')].map(b => b.dataset.iaPlaceBtn), vw: document.documentElement.scrollWidth <= innerWidth + 1,"
+              " pill: document.querySelector('.ia-actions [data-nc-unread]').textContent, stripPills: s.querySelectorAll('[data-nc-unread]').length }); })()")
     opened = (f"JSON.stringify({{ rows: {ROWS}.length, sw: {MODAL}.scrollWidth <= {MODAL}.clientWidth + 1, title: {MODAL}.querySelector('h2').textContent }})")
     filtered = (f"(() => {{ const i = {MODAL}.querySelector('.nc-filter'); i.value = 'backup'; i.dispatchEvent(new Event('input', {{bubbles: true}}));"
                 f" return JSON.stringify({{ narrowed: [...{ROWS}].map(r => r.querySelector('.nc-title').textContent) }}); }})()")
@@ -129,8 +129,8 @@ def test_the_strip_draws_at_every_width_with_its_unread_count_and_opens_the_cent
             OPEN, OPENED, {"eval": opened}, {"eval": filtered}])
     wide, narrow, op, fl = _json(out)
     for lay in (wide, narrow):
-        assert lay["d"] == "flex" and lay["pos"] == "sticky" and lay["tabs"] == ["needs", "board", "notifications", "grants", "drop", "room", "desk"], lay
-        assert lay["vw"] is True and lay["pill"] == str(unread), lay
+        assert lay["d"] == "flex" and lay["pos"] == "sticky" and lay["tabs"] == ["home", "desk", "room", "memory"], lay
+        assert lay["vw"] is True and lay["pill"] == str(unread) and lay["stripPills"] == 0, lay
     assert op["rows"] == total and op["sw"] is True and op["title"] == "Notifications", op
     assert fl["narrowed"] == ["B2 backup finished"], fl
 
