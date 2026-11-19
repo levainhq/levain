@@ -447,7 +447,7 @@ def test_exception_publishes_error_keeps_last_body_and_the_loop_continues():
     loop.dirty(["a", "b"], 1)
     assert sorted(loop.run_once(clock.t)) == ["a", "b"]
     err = writer.of("a")[-1]
-    assert err["status"] == "error" and err["error"] == "ValueError: bad thing" and err["body"] == good
+    assert err["status"] == "error" and err["error"] == "ValueError: bad thing" and err["body"] is None and good
     assert writer.of("b")[-1]["status"] == "ok"
     state["boom"] = False
     loop.dirty(["a"], 2)
@@ -973,3 +973,278 @@ def test_sqlite_fingerprint_reopens_when_the_db_file_is_replaced(tmp_path):
         assert b != a and fp._conns[str(path)][0] is not held
     finally:
         fp.close()
+
+
+# ------------------------------------------------------------------------------------------ L3 round 1
+
+
+def _fail_publish_once(writer):
+    real, left = writer.publish, [1]
+
+    def flaky(*a, **k):
+        if left[0]:
+            left[0] -= 1
+            raise OSError("disk full")
+        return real(*a, **k)
+
+    writer.publish = flaky
+
+
+def test_a_failed_publish_leaves_the_panel_due_and_the_stream_degraded(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("1")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(File(str(f)),))], backstop_s=1e9)
+    _fail_publish_once(writer)
+    assert loop.run_once(clock.t) == ["a"]  # first derive: the publish fails
+    assert isinstance(loop.last_publish_error, OSError) and writer.of("a") == []
+    jobs = loop._evaluate(clock.t)
+    assert [j.pid for j in jobs] == ["a"]  # still due, not waiting for the backstop
+    assert writer.streams[-1]["state"] == "degraded" and "write error" in writer.streams[-1]["detail"]
+    assert loop.run_once(clock.t) == ["a"] and len(writer.of("a")) == 1
+    assert loop.last_publish_error is None and loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_a_failed_publish_after_an_input_move_retries_the_move(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("1")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(File(str(f)),))], backstop_s=1e9)
+    settle(loop, clock)
+    f.write_text("22")
+    _fail_publish_once(writer)
+    assert loop.run_once(clock.t) == ["a"]
+    assert len(writer.of("a")) == 1
+    assert loop.run_once(clock.t) == ["a"]  # the move was not consumed by the failed publish
+    assert len(writer.of("a")) == 2
+    loop.stop()
+
+
+def test_a_failed_publish_keeps_the_write_owed():
+    loop, writer, clock, _ = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    _fail_publish_once(writer)
+    loop.dirty(["a"], 5)
+    loop.run_once(clock.t)
+    assert loop.run_once(clock.t) == ["a"] and writer.of("a")[-1]["write_gen"] == 5
+
+
+@pytest.mark.parametrize("status", ["error", "timeout"])
+def test_an_error_or_timeout_result_is_published_without_a_body(status):
+    loop, writer, clock, _ = make(
+        [PanelPlan("a")], fn=lambda pid: DeriveResult(status=status, body={"junk": 1}, error="e")
+    )
+    loop.run_once(clock.t)
+    pub = writer.of("a")[0]
+    assert pub["status"] == status and pub["body"] is None
+    loop.stop()
+
+
+def test_a_failed_derive_does_not_claim_the_write_it_was_derived_for():
+    state = {"boom": False}
+
+    def fn(pid):
+        if state["boom"]:
+            raise ValueError("x")
+        return ok()
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, backstop_s=1e9)
+    settle(loop, clock)
+    state["boom"] = True
+    loop.dirty(["a"], 7)
+    loop.run_once(clock.t)
+    assert writer.of("a")[-1]["status"] == "error" and writer.of("a")[-1]["write_gen"] == 0
+    loop.stop()
+
+
+def test_valid_until_that_passed_during_the_derive_does_not_hot_loop():
+    loop, writer, clock, _ = make([PanelPlan("a")], backstop_s=1e9)
+
+    def slow(pid):
+        clock.t += 10
+        return ok(valid_until=clock.t - 5)  # after the start, before the finish
+
+    loop._derive_fn = slow
+    settle(loop, clock)
+    assert writer.of("a")[0]["valid_until"] is None
+    assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_timeout_s_zero_is_not_read_as_unset():
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=0.0)])
+    with loop._lock:
+        st = loop._states["a"]
+        st.running_since = clock.t
+    loop._publish_timeouts(clock.t)
+    assert writer.of("a")[-1]["status"] == "timeout"
+
+
+def test_a_failed_timeout_publish_is_retried_and_timed_out_is_set_only_after_it_lands():
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=5.0)])
+    with loop._lock:
+        loop._states["a"].running_since = clock.t
+    _fail_publish_once(writer)
+    clock.t += 6
+    loop._publish_timeouts(clock.t)
+    assert not loop._states["a"].timed_out and writer.of("a") == []
+    loop._publish_timeouts(clock.t)
+    assert loop._states["a"].timed_out and writer.of("a")[-1]["status"] == "timeout"
+
+
+def test_stop_drops_queued_jobs_and_frees_their_panels():
+    gate, entered = threading.Event(), threading.Event()
+
+    def fn(pid):
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("x")
+
+    loop, writer, clock, _ = make([PanelPlan("a"), PanelPlan("b")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    loop.start()
+    try:
+        assert entered.wait(WAIT)
+        deadline = time.monotonic() + WAIT
+        while time.monotonic() < deadline and not loop._queue:
+            time.sleep(0.005)
+        assert loop._queue  # one is running, one is waiting
+        loop.stop(timeout=0.05)
+        assert not loop._queue and sum(1 for s in loop._states.values() if s.busy) == 1  # only the running one
+    finally:
+        gate.set()
+        loop.stop()
+
+
+def test_the_fingerprinter_is_closed_only_after_every_thread_has_ended():
+    gate, entered = threading.Event(), threading.Event()
+
+    def fn(pid):
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("x")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    closed = []
+    real_close = loop._fingerprinter.close
+    loop._fingerprinter.close = lambda: (closed.append(1), real_close())
+    loop.start()
+    assert entered.wait(WAIT)
+    loop.stop(timeout=0.05)
+    assert closed == [] and loop._lingering  # the running derive is remembered, the fingerprinter kept
+    gate.set()
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline and not closed:
+        time.sleep(0.01)
+    assert closed and not loop._lingering
+
+
+def test_a_stale_generations_publish_is_dropped_and_the_write_stays_owed():
+    gate, entered = threading.Event(), threading.Event()
+
+    calls = []
+
+    def fn(pid):
+        calls.append(pid)
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("late")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    loop.dirty(["a"], 3)
+    loop.start()
+    assert entered.wait(WAIT)
+    loop.stop(timeout=0.05)
+    loop.start()  # a new generation while the old derive still runs
+    gate.set()
+    assert writer.wait_for(lambda pubs: len(pubs) >= 1)
+    loop.stop()
+    # the first publish came from a second derive: the dropped one published nothing and its write was derived again
+    assert len(calls) == 2 and writer.of("a")[0]["write_gen"] == 3
+
+
+def test_start_and_stop_race_never_raises():
+    loop, writer, clock, _ = make([PanelPlan("a")], poll_s=0.005, threads=2)
+    errors = []
+
+    def cycle():
+        try:
+            for _ in range(20):
+                loop.start()
+                loop.stop()
+        except Exception as exc:  # RuntimeError: cannot join thread before it is started
+            errors.append(exc)
+
+    ts = [threading.Thread(target=cycle) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(WAIT * 4)
+    assert errors == []
+    loop.stop()
+
+
+def test_sqlite_reopen_failure_leaves_no_closed_connection_cached(tmp_path, monkeypatch):
+    path = tmp_path / "s.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    fp = derive._Fingerprinter()
+    try:
+        fp.fingerprint(Sqlite(str(path)))
+        held = fp._conns[str(path)][0]
+        os.replace(str(path), str(tmp_path / "old.db"))
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE t(x)")
+        c.commit()
+        c.close()
+
+        def refuse(*a, **k):
+            raise sqlite3.OperationalError("unable to open")
+
+        monkeypatch.setattr(derive.sqlite3, "connect", refuse)
+        assert fp.fingerprint(Sqlite(str(path))) is None
+        assert str(path) not in fp._conns
+        monkeypatch.undo()
+        assert fp.fingerprint(Sqlite(str(path))) not in (None, "absent")
+        assert fp._conns[str(path)][0] is not held
+    finally:
+        fp.close()
+
+
+def test_a_vanished_sqlite_file_answers_absent_and_closes_the_held_connection(tmp_path):
+    path = tmp_path / "s.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    fp = derive._Fingerprinter()
+    try:
+        fp.fingerprint(Sqlite(str(path)))
+        os.unlink(path)
+        assert fp.fingerprint(Sqlite(str(path))) == "absent" and fp._conns == {}
+    finally:
+        fp.close()
+
+
+def test_the_module_fingerprint_helper_holds_no_connection(tmp_path):
+    path = tmp_path / "s.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    assert fingerprint(Sqlite(str(path))) not in (None, "absent")
+    assert not hasattr(derive, "_DEFAULT_FINGERPRINTER")
+
+
+def test_a_same_size_atomic_replace_moves_a_dir_fingerprint(tmp_path):
+    d = tmp_path / "d"
+    d.mkdir()
+    a = d / "ref"
+    a.write_text("A" * 41)
+    ts = os.stat(a).st_mtime_ns
+    before = fingerprint(Dir(str(d)))
+    tmp = d / "tmp"
+    tmp.write_text("B" * 41)
+    os.utime(tmp, ns=(ts, ts))
+    os.replace(tmp, a)  # same name, size and mtime: only the inode differs
+    assert fingerprint(Dir(str(d))) != before

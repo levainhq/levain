@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from levain.cockpit.snapshots import encode_body
+from levain.cockpit.snapshots import KEEP_BODY_STATUSES, encode_body
 
 # Concurrent derives (one panel is never derived twice at once, whatever this is).
 DERIVE_THREADS = 3
@@ -71,12 +71,15 @@ class Poll:
     every_s: float
 
 
+def _sig(st: os.stat_result) -> str:
+    return f"{st.st_mtime_ns}:{st.st_size}:{st.st_ino}"
+
+
 def _stat_sig(path: str) -> str:
     try:
-        st = os.stat(path)
+        return _sig(os.stat(path))
     except FileNotFoundError:
         return ABSENT
-    return f"{st.st_mtime_ns}:{st.st_size}:{st.st_ino}"
 
 
 def _gitdir(repo: str) -> tuple[str, str] | None:
@@ -122,7 +125,7 @@ def _refs_walk(refs_dir: str) -> list[str] | None:
                     st = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                out.append(f"{os.path.relpath(entry.path, refs_dir)}:{st.st_mtime_ns}:{st.st_size}")
+                out.append(f"{os.path.relpath(entry.path, refs_dir)}:{_sig(st)}")
                 if len(out) > GIT_REFS_MAX:
                     return None
     out.sort()
@@ -175,24 +178,24 @@ class _Fingerprinter:
                     est = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                names.append(f"{entry.name}:{est.st_mtime_ns}:{est.st_size}")
+                names.append(f"{entry.name}:{_sig(est)}")
                 if len(names) > DIR_ENTRIES_MAX:
                     return None
         names.sort()
         return hashlib.sha256("\n".join(names).encode("utf-8", "surrogateescape")).hexdigest()
 
     def _sqlite(self, path: str) -> str | None:
-        db = _stat_sig(path)
-        if db == ABSENT:
+        try:
+            st = os.stat(path)  # the one stat: the signature and the identity come from the same look
+        except FileNotFoundError:
             with self._lock:
                 held = self._conns.pop(path, None)
             if held is not None:
                 held[0].close()
             return ABSENT
-        st = os.stat(path)
         ident = (st.st_dev, st.st_ino)
         with self._lock:
-            held = self._conns.get(path)
+            held = self._conns.pop(path, None)  # out of the map while it is closed or reopened: never a closed one in it
             if held is not None and held[1] != ident:
                 held[0].close()  # the file was replaced: the held connection reads the old inode
                 held = None
@@ -200,9 +203,10 @@ class _Fingerprinter:
                 conn = sqlite3.connect(
                     Path(path).resolve().as_uri() + "?mode=ro", uri=True, check_same_thread=False, timeout=1.0
                 )
-                held = self._conns[path] = (conn, ident)
+                held = (conn, ident)
+            self._conns[path] = held
             version = held[0].execute("PRAGMA data_version").fetchone()[0]
-        return f"{db}|{_stat_sig(path + '-wal')}|dv={version}"
+        return f"{_sig(st)}|{_stat_sig(path + '-wal')}|dv={version}"
 
     @staticmethod
     def _git(repo: str) -> str | None:
@@ -232,12 +236,16 @@ class _Fingerprinter:
         return stale + hashlib.sha256("\n".join(parts).encode("utf-8", "surrogateescape")).hexdigest()
 
 
-_DEFAULT_FINGERPRINTER = _Fingerprinter()
-
-
 def fingerprint(inp: Any) -> str | None:
-    """The fingerprint of one input, None when it cannot be told (treated as "changed" by the loop)."""
-    return _DEFAULT_FINGERPRINTER.fingerprint(inp)
+    """The fingerprint of one input, None when it cannot be told (treated as "changed" by the loop).
+
+    One-shot: a Sqlite input is opened, read and closed here. The loop keeps its own connections between polls.
+    """
+    fp = _Fingerprinter()
+    try:
+        return fp.fingerprint(inp)
+    finally:
+        fp.close()
 
 
 # --------------------------------------------------------------------------------------------------- plans
@@ -279,7 +287,6 @@ class PanelState:
     token: Any = _UNSET
     dirty_gen: int | None = None  # highest write_gen dirtied and not yet taken by a derive
     busy: bool = False  # queued or running
-    last_body: bytes | None = None  # the last good body of this process, republished under an error status
     running_since: float | None = None  # when the derive now running started; None when none is running
     run_fp: str = ""  # the inputs fingerprint the running derive started from
     timed_out: bool = False  # the running derive passed its deadline and a timeout was published
@@ -345,6 +352,7 @@ class _Job:
     reason: str
     fp: str
     token: Any
+    gen: int = 0  # the loop generation it was created in; a publish from an older one is dropped
 
 
 # --------------------------------------------------------------------------------------------------- the loop
@@ -385,8 +393,11 @@ class DeriveLoop:
         self._wake = threading.Event()
         self._queue: dict[str, _Job] = {}
         self._stopping = False
-        self._start_gen = 0  # bumped by start(): threads of an earlier start exit
+        self._start_gen = 0  # bumped by start(): threads and jobs of an earlier start are stale
+        self._lifecycle = threading.Lock()  # one start() or stop() at a time
         self._threads: list[threading.Thread] = []
+        self._lingering: list[threading.Thread] = []  # stopped threads that had not ended when stop() gave up on them
+        self._pending_pub: dict[str, BaseException] = {}  # panels whose last publish failed, until one lands
         self._last_event_at: float | None = None
         self._last_views: dict[Any, str | None] | None = None
         self.last_publish_error: BaseException | None = None
@@ -404,29 +415,60 @@ class DeriveLoop:
         self._wake.set()
 
     def start(self) -> None:
-        with self._lock:
-            if self._threads:
-                return
-            self._stopping = False
-            self._start_gen += 1
-            gen = self._start_gen
-            self._wake.clear()
-            self._threads = [threading.Thread(target=self._poll_loop, args=(gen,), name="derive-poll", daemon=True)]
-            for i in range(self._threads_n):
-                self._threads.append(threading.Thread(target=self._worker, args=(gen,), name=f"derive-{i}", daemon=True))
-            threads = list(self._threads)
-        for t in threads:
-            t.start()
+        with self._lifecycle:
+            with self._lock:
+                if self._threads:
+                    return
+                self._stopping = False
+                self._start_gen += 1
+                gen = self._start_gen
+                self._wake.clear()
+                self._threads = [
+                    threading.Thread(target=self._thread_main, args=(self._poll_loop, gen), name="derive-poll", daemon=True)
+                ]
+                for i in range(self._threads_n):
+                    self._threads.append(
+                        threading.Thread(target=self._thread_main, args=(self._worker, gen), name=f"derive-{i}", daemon=True)
+                    )
+            for t in self._threads:
+                t.start()  # still inside the lifecycle lock: a stop() cannot see a thread that was not started
 
     def stop(self, timeout: float | None = None) -> None:
-        with self._cv:
-            self._stopping = True
-            threads, self._threads = self._threads, []
-            self._cv.notify_all()
-        self._wake.set()
-        for t in threads:
-            t.join(timeout)
-        self._fingerprinter.close()
+        """Stop the threads and wait for them (`timeout` seconds in all; None waits for as long as it takes).
+
+        Jobs queued but not started are dropped (their panels are free again). A derive already running keeps its panel
+        busy until it returns; its result is published unless start() ran meanwhile. The fingerprinter's connections are closed once every
+        thread has ended; a thread still running when the wait ran out is remembered until it does.
+        """
+        with self._lifecycle:
+            with self._cv:
+                self._stopping = True
+                for pid in self._queue:
+                    self._states[pid].busy = False
+                self._queue.clear()
+                threads, self._threads = self._threads, []
+                self._lingering.extend(threads)
+                self._cv.notify_all()
+            self._wake.set()
+            deadline = None if timeout is None else time.monotonic() + timeout
+            for t in threads:
+                t.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+            self._reap()
+
+    def _reap(self) -> None:
+        """Forget ended threads; close the fingerprinter when none is left and the loop is stopped."""
+        me = threading.current_thread()
+        with self._lock:
+            self._lingering = [t for t in self._lingering if t is not me and t.is_alive()]
+            done = self._stopping and not self._lingering
+        if done:
+            self._fingerprinter.close()
+
+    def _thread_main(self, target: Callable[[int], None], gen: int) -> None:
+        try:
+            target(gen)
+        finally:
+            self._reap()
 
     def run_once(self, now: float) -> list[str]:
         """Evaluate dueness once and run the due derives to completion on the calling thread.
@@ -480,7 +522,9 @@ class DeriveLoop:
                 (pid, st.running_since)
                 for pid, st in self._states.items()
                 if st.running_since is not None and not st.timed_out
-                and now - st.running_since >= (self._plans[pid].timeout_s or DERIVE_TIMEOUT_S)
+                and now - st.running_since >= (
+                    DERIVE_TIMEOUT_S if self._plans[pid].timeout_s is None else self._plans[pid].timeout_s
+                )
             ]
         for pid, since in late:
             with self._write_lock:
@@ -488,7 +532,6 @@ class DeriveLoop:
                     st = self._states[pid]
                     if st.running_since != since or st.timed_out:
                         continue  # it finished (and published) meanwhile
-                    st.timed_out = True
                     run_fp = st.run_fp
                 try:
                     self._writer.publish(
@@ -497,7 +540,12 @@ class DeriveLoop:
                         error=f"derive still running after {now - since:.0f} s",
                     )
                 except Exception as exc:
-                    self.last_publish_error = exc
+                    with self._lock:
+                        self.last_publish_error = exc  # timed_out stays False: the next poll tries again
+                else:
+                    with self._lock:
+                        if st.running_since == since:
+                            st.timed_out = True  # only once the timeout row is in the store
 
     def _evaluate(self, now: float) -> list[_Job]:
         """One poll: heartbeat, the inputs stream, then the due panels not already busy, as jobs in order."""
@@ -515,7 +563,8 @@ class DeriveLoop:
         degraded = [name for v in views.values() for name in (*v.unknown_names, *v.stale_locks)]
         with self._lock:
             degraded += [f"{pid}: derive timeout" for pid, st in self._states.items() if st.timed_out]
-        err = self.last_publish_error
+        with self._lock:
+            err = self.last_publish_error
         if err is not None:
             degraded.append(f"write error: {type(err).__name__}: {err}")
         with self._write_lock:
@@ -528,13 +577,16 @@ class DeriveLoop:
                     detail="; ".join(degraded),
                 )
             except Exception as exc:  # a failing writer must not kill the loop
-                self.last_publish_error = exc
+                with self._lock:
+                    self.last_publish_error = exc
             else:
-                if err is not None and self.last_publish_error is err:
-                    self.last_publish_error = None  # the writer answers again
+                with self._lock:
+                    # the writer answers again; a panel whose publish failed keeps the error until it publishes
+                    if err is not None and self.last_publish_error is err and not self._pending_pub:
+                        self.last_publish_error = None
         with self._lock:
             due = due_panels(self._plans, self._states, views, token, now, self._backstop_s)
-            return [_Job(pid, reason, views[pid].fp, token) for pid, reason in due]
+            return [_Job(pid, reason, views[pid].fp, token, self._start_gen) for pid, reason in due]
 
     def _poll_loop(self, gen: int) -> None:
         while True:
@@ -545,7 +597,8 @@ class DeriveLoop:
             try:
                 jobs = self._evaluate(self._clock())
             except Exception as exc:  # one bad poll must not end the loop
-                self.last_publish_error = exc
+                with self._lock:
+                    self.last_publish_error = exc
                 jobs = []
             with self._cv:
                 if self._stopping or self._start_gen != gen:
@@ -579,14 +632,15 @@ class DeriveLoop:
     def _run_job(self, job: _Job, started: float) -> BaseException | None:
         """Run one derive and publish it; the panel is not busy afterwards whatever happened.
 
-        Returns a non-Exception BaseException the derive raised (the caller decides whether to re-raise), else None.
+        A derive that was not published (the writer failed, or the loop was stopped meanwhile) changes none of the
+        panel's scheduling state, so the panel is still due at the next poll. Returns a non-Exception BaseException the
+        derive raised (the caller decides whether to re-raise), else None.
         """
         pid = job.pid
         with self._lock:
             st = self._states[pid]
             write_gen = st.dirty_gen if st.dirty_gen is not None else 0
             st.dirty_gen = None  # a dirty arriving from here on is for the next derive
-            last_body = st.last_body
             st.running_since, st.run_fp, st.timed_out = started, job.fp, False
         body: bytes | None = None
         status, error, valid_until = "error", None, None
@@ -596,52 +650,59 @@ class DeriveLoop:
         try:
             try:
                 result = self._derive_fn(pid)
-                body = encode_body(result.body)
+                if result.status not in KEEP_BODY_STATUSES:
+                    body = encode_body(result.body)  # a failed or timed-out result never carries a body to the store
                 status, error, valid_until = result.status, result.error, result.valid_until
             except BaseException as exc:
+                body = None
                 error = f"{type(exc).__name__}: {exc}"
                 if not isinstance(exc, Exception):
                     fatal = exc
             finished = self._clock()
             duration_ms = max(0, int(round((finished - started) * 1000)))
-            # A valid_until at or before the start would re-derive on every poll: treat it as no expiry, also in the store.
-            if valid_until is not None and valid_until <= started:
+            # A valid_until at or before the finish would re-derive on every poll: treat it as no expiry, also in the store.
+            if valid_until is not None and valid_until <= finished:
                 valid_until = None
             try:
                 with self._write_lock:
                     with self._lock:
                         st.running_since = None  # the timeout publisher checks this under the write lock
-                    self._writer.publish(
-                        pid,
-                        status=status,
-                        body=body if body is not None else last_body,  # None keeps the stored body
-                        started_at=started,
-                        derived_at=finished,
-                        duration_ms=duration_ms,
-                        valid_until=valid_until,
-                        inputs_fp=job.fp,
-                        write_gen=write_gen,
-                        error=error,
-                    )
-                published = True
+                        stale = job.gen != self._start_gen
+                    if not stale:
+                        self._writer.publish(
+                            pid,
+                            status=status,
+                            body=body,
+                            started_at=started,
+                            derived_at=finished,
+                            duration_ms=duration_ms,
+                            valid_until=valid_until,
+                            inputs_fp=job.fp,
+                            # a snapshot that failed does not reflect the write it was derived for
+                            write_gen=0 if status in KEEP_BODY_STATUSES else write_gen,
+                            error=error,
+                        )
+                        published = True
+                        with self._lock:
+                            self._pending_pub.pop(pid, None)
+                            if not self._pending_pub:
+                                self.last_publish_error = None
             except Exception as exc:
-                self.last_publish_error = exc
-            else:
-                self.last_publish_error = None
+                with self._lock:
+                    self._pending_pub[pid] = exc
+                    self.last_publish_error = exc
         finally:
             with self._cv:
                 st.running_since, st.timed_out = None, False
                 late_dirty = st.dirty_gen is not None  # a dirty that arrived during this derive
                 if not published and write_gen and (st.dirty_gen is None or st.dirty_gen < write_gen):
                     st.dirty_gen = write_gen  # the write was not published: the next derive still owes it
-                if finished is not None:
+                if published:
                     st.started_at = started
                     st.derived_at = finished
                     st.inputs_fp = job.fp
                     st.token = job.token
                     st.valid_until = valid_until
-                    if body is not None:
-                        st.last_body = body
                 st.busy = False
             if late_dirty:
                 self._wake.set()

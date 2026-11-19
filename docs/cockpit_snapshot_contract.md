@@ -45,7 +45,10 @@ Two cheap signals, different questions:
 
 - `PRAGMA data_version` answers "the file changed". It changes whenever another connection commits anything,
   heartbeats and stream rows included, so on a live worker it moves about once per poll. It is per connection: its
-  values mean nothing across connections, and the first value on a new connection says nothing. In a language whose
+  values mean nothing across connections, and the first value on a new connection says nothing (a new connection on a
+  replaced file can repeat the old connection's number, so a reader that reopens must treat the reopen itself as a
+  change; the Python reader's `data_version()` folds its reopen count in and is an opaque token, compared for equality
+  only). In a language whose
   database pool hands out different connections (Go `database/sql`), pin one connection for the probe.
 - meta `publish_seq` answers "a panel changed". It is an integer (as decimal text) that goes up by one in the same
   transaction as every `gen` change (including a panel's first publish), so it does not move on heartbeats, stream
@@ -59,7 +62,8 @@ integer. The string carries a major only; there is no minor in it. The reader co
 what it speaks. On an unknown major, or a different name, it refuses: it serves no snapshots and says so in its own
 health, rather than guessing at a layout it does not know. Minor, additive changes never change the major; a reader
 ignores columns and meta keys it does not know. A writer that opens an existing file whose contract it does not speak
-refuses too and never migrates in place.
+refuses too and never migrates in place: it reads the contract row before it sets any pragma or writes any table, so a
+refusal leaves the file exactly as it found it. A file with other tables and no contract row is refused as well.
 
 A file with no contract row (the writer has not finished opening, or it is some other database) is empty to a
 reader: no panels, no meta, not a mismatch.
@@ -82,7 +86,7 @@ CREATE TABLE IF NOT EXISTS panel (
     status TEXT NOT NULL,
     error TEXT,
     body_sha TEXT NOT NULL,
-    body BLOB NOT NULL
+    body BLOB
 );
 CREATE TABLE IF NOT EXISTS stream (
     id TEXT PRIMARY KEY,
@@ -102,7 +106,7 @@ exponent form).
 | `contract` | the contract string above |
 | `worker_pid` | process id of the worker that opened the file |
 | `worker_started_at` | when that worker opened it, epoch seconds |
-| `heartbeat_at` | the worker's last heartbeat, epoch seconds; absent until the first one |
+| `heartbeat_at` | the worker's last heartbeat, epoch seconds; absent until the first one (a worker that opens the file removes its predecessor's, so it is not live until its own first heartbeat) |
 | `publish_seq` | integer, +1 with every `gen` change (see Change signals); `0` on a new file |
 
 ### `panel`
@@ -118,13 +122,16 @@ One row per panel, updated in place on every publish.
 | `duration_ms` | how long that derive took, milliseconds |
 | `valid_until` | null means no time limit; else the time after which the content should be re-derived |
 | `inputs_fp` | fingerprint of the panel's inputs at derive time; opaque to readers |
-| `write_gen` | the highest write generation this snapshot reflects (read-your-writes marker); never decreases |
+| `write_gen` | the highest write generation this snapshot reflects (read-your-writes marker); never decreases. An `error` or `timeout` publish carries none: it reflects no write |
 | `status` | the outcome: `ok`, `empty`, `partial`, `error`, `timeout`; a reader treats an unknown value as `partial` |
 | `error` | the error text when the derive failed or timed out, else null |
-| `body_sha` | lowercase hex sha256 of `body` |
-| `body` | the panel content, canonical JSON bytes stored as a BLOB (see below) |
+| `body_sha` | lowercase hex sha256 of `body`; the empty string when `body` is NULL |
+| `body` | the panel content, canonical JSON bytes stored as a BLOB (see below); NULL when no good body was ever stored |
 
-A `timeout` or `error` publish keeps the previous `body`: the panel shows its last good content under that status.
+A `timeout` or `error` publish keeps the previous `body`, whatever body the deriving code had: the panel shows its last
+good content under that status. A panel whose first publish is an `error` or `timeout` has a NULL `body` (and an empty
+`body_sha`): a reader treats it as a panel with no content, and `status` and `error` say why. The first `ok`, `empty` or
+`partial` publish after it stores the body and moves `gen`.
 
 ### `stream`
 
@@ -160,7 +167,7 @@ of `error` text alone, with the same status, does not move `gen`. `gen` is uniqu
 lone surrogate is escaped the same way and stays valid JSON), and no `NaN` or `Infinity` (a derive that produces one
 fails with status `error`). Equal values give equal bytes and equal `body_sha`. Numbers print as the Python writer
 prints them (integers without a point, floats by Python's shortest round-trip form), which is another reason a second
-writer is out of scope. A reader only needs a JSON parser and should accept the body as BLOB or TEXT. Bodies carry no
+writer is out of scope. A reader only needs a JSON parser and should accept the body as BLOB or TEXT (and NULL, see above). Bodies carry no
 credentials: the serve adds per-request, per-credential layers on top.
 
 ## Freshness fields a reader derives

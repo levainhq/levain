@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -25,6 +26,13 @@ CONTRACT_NAME = "levain-cockpit-snapshots"
 CONTRACT_MAJOR = 1
 CONTRACT = f"{CONTRACT_NAME}/{CONTRACT_MAJOR}"
 DB_FILENAME = "snapshots.db"
+# A publish with one of these statuses never replaces the stored body (a first-ever one stores no body at all).
+KEEP_BODY_STATUSES = ("error", "timeout")
+# The statuses this code knows; a reader treats any other stored value as "partial".
+KNOWN_STATUSES = ("ok", "empty", "partial", "error", "timeout")
+# body_sha of a panel row that has no body (a first-ever error or timeout publish).
+NO_BODY_SHA = ""
+_OURS = ("meta", "panel", "stream")
 LOCK_SUFFIX = ".lock"
 DECODED_CACHE_MAX = 256
 # A reader's thread connection is checked against the file on disk (device and inode) at most this often.
@@ -46,7 +54,7 @@ CREATE TABLE IF NOT EXISTS panel (
     status TEXT NOT NULL,
     error TEXT,
     body_sha TEXT NOT NULL,
-    body BLOB NOT NULL
+    body BLOB
 );
 CREATE TABLE IF NOT EXISTS stream (
     id TEXT PRIMARY KEY,
@@ -114,14 +122,27 @@ class PanelSnap:
     status: str
     error: str | None
     body_sha: str
-    body: bytes
+    body: bytes | None  # None: no good body was ever stored (see the contract)
 
 
 def _snap(row: tuple) -> PanelSnap:
+    raw = row[11]
+    body = None if raw is None else raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
     return PanelSnap(
         id=row[0], gen=row[1], derived_at=row[2], started_at=row[3], duration_ms=row[4], valid_until=row[5],
-        inputs_fp=row[6], write_gen=row[7], status=row[8], error=row[9], body_sha=row[10], body=bytes(row[11]),
+        inputs_fp=row[6], write_gen=row[7], status=row[8] if row[8] in KNOWN_STATUSES else "partial", error=row[9],
+        body_sha=row[10], body=body,
     )
+
+
+def _close_fd_box(box: list) -> None:
+    """Close the descriptor in `box` once (the box outlives the writer object, so a finalizer can hold it)."""
+    fd, box[0] = box[0], None
+    if fd is not None:
+        try:
+            os.close(fd)  # closing the descriptor drops the flock
+        except OSError:
+            pass
 
 
 class SnapshotWriter:
@@ -132,31 +153,42 @@ class SnapshotWriter:
 
     def __init__(self, path: str | os.PathLike, *, pid: int | None = None, now: float | None = None) -> None:
         self.path = os.fspath(path)
-        self._lock_fd = os.open(self.path + LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(self.path + LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            os.close(self._lock_fd)
+            os.close(fd)
             raise WriterLocked(f"another process holds {self.path + LOCK_SUFFIX}") from None
+        self._fd_box = [fd]
+        # A writer dropped without close() still gives the lock back.
+        self._fd_finalizer = weakref.finalize(self, _close_fd_box, self._fd_box)
         self._db: sqlite3.Connection | None = None
         try:
             self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+            # The contract is checked before any pragma or schema write: a refusal leaves the file as it was found.
+            try:
+                row = self._db.execute("SELECT value FROM meta WHERE key='contract'").fetchone()
+            except sqlite3.OperationalError as exc:
+                if not _absent(exc):
+                    raise
+                row = None  # no meta table yet: a fresh file, or some other database
+            _check_contract(row[0] if row else None)
+            if row is None:
+                tables = {r[0] for r in self._db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if tables - set(_OURS):
+                    raise ContractMismatch(f"{self.path} is a database with other tables and no snapshot contract")
             mode = self._db.execute("PRAGMA journal_mode=WAL").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
                 raise sqlite3.OperationalError(f"journal_mode stayed {mode[0] if mode else None!r}, not wal")
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute(f"PRAGMA journal_size_limit={int(JOURNAL_SIZE_LIMIT)}")
-            try:
-                row = self._db.execute("SELECT value FROM meta WHERE key='contract'").fetchone()
-            except sqlite3.OperationalError:
-                row = None  # no meta table yet: a fresh file
-            _check_contract(row[0] if row else None)
             self._db.executescript(_SCHEMA)
             started = time.time() if now is None else now
             with self._tx():
                 self._set_meta("contract", CONTRACT)
                 self._set_meta("worker_pid", str(os.getpid() if pid is None else pid))
                 self._set_meta("worker_started_at", repr(float(started)))
+                self._db.execute("DELETE FROM meta WHERE key='heartbeat_at'")  # not live until its own first heartbeat
                 self._db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('publish_seq', '0')")
         except BaseException:
             self.close()
@@ -186,18 +218,24 @@ class SnapshotWriter:
 
         An identical body and status keep gen (only the timing fields move, the body is not rewritten); a changed body
         or status bumps gen, and meta `publish_seq` goes up by one in the same transaction. `body=None` keeps the
-        stored body and changes only the other columns (a panel with no stored row then gets the body `null`).
+        stored body and changes only the other columns (a panel with no stored row then gets the body `null`). A status
+        in KEEP_BODY_STATUSES ignores `body` altogether and keeps the stored one; with no stored row it stores no body.
         """
+        keep = status in KEEP_BODY_STATUSES
+        if keep:
+            body = None
         with self._tx():
             row = self._db.execute(
                 "SELECT gen, body_sha, status, write_gen FROM panel WHERE id=?", (panel_id,)
             ).fetchone()
             if body is None:
-                if row is None:
+                if row is not None:
+                    sha = row[1]
+                elif keep:
+                    sha = NO_BODY_SHA
+                else:
                     body = encode_body(None)
                     sha = _sha(body)
-                else:
-                    sha = row[1]
             else:
                 sha = _sha(body)
             if row is None:
@@ -252,11 +290,8 @@ class SnapshotWriter:
                 self._db.close()
             finally:
                 self._db = None
-        if self._lock_fd is not None:
-            try:
-                os.close(self._lock_fd)  # closing the descriptor drops the flock
-            finally:
-                self._lock_fd = None
+        _close_fd_box(self._fd_box)
+        self._fd_finalizer.detach()
 
 
 class _Tx:
@@ -268,7 +303,10 @@ class _Tx:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc_type:
-            self._db.execute("ROLLBACK")
+            try:
+                self._db.execute("ROLLBACK")  # sqlite may already have rolled back: never mask the original error
+            except sqlite3.Error:
+                pass
             return
         try:
             self._db.execute("COMMIT")
@@ -304,6 +342,7 @@ class SnapshotReader:
         self._local = threading.local()
         self._cache: OrderedDict[tuple[str, int, str], Any] = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._opens = threading.local()  # per thread: how many connections it has opened
 
     def _conn(self) -> sqlite3.Connection | None:
         now = time.monotonic()
@@ -315,6 +354,8 @@ class SnapshotReader:
         except FileNotFoundError:
             self.close()
             return None
+        except OSError as exc:
+            raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
         if slot is not None:
             if (st.st_dev, st.st_ino) == (slot[1], slot[2]):
                 self._local.slot = (slot[0], slot[1], slot[2], now)
@@ -327,6 +368,7 @@ class SnapshotReader:
                 return None
             raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
         self._local.slot = (conn, st.st_dev, st.st_ino, now)
+        self._opens.n = getattr(self._opens, "n", 0) + 1
         return conn
 
     def close(self) -> None:
@@ -350,35 +392,35 @@ class SnapshotReader:
                 try:
                     meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
                     _check_contract(meta.get("contract"))
-                    if "contract" not in meta:
-                        return empty()
-                    return work(conn, meta)
+                    result = empty() if "contract" not in meta else work(conn, meta)
                 except sqlite3.OperationalError as exc:
-                    if _absent(exc):
-                        return empty()
-                    raise
-            finally:
+                    if not _absent(exc):
+                        raise
+                    result = empty()
+                conn.execute("COMMIT")  # a failed COMMIT is a failed read: it raises, nothing is returned
+            except BaseException:
                 try:
-                    conn.execute("COMMIT")
+                    conn.execute("ROLLBACK")
                 except sqlite3.Error:
-                    try:
-                        conn.execute("ROLLBACK")
-                    except sqlite3.Error:
-                        pass
+                    pass
+                raise
+            return result
         except sqlite3.Error as exc:
             raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
 
     def data_version(self) -> int:
-        """`PRAGMA data_version` on this thread's connection; 0 while the file is absent.
+        """An opaque change token for this thread's connection (compare for equality only); 0 while the file is absent.
 
-        It moves when another connection commits anything, heartbeats included: it is a "the file changed" gate, not a
+        It folds the count of connections this thread has opened with `PRAGMA data_version`, so a file replaced under
+        the reader (a reopen) changes it even when the new connection's own data_version repeats the old one. It also
+        moves when another connection commits anything, heartbeats included: it is a "the file changed" gate, not a
         "a panel changed" signal (that is meta `publish_seq`).
         """
         conn = self._conn()
         if conn is None:
             return 0
         try:
-            return int(conn.execute("PRAGMA data_version").fetchone()[0])
+            return (getattr(self._opens, "n", 0) << 48) | int(conn.execute("PRAGMA data_version").fetchone()[0])
         except sqlite3.Error as exc:
             raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
 
@@ -425,7 +467,7 @@ class SnapshotReader:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key]
-        value = json.loads(snap.body)
+        value = None if snap.body is None else json.loads(snap.body)
         with self._cache_lock:
             self._cache[key] = value
             self._cache.move_to_end(key)

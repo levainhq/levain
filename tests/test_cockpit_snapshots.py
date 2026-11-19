@@ -212,9 +212,12 @@ def test_body_none_keeps_the_stored_body_across_a_writer_reopen(db):
     snap = S.SnapshotReader(db).read("a")
     assert g == 2 and snap.status == "error" and snap.error == "boom" and snap.derived_at == 2.0
     assert snap.body == S.encode_body({"good": True}) and snap.body_sha == hashlib.sha256(snap.body).hexdigest()
-    # a panel with no stored row gets the body null
+    # a panel with no stored row and an error status gets no body at all
     w2.publish("new", status="error", body=None, started_at=1.0, derived_at=2.0, duration_ms=1.0)
-    assert S.SnapshotReader(db).read("new").body == b"null"
+    assert S.SnapshotReader(db).read("new").body is None
+    # a non-error publish with no body and no row stores the JSON null
+    w2.publish("nul", status="ok", body=None, started_at=1.0, derived_at=2.0, duration_ms=1.0)
+    assert S.SnapshotReader(db).read("nul").body == b"null"
 
 
 def test_second_writer_is_refused_in_process_and_across_processes(db, tmp_path):
@@ -420,3 +423,139 @@ def test_reader_close_drops_this_threads_connection(db):
     r.close()
     r.close()
     assert r.meta() and r._conn() is not first
+
+
+# ------------------------------------------------------------------------------------------ L3 round 1
+
+
+@pytest.mark.parametrize("status", ["error", "timeout"])
+def test_error_and_timeout_publishes_never_replace_the_stored_body(db, status):
+    w = S.SnapshotWriter(db)
+    _pub(w, body={"good": 1})
+    g = w.publish("a", status=status, body=S.encode_body(None), started_at=1.0, derived_at=2.0, duration_ms=1.0)
+    snap = S.SnapshotReader(db).read("a")
+    assert g == 2 and snap.status == status and snap.body == S.encode_body({"good": 1})
+    assert snap.body_sha == hashlib.sha256(snap.body).hexdigest()
+
+
+def test_first_ever_error_stores_no_body_and_a_later_ok_replaces_it(db):
+    w = S.SnapshotWriter(db)
+    w.publish("a", status="timeout", body=b"{}", started_at=1.0, derived_at=2.0, duration_ms=1.0)
+    snap = S.SnapshotReader(db).read("a")
+    assert snap.body is None and snap.status == "timeout" and snap.gen == 1
+    assert S.SnapshotReader(db).decoded(snap) is None
+    assert _pub(w, body={"v": 2}) == 2
+    assert S.SnapshotReader(db).read("a").body == S.encode_body({"v": 2})
+
+
+def test_writer_reopen_clears_the_previous_workers_heartbeat(db):
+    w = S.SnapshotWriter(db)
+    w.heartbeat(100.0)
+    w.close()
+    assert "heartbeat_at" in S.SnapshotReader(db).meta()
+    w2 = S.SnapshotWriter(db)
+    assert "heartbeat_at" not in S.SnapshotReader(db).meta()
+    w2.heartbeat(101.0)
+    assert S.SnapshotReader(db).meta()["heartbeat_at"] == "101.0"
+
+
+def test_data_version_changes_when_the_file_was_replaced(db):
+    w = S.SnapshotWriter(db)
+    w.close()
+    r = S.SnapshotReader(db)
+    r._conn()
+    first = r.data_version()
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(str(db) + suffix):
+            os.unlink(str(db) + suffix)
+    S.SnapshotWriter(db).close()
+    r._local.slot = (r._local.slot[0], r._local.slot[1], r._local.slot[2], time.monotonic() - 10)  # due a recheck
+    assert r.data_version() != first
+
+
+def test_unknown_major_is_refused_before_any_pragma_or_file_is_created(db):
+    c = sqlite3.connect(db)  # a rollback-journal file, as another tool would leave it
+    c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    c.execute("INSERT INTO meta VALUES ('contract', 'levain-cockpit-snapshots/2')")
+    c.commit()
+    c.close()
+    with pytest.raises(S.ContractMismatch):
+        S.SnapshotWriter(db)
+    assert sqlite3.connect(db).execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert not os.path.exists(str(db) + "-wal") and not os.path.exists(str(db) + "-shm")
+
+
+def test_a_foreign_database_with_no_contract_row_is_refused(db):
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE other (x)")
+    c.commit()
+    c.close()
+    with pytest.raises(S.ContractMismatch):
+        S.SnapshotWriter(db)
+
+
+def test_a_text_body_is_read_and_an_unknown_status_reads_as_partial(db):
+    w = S.SnapshotWriter(db)
+    _pub(w, body={"a": 1})
+    w.close()
+    c = sqlite3.connect(db)
+    c.execute("UPDATE panel SET body=CAST(body AS TEXT), status='deferred'")
+    assert isinstance(c.execute("SELECT body FROM panel").fetchone()[0], str)
+    c.commit()
+    c.close()
+    snap = S.SnapshotReader(db).read("a")
+    assert snap.body == S.encode_body({"a": 1}) and snap.status == "partial"
+
+
+def test_a_writer_dropped_without_close_gives_the_lock_back(db):
+    import gc
+
+    w = S.SnapshotWriter(db)
+    del w
+    gc.collect()
+    S.SnapshotWriter(db).close()  # WriterLocked here if the descriptor leaked
+
+
+def test_a_failed_reader_commit_raises_instead_of_returning(db):
+    S.SnapshotWriter(db).close()
+
+    class _CommitFails:
+        def __init__(self, real):
+            self.real = real
+
+        def execute(self, sql, *a):
+            if sql == "COMMIT":
+                raise sqlite3.OperationalError("disk I/O error")
+            return self.real.execute(sql, *a)
+
+        def close(self):
+            self.real.close()
+
+    r = S.SnapshotReader(db)
+    r._conn()
+    slot = r._local.slot
+    r._local.slot = (_CommitFails(slot[0]), slot[1], slot[2], time.monotonic() + 1e6)
+    with pytest.raises(S.SnapshotReadError):
+        r.read_all()
+
+
+def test_a_rollback_failure_does_not_mask_the_original_error(db):
+    w = S.SnapshotWriter(db)
+
+    class _RollbackFails(_SpyDb):
+        def execute(self, sql, *args):
+            if sql == "ROLLBACK":
+                raise sqlite3.OperationalError("cannot rollback - no transaction is active")
+            return super().execute(sql, *args)
+
+    w._db = _RollbackFails(w._db)
+    with pytest.raises(ZeroDivisionError):
+        with w._tx():
+            1 / 0
+
+
+def test_an_unreadable_path_raises_snapshot_read_error(tmp_path):
+    (tmp_path / "file").write_text("not a directory")
+    r = S.SnapshotReader(tmp_path / "file" / "x.db")  # stat answers ENOTDIR, not "not found"
+    with pytest.raises(S.SnapshotReadError):
+        r.read("a")
