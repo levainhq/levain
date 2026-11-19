@@ -423,7 +423,11 @@ def diff_stamp(repo: Path) -> tuple[tuple[str, ...], str]:
     """``(git dirs, digest)``: the digest of everything that changes the text ``git diff-tree -p`` makes (so the patch-id) of a
     commit in this repo, by CONTENT and never by path or time, so the main checkout and its linked worktrees of one repo agree:
     the config git lists, ``objects/info/alternates`` and ``shallow`` and ``info/attributes`` of the common dir, the global
-    attributes file, the work tree's top ``.gitattributes``, every tracked ``.gitattributes`` (mode, object and path) and the git version. Raises :class:`GitFailed`."""
+    attributes file, the work tree's top ``.gitattributes``, every tracked ``.gitattributes`` (mode, object and path) and the git version. Raises :class:`GitFailed`.
+
+    Known edges (L3 r2, levain#155; each needs a change no repo of ours makes): an
+    UNSTAGED edit of a tracked nested ``.gitattributes`` (the index is what is stamped), git's system attributes file, command-line
+    or environment config, a relative ``core.attributesFile``, and ``info/grafts`` or ``refs/replace``."""
     dirs, listed = _config_inputs(repo)
     common = Path(dirs[-1])
     parts: list[Any] = [_git_version(repo)]
