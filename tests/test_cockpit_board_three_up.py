@@ -58,19 +58,40 @@ def _board(tmp_path: Path, w: int, h: int, name: str) -> dict[str, Any]:
     return json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"tile"' in v))
 
 
+# Home lays the Work row out by named spans (the List, the Board and the Inbox take four of twelve columns each from 1101 px), not by the Board's
+# own grid: the List's share of the page's width is what says a row holds three, since this fixture has no Board or Inbox panel to put beside it.
+HOME_TRAY = """(() => { const t = document.querySelector('[data-ck-panel=tray]'), d = document.querySelector('.deck'), cs = getComputedStyle(d);
+  const inner = d.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  return JSON.stringify({place: document.body.dataset.iaPlace, share: t.getBoundingClientRect().width / inner, width: Math.round(t.getBoundingClientRect().width),
+    hs: document.documentElement.scrollWidth <= window.innerWidth + 1, tile: 1}); })()"""
+
+
+def _home(tmp_path: Path, w: int, h: int) -> dict[str, Any]:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": w, "h": h, "dpr": 1}},
+            *_reload(),
+            {"until": "document.body.dataset.iaPlace === 'home' && !!document.querySelector('[data-ck-panel=tray]') && 1"},
+            {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"},
+            {"eval": HOME_TRAY},
+        ])
+    return json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"tile"' in v))
+
+
 @needs_browser
-def test_the_board_is_three_to_a_row_on_a_desktop(tmp_path: Path) -> None:
-    m = _board(tmp_path, 1440, 900, "desktop")
-    assert m["cells"] >= 3, m
-    assert m["perRow"] == 3, m                      # three cards share a row, not one full-width stack
-    assert m["widest"] < 0.5, m                     # no card is the whole row
+def test_home_gives_the_list_a_third_of_the_row_on_a_desktop(tmp_path: Path) -> None:
+    m = _home(tmp_path, 1440, 900)
+    assert m["place"] == "home", m
+    assert 0.28 < m["share"] < 0.38, m              # a third of the row, not the whole stack
     assert m["hs"] is True, m
 
 
 @needs_browser
-def test_the_board_is_three_to_a_row_at_the_desktop_breakpoint(tmp_path: Path) -> None:
-    m = _board(tmp_path, 1100, 900, "bp1100")
-    assert m["perRow"] == 3 and m["hs"] is True, m
+def test_home_keeps_the_list_a_third_of_the_row_at_the_home_breakpoint(tmp_path: Path) -> None:
+    m = _home(tmp_path, 1101, 900)                  # 1101 is where Home goes three across (1100 and under it is two)
+    assert 0.28 < m["share"] < 0.38 and m["width"] >= 280 and m["hs"] is True, m
 
 
 @needs_browser

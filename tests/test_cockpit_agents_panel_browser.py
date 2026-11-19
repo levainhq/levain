@@ -1,4 +1,4 @@
-"""P9b: the agents panel in the running cockpit's Build tab, in a real headless Chrome at 390 px and 1280 px.
+"""P9b: the agents panel in the running cockpit's Home place (under Machine), in a real headless Chrome at 390 px and 1280 px.
 
 The scratch store is the real agent DDL and the authority log is real (the ``Rig`` of the launch tests), laid where the
 served install reads them: the agent store under ``$LEVAIN_HOME/autonomic`` and the log under the install's
@@ -33,7 +33,7 @@ TOK = "T"
 PANEL = "document.querySelector('[data-ck-panel=\"agents\"]')"
 WIDTHS = {"390": {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
           "1280": {"emulate": {"w": 1280, "h": 1000, "dpr": 1}}}
-BUILD = {"eval": "window.LevainCockpitKinds.applyMode('build', true); 1"}
+HOME = {"eval": "window.LevainCockpitKinds.applyMode('board', true); 1"}
 SETTLE = {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"}
 
 
@@ -129,9 +129,9 @@ def _json(out: dict, at: int) -> dict:
 
 
 @pytest.mark.parametrize("width", sorted(WIDTHS))
-def test_the_panel_draws_in_build_with_the_four_groups_and_the_pinned_operator_row(width, tmp_path, monkeypatch) -> None:
+def test_the_panel_draws_on_home_with_the_four_groups_and_the_pinned_operator_row(width, tmp_path, monkeypatch) -> None:
     s = Scratch(tmp_path, monkeypatch)
-    steps = [WIDTHS[width], BUILD, OPEN, SETTLE, {"eval": READ}]
+    steps = [WIDTHS[width], HOME, OPEN, SETTLE, {"eval": READ}]
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", _shots("agents_" + width, steps))
     seen = _json(out, -1)
@@ -142,6 +142,7 @@ def test_the_panel_draws_in_build_with_the_four_groups_and_the_pinned_operator_r
     for name in ("w-firing", "w-paused", "w-unarmed", "w-retired"):
         assert name in text, (name, text)
     assert all(r["opens"] for r in seen["rows"]), seen["rows"]                  # every row takes the open gesture
+    assert seen["w"] > 0, seen                                                   # on Home it is drawn, not display:none
     assert not seen["clipped"], seen
     for bad in ("undefined", "[object", "null", "Traceback"):
         assert bad not in text, (bad, text)
@@ -151,7 +152,7 @@ def test_the_panel_draws_in_build_with_the_four_groups_and_the_pinned_operator_r
 @pytest.mark.parametrize("width", sorted(WIDTHS))
 def test_the_detail_offers_each_verb_only_where_the_state_allows_it_and_none_on_the_operator_row(width, tmp_path, monkeypatch) -> None:
     s = Scratch(tmp_path, monkeypatch)
-    steps: list[dict] = [WIDTHS[width], BUILD, OPEN, SETTLE]
+    steps: list[dict] = [WIDTHS[width], HOME, OPEN, SETTLE]
     order = ("operator", "w-firing", "w-paused", "w-unarmed", "w-retired")
     for name in order:
         target = "no operator agent" if name == "operator" else name
@@ -173,7 +174,7 @@ def test_a_verb_round_trip_hits_the_verbspec_and_the_row_moves(width, tmp_path, 
     s = Scratch(tmp_path, monkeypatch)
     moved = lambda name, group: (f"({_row(name)} && {_row(name)}.querySelector('.ext-meta').textContent.trim() === {json.dumps(group)}) || null")
     verb = lambda v: f"document.querySelector('#levain-modal [data-agent-verb={v}]')"
-    steps: list[dict] = [WIDTHS[width], BUILD, OPEN, SETTLE,
+    steps: list[dict] = [WIDTHS[width], HOME, OPEN, SETTLE,
                          # pause: one tap, no confirm; the unarmed agent moves to Paused
                          _tap_row("w-unarmed"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_pause"), "ms": 20000},
                          {"until": moved("w-unarmed", "Paused") + " && 1", "ms": 30000},
@@ -200,7 +201,7 @@ def test_a_verb_round_trip_hits_the_verbspec_and_the_row_moves(width, tmp_path, 
 def test_the_cleared_or_not_cell_reflects_the_agent_review_cards_cleared_and_not(width, tmp_path, monkeypatch) -> None:
     s = Scratch(tmp_path, monkeypatch)
     s.cards(tmp_path / "levain_home")
-    steps = [WIDTHS[width], BUILD, OPEN, SETTLE, {"eval": READ}]
+    steps = [WIDTHS[width], HOME, OPEN, SETTLE, {"eval": READ}]
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", steps)
     bodies = {r["body"].split(" · ")[0]: r["body"] for r in _json(out, -1)["rows"]}

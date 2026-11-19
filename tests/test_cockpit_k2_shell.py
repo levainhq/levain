@@ -312,7 +312,8 @@ process.exit(0);                      // the page's repaint interval would keep 
         r = subprocess.run([NODE, str(drv), str(WEB / "dashboard_boot.js"), str(WEB / "cockpit_view.js"), hash_], capture_output=True, text=True, timeout=30)
         assert r.returncode == 0, r.stderr
         got[hash_] = json.loads(r.stdout.strip().splitlines()[-1])
-    assert [got[h]["mode"] for h in ("#write_token=T&memory", "#write_token=T&build", "#memory&write_token=T")] == ["memory", "build", "memory"], got
+    # a retired name in the address is read as Home when the page opens, and the address is rewritten to say so
+    assert [got[h]["mode"] for h in ("#write_token=T&memory", "#write_token=T&build", "#memory&write_token=T")] == ["memory", "board", "memory"], got
     assert got["#write_token=T"]["mode"] == ""
     assert all(g["token"] == "T" for g in got.values()), got                # the token was taken and kept
 
@@ -323,10 +324,10 @@ globalThis.location = { hash: "#memory=", search: "", pathname: "/" };
 out.read = K.hashMode();
 const calls = [];
 globalThis.history = { replaceState: (a, b, url) => calls.push(url) };
-K.applyMode("build", true);
+K.applyMode("board", true);
 out.written = calls;
 """, tmp_path)
-    assert out["read"] == "memory" and out["written"] == ["/#build"], out
+    assert out["read"] == "memory" and out["written"] == ["/#board"], out
 
 
 def test_a_fragment_part_that_is_not_a_tab_keeps_its_equals(tmp_path: Path) -> None:
@@ -334,10 +335,10 @@ def test_a_fragment_part_that_is_not_a_tab_keeps_its_equals(tmp_path: Path) -> N
 globalThis.location = { hash: "#key=&memory=", search: "", pathname: "/" };
 const calls = [];
 globalThis.history = { replaceState: (a, b, url) => calls.push(url) };
-K.applyMode("build", true);
+K.applyMode("board", true);
 out.written = calls;
 """, tmp_path)
-    assert out["written"] == ["/#key=&build"], out
+    assert out["written"] == ["/#key=&board"], out
 
 
 def test_the_legacy_page_keeps_only_the_two_mode_rules_it_had() -> None:

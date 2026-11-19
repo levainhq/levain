@@ -2,8 +2,8 @@
 // It draws nothing of its own data and changes no renderer: every panel is the page's own. What it does:
 //   - names the place on the body (data-ia-place) from the page's own state (dv-on, rv-on, data-mode), which dashboard.css reads;
 //   - maps the places bar and the 1-4 keys onto the page's existing wiring (data-mode-tab, data-phone-jump) through the hidden drivers;
-//   - keeps the page off the retired modes (Morning, Build): their content lives on Home or in Memory, so a stored mode, a hash or a
-//     jump that names one lands on Home instead;
+//   - Morning and Build are retired in the page's own applyMode (cockpit_view.js), which resolves either to Home, so nothing here
+//     redirects after the fact;
 //   - folds the agents graph to a one-line strip that opens on a click;
 //   - adds the section heads Home groups its blocks under.
 (function () {
@@ -41,6 +41,19 @@
     if (where === "room") return clickHidden("[data-ia-jump=room]");
     if (where === "memory") return clickHidden("[data-ia-mode=memory]");
   }
+
+  // The masthead's own actions are not places. Drop scrolls to a box Memory does not draw, so from Memory it goes Home first (the
+  // attribute changes here; the page's jump scrolls and focuses a frame later, once the box is drawn). Grants and Notifications only
+  // open a dialog, but the page's boot handler leaves the Desk and the Room on any jump: the place is put back on the next tick.
+  document.addEventListener("click", function (ev) {
+    var a = ev.target && ev.target.closest ? ev.target.closest(".ia-act[data-phone-jump]") : null;
+    if (!a) return;
+    // the painted place, not place(): the page's boot handler has already left the Desk or Room by the time this runs, and the
+    // attribute is repainted on the microtask after it
+    var which = a.dataset.phoneJump, was = document.body.dataset.iaPlace;
+    if (which === "drop" && was === "memory") go("home");
+    else if ((which === "grants" || which === "notifications") && (was === "desk" || was === "room")) setTimeout(function () { go(was); }, 0);
+  });
 
   document.addEventListener("click", function (ev) {
     var t = ev.target && ev.target.closest ? ev.target : null;
@@ -110,14 +123,29 @@
     });
   }
 
+  // The Notifications button's aria-label replaces its content for assistive tech, so the unread count in the pill (written by the
+  // page) is carried into the label here.
+  function syncNotifyLabel() {
+    var pill = document.querySelector(".ia-act[data-phone-jump=notifications] [data-nc-unread]");
+    var btn = pill && pill.closest(".ia-act");
+    if (!btn) return;
+    var n = pill.hidden ? "" : (pill.textContent || "").trim();
+    var label = n ? "Notifications, " + n + " unread" : "Notifications";
+    if (btn.getAttribute("aria-label") !== label) btn.setAttribute("aria-label", label);
+    if (btn.getAttribute("title") !== label) btn.setAttribute("title", label);
+  }
+  function watchNotifyLabel() {
+    var pill = document.querySelector(".ia-act[data-phone-jump=notifications] [data-nc-unread]");
+    if (!pill) return;
+    new MutationObserver(syncNotifyLabel).observe(pill, { attributes: true, attributeFilter: ["hidden"], childList: true, characterData: true, subtree: true });
+    syncNotifyLabel();
+  }
+
   function start() {
     addHeads();
     addGraphToggle();
-    function offRetired() {
-      if (mode() === "morning" || mode() === "build") clickHidden("[data-ia-mode=board]");
-    }
-    new MutationObserver(function () { offRetired(); paint(); }).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
-    offRetired();
+    watchNotifyLabel();
+    new MutationObserver(paint).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
     paint();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();

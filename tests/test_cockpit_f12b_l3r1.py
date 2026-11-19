@@ -12,7 +12,7 @@ from levain.cockpit import Cockpit, ProviderSpec, Read
 from levain.cockpit.results import Fault
 from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _paint, _run, _intention, _value
 from tests.test_cockpit_flip_parity import needs_browser
-from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
+from tests.test_cockpit_k7_build import DESKTOP, RETIRED_BUILD, _sessions_fixture
 from tests.test_cockpit_topology import _good, _panel
 
 
@@ -52,6 +52,7 @@ def test_a_node_with_work_to_lose_carries_an_at_risk_mark_in_both_lenses_and_unk
 # --- codex MED + complement MED-2: a faulted provider hidden -------------------------------------------------
 
 
+@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
 @needs_browser
 def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_either_view(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -90,6 +91,7 @@ def test_a_waiting_task_with_no_card_is_never_listed_and_no_header_counts_it(tmp
 # --- codex MED + glm LOW + complement 7: one ResizeObserver --------------------------------------------------
 
 
+@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
 @needs_browser
 def test_a_second_render_leaves_one_live_resize_observer_not_two(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -128,6 +130,7 @@ def test_the_provider_value_is_refused_when_parents_form_a_cycle():
 # --- complement MED-1: a throw kills the card ----------------------------------------------------------------
 
 
+@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
 @needs_browser
 def test_a_renderer_that_throws_leaves_the_list_and_one_line_not_a_dead_card(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)

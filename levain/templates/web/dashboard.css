@@ -3921,6 +3921,11 @@ body.ia[data-ia-place="home"] .deck > :is(.masthead, .ia-places) {
 body.ia[data-ia-place="home"] :is(main.frame, #board, .ck-zone[data-zone="operate"],
   .ck-zone[data-zone="operate"] > .ck-zgrid, .ck-zone[data-zone="operate"] .ck-col, .hero) { display: contents !important; }
 body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head { display: none; }
+/* The zone head is not drawn on Home, but the Reset layout control lives in it and only shows while a layout is saved: it is the one
+   child kept, placed in the Work head's row (the Work head takes the rest of the row from 721 px; below that it has a row of its own). */
+body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head:has(> [data-layout-reset]) {
+  display: flex; order: 30; justify-content: flex-end; align-self: end; margin: 0; }
+body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head > :not([data-layout-reset]) { display: none; }
 body.ia[data-ia-place="home"] .deck > .frame:not(.masthead):not(.ia-places),
 body.ia[data-ia-place="home"] :is(#ck-band, #ck-skycol) { padding-inline: 0; margin: 0; }
 body.ia[data-ia-place="home"] .ck-zone:not([data-zone="operate"]) { order: 90; margin: 0; }
@@ -3939,23 +3944,25 @@ body.ia[data-ia-place="home"] .ia-head span { font: var(--fw-regular) var(--fs-m
 body.ia[data-ia-place="home"] .ia-head[data-ia-head="desk"] { order: 20; }
 body.ia[data-ia-place="home"] #ck-drop { order: 21; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { order: 22; }
-body.ia[data-ia-place="home"] .ia-head[data-ia-head="work"] { order: 30; }
+body.ia[data-ia-place="home"] .ia-head[data-ia-head="work"] { order: 29; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { order: 31; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="board"] { order: 32; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="inbox"] { order: 33; }
 body.ia[data-ia-place="home"] .ia-head[data-ia-head="machine"] { order: 40; }
 body.ia[data-ia-place="home"] #ck-skycol { order: 41; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="roster"] { order: 42; }
-body.ia[data-ia-place="home"] .panel[data-ck-panel="agent_calls"] { order: 43; }
-body.ia[data-ia-place="home"] .panel[data-ck-panel="stream"] { order: 44; }
-body.ia[data-ia-place="home"] .panel[data-ck-panel="scheduled_jobs"] { order: 45; }
-body.ia[data-ia-place="home"] .panel[data-ck-panel="jobs"] { order: 46; }
-body.ia[data-ia-place="home"] .panel[data-ck-panel="edits"] { order: 47; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="agents"] { order: 43; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="agent_calls"] { order: 44; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="stream"] { order: 45; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="scheduled_jobs"] { order: 46; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="jobs"] { order: 47; }
+body.ia[data-ia-place="home"] .panel[data-ck-panel="edits"] { order: 48; }
 body.ia[data-ia-place="home"] .ia-head[data-ia-head="glance"] { order: 60; }
 body.ia[data-ia-place="home"] #ck-widgets { order: 61; }
-/* Build is retired: its two panels (jobs, edits) sit with the machine, its topology panel is the hero graph again (the strip stands for
-   it), the notifications panel is the Notifications button, and Recent episodes moves to Memory. */
-body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { display: flex !important; }
+/* Build is retired: its panels (agents, jobs, edits) sit with the machine, its topology panel is the hero graph again (the strip stands for
+   it), the notifications panel is the Notifications button, and Recent episodes moves to Memory. The agents panel is where the governed
+   agent verbs (pause, resume, renew, revoke, retire) are reached, so it cannot be left to the retired tab. */
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="agents"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { display: flex !important; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="notifications"], [data-ck-panel="episodes"], [data-ck-panel="topology"]) { display: none !important; }
 body.ia[data-ia-place="home"] #ck-h-widgets { display: none !important; }
 body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: grid !important; }
@@ -3991,28 +3998,33 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens :is(.tv-lensbody, .t
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-skycard { min-height: 0; padding-block: var(--sp-3); }
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 160px; }
 
+@media (min-width: 721px) {
+  body.ia[data-ia-place="home"] .ia-head[data-ia-head="work"] { grid-column: 1 / span 8; }
+  body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head:has(> [data-layout-reset]) { grid-column: 9 / span 4; }
+}
+
 /* ── heights: the work row one height, the machine row compact (each panel scrolls inside) ───────────────────────────── */
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) {
   height: 560px !important; max-height: none; }
-body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"]) {
+body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"]) {
   height: 320px !important; max-height: none; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { height: 260px !important; max-height: none; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !important; min-height: 0; }
 body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
 
 /* ── the glance: the widgets small, at the bottom ────────────────────────────────────────────────────────────────────── */
-body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
+body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
 body.ia[data-ia-place="home"] #ck-widgets > * { min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
 body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-size: var(--fs-h) !important; }
 
 /* ── the spans: laptop three across, tablet two, phone one ───────────────────────────────────────────────────────────── */
 @media (min-width: 1101px) {
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) { grid-column: span 4 !important; }
-  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"]) { grid-column: span 3 !important; }
-  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 6 !important; }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 3 !important; }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="scheduled_jobs"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 4 !important; }
 }
 @media (min-width: 721px) and (max-width: 1100px) {
-  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"], [data-ck-panel="roster"],
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"], [data-ck-panel="roster"], [data-ck-panel="agents"],
     [data-ck-panel="agent_calls"], [data-ck-panel="stream"], [data-ck-panel="scheduled_jobs"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 6 !important; }
 }
 @media (max-width: 720px) {
@@ -4030,10 +4042,19 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia .ia-places { justify-content: space-between; }
   body.ia .ia-places button { flex: 1 1 0 !important; justify-content: center; padding: 0 var(--sp-1) !important; }
   body.ia[data-ia-place="home"] .deck { padding-inline: var(--gutter-ke); }
-  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="tray"], [data-ck-panel="board"], [data-ck-panel="inbox"]) { height: 480px !important; }
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="board"], [data-ck-panel="inbox"]) { height: 480px !important; }
+  /* the List's own compose box and filter rows take about 270 px of its card before the first row: at 480 the card folded every row and
+     said "24 more", so it is taller than the other two on a phone */
+  body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { height: 720px !important; }
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
   body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
 }
 
-/* Memory is a place of its own: the drop box is the Drop button there, not a block at its top */
+/* (after the phone block, whose 38 px it overrides) a finger is the pointer: the masthead's three actions and the places are the page's touch targets at any width, not only on a phone */
+@media (pointer: coarse) {
+  body.ia .ia-act, body.ia .ia-places button { min-height: var(--hit-min, 44px); }
+  body.ia .ia-act { min-width: var(--hit-min, 44px); }
+}
+
+/* Memory is a place of its own and draws no drop box at its top: the Drop button goes Home first (dashboard_places.js), then to the box */
 body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }

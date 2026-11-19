@@ -28,7 +28,9 @@ def _compose(enum, declared=DECLARED):
 CHIPS = "[...document.querySelectorAll('[data-ck-compose=recipient]')]"
 PRESSED = CHIPS + ".filter(c => c.getAttribute('aria-pressed') === 'true').map(c => c.dataset.value)"
 PICK = "document.querySelector('[data-ck-compose=recipient-pick]')"
-PRIME = [{"until": "document.querySelector('#ck-hlens [data-tv=agents]') && 1"}, {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
+# Home draws the agents graph folded to a strip (its body is not laid out until opened), so the graph is opened before it is read
+OPEN_GRAPH = {"eval": "(() => { const t = document.querySelector('[data-ia-graph-toggle]'); if (t && !document.body.classList.contains('ia-graph-open')) t.click(); return 1; })()"}
+PRIME = [{"until": "document.querySelector('#ck-hlens [data-tv=agents]') && 1"}, OPEN_GRAPH, {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
 
 
 def _message_effect(params, *, origin_key):
