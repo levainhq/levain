@@ -1252,13 +1252,16 @@ class CockpitDB:
         ``last_seen`` stamp is not taken here (:meth:`stamp_last_seen`).
 
         Every call looks the token up, in its own transaction, on the calling thread's credential connection
-        (:attr:`_cred`): no answer is remembered, and no other method reads through that connection. Any error
-        propagates and closes the connection: the caller refuses on it, never admits."""
+        (:attr:`_cred`): no answer is remembered, and no other method reads through that connection. A token that
+        resolves to no live device closes the thread's connection, so only a thread whose last answer was a device
+        keeps one open (a token-shaped header alone never leaves a connection held). Any error propagates and closes
+        the connection: the caller refuses on it, never admits."""
         del now
         key = _sha256(token)
         rows = self._cred.run(lambda: self._connect(held=True), self.path, lambda conn: conn.execute(
             "SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?", (key,)).fetchall())
         if not rows or rows[0]["revoked_at"] is not None:
+            self._cred.drop()
             return None
         return str(rows[0]["id"])
 

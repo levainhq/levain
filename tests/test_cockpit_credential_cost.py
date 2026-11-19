@@ -84,14 +84,19 @@ def _lookups(db: CockpitDB) -> list[str]:
 
 def test_verify_device_opens_one_connection_for_many_lookups(db: CockpitDB, monkeypatch) -> None:
     """MEASURED before the change: every ``verify_device`` opened ``cockpit.db`` once (N calls, N opens). After: the
-    first call opens the held connection, the rest open nothing."""
+    first call that finds a device opens the held connection, the rest open nothing. A miss closes it (L1 W4), so a
+    run of misses costs what every call cost before: one open each."""
     _dev, tok = _enrol(db)
     spy = _OpenSpy(monkeypatch)
     for _ in range(N_READS):
         assert db.verify_device(tok, now=NOW) is not None
-        assert db.verify_device("x" * 43, now=NOW) is None      # a miss costs no open either
-    print(f"MEASURE: {2 * N_READS} verify_device calls -> {len(spy.of('cockpit.db'))} cockpit.db opens")
-    assert len(spy.of("cockpit.db")) == 1, spy.opens
+    hits = len(spy.of("cockpit.db"))
+    for _ in range(N_READS):
+        assert db.verify_device("x" * 43, now=NOW) is None
+    misses = len(spy.of("cockpit.db")) - hits
+    print(f"MEASURE: {N_READS} verify_device hits -> {hits} cockpit.db opens; {N_READS} misses -> {misses}")
+    assert hits == 1, spy.opens
+    assert misses <= N_READS
 
 
 # --- the security invariant: a revocation is seen on the very next call ---------------------------------------------
@@ -147,15 +152,15 @@ def test_the_held_connection_is_read_only(db: CockpitDB) -> None:
 
 def test_the_held_connection_reopens_when_the_db_file_is_replaced(db: CockpitDB, monkeypatch) -> None:
     dev, tok = _enrol(db)
+    dev2, tok2 = _enrol(db, "phone")
     assert db.verify_device(tok, now=NOW) == dev
-    first = _held(db)
-    # a replacement file: the same journal with the device revoked, moved over the old one (a new inode)
+    # a replacement file: the same journal with the first device revoked, moved over the old one (a new inode)
     fresh = db.path.with_name("replacement.db")
     src = sqlite3.connect(db.path)
     dst = sqlite3.connect(fresh)
     src.backup(dst)
     src.close()
-    dst.execute("UPDATE paired_devices SET revoked_at = '2026-11-19T12:00:01Z'")
+    dst.execute("UPDATE paired_devices SET revoked_at = '2026-11-19T12:00:01Z' WHERE id = ?", (dev,))
     dst.commit()
     dst.execute("PRAGMA journal_mode = DELETE")
     dst.close()
@@ -164,13 +169,14 @@ def test_the_held_connection_reopens_when_the_db_file_is_replaced(db: CockpitDB,
     os.replace(fresh, db.path)
     spy = _OpenSpy(monkeypatch)
     assert db.verify_device(tok, now=NOW) is None, "answered from the replaced file, not the old connection's"
-    assert _held(db) is not first
-    # the replacement is not in WAL mode: the reopen's own switch to WAL writes the file after it was looked at, so
-    # the next call reopens once more; then it settles
-    assert len(spy.of("cockpit.db")) <= 2
+    # the replacement is not in WAL mode: an open's own switch to WAL writes the file after it was looked at, so the
+    # call after it reopens once more; then it settles
+    for _ in range(2):
+        assert db.verify_device(tok2, now=NOW) == dev2
     settled = len(spy.of("cockpit.db"))
+    assert settled <= 3
     for _ in range(3):
-        assert db.verify_device(tok, now=NOW) is None
+        assert db.verify_device(tok2, now=NOW) == dev2
     assert len(spy.of("cockpit.db")) == settled
 
 
@@ -542,6 +548,37 @@ def test_an_in_place_restore_is_seen_by_the_next_credential_check(db: CockpitDB)
         t.truncate()
     assert os.stat(db.path).st_ino == ino, "the restore kept the inode"
     assert db.verify_device(tok, now=NOW) is None, "answered from the old contents"
+
+
+def test_a_token_that_resolves_to_no_device_leaves_no_connection_held(db: CockpitDB) -> None:
+    """L1 W4: an unauthenticated token-shaped header must not make its thread hold a journal connection. MEASURED
+    before: 8 threads parked after a miss held 15 and 17 file descriptors (two runs)."""
+    _enrol(db)
+    n = 8
+    gate = threading.Event()
+    done = threading.Barrier(n + 1)
+    answers: list[Any] = []
+
+    def run(i: int) -> None:
+        answers.append(db.verify_device(f"{i:043d}", now=NOW))
+        done.wait(30)
+        gate.wait(30)
+
+    gc.collect()
+    before = _fds()
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    try:
+        done.wait(30)
+        during = _fds()
+    finally:
+        gate.set()
+        for t in threads:
+            t.join(10)
+    assert answers == [None] * n
+    print(f"MEASURE: {n} threads after a miss, parked -> {during - before} file descriptors held")
+    assert during - before <= 0, during - before
 
 
 def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
