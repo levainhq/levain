@@ -21,7 +21,7 @@ import pytest
 from levain.cockpit import engine
 from levain.cockpit import snapshot_host as sh
 from levain.cockpit.derive import DeriveLoop, PanelPlan
-from levain.cockpit.engine import Cockpit
+from levain.cockpit.engine import Cockpit, ReadContext
 from levain.cockpit.snapshots import encode_body
 from tests.test_cockpit_attached_engine import CRED, PANELS, Recorder, Rig, list_spec
 
@@ -523,3 +523,50 @@ def test_a_row_stamped_by_an_earlier_serve_does_not_answer_this_serves_writes(ri
     assert out["stale"] is True and out["pending"] is True
 
 
+
+
+# --- a requirement outlives the first reader that sees its row ------------------------------------------------------------
+def test_a_reader_holding_an_older_row_is_marked_owed_after_another_reader_saw_the_new_one(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.1)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    held = rig.reader.read_manifest()                   # one reader's read of the store, before the write's row lands
+    rig.publish_by_hand("alpha", 1)
+    ctx = ReadContext(rig.clock())
+    seen_new = rig.ck._attached_snap(rig.spec("alpha"), ctx)
+    assert seen_new.fresh_info.stale is False and seen_new.fresh_info.pending is False
+    seen_old = rig.ck._attached_snap(rig.spec("alpha"), ctx, held)
+    assert seen_old.fresh_info.stale is True and seen_old.fresh_info.pending is True
+    assert rig.ck._write_owed("alpha", rig.reader.read("alpha")) == (False, False)
+    assert rig.ck._write_owed("alpha", held[1]["alpha"]) == (True, False)       # asked again, by any reader, in any order
+
+
+def test_a_manifest_that_read_the_store_before_the_row_landed_is_not_served_unmarked_by_another_readers_look(
+        rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.1)
+    rig.derive()
+    rig.forward = False
+    rig.rec.rows["alpha"] = ["a", "z", "y"]
+    rig.ck.invalidate_reads(["alpha"])
+    orig = rig.reader.read_manifest
+    gate = threading.Event()
+    other_done = threading.Event()
+
+    def read_manifest_then_wait() -> Any:
+        got = orig()                                    # the old row
+        if not gate.is_set():
+            gate.set()
+            assert other_done.wait(10)                  # the row lands and another reader looks at it first
+        return got
+
+    rig.reader.read_manifest = read_manifest_then_wait
+    out: list[Any] = []
+    t = threading.Thread(target=lambda: out.append(rig.ck.manifest(CRED)["panels"]["alpha"]))
+    t.start()
+    assert gate.wait(10)
+    rig.publish_by_hand("alpha", 1)
+    assert rig.ck._attached_snap(rig.spec("alpha"), ReadContext(rig.clock())).fresh_info.stale is False
+    other_done.set()
+    t.join(10)
+    assert out and (out[0]["count"] == 3 or out[0]["stale"] is True)

@@ -2979,15 +2979,14 @@ class Cockpit:
     def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
         """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and
         whether the host was never told of it. A row answers a write once it is stamped with the write's generation, or, for
-        a write the host was never told of, once a derive began after the write. An answered write is forgotten."""
+        a write the host was never told of, once a derive began after the write. The answer depends on the row handed in and
+        the panel's requirement alone: a reader holding an older row is told it is owed whoever has looked at a newer one."""
         with self._rc_lock:
             req = self._write_required.get(panel_id)
             if req is None:
                 return False, False
             unsent = panel_id in self._write_unsent
             if row is not None and (row.write_gen >= req[0] or (unsent and row.started_at > req[1])):
-                del self._write_required[panel_id]
-                self._write_lapsed.pop(panel_id, None)
                 return False, False
             return True, unsent
 
