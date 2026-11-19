@@ -6,9 +6,11 @@ pin the sharing and, above all, its edges: a write admitted after a read STARTED
 read is never shared, the window counts from the commit, and nothing is shared where the read cache is off."""
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -425,7 +427,7 @@ def test_a_read_begun_before_a_keyed_write_publishes_nothing_when_it_ends_after_
         hold.set()
         t.join(10)
     assert not t.is_alive() and got and {r["id"] for r in got[0]["rows"]} == {"r1"}      # its own caller: the pre-write rows
-    assert (st.snap, st.fresh, st.commits, st.recent) == (None, None, 0, None)           # but nothing of it is published
+    assert (st.snap, st.fresh, st.commits, st.recent, st.last_completion) == (None, None, 0, None, None)   # nothing of it is published
     b = c.panel("od", credential_class="none")
     assert state["reads"] == 2 and {r["id"] for r in b["rows"]} == {"r1", "r2"}
     assert st.commits == 1 and st.recent is not None and st.recent[0] is st.snap         # B's read is the published one
@@ -435,62 +437,126 @@ def test_a_read_begun_before_a_keyed_write_publishes_nothing_when_it_ends_after_
 
 
 class _HookLock:
-    """A lock that runs ``after`` once, after the next release (a write placed between two lock sections of one caller)."""
+    """A lock that, for ONE watched thread, records each section it takes (who took it, the epoch it saw) and runs ``after``
+    once after that thread's next release (a write placed between two lock sections of one caller)."""
 
-    def __init__(self) -> None:
+    def __init__(self, st: Any) -> None:
         self._l = threading.Lock()
+        self._st = st
         self.after = None
+        self.only: threading.Thread | None = None
+        self.sections: list[tuple[str, int]] = []
+        self._quiet = False                  # the ``after`` write takes this lock itself: that is not a section of the caller
 
     def __enter__(self):
         self._l.acquire()
+        if self.only is not None and not self._quiet and threading.current_thread() is self.only:
+            self.sections.append((sys._getframe(1).f_code.co_name, self._st.epoch))
         return self
 
     def __exit__(self, *exc) -> None:
         self._l.release()
-        fn, self.after = self.after, None
-        if fn is not None:
-            fn()
+        if self.after is not None and threading.current_thread() is self.only:
+            fn, self.after = self.after, None
+            self._quiet = True
+            try:
+                fn()
+            finally:
+                self._quiet = False
+
+
+class _WaitSpy(Future):
+    """A flight's ``out`` that says who waited on it, and what the state's epoch was when they did."""
+
+    def __init__(self, st: Any, flight: Any, waiting: threading.Event) -> None:
+        super().__init__()
+        self._st, self._flight, self._waiting = st, flight, waiting
+        self.waits: list[tuple[threading.Thread, int, int]] = []
+
+    def result(self, timeout=None):
+        self.waits.append((threading.current_thread(), self._flight.epoch, self._st.epoch))
+        self._waiting.set()
+        return super().result(timeout)
 
 
 def test_a_caller_that_waits_out_a_pre_write_flight_and_then_owns_a_post_write_one_shares(tmp_path: Path) -> None:
     """B takes its epoch, a keyed write lands, A's older flight is still out: B waits it out, then owns a flight created
-    AFTER the write. That read is post-write, so it shares; the epoch B took at entry must not stop it."""
-    c, state, _other = _two_panels(tmp_path)
+    AFTER the write. That read is post-write, so it shares; the epoch B took at entry must not stop it. The interleave is
+    asserted, not assumed: B's entry capture is the first lock section it takes after ``_recent_snap`` and the write lands
+    right after it, B is blocked on A's pre-write flight before A is released, and B's flight starts under a later epoch."""
+    c, state = _external_cockpit(tmp_path)
     st = c._state["od"]
+    real_recent, real_lock = c._recent_snap, st.lock
+    wrote, waiting = threading.Event(), threading.Event()
+    hook = _HookLock(st)
+    events: list[str] = []
+    starts: list[tuple[int, int]] = []                       # (the state's epoch, the new flight's epoch) at B's flight creation
     state["hold"] = hold = threading.Event()
     ta = threading.Thread(target=lambda: c.panel("od", credential_class="none"))
-    ta.start()
-    real_recent, wrote, real_lock = c._recent_snap, threading.Event(), st.lock
-    hook = _HookLock()
+    got: list = []
+    tb = threading.Thread(target=lambda: got.append(c.panel("od", credential_class="token")))   # not A's read-cache key: it reaches the flight
 
     def write_after_epoch_taken() -> None:
+        events.append("entry")
         state["rows"] = [_row(1), _row(2)]
         c.invalidate_reads(["od"], refresh=False)
+        events.append("write")
         wrote.set()
 
     def recent_then_arm(s, read_after=None):
         out = real_recent(s, read_after)
         if s is st and threading.current_thread() is tb:
-            hook.after = write_after_epoch_taken     # the next lock section on B's thread is ``_read_panel``'s epoch capture
-            st.lock = hook
+            hook.only, hook.after = tb, write_after_epoch_taken
+            st.lock = hook                                   # from here B's lock sections are logged
         return out
 
-    got: list = []
-    tb = threading.Thread(target=lambda: got.append(c.panel("od", credential_class="token")))   # not A's read-cache key: it reaches the flight
-    c._recent_snap = recent_then_arm
+    def single_flight(s, *a, on_start=None, **kw):
+        if s is st and threading.current_thread() is tb and on_start is not None:
+            inner = on_start
+
+            def on_start() -> None:                          # runs under ``st.lock`` at the flight's creation
+                inner()
+                events.append("start")
+                starts.append((st.epoch, st.pflight.epoch))
+        return real_single_flight(s, *a, on_start=on_start, **kw)
+
+    real_single_flight = c._single_flight
     try:
-        assert state["in_read"].wait(10)                     # A's flight is out with the old rows
-        tb.start()
-        assert wrote.wait(10)                                # B took its epoch, then the keyed write landed
+        c._recent_snap = recent_then_arm                     # type: ignore[method-assign]
+        c._single_flight = single_flight                     # type: ignore[method-assign]
+        try:
+            ta.start()
+            assert state["in_read"].wait(10)                 # A's flight is out with the old rows
+            with real_lock:
+                a_flight = st.pflight
+                assert a_flight is not None
+                a_flight.out = spy = _WaitSpy(st, a_flight, waiting)    # type: ignore[assignment]
+            tb.start()
+            assert wrote.wait(10)                            # B took its epoch, then the keyed write landed
+            assert waiting.wait(10), "B never blocked on A's pre-write flight"
+        finally:
+            state["hold"] = None
+            hold.set()                                       # only now: B is already waiting on A's flight
+            if ta.ident is not None:
+                ta.join(10)
+            if tb.ident is not None:
+                tb.join(10)
     finally:
-        state["hold"] = None
-        hold.set()
-        ta.join(10)
-        tb.join(10)
-        c._recent_snap = real_recent
+        c._recent_snap = real_recent                         # type: ignore[method-assign]
+        vars(c).pop("_single_flight", None)
         st.lock = real_lock
     assert not ta.is_alive() and not tb.is_alive() and got and {r["id"] for r in got[0]["rows"]} == {"r1", "r2"}
+    # the interleave the test names, not one it hopes for: B's first lock section after ``_recent_snap`` is ``_read_panel``'s
+    # entry capture (no other section sits between), the write lands right after it, B then finds A's flight under the
+    # older epoch and waits it out, and the flight B finally owns is created under the later epoch
+    assert [n for n, _ in hook.sections[:2]] == ["_read_panel", "_single_flight"], hook.sections
+    entry_epoch = hook.sections[0][1]
+    assert events == ["entry", "write", "start"], events
+    assert spy.waits and spy.waits[0][0] is tb
+    assert spy.waits[0][1] == entry_epoch and spy.waits[0][2] > entry_epoch      # A's flight is pre-write, the state is not
+    assert len(starts) == 1 and starts[0][0] == starts[0][1] > entry_epoch       # B's own flight began after the write
     assert state["reads"] == 2
+    assert st.commits == 1 and st.recent is not None         # A's pre-write read published nothing; B's read is the published one
     c.panel("od", credential_class="none")                   # B's read began after the write: inside the window it is shared
     assert state["reads"] == 2
 
