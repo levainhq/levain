@@ -105,7 +105,10 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
     const ke = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} }, generated_at: "2026-10-11T12:00:00+00:00",
       regions: { header: [], hero: [], brief: ["begin"], widgets: [], zones: [] }, panels: { begin: Object.assign(head("brief", "Where to begin"), { id: "begin" }) }, verbs: {}, errors: [], transport: { writable: false } };
     V.fromManifest({ manifest: ke, panels: { begin: Object.assign(head("brief", "Where to begin"), { id: "begin", brief: { headline: "x", lines: [] } }) } });
+    globalThis.LevainCockpitHeld = { begin: { etag: "old" } };
+    globalThis.__next = Object.assign(head("brief", "Where to begin"), { id: "begin", brief: { headline: "x", lines: [] }, etag: "new" });
     ok(await K.refetchPanel("begin") === "applied", "an undrawn brief-region panel needs no reload");
+    ok(globalThis.LevainCockpitHeld.begin.etag === "new", "its own read records the held etag, so the manifest diff converges: " + JSON.stringify(globalThis.LevainCockpitHeld));
     ok(await K.refetchPanel("ghost") === false, "a panel the manifest does not place still asks for a reload");
   }
   process.exit(failed ? 1 : 0);

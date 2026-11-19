@@ -1914,10 +1914,18 @@
   let boardEpoch = 0;
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   // A brief-region panel other than the state line has no copy on the page (the Today card is not drawn): an announcement of it has
-  // nothing to refresh, and answering false would reload the whole board each time it changes.
+  // nothing to repaint, and answering false would reload the whole board each time it changes. Its own read still records the held
+  // etag, so the stream's manifest diff stops announcing the same change.
   const briefUndrawn = (pid) => { const r = lastManifest && lastManifest.regions; return !!(r && Array.isArray(r.brief) && pid !== "state" && r.brief.indexOf(pid) >= 0); };
   async function refetchPanel(pid) {
-    if (!liveOf(pid).length) return briefUndrawn(pid) ? "applied" : false;
+    if (!liveOf(pid).length) {
+      if (!briefUndrawn(pid)) return false;
+      try {
+        const raw = await readPanel(pid), heldMap = root.LevainCockpitHeld;
+        if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
+      } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
+      return "applied";
+    }
     // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
     if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
     const gen = (refetchGen.get(pid) || 0) + 1;
