@@ -48,11 +48,14 @@ function fixture() {
   return { manifest, panels };
 }
 
-function makeEnv(verbAnswer, refetchAnswer) {
+// opts.real: the page's own LevainCockpitView.refetchPanel (no stand-in), so a panel the view cannot repaint in place answers false as it does on the board
+function makeEnv(verbAnswer, refetchAnswer, opts) {
+  opts = opts || {};
   const fx = fixture();
   const posts = [], gets = [], renders = [], marks = [];
   const store = () => { const m = {}; return { getItem: (k) => (k in m ? m[k] : null), setItem: (k, v) => { m[k] = String(v); }, removeItem: (k) => { delete m[k]; } }; };
-  let n = 0, gate = null, gated = false;
+  let n = 0, gate = null, gated = false, manifestGate = null;
+  const listeners = {};
   const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, text: async () => JSON.stringify(body), headers: { get: () => null }, clone() { return this; } });
   async function fetchFn(url, init) {
     if (init && init.method === "POST") {
@@ -61,7 +64,7 @@ function makeEnv(verbAnswer, refetchAnswer) {
       return resp(200, verbAnswer(body));
     }
     gets.push(url);
-    if (url.indexOf("/cockpit/manifest.json") >= 0) return resp(200, fx.manifest);
+    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (manifestGate) await manifestGate; return resp(200, fx.manifest); }
     const m = /\/cockpit\/panel\/([^?]+)\.json/.exec(url);
     const pid = m ? decodeURIComponent(m[1]) : null;
     if (pid && fx.panels[pid]) return resp(200, fx.panels[pid]);
@@ -74,8 +77,8 @@ function makeEnv(verbAnswer, refetchAnswer) {
                   querySelector: (sel) => (sel === ".clause" ? clauseEl : null), appendChild() {},
                   style: {}, title: "", attrs, setAttribute: (k, v) => { attrs[k] = String(v); }, getAttribute: (k) => (k in attrs ? attrs[k] : null) };
   const ls = store(); ls.setItem("levain_write_token", "tok");
-  const env = { posts, gets, renders, marks, rowEl, clauseEl, refetchCalls: [], releaseGate: () => {}, settled: [] };
-  const V = Object.assign({}, View, {
+  const env = { posts, gets, renders, marks, rowEl, clauseEl, refetchCalls: [], releaseGate: () => {}, releaseManifest: () => {}, settled: [], editing: false };
+  const V = Object.assign({}, View, opts.real ? {} : {
     refetchPanel: (pid) => {
       env.refetchCalls.push(pid);
       const mark = () => marks.push("get-resolved:" + pid);
@@ -89,11 +92,15 @@ function makeEnv(verbAnswer, refetchAnswer) {
   });
   const win = { LevainCockpitView: V, localStorage: ls, sessionStorage: store(), location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
-    LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false }, dispatchEvent() {} };
-  const doc = { getElementById: () => null, addEventListener() {}, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
+    LevainDashboard: { render: (view, o) => renders.push({ view, opts: o }), hasUnsavedEdit: () => env.editing, jobsActive: () => false }, dispatchEvent() {} };
+  const doc = { getElementById: () => null, addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
                 createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   env.V = V;
-  env.hold = () => { gated = true; gate = new Promise((r) => { env.releaseGate = r; }); };
+  // a board read already out: the manifest GET is held until released; the page's resume handler asks a passive load
+  env.holdManifest = () => { manifestGate = new Promise((r) => { env.releaseManifest = () => { manifestGate = null; r(); }; }); };
+  env.startPassiveLoad = () => { for (const f of listeners["levain:resume"] || []) f({ detail: {} }); };
+  env.manifestGets = (from) => env.gets.slice(from).filter((u) => u.indexOf("/cockpit/manifest.json") >= 0).length;
+  env.hold =() => { gated = true; gate = new Promise((r) => { env.releaseGate = r; }); };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
     await new Promise((r) => setTimeout(r, 30));
@@ -238,6 +245,22 @@ cases.a_panel_that_cannot_repaint_in_place_asks_one_passive_board_read = async (
   ok(manifests.length === 1, "one board read, not a latched second: " + JSON.stringify(env.gets.slice(getsBefore)));
 };
 
+// H1: the save's own re-read must rebuild the board (closing the form it came from) even though an edit is open, as the old
+// whole-board reload did; a passive read is refused for an open edit and the form would sit on "saving..." forever.
+cases.a_write_from_an_open_form_reads_the_board_non_passively = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => false).start();
+  const getsBefore = env.gets.length;
+  env.editing = true;                 // the form's own edit state: hasUnsavedEdit is true while it is open
+  env.holdManifest();                 // the board read stays out: the write must not wait on it
+  const timeout = new Promise((r) => setTimeout(() => r("waited"), 500));
+  const r = await Promise.race([env.snooze(), timeout]);
+  ok(r && r.ok === true, "the write answered without waiting on the board read: " + JSON.stringify(r));
+  await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "a board read was issued although an edit is open: " + JSON.stringify(env.gets.slice(getsBefore)));
+  env.releaseManifest();
+  await env.tick();
+};
+
 (async () => {
   for (const name of Object.keys(cases)) {
     if (only && name !== only) continue;
@@ -260,6 +283,7 @@ CASES = [
     "an_empty_touched_is_no_touched",
     "the_stream_announcing_a_refetched_panel_reads_it_once",
     "a_panel_that_cannot_repaint_in_place_asks_one_passive_board_read",
+    "a_write_from_an_open_form_reads_the_board_non_passively",
 ]
 
 

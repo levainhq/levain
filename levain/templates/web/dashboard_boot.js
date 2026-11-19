@@ -1096,8 +1096,7 @@
   }
 
   // Refetch ONLY the panels a write touched, in the place they are drawn, in the background: nothing here waits on a read and
-  // no whole-board load is asked for or queued. A panel the page cannot repaint in place (answered false) asks one passive
-  // board read, which a busy or editing page drops rather than queues.
+  // no whole-board load is waited on. A panel the page cannot repaint in place (answered false) asks for the board read, below.
   function refetchTouched(ids) {
     installRefetchDedup();
     const V = window.LevainCockpitView;
@@ -1108,7 +1107,10 @@
       try { done = Promise.resolve(read.call(V, pid)); } catch (_) { done = Promise.resolve("fault"); }
       done = done.catch(() => "fault");
       writeRefetches.set(pid, { at: Date.now(), done });
-      done.then((r) => { if (r === false) load({ passive: true }); });
+      // A panel the view cannot repaint in place asks for the board read, NOT passive and not awaited here: the rebuild it
+      // makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit and
+      // would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
+      done.then((r) => { if (r === false) load(); });
     }
     return true;
   }
