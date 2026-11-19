@@ -604,3 +604,56 @@ class TestServerProbe:
         assert probe.snapshot() == ({"a": "1"}, "v") and eng.snapshots == 1
         bare = ServerProbe(lambda: None, lambda: None, lambda: ({"bare": "1"}, None), slow_s=5.0)
         assert bare.snapshot() == ({"bare": "1"}, None) and isinstance(bare.change_seq(), int)
+
+
+# ---------------------------------------------------------------------------------------------- a construction that fails
+
+
+class TestConstructionFailure:
+    def _tracked_readers(self, monkeypatch) -> "list[Any]":
+        from levain.cockpit import snapshot_host as sh
+
+        made: list[Any] = []
+
+        class Tracked(sh.SnapshotReader):
+            def __init__(self, *a: Any, **k: Any) -> None:
+                super().__init__(*a, **k)
+                self.was_closed = False
+                made.append(self)
+
+            def close(self) -> None:
+                self.was_closed = True
+                super().close()
+
+        monkeypatch.setattr(sh, "SnapshotReader", Tracked)
+        return made
+
+    def test_a_derive_loop_that_cannot_be_built_leaves_no_open_reader_and_frees_the_writer_lock(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from levain.cockpit import snapshot_host as sh
+
+        made = self._tracked_readers(monkeypatch)
+
+        def refuse(*a: Any, **k: Any) -> None:
+            raise RuntimeError("no loop")
+
+        monkeypatch.setattr(sh, "DeriveLoop", refuse)
+        with pytest.raises(RuntimeError, match="no loop"):
+            SnapshotHost(Cockpit(), tmp_path)
+        assert len(made) == 1 and made[0].was_closed
+        monkeypatch.undo()
+        again, reason = SnapshotHost.try_open(Cockpit(), tmp_path)
+        assert again is not None, reason
+        again.stop()
+
+    def test_plans_that_cannot_be_made_leave_no_open_reader(self, tmp_path: Path, monkeypatch) -> None:
+        made = self._tracked_readers(monkeypatch)
+
+        def refuse(self: SnapshotHost) -> list:
+            raise RuntimeError("no plans")
+
+        monkeypatch.setattr(SnapshotHost, "_plans", refuse)
+        with pytest.raises(RuntimeError, match="no plans"):
+            SnapshotHost(Cockpit(), tmp_path)
+        assert len(made) == 1 and made[0].was_closed

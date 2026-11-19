@@ -295,14 +295,18 @@ class SnapshotHost:
         self._closed = False
         path = Path(data_root) / DB_FILENAME
         self._writer = SnapshotWriter(path)
+        reader: "SnapshotReader | None" = None
         try:
-            self._reader = SnapshotReader(path)
+            reader = self._reader = SnapshotReader(path)
             self._loop = DeriveLoop(
                 self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
                 poll_s=_engine().HEARTBEAT_CADENCE_S if poll_s is None else poll_s, token_fn=token_fn, clock=clock, on_publish=None,
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
+            # whatever was opened before the failure is released: the writer's lock and the reader's connection
+            if reader is not None:
+                reader.close()
             self._writer.close()
             raise
 
