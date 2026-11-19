@@ -21,8 +21,11 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional, Tuple, TypeVar
 
-__all__ = ["MIN_SQLITE", "open_durable", "read_transaction", "rollback", "write_transaction"]
+_T = TypeVar("_T")
+
+__all__ = ["HELD_READS_MAX", "HeldRead", "HeldReads", "MIN_SQLITE", "open_durable", "read_transaction", "rollback", "write_transaction"]
 
 MIN_SQLITE = (3, 35, 0)
 
@@ -122,17 +125,19 @@ def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> obj
 
 
 def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
-                 needs: str = "this store", busy_s: float | None = None) -> sqlite3.Connection:
+                 needs: str = "this store", busy_s: float | None = None,
+                 check_same_thread: bool = True) -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
     owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library,
     naming what ``needs`` it. ``busy_s`` (default :data:`BUSY_WAIT_S`) bounds every wait of the open itself (the
     WAL switch, the first read) and is the connection's busy timeout after: a caller on a deadline passes what is
-    left of it, and a lock held past it raises SQLite's own busy error."""
+    left of it, and a lock held past it raises SQLite's own busy error. ``check_same_thread=False`` is for
+    :class:`HeldReads`, whose connection is used by its one owning thread and closed by whichever thread drops it."""
     if min_sqlite is not None and _library_version() < min_sqlite:
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is older than "
                            f"{'.'.join(map(str, min_sqlite))}, which {needs} needs")
     wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
-    conn = sqlite3.connect(path, timeout=wait, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=wait, isolation_level=None, check_same_thread=check_same_thread)
     try:
         began = time.monotonic()
         _set_wal(conn, None if busy_s is None else wait)  # sidecars -wal/-shm stay beside the database
@@ -187,3 +192,176 @@ def read_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sqli
         conn.execute("COMMIT")
     finally:
         conn.close()
+
+
+#: The most :class:`HeldRead` connections held open at once in this process, across every :class:`HeldReads` and
+#: thread (read at call time). A call that finds none free reads on a connection it opens and closes itself.
+HELD_READS_MAX = 32
+
+
+class _Slots:
+    """The count of held connections open now, against :data:`HELD_READS_MAX`."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.taken = 0
+
+    def take(self) -> bool:
+        with self._lock:
+            if self.taken >= HELD_READS_MAX:
+                return False
+            self.taken += 1
+            return True
+
+    def give(self) -> None:
+        with self._lock:
+            self.taken -= 1
+
+
+_SLOTS = _Slots()
+
+# Runtime aliases in typing's spelling: root-side modules import this file on the 3.9 floor interpreter.
+#: A file's (device, inode) pair, or None when it is absent.
+_Node = Optional[Tuple[int, int]]
+#: The database file's (device, inode, size, mtime_ns, ctime_ns), then its ``-wal`` and ``-shm`` nodes.
+_Ident = Tuple[int, int, int, int, int, _Node, _Node]
+
+
+class HeldRead:
+    """One thread's held read connection to one database file, and the file identity it was opened against. ``slot``
+    is True while it holds one of :data:`HELD_READS_MAX`; :meth:`close` gives it back, once."""
+
+    __slots__ = ("conn", "ident", "slot")
+
+    def __init__(self, conn: sqlite3.Connection, ident: "_Ident | None", slot: bool = False) -> None:
+        self.conn = conn
+        self.ident = ident
+        self.slot = slot
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001 - closing a held connection never raises into its caller
+            pass
+        if self.slot:
+            self.slot = False
+            _SLOTS.give()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class HeldReads:
+    """A read connection held open per thread, in place of one open per call, for ONE owner that never hands it out:
+    the only way to read through it is :meth:`run`, which takes a function and returns what it returned.
+
+    It keeps no reference to its owner (``connect`` and ``path`` are passed to each call), so an owner made per call
+    and dropped closes its connections by refcounting, with no cycle for the collector to find.
+
+    :meth:`run` uses this thread's :class:`HeldRead`, opening it on first use, and reopens it when the file at ``path``
+    is no longer what the connection was opened against: deleted, replaced or moved (device or inode changed), or
+    written in place (size, modification time or inode change time changed: a copy over the file keeps its inode, and
+    SQLite keeps the connection's cached pages while the WAL index is unchanged; the change time moves on every write
+    and cannot be set back from userland, so a restore that puts the modification time back is still seen), or its
+    ``-wal`` or ``-shm`` sidecar appeared, went, or is another file (device or inode; their size and times are not
+    looked at, a commit writes them). A checkpoint writes the file too, which costs one reopen. The file is looked at
+    BEFORE the connection is opened, so a change in between makes the next call reopen, never keep a connection to the
+    old contents under the new identity; the sidecars are looked at again after the open (:meth:`_settled`), so a
+    sidecar swapped while the open runs is not seen. This is a bound, not a restore protocol: stop the serve before
+    restoring the database.
+
+    At most :data:`HELD_READS_MAX` connections are held at once in this process. A call that finds none free opens a
+    connection, reads the same way on it, and closes it; it gives the same answer. A held connection gives its slot
+    back when it closes: by :meth:`drop`, on an error, when its thread ends, or when this object is collected.
+
+    The held connection is ``query_only``, so a write through it is refused by SQLite. Each :meth:`run` is one
+    ``BEGIN`` .. read .. ``COMMIT``; any exception on the connection, the read's own included, closes it and forgets it
+    (so its transaction ends with it) before the exception propagates, and the next call opens a new one. A thread's
+    connection lives in ``threading.local``: it is closed when the thread ends, and when this object is collected.
+    There is no map to grow."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    @staticmethod
+    def _node(path: str) -> _Node:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    @staticmethod
+    def _ident(path: "Path | str") -> "_Ident | None":
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                HeldReads._node(f"{path}-wal"), HeldReads._node(f"{path}-shm"))
+
+    def get(self, connect: Callable[[], sqlite3.Connection], path: "Path | str") -> HeldRead:
+        """This thread's held connection, (re)opened with ``connect`` as the class docstring says. With no slot free
+        (:data:`HELD_READS_MAX`), a connection that is not kept: its ``slot`` is False, and the caller closes it."""
+        ident = self._ident(path)
+        held: "HeldRead | None" = getattr(self._local, "held", None)
+        if held is not None:
+            if ident is not None and held.ident == ident:
+                return held
+            self.drop()
+        slot = _SLOTS.take()
+        try:
+            conn = connect()
+        except BaseException:
+            if slot:
+                _SLOTS.give()
+            raise
+        held = HeldRead(conn, ident, slot)
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except BaseException:
+            held.close()
+            raise
+        if slot:
+            held.ident = self._settled(path, ident)
+            self._local.held = held
+        return held
+
+    @classmethod
+    def _settled(cls, path: "Path | str", before: "_Ident | None") -> "_Ident | None":
+        """The identity to keep for a connection just opened against ``before``. Opening a database no connection had
+        open makes its ``-wal`` and ``-shm``, so the sidecars are looked at again after the open; that look is kept
+        only when the database file itself is what it was before the open (else ``before`` is kept, and the next call
+        reopens)."""
+        after = cls._ident(path)
+        if before is not None and after is not None and after[:5] == before[:5]:
+            return after
+        return before
+
+    def drop(self) -> None:
+        """Close and forget THIS thread's held connection (the next :meth:`get` opens a new one)."""
+        held: "HeldRead | None" = getattr(self._local, "held", None)
+        self._local.held = None
+        if held is not None:
+            held.close()
+
+    def run(self, connect: Callable[[], sqlite3.Connection], path: "Path | str",
+            read: Callable[[sqlite3.Connection], _T]) -> _T:
+        """``read(conn)`` inside one ``BEGIN`` .. ``COMMIT`` on this thread's held connection. ``read`` must return
+        values, never a cursor or a row source: everything it executed is drained before it returns, so the ``COMMIT``
+        leaves no statement holding the snapshot. Any exception closes and forgets the connection, then propagates."""
+        held = self.get(connect, path)
+        kept, conn = held.slot, held.conn
+        try:
+            _until_not_busy(conn, lambda: conn.execute("BEGIN"))
+            answer = read(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            if kept:
+                self.drop()
+            else:
+                held.close()
+            raise
+        if not kept:
+            held.close()
+        return answer

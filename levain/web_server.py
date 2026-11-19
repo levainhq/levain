@@ -101,6 +101,7 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError, Lifecycle
 from levain.cockpit.firejournal import BOX_MINTER, OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
+from levain.cockpit.last_seen import LastSeenStamper
 from levain.cockpit.shortcode import SHORT_MAX_FAILURES, SHORT_PAIRING_TTL
 from levain.cockpit.anneal_effects import (
     EPISODES,
@@ -2132,6 +2133,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.receipt_gate = threading.BoundedSemaphore(_RECEIPT_SLOTS)
         self.pair_epoch = 0
         self.pair_epoch_lock = threading.Lock()
+        self.last_seen_stamper = LastSeenStamper()      # a paired device's last_seen, written off the request thread (D15b)
         # (verb, client_txn) -> params fingerprint, for each draft whose compose_signer call is in flight here
         # (_sign_compose): a second compose of the same draft waits on compose_wake for it (so two at once file one),
         # and a compose of any other draft never waits. A concurrency primitive only, never the record: which request a
@@ -2271,6 +2273,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
 
             withdraw_origin(*self.published_origin)
             self.published_origin = None
+        self.last_seen_stamper.close()      # no new stamp queues; its thread is waited for, bounded, never held on
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self._close_voice_streams()
         self.stream_watcher.stop()
@@ -2736,11 +2739,11 @@ class _Handler(GuardedHandler):
                 raise _CredentialUnavailable(f"{type(exc).__name__}") from exc
         finally:
             srv.pair_verify_gate.release()
-        # F1: the last_seen stamp runs AFTER the answer and after the verify slot is released, with no busy wait
-        # (busy_timeout 0), and nothing it does reaches the answer
+        # F1 / D15b: the last_seen stamp is queued AFTER the answer and after the verify slot is released; the
+        # stamper's own thread writes it, and nothing it does reaches the answer or waits on this thread
         if device is not None:
             try:
-                db.stamp_last_seen(device, now=now)
+                srv.last_seen_stamper.note(db, device, now)
             except Exception:  # noqa: BLE001 - a display stamp never fails a request
                 _log.debug("paired device last_seen stamp skipped", exc_info=True)
         return device

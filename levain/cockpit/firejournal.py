@@ -50,7 +50,7 @@ from levain.cockpit.consent import (
 )
 from levain.cockpit.shortcode import (SHORT_ALPHABET, SHORT_LENGTH, SHORT_MAX_FAILURES, SHORT_PAIRING_TTL,
                                        display_short, normalize_short)
-from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import HeldReads, MIN_SQLITE, open_durable, read_transaction, write_transaction
 # the journal is history across the rename: a row the release that said "spore" wrote is read in the new words
 from levain.intention_legacy import (
     read_recorded_key,
@@ -653,9 +653,10 @@ def _request_shape(record: Mapping[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------------------------------
 
 class CockpitDB:
-    """``cockpit.db`` in ``data_root``. Every operation opens its own connection; every write is one
-    ``BEGIN IMMEDIATE`` transaction. ``data_root`` must exist: the broker's start sequence checks and
-    owns it (§4.2, §6), so this never creates it."""
+    """``cockpit.db`` in ``data_root``. Every operation opens its own connection, except :meth:`verify_device`, which
+    reads through a connection held per thread that nothing else is ever handed (:attr:`_cred`); every write is one
+    ``BEGIN IMMEDIATE`` transaction. ``data_root`` must exist: the broker's start sequence checks and owns it (§4.2,
+    §6), so this never creates it."""
 
     def __init__(self, data_root: Path | str, *, install_class: str | None = None, owns_lock: bool = False) -> None:
         """``install_class`` is the class this opener serves (None: it migrates nothing) and
@@ -667,16 +668,19 @@ class CockpitDB:
         self._ready = False
         self._install_class = install_class
         self._owns_lock = owns_lock
+        self._cred = HeldReads()        # verify_device's connection per thread; read() never hands it out
 
     # -- connection -----------------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, held: bool = False) -> sqlite3.Connection:
+        """A new connection. ``held`` is for :attr:`_cred` alone: one its owning thread uses and any thread may close."""
         if self._ready:
             if not self.path.exists():
                 raise CockpitFormatError(f"journal {self.path} has disappeared")
         elif not self.data_root.is_dir():
             raise CockpitFormatError(f"data root {self.data_root} is not a directory")
-        conn = open_durable(self.path, min_sqlite=MIN_SQLITE, needs="the cockpit journal's RETURNING")
+        conn = open_durable(self.path, min_sqlite=MIN_SQLITE, needs="the cockpit journal's RETURNING",
+                            check_same_thread=not held)
         conn.row_factory = sqlite3.Row
         try:
             if not self._ready:
@@ -764,7 +768,7 @@ class CockpitDB:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        """A consistent read snapshot."""
+        """A consistent read snapshot, on a connection of its own that is closed when the block ends."""
         with read_transaction(self._connect) as conn:
             yield conn
 
@@ -1244,15 +1248,22 @@ class CockpitDB:
 
     def verify_device(self, token: str, *, now: datetime) -> str | None:
         """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of
-        its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock); the
-        ``last_seen`` stamp is :meth:`stamp_last_seen`, which the caller runs AFTER this answer (F1)."""
+        its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock). The
+        ``last_seen`` stamp is not taken here (:meth:`stamp_last_seen`).
+
+        Every call looks the token up, in its own transaction, on the calling thread's credential connection
+        (:attr:`_cred`): no answer is remembered, and no other method reads through that connection. A token that
+        resolves to no live device closes the thread's connection, so only a thread whose last answer was a device
+        keeps one open (a token-shaped header alone never leaves a connection held). Any error propagates and closes
+        the connection: the caller refuses on it, never admits."""
         del now
-        with self.read() as conn:
-            row = conn.execute("SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?",
-                               (_sha256(token),)).fetchone()
-        if row is None or row["revoked_at"] is not None:
+        key = _sha256(token)
+        rows = self._cred.run(lambda: self._connect(held=True), self.path, lambda conn: conn.execute(
+            "SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?", (key,)).fetchall())
+        if not rows or rows[0]["revoked_at"] is not None:
+            self._cred.drop()
             return None
-        return str(row["id"])
+        return str(rows[0]["id"])
 
     def stamp_last_seen(self, device_id: str, *, now: datetime) -> bool:
         """Stamp ``device_id``'s ``last_seen`` when it is due (at most once per ``LAST_SEEN_EVERY``), fail-soft: the

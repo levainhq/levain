@@ -204,6 +204,18 @@ def _raw_passkey_link(db: Path, phone: SoftPasskey, op: dict, origin: str) -> st
         conn.close()
 
 
+def _copy_journal(src: Path, dst: Path) -> None:
+    """A copy of the journal with every commit in it: the server's threads hold read connections open, so the last
+    close no longer folds the write-ahead log into ``cockpit.db``, and a bare file copy can miss the newest commits."""
+    dst.unlink(missing_ok=True)
+    a, b = sqlite3.connect(src), sqlite3.connect(dst)
+    try:
+        a.backup(b)
+    finally:
+        b.close()
+        a.close()
+
+
 def test_the_replay_takes_a_passkey_revoke_of_a_consent_grant_only_and_only_from_https(world, tmp_path) -> None:
     """Reproduced on 3522dba2 (m17/repro_on_3522dba2.txt, HIGH1): a passkey-signed revoke_grant of an EGRESS grant,
     inserted raw, was ACCEPTED by a fresh replay and removed the grant. And (m17/hardcheck_run.txt, 4b) a raw revoke
@@ -220,10 +232,10 @@ def test_the_replay_takes_a_passkey_revoke_of_a_consent_grant_only_and_only_from
         conn.close()
     world.grant("cg-0123456789ab")
     copy = tmp_path / "egress.db"
-    shutil.copy(world.root / "cockpit.db", copy)
+    _copy_journal(world.root / "cockpit.db", copy)
     got = _raw_passkey_link(copy, world.phone, {"op": "revoke_grant", "grant_id": "eg-1"}, ORIGIN)
     assert "a passkey key revokes a consent grant or an inert one only, never grant 'eg-1'" in got
-    shutil.copy(world.root / "cockpit.db", copy)          # control: the same raw path on the consent grant lands
+    _copy_journal(world.root / "cockpit.db", copy)          # control: the same raw path on the consent grant lands
     assert _raw_passkey_link(copy, world.phone, {"op": "revoke_grant", "grant_id": "cg-0123456789ab"},
                              ORIGIN) == "ACCEPTED"
     # a passkey made on localhost: enrolled, valid WebAuthn, and still refused by the replay
@@ -235,7 +247,7 @@ def test_the_replay_takes_a_passkey_revoke_of_a_consent_grant_only_and_only_from
                 "custody": "passkey"})
     finally:
         conn.close()
-    shutil.copy(world.root / "cockpit.db", copy)
+    _copy_journal(world.root / "cockpit.db", copy)
     got = _raw_passkey_link(copy, local, {"op": "revoke_grant", "grant_id": "cg-0123456789ab"},
                             "http://localhost:7428")
     assert "a passkey made on localhost signs no authority link" in got
