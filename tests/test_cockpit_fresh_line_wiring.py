@@ -222,7 +222,7 @@ def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_fail
 
 @needs_browser
 def test_a_parenthesis_that_is_part_of_a_panel_title_is_kept_in_the_line(tmp_path: Path) -> None:
-    """The line strips what the heading adds (a count, 'unavailable'), not a title's own closing parenthesis."""
+    """A title's own parenthesis stays in the line (a year included); only the '(unavailable)' the heading adds is removed."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
     steps = [READY, LIVE, SETTLE, _run(STUB2), title,
              _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (remote)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1")]

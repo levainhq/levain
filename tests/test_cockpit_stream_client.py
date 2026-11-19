@@ -374,7 +374,51 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
     ok(!h.live().some((x) => x.ms === 5000), "the owed read after a hide does not start the schedule over");
     for (let i = 0; i < 6; i++) { t = h.live().find((x) => [5000, 15000, 60000].includes(x.ms)); if (!t) break; t.off = true; t.fn(); await settle(); }
-    ok(calls.length === 4, "the event, two retries and the owed read, then it waits: " + calls.length);
+    ok(calls.length === 5, "the event, the first retry, the owed read (a read, not a retry), then the two steps it had not taken, then it waits: " + calls.length);
+  }
+  // ---- a step is spent when its timer FIRES: timers cancelled before that (a whole draw, a hide) spend nothing ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    for (let i = 0; i < 5; i++) {
+      (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());     // a whole draw cancels the pending timer and schedules again
+      await settle();
+    }
+    for (let i = 0; i < 5; i++) {
+      h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();     // a hide cancels it too
+      h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    }
+    const before = calls.length;
+    const t = h.live().find((x) => x.ms === 5000);
+    ok(!!t, "after ten cancelled timers the first step is still the next one: " + JSON.stringify(h.live().filter((x) => !x.every).map((x) => x.ms)));
+    if (t) { t.off = true; t.fn(); await settle(); }
+    ok(calls.length === before + 1 && h.live().some((x) => x.ms === 15000), "a retry still happens, and the second step follows it");
+  }
+  // ---- a panel recovered by a direct refetchPanel (no stream path) starts its budget over ----
+  {
+    const h = boot({ manifest: () => ({ panels: { a: { etag: "m" }, b: { etag: "1" } } }) });
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    ok(!h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "the budget is spent");
+    // a write's refetch read the panel well: the record is clean and the page says so (the stream path was not involved)
+    delete h.win.LevainCockpitHeld.a.err;
+    (h.listeners["levain:fresh"] || []).forEach((f) => f());
+    // a later transient fault leaves the panel never read; the next reconciliation reads it again, which it would not with a spent budget
+    delete h.win.LevainCockpitHeld.a.etag;
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    const before = calls.length;
+    h.fetches[0].push(frame("hello", "E.1:2", { epoch: "E.1", resync: true }));
+    await settle();
+    ok(calls.length === before + 1 && h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "a fresh fault is read again and has retry steps left: " + (calls.length - before));
   }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });

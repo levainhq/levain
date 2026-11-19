@@ -96,9 +96,9 @@
     if (n >= FAULT_RETRY_MS.length) return;
     // a retry started while hidden would run unseen and spend the budget: it is owed to the visible edge instead
     if (paused) { if (owed.indexOf(id) < 0) owed.push(id); return; }
-    tries[id] = n + 1;
     var f = { timer: 0 };
-    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id); } }, FAULT_RETRY_MS[n]);
+    // a step is spent when its timer fires: a timer cancelled before that (a whole draw, a hide) spends nothing
+    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; tries[id] = (tries[id] || 0) + 1; refetch(id); } }, FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
 
@@ -235,8 +235,13 @@
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
       if (h[id] && h[id].etag === heads[id].etag) return;
-      // a panel never read (held `err`, no etag) differs from every head: once its budget is spent it waits for an event or a recovery
-      if (h[id] && h[id].err && !h[id].etag && (tries[id] || 0) >= FAULT_RETRY_MS.length) return;
+      // a panel never read (held `err`, no etag) differs from every head, so this read is a retry taken early (it replaces the pending timer
+      // and spends the step); once the budget is spent it waits for an event or a recovery
+      if (h[id] && h[id].err && !h[id].etag) {
+        var n = tries[id] || 0;
+        if (n >= FAULT_RETRY_MS.length) return;
+        tries[id] = n + 1;
+      }
       reread(id);
     });
   }
@@ -318,12 +323,19 @@
     else if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
     // a panel that whole read could not read (drawn as unavailable) enters the same bounded retry as a refetch that failed
     if (started) {
+      sweepTries();
       var h = held();
-      Object.keys(tries).forEach(function (id) { if (!(h[id] && h[id].err)) delete tries[id]; });     // it recovered
       Object.keys(h).forEach(function (id) { if (h[id] && h[id].err) scheduleFault(id); });
     }
   }
+  // a panel whose held record has no `err` has recovered, by whatever path read it: its budget starts over
+  function sweepTries() {
+    var h = held();
+    Object.keys(tries).forEach(function (id) { if (!(h[id] && h[id].err)) delete tries[id]; });
+  }
   document.addEventListener("levain:cockpit-held", onDrawn);
+  // refetchPanel says this after every settled panel read, a direct caller's (a write's refetch, the topology replay) included; it only deletes
+  document.addEventListener("levain:fresh", sweepTries);
 
   function start() {
     if (started) return;
