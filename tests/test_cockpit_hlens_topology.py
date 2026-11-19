@@ -25,8 +25,8 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_header_lens_in_eithe
     for lens in ("agents", "work"):
         # the stored lens is read when the page paints: store it, reload, and wait for the fault line again, so the paint under test is the one
         # drawn with the lens in force (a lens that is not the pressed one means the test would be grading the other lens)
-        steps = [{"eval": "localStorage.setItem('levain_cockpit_header_lens', '%s'); setTimeout(() => location.reload(), 0); 1" % lens},
-                 {"eval": "new Promise(r => setTimeout(r, 1500))"}, {"until": LINE}, {"eval": probe}]
+        steps = [{"eval": "localStorage.setItem('levain_cockpit_header_lens', '%s'); window.__pre148 = 1; setTimeout(() => location.reload(), 0); 1" % lens},
+                 {"until": "!window.__pre148 && " + LINE}, {"eval": probe}]       # the reloaded document has no __pre148: no fixed sleep across the reload
         out = _run(tmp_path, src, steps, first=MID, until=LINE)
         got = json.loads(out[-1])
         assert got["pressed"] == [lens], (lens, got)
