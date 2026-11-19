@@ -780,3 +780,19 @@ def test_a_manifests_panels_are_in_drawing_order_whatever_reads_them(tmp_path: P
         assert list(heads) == drawing                              # and the head layer hands them over in that order itself
     finally:
         r.close()
+
+
+def test_a_band_row_whose_since_cannot_be_set_against_the_clock_reads_with_no_age(tmp_path: Path) -> None:
+    def read(ctx: ReadContext) -> Read:
+        return Read(rows=(RowIn("band:a", "a", {"at": "2026-11-19", "band_since": "0001-01-01T00:00:00"},
+                                stored={"id": "band:a"}),))
+
+    spec = ProviderSpec(id="band", kind="triage-list", title="band", priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at", "band_since"}), version_fields=("id",))
+    r = Rig(tmp_path, ("band",), specs={"band": spec})
+    try:
+        r.derive()
+        for got in (r.ck.panel("band"), r.ck.panel("band", q="a")):
+            assert got["rows"][0]["id"] == "band:a" and "band_age" not in got["rows"][0]["facets"]
+    finally:
+        r.close()

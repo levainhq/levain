@@ -2682,7 +2682,7 @@ class Cockpit:
             if isinstance(facets, dict) and facets.get("band_since"):
                 try:
                     age = _age_text(facets["band_since"], now)
-                except TypeError:     # a clock without an offset cannot be set against an aware instant
+                except (TypeError, ValueError):     # an instant that cannot be set against this clock (no offset, or out of range) has no age
                     age = None
                 if age:
                     r = {**r, "facets": {**facets, "band_age": age}}
