@@ -3995,7 +3995,9 @@ body.ia[data-ia-place="home"] .ia-graph-toggle {
   padding: 0 var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--text);
   font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens :is(.tv-lensbody, .tv-legend) { display: none !important; }
-body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-skycard { min-height: 0; padding-block: var(--sp-3); }
+/* the Event graph is the page's own #ck-sky and its legend beside the lens bar, not inside it */
+body.ia[data-ia-place="home"]:not(.ia-graph-open) :is(#ck-sky, #ck-legend) { display: none !important; }
+body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-skycard { min-height: calc(var(--seg-h) + var(--sp-4) + var(--sp-3)); padding-block: var(--sp-3); }
 body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 160px; }
 
 /* the Work head takes the whole row; it gives up its last four columns only while the Reset layout control is drawn beside it */
