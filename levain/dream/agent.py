@@ -1884,9 +1884,8 @@ def dream_program_view(agent_dir: Path | str, spec_hash: object = None) -> Progr
             if inst.shadow_flow_root is None:
                 source = _spec_source(agent_dir, h)
                 signed = live_bound_of(source)
-                if source == LIVE_SOURCE:
-                    bound = (inst.claude_bin or DEFAULT_CLAUDE_BIN) == DEFAULT_CLAUDE_BIN
-                elif signed is not None and _well_formed_bound(signed):
+                if source == LIVE_SOURCE or (signed is not None and _well_formed_bound(signed)):
+                    # the signed program (the default for the bare LIVE_SOURCE), as the success path reads it
                     bound = bound_pair(signed)[0] == (inst.claude_bin or DEFAULT_CLAUDE_BIN)
         except Exception:  # noqa: BLE001 - advisory only
             bound = None

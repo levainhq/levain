@@ -2607,11 +2607,17 @@ def _check_dream_claude_bin(agent_dir: Path | None = None) -> list[CheckResult]:
     line = None if v is None else v.line()
     if line is None:
         return []
-    fix = ("To return to the default program, remove `claude_bin` from dream_install.json (re-running `levain dream "
-           "enable` keeps the program already there, and it has no flag that sets it); if the dream was signed with "
-           "this program, then run `levain dream enable --revise` and sign the new link.")
-    return [CheckResult("dream program", True, line, fix if v.program is not None else
-                        "Fix the facts file, then run `levain dream enable --revise` if its facts changed.", warn=True)]
+    program_hint = ("The program the install names and the program the signed link binds must be the same: restore "
+                    "the program the link was signed for, or sign a new link for this one (`levain dream enable "
+                    "--help`).")
+    facts_hint = "Fix the facts file the note names; a fire is refused until it can be read."
+    if v.note is None:
+        hint = program_hint
+    elif v.program is None:
+        hint = facts_hint
+    else:
+        hint = f"{facts_hint} Then: {program_hint}"
+    return [CheckResult("dream program", True, line, hint, warn=True)]
 
 
 def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, exc: BaseException) -> CheckResult:

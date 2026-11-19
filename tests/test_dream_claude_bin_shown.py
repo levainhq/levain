@@ -11,6 +11,8 @@ from levain.dream import agent as da
 from tests.test_dream_live_binding import _enabled, _hand_edit, _show_json, env  # noqa: F401 - env is a fixture
 
 FALSE_CLAIM = "does not bind a live install's program"
+INVARIANT = ("the program the install names and the program the signed link binds must be the same: restore the "
+             "program the link was signed for, or sign a new link for this one")
 
 
 def _show_text(env, capsys) -> str:
@@ -71,8 +73,9 @@ def test_a_program_the_link_does_not_bind_is_a_refusal_never_a_run(env, capsys):
     assert j["dream_install_refusal"] and j["dream_claude_bin"] == bin_ and "a fire runs" not in j["dream_program_line"]
     (row,) = doctor._check_dream_claude_bin(env["ag"])
     assert row.ok and row.warn and "does not bind it: a fire is refused" in row.detail and "a fire runs" not in row.detail
-    # the real restore: re-running enable keeps the program, so the hint names removing it and --revise
-    assert "remove `claude_bin`" in row.hint and "enable --revise" in row.hint and "keeps the program" in row.hint
+    # the hint states only the invariant true for every link history, never a step that is wrong for some
+    assert INVARIANT in row.hint.lower() and "enable --help" in row.hint
+    assert "remove" not in row.hint and "--revise" not in row.hint and "facts file" not in row.hint
 
 
 def test_the_program_is_shown_from_one_read_of_the_install(env, capsys, monkeypatch):
@@ -133,6 +136,52 @@ def test_an_unrelated_bad_fact_does_not_hide_the_program(env, capsys):
     assert f"names the program {bin_!r}" in _show_text(env, capsys)
     (row,) = doctor._check_dream_claude_bin(env["ag"])
     assert row.warn and "cannot read the install" in row.detail
+    # program AND a bad fact: the hint names both, the fact first
+    assert row.hint.startswith("Fix the facts file") and INVARIANT in row.hint.lower()
+
+
+def test_a_bad_fact_alone_gets_the_facts_hint_not_the_program_one(env, capsys):
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    _hand_edit(env, store_path=str(env["tmp"] / "gone.db"))
+    v = da.dream_program_view(env["ag"])
+    assert v.program is None and v.note and v.line().startswith("cannot read the install")
+    (row,) = doctor._check_dream_claude_bin(env["ag"])
+    assert row.hint.startswith("Fix the facts file") and "signed link binds" not in row.hint
+
+
+def test_a_program_mismatch_alone_gets_the_program_hint(env, capsys):
+    _signed_with(env, capsys, _stub(env))
+    _hand_edit(env, claude_bin=str(env["tmp"] / "other"))
+    v = da.dream_program_view(env["ag"])
+    assert v.refusal is not None and v.bound is False and v.note is None
+    (row,) = doctor._check_dream_claude_bin(env["ag"])
+    assert INVARIANT in row.hint.lower() and "enable --help" in row.hint and "Fix the facts file" not in row.hint
+
+
+def test_an_explicit_null_program_is_the_default_like_a_missing_key(env, capsys):
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    path = env["ag"] / da.INSTALL_FILE
+    for null in (True, False):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc.pop("claude_bin", None)
+        if null:
+            doc["claude_bin"] = None
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        da.check_program_facts(doc, "x")  # the fire's check accepts it as the default
+        v = da.dream_program_view(env["ag"])
+        assert v.program is None and v.note is None and v.refusal is None and v.line() is None
+        assert _show_json(env, capsys)["dream_claude_bin"] is None
+        assert doctor._check_dream_claude_bin(env["ag"]) == []
+
+
+def test_a_live_source_refusal_for_another_fact_still_reads_the_program_as_bound(env, capsys):
+    da.write_install(env["ag"], **env["kw"])
+    _enabled(env, capsys)
+    _hand_edit(env, model="some-other-model")
+    v = da.dream_program_view(env["ag"])
+    assert v.refusal is not None and v.bound is True and v.program is None
 
 
 def test_an_unreadable_install_says_so_through_the_cli_and_the_doctor(env, capsys):
