@@ -1153,7 +1153,8 @@
 
 /* the freshness line (levain#159, fresh_line.js): the dot, the state words, then the age beside them. The words and the age are
    two spans so that only the words are in the live region (the age ticks and is never spoken). Where the line is short of room
-   the age is cut first and then the words, each with an ellipsis, never a wrapped second line; the full sentence is its title.
+   the age is cut first and then the words, each with an ellipsis, so the text itself never wraps to a second line (where the CHIP sits in a
+   wrapping masthead is the rules at 720 px and 1100 px below); the full sentence is its title.
    data-state names the state (connecting, live, stale: a panel, down: the change stream, failed: a read, refused); the dot's
    colour is never the only signal, the words carry it. Nothing here animates. */
 .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--meta); display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; max-width: 34ch; }
@@ -4167,14 +4168,15 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead .themesw button { min-width: var(--hit-min, 44px); }   /* the icon-only ones are 44 wide too (the Drop / Grants / Notifications buttons are, in the block above) */
   body.ke .masthead .themesw, body.ke .masthead .indicators button { height: auto; }
 }
-/* the three theme buttons are 44 wide on touch (144 px with their padding, 36 px each before), so on a phone the brand leaves them 164 px
-   on its row, not 140: the brand and the theme switch stay one row and Drop, Grants, Notifications and Jump keep theirs */
-@media (pointer: coarse) and (max-width: 720px) {
+/* the three theme buttons are 44 wide up to 720 px whatever the pointer (144 px with their padding, 36 px each before), so the brand leaves
+   them 164 px on its row, not 140: the brand and the theme switch stay one row, which also leaves the freshness line the room of the
+   buttons' row instead of sharing it with the switch (a mouse at 481 to 720), and Drop, Grants, Notifications and Jump keep theirs */
+@media (max-width: 720px) {
   body.ia .masthead .brand { flex-basis: calc(100% - 164px); }
 }
 
 /* the phone's header: Drop, Grants, Notifications and Jump are one row, and the freshness line is right-aligned after them on that row
-   (it ellipsizes before it wraps); the presence chip takes its own row after them, and the transient status line the one after that,
+   (its text is cut with an ellipsis before it wraps); the presence chip takes its own row after them, and the transient status line the one after that,
    where the chip used to sit between them and push Jump onto a row of its own */
 @media (max-width: 720px) {
   body.ia .masthead .indicators > .ia-actions, body.ia .masthead #jumpbtn { order: 3; }
@@ -4182,8 +4184,16 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead #freshline { order: 4; flex: 1 1 0; min-width: 7ch; max-width: none; justify-content: flex-end; }
   /* the state words keep their room and the age takes what is left of the row (an ellipsis on the age first, then on the words) */
   body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
-  body.ia .masthead #presencebtn { order: 5; }
+  /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
+  body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
   body.ia .masthead #stamp { order: 6; }
+}
+/* Between the phone and the desktop bar the masthead wraps and is pinned, so the line's footprint must not depend on what it says: a
+   zero basis with a floor that holds the dot and the longest state words, and the room left over is the age's. A line sized by its text
+   took its own row when a trouble state arrived and moved the bar and everything under it. */
+@media (min-width: 721px) and (max-width: 1100px) {
+  body.ia .masthead #freshline { flex: 1 1 0; min-width: 18ch; max-width: none; justify-content: flex-end; }
+  body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
 }
 /* the transient status line (#stamp) is empty until a read, a notice or a refusal writes it: empty, it takes no row */
 body.ia .masthead .stamp:empty { display: none; }

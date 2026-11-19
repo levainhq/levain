@@ -16,7 +16,7 @@
  *
  * The stream does not paint anything. It keeps the facts the masthead's freshness line needs (its state, the last bytes, the last good
  * manifest read, the panels whose refetch failed) and says `levain:fresh` when one changes; fresh_line.js reads them through
- * window.LevainStreamFacts and writes the line (#freshline, which ensureChip adopts). A heartbeat updates `lastChunk` and tells no one. */
+ * window.LevainStreamFacts and writes the line (#freshline). A heartbeat updates `lastChunk` and tells no one. */
 (function (root) {
   "use strict";
   var EVENTS = "/cockpit/events";
@@ -27,13 +27,12 @@
   var FAULT_RETRY_MS = [5000, 15000, 60000];
   var PENDING_RETRY_MS = [5000, 15000, 60000];   // the last step repeats while a reload is still pending
   var RELOAD_GAP_MS = 10000;
-  var HELLO_MS = 8000;               // a connection that has not said hello by now is dead: the chip says stale, the retry runs
-  var DRAW_WAIT_MS = 30000;          // how long the stream waits for a first draw before saying it is not live
+  var HELLO_MS = 8000;               // a connection that has not said hello by now is dead: it is dropped and the retry runs
+  var DRAW_WAIT_MS = 30000;          // how long the stream waits for a first draw before it gives up (state "off")
 
   var T = null, V = null;
-  var chip = null;
   var abort = null, watchdog = 0, retryTimer = 0, pollTimer = 0, reloadTimer = 0;
-  var attempt = 0, staleSince = null, epoch = null, started = false, paused = false, gaveUp = false;
+  var attempt = 0, staleSince = null, epoch = null, started = false, paused = false, gaveUp = false, everLive = false;
   var lastId = null, pollTag = null, lastConnect = 0, lastChunk = 0;
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
@@ -42,26 +41,23 @@
   var bytesAt = 0;                    // the last bytes of any connection (lastChunk restarts with each connection; this does not)
   var pollOkAt = 0, lastHeads = null, lastHeadsAt = 0;   // the last good manifest read (a 304 counts), and the heads it carried
 
-  // the stream's state as the line names it: off (gave up waiting for a first draw), paused (hidden tab), down, live, connecting
+  // the stream's state as the line names it: off (gave up waiting for a first draw), paused (hidden tab), down, live, connecting; null when
+  // this page never runs a stream (the line then has no stream words to say)
   function streamState() {
+    if (!started) return null;
     if (gaveUp) return "off";
     if (paused) return "paused";
     if (staleSince) return "down";
     return epoch ? "live" : "connecting";
   }
   function facts() {
-    return { state: streamState(), since: staleSince ? staleSince.getTime() : null, lastChunk: bytesAt, pollOkAt: pollOkAt,
+    return { state: streamState(), everLive: everLive, since: staleSince ? staleSince.getTime() : null, lastChunk: bytesAt, pollOkAt: pollOkAt,
       faults: Object.keys(failed), heads: lastHeads, headsAt: lastHeadsAt };
   }
   root.LevainStreamFacts = facts;
   // tell the line that a fact moved (a state change, a read that settled): never a heartbeat
   function tell() {
     try { if (typeof document.dispatchEvent === "function" && typeof root.CustomEvent === "function") document.dispatchEvent(new root.CustomEvent("levain:fresh")); } catch (_) { /* no line to tell */ }
-  }
-  function ensureChip() {
-    if (chip && chip.isConnected) return;
-    chip = document.getElementById ? document.getElementById("freshline") : null;
-    tell();
   }
 
   function held() { return root.LevainCockpitHeld || {}; }
@@ -123,11 +119,21 @@
       if (r === "applied" || r === true) {
         clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
         if (failed[id]) delete failed[id];
+        noteHead(id);
         tell();
       } else if (r === "fault") { failed[id] = true; scheduleFault(id); tell(); }
       else wantReload();
       return r;
     }, function () { failed[id] = true; scheduleFault(id); tell(); return "fault"; });
+  }
+  // the head this stream keeps for a panel follows the panel's own read (the status and read time refetchPanel recorded), as the view's does
+  function noteHead(id) {
+    var rec = held()[id];
+    if (!lastHeads || !lastHeads[id] || !rec) return;
+    var nx = {};
+    if (typeof rec.status === "string") nx.status = rec.status;
+    if (typeof rec.as_of === "string") nx.as_of = rec.as_of;
+    lastHeads[id] = Object.assign({}, lastHeads[id], nx);
   }
   function onEvent(id) { clearFault(id); return refetch(id); }
 
@@ -149,6 +155,7 @@
     if (id) lastId = id;
     if (event === "hello") {
       epoch = body.epoch || "?";
+      everLive = true;
       staleSince = null;
       attempt = 0;
       stopPoll();
@@ -184,7 +191,6 @@
     if (paused) return;
     lastConnect = Date.now();
     lastChunk = 0;
-    ensureChip();
     var ctl = new AbortController();
     abort = ctl;
     arm(HELLO_MS);
@@ -304,7 +310,6 @@
     // the legacy substrate page draws no cockpit panels
     if (new URLSearchParams(root.location.search).get("source") === "substrate") return;
     started = true;
-    ensureChip();
     tell();
     document.addEventListener("visibilitychange", function () { if (document.hidden) pause(); else resume(); });
     whenDrawn(Date.now() + DRAW_WAIT_MS);

@@ -45,8 +45,7 @@ def test_the_line_is_the_one_livechip_with_the_state_words_alone_in_the_live_reg
     assert 'role="status"' in m.group(1) and 'class="fl-state"' in m.group(1)               # the words, and only the words, are spoken
     assert HTML.index('id="presencebtn"') < HTML.index('id="freshline"') < HTML.index('id="jumpbtn"')
     assert HTML.index('<script src="/fresh_line.js">') < HTML.index('<script src="/cockpit_stream.js">')
-    assert 'document.createElement("span")' not in STREAM.split("function ensureChip")[1].split("function held")[0]   # the stream adopts, it does not create a second chip
-    assert 'getElementById("freshline")' in STREAM
+    assert "createElement" not in STREAM and "getElementById" not in STREAM                       # the stream creates no chip and looks none up: it only says what it knows
 
 
 def test_the_phone_rules_that_hid_the_stamp_and_zeroed_the_chip_font_are_gone() -> None:
@@ -185,6 +184,13 @@ Object.defineProperty(document, 'hidden', { configurable: true, get: () => false
 document.dispatchEvent(new Event('visibilitychange')); advance(3100);
 out.seen = snap();
 
+// 10. a stream that has never been live is given the longer hold: a slow first hello is not "stream down"
+F.reset(); facts.boot = { wholeDrawn: false, lastWholeAt: 0 }; facts.stream = { state: 'connecting' }; tell();
+facts.boot = { wholeDrawn: true, lastWholeAt: fake.now, inflight: false, inflightAt: 0, refused: false, failed: '', failedAt: 0 };
+facts.stream = { state: 'connecting', everLive: false, faults: [] }; tell(); advance(5000); out.slowHello5 = snap(); advance(4100); out.slowHello9 = snap();
+F.reset(); facts.boot = { wholeDrawn: false, lastWholeAt: 0 }; facts.stream = { state: 'connecting' }; tell();
+live(); facts.stream = { state: 'connecting', everLive: true, faults: [] }; tell(); advance(3100); out.reconnect = snap();
+
 F.setInputs(null); F.setClock(null); F.setTimers({ setInterval: (f, m) => setInterval(f, m), clearInterval: (t) => clearInterval(t), setTimeout: (f, m) => setTimeout(f, m), clearTimeout: (t) => clearTimeout(t) });
 out.probe = 'states';
 return JSON.stringify(out); })()
@@ -226,6 +232,8 @@ def test_every_state_from_a_faked_clock_and_faked_facts(tmp_path: Path) -> None:
     assert g["upd0"]["age"] == "" and g["upd1"]["age"] == "updating" and g["upd1"]["state"] == "live" and g["upd2"]["age"] == "", (g["upd0"], g["upd1"], g["upd2"])
     assert g["hidden"]["snap"]["state"] == "live" and g["hidden"]["mutations"] == 0 and g["hidden"]["snap"]["armed"]["tick"] == 0, g["hidden"]   # a hidden tab is frozen
     assert g["seen"]["state"] == "down", g["seen"]                                                         # and repainted when seen
+    assert g["slowHello5"]["state"] == "connecting" and g["slowHello9"]["state"] == "down", (g["slowHello5"], g["slowHello9"])   # a first connection waits out the longer hold
+    assert g["reconnect"]["state"] == "down", g["reconnect"]                                               # a reconnect after the stream was live waits only the flap hold
 
 
 # the layout: the longest words with a long panel name, at the widths the page has rules for
@@ -261,3 +269,71 @@ def test_the_line_fits_the_masthead_at_every_width_and_never_wraps(tmp_path: Pat
                 assert row["shown"] and row["inside"] and row["overlap"] == [], where     # in the masthead, over no control
                 assert row["oneLine"], where                                              # words and age stay one line (an ellipsis, never a wrap)
                 assert not row["mastOver"] and not row["docOver"], where                  # no horizontal scroll
+
+
+# The trouble states at the widths between the phone and the desktop: the masthead is pinned there, so its height must not move when a
+# state appears, and the state words (never the age) are what must always fit. Names are the page's real ones, not a stress string.
+BANDS = r"""((presence) => { const F = window.LevainFreshLine.seam, el = document.getElementById('freshline'), m = document.querySelector('.masthead');
+  const pb = document.getElementById('presencebtn'); pb.hidden = !presence; pb.querySelector('.pr-chip-t').textContent = 'Follow here';
+  const now = Date.now(), R = (e) => e.getBoundingClientRect();
+  const base = { now, boot: { wholeDrawn: true, lastWholeAt: now - 5000 }, stream: { state: 'live', lastChunk: now, faults: [], everLive: true }, held: {}, heads: {}, titleOf: (id) => id === 'p1' ? 'Inbox' : 'Work board' };
+  const stale = (n) => { const h = {}; for (let i = 0; i < n; i++) h['p' + i] = { status: 'stale', as_of: new Date(now - 180000 - i * 60000).toISOString() }; return h; };
+  const states = { live: base,
+    down: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 60000 }, stream: { state: 'down', lastChunk: now - 40000, faults: [], everLive: true } }),
+    failed: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 125000, failed: 'HTTP 502', failedAt: now - 1000 } }),
+    refused: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, refused: true } }),
+    stale1: Object.assign({}, base, { heads: stale(1) }),
+    stale2: Object.assign({}, base, { heads: stale(2) }),
+    updating: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, inflight: true, inflightAt: now - 3000 } }) };
+  const rows = [];
+  for (const k of Object.keys(states)) { F.setInputs(() => states[k]); F.reset(); F.recompute();
+    const st = el.querySelector('.fl-state'), ag = el.querySelector('.fl-age'), l = R(el);
+    rows.push({ k, w: innerWidth, h: Math.round(R(m).height * 10) / 10, stCut: st.scrollWidth > st.clientWidth, ageCut: !ag.hidden && ag.scrollWidth > ag.clientWidth,
+      words: st.textContent, age: ag.textContent, line: [Math.round(l.left), Math.round(l.right)], oneLine: l.height <= (parseFloat(getComputedStyle(el).fontSize) || 12) * 2 }); }
+  F.setInputs(null);
+  return JSON.stringify({ probe: 'bands', presence, rows }); })"""
+
+
+def _bands(tmp_path: Path, widths: tuple, touch: bool) -> list[dict]:
+    """Every trouble state at each width, with the presence chip shown and with it hidden (the chip is what takes the row's room)."""
+    steps: list = [{"emulate": {"w": widths[0], "h": 900, "dpr": 2 if touch else 1, "mobile": touch}}] + ([{"touch": True}] if touch else []) + [READY, LIVE, SETTLE]
+    for w in widths:
+        for presence in ("true", "false"):
+            steps += [{"emulate": {"w": w, "h": 900, "dpr": 2 if touch else 1, "mobile": touch}}, SETTLE, {"eval": BANDS + "(" + presence + ")"}]
+    (tmp_path / ("touch" if touch else "mouse")).mkdir()
+    return [g for g in _vals(_open(tmp_path / ("touch" if touch else "mouse"), steps, touch=touch)) if g.get("probe") == "bands"]
+
+
+@needs_browser
+def test_the_masthead_keeps_its_height_when_a_trouble_state_appears_at_tablet_widths(tmp_path: Path) -> None:
+    """The pinned masthead is the same height in every state at 721 / 768 / 790 / 820 (iPad portrait and a narrow desktop window)."""
+    for touch in (True, False):
+        for g in _bands(tmp_path, (721, 768, 790, 820), touch):
+            heights = {r["k"]: r["h"] for r in g["rows"]}
+            assert max(heights.values()) - min(heights.values()) <= 1, (g["rows"][0]["w"], touch, g["presence"], heights)
+
+
+@needs_browser
+def test_the_state_words_never_clip_between_the_phone_and_the_tablet(tmp_path: Path) -> None:
+    """At 481 / 540 / 600 / 640 (a folded or split screen) the age may be cut; the state words never are, in every trouble state."""
+    for touch in (True, False):
+        for g in _bands(tmp_path, (481, 540, 600, 640), touch):
+            for r in g["rows"]:
+                assert not r["stCut"], (r["w"], touch, g["presence"], r)
+                assert r["oneLine"], (r["w"], touch, g["presence"], r)
+
+
+@needs_browser
+def test_the_phone_keeps_the_age_number_and_the_words_at_390(tmp_path: Path) -> None:
+    """At 390 the age is the short form and survives beside the words in every state that carries one; the masthead keeps its height."""
+    g = [g for g in _bands(tmp_path, (390,), True) if g["presence"]][0]
+    rows = {r["k"]: r for r in g["rows"]}
+    for k in ("down", "failed", "stale1", "stale2"):
+        assert not rows[k]["stCut"] and not rows[k]["ageCut"] and rows[k]["age"], (k, rows[k])
+    assert rows["down"]["words"] == "stream down" and rows["down"]["age"] == "40s", rows["down"]
+    assert rows["stale1"]["words"] == "Work board stale" and rows["stale1"]["age"] == "3m", rows["stale1"]
+    assert rows["stale2"]["words"] == "Inbox stale +1" and rows["stale2"]["age"] == "4m", rows["stale2"]
+    assert rows["failed"]["age"] == "2m" and rows["refused"]["age"] == "", rows
+    assert all(not r["stCut"] for r in g["rows"]), g["rows"]
+    heights = {r["h"] for r in g["rows"]}
+    assert max(heights) - min(heights) <= 1, heights

@@ -1923,13 +1923,30 @@
   // A brief-region panel other than the state line has no copy on the page (the Today card is not drawn): an announcement of it has
   // nothing to repaint, and answering false would reload the whole board each time it changes. Its own read still records the held
   // etag, so the stream's manifest diff stops announcing the same change.
+  // A panel read in place records the read: its etag and when (the held map), and its own status and read time, which also become its head in the
+  // manifest the page keeps. The freshness line reads the heads, so a panel read fresh stops being named stale until the next whole read.
+  function noteApplied(pid, raw) {
+    const heldMap = root.LevainCockpitHeld;
+    if (heldMap && raw && typeof raw.etag === "string") {
+      const rec = { etag: raw.etag, at: Date.now() };
+      if (typeof raw.status === "string") rec.status = raw.status;
+      if (typeof raw.as_of === "string") rec.as_of = raw.as_of;
+      heldMap[pid] = Object.assign({}, heldMap[pid], rec);
+    }
+    const heads = lastManifest && lastManifest.panels;
+    if (heads && heads[pid] && raw) {
+      const nx = {};
+      if (typeof raw.status === "string") nx.status = raw.status;
+      if (typeof raw.as_of === "string") nx.as_of = raw.as_of;
+      heads[pid] = Object.assign({}, heads[pid], nx);
+    }
+  }
   const briefUndrawn = (pid) => { const r = lastManifest && lastManifest.regions; return !!(r && Array.isArray(r.brief) && pid !== "state" && r.brief.indexOf(pid) >= 0); };
   async function refetchPanel(pid) {
     if (!liveOf(pid).length) {
       if (!briefUndrawn(pid)) return false;
       try {
-        const raw = await readPanel(pid), heldMap = root.LevainCockpitHeld;
-        if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag, at: Date.now() });
+        noteApplied(pid, await readPanel(pid));
       } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
       return "applied";
     }
@@ -1970,8 +1987,7 @@
     }
     if (core.adoptPanel) core.adoptPanel(pid, view);
     // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
-    const heldMap = root.LevainCockpitHeld;
-    if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag, at: Date.now() });
+    noteApplied(pid, raw);
     return "applied";
   }
 

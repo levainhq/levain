@@ -32,7 +32,7 @@ out.nowMs = NOW;
 // freshFacts v1: the shape the painter reads, and `worker` null
 const f = facts({ heads: { board: { status: "stale", as_of: "2026-11-19T11:57:00Z" }, inbox: { status: "ok", as_of: "2026-11-19T11:59:00Z" } } });
 out.shape = { keys: Object.keys(f).sort(), worker: f.worker, readKeys: Object.keys(f.read).sort(), streamKeys: Object.keys(f.stream).sort(), panelKeys: Object.keys(f.panels[0]).sort() };
-out.panels = f.panels.map((p) => [p.id, p.title, p.asOfMs, p.stale, p.pending]);
+out.panels = f.panels.map((p) => [p.id, p.title, p.asOfMs, p.stale, p.pending, p.kind]);
 // confirmedAt is the newest of the whole draw, a panel's applied refetch, a good poll and the last bytes
 out.confirm = [
   facts({}).confirmedAt - NOW,
@@ -61,6 +61,9 @@ out.keys = {
   downBeatsStale: key({ stream: { state: "down", lastChunk: NOW - 4000 }, heads: { board: { status: "stale" } } }),
   failedBeatsDown: key({ boot: Object.assign({}, base, { failed: "x", failedAt: NOW }), stream: { state: "down", lastChunk: NOW - 4000 } }),
   unreadIsNotStale: key({ heads: { board: { status: "unread", as_of: null } } }),
+  errorHead: key({ heads: { board: { status: "error", as_of: "2026-11-19T11:57:00Z" } } }),
+  // a page that never starts a change stream has no stream words: the stream facts say so with a null state
+  noStreamConfigured: key({ stream: { state: null } }),
 };
 
 // the words and ages, from a fake clock
@@ -75,6 +78,29 @@ out.updating = [d({ boot: Object.assign({}, base, { inflight: true, inflightAt: 
 out.liveAge = d({}).age;
 out.titleHasClock = /Last read/.test(d({}).title);
 out.faultAge = d({ stream: Object.assign({}, live, { faults: ["inbox"] }), held: { inbox: { at: NOW - 70000 } } }).age;
+
+// an error head is named like a stale one, in its own words
+const errH = d({ heads: { board: { status: "error", as_of: new Date(NOW - 180000).toISOString() } } });
+const mixH = d({ heads: { board: { status: "error", as_of: new Date(NOW - 180000).toISOString() }, inbox: { status: "stale", as_of: new Date(NOW - 300000).toISOString() } } });
+out.error = [errH.words, errH.age, errH.title, mixH.words, mixH.title];
+
+// the phone's forms keep the number: no words around it
+const short = (o, at) => L.decide(facts(o), at === undefined ? NOW : at, { short: true });
+out.short = [short(down).words, short(down).age, short(down, NOW + 5000).age, short(staleH).words, short(staleH).age,
+  short({ boot: Object.assign({}, base, { failed: "x", failedAt: NOW - 1000 }) }, NOW + 1000).age,
+  short({ stream: { state: "down", since: NOW, lastChunk: NOW - 1000 } }, NOW).age];
+
+// a head's read time is the server's clock: the age is measured against the server's now (a phone clock 10 minutes ahead does not age it)
+const skew = (offset) => d({ serverOffsetMs: offset, heads: { board: { status: "stale", as_of: new Date(NOW - 180000).toISOString() } } }, NOW + 600000).age;
+out.skew = [skew(-600000), skew(0)];
+
+// a failed read ages from the last READ: heartbeats on a live stream do not move it
+const failedLive = { boot: Object.assign({}, base, { lastWholeAt: NOW - 120000, failed: "HTTP 502", failedAt: NOW - 1000 }), stream: Object.assign({}, live, { lastChunk: NOW - 500 }) };
+out.failedAge = [d(failedLive).words, d(failedLive).age, d(failedLive, NOW + 60000).age];
+
+// the first connection of a stream that was never live waits longer than a reconnect before it speaks
+const holdOf = (st) => d({ stream: st }).holdMs;
+out.hold = [holdOf({ state: "connecting" }), holdOf({ state: "connecting", everLive: true }), holdOf({ state: "down" }), L.HOLD_MS, L.HOLD_FIRST_MS];
 console.log(JSON.stringify(out));
 """
 
@@ -98,12 +124,12 @@ def test_to_ms_reads_an_iso_string_and_epoch_seconds(tmp_path: Path) -> None:
 
 def test_fresh_facts_has_the_interface_shape_and_v1_fills_it_from_the_page(tmp_path: Path) -> None:
     got = _run(tmp_path)
-    assert got["shape"]["keys"] == ["confirmedAt", "lastReadAt", "panels", "read", "stream", "worker"]
+    assert got["shape"]["keys"] == ["confirmedAt", "lastReadAt", "panels", "read", "serverOffsetMs", "stream", "worker"]
     assert got["shape"]["worker"] is None                                      # v1: the worker is not known to the page
-    assert got["shape"]["readKeys"] == ["inflightAt", "state", "why"] and got["shape"]["streamKeys"] == ["since", "state"]
-    assert got["shape"]["panelKeys"] == ["asOfMs", "id", "pending", "stale", "title"]
+    assert got["shape"]["readKeys"] == ["inflightAt", "state", "why"] and got["shape"]["streamKeys"] == ["everLive", "state"]
+    assert got["shape"]["panelKeys"] == ["asOfMs", "id", "kind", "onServerClock", "pending", "stale", "title"]
     now = got["nowMs"]
-    assert got["panels"] == [["board", "BOARD", now - 180000, True, False], ["inbox", "inbox", now - 60000, False, False]]   # a stale panel is titled, a quiet one is not looked up
+    assert got["panels"] == [["board", "BOARD", now - 180000, True, False, "stale"], ["inbox", "inbox", now - 60000, False, False, ""]]   # a stale panel is titled, a quiet one is not looked up
     assert got["confirm"] == [-2000, -500, -9000, None]
     assert got["lastRead"] == [-60000, -100]
 
@@ -119,6 +145,8 @@ def test_the_state_is_the_first_match_of_the_table(tmp_path: Path) -> None:
     assert k["stale"] == "stale" and k["fault"] == "stale"          # a stale head, or a panel the page could not read
     assert k["downBeatsStale"] == "down" and k["failedBeatsDown"] == "failed"
     assert k["unreadIsNotStale"] == "live"
+    assert k["errorHead"] == "stale"                                # a head that says error is not "live": it is named like a stale panel
+    assert k["noStreamConfigured"] == "live"                        # a page that never runs a stream says nothing about one
 
 
 def test_the_age_steps_by_five_seconds_then_minutes_and_only_trouble_states_carry_it(tmp_path: Path) -> None:
@@ -129,3 +157,31 @@ def test_the_age_steps_by_five_seconds_then_minutes_and_only_trouble_states_carr
     assert got["liveAge"] == "" and got["titleHasClock"] is True    # a quiet board carries no age; the absolute time rides in the title
     assert got["faultAge"] == "read 1m ago"                         # a panel the page could not read ages from its own last read
     assert got["updating"] == ["", "updating", ""]                  # a read shorter than a second shows no cue, and the first read says "connecting" already
+
+
+def test_an_error_head_is_named_in_its_own_words_and_the_two_kinds_share_one_line(tmp_path: Path) -> None:
+    words, age, title, mixed_words, mixed_title = _run(tmp_path)["error"]
+    assert words == "BOARD unavailable" and age == "read 3m ago", (words, age)
+    assert title.startswith("A panel could not be read: BOARD."), title
+    assert mixed_words == "INBOX stale +1"                                     # the oldest is named, whatever its kind
+    assert mixed_title.startswith("A panel's data is old: INBOX. A panel could not be read: BOARD."), mixed_title
+
+
+def test_the_phone_forms_keep_the_age_number_without_its_words(tmp_path: Path) -> None:
+    got = _run(tmp_path)["short"]
+    assert got == ["stream down", "40s", "45s", "INBOX stale +1", "5m", "1m", "<5s"], got
+
+
+def test_a_stale_head_ages_on_the_servers_clock(tmp_path: Path) -> None:
+    ahead, plain = _run(tmp_path)["skew"]
+    assert ahead == "read 3m ago" and plain == "read 13m ago", (ahead, plain)   # a phone clock 10 minutes fast, told by the offset, does not age the panel
+
+
+def test_a_failed_read_ages_from_the_last_read_never_from_heartbeats(tmp_path: Path) -> None:
+    got = _run(tmp_path)["failedAge"]
+    assert got == ["can't reach", "updated 2m ago", "updated 3m ago"], got
+
+
+def test_the_first_connection_of_a_stream_waits_longer_than_a_reconnect(tmp_path: Path) -> None:
+    first, reconnect, down, hold, hold_first = _run(tmp_path)["hold"]
+    assert first == hold_first and reconnect == hold and down == hold and hold_first > hold
