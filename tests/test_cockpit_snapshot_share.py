@@ -356,3 +356,70 @@ def test_a_manifest_stuck_on_its_panels_does_not_hold_another_credentials_manife
         ta.join(30)
         tb.join(30)
     assert isinstance(out["stuck"], dict) and not ta.is_alive()
+
+
+# --- levain#157 x levain#138: a keyed write must end the shared snapshot of the panels it names ---------------------------
+
+def _two_panels(tmp_path: Path):
+    """``_external_cockpit`` plus a second on-demand panel ``od2`` with its own provider call count (the untouched one)."""
+    from levain.cockpit.engine import Read
+    from tests.test_cockpit_k1 import _simple
+
+    c, state = _external_cockpit(tmp_path)
+    other = {"reads": 0}
+
+    def read2(ctx):
+        other["reads"] += 1
+        return Read(rows=(_row(7),))
+
+    c.register(_simple("od2", rows=(), read=read2))
+    return c, state, other
+
+
+def test_a_keyed_write_sends_the_next_read_of_a_touched_panel_to_the_provider(tmp_path: Path) -> None:
+    c, state, _other = _two_panels(tmp_path)
+    first = c.panel("od", credential_class="none")
+    assert state["reads"] == 1
+    state["rows"] = [_row(1), _row(2)]                       # what the write changed
+    c.invalidate_reads(["od"], refresh=False)                # W: a keyed write, ``_rc_gen`` does not move
+    second = c.panel("od", credential_class="none")          # inside the share window
+    assert state["reads"] == 2
+    assert {r["id"] for r in first["rows"]} == {"r1"} and {r["id"] for r in second["rows"]} == {"r1", "r2"}
+
+
+def test_a_read_in_flight_when_a_keyed_write_lands_is_not_shared_after_it(tmp_path: Path) -> None:
+    c, state, _other = _two_panels(tmp_path)
+    state["hold"] = hold = threading.Event()
+    t = threading.Thread(target=lambda: c.panel("od", credential_class="none"))
+    t.start()
+    assert state["in_read"].wait(10)                         # a read began with the old rows
+    state["rows"] = [_row(1), _row(2)]
+    c.invalidate_reads(["od"], refresh=False)                # the keyed write lands while it runs
+    state["hold"] = None
+    hold.set()
+    t.join(10)
+    assert state["reads"] == 1
+    later = c.panel("od", credential_class="none")           # a reader after the write: never the pre-write snapshot
+    assert state["reads"] == 2 and {r["id"] for r in later["rows"]} == {"r1", "r2"}
+
+
+def test_a_keyed_write_leaves_an_untouched_panels_shared_snapshot_alone(tmp_path: Path) -> None:
+    c, state, other = _two_panels(tmp_path)
+    c.panel("od", credential_class="none")
+    c.panel("od2", credential_class="none")
+    assert (state["reads"], other["reads"]) == (1, 1)
+    c.invalidate_reads(["od"], refresh=False)
+    c.panel("od2", credential_class="none")
+    assert other["reads"] == 1                               # W's point: only the named panel goes cold
+    c.panel("od", credential_class="none")
+    assert state["reads"] == 2
+
+
+def test_a_write_naming_no_panels_makes_every_panel_read_cold(tmp_path: Path) -> None:
+    c, state, other = _two_panels(tmp_path)
+    c.panel("od", credential_class="none")
+    c.panel("od2", credential_class="none")
+    c.invalidate_reads()
+    c.panel("od", credential_class="none")
+    c.panel("od2", credential_class="none")
+    assert (state["reads"], other["reads"]) == (2, 2)
