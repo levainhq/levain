@@ -4186,7 +4186,8 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
   /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
   body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
-  body.ia .masthead #stamp { order: 6; }
+  /* its own full row, cut with an ellipsis rather than past the edge: it now carries a read's failure and what to do about it */
+  body.ia .masthead #stamp { order: 6; flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 /* Between the phone and the desktop bar the masthead wraps and is pinned, so the line's footprint must not depend on what it says: a
    zero basis with a floor that holds the dot and the longest state words, and the room left over is the age's. A line sized by its text

@@ -1454,7 +1454,7 @@
       if (e && e.credentialChanged) { reread = true; return false; }
       const refused = !!(e && e.refused);
       // the reason, and for a refusal the remedy, are written where a touch screen reads them (the stamp), not only in the line's title
-      status(refused ? "not signed in: the cockpit refused this device (" + (e && e.message ? e.message : e) + "); pair it again" : "read failed: " + (e && e.message ? e.message : e));
+      status(refused ? "not signed in: pair this device again" : "read failed: " + (e && e.message ? e.message : e));
       stampFailure = true;
       readFailed = String(e && e.message ? e.message : e || "read failed"); readFailedAt = Date.now();
       // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog

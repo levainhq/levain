@@ -89,7 +89,7 @@ def test_a_refusal_after_the_board_is_drawn_says_not_signed_in_and_stops(tmp_pat
     assert _at(first, 500)["refused"] is True, _at(first, 500)
     assert first[-1]["state"] == "refused" and first[-1]["words"] == "not signed in", first[-1]
     assert first[-1]["reads"] == 1, [(r["t"], r["reads"]) for r in first]                              # no retry: one read, one refusal
-    assert "pair it again" in first[-1]["stamp"] and first[-1]["stamp"].startswith("not signed in"), first[-1]["stamp"]   # the remedy is on the page, not only in a title
+    assert "pair this device again" in first[-1]["stamp"] and first[-1]["stamp"].startswith("not signed in"), first[-1]["stamp"]   # the remedy is on the page, not only in a title
     assert second[-1]["state"] == "live" and second[-1]["refused"] is False and second[-1]["stamp"] == "", second[-1]   # a foreground read lands again
 
 
