@@ -42,6 +42,7 @@ SWAPS = [
     ("needs_you", "landing", "precedence 3 over 4"),
     ("landing", "in_flight", "precedence 4 over 5"),
     ("in_flight", "landed_not_closed", "precedence 5 over 6"),
+    # np-5023a20a: this pair is pinned by the link/gate cases (landed holds); an unmet item:/band: dependency is "7 over 6"
     ("landed_not_closed", "blocked", "precedence 6 over 7"),
     ("blocked", "ready_with_start", "precedence 7 over 8"),
     ("ready_with_start", "needs_grooming", "precedence 8 over 9"),

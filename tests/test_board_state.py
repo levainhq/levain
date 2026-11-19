@@ -569,6 +569,38 @@ def test_each_audited_item_id_appears_in_the_audit_exactly_once_per_world():
     assert sorted(ids) == ["levain#1", "levain#2", "levain#3"], board.audit
 
 
+def _dep_world(dep: dict, *, orphan: bool = False):
+    """levain#133 has commits on main and no close; levain#140 is open and ready. ``dep`` is what #133 depends on."""
+    lines = [_line(iid="levain#133", done="d", tier="sonnet", depends_on=[dep]), _line(iid="levain#140", done="d", tier="sonnet")]
+    branches = [{"name": "seat/x", "tip": "b" * 40, "date": None, "ahead": 2, "items": ["levain#133"]}] if orphan else []
+    ev = bs.Evidence.from_dict(_ev_dict(
+        main=[{"sha": "a" * 40, "date": "2026-11-11T00:00:00Z", "items": ["levain#133"], "closes": []}], branches=branches,
+        band={"open": {"np-dddddddd": []}, "resolved": {}}, refs=["queue/x/y"]), now=None)
+    board = bs.derive_all(bs.fold(lines), ev, now=NOW)
+    return {s.id: s for s in board.items}["levain#133"], [a for a in board.audit if a.id == "levain#133"]
+
+
+@pytest.mark.parametrize("dep", [{"kind": "item", "ref": "levain#140"}, {"kind": "band", "ref": "np-dddddddd"}], ids=["item", "band"])
+def test_np_5023a20a_an_unmet_item_or_band_dependency_blocks_landed_work_and_files_no_audit_entry(dep):
+    s, audit = _dep_world(dep)
+    assert (s.state, s.column) == ("blocked", "backlog")
+    assert "waits on" in s.reason and "1 commit(s) on main, last aaaaaaaaa: close it once the dependency clears" in s.reason, s.reason
+    assert audit == []
+
+
+@pytest.mark.parametrize("dep", [{"kind": "link", "ref": "queue/x/y"}, {"kind": "gate", "words": "a judgement", "recheck": "2026-12-20"}], ids=["link", "gate"])
+def test_np_5023a20a_a_link_or_gate_dependency_keeps_landed_not_closed_and_its_audit_entry(dep):
+    s, audit = _dep_world(dep)
+    assert (s.state, s.column) == ("landed_not_closed", "ready")
+    assert [a.kind for a in audit] == ["landed_not_closed"]
+
+
+def test_np_5023a20a_the_orphan_branch_audit_path_is_untouched():
+    s, audit = _dep_world({"kind": "item", "ref": "levain#140"}, orphan=True)
+    assert s.state == "blocked" and "commit(s) on main" not in s.reason
+    assert [a.kind for a in audit] == ["landed_not_closed"] and "an orphan branch carries more" in audit[0].why
+
+
 # ------------------------------------------------------------------------------------------------ levain#73
 def _orphan_world(closes: bool):
     """The reproduced shape: levain#1 and levain#8 each ride a stale queue ref and each has an orphan seat branch with

@@ -1318,15 +1318,152 @@
    },
    "expect": {
     "levain#25": {
+     "column": "backlog",
+     "reason_contains": "1 commit(s) on main, last 000000000",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"band\", \"ref\": \"np-dddddddd\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#25\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "precedence 7 over 6: an unmet band dependency beats landed-not-closed (np-5023a20a)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {
+      "np-dddddddd": []
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#133"
+      ],
+      "sha": "0000000000000000000000000000000000000021"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#133": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#140": {
+     "column": "ready",
+     "reason_contains": "nothing it waits on",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#140\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#133\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#140\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"the dependency\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "precedence 7 over 6: an unmet item dependency beats landed-not-closed (np-5023a20a)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {
+      "np-dddddddd": []
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#27"
+      ],
+      "sha": "0000000000000000000000000000000000000022"
+     }
+    ],
+    "merged": [],
+    "refs": [
+     "queue/1119-5/zzz"
+    ],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#27": {
      "column": "ready",
      "reason_contains": "commits on main",
      "state": "landed_not_closed"
     }
    },
    "items_lines": [
-    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"band\", \"ref\": \"np-dddddddd\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#25\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"link\", \"ref\": \"queue/1119-5/zzz\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#27\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
    ],
-   "name": "precedence 6 over 7: landed-not-closed beats an unmet dependency",
+   "name": "precedence 6 over 7: landed-not-closed beats an unmet link dependency",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {
+      "np-dddddddd": []
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#28"
+      ],
+      "sha": "0000000000000000000000000000000000000023"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#28": {
+     "column": "ready",
+     "reason_contains": "commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-12-20\", \"words\": \"a judgement\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#28\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "precedence 6 over 7: landed-not-closed beats an unmet gate dependency",
    "now": "2026-11-12T20:00:00Z"
   },
   {
