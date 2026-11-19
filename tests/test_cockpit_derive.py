@@ -1958,3 +1958,34 @@ def test_retire_and_set_plans_drop_the_rows_of_the_panels_that_leave_and_a_faili
     loop.set_plans([])                           # the plan change lands though the row could not be dropped
     assert loop.deriving() == [] and not loop._plans
     loop.stop()
+
+
+# ------------------------------------------------------------------------------------------ S3a fix 2
+
+
+def test_a_publish_that_fails_while_the_panel_is_retired_leaves_no_error_for_the_retired_panel():
+    loop, writer, clock, calls = make([PanelPlan("a"), PanelPlan("b")])
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    writer.publish = boom
+    real_fail, retirers = loop._fail, []
+
+    def fail_with_a_retire_trying_to_run(key, exc):
+        # a retire that arrives as the failed publish is recorded: it must wait for the record, not slip in before it
+        if key == "publish:a":
+            t = threading.Thread(target=loop.retire, args=("a",), name="retirer")
+            t.start()
+            t.join(0.5)
+            retirers.append(t)
+        real_fail(key, exc)
+
+    loop._fail = fail_with_a_retire_trying_to_run
+    job = derive._Job("a", "first", "", derive._UNSET, loop._states["a"])
+    loop._states["a"].busy = True
+    loop._run_job(job, clock.t)
+    retirers[0].join(WAIT)
+    assert not retirers[0].is_alive() and "a" not in loop._states
+    assert "publish:a" not in loop._write_errors
+    loop.stop()

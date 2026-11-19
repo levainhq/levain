@@ -847,8 +847,10 @@ class DeriveLoop:
             # A valid_until at or before the finish would re-derive on every poll: treat it as no expiry, also in the store.
             if valid_until is not None and valid_until <= finished:
                 valid_until = None
-            try:
-                with self._write_lock:
+            with self._write_lock:
+                # the failure is recorded under the write lock too, as _publish_timeouts does: a retire that takes the
+                # lock next then clears it, so a retired panel's error never outlives it
+                try:
                     with self._lock:
                         st.running_since = None  # the timeout publisher checks this under the write lock
                         current = self._states.get(pid) is st
@@ -871,8 +873,8 @@ class DeriveLoop:
                         published = True
                         self._succeed(f"publish:{pid}")
                         notice = self._note_publish(pid, st, gen, write_gen)
-            except Exception as exc:
-                self._fail(f"publish:{pid}", exc)
+                except Exception as exc:
+                    self._fail(f"publish:{pid}", exc)
         finally:
             with self._cv:
                 st.running_since, st.timed_out = None, False
