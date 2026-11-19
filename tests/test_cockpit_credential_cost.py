@@ -668,12 +668,22 @@ def test_a_same_size_in_place_restore_with_its_mtime_put_back_is_seen(db: Cockpi
     assert db.verify_device(tok, now=NOW) == dev
     was = os.stat(db.path)
     assert os.stat(restored).st_size == was.st_size, "the restore is the same size"
+    probe = db.path.with_name("tick-probe")             # a coarse filesystem clock (ext4: up to several ms per tick):
+    deadline = time.monotonic() + 5                     # wait for a tick past the original ctime, so the rewrite's
+    while True:                                         # ctime cannot land in the same tick and read as unchanged
+        probe.write_bytes(b"x")
+        if os.stat(probe).st_ctime_ns > was.st_ctime_ns:
+            break
+        assert time.monotonic() < deadline, "the filesystem clock did not tick past the database's ctime"
+        time.sleep(0.005)
+    probe.unlink()
     with open(restored, "rb") as s, open(db.path, "r+b") as t:
         t.write(s.read())
         t.truncate()
     os.utime(db.path, ns=(was.st_atime_ns, was.st_mtime_ns))
     now = os.stat(db.path)
     assert (now.st_ino, now.st_size, now.st_mtime_ns) == (was.st_ino, was.st_size, was.st_mtime_ns)
+    assert now.st_ctime_ns != was.st_ctime_ns, "ctime did not move: the rewrite landed in the original's clock tick"
     assert db.verify_device(tok, now=NOW) is None, "answered from the old contents"
 
 
@@ -738,7 +748,8 @@ def test_held_connections_are_capped_process_wide_and_over_the_cap_answer_the_sa
     second: dict[int, Any] = {}
     held: dict[int, bool] = {}
     parked = threading.Barrier(n + 1)
-    turn = [threading.Event() for _ in range(n)]
+    turn = [threading.Event() for _ in range(n)]       # phase 1: the driver lets thread i take its second answer
+    release = [threading.Event() for _ in range(n)]    # phase 2: only the driver's finally lets thread i end
     done = [threading.Event() for _ in range(n)]
 
     def run(i: int) -> None:
@@ -748,7 +759,7 @@ def test_held_connections_are_capped_process_wide_and_over_the_cap_answer_the_sa
         turn[i].wait(30)
         second[i] = db.verify_device(tok, now=NOW)
         done[i].set()
-        turn[i].wait(30)
+        release[i].wait(30)
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
     for t in threads:
@@ -765,9 +776,8 @@ def test_held_connections_are_capped_process_wide_and_over_the_cap_answer_the_sa
         for i in order:                                 # the over-cap threads first: every slot is still taken
             turn[i].set()
             assert done[i].wait(30)
-            turn[i].clear()
     finally:
-        for e in turn:
+        for e in turn + release:
             e.set()
         for t in threads:
             t.join(10)
