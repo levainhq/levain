@@ -188,7 +188,8 @@
     try {
       var esc = root.CSS && root.CSS.escape ? root.CSS.escape(id) : String(id).replace(/"/g, "");
       var h = document.querySelector('[data-panel-id="' + esc + '"] .phead h2');
-      var t = h && h.textContent ? h.textContent.trim() : "";
+      // the heading carries the panel's count or "(unavailable)" after its name: the line names the panel, not its tally
+      var t = h && h.textContent ? h.textContent.replace(/\s*\([^()]*\)\s*$/, "").trim() : "";
       return t || id;
     } catch (_) { return id; }
   }

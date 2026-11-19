@@ -210,10 +210,11 @@ def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_fail
     """B: refetchPanel is the ONE place that says a panel read settled; a caller that does not tell the line (a write's refetch, the topology's replay) is still heard."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
     steps = [READY, LIVE, SETTLE, _run(STUB2), title,
-             _sample(4500, "window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
+             _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (12)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
              _sample(3500, "window.__panelFail = null; window.LevainCockpitView.refetchPanel('work_board'); 1")]
     out = _open(tmp_path, steps)
     failed, healed = _samples(out)
+    # the heading a real panel shows ends in its tally ("Inbox (50)"): the line names the panel, not the tally
     assert failed[-1]["state"] == "stale" and failed[-1]["words"] == f"{_title(out)} stale", failed[-1]
     assert healed[-1]["state"] == "live", healed[-1]
 
