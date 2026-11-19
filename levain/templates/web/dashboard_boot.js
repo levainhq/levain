@@ -11,13 +11,22 @@
   "use strict";
   const storeEl = document.getElementById("store");
   const stampEl = document.getElementById("stamp");
-  const btn = document.getElementById("refresh");
 
   // Report transient status WITHOUT clobbering the store-path subtitle (#store):
   // a momentary fetch blip shouldn't erase the identity of what we're viewing.
   function status(msg) {
     if (stampEl) stampEl.textContent = msg;
   }
+
+  // What this shim knows about how current the page is, for the masthead's freshness line (fresh_line.js). The line is told when
+  // a read starts, settles or fails (`levain:fresh`) and asks for these facts then; nothing here is a timer.
+  let lastWholeAt = 0, readFailed = "", readFailedAt = 0;
+  function fresh() {
+    try { if (typeof document.dispatchEvent === "function" && typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("levain:fresh")); } catch (_) { /* a page without events has no line to tell */ }
+  }
+  window.LevainBootFacts = function () {
+    return { wholeDrawn: wholeDrawn, lastWholeAt: lastWholeAt, inflight: inflight, inflightAt: inflightAt, refused: refusedStop, failed: readFailed, failedAt: readFailedAt };
+  };
 
   let inflight = false;
   // A foreground (pwa_resume.js) after a long freeze: iOS kills the sockets of a frozen page, so a read that was in flight may
@@ -58,7 +67,7 @@
   //   left pulsing; a later whole draw replaces the board like any redraw. No count of failures releases the part.
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
-  //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
+  //   tabs, the theme switch, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
   //   the zones, but the hero, the Needs strip, the notes and the widgets (the tiles) are its siblings, and those are where a
   //   reader first acts (dashboard.html; renderKe in dashboard_core.js fills them). The drop (#ck-drop) is NOT in the list: renderDropHero
   //   builds its card once and refreshes it in place, so the whole draw never replaces it, and an inert drop would make a tap on the Drop
@@ -90,7 +99,7 @@
   function retryUntilDrawn(why, refused) {
     if (wholeDrawn) return;
     // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
-    // put up the token prompt. Say it and stop; the next foreground or the Refresh button reads again.
+    // put up the token prompt. Say it and stop; the next foreground reads again.
     if (refused) {
       refusedStop = true;
       if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
@@ -693,7 +702,7 @@
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
   // would discard an in-progress edit/capture textarea (intention-108). The PASSIVE triggers
-  // (refresh-button, visibilitychange) defer while the operator is mid-edit — never the
+  // (visibilitychange, the foreground) defer while the operator is mid-edit — never the
   // save's own commit→load reload (passive:false), which MUST rebuild to close the editor
   // and show saved state. Deferring loses nothing: the substrate only changes on a wrap,
   // so the next visibility flip / the save's reload re-reads.
@@ -708,7 +717,7 @@
     if (!d || typeof d.hasUnsavedEdit !== "function") return true;
     return d.hasUnsavedEdit();
   }
-  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the refresh button,
+  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the transport's reload,
   // the tab coming back, a stale re-read) is flushed by the same release, and a timer checks again once a focus-only hold has aged out.
   let idleT = 0;
   const IDLE_RECHECK_MS = 10250;
@@ -1324,7 +1333,7 @@
     inflightPassive = passive;
     const myGen = ++loadGen;
     let landed = false, reread = false;
-    if (btn) btn.disabled = true;
+    fresh();
     try {
       if (fragmentTokenPending) await fragmentTokenPending;   // a link's token is being checked: read with the token that settles
       if (useManifest) {
@@ -1361,7 +1370,8 @@
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
         }
-        status("read " + new Date().toLocaleTimeString());
+        lastWholeAt = Date.now(); readFailed = "";
+        status("");     // the transient line is cleared; the freshness line says how current the page is
         showNotice();
         landed = true; drawnOnce(true);
         return true;
@@ -1411,7 +1421,8 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       boardMark(true);
-      status("read " + new Date().toLocaleTimeString());
+      lastWholeAt = Date.now(); readFailed = "";
+      status("");
       landed = true; drawnOnce(true);
       return true;
     } catch (e) {
@@ -1420,6 +1431,7 @@
       // backoff, the board is read again at once as the page's credential now, as a passive read (an open edit defers it, see refuseForEdit)
       if (e && e.credentialChanged) { reread = true; return false; }
       status("read failed: " + (e && e.message ? e.message : e));
+      readFailed = String(e && e.message ? e.message : e || "read failed"); readFailedAt = Date.now();
       const refused = !!(e && e.refused);
       // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog
       // releases it); anything else (no part drawn, a refusal, or the watchdog already fired) releases the page as it is, and the retry
@@ -1430,7 +1442,7 @@
     } finally {
      if (myGen === loadGen) {
       inflight = false;
-      if (btn) btn.disabled = false;
+      fresh();
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
       // Always non-passive → never deferred, so a saved edit's state always lands.
       if (pendingReload) { pendingReload = false; load(); }
@@ -1450,17 +1462,15 @@
     let passive = true;
     if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) {
       passive = inflightPassive;     // an authoritative (save) reload that crossed the freeze is replaced by an authoritative one
-      loadGen++; inflight = false;
-      if (btn) btn.disabled = false;   // the superseded read's own finally is skipped: the button is freed here, whatever the new read does
+      loadGen++; inflight = false;     // the superseded read's own finally is skipped: the line is told by the new read
     }
     load({ passive: passive }).then(function (ok) { if (ok && storeEl && !inflight) storeEl.removeAttribute("data-cold"); });   // only a read that landed: a failed one leaves the placeholder
   });
 
-  // The refresh button + visibilitychange are PASSIVE re-reads → load({passive:true}),
+  // visibilitychange is a PASSIVE re-read → load({passive:true}),
   // which defers (and reports) while an edit is open. The substrate only changes on a
   // wrap, so we don't poll; visibilitychange catches "something moved while you were
   // away" — but never at the cost of the operator's in-progress text.
-  if (btn) btn.addEventListener("click", function () { load({ passive: true }); });
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") load({ passive: true });
   });

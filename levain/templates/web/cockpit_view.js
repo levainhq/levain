@@ -687,6 +687,8 @@
   // payload through the same mapper, against this manifest, so it draws exactly what a full load would.
   let lastManifest = null;
   let manifestAt = 0;
+  // the manifest heads the board was last drawn from, and when: the freshness line (fresh_line.js) reads each panel's status and as_of here
+  const freshHeads = () => ({ heads: lastManifest && lastManifest.panels ? lastManifest.panels : null, at: manifestAt });
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
@@ -1927,7 +1929,7 @@
       if (!briefUndrawn(pid)) return false;
       try {
         const raw = await readPanel(pid), heldMap = root.LevainCockpitHeld;
-        if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
+        if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag, at: Date.now() });
       } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
       return "applied";
     }
@@ -1969,7 +1971,7 @@
     if (core.adoptPanel) core.adoptPanel(pid, view);
     // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
     const heldMap = root.LevainCockpitHeld;
-    if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
+    if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag, at: Date.now() });
     return "applied";
   }
 
@@ -2806,7 +2808,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

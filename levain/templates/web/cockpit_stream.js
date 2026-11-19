@@ -12,7 +12,11 @@
  *
  * Connections are scarce (a browser gives an origin only a handful), so a hidden tab closes its stream and a
  * visible one reconnects, naming the last event it saw so the server can replay or ask for a resync.
- * While the stream is down the page polls the manifest with a validator and refetches what moved. */
+ * While the stream is down the page polls the manifest with a validator and refetches what moved.
+ *
+ * The stream does not paint anything. It keeps the facts the masthead's freshness line needs (its state, the last bytes, the last good
+ * manifest read, the panels whose refetch failed) and says `levain:fresh` when one changes; fresh_line.js reads them through
+ * window.LevainStreamFacts and writes the line (#freshline, which ensureChip adopts). A heartbeat updates `lastChunk` and tells no one. */
 (function (root) {
   "use strict";
   var EVENTS = "/cockpit/events";
@@ -34,26 +38,30 @@
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
   var faults = Object.create(null);   // panel id -> { n, timer }
+  var failed = Object.create(null);   // panel id -> true: its last refetch faulted and no read has applied since (outlives the retry schedule)
+  var bytesAt = 0;                    // the last bytes of any connection (lastChunk restarts with each connection; this does not)
+  var pollOkAt = 0, lastHeads = null, lastHeadsAt = 0;   // the last good manifest read (a 304 counts), and the heads it carried
 
-  function hhmm(d) { return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); }
-  function paintChip() {
-    if (!chip) return;
-    if (gaveUp) { chip.dataset.state = "off"; chip.textContent = "not live"; }
-    else if (paused) { chip.dataset.state = "off"; chip.textContent = "paused"; }
-    else if (staleSince) { chip.dataset.state = "stale"; chip.textContent = "stale since " + hhmm(staleSince); }
-    else if (epoch) { chip.dataset.state = "live"; chip.textContent = "live"; }
-    else { chip.dataset.state = "connecting"; chip.textContent = "connecting"; }
+  // the stream's state as the line names it: off (gave up waiting for a first draw), paused (hidden tab), down, live, connecting
+  function streamState() {
+    if (gaveUp) return "off";
+    if (paused) return "paused";
+    if (staleSince) return "down";
+    return epoch ? "live" : "connecting";
+  }
+  function facts() {
+    return { state: streamState(), since: staleSince ? staleSince.getTime() : null, lastChunk: bytesAt, pollOkAt: pollOkAt,
+      faults: Object.keys(failed), heads: lastHeads, headsAt: lastHeadsAt };
+  }
+  root.LevainStreamFacts = facts;
+  // tell the line that a fact moved (a state change, a read that settled): never a heartbeat
+  function tell() {
+    try { if (typeof document.dispatchEvent === "function" && typeof root.CustomEvent === "function") document.dispatchEvent(new root.CustomEvent("levain:fresh")); } catch (_) { /* no line to tell */ }
   }
   function ensureChip() {
     if (chip && chip.isConnected) return;
-    var host = document.querySelector(".indicators");
-    if (!host) return;
-    chip = document.createElement("span");
-    chip.className = "livechip";
-    chip.setAttribute("role", "status");
-    chip.title = "whether the page is told when a panel changes";
-    host.insertBefore(chip, host.firstChild);
-    paintChip();
+    chip = document.getElementById ? document.getElementById("freshline") : null;
+    tell();
   }
 
   function held() { return root.LevainCockpitHeld || {}; }
@@ -68,6 +76,7 @@
     var f = faults[id];
     if (f) { root.clearTimeout(f.timer); delete faults[id]; }
   }
+  function clearFailed() { var had = Object.keys(failed).length > 0; failed = Object.create(null); if (had) tell(); }
   function cancelFaults() { Object.keys(faults).forEach(clearFault); }
   function scheduleFault(id) {
     var n = faults[id] ? faults[id].n : 0;
@@ -98,7 +107,7 @@
     try { p = T.reload(); } catch (_) { p = false; }
     Promise.resolve(p).then(function (ok) { return ok === true; }, function () { return false; }).then(function (ok) {
       reloading = false;
-      if (ok && startGen === reloadGen) { pending = false; pendingAttempt = 0; cancelFaults(); return; }
+      if (ok && startGen === reloadGen) { pending = false; pendingAttempt = 0; cancelFaults(); clearFailed(); return; }
       // a request made while this render was under way is not covered by it
       pendingAttempt = ok ? 0 : pendingAttempt + 1;
       wantReload();
@@ -113,10 +122,12 @@
       if (r === "superseded") return r;
       if (r === "applied" || r === true) {
         clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
-      } else if (r === "fault") scheduleFault(id);
+        if (failed[id]) delete failed[id];
+        tell();
+      } else if (r === "fault") { failed[id] = true; scheduleFault(id); tell(); }
       else wantReload();
       return r;
-    }, function () { scheduleFault(id); return "fault"; });
+    }, function () { failed[id] = true; scheduleFault(id); tell(); return "fault"; });
   }
   function onEvent(id) { clearFault(id); return refetch(id); }
 
@@ -141,7 +152,7 @@
       staleSince = null;
       attempt = 0;
       stopPoll();
-      paintChip();
+      tell();
       // anything but a ring replay is compared with the server's manifest
       if (body.resync || !withPosition) reconcile(false);
     } else if (event === "panel-changed" && body && body.id) {
@@ -161,7 +172,7 @@
     abort = null;
     if (paused) return;
     if (!staleSince) staleSince = new Date();
-    paintChip();
+    tell();
     startPoll();
     var wait = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
     attempt++;
@@ -187,7 +198,7 @@
         return reader.read().then(function (r) {
           if (r.done) throw new Error("stream ended");
           arm();
-          lastChunk = Date.now();
+          lastChunk = bytesAt = Date.now();
           buf += dec.decode(r.value, { stream: true });
           var cut;
           while ((cut = buf.indexOf("\n\n")) >= 0) { onFrame(buf.slice(0, cut)); buf = buf.slice(cut + 2); }
@@ -203,6 +214,7 @@
   // ---- the manifest against what the page holds: the poll while the stream is down, and every hello that is not a replay ----
   function diffManifest(m) {
     var heads = (m && m.panels) || {}, h = held();
+    lastHeads = heads; lastHeadsAt = Date.now();
     var ids = Object.keys(heads), have = Object.keys(h);
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
@@ -215,10 +227,10 @@
     var headers = readHeaders();
     if (conditional && pollTag) headers["If-None-Match"] = pollTag;
     fetch(MANIFEST, { cache: "no-store", headers: headers }).then(function (res) {
-      if (res.status === 304) return null;
+      if (res.status === 304) { pollOkAt = Date.now(); tell(); return null; }
       if (!res.ok) throw new Error("HTTP " + res.status);
       var tag = res.headers.get("ETag");
-      return res.json().then(function (m) { if (conditional) pollTag = tag; diffManifest(m); });
+      return res.json().then(function (m) { if (conditional) pollTag = tag; pollOkAt = Date.now(); diffManifest(m); tell(); });
     }).catch(function () { /* the next hello or poll tries again */ });
   }
   function pollOnce() { reconcile(true); }
@@ -237,14 +249,14 @@
     stopPoll();
     if (abort) { var a = abort; abort = null; a.abort(); }
     epoch = null;
-    paintChip();
+    tell();
   }
   function resume() {
     if (!paused) return;
     paused = false;
     attempt = 0;
     staleSince = null;
-    paintChip();
+    tell();
     var o = owed; owed = [];
     o.forEach(function (id) { onEvent(id); });
     if (pending) wantReload();
@@ -257,7 +269,7 @@
   document.addEventListener("levain:resume", function () {
     // gaveUp: still waiting for the board's first draw; the stream starts from that draw (onDrawn), never from here
     if (!started || paused || gaveUp || document.hidden) return;
-    paintChip();
+    tell();
     // the visible edge just opened a stream (resume() above): one is enough
     if (Date.now() - lastConnect < 1500) return;
     // a stream that has spoken within a heartbeat is live: leave it (no reconnect, no hello replay)
@@ -271,13 +283,14 @@
 
   // the first hello is compared with what the board was drawn from, so it waits for the first draw
   function whenDrawn(deadline) {
-    if (root.LevainCockpitHeld) { gaveUp = false; if (document.hidden) { paused = true; paintChip(); } else connect(); return; }
-    if (Date.now() > deadline) { gaveUp = true; paused = true; paintChip(); return; }
+    if (root.LevainCockpitHeld) { gaveUp = false; if (document.hidden) { paused = true; tell(); } else connect(); return; }
+    if (Date.now() > deadline) { gaveUp = true; paused = true; tell(); return; }
     root.setTimeout(function () { whenDrawn(deadline); }, 200);
   }
 
   // the board's first successful draw after the wait gave up (or the view arrived late) starts the stream
   function onDrawn() {
+    clearFailed();     // the board was drawn whole from fresh reads: no panel is left holding a failed one
     if (!started) { start(); return; }
     if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
   }
@@ -292,7 +305,7 @@
     if (new URLSearchParams(root.location.search).get("source") === "substrate") return;
     started = true;
     ensureChip();
-    paintChip();
+    tell();
     document.addEventListener("visibilitychange", function () { if (document.hidden) pause(); else resume(); });
     whenDrawn(Date.now() + DRAW_WAIT_MS);
   }
