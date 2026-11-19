@@ -2480,7 +2480,9 @@ class Cockpit:
         fresh = snap.fresh_info
         # an attached snapshot's etag stands on its row: the body hash, the freshness verdict a page must see change (a 304
         # would hide a flip of either), what the rows left in the read are and whether the hidden ones were let in. Neither
-        # ``as_of`` nor ``valid_until`` is in it: a derive that changed nothing is no change
+        # ``as_of`` nor ``valid_until`` is in it: a derive that changed nothing is no change. Both are advisory head fields
+        # (R13): a 304 may leave a client holding an older value of either, and an older ``valid_until`` only makes it
+        # re-read sooner. They are stamped per request on a copy (``_stamp_fresh``), never into a cached head
         stands_on = ([snap.row_key[1] if snap.row_key is not None else None, fresh.stale, fresh.pending,
                       None if snap.rows is None else len(snap.rows), with_hidden] if fresh is not None else None)
         etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head,
@@ -2536,12 +2538,13 @@ class Cockpit:
     @staticmethod
     def _snap_key(spec: ProviderSpec, snap: _Snap) -> tuple:
         """What a cached head or panel depends on in the snapshot and its spec. ``row_key`` is the generation and the body
-        hash; the rest are the facts the head shows that move without the content moving (the freshness verdict, the
-        instant it is as of, its bound) and the spec (its identity: a discovery that replaced it is a new spec)."""
+        hash; the rest are the facts the head shows that move without the content moving (the freshness verdict) and the
+        spec (its identity: a discovery that replaced it is a new spec). The instant it is as of and its bound are NOT in
+        it: a derive of an unchanged body moves both with the generation unmoved, so they are stamped on each served copy
+        (``_stamp_fresh``) and a cached object is composed without them."""
         fresh = snap.fresh_info
         gen, sha = snap.row_key if snap.row_key is not None else (-1, None)
-        return (spec.id, gen, sha, snap.status, snap.error, fresh.stale, fresh.pending, fresh.valid_until, snap.as_of,
-                id(spec))
+        return (spec.id, gen, sha, snap.status, snap.error, fresh.stale, fresh.pending, id(spec))
 
     def _cache_get(self, cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]", key: tuple) -> Any:
         with self._head_lock:
@@ -2569,19 +2572,35 @@ class Cockpit:
                 cache.popitem(last=False)
             return value
 
-    def _attached_head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date, auth: RequestAuthority,
-                       now: datetime, rkey: tuple | None = None) -> dict[str, Any]:
-        """The head of an attached panel, composed once per distinct key (``_snap_key`` and ``_request_key``) and shared
-        read-only. A snapshot a row did not stand behind (the serve-composed panels, a retired one) is composed every
-        time. A roster's health is a clock function, so its etag is the one thing set per request, on a copy."""
-        if snap.fresh_info is None:
-            return self._head(spec, snap, cred, today, auth, now)
+    @staticmethod
+    def _stamp_fresh(out: dict[str, Any], snap: _Snap) -> dict[str, Any]:
+        """``as_of`` and ``valid_until`` of this request's snapshot, set on a shallow copy: they are advisory head fields in
+        no etag (R13), so a cached head or payload is composed without them and never holds one."""
+        return {**out, "as_of": snap.as_of, "valid_until": snap.fresh_info.valid_until if snap.fresh_info is not None else None}
+
+    def _cached_head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date, auth: RequestAuthority,
+                     rkey: tuple | None = None) -> dict[str, Any]:
+        """The shared composed head of an attached panel (``_snap_key`` and ``_request_key``), composed without its
+        ``as_of`` and ``valid_until``. Read only: nothing may write into it."""
         key = ("head", *self._snap_key(spec, snap), *(rkey or self._request_key(cred, today, auth)))
         head = self._cache_get(self._head_cache, key)
         if head is None:
-            head = self._cache_put(self._head_cache, HEAD_CACHE_MAX, key, spec, self._head(spec, snap, cred, today, auth, None))
+            bare = dataclasses.replace(snap, as_of=None,
+                                       fresh_info=dataclasses.replace(snap.fresh_info, derived_at=None, valid_until=None))
+            head = self._cache_put(self._head_cache, HEAD_CACHE_MAX, key, spec, self._head(spec, bare, cred, today, auth, None))
+        return head
+
+    def _attached_head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date, auth: RequestAuthority,
+                       now: datetime, rkey: tuple | None = None) -> dict[str, Any]:
+        """The head of an attached panel, composed once per distinct key and shared read-only (``_cached_head``), served as
+        a copy stamped with this request's ``as_of`` and ``valid_until``. A snapshot a row did not stand behind (the
+        serve-composed panels, a retired one) is composed every time. A roster's health is a clock function, so its etag is
+        set per request, on the copy."""
+        if snap.fresh_info is None:
+            return self._head(spec, snap, cred, today, auth, now)
+        head = self._stamp_fresh(self._cached_head(spec, snap, cred, today, auth, rkey), snap)
         if spec.kind == "roster" and isinstance(snap.value, dict):
-            head = {**head, "etag": self._roster_etag(head["etag"], snap.value, now)}
+            head["etag"] = self._roster_etag(head["etag"], snap.value, now)
         return head
 
     def _attached_heads(self, specs: list[ProviderSpec], cred: str, auth: RequestAuthority, ctx: ReadContext,
@@ -3208,15 +3227,16 @@ class Cockpit:
         of the class under that policy) and the compact projection. Set per request, on copies: a roster's health text
         (a clock function), and every row's ``band_age``. A row lookup that finds nothing raises and stores nothing."""
         rkey = self._request_key(credential_class, ctx.today, auth)
-        head = self._attached_head(spec, snap, credential_class, ctx.today, auth, ctx.now, rkey)
         if spec.kind == "roster":
+            head = self._attached_head(spec, snap, credential_class, ctx.today, auth, ctx.now, rkey)
             return self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
         key = ("panel", *self._snap_key(spec, snap), *rkey, profile, row)
         out = self._cache_get(self._panel_cache, key)
         if out is None:
+            head = self._cached_head(spec, snap, credential_class, ctx.today, auth, rkey)
             out = self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
             out = self._cache_put(self._panel_cache, PANEL_CACHE_MAX, key, spec, out)
-        return self._stamp_band_age(out, ctx.now)
+        return self._stamp_fresh(self._stamp_band_age(out, ctx.now), snap)
 
     def _panel_body(self, spec: ProviderSpec, snap: _Snap, head: dict[str, Any] | None, ctx: ReadContext,
                     auth: RequestAuthority, panel_id: str, profile: str, q: str | None, row: str | None,

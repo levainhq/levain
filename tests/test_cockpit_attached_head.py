@@ -381,6 +381,11 @@ class Ins:
         k = {**self.kw, **over}
         return self.rig.ck._attached_head(k["spec"], k["snap"], k["cred"], k["today"], k["auth"], k["now"])
 
+    def cached(self, **over: Any) -> dict[str, Any]:
+        """The shared head object the head layer keeps for these inputs (what ``head`` serves a stamped copy of)."""
+        k = {**self.kw, **over}
+        return self.rig.ck._cached_head(k["spec"], k["snap"], k["cred"], k["today"], k["auth"])
+
 
 def test_the_head_cache_returns_one_object_and_misses_on_each_input(rig: Rig) -> None:
     view = FakeVerbView()
@@ -388,8 +393,9 @@ def test_the_head_cache_returns_one_object_and_misses_on_each_input(rig: Rig) ->
     rig.derive()
     ins = Ins(rig)
     snap, auth = ins.kw["snap"], ins.kw["auth"]
-    base = ins.head()
-    assert ins.head() is base and head(rig) is head(rig)
+    base = ins.cached()
+    assert ins.cached() is base and head(rig) == head(rig)
+    assert len(rig.ck._head_cache) == 2                  # a hit adds nothing: this panel's and the other's
     gen, sha = snap.row_key
     fresh = snap.fresh_info
     other_labels = SimpleNamespace(revision=("x", 1, 2, "y"), error=None, provenance=lambda k: None, label=lambda k: "unverified")
@@ -399,8 +405,6 @@ def test_the_head_cache_returns_one_object_and_misses_on_each_input(rig: Rig) ->
         "error": {"snap": dataclasses.replace(snap, error="boom")},
         "stale": {"snap": dataclasses.replace(snap, fresh_info=dataclasses.replace(fresh, stale=True))},
         "pending": {"snap": dataclasses.replace(snap, fresh_info=dataclasses.replace(fresh, pending=True))},
-        "valid_until": {"snap": dataclasses.replace(snap, fresh_info=dataclasses.replace(fresh, valid_until="2030-01-01T00:00:00+00:00"))},
-        "as_of": {"snap": dataclasses.replace(snap, as_of="2026-11-19T15:00:01+00:00")},
         "class": {"cred": "token"},
         "today": {"today": ins.kw["today"] + timedelta(days=1)},
         "authority revision": {"auth": dataclasses.replace(auth, authority_error="unreadable")},
@@ -409,18 +413,70 @@ def test_the_head_cache_returns_one_object_and_misses_on_each_input(rig: Rig) ->
     }
     seen = [base]
     for name, over in changes.items():
-        got = ins.head(**over)
+        got = ins.cached(**over)
         assert all(got is not s for s in seen), name
-        assert ins.head(**over) is got, name              # and each is itself a hit the second time
+        assert ins.cached(**over) is got, name              # and each is itself a hit the second time
         seen.append(got)
     view.rev = "r2"                                       # the verb revision
-    revised = ins.head()
+    revised = ins.cached()
     assert all(revised is not s for s in seen)
     view.rev = "r1"
-    assert ins.head() is base                             # nothing above evicted it
-    newer = ins.head(snap=dataclasses.replace(snap, row_key=(gen + 1, sha)))      # a later generation of the panel
+    assert ins.cached() is base                             # nothing above evicted it
+    newer = ins.cached(snap=dataclasses.replace(snap, row_key=(gen + 1, sha)))      # a later generation of the panel
     assert all(newer is not s for s in seen) and newer is not revised
-    assert ins.head(snap=dataclasses.replace(snap, row_key=(gen + 1, sha))) is newer
+    assert ins.cached(snap=dataclasses.replace(snap, row_key=(gen + 1, sha))) is newer
+
+
+def _entries(rig: Rig, pid: str = "alpha") -> "tuple[int, int]":
+    return (len([k for k in rig.ck._head_cache if k[1] == pid]), len([k for k in rig.ck._panel_cache if k[1] == pid]))
+
+
+def test_rederiving_an_unchanged_body_keeps_one_entry_per_key_and_serves_the_latest_as_of(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.derive()
+    rig.ck.manifest(CRED)
+    rig.ck.panel("alpha")
+    gen = rig.reader.read("alpha").gen
+    composed: list[int] = []
+    real = Cockpit._panel_body
+
+    def spy(self: Any, *a: Any, **k: Any) -> Any:
+        composed.append(1)
+        return real(self, *a, **k)
+    monkeypatch.setattr(Cockpit, "_panel_body", spy)
+    for _ in range(10):
+        beat(rig, 5)
+        rig.derive("alpha")
+        got_head, got_panel = head(rig), rig.ck.panel("alpha")
+        assert got_head["as_of"] == got_panel["as_of"] == rig.clock().isoformat()      # the latest derive's, every time
+    assert rig.reader.read("alpha").gen == gen                           # the body never changed
+    assert _entries(rig) == (1, 1) and composed == []                    # one entry per key; nothing recomposed
+    for cache in (rig.ck._head_cache, rig.ck._panel_cache):
+        for _spec, held in cache.values():
+            assert held["as_of"] != rig.clock().isoformat()              # the stamp is on the served copy, never in a cached object
+
+
+def test_a_rederive_that_moves_only_valid_until_keeps_the_entry_and_serves_the_new_bound(tmp_path: Path) -> None:
+    r = ValidRig(tmp_path)
+    try:
+        r.valid = {"alpha": (T0 + timedelta(seconds=60)).timestamp()}
+        r.derive()
+        r.ck.manifest(CRED)
+        r.ck.panel("alpha")
+        first = head(r)["valid_until"]
+        for i in range(1, 6):
+            beat(r, 5)
+            r.valid = {"alpha": (T0 + timedelta(seconds=60 + 100 * i)).timestamp()}
+            r.derive("alpha")
+            want = (T0 + timedelta(seconds=60 + 100 * i)).isoformat()
+            assert head(r)["valid_until"] == r.ck.panel("alpha")["valid_until"] == want
+        assert first != want and _entries(r) == (1, 1)
+        r.clock.advance(1000)                                    # past the last bound, the worker beating
+        r.writer.heartbeat(r.clock.epoch())
+        assert head(r)["stale"] is True and head(r)["valid_until"] == want         # the expiry still reads right
+        assert r.ck.panel("alpha")["stale"] is True
+    finally:
+        r.close()
 
 
 def test_the_head_cache_is_bounded_and_least_recently_used(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,15 +484,15 @@ def test_the_head_cache_is_bounded_and_least_recently_used(rig: Rig, monkeypatch
     rig.derive()
     ins = Ins(rig)
     day0 = ins.kw["today"]
-    first = ins.head()
+    first = ins.cached()
     for i in range(1, 4):
-        ins.head(today=day0 + timedelta(days=i))
-    assert ins.head() is first                            # touched: now the most recent
+        ins.cached(today=day0 + timedelta(days=i))
+    assert ins.cached() is first                            # touched: now the most recent
     for i in range(4, 10):
-        ins.head(today=day0 + timedelta(days=i))
+        ins.cached(today=day0 + timedelta(days=i))
     assert len(rig.ck._head_cache) == 4
-    assert ins.head() is not first                        # long gone
-    assert ins.head(today=day0 + timedelta(days=9)) is ins.head(today=day0 + timedelta(days=9))
+    assert ins.cached() is not first                        # long gone
+    assert ins.cached(today=day0 + timedelta(days=9)) is ins.cached(today=day0 + timedelta(days=9))
 
 
 def test_the_panel_cache_is_bounded(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -467,12 +523,13 @@ def test_a_new_generation_drops_the_old_ones_entries(rig: Rig) -> None:
 
 def test_a_panel_read_is_one_object_per_key_and_a_search_is_never_kept(rig: Rig) -> None:
     rig.derive()
+    held = lambda: [v for _s, v in rig.ck._panel_cache.values()]      # noqa: E731 - the objects the cache keeps
     full = rig.ck.panel("alpha")
-    assert rig.ck.panel("alpha") is full
-    assert rig.ck.panel("alpha", profile="compact") is not full
+    assert rig.ck.panel("alpha") == full and len(held()) == 1          # a re-read is a hit on the one kept object
+    assert rig.ck.panel("alpha", profile="compact") != full and len(held()) == 2
     row = rig.ck.panel("alpha", row="alpha:a")
-    assert rig.ck.panel("alpha", row="alpha:a") is row and row is not full
-    assert rig.ck.panel("beta") is not full
+    assert rig.ck.panel("alpha", row="alpha:a") == row and row != full and len(held()) == 3
+    assert rig.ck.panel("beta") != full and len(held()) == 4
     kept = dict(rig.ck._panel_cache)
     one, two = rig.ck.panel("alpha", q="a"), rig.ck.panel("alpha", q="a")
     assert one is not two and one == two and dict(rig.ck._panel_cache) == kept
