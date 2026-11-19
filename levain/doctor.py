@@ -2594,21 +2594,24 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
 
 
 def _check_dream_claude_bin(agent_dir: Path | None = None) -> list[CheckResult]:
-    """The ``dream program`` row (levain#121, ruling np-389e829d (a)): a dream install whose ``claude_bin`` is not the
-    default program. The user who writes ``dream_install.json`` chooses the binary a fire runs and a live install's
-    link does not bind it, so it is shown, never silently trusted. No row when the program is the default or there is
-    no readable dream install."""
+    """The ``dream program`` row (levain#127, ruling np-389e829d (a)): a dream install whose ``claude_bin`` is not the
+    default program, shown with whether the registered spec's signed link binds it, judged by the fire's own check
+    over one read of the install (:func:`levain.dream.agent.dream_program_view`). Since levain#126 the link binds the
+    program, so an unbound one means a fire is refused. No row when the program is the default or there is no dream
+    install; a facts file that is there but unreadable is a warning row saying so (the one place this doctor reads
+    that file)."""
     from levain.autonomic.db import default_store_dir
     from levain.dream import agent as dream_agent
 
-    b = dream_agent.non_default_claude_bin(agent_dir if agent_dir is not None else default_store_dir())
-    if b is None:
+    v = dream_agent.dream_program_view(agent_dir if agent_dir is not None else default_store_dir())
+    line = None if v is None else v.line()
+    if line is None:
         return []
-    from levain import unshowable
-
-    return [CheckResult("dream program", True, f"the dream install runs {unshowable.mark(b[:200], allow='')!r}, not the "
-                        "default program; the dream's signed link does not bind a live install's program",
-                        "If you did not set it, edit or re-run `levain dream enable` to restore it.", warn=True)]
+    fix = ("To return to the default program, remove `claude_bin` from dream_install.json (re-running `levain dream "
+           "enable` keeps the program already there, and it has no flag that sets it); if the dream was signed with "
+           "this program, then run `levain dream enable --revise` and sign the new link.")
+    return [CheckResult("dream program", True, line, fix if v.program is not None else
+                        "Fix the facts file, then run `levain dream enable --revise` if its facts changed.", warn=True)]
 
 
 def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, exc: BaseException) -> CheckResult:

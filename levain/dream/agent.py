@@ -1754,7 +1754,7 @@ def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str |
     def facts_file(p: Path | str | None) -> str:
         return "no first-run facts file" if p is None else f"the first-run facts file {str(p)!r}"
 
-    facts = (f"this install's facts name the program {inst.claude_bin!r}, the model {inst.model!r} and "
+    facts = (f"this install's facts name the program {shown_program(inst.claude_bin)!r}, the model {inst.model!r} and "
              f"{facts_file(inst.facts_path)}")
     if unknown is not None:
         spec_side = (f"the occurrence's spec has the input source {unknown[:200]!r}, which is not one this build "
@@ -1766,7 +1766,7 @@ def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str |
                      "file were bound into the spec")
     else:
         sb, sm = bound_pair(signed)
-        spec_side = (f"the occurrence's spec binds the program {sb!r}, the model {sm!r} and "
+        spec_side = (f"the occurrence's spec binds the program {shown_program(sb)!r}, the model {sm!r} and "
                      f"{facts_file(bound_facts_path(signed))}: the facts changed after that spec was registered")
     # An unknown source's remainder may not parse (a spec this build did not write), so it is never read for a pair.
     pair_differs = unknown is not None or (
@@ -1777,16 +1777,122 @@ def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str |
     return f"{lead}: {facts}, but {spec_side}. Every fire of that spec refuses. {_revise_advice(agent_dir, inst)}"
 
 
-def non_default_claude_bin(agent_dir: Path | str) -> str | None:
-    """The install fact ``claude_bin`` when it is not the default program, else None. The install file's writer (the
-    same user) chooses the binary a fire runs, and a live install's link does not bind it (levain#121, ruling
-    np-389e829d (a): same-user trust for 1.0, shown instead): ``agents show`` and the doctor print it. None too when
-    the facts cannot be read; it never raises."""
+PROGRAM_SHOWN_CAP = 200
+
+
+def shown_program(raw: object) -> str:
+    """``raw`` (an install's ``claude_bin``, or whatever stands there) as one printable string: unshowable characters
+    (control, bidi, variation selectors) marked, and at most :data:`PROGRAM_SHOWN_CAP` characters with the count of
+    the rest said, never a silent cut. The one cap and mark for ``agents show`` (text and ``--json``) and the doctor."""
+    from levain import unshowable
+
+    text = raw if isinstance(raw, str) else repr(raw)
+    out = unshowable.mark(text[:PROGRAM_SHOWN_CAP], allow="")
+    return out if len(text) <= PROGRAM_SHOWN_CAP else f"{out}...(+{len(text) - PROGRAM_SHOWN_CAP} more characters)"
+
+
+@dataclass(frozen=True)
+class ProgramView:
+    """What ``agents show`` and the doctor print about a dream install's program (levain#127, ruling np-389e829d (a)),
+    from ONE read of the facts file. ``program``: the non-default ``claude_bin`` as :func:`shown_program` (None: the
+    default, or no install). ``refusal``: :func:`check_bound`'s refusal of the spec under those same facts (None: a fire
+    passes it, or it could not be judged). ``bound``: True when the signed spec binds this program, False when it does
+    not, None when that could not be read. ``note``: why the install could not be read (the program, if any, is
+    still shown)."""
+    program: str | None = None
+    refusal: str | None = None
+    bound: bool | None = None
+    note: str | None = None
+
+    def line(self) -> str | None:
+        """The one line to print for the program, or None when there is nothing to say. It says a fire runs a program
+        only when the same read found the signed spec binding it and no refusal."""
+        p = self.program
+        if self.note is not None:
+            return (f"cannot read the install: {self.note}" +
+                    ("" if p is None else f"; it names the program {p!r}, not the default, and a fire is refused "
+                                          "until the install is readable"))
+        if p is None:
+            return None
+        if self.refusal is None and self.bound is True:
+            return f"a fire runs {p!r} (bound by the signed link), not the default"
+        if self.bound is False:
+            return (f"the install names {p!r} but the signed link does not bind it: a fire is refused until the dream "
+                    "is re-signed")
+        if self.refusal is not None:
+            return (f"the install names {p!r}, not the default, and a fire of this spec is refused (see the refusal) "
+                    "until that is fixed")
+        return f"the install names {p!r}, not the default; whether the signed link binds it could not be read"
+
+
+def _registered_spec_hash(agent_dir: Path | str) -> str | None:
+    """The spec_hash of the registered dream agent's current version (read only); None when there is none or the store
+    cannot be read."""
+    import sqlite3
+    from urllib.parse import quote
+
+    from levain.autonomic.db import DB_NAME
+
     try:
-        b = read_install(agent_dir).claude_bin
+        conn = sqlite3.connect(f"file:{quote(str(Path(agent_dir) / DB_NAME))}?mode=ro", uri=True, timeout=5.0,
+                               isolation_level=None)
+        try:
+            row = conn.execute("SELECT s.spec_hash FROM agents a JOIN agent_specs s ON s.agent_id = a.agent_id AND "
+                               "s.version = a.current_version WHERE a.name = ? AND a.registration = 'registered'",
+                               (NAME,)).fetchone()
+        finally:
+            conn.close()
     except Exception:  # noqa: BLE001 - advisory only
         return None
-    return b if b and b != DEFAULT_CLAUDE_BIN else None
+    return row[0] if row and isinstance(row[0], str) else None
+
+
+def dream_program_view(agent_dir: Path | str, spec_hash: object = None) -> ProgramView | None:
+    """Read only and advisory, never raises: the install's program together with whether the spec ``spec_hash`` (the
+    registered dream's current spec when omitted) binds it, judged by :func:`check_bound` over the SAME read of
+    ``dream_install.json`` (one read, so the program shown and the refusal cannot describe two files). Since levain#126
+    the signed spec binds the program, so a hand-edited ``claude_bin`` is a refusal, not a program that runs. None when
+    there is no facts file. A file that is there but cannot be read, or fails any fact's check, gives a view whose
+    ``note`` says so and which still carries the program the file names (an unrelated bad fact never hides it)."""
+    path = Path(agent_dir) / INSTALL_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - advisory only
+        return ProgramView(note=f"the facts file cannot be read ({type(exc).__name__})")
+    if not isinstance(doc, dict):
+        return ProgramView(note="the facts file is not a JSON object")
+    raw = doc.get("claude_bin")
+    # an empty or non-string value is not the default: it is shown (and the facts check below refuses it)
+    program = None if raw is None or raw == DEFAULT_CLAUDE_BIN else shown_program(raw)
+    try:
+        inst = install_of_doc(agent_dir, doc)
+    except Exception as exc:  # noqa: BLE001 - advisory only
+        return ProgramView(program=program, note=shown_program(str(exc)) if isinstance(exc, InstallRefused)
+                           else f"the facts cannot be read ({type(exc).__name__})")
+    h = spec_hash if spec_hash is not None else _registered_spec_hash(agent_dir)
+    if h is None:
+        return ProgramView(program=program)
+    refusal = bound = None
+    try:
+        check_bound(agent_dir, {"spec_hash": h}, inst)
+        bound = True
+    except InstallRefused as exc:
+        refusal = str(exc)
+        try:
+            if inst.shadow_flow_root is None:
+                source = _spec_source(agent_dir, h)
+                signed = live_bound_of(source)
+                if source == LIVE_SOURCE:
+                    bound = (inst.claude_bin or DEFAULT_CLAUDE_BIN) == DEFAULT_CLAUDE_BIN
+                elif signed is not None and _well_formed_bound(signed):
+                    bound = bound_pair(signed)[0] == (inst.claude_bin or DEFAULT_CLAUDE_BIN)
+        except Exception:  # noqa: BLE001 - advisory only
+            bound = None
+    except Exception:  # noqa: BLE001 - advisory only: a spec store that cannot be read is the fire's to refuse
+        pass
+    return ProgramView(program=program, refusal=refusal, bound=bound)
 
 
 def bound_refusal_now(agent_dir: Path | str, spec_hash: object) -> str | None:
