@@ -2609,8 +2609,10 @@ class Cockpit:
                        now: datetime, rkey: tuple | None = None) -> dict[str, Any]:
         """The head of an attached panel, composed once per distinct key and shared read-only (``_cached_head``), served as
         a copy stamped with this request's ``as_of`` and ``valid_until``. A snapshot a row did not stand behind (the
-        serve-composed panels, a retired one) is composed every time. A roster's health is a clock function, so its etag is
-        set per request, on the copy."""
+        serve-composed panels, a retired one) is composed every time and takes its freshness fields from
+        ``_stamp_unrowed``. A snapshot of a row that could not be read (a store that failed, no row yet) is kept under its
+        error text (``_snap_key``) like any other. A roster's health is a clock function, so its etag is set per request,
+        on the copy."""
         if snap.fresh_info is None:
             return self._stamp_unrowed(self._head(spec, snap, cred, today, auth, now), snap)
         head = self._stamp_fresh(self._cached_head(spec, snap, cred, today, auth, rkey), snap)
