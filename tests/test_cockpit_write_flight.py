@@ -86,3 +86,116 @@ def test_a_read_after_a_write_does_not_join_the_provider_read_begun_before_it(in
 def test_a_write_to_another_panel_leaves_the_flight_shared() -> None:
     store, early, late, after = _read_across_a_write(lambda ck: ck.invalidate_reads(["other"]))
     assert store.calls == ["OLD"] and early == late == after == "OLD"
+
+
+# --- a refresher panel: the write's background refresh -------------------------------------------------------
+
+
+class _Gated:
+    """A refresher panel's provider: reads ``value`` at the start of a call and holds the calls named in ``hold`` until released."""
+
+    def __init__(self, hold: set[int]) -> None:
+        self.value = "OLD"
+        self.hold = {n: threading.Event() for n in hold}
+        self.entered = {n: threading.Event() for n in hold}
+        self.calls: list[str] = []
+        self._mu = threading.Lock()
+
+    def read(self, ctx) -> Read:
+        with self._mu:
+            self.calls.append(self.value)
+            n, seen = len(self.calls), self.value
+        if n in self.hold:
+            self.entered[n].set()
+            self.hold[n].wait(10)
+        return Read(rows=(RowIn(id="r1", title=seen, facets={"at": "2026-11-19T00:00:00+00:00"}),))
+
+
+def _refresher(prov: _Gated) -> Cockpit:
+    ck = _cockpit(prov, refresh_every_s=600.0)
+    ck.start()                                             # the first read, taken here, is call 1
+    return ck
+
+
+def _settled(ck: Cockpit, pid: str = "p") -> bool:
+    for _ in range(200):
+        with ck._rc_lock:
+            if pid not in ck._rc_refreshing:
+                return True
+        time.sleep(0.02)
+    return False
+
+
+def test_the_refetch_that_races_the_write_refresh_is_not_what_the_page_keeps() -> None:
+    prov = _Gated({2})
+    ck = _refresher(prov)
+    try:
+        assert _title(ck.panel("p", credential_class="token")) == "OLD"
+        prov.value = "NEW"
+        ck.invalidate_reads(["p"])                         # the write's refresh (call 2) is now held in the provider
+        assert prov.entered[2].wait(5)
+        assert _title(ck.panel("p", credential_class="token")) == "OLD"     # the page's refetch: the snapshot so far
+        prov.hold[2].set()
+        assert _settled(ck)
+        assert _title(ck.panel("p", credential_class="token")) == "NEW"     # not the stale entry, inside the TTL
+    finally:
+        ck.stop()
+
+
+def test_a_write_that_lands_while_a_refresh_is_running_gets_a_read_after_it() -> None:
+    prov = _Gated({2})
+    ck = _refresher(prov)
+    try:
+        t = threading.Thread(target=lambda: ck.refresh("p"))          # a periodic cycle, inside its provider read
+        t.start()
+        assert prov.entered[2].wait(5)
+        prov.value = "NEW"                                 # the write commits after that read began
+        ck.invalidate_reads(["p"])
+        prov.hold[2].set()
+        t.join(10)
+        assert _settled(ck)
+        assert prov.calls == ["OLD", "OLD", "NEW"], prov.calls
+        assert _title(ck.panel("p", credential_class="token")) == "NEW"
+    finally:
+        ck.stop()
+
+
+def test_a_second_write_during_the_write_refresh_gets_its_own_read() -> None:
+    prov = _Gated({2})
+    ck = _refresher(prov)
+    try:
+        prov.value = "NEW"
+        ck.invalidate_reads(["p"])
+        assert prov.entered[2].wait(5)
+        prov.value = "NEWER"                               # a second write, while the first one's refresh is out
+        ck.invalidate_reads(["p"], refresh=True)
+        prov.hold[2].set()
+        assert _settled(ck)
+        assert prov.calls == ["OLD", "NEW", "NEWER"], prov.calls
+        assert _title(ck.panel("p", credential_class="token")) == "NEWER"
+    finally:
+        ck.stop()
+
+
+def test_a_refresh_thread_that_cannot_start_leaves_no_mark_and_raises_nothing(monkeypatch) -> None:
+    prov = _Gated(set())
+    ck = _refresher(prov)
+    try:
+        real = threading.Thread
+
+        class Refusing(real):
+            def start(self):
+                if self.name.startswith("cockpit-write-refresh"):
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        monkeypatch.setattr(threading, "Thread", Refusing)
+        ck.invalidate_reads(["p"])                         # must not raise out of the server's response path
+        assert not ck._rc_refreshing
+        monkeypatch.setattr(threading, "Thread", real)
+        prov.value = "NEW"
+        ck.invalidate_reads(["p"])                         # and a later write still refreshes
+        assert _settled(ck)
+        assert prov.calls[-1] == "NEW"
+    finally:
+        ck.stop()

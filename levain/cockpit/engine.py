@@ -774,6 +774,7 @@ class Cockpit:
         self._rc_gen = 0
         self._rc_scope_gen: dict[Any, int] = {}     # a keyed write's generation per read scope (see ``invalidate_reads``)
         self._rc_refreshing: set[str] = set()       # refresher panels with a write-triggered refresh still running
+        self._rc_refresh_dirty: set[str] = set()    # of those, the ones a later write reached while it ran
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -2203,37 +2204,53 @@ class Cockpit:
             if st is not None:
                 with st.lock:
                     st.epoch += 1
-        scopes = [("panel", p) for p in ids] + [_RC_SHARED_SCOPE]
+        self._drop_scopes([("panel", p) for p in ids] + [_RC_SHARED_SCOPE])
+        if refresh:
+            for pid in ids:
+                self._refresh_in_background(pid)
+
+    def _drop_scopes(self, scopes: list) -> None:
+        """Advance these read scopes' generation and delete their entries, in-flight ones included."""
         with self._rc_lock:
             for sc in scopes:
                 self._rc_scope_gen[sc] = self._rc_scope_gen.get(sc, 0) + 1
             gone = [k for k in self._rc if _rc_scope(k[2]) in scopes]
             for k in gone:
                 del self._rc[k]
-        if refresh:
-            for pid in ids:
-                self._refresh_in_background(pid)
 
     def _refresh_in_background(self, panel_id: str) -> None:
-        """One refresh of a refresher panel on its own short-lived thread, skipped when the panel has no refresher or one
-        started by an earlier write has not finished (that one reads after the write it was started for)."""
+        """Refresh a refresher panel after a write, on its own short-lived thread (nothing here runs on the caller's).
+        A panel with no refresher is skipped. While a write's refresh is still running, the write is only noted
+        (``_rc_refresh_dirty``) and the running thread reads again once it ends, so every write is followed by a refresh
+        that began after it. When a refresh returns, the panel's cached reads are dropped: an on-demand read that
+        arrived meanwhile was served the snapshot from before it and stored that."""
         if panel_id not in self._refreshers:
             return
         with self._rc_lock:
             if panel_id in self._rc_refreshing:
+                self._rc_refresh_dirty.add(panel_id)
                 return
             self._rc_refreshing.add(panel_id)
 
         def run() -> None:
-            try:
-                self.refresh(panel_id)
-            except Exception:  # noqa: BLE001 - the refresher's own cycle reports a bad read; this one is a nudge
-                pass
-            finally:
+            while True:
+                try:
+                    self.refresh(panel_id)
+                except Exception:  # noqa: BLE001 - the refresher's own cycle reports a bad read; this one is a nudge
+                    pass
+                self._drop_scopes([("panel", panel_id)])
                 with self._rc_lock:
-                    self._rc_refreshing.discard(panel_id)
+                    if panel_id not in self._rc_refresh_dirty:
+                        self._rc_refreshing.discard(panel_id)
+                        return
+                    self._rc_refresh_dirty.discard(panel_id)
 
-        threading.Thread(target=run, name=f"cockpit-write-refresh-{panel_id}", daemon=True).start()
+        try:
+            threading.Thread(target=run, name=f"cockpit-write-refresh-{panel_id}", daemon=True).start()
+        except Exception:  # noqa: BLE001 - a thread that cannot start must not strand the mark or fail the write's response
+            with self._rc_lock:
+                self._rc_refreshing.discard(panel_id)
+                self._rc_refresh_dirty.discard(panel_id)
 
     def _shared_read(self, key: Any, compute: Callable[[], Any], keep: Callable[[Any], bool] = lambda v: True) -> Any:
         """Single-flight plus a short TTL for one identical read. ``key`` must hold EVERYTHING the result
