@@ -50,6 +50,8 @@
   // learns the drop was delivered and signed from the cockpit's own event (dashboard_core.js raises it for a message from the sheet's
   // frame; the event is display only, not an authentication). A drop sent as words only is not counted as an ask.
   var ROTATE_MARK = "/rotate", UNNAMED_DESK = "(unnamed desk)";
+  // the verb a drop's words lead with: the first word, which tells one kind of drop from another
+  function firstWord(s) { return String(s).trim().split(/\s+/)[0] || ""; }
   // the drop's words name the desk they are for (the lease holder's seat name when the sheet opens) and carry their own condition
   function rotateWords(holder) {
     var name = String(holder === null || holder === undefined ? "" : holder).replace(/\s+/g, " ").trim();
@@ -504,15 +506,16 @@
     function deskName(h) { return h ? shown(h) : "an unnamed desk"; }
     // A signed drop the cockpit's sheet delivered, and what it said: counted as an ask only when this view opened that sheet for it, the
     // delivered words are EXACTLY the words the button handed the sheet, it was signed, and the lease is still held by the desk those
-    // words named. Anything else is said, and no ask is recorded.
+    // words named. Anything else that is this sheet's words is said, and no ask is recorded; another verb's drop is not this sheet's and says nothing.
     function onDelivered(ev) {
       if (stopped || !pendingOpen || !current || current.kind !== "wired") return;
       var d = ev && ev.detail, words = d && typeof d.words === "string" ? d.words : null;
       if (words === null) return;
       var lease = current.lease;
       if (words !== pendingOpen.words) {
-        // edited, or another drop: not what the button handed over. The sheet may be sent again, so the open stays.
-        startNote = DIFFERENT_WORDS; noteFor = lease.state; lastKey = ""; draw();
+        // edited, or another drop: not what the button handed over. The sheet may be sent again, so the open stays. Only the same
+        // verb's words are named as differing; a drop with another verb is not this sheet's and is left unsaid.
+        if (firstWord(words) === firstWord(pendingOpen.words)) { startNote = DIFFERENT_WORDS; noteFor = lease.state; lastKey = ""; draw(); }
         return;
       }
       if (d.signed !== true) { startNote = UNSIGNED_WORDS; noteFor = lease.state; lastKey = ""; draw(); return; }
@@ -523,7 +526,7 @@
       if (lease.state !== "held" || (lease.holder || null) !== pendingOpen.holder) {
         // the desk the words named is no longer the one holding the lease (a successor, or none): a signed drop, but no ask to wait on
         startNote = "Signed for " + deskName(pendingOpen.holder) + ", but " + (lease.state === "held" ? deskName(lease.holder) : "no desk") +
-          " holds the lease now; no ask is recorded here.";
+          " held the lease at delivery; no ask is recorded here.";
         noteFor = lease.state; pendingOpen = null; lastKey = ""; draw();
         return;
       }

@@ -330,7 +330,7 @@ def test_a_signed_delivery_after_the_lease_left_held_says_so_and_records_no_ask(
         put(get={"status": 200, "json": wired(lease=NONE)}), until("document.querySelector('.dv-lease-none .dv-start')"),
         delivered(True), SETTLE, LOOK])
     g = looks(out)[-1]
-    assert g["note"] == "Signed for desk 25, but no desk holds the lease now; no ask is recorded here.", g
+    assert g["note"] == "Signed for desk 25, but no desk held the lease at delivery; no ask is recorded here.", g
     assert g["kept"] is None and g["rotate"] == [] and g["age"] == [], g                  # no ask record, no timer
 
 
@@ -360,7 +360,7 @@ def test_a_lease_that_passed_to_another_desk_while_the_sheet_was_open_records_no
         until("document.querySelector('.dv-leasewords') && document.querySelector('.dv-leasewords').textContent.indexOf('desk 26') === 0"),
         delivered(True), SETTLE, LOOK])
     g = looks(out)[-1]
-    assert g["note"] == "Signed for desk 25, but desk 26 holds the lease now; no ask is recorded here.", g
+    assert g["note"] == "Signed for desk 25, but desk 26 held the lease at delivery; no ask is recorded here.", g
     assert g["kept"] is None and g["rotate"] == [] and g["age"] == [] and g["start"] == "Rotate Desk", g          # no ask, no timer, no wait drawn
 
 
@@ -376,6 +376,20 @@ def test_words_the_user_edited_are_not_counted_and_the_exact_words_are_counted_w
         assert g["rotate"] == [] and g["kept"] is None and g["start"] == "Rotate Desk", g
         assert g["note"] and "differ from the words this button handed the sheet" in g["note"] and "not counted as asked here" in g["note"], g
     assert len(exact["rotate"]) == 1 and "Asked the desk to rotate" in exact["rotate"][0] and json.loads(exact["kept"])["holder"] == "desk 25", exact      # the edited tries left the sheet open
+
+
+@needs_browser
+def test_a_drop_with_another_verb_while_the_sheet_is_open_is_not_named_as_differing(tmp_path):
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired()}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE, LOOK,
+        delivered(True, "/fanin broad"), SETTLE, LOOK,
+        delivered(True, "/rotate desk 25 Write your handoff, start your successor, then stop. and one more thing"), SETTLE, LOOK])
+    opened, other_verb, same_verb = looks(out)
+    assert "rotates nothing" in opened["note"], opened
+    assert other_verb["note"] == opened["note"], other_verb                                          # another verb's drop says nothing: the open note stands
+    assert other_verb["rotate"] == [] and other_verb["kept"] is None and other_verb["start"] == "Rotate Desk", other_verb
+    assert "differ from the words this button handed the sheet" in same_verb["note"], same_verb      # the same verb's edited words are named
+    assert same_verb["rotate"] == [] and same_verb["kept"] is None, same_verb
 
 
 @needs_browser
