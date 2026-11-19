@@ -9,7 +9,10 @@ fetch, held open by a gate the test releases, so the order "row repainted, then 
 * no `touched` (an older server): the whole-board path runs (manifest GET, every panel), the view's refetch is never used;
 * de-dup: a stream-style refetch of the same panel right after the write is answered by the write's read, another panel
   is read for itself;
-* a panel the page cannot repaint in place (answers false) asks one passive board read, never a latched reload.
+* a panel the page cannot repaint in place (answers false) asks one board read (not passive), however many of a write's
+  panels answer false, and a board read already in flight is re-read once it ends;
+* the row repaint is visible before the panel read returns (a snooze into the future hides the row, a text edit changes the
+  row's words, another field dims the row).
 """
 
 from __future__ import annotations
@@ -236,7 +239,7 @@ cases.the_stream_announcing_a_refetched_panel_reads_it_once = async () => {
   ok(b === "applied" && env.refetchCalls.filter((p) => p === "tray").length === 1, "still one read inside the window: " + JSON.stringify(env.refetchCalls));
 };
 
-cases.a_panel_that_cannot_repaint_in_place_asks_one_passive_board_read = async () => {
+cases.a_panel_that_cannot_repaint_in_place_asks_one_board_read = async () => {
   const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => false).start();
   const getsBefore = env.gets.length;
   await env.snooze();
@@ -261,6 +264,33 @@ cases.a_write_from_an_open_form_reads_the_board_non_passively = async () => {
   await env.tick();
 };
 
+// H2: with the page's REAL refetchPanel a native panel (the tray) answers false without a read, so the board read is the
+// only thing that can show the write. A board read already in flight when it is asked renders the pre-write board: the
+// re-read must be owed once that one ends.
+cases.a_native_panel_with_a_board_read_in_flight_is_re_read_after_it = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied", { real: true }).start();
+  const getsBefore = env.gets.length;
+  env.holdManifest();
+  env.startPassiveLoad();               // a board read is out (the page's own refresh), held
+  await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read is in flight: " + JSON.stringify(env.gets.slice(getsBefore)));
+  const r = await env.snooze();
+  ok(r && r.ok === true, "the write landed");
+  await env.tick();
+  env.releaseManifest();                // the in-flight read (which began before the write) ends
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 2, "a second board read followed the in-flight one: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
+// two touched panels the view cannot repaint (the tray and the edits list) ask for ONE board read between them
+cases.two_native_panels_ask_one_board_read = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray", "edits"] }), () => "applied", { real: true }).start();
+  const getsBefore = env.gets.length;
+  await env.snooze();
+  await env.tick(); await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) === 1, "one board read for two native panels: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
 (async () => {
   for (const name of Object.keys(cases)) {
     if (only && name !== only) continue;
@@ -282,8 +312,10 @@ CASES = [
     "a_response_without_touched_runs_the_whole_board_path",
     "an_empty_touched_is_no_touched",
     "the_stream_announcing_a_refetched_panel_reads_it_once",
-    "a_panel_that_cannot_repaint_in_place_asks_one_passive_board_read",
+    "a_panel_that_cannot_repaint_in_place_asks_one_board_read",
     "a_write_from_an_open_form_reads_the_board_non_passively",
+    "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
+    "two_native_panels_ask_one_board_read",
 ]
 
 

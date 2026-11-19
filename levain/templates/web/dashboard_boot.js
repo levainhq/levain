@@ -1102,6 +1102,7 @@
     const V = window.LevainCockpitView;
     const read = viewRefetch || (V && V.refetchPanel);
     if (typeof read !== "function") return false;
+    let boardAsked = false;
     for (const pid of ids) {
       let done;
       try { done = Promise.resolve(read.call(V, pid)); } catch (_) { done = Promise.resolve("fault"); }
@@ -1110,7 +1111,12 @@
       // A panel the view cannot repaint in place asks for the board read, NOT passive and not awaited here: the rebuild it
       // makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit and
       // would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
-      done.then((r) => { if (r === false) load(); });
+      // One write asks for it once, whatever number of its panels answered false, and not at all when a re-read is already owed.
+      done.then((r) => {
+        if (r !== false || boardAsked || pendingReload) return;
+        boardAsked = true;
+        load().catch(() => {});
+      });
     }
     return true;
   }
