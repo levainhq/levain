@@ -606,6 +606,33 @@ def test_start_stop_leaves_no_thread_alive_and_is_single_use():
     assert set(derive_threads()) - before == set()
 
 
+def _loop_thread_names(loop):
+    return sorted(t.name for t in loop._threads)
+
+
+def _started_names(**kw):
+    loop, writer, clock, _ = make([PanelPlan("a")], poll_s=0.01, threads=3, **kw)
+    loop.start()
+    try:
+        names = _loop_thread_names(loop)
+        assert writer.wait_for(lambda pubs: len(pubs) >= 1)
+    finally:
+        loop.stop()
+    return names
+
+
+def test_thread_names_default_to_derive_poll_and_derive_n():
+    assert _started_names() == ["derive-0", "derive-1", "derive-2", "derive-poll"]
+
+
+def test_thread_name_prefix_applies_to_the_poll_thread_and_every_derive_thread():
+    assert _started_names(thread_name_prefix="pfx-") == ["pfx-derive-0", "pfx-derive-1", "pfx-derive-2", "pfx-derive-poll"]
+
+
+def test_an_empty_thread_name_prefix_is_the_default():
+    assert _started_names(thread_name_prefix="") == _started_names()
+
+
 def test_a_slow_panel_does_not_block_the_others():
     gate, entered = threading.Event(), threading.Event()
 

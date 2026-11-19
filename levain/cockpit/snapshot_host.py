@@ -259,15 +259,6 @@ DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
 HOST_POLL_S = 1.0
 
 
-class _HostLoop(DeriveLoop):
-    """The derive loop with its threads named under ``DERIVE_THREAD_PREFIX``. The name is set by the thread itself
-    before it does any work, so no derive ever runs on a thread that still has the loop's plain name."""
-
-    def _thread_main(self, target: Callable[[], None]) -> None:
-        me = threading.current_thread()
-        me.name = "levain-cockpit-" + me.name
-        super()._thread_main(target)
-
 
 def _one_line(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())
@@ -299,9 +290,10 @@ class SnapshotHost:
         self._writer = SnapshotWriter(path)
         try:
             self._reader = SnapshotReader(path)
-            self._loop = _HostLoop(
+            self._loop = DeriveLoop(
                 self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
                 poll_s=poll_s, token_fn=token_fn, clock=clock, on_publish=None,
+                thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
             self._writer.close()
