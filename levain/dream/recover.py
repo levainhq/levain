@@ -112,9 +112,33 @@ def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path, deadline
     if not (isinstance(started, str) and started and " ".join(started.split()) == ident[0]):
         return False
     want = " ".join(str(a) for a in argv) if isinstance(argv, list) else ""
-    if " ".join(want.split()) != " ".join(ident[1].split()):
+    have = " ".join(ident[1].split())
+    if " ".join(want.split()) != have and not any(
+            " ".join((pre + " " + want).split()) == have for pre in _script_prefixes(argv)):
         return False
     return _names_occurrence(argv, occ_dir)
+
+
+def _script_prefixes(argv: Any) -> list[str]:
+    """What ``ps`` may list before the recorded argv when ``argv[0]`` is a ``#!`` script: the kernel runs the script's
+    interpreter and ``ps`` shows ``<interpreter> <script> <args>``, not the argv the parent passed. Only the script's own
+    shebang line is offered (and, for ``/usr/bin/env <prog>``, ``<prog>`` by name or path): a native binary has none."""
+    if not (isinstance(argv, list) and argv and isinstance(argv[0], str)):
+        return []
+    try:
+        with open(argv[0], "rb") as f:
+            first = f.readline(512)
+    except OSError:
+        return []
+    if not first.startswith(b"#!"):
+        return []
+    toks = first[2:].decode("utf-8", "replace").split()
+    if not toks:
+        return []
+    out = [" ".join(toks[:i]) for i in (len(toks),)]
+    if os.path.basename(toks[0]) == "env" and len(toks) > 1:
+        out.append(toks[1])                       # `env prog` execs prog: ps lists it as the interpreter
+    return out
 
 
 def _names_occurrence(argv: Any, occ_dir: Path) -> bool:

@@ -805,3 +805,47 @@ def test_j5_a_saving_phase_refusal_files_the_same_unsettled_kind_as_the_other_un
     monkeypatch.setattr(sn, "record_post_for", refuse)
     res = rc.recover(scratch, occ(scratch, "o1"))
     assert not res.settled and res.card["kind"] == "failed"
+
+
+# ------------------------------------------------------------------------------------------- levain#131 (script argv)
+
+def _script_stub(tmp_path):
+    """A `#!/bin/sh` stub like the fire rigs' `claude`: ps shows `/bin/sh <path> ...`, not `<path> ...`."""
+    stub = tmp_path / "claude"
+    stub.write_text("#!/bin/sh\nsleep 300\n")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_l131_a_shebang_script_child_is_confirmed_by_its_recorded_argv(scratch, tmp_path):
+    """The reproduced failure: the recorded argv[0] is the script's path, ps lists the interpreter first, so the exact
+    comparison read the live orphan as not-confirmed and recovery never ended it."""
+    stub = _script_stub(tmp_path)
+    argv = [str(stub), "-p", "--add-dir", str(occ(scratch, "o1"))]
+    p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.3)
+        _record_child(scratch, "o1", p, argv)
+        assert rc._identity_matches(p.pid, prog(scratch, "o1")["child_started_at"], argv, occ(scratch, "o1")) is True
+        import threading
+        threading.Thread(target=p.wait, daemon=True).start()      # the test is the parent: reap, as the fire's init would
+        kind, _ = rc.end_orphan_child(prog(scratch, "o1"), occ(scratch, "o1"), term_wait=2, kill_wait=2)
+        assert kind == "ended" and p.wait(timeout=5) is not None
+    finally:
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+
+
+def test_l131_an_interpreter_prefix_is_not_accepted_for_a_binary_or_a_wrong_interpreter(scratch, tmp_path):
+    stub = _script_stub(tmp_path)
+    argv = [str(stub), "-p", "--add-dir", str(occ(scratch, "o1"))]
+    p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.3)
+        _record_child(scratch, "o1", p, argv)
+        stub.write_text("#!/usr/bin/perl\nsleep 300\n")             # shebang no longer names the running interpreter
+        assert rc._identity_matches(p.pid, prog(scratch, "o1")["child_started_at"], argv, occ(scratch, "o1")) is False
+    finally:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
