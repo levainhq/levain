@@ -271,7 +271,9 @@ class Watcher:
 
     def tick(self, run: threading.Event | None = None) -> bool:
         """One observation. Any failure is this tick's alone: it is logged and the next tick tries again.
-        True when the observation was taken (whether or not it announced anything)."""
+        False when the observation failed. True otherwise, which includes a tick from a run that has been stopped or
+        replaced: that observation is read but discarded (nothing adopted, nothing announced). A True return is "the
+        look did not fail", not "this tick's observation is the watcher's current one"."""
         try:
             now, version = self._observe()
         except Exception:   # noqa: BLE001 - a watcher that dies would leave every page reading "live" over stale data
