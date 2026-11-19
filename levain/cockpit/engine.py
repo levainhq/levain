@@ -2458,7 +2458,7 @@ class Cockpit:
                 if self._obs_after is None or read_after >= self._obs_after:
                     self._obs_after = read_after
                     prev, self._obs_etags = self._obs_etags, seen
-                    if prev is None or prev != seen:
+                    if prev is not None and prev != seen:
                         self._obs_gen += 1
                 # else: a newer build already completed and owns the baseline; this older one decides nothing
             return out
