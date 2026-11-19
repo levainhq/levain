@@ -158,12 +158,7 @@ def _decide(root, path) -> Tuple[bool, bool]:
 
     An unsure side never takes the lexical answer: its spelling is the unresolved one, and a component of it may be a
     link that leads elsewhere. The identity walk then decides, and a match found ABOVE a component that exists and
-    could not be stat'ed is unsure, not inside (that component is where the path could not be placed).
-
-    Known edge (Diogenes 11-19, ruled levain 48 1119-5, no caller reaches it): a root that does not exist yet, below a
-    directory that stats but refuses the open, answers a sure "not inside" for a path whose text is under it. Diogenes read the
-    ``maybe_inside`` call sites on 11-19 and found none that reaches it. Fix if one does:
-    ``return False, unsure or sr or sp or exc.errno not in _ABSENT`` in the root-stat branch, pinned by a mode-0o311 case."""
+    could not be stat'ed is unsure, not inside (that component is where the path could not be placed)."""
     try:
         Path(root), Path(path)
     except TypeError:                                   # not a path at all (None, an int): nothing can be said of it
@@ -177,7 +172,10 @@ def _decide(root, path) -> Tuple[bool, bool]:
         want = os.stat(cr)
     except OSError as exc:
         # a root that does not exist is identical to nothing; one that exists and cannot be stat'ed is an open question
-        return False, unsure or exc.errno not in _ABSENT
+        # an absent root has no inode to match by identity: where a side's spelling was not read, the text under the root
+        # is the only evidence there is, so that stays an open question rather than a sure no (Diogenes 11-19)
+        text_under = (sr or sp) and (cp == cr or cr in cp.parents)
+        return False, unsure or text_under or exc.errno not in _ABSENT
     except (ValueError, TypeError):                     # an embedded NUL: a root that cannot be stat'ed is an open question
         return False, True
     unplaced = False                                    # a component below this candidate exists and could not be stat'ed

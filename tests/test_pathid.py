@@ -388,3 +388,21 @@ def test_an_unspelled_component_is_compared_by_identity_only_on_any_filesystem(t
     assert not pathid.maybe_inside(tree / "root", target)              # placed by stat: not a refusal of everything
     assert not pathid.maybe_inside(target, tree / "root")
     assert pathid.inside(tree, target)                                 # its real parent still contains it, by identity
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens every directory: no permission failure to provoke")
+@pytest.mark.parametrize("mode", [0o111, 0o311, 0o100])
+def test_an_absent_root_below_a_searchable_but_unopenable_directory_keeps_a_path_under_it_open(tree, mode):
+    """Diogenes 11-19 LOW, replayed with real directories: root = D/newroot (absent), path = D/newroot/f, D stats but
+    refuses the open. The lexical shortcut is skipped for the unspelled side and the root has no inode, so the answer
+    was a sure NO at a DENY site; it is now an open question. An absent root with the text NOT under it stays a plain no."""
+    d = tree / "d"
+    d.mkdir()
+    d.chmod(mode)
+    try:
+        assert pathid.maybe_inside(d / "newroot", d / "newroot" / "f")
+        assert pathid.maybe_inside(d / "newroot", d / "newroot")
+        assert not pathid.maybe_inside(d / "newroot", tree / "elsewhere" / "f")
+        assert not pathid.maybe_inside(d / "newroot", d / "other" / "f")
+    finally:
+        d.chmod(0o700)

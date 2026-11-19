@@ -552,3 +552,17 @@ def test_init_stdout_still_exits_two_when_the_registry_of_a_found_store_cannot_b
         main(["charter", "init", "--help"])
     out = " ".join(capsys.readouterr().out.split())
     assert "still exits 2" in out and "gives 0 or 1" not in out
+
+
+def test_the_two_help_rc_claims_for_a_bad_items_are_pinned(tmp_path, capsys):
+    """check --file with an --items that is no store gives 0 (warn mode); init --stdout with one gives 1, never 2."""
+    repo = _git_repo(tmp_path / "levain")
+    doc = tmp_path / "C.md"
+    doc.write_text("# nothing\n", encoding="utf-8")
+    nostore = tmp_path / "not-a-store"
+    nostore.mkdir()
+    assert main(["charter", "check", "--repo", str(repo), "--file", str(doc), "--items", str(nostore)]) == 0
+    capsys.readouterr()
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(nostore), "--stdout"]) == 1
+    out = capsys.readouterr()
+    assert out.out == ""
