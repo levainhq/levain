@@ -1573,10 +1573,13 @@ class Cockpit:
         """Every registered panel's class-none head etag, built the way the change stream's manifest read builds them, and a
         version of the panel set: the ids, the verb revision, the calendar day, the entity and the discovery errors, each
         of which changes what a page draws with no snapshot moving. A serve-composed panel reads its stores here, as it does in a manifest."""
+        began = time.monotonic()
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         live = [s for s in self._ordered_specs(self._specs) if self._state_of(s) is not None]
-        heads, _meta = self._attached_heads(live, "none", auth, ctx)
+        # a serve-composed panel is read no earlier than this look: a read shared from before it could miss a change made
+        # by another process, which the probe exists to announce (the watcher's own read is taken the same way)
+        heads, _meta = self._attached_heads(live, "none", auth, ctx, read_after=began)
         etags = {spec.id: heads[spec.id]["etag"] for spec in live}
         # the entity and the errors the manifest carries move a page with no panel etag moving, so they are in the version
         stored, discovery_errors = self._entity_value, list(self._discovery_errors)

@@ -188,6 +188,31 @@ def test_the_probe_etags_are_the_manifest_etags_and_read_the_store_once(rig: Rig
     assert etags == {pid: head(rig, pid)["etag"] for pid in PANELS}
 
 
+def test_the_probe_snapshot_reads_a_serve_composed_store_afresh_inside_the_read_cache_window(tmp_path: Path) -> None:
+    """A store another process changed is announced when the probe next looks, not up to ``read_cache_ttl_s`` later."""
+    store = {"rows": ["a"]}
+
+    def read(ctx: ReadContext) -> Read:
+        return Read(rows=tuple(RowIn(f"mine:{n}", n, {"at": "2026-11-19"}, stored={"id": f"mine:{n}"}) for n in store["rows"]))
+
+    spec = ProviderSpec(id="mine", kind="triage-list", title="mine", priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+    r = Rig(tmp_path, ("alpha", "mine"), specs={"mine": spec})
+    try:
+        r.ck.mark_serve_composed(["mine"])
+        r.ck.read_cache_ttl_s = 30.0
+        r.derive()
+        probe = r.ck.change_probe()
+        before = probe.snapshot()[0]["mine"]
+        assert r.ck.panel("mine")["count"] == 1                      # a read inside the window, now the shared one
+        store["rows"] = ["a", "b"]                                   # another process changed the store
+        after = probe.snapshot()[0]["mine"]
+        assert after != before
+        assert r.ck.panel("mine")["count"] == 2
+    finally:
+        r.close()
+
+
 # --- 1. one read transaction per manifest ------------------------------------------------------------------------------------
 def _count_reads(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> Counter:
     calls: Counter = Counter()
