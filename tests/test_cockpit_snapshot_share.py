@@ -252,13 +252,9 @@ def _clock_on(ck: Cockpit, day: int) -> None:
 
 
 def test_a_page_manifest_after_a_watcher_build_is_never_the_entry_cached_before_it(ck) -> None:
-    # gemini L3 r1: the watcher's build that announced (here the day turning, no provider value moved); the page's
-    # manifest inside the window must not be the older entry
-    _clock_on(ck, 10)
-    ck.manifest(NONE, read_after=time.monotonic())          # the watcher's baseline
+    # gemini L3 r1: the watcher's fresh build announced; the page's manifest inside the window must not be the older entry
     m1 = ck.manifest(NONE)
     assert ck.manifest(NONE) is m1
-    _clock_on(ck, 11)
     ck.manifest(NONE, read_after=time.monotonic())
     assert ck.manifest(NONE) is not m1
 
@@ -271,41 +267,44 @@ def test_a_refresher_panels_refetch_after_a_watcher_build_is_a_new_entry(ck) -> 
 
     ck.register(_simple("cyc", rows=(), read=lambda ctx: Read(rows=(_row(1),)), refresh_every_s=60.0, stale_after_s=120.0))
     ck.refresh("cyc")
-    _clock_on(ck, 10)
-    ck.manifest(NONE, read_after=time.monotonic())          # the watcher's baseline
     p1 = ck.panel("cyc", credential_class="none")
     assert ck.panel("cyc", credential_class="none") is p1
-    _clock_on(ck, 11)
     ck.manifest(NONE, read_after=time.monotonic())
     assert ck.panel("cyc", credential_class="none") is not p1
 
 
-def test_watcher_builds_that_announce_nothing_leave_the_page_sharing_what_it_cached(ck, monkeypatch) -> None:
-    # the first watcher build is the baseline (nothing to differ from) and an unchanged one announces nothing: neither
-    # may move the generation in the cache keys, or the page's refetch right after the stream starts recomputes
+def test_the_first_watcher_build_moves_the_generation_once(tmp_path: Path) -> None:
+    # a page cached manifest A, a provider changed before the stream's first build: that build announces nothing to diff
+    # against, but the page's refetch after the stream's hello must still not be A
+    c, state = _external_cockpit(tmp_path)
+    a = c.manifest(NONE)
+    state["rows"] = [_row(1), _row(2)]                       # another process changes a value after the page cached A
+    c.manifest(NONE, read_after=time.monotonic())            # the stream's first build
+    assert c._obs_gen == 1
+    b = c.manifest(NONE)
+    assert b is not a
+    assert b["panels"]["od"]["etag"] != a["panels"]["od"]["etag"]
+
+
+def test_a_later_build_that_announces_nothing_leaves_the_page_sharing_what_it_cached(ck, monkeypatch) -> None:
+    # an equal later build announces nothing: it must not move the generation, or the page's reads right after the
+    # stream starts recompute (what a bump on every build did)
     n = _provider_reads(monkeypatch, ck)
-    m1 = ck.manifest(NONE)
-    assert n[PID] == 1
-    ck.manifest(NONE, read_after=time.monotonic())           # the first build
-    assert ck._obs_gen == 0
+    ck.manifest(NONE, read_after=time.monotonic())           # the first build bumps once
+    assert ck._obs_gen == 1
+    m1 = ck.manifest(NONE)                                   # cached under the generation the first build left
+    assert n[PID] >= 1
     ck.manifest(NONE, read_after=time.monotonic())           # nothing moved since
     ck.manifest(NONE, read_after=time.monotonic())
-    assert ck._obs_gen == 0
+    assert ck._obs_gen == 1
     reads = n[PID]
-    assert ck.manifest(NONE) is m1                           # still the entry cached before the builds
+    assert ck.manifest(NONE) is m1                           # still the entry cached after the first build
     assert n[PID] == reads
-
-
-def test_the_first_watcher_build_is_the_baseline_and_moves_nothing(ck) -> None:
-    m1 = ck.manifest(NONE)
-    ck.manifest(NONE, read_after=time.monotonic())
-    assert ck._obs_gen == 0
-    assert ck.manifest(NONE) is m1
 
 
 def test_a_watcher_build_whose_etags_differ_moves_the_generation_once(tmp_path: Path) -> None:
     c, state = _external_cockpit(tmp_path)
-    c.manifest(NONE, read_after=time.monotonic())            # the baseline
+    c.manifest(NONE, read_after=time.monotonic())            # the first build
     gen = c._obs_gen
     state["rows"] = [_row(1), _row(2)]                       # a provider value moves (another process)
     c.manifest(NONE, read_after=time.monotonic())
@@ -317,12 +316,56 @@ def test_a_watcher_build_whose_etags_differ_moves_the_generation_once(tmp_path: 
 def test_a_watcher_build_after_the_day_turns_moves_the_generation_once(ck) -> None:
     _clock_on(ck, 10)
     ck.manifest(NONE, read_after=time.monotonic())
-    assert ck._obs_gen == 0
+    assert ck._obs_gen == 1
     _clock_on(ck, 11)                                        # no provider read moved; the head's date did
     ck.manifest(NONE, read_after=time.monotonic())
-    assert ck._obs_gen == 1
+    assert ck._obs_gen == 2
     ck.manifest(NONE, read_after=time.monotonic())
-    assert ck._obs_gen == 1
+    assert ck._obs_gen == 2
+
+
+def test_an_older_build_finishing_after_a_newer_one_never_rewinds_the_baseline(tmp_path: Path, monkeypatch) -> None:
+    # codex/gemini L3 r1: overlapping builds complete out of order. X (older read_after) stalls, Y (newer) completes with
+    # different etags and bumps; X then completes holding the stale etags: it neither overwrites Y's nor decides a bump
+    c, state = _external_cockpit(tmp_path)
+    base = time.monotonic() - 1000.0                         # X's read_after: far older than any read here
+    c.manifest(NONE, read_after=base)                        # a baseline build
+    real, gate, computed = c._manifest_compute, threading.Event(), threading.Event()
+
+    def compute(credential, **kw):
+        out = real(credential, **kw)
+        if kw.get("read_after") == base + 1:                 # build X: reads the old rows, then stalls
+            computed.set()
+            assert gate.wait(10)
+        return out
+
+    monkeypatch.setattr(c, "_manifest_compute", compute)
+    x_out: list = []
+    x = threading.Thread(target=lambda: x_out.append(c.manifest(NONE, read_after=base + 1)))
+    x.start()
+    assert computed.wait(10)
+    state["rows"] = [_row(1), _row(2)]
+    gen0 = c._obs_gen
+    try:
+        y = c.manifest(NONE, read_after=time.monotonic())    # build Y: newer, begun after X read; other etags
+        gen = c._obs_gen
+        assert gen == gen0 + 1                               # Y announced
+        y_etags = dict(c._obs_etags)
+    finally:
+        gate.set()
+        x.join(10)
+    assert x_out and not x.is_alive()
+    assert x_out[0]["panels"]["od"]["etag"] != y["panels"]["od"]["etag"]    # X really held the stale etags
+    assert c._obs_etags == y_etags
+    assert c._obs_gen == gen
+    c.manifest(NONE, read_after=time.monotonic())         # equal to Y: announces nothing
+    assert c._obs_gen == gen
+
+
+def test_a_build_with_no_panels_or_a_non_mapping_head_does_not_raise(ck, monkeypatch) -> None:
+    for bad in ({"x": 1}, {"panels": None}, {"panels": {"a": None, "b": "x", "c": {"etag": "e"}}}):
+        monkeypatch.setattr(ck, "_manifest_compute", lambda credential, _b=bad, **kw: _b)
+        assert ck.manifest(NONE, read_after=time.monotonic()) is bad
 
 
 def test_concurrent_manifests_share_one_bounded_pool_of_readers(tmp_path: Path, monkeypatch) -> None:
