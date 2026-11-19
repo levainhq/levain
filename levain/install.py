@@ -1095,8 +1095,6 @@ def _ensure_gitignored(levain_dir: Path, name: str) -> None:
     """Ensure ``name`` is listed in ``.levain/.gitignore`` (the operator's private
     answers must never be committed). Creates or appends; best-effort."""
     gi = levain_dir / ".gitignore"
-    if gi.is_symlink():
-        return  # never write through a link
     try:
         existing = gi.read_text(encoding="utf-8").splitlines() if gi.is_file() else []
         if name not in existing:
