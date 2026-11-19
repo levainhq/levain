@@ -324,8 +324,10 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
             try:
                 hl.ensure_config_home(hands, VENDOR, entity_dir=entity_dir)
                 # levain#139: an MCP token is a Claude login too; with no keychain at all its save fails the same way
-                if hl.keychain_needed(VENDOR) and hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir) == "made":
-                    (emit or hl._write_out)(hl.KEYCHAIN_MADE_NOTE.format(path=hl.keychain_path(hands)) + "\n")
+                if hl.keychain_needed(VENDOR):
+                    note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
+                    if note:
+                        (emit or hl._write_out)(note)
                 held = vendor_servers(hands, entity_dir, held=True)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
@@ -450,6 +452,15 @@ def cmd_signin(entity_dir: Path | str, name: str, cockpit_root: Path | str | Non
         print(f"hands mcp signin: {exc}")
         return 1
     print(f"hands mcp {name}: the login exited 0; the vendor's own view: {view}")
+    # levain#139 (as `hands login` does): the token is expected in the 0600 file; say so when the vendor kept it elsewhere
+    try:
+        cred = hl.credential_state(hands, VENDOR, entity_dir=entity_dir)
+    except (hl.HandsLoginError, hl.HandsRefused, OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: the credential file could not be read after the sign-in ({exc})")
+    else:
+        if cred is None:
+            print(f"warning: no credential file at {hl.credential_path(hands, VENDOR)}; the vendor kept this sign-in "
+                  f"somewhere else, which `levain hands mcp remove {name}` may not reach")
     return 0
 
 

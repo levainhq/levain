@@ -85,9 +85,10 @@ elif verb == "login":
         sys.exit(3)
     tok = json.load(urllib.request.urlopen(urllib.request.Request(base + "/token", data=code.encode()), timeout=10))["access_token"]
     os.umask(0o077)
-    cred = load(CRED, {})
-    cred.setdefault("mcpOAuth", {})[name] = {"accessToken": tok}
-    save(CRED, cred)
+    if not env.get("SHIM_NO_CRED"):
+        cred = load(CRED, {})
+        cred.setdefault("mcpOAuth", {})[name] = {"accessToken": tok}
+        save(CRED, cred)
 elif verb == "logout":
     name = rest[-1]
     if name not in servers:
@@ -367,13 +368,39 @@ def test_signin_makes_the_hands_keychain_first_and_refuses_a_foreign_one(rig, ca
     kc = rig.hands_home / "Library" / "Keychains" / hands_login.HANDS_KEYCHAIN
     assert kc.is_file() and "Made the hands account's own keychain" in capsys.readouterr().out
     # a default keychain Levain did not make: refused before any add, and left as it was
+    foreign = rig.hands_home.parent / "elsewhere-login.keychain-db"
+    foreign.write_text("someone's keychain")
     other = rig.hands_home / ".fake-security-default"
-    other.write_text("/elsewhere/login.keychain-db")
+    other.write_text(str(foreign))
     rig.log.write_text("")
     rig.register("notion")
     assert signin(rig, "notion") == 1
     assert "not adopted or replaced" in capsys.readouterr().out
-    assert rig.calls() == [] and other.read_text() == "/elsewhere/login.keychain-db"
+    assert rig.calls() == [] and other.read_text() == str(foreign)
+
+
+def test_signin_warns_when_the_token_is_not_in_the_credential_file(rig, capsys):
+    # levain#139 L1 MED-2: as `hands login` does, a sign-in whose token did not land in the 0600 file says so
+    rig.knobs["SHIM_NO_CRED"] = "1"
+    rig.register()
+    assert signin(rig) == 0
+    out = capsys.readouterr().out
+    assert f"warning: no credential file at {rig.cred}" in out and "levain hands mcp remove linear" in out
+    rig.knobs.pop("SHIM_NO_CRED")
+    rig.register("notion")
+    assert signin(rig, "notion") == 0
+    assert "warning" not in capsys.readouterr().out
+
+
+def test_signin_whose_keychain_create_times_out_never_shows_the_password(rig, capsys, monkeypatch):
+    monkeypatch.setattr(hands_login.secrets, "token_urlsafe", lambda n: "PW-SENTINEL-not-for-any-message")
+    monkeypatch.setattr(hands_login, "STEP_TIMEOUT", 1.0)
+    rig.knobs["SEC_CREATE_HANG"] = "1"
+    rig.register()
+    assert signin(rig) == 1
+    out = capsys.readouterr().out
+    assert "timed out after 1 seconds" in out and "the sign-in was not started" in out and "PW-SENTINEL" not in out
+    assert rig.mutating() == []
 
 
 def test_a_second_signin_does_not_add_the_server_again(rig, capsys):
