@@ -863,6 +863,13 @@ def signing_public_key(key_path: Path) -> str:
     return normalise_public_key(text)
 
 
+# an EMPTY answer (the provider answered without a usable touch) is asked for again after a wait, up to this many attempts in all
+_SK_EMPTY_ATTEMPTS = 3
+# the waits before attempt 2 and attempt 3 after an empty answer: a measurement of 2026-11-19, ONE run of three rounds
+# (probe2_run1_1119.txt in levain project_memory 1119-14_sign_probe): a sign about a second after an empty one mostly
+# answered, a longer gap was needed after a second empty. The next failures carry their own timing (elapsed_s in the evidence).
+_EMPTY_RETRY_WAITS_S = (1.0, 2.0)         # indexed by attempt number - 1: the tables here must cover _SK_EMPTY_ATTEMPTS
+_ORDINALS = {2: "second", 3: "third"}
 _SK_RETRIES = 1                # a security-key answer that does not verify is asked for once more, never twice (levain#125)
 # a second touch is asked for only while at least this much of the ONE sign bound is left: the sheet comes up at once and a
 # touch takes a second or two, so 5 s is a real chance; any less and the person would be shown a sheet that closes under them
@@ -1006,7 +1013,8 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     that wants a shorter bound for its own signer does not have to change the module's global.
 
     A security-key answer that does not verify leaves an evidence file (:func:`_write_sign_failure`, under
-    ``<key dir>/sign-failures``) and may be asked for once more (:data:`_SK_RETRIES`)."""
+    ``<key dir>/sign-failures``) and may be asked for again: once more (:data:`_SK_RETRIES`), or after a wait up to
+    :data:`_SK_EMPTY_ATTEMPTS` attempts when the answers are empty (``sign`` below says which)."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
     public_key = signing_public_key(key_path)
@@ -1016,9 +1024,12 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     no_agent = is_encrypted_file(key_path) or (sidecar is not None and sidecar.custody == PASSPHRASE)
 
     def sign(message: bytes) -> str:
-        """One signature over ``message``. A security-key (sk-*) answer that does not verify is asked for ONCE more (a
-        new sign over the same message, so a second touch); that retry loop is these few lines and nothing else: the
-        bound is :data:`_SK_RETRIES`, a constant, and ``_once`` itself never retries. Everything else (a cancel, a
+        """One signature over ``message``. A security-key (sk-*) answer that carries NO signature (an empty one) is asked
+        for again after a short wait, up to :data:`_SK_EMPTY_ATTEMPTS` attempts in all (waits :data:`_EMPTY_RETRY_WAITS_S`); a
+        signature that is there and does not verify is asked for ONCE more, at once (:data:`_SK_RETRIES`); a third
+        attempt is made only while every answer so far was empty (and that third answer may itself fail to verify), so
+        any run with a verify failure among its first two answers stops at two. Each retry is a new sign over the same message, so a new touch; that
+        retry loop is these few lines and nothing else, and ``_once`` itself never retries. Everything else (a cancel, a
         timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt.
 
         Every attempt shares ONE deadline, ``timeout`` from now, and so does every ssh-keygen child the step runs: each
@@ -1035,45 +1046,70 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
         if isinstance(first, str):
             return first
         failed = [first]
-        for n in range(_SK_RETRIES):
+        while True:
+            n = len(failed)
+            last = failed[-1]
+            # only an unbroken run of EMPTY answers earns the longer, waited retry; a signature that is there and does not
+            # verify keeps its one immediate retry, and a run that mixes the two ends at that one retry too
+            cap = _SK_EMPTY_ATTEMPTS if all(f.empty for f in failed) else 1 + _SK_RETRIES
+            if n >= cap:
+                break
+            wait = _EMPTY_RETRY_WAITS_S[n - 1] if last.empty else 0.0
             left = deadline - time.monotonic()
-            if left < _SK_RETRY_MIN_S:
+            if left - wait < _SK_RETRY_MIN_S:           # the wait itself must leave a real chance, and never passes the deadline
+                ordinal = _ORDINALS[n + 1]
+                if all(f.empty for f in failed):
+                    named = (f"({last.carried}; {last.evidence})" if n == 1 else
+                             f"({n} attempts: " + "; ".join(f"attempt {i} flags {f.flags:#04x} ({f.carried}; {f.evidence})"
+                                                            for i, f in enumerate(failed, 1)) + ")")
+                    raise KeyError_(f"{_empty_sig_words(any(f.touch for f in failed))} for {fp} {named}, and no {ordinal} "
+                                    f"touch was asked for: only {max(left - wait, 0.0):.1f}s of the {bound:g}s bound would remain "
+                                    f"after the {wait:g}s wait, under {_SK_RETRY_MIN_S:g}s, so nothing was signed; "
+                                    f"{_EMPTY_SIG_NEXT}")
                 a = failed[0]
-                if a.empty:
-                    raise KeyError_(f"{_empty_sig_words(a.touch)} for {fp} ({a.carried}; {a.evidence}), and no second touch was "
-                                    f"asked for: {max(left, 0.0):.1f}s of the {bound:g}s bound was left, under "
-                                    f"{_SK_RETRY_MIN_S:g}s, so nothing was signed; {_EMPTY_SIG_NEXT}")
                 raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({a.carried}; {a.detail}; "
                                 f"{a.evidence}), and no second touch was asked for: {max(left, 0.0):.1f}s of the "
                                 f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s, so nothing was signed")
+            if wait:
+                time.sleep(wait)
             # stderr is the terminal's, where the touch prompt already goes; the words say what happened, not that it is safe
             print("the key's answer did not check out; touch again", file=sys.stderr, flush=True)
             try:
-                again = _once(message, n + 2, deadline)
+                again = _once(message, n + 1, deadline)
             except (KeyError_, _authority.VerifierUnavailable) as exc:
-                # the retry's own words first (terminal_sign._classify reads them), then what attempt 1 left behind;
-                # attempt 1's ssh-keygen verdicts stay in its evidence file, so no verdict text can misfile this one.
+                # the retry's own words first (terminal_sign._classify reads them), then what the earlier attempts left
+                # behind; their ssh-keygen verdicts stay in their evidence files, so no verdict text can misfile this one.
                 # Re-raised as its own type: a caller that tells a verifier failure from a refusal still can
-                a = failed[0]
-                raise type(exc)(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
-                                f"{a.evidence})") from None
+                if n == 1:
+                    a = failed[0]
+                    raise type(exc)(f"{exc}; before it, attempt 1's answer did not check out (flags {a.flags:#04x}; "
+                                    f"{a.evidence})") from None
+                raise type(exc)(f"{exc}; before it, attempts 1 to {n} did not check out ("
+                                + "; ".join(f"flags {f.flags:#04x}; {f.evidence}" for f in failed) + ")") from None
             if isinstance(again, str):
                 return again
             failed.append(again)
         a, b = failed[0], failed[-1]
         if a.empty and b.empty:
-            raise KeyError_(f"{_empty_sig_words(a.touch or b.touch)} for {fp}, twice ({_EMPTY_SIG_REASON}): "
-                            f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.evidence}); "
-                            f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.evidence}); "
-                            f"so nothing was signed; {_EMPTY_SIG_NEXT}")
-        if a.empty or b.empty:      # mixed: each attempt is described by its own outcome, and the phone guidance stays
-            which = 1 if a.empty else 2
-            raise KeyError_(f"ssh-keygen did not return a verifiable signature as {fp}, and both attempts failed "
-                            f"(one attempt returned no signature, the other returned a signature that did not verify; "
-                            f"attempt {which} returned no signature): "
-                            f"attempt 1 flags {a.flags:#04x} ({a.carried}; {_EMPTY_SIG_REASON if a.empty else a.detail}; {a.evidence}); "
-                            f"attempt 2 flags {b.flags:#04x} ({b.carried}; {_EMPTY_SIG_REASON if b.empty else b.detail}; {b.evidence}); "
-                            f"so nothing was signed; {_EMPTY_SIG_NEXT}")
+            count = {2: "twice", 3: "three times"}.get(len(failed), f"{len(failed)} times")
+            raise KeyError_(f"{_empty_sig_words(any(f.touch for f in failed))} for {fp}, {count} ({_EMPTY_SIG_REASON}): "
+                            + "".join(f"attempt {i} flags {f.flags:#04x} ({f.carried}; {f.evidence}); "
+                                      for i, f in enumerate(failed, 1))
+                            + f"so nothing was signed; {_EMPTY_SIG_NEXT}")
+        if any(f.empty for f in failed):    # mixed: EVERY attempt is described by its own number and outcome; the phone guidance stays
+            if len(failed) == 2:
+                which = 1 if a.empty else 2
+                head = (f"both attempts failed (one attempt returned no signature, the other returned a signature that did "
+                        f"not verify; attempt {which} returned no signature)")
+            else:
+                head = (f"all {len(failed)} attempts failed ("
+                        + "; ".join(f"attempt {i} returned " + ("no signature" if f.empty else "a signature that did not verify")
+                                    for i, f in enumerate(failed, 1)) + ")")
+            raise KeyError_(f"ssh-keygen did not return a verifiable signature as {fp}, and {head}: "
+                            + "".join(f"attempt {i} flags {f.flags:#04x} "
+                                      f"({f.carried}; {_EMPTY_SIG_REASON if f.empty else f.detail}; {f.evidence}); "
+                                      for i, f in enumerate(failed, 1))
+                            + f"so nothing was signed; {_EMPTY_SIG_NEXT}")
         raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp}, and both attempts failed "
                         f"(the key's answer did not check out, and touching again did not help): "
                         f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.detail}; {a.evidence}); "
