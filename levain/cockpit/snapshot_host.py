@@ -3,8 +3,9 @@
 What a body holds. A snapshot body is the credential-free result of one panel read, in the form a reader in any language
 can decode: the panel's rows (or its value), what the read filtered and skipped, the error and note and empty text, the
 value's write version, each view's row order, the label keys the request layer later turns into provenance, and what a
-search merges in from the hidden part. It holds no clock reading: the instant a read was made is the snapshot row's own
-timestamp, not part of the body, and the wall-clock facets of a row (the "58m" age) are taken out before encoding, so two
+search merges in from the hidden part. It holds no reading of the clock: the instant a read was made is the snapshot row's
+own timestamp, not part of the body. The one instant a body does carry is ``source_as_of``, when the provider declared
+that its source confirmed the content then (a fact about the content, so part of its hash). The wall-clock facets of a row (the "58m" age) are taken out before encoding, so two
 reads of unchanged data give the same bytes and so the same content hash. A body leads with ``"v"``, its schema version.
 A reader that does not know that version refuses the body (``SnapshotBodyError``) and never builds half a result.
 
@@ -51,7 +52,8 @@ BODY_VERSION = 1
 
 # Every key a body carries, in the order ``body_for`` writes them ("v" first).
 BODY_FIELDS = ("v", "rows", "value", "filtered", "skipped", "error", "note", "stale_hint", "empty", "value_version",
-               "view_order", "label_keys", "value_label_key", "hidden_skipped", "hidden_note")
+               "view_order", "label_keys", "value_label_key", "hidden_skipped", "hidden_note",
+               "source_as_of")
 
 # The gate a LabelKey gets when its values were changed to fit JSON (a datetime turned into its string, say): a key whose
 # values are no longer the ones the provider held must not be read as verified.
@@ -148,7 +150,8 @@ def _decode_label_key(raw: Any, where: str) -> LabelKey:
 
 def body_for(snap: "_Snap") -> dict[str, Any]:
     """The body of ``snap``: every field the request layer reads, as plain JSON values, with the clock facets of the
-    rows taken out and ``as_of`` left out. ``stale_hint`` is set when the engine called the read stale."""
+    rows taken out and the read time left out (``source_as_of`` is the provider's own declared instant, or None).
+    ``stale_hint`` is set when the engine called the read stale."""
     rows = _plain(_engine()._etag_rows(snap.rows))
     label_keys = None
     if snap.label_keys is not None:
@@ -169,6 +172,7 @@ def body_for(snap: "_Snap") -> dict[str, Any]:
         "value_label_key": None if snap.value_label_key is None else _encode_label_key(snap.value_label_key),
         "hidden_skipped": _plain(snap.hidden_skipped),
         "hidden_note": _plain(snap.hidden_note),
+        "source_as_of": _plain(snap.source_as_of),
     }
 
 
@@ -200,6 +204,8 @@ def _check(body: dict[str, Any]) -> None:
             raise SnapshotBodyError(f"body field {f!r}: a string")
     if not isinstance(body["stale_hint"], bool):
         raise SnapshotBodyError("body field 'stale_hint': a boolean")
+    if not (body["source_as_of"] is None or isinstance(body["source_as_of"], str)):
+        raise SnapshotBodyError("body field 'source_as_of': a string or null")
     if not (body["view_order"] is None or isinstance(body["view_order"], dict)):
         raise SnapshotBodyError("body field 'view_order': an object or null")
     if not (body["label_keys"] is None or isinstance(body["label_keys"], dict)):
@@ -207,7 +213,8 @@ def _check(body: dict[str, Any]) -> None:
 
 
 def decode_snap(status: str, body: dict[str, Any] | None, *, as_of: str | None, error: str | None = None) -> "_Snap":
-    """The ``_Snap`` ``body`` was encoded from. ``as_of`` is the snapshot row's derived-at, which no body carries.
+    """The ``_Snap`` ``body`` was encoded from. ``as_of`` is the snapshot row's derived-at, which no body carries (a body's own ``source_as_of`` rides on the result's
+    ``source_as_of``, not in ``as_of``).
     ``error``, when given, is the row's own error text and replaces the body's (a failed derive keeps the last good body
     and puts its message on the row). Every container in the result is new: ``body`` is never aliased, so the reader's
     one shared decoded object stays untouched. A row with status ``error`` or ``timeout`` and no body at all (the store
@@ -242,7 +249,7 @@ def decode_snap(status: str, body: dict[str, Any] | None, *, as_of: str | None, 
         fresh["skipped"], as_of, fresh["error"] if error is None else error, fresh["note"], fresh["stale_hint"],
         fresh["empty"], fresh["value_version"], fresh["view_order"], label_keys,
         None if vkey is None else _decode_label_key(vkey, "value_label_key"), fresh["hidden_skipped"],
-        fresh["hidden_note"])
+        fresh["hidden_note"], source_as_of=fresh["source_as_of"])
 
 
 # --------------------------------------------------------------------------------------------------- the host

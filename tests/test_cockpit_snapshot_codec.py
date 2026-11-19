@@ -264,6 +264,16 @@ def test_a_provider_stale_hint_survives_on_a_non_stale_snapshot() -> None:
     assert (status, body["stale_hint"]) == ("ok", True)
 
 
+def test_a_declared_source_instant_rides_the_body_and_a_read_with_none_carries_none() -> None:
+    declared = _snap("stale", rows=[_row(0)], source_as_of="2026-11-19T10:00:00+00:00")
+    status, body = sh.encode_snap(declared)
+    assert body["source_as_of"] == "2026-11-19T10:00:00+00:00"
+    assert sh.decode_snap(status, _via_store_bytes(status, body), as_of=AS_OF).source_as_of == declared.source_as_of
+    assert sh.encode_snap(_snap(rows=[_row(0)]))[1]["source_as_of"] is None
+    other = sh.encode_snap(_snap("stale", rows=[_row(0)], source_as_of="2026-11-19T09:00:00+00:00"))[1]
+    assert snapshots.encode_body(other) != snapshots.encode_body(body)
+
+
 def test_decode_takes_the_status_it_is_given_and_maps_an_unknown_one_to_partial() -> None:
     body = sh.encode_snap(_snap(rows=[_row(0)]))[1]
     assert sh.decode_snap("error", body, as_of=AS_OF).status == "error"
@@ -379,7 +389,7 @@ def test_a_missing_version_and_a_missing_field_are_refused() -> None:
 
 @pytest.mark.parametrize("field,bad", [
     ("rows", "x"), ("rows", {}), ("filtered", None), ("skipped", {}), ("hidden_skipped", "x"), ("error", 5),
-    ("empty", []), ("value_version", 1), ("note", None), ("hidden_note", 3), ("stale_hint", 1), ("stale_hint", None),
+    ("empty", []), ("value_version", 1), ("note", None), ("hidden_note", 3), ("stale_hint", 1), ("stale_hint", None), ("source_as_of", 3),
     ("view_order", []), ("label_keys", []), ("label_keys", {"r": "x"}), ("label_keys", {"r": {"resource_key": 1}}),
     ("value_label_key", "x"), ("value_label_key", {"resource_key": "r", "values": []}),
     ("value", {"x": float("nan")}),

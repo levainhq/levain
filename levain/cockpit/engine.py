@@ -452,6 +452,10 @@ class _Snap:
     # kept text of one read's rows is never served to the other.
     hidden_skipped: list[dict[str, Any]] = field(default_factory=list)
     hidden_note: str = ""
+    # the instant the SOURCE confirmed this content, when the provider declared one (``Read.as_of`` not None). It is a fact
+    # about the content, so it is part of the body and of its hash; a read that declares none leaves it None and its
+    # ``as_of`` is the time it was read, which the body never carries.
+    source_as_of: str | None = None
     # the freshness facts of a snapshot an attached cockpit read from its row; None on a snapshot a provider read made. An
     # init field so ``dataclasses.replace`` carries it; it is no part of what the snapshot says, so it never takes part in equality
     fresh_info: "_Fresh | None" = field(default=None, compare=False)
@@ -1614,8 +1618,12 @@ class Cockpit:
                 while len(self._attached_snaps) > ATTACHED_SNAP_CACHE_MAX:
                     self._attached_snaps.popitem(last=False)
         # one decoded snapshot serves every read of its generation; each read gets its own copy for the facts that move
-        # without the content moving (when it was derived, how stale it is), and the kept etag text rides along
-        snap = dataclasses.replace(base, as_of=as_of, fresh_info=fresh)
+        # without the content moving (when it was derived, how stale it is), and the kept etag text rides along. The
+        # provider's own word that the content is stale makes the served freshness stale, and the instant its source
+        # declared is the as_of; a read that declared none is as of the row's derive time.
+        if base.stale_hint and not fresh.stale:
+            fresh = dataclasses.replace(fresh, stale=True)
+        snap = dataclasses.replace(base, as_of=base.source_as_of or as_of, fresh_info=fresh)
         snap._etag_frags = base.etag_frags()
         return snap
 
@@ -2177,7 +2185,8 @@ class Cockpit:
                      value["value_version"] if spec.kind in VERSIONED_VALUE_KINDS else None, view_order,
                      label_keys, value_key,
                      [{"count": c, "reason": r} for c, r in res.hidden_skipped if c],
-                     res.hidden_note if isinstance(res.hidden_note, str) else "")
+                     res.hidden_note if isinstance(res.hidden_note, str) else "",
+                     source_as_of=res.as_of if isinstance(res.as_of, str) and res.as_of else None)
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:

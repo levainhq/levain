@@ -646,3 +646,65 @@ def test_freshness_answers_from_the_rows(rig: Rig) -> None:
     rig.clock.advance(seconds=60)
     assert rig.ck.freshness()["alpha"]["stale"] is True
     assert rig.rec.request_side() == []
+
+
+# --- a provider's own stale word and its own source instant survive the move to attached mode -------------------------------
+def _declared_spec(pid: str, rows: tuple[str, ...], *, stale: bool, as_of: str | None) -> ProviderSpec:
+    def read(ctx: ReadContext) -> Read:
+        return Read(rows=tuple(RowIn(f"{pid}:{n}", n, {"at": "2026-11-19"}, stored={"id": f"{pid}:{n}"}) for n in rows),
+                    stale=stale, as_of=as_of)
+
+    return ProviderSpec(id=pid, kind="triage-list", title=pid, priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+
+
+EARLIER = (T0 - timedelta(hours=5)).isoformat()
+
+
+def test_a_provider_declared_stale_read_with_its_own_as_of_reads_the_same_attached_as_on_a_bare_cockpit(tmp_path: Path) -> None:
+    specs = {"alpha": _declared_spec("alpha", ("a", "b"), stale=True, as_of=EARLIER)}
+    bare = Cockpit(clock=Clock())
+    bare.register(specs["alpha"])
+    want = bare._snap_for(bare._specs["alpha"], ReadContext(T0))
+    assert (want.status, want.as_of, want.stale_hint) == ("stale", EARLIER, True)
+    r = Rig(tmp_path, panels=("alpha",), specs=specs)
+    try:
+        r.derive()
+        got = r.snap("alpha")
+        assert got.fresh_info.stale is True
+        assert got.as_of == want.as_of == EARLIER
+        assert r.ck.freshness()["alpha"] == {"as_of": EARLIER, "status": got.status, "stale": True}
+    finally:
+        r.close()
+
+
+def test_a_read_with_no_declared_as_of_serves_the_row_s_derive_time_and_is_not_stale(tmp_path: Path) -> None:
+    r = Rig(tmp_path, panels=("alpha",), specs={"alpha": _declared_spec("alpha", ("a",), stale=False, as_of=None)})
+    try:
+        r.derive()
+        got = r.snap("alpha")
+        assert (got.as_of, got.fresh_info.stale) == (T0.isoformat(), False)
+    finally:
+        r.close()
+
+
+def test_a_declared_as_of_is_part_of_the_content_so_a_new_one_is_a_new_generation(tmp_path: Path) -> None:
+    box = {"as_of": EARLIER}
+
+    def read(ctx: ReadContext) -> Read:
+        return Read(rows=(RowIn("p:a", "a", {"at": "2026-11-19"}, stored={"id": "p:a"}),), as_of=box["as_of"])
+
+    spec = ProviderSpec(id="alpha", kind="triage-list", title="alpha", priority="feed", read=read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+    r = Rig(tmp_path, panels=("alpha",), specs={"alpha": spec})
+    try:
+        r.derive()
+        first = r.reader.read("alpha")
+        box["as_of"] = (T0 - timedelta(hours=1)).isoformat()
+        r.clock.advance(seconds=1)
+        r.derive("alpha")
+        second = r.reader.read("alpha")
+        assert second.body_sha != first.body_sha and second.gen > first.gen
+        assert r.snap("alpha").as_of == box["as_of"]
+    finally:
+        r.close()
