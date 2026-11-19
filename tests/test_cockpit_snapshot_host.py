@@ -844,3 +844,36 @@ class TestFirstDiscovery:
             assert host.wait_first_discovery(10.0) is True
         finally:
             host.stop()
+
+
+# ------------------------------------------------------------------------------------ (h) a write, read through a real host
+
+
+class TestWriteThroughARealHost:
+    def test_a_read_after_a_write_is_woken_by_the_hosts_own_publish_not_by_the_bound(
+            self, make_host, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D7 end to end: the host's loop answers the cockpit's ``dirty`` and tells it when the row landed. With the bound
+        set far above what the test may take, a read that finished in time was woken by the publish; the stale+pending
+        fallback would only come with the bound."""
+        from levain.cockpit import engine
+
+        monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+        state = {"n": 1}
+
+        def read(ctx):
+            return Read(rows=(_row(state["n"]),))
+
+        ck = Cockpit()
+        ck.register(_simple("a", read=read))
+        host = make_host(ck)
+        host.attach()
+        host.start()
+        _until(lambda: host.reader.read("a") is not None)
+        assert [r["id"] for r in ck.panel("a", credential_class="none")["rows"]] == ["r1"]
+        state["n"] = 2
+        began = time.monotonic()
+        ck.invalidate_reads(["a"])
+        out = ck.panel("a", credential_class="none")
+        assert time.monotonic() - began < 10
+        assert [r["id"] for r in out["rows"]] == ["r2"]
+        assert not out.get("stale") and not out.get("pending")
