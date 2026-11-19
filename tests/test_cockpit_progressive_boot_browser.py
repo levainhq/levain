@@ -40,13 +40,13 @@ setInterval(() => { const d = document; const q = (s) => d.querySelector(s); con
     memMeta: t(q(".ck-mem-neo .ck-mem-meta")), whole: d.documentElement.hasAttribute("data-board-whole"), busy: n('[aria-busy="true"]') }); }, 25);
 """
 
-# a panel that is both loading and failed draws its failure: at the zone's external panels and at the bare (brief / widget / hero) ones
+# a panel that is both loading and failed draws its failure: at the zone's external panels and at the bare (widget / hero) ones
 _PRECEDENCE = r"""(() => { const D = window.LevainDashboard, v = window.__views[window.__views.length - 1]; const out = {};
   const zone = v.layout.find((e) => e.kind === "external" && v.extra_panels[e.id] && !v.extra_panels[e.id].error);
   v.extra_panels[zone.id] = { loading: true, error: "boomz" };
   const n = D.renderPanel(zone, v);
   out.zone = { err: /boomz/.test(n.textContent), loading: !!n.querySelector("p.empty.loading"), busy: n.getAttribute("aria-busy") };
-  const bare = (v.ke.brief || []).concat(v.ke.widgets || [], v.ke.hero || []).find((id) => v.extra_panels[id] && !v.extra_panels[id].error);
+  const bare = (v.ke.widgets || []).concat(v.ke.hero || []).find((id) => v.extra_panels[id] && !v.extra_panels[id].error);
   v.extra_panels[bare] = { loading: true, error: "boomb" };
   D.render(v, {});
   const b = document.querySelector('[data-ck-panel="' + bare + '"]');

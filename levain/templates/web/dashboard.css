@@ -1254,34 +1254,7 @@ body.ke .skycard[data-hlens="agents"] .ck-legend, body.ke .skycard[data-hlens="w
 /* a tab with no sky (Memory) or no band content draws no hole */
 body.ke[data-mode="memory"] .skycol { display: none; }
 
-/* BRIEF: where to begin, one wide card */
-body.ke .ck-brief { margin-top: var(--sp-4); }
-body.ke .ck-briefcard, body.ke .ck-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; position: relative; }
-body.ke .ck-briefcard { padding: var(--sp-6); }
-.ck-brief-body { margin-top: var(--sp-5); }
-.ck-brief-body .brief-line:first-child { margin-top: 0; }
-.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); column-gap: var(--sp-7); }
-.ck-brief-body .xbody.has-side .brief-line { grid-column: 1; }
-.brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-3); align-self: start; }
-.brief-side .side-line { margin: 0; font-size: var(--fs-body); line-height: var(--lh-list); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
-
-/* Where to begin as a card with a head: the lead and what follows it on the left, nothing beside it (the loops column went with the Open loops panel) */
-body.ke .ck-briefcard:has(.brief-card) { padding-top: var(--sp-5); }
-body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
-.brief-card .brief-head { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-5); }
-.brief-card .brief-head h3 { margin: 0; font: var(--fw-bold) var(--fs-title)/1.2 var(--round); letter-spacing: var(--track-tight); }
-.brief-card .brief-head .sp { flex: 1; }
-.brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
-.brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); align-items: start; }
-.brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
-.brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
-.brief-card .lead-then .k { margin-right: var(--sp-2); }
-.brief-card .lead-more { margin-top: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
-.brief-card .lead-item { margin: 0; font-size: var(--fs-meta); line-height: var(--lh-list); color: var(--meta); }
-.brief-card .lead-item .k { margin-right: var(--sp-2); }
-.brief-card .brief-overnight { margin-top: var(--sp-4); display: flex; gap: var(--sp-4); align-items: baseline; flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
-.brief-card .brief-overnight .mono { font-family: var(--mono); font-size: var(--fs-micro); color: var(--label); }
-@media (max-width: 720px) { .brief-card .brief-head .stamp { display: none; } }
+body.ke .ck-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); min-width: 0; position: relative; }
 
 /* WIDGETS: one answer each, equal widths in one row */
 body.ke .ck-widgets[hidden] { display: none; }
@@ -1360,7 +1333,7 @@ body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-mode
 body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="memory"]))) { display: none; }
 body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
-body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
+body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
 /* the strip stands clear of the Needs-you cards above it, not 12px off their ring */
 body.ke .ck-needs ~ .ck-widgets { margin-top: var(--sp-6); }
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
@@ -1418,9 +1391,6 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke .ck-zgrid { grid-template-columns: 1fr; }
   body.ke .ck-zgrid .panel, body.ke .ck-zgrid .panel.ck-h-tall, body.ke .ck-zgrid .panel.ck-h-medium, body.ke .ck-zgrid .panel.ck-h-short { height: auto; max-height: 560px; }   /* the desktop heights are for a grid row; one column sizes to its content */
   body.ke .panel .phead .src.fresh { display: none; }   /* "read 0s ago" pushed the expand control onto a line of its own at this width */
-  body.ke .ck-brief-body .xbody.has-side { display: block; }
-  .brief-side { border-left: 0; padding-left: 0; margin-top: var(--sp-6); }
-  .brief-side .xnote { margin-bottom: var(--sp-5); }
 }
 
 /* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
@@ -1698,7 +1668,6 @@ html body.ke .ck-card.w[data-signal="on"] { background: linear-gradient(to botto
    TABS_OF_ID / TABS_OF_REGION; this block is how each tab lays its panels out. The rules of the shape, which every tab obeys:
    no lone tile, no hole beside a card (a card alone in its row takes the row: cockpit_view.js sets data-stretch), no empty card
    (an empty provider is one dashed line), one gap (--gap) between cards and blocks, one space (--sec) above a section heading. */
-body.ke:not([data-mode="morning"]) #ck-h-brief, body.ke:not([data-mode="morning"]) #ck-brief { display: none; }
 body.ke:not([data-mode="morning"]) #ck-h-widgets { display: none; }
 
 /* the glance. Fewer than four tiles: one bordered strip of equal tiles that share the whole row. Four or more: full tiles
@@ -3680,9 +3649,9 @@ body.ke .ck-zgrid .panel .nc-pbody { padding: 0 var(--sp-2) var(--sp-3) var(--sp
 /* the first board draws in parts (dashboard_boot.js): while only a part is drawn the regions the draw replaces are inert (nothing in them can be
    focused, clicked or opened, so the whole draw that replaces them takes nothing from the reader), and inert has no look of its own: the part is
    dimmed, and the dimming goes at once with the `inert` the whole draw drops. #state is inert too but is not listed here: on the cockpit page
-   renderBriefRegion moves it into the hero's slot (#ck-state-slot, inside #ck-hero), so it is dimmed through its ancestor, and listing it
+   the KE render moves it into the hero's slot (#ck-state-slot, inside #ck-hero), so it is dimmed through its ancestor, and listing it
    would dim it twice (.45 of .45). The drop (#ck-drop) is neither inert nor dimmed: the whole draw never replaces it. */
-:is(#board, #ck-hero, #ck-needs, #ck-notes, #ck-brief, #ck-widgets)[inert] { opacity: .45; }
+:is(#board, #ck-hero, #ck-needs, #ck-notes, #ck-widgets)[inert] { opacity: .45; }
 .nf-form { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
 .nf-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .nf-new .dev-url { width: 100%; margin: var(--sp-3) 0; }

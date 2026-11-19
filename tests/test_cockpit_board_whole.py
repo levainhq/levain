@@ -42,7 +42,7 @@ RELEASE = "window.__releasePanels()"
 # the regions the draw replaces (dashboard_boot.js BOARD_REGIONS): #board holds the zones, and its siblings hold the hero, the Needs strip, the
 # notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them, and neither is the
 # drop (#ck-drop): its card is built once and refreshed in place, never replaced, so an inert drop would only stop the Drop tab's focus.
-REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"]
+REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-widgets", "state", "board"]
 # the board is a part: the regions are inert, a tile is drawn in the widgets region, and the signal is not there
 PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
            "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")

@@ -79,7 +79,7 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
     probe = ("(() => { const top = (s) => { const e = document.querySelector(s); return e && e.getClientRects().length ? Math.round(e.getBoundingClientRect().top + window.scrollY) : null; };"
              " const bot = (s) => { const e = document.querySelector(s); return e ? Math.round(e.getBoundingClientRect().bottom + window.scrollY) : null; };"
              " const box = document.getElementById('ck-drop-words').getBoundingClientRect(); const host = document.getElementById('ck-drop').getBoundingClientRect();"
-             " return JSON.stringify({t: 'pos', bandBottom: bot('#ck-band'), drop: top('#ck-drop'), needs: top('#ck-needs'), needsBottom: bot('#ck-needs'), brief: top('#ck-brief'), tray: top('.panel[data-ck-panel=\"tray\"]'),"
+             " return JSON.stringify({t: 'pos', bandBottom: bot('#ck-band'), drop: top('#ck-drop'), needs: top('#ck-needs'), needsBottom: bot('#ck-needs'), tray: top('.panel[data-ck-panel=\"tray\"]'),"
              " sky: top('#ck-skycard'), boxW: box.width, hostW: host.width, boxH: box.height, over: document.documentElement.scrollWidth > window.innerWidth,"
              " buttons: [...document.querySelectorAll('#ck-drop button')].map(b => b.textContent), afterNeeds: !!document.querySelector('#ck-needs + #ck-drop'), insideHero: !!document.querySelector('#ck-hero #ck-drop') }); })()")
     with rig.serving():
@@ -89,8 +89,7 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
     assert p["needs"] is not None and p["bandBottom"] is not None and p["drop"] is not None, p   # a hidden Needs-you row fails here, not as a TypeError below
     assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # the next element after the strip in the document, outside the hero
     assert p["bandBottom"] <= p["needs"] and p["needsBottom"] <= p["drop"], p               # under the band, and under the strip (the document order is the narrow order too)
-    assert p["drop"] < p["tray"], p                                                         # above the work regions...
-    assert p["brief"] is None or p["drop"] < p["brief"], p                                  # ...and the brief
+    assert p["drop"] < p["tray"], p                                                         # above the work regions
     assert p["sky"] is None or (p["sky"] < p["needs"] if view == "1280" else p["needs"] < p["sky"]), p   # the desktop sky card sits above the strip; the narrow page draws it after
     assert p["boxW"] >= (0.55 if view == "1280" else 0.85) * p["hostW"] and p["boxH"] >= 150, p   # the free-text rule: the box fills its card (a side column of drops beside it from 1100px), ~8 rows
     assert p["buttons"][:2] == ["Send", "Add an envelope"], p

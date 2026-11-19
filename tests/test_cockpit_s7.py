@@ -1,4 +1,4 @@
-"""K10 S7: Morning's Where to begin is a card (lead, overnight; the loop fold took its loop line and Threads by repo), and Build's Activity band is the compact strip."""
+"""K10 S7: the Where to begin provider's data (lead, overnight; the loop fold took its loop line and Threads by repo), and Build's Activity band is the compact strip."""
 from __future__ import annotations
 
 import json
@@ -94,31 +94,6 @@ def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     got = _begin()
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got and "overnight" not in got
     assert got["title"] == "Where to begin" and got["source"]
-
-
-_PROBE = r"""(() => {
-  const card = document.querySelector('.brief-card');
-  if (!card) return JSON.stringify({card: false});
-  const rows = [...card.querySelectorAll('.brief-threads .thread')].map((r) => ({
-    t: r.querySelector('.t').textContent, n: r.querySelector('.pill').textContent,
-    tag: (r.querySelector('.rp-tag') || {}).textContent || null, hue: (r.querySelector('.rp-tag') || {dataset: {}}).dataset.repo || null}));
-  return JSON.stringify({card: true, title: card.querySelector('.brief-head h3').textContent,
-    source: (card.querySelector('.brief-head .stamp') || card.querySelector('.brief-threads .brief-src')).textContent, lead: card.querySelector('.lead-first').textContent,
-    rows: rows, overnight: (card.querySelector('.brief-overnight .mono') || {}).textContent || null,
-    items: card.querySelectorAll('.lead-then, .lead-item').length});
-})()"""
-
-
-@needs_browser
-def test_the_card_draws_its_lead_from_the_list_and_has_no_threads_column(tmp_path: Path) -> None:
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": "document.querySelector('.brief-card')"},
-                                                          {"eval": _PROBE}])["values"]
-    got = json.loads(out[-1])
-    assert got["card"] and got["title"] == "Next from the List" and got["source"] == "from the List", got   # the data says "Where to begin"; the card names what it holds
-    assert got["lead"], got
-    assert got["rows"] == [], got                                       # the kernel sends no threads since the fold: the column has nothing to draw
 
 
 @needs_browser
