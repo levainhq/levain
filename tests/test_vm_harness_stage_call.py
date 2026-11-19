@@ -242,6 +242,44 @@ def test_prep_fails_when_a_chmod_that_exits_zero_leaves_a_write_bit(tmp_path, mo
 
 
 @pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+@pytest.mark.parametrize("target,left", [("cockpit.db", 0o744), ("cockpit.db", 0o044), ("anchor/authority.anchor", 0o664),
+                                         ("anchor", 0o750), ("anchor", 0o777)])
+def test_prep_fails_on_any_mode_that_is_not_exactly_the_intended_one(tmp_path, monkeypatch, capsys, target, left):
+    """The postcondition is EQUALITY, not a mask: a chmod that exits 0 but leaves 0744 / 0044 / 0664 (file) or 0750 / 0777 (directory; 0601 would hide its own children from the stat)."""
+    a, calls = _prep_world(tmp_path, monkeypatch)
+    inner = SC.run
+    root = Path(a.data_root)
+
+    def fake_run(argv, **kw):
+        if argv[0] == "/bin/chmod" and argv[2] == str(root / target):
+            (root / target).chmod(left)
+            return 0, "", ""
+        return inner(argv, **kw)
+
+    monkeypatch.setattr(SC, "run", fake_run)
+    with pytest.raises(SystemExit):
+        SC.mode_prep(a)
+    out = capsys.readouterr().out
+    assert f"stage-failed prep-chmod: {root / target} is mode {left:04o}" in out and "prepped" not in out
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+@pytest.mark.parametrize("mode,ok", [(0o711, True), (0o705, True), (0o710, False), (0o700, False)])
+def test_a_pre_existing_ancestor_must_have_the_other_execute_bit(tmp_path, monkeypatch, capsys, mode, ok):
+    """The dispatch account is another account, not in the operator's group: traversal is other-x (read is not needed)."""
+    a, calls = _prep_world(tmp_path, monkeypatch)
+    SC.SCRATCH.mkdir(parents=True)
+    os.chmod(SC.SCRATCH, mode)
+    if ok:
+        assert SC.mode_prep(a) == 0
+    else:
+        with pytest.raises(SystemExit):
+            SC.mode_prep(a)
+        assert "prep widens no directory it did not make" in capsys.readouterr().out
+    assert SC.SCRATCH.stat().st_mode & 0o7777 == mode           # a pre-existing ancestor is never widened
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 def test_a_failed_chmod_fails_prep_before_the_key_is_installed(tmp_path, monkeypatch, capsys):
     a, calls = _prep_world(tmp_path, monkeypatch, fail_chmod=lambda argv: argv[1] == "1777")
     with pytest.raises(SystemExit) as e:
@@ -527,16 +565,20 @@ def _store(d: Path, extra=()):
     con.close()
 
 
-def _run_dispatch_side(tmp_path, monkeypatch, capsys, body):
+def _run_dispatch_side(tmp_path, monkeypatch, capsys, body, extra=()):
     d = tmp_path / "ctl"
     d.mkdir(exist_ok=True)
-    _store(d)
+    _store(d, extra)
     fake = {k: types.ModuleType(k) for k in ("levain", "levain.contracts", "levain.dispatch", "levain.cockpit", "levain.slot")}
     canon = types.ModuleType("levain.contracts.canon")
     canon.parse, canon.canonical_bytes = real_canon.parse, real_canon.canonical_bytes
     ctl = types.ModuleType("levain.dispatch.control")
     ctl.CONFIG_NAMESPACE = "ns"
-    ctl.parse_item = lambda text: types.SimpleNamespace(digest="sha256:" + hashlib.sha256(text.encode()).hexdigest())
+    def parse_item(text):
+        if text.startswith("legacy"):                     # a 0.11 'verifiers' item: the current parser refuses it
+            raise ValueError("not an item the current parser reads")
+        return types.SimpleNamespace(digest="sha256:" + hashlib.sha256(text.encode()).hexdigest())
+    ctl.parse_item = parse_item
     ctl.item_bytes = lambda kind, gen, body, at, prev, store_id: real_canon.canonical_bytes(
         {"kind": kind, "generation": gen, "body": body, "issued_at": at.isoformat(), "prev": prev, "store_id": store_id})
     keys = types.ModuleType("levain.cockpit.keys")
@@ -572,6 +614,17 @@ def control():
 
 def _map(tmp_path):
     return SC.build_bodies(_args(tmp_path))["routemap"]
+
+
+def test_a_legacy_verifiers_row_as_the_top_item_does_not_kill_the_dispatch_side(tmp_path, monkeypatch, capsys, control):
+    code, out = _run_dispatch_side(tmp_path, monkeypatch, capsys, _map(tmp_path),
+                                   extra=[(4, "verifiers", "legacy 0.11 item", "s")])
+    assert code is None and "stage-failed" not in out and out.strip().splitlines()[-1] == "staged gen=4"
+
+
+def test_the_two_guest_scripts_share_the_one_kind_filter():
+    assert f"KINDS = {SC.KINDS!r}\n" in SC.DISPATCH_SIDE and f"KINDS = {SC.KINDS!r}\n" in SC.STORE_SCRIPT
+    assert "__KINDS__" not in SC.DISPATCH_SIDE + SC.STORE_SCRIPT
 
 
 def test_a_first_stage_submits_both_items_and_records_the_map(tmp_path, monkeypatch, capsys, control):

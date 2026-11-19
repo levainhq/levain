@@ -30,6 +30,10 @@ present); ``L/dispatch`` exists and is owned by _levain_dispatch 0700; ``prep`` 
 laptop-presence in the authority log at --data-root, which must sit under the guest scratch tree /private/tmp/w3, and a copy of
 its private file is owned by _levain_dispatch 0600 at --signing-key); the OpenRouter key is already installed as the keys
 credential --cred (wave3's own W1 does that FIRST). Python 3.13 in the guest; the levain source at --levain-root.
+
+KNOWN EDGE (acknowledged, not built): in threec10.py the keys account can swap the freshly made ``cred`` dir for a symlink between
+validation and root's cat/chown/mv; the full fix is the product's ``install-helper set-credential``, and this harness runs in an
+ephemeral VM.
 """
 from __future__ import annotations
 
@@ -117,7 +121,8 @@ def write_path_problem(write_path: str) -> "str | None":
         return f"--write-path {write_path!r} is absolute; it is repo-relative"
     if any(p in ("", ".", "..") for p in write_path.split("/")):
         return f"--write-path {write_path!r} has an empty, '.' or '..' component"
-    unprintable = sorted(c for c in set(write_path) if not c.isprintable())
+    # an ASCII space IS printable but is refused too: the policy's read allowlist glob is space-sensitive
+    unprintable = sorted(c for c in set(write_path) if not c.isprintable() or c == " ")
     if unprintable:
         return f"--write-path {write_path!r} holds a character that is not printable ({unprintable[0]!r})"
     bad = sorted(WRITE_PATH_REFUSED & set(write_path))
@@ -200,7 +205,13 @@ def build_bodies(a) -> dict:
 # argv: levain-root dispatch-dir signing-key socket routemap-body-json dry(0|1) trust-pub-json
 # --------------------------------------------------------------------------------------------------------------------
 
+#: the config kinds this stage builds and reads: the ONE filter both guest scripts apply to the store's items (spliced in as
+#: ``KINDS``); any other kind, a legacy 0.11 ``verifiers`` row above all, is skipped before ``parse_item``
+KINDS = ("provider_policy", "verifier", "templates")
+_KINDS_LINE = "KINDS = %r\n" % (KINDS,)
+
 DISPATCH_SIDE = r'''import hashlib, json, os, sqlite3, sys
+KINDS = __KINDS__
 from datetime import datetime, timezone
 from pathlib import Path
 root, d, key, sock, body_json, dry, trust_json = sys.argv[1:8]
@@ -216,6 +227,7 @@ try:
     con = sqlite3.connect((Path(d) / "control.db").as_uri() + "?mode=ro", uri=True)
     meta = dict(con.execute("SELECT key, value FROM meta"))
     rows = con.execute("SELECT generation, kind, item, signature FROM items ORDER BY generation").fetchall()
+    rows = [r for r in rows if r[1] in KINDS]      # the one kind filter (STORE_SCRIPT's): a legacy 'verifiers' row is never parsed
     vrows = [r for r in rows if r[1] == "verifier"]
     if not rows or not vrows:
         raise RuntimeError("the control store holds no verifier item (config sign has not run)")
@@ -304,6 +316,7 @@ except Exception as e:
 #: the store's ACTIVE body of each kind (its latest item), as ``{kind: {generation, sha256}}``: the sha256 of the body's canonical
 #: bytes, the same form :func:`body_sha` gives a built body. Run as the dispatch account (the store is its 0700 directory).
 STORE_SCRIPT = r'''import hashlib, json, sqlite3, sys
+KINDS = __KINDS__
 from pathlib import Path
 root, d = sys.argv[1:3]
 sys.path.insert(0, root)
@@ -313,7 +326,7 @@ try:
     con = sqlite3.connect((Path(d) / "control.db").as_uri() + "?mode=ro", uri=True)
     latest = {}
     for gen, kind, item in con.execute("SELECT generation, kind, item FROM items ORDER BY generation"):
-        if kind in ("provider_policy", "verifier", "templates"):      # a legacy 'verifiers' item (0.11) is no longer read here
+        if kind in KINDS:      # a legacy 'verifiers' item (0.11) is no longer read here
             latest[kind] = (gen, item)
     out = {k: {"generation": g, "sha256": "sha256:" + hashlib.sha256(canon.canonical_bytes(dctl.parse_item(t).body)).hexdigest()}
            for k, (g, t) in latest.items()}
@@ -321,6 +334,9 @@ try:
 except Exception as e:
     print("store-read-failed %s: %s" % (type(e).__name__, str(e)[:300])); sys.exit(1)
 '''
+
+DISPATCH_SIDE = DISPATCH_SIDE.replace("KINDS = __KINDS__\n", _KINDS_LINE)
+STORE_SCRIPT = STORE_SCRIPT.replace("KINDS = __KINDS__\n", _KINDS_LINE)
 
 POOL_SCRIPT = r'''import sys
 root, sock = sys.argv[1:3]
@@ -509,7 +525,9 @@ def open_data_root(data_root: Path, made: list) -> None:
     for parent in data_root.parents:
         if not _within(parent, SCRATCH):
             break
-        if parent not in made and (parent.stat().st_mode & 0o005) != 0o005:
+        # traversal for the dispatch account is by the OTHER execute bit: it is a separate account that shares no group with the
+        # operator (sudo -u _levain_dispatch), so a group-x-only ancestor (0710) does not let it in, and read is not needed
+        if parent not in made and not parent.stat().st_mode & 0o001:
             die("prep", f"{parent} is not searchable by other accounts and prep did not make it: prep widens no directory it "
                         "did not make (fix it by hand, or pick a fresh --data-root)")
     argvs.append(["/bin/chmod", "1777", str(data_root)])
@@ -522,21 +540,30 @@ def open_data_root(data_root: Path, made: list) -> None:
     for f in (data_root / "cockpit.db", anchor_path(data_root)):
         if f.is_file():
             argvs.append(["/bin/chmod", FILE_MODE, str(f)])
+    wants = [(argv, intended_mode(argv)) for argv in argvs]      # computed BEFORE any chmod runs
     for argv in argvs:
         rc, out, err = run(argv)
         if rc:
             die("prep-chmod", f"{' '.join(argv)}: rc={rc} {(out + err).strip()[-300:]}")
-    # verify the RESULT, not the command: a world-write bit an earlier mode left must be gone, and nothing is left unreadable
-    for argv in argvs:
-        mode = os.stat(argv[2]).st_mode & 0o7777
-        if argv[1] == "1777":
-            ok = mode == 0o1777
-        elif argv[1] == DIR_MODE:
-            ok = (mode & 0o001) == 0o001 and (mode & 0o022) == 0
-        else:
-            ok = (mode & 0o044) == 0o044 and (mode & 0o022) == 0
-        if not ok:
-            die("prep-chmod", f"{argv[2]} is mode {mode:04o} after {' '.join(argv)}")
+    # verify the RESULT, not the command, EXACTLY (one helper, one equality): a no-op chmod that exits 0 fails prep
+    for argv, want in wants:
+        problem = exact_mode_problem(argv[2], want)
+        if problem:
+            die("prep-chmod", f"{problem} after {' '.join(argv)}")
+
+
+def intended_mode(argv) -> int:
+    """The exact mode a prep chmod argv must leave: 1777 and 0644 as named; DIR_MODE is the path's current mode with every
+    execute bit set and group/other write cleared (read bits and special bits are kept). Read BEFORE the chmod runs."""
+    if argv[1] == DIR_MODE:
+        return (os.stat(argv[2]).st_mode & 0o7777 | 0o111) & ~0o022
+    return int(argv[1], 8)
+
+
+def exact_mode_problem(path: str, want: int) -> "str | None":
+    """None when ``path``'s permission bits (including sticky/setuid/setgid) are EXACTLY ``want``, else why not. Equality, never a mask."""
+    mode = os.stat(path).st_mode & 0o7777
+    return None if mode == want else f"{path} is mode {mode:04o}, not {want:04o}"
 
 
 def mode_prep(a) -> int:
