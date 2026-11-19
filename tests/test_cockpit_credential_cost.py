@@ -68,10 +68,15 @@ class _OpenSpy:
         return [o for o in self.opens if o[0].endswith(name)]
 
 
+def _held(db: CockpitDB) -> Any:
+    """The calling thread's credential connection (a ``HeldRead``), opened if it is not."""
+    return db._cred.get(lambda: db._connect(held=True), db.path)
+
+
 def _lookups(db: CockpitDB) -> list[str]:
-    """Trace the calling thread's held connection: the paired_devices lookups it runs (a list that grows)."""
+    """Trace the calling thread's credential connection: the paired_devices lookups it runs (a list that grows)."""
     seen: list[str] = []
-    db._held.get().conn.set_trace_callback(lambda s: seen.append(s) if "FROM paired_devices" in s else None)
+    _held(db).conn.set_trace_callback(lambda s: seen.append(s) if "FROM paired_devices" in s else None)
     return seen
 
 
@@ -81,7 +86,6 @@ def test_verify_device_opens_one_connection_for_many_lookups(db: CockpitDB, monk
     """MEASURED before the change: every ``verify_device`` opened ``cockpit.db`` once (N calls, N opens). After: the
     first call opens the held connection, the rest open nothing."""
     _dev, tok = _enrol(db)
-    db._held.drop()                 # enrolling read through the held connection too; start this thread from none
     spy = _OpenSpy(monkeypatch)
     for _ in range(N_READS):
         assert db.verify_device(tok, now=NOW) is not None
@@ -92,20 +96,18 @@ def test_verify_device_opens_one_connection_for_many_lookups(db: CockpitDB, monk
 
 # --- the security invariant: a revocation is seen on the very next call ---------------------------------------------
 
-def test_a_revoke_by_another_connection_is_refused_on_the_next_call_cache_warm(db: CockpitDB, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)      # the window can never be what refuses
+def test_a_revoke_by_another_connection_is_refused_on_the_next_call(db: CockpitDB) -> None:
+    """Every call looks the token up (nothing is remembered between calls), so a revoke is seen by the next one."""
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
     seen = _lookups(db)
     assert db.verify_device(tok, now=NOW) == dev
-    assert seen == [], "the second answer came from the cache (an unchanged journal)"
     db.revoke_devices([dev], by="browser", now=NOW)
     assert db.verify_device(tok, now=NOW) is None
-    assert len(seen) == 1, "the revoke changed the journal's version: the token was looked up again"
+    assert len(seen) == 2, "one lookup per call"
 
 
-def test_a_revoke_by_another_process_is_refused_on_the_next_call(db: CockpitDB, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
+def test_a_revoke_by_another_process_is_refused_on_the_next_call(db: CockpitDB) -> None:
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
     code = ("import sqlite3, sys\n"
@@ -115,38 +117,7 @@ def test_a_revoke_by_another_process_is_refused_on_the_next_call(db: CockpitDB, 
     assert db.verify_device(tok, now=NOW) is None
 
 
-def test_a_cache_cannot_serve_after_any_change_to_the_journal(db: CockpitDB, monkeypatch) -> None:
-    """Not only a revoke: any commit by another connection changes the version, and the token is looked up again."""
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
-    dev, tok = _enrol(db)
-    assert db.verify_device(tok, now=NOW) == dev
-    seen = _lookups(db)
-    db.mint_offer(label="other", minted_by="browser", now=NOW)      # an unrelated commit
-    assert db.verify_device(tok, now=NOW) == dev
-    assert len(seen) == 1
-
-
-def test_a_cached_answer_does_not_outlive_its_window(db: CockpitDB, monkeypatch) -> None:
-    dev, tok = _enrol(db)
-    assert db.verify_device(tok, now=NOW) == dev
-    seen = _lookups(db)
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 0.0)
-    assert db.verify_device(tok, now=NOW) == dev
-    assert len(seen) == 1
-
-
-def test_a_device_not_found_is_never_remembered(db: CockpitDB, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
-    junk = "j" * 43
-    assert db.verify_device(junk, now=NOW) is None
-    seen = _lookups(db)
-    for _ in range(3):
-        assert db.verify_device(junk, now=NOW) is None
-    assert len(seen) == 3
-
-
-def test_a_re_enrolled_device_old_token_refused_new_token_admitted(db: CockpitDB, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
+def test_a_re_enrolled_device_old_token_refused_new_token_admitted(db: CockpitDB) -> None:
     dev1, tok1 = _enrol(db, "ipad")
     assert db.verify_device(tok1, now=NOW) == dev1
     db.revoke_devices([dev1], by="browser", now=NOW)
@@ -154,15 +125,14 @@ def test_a_re_enrolled_device_old_token_refused_new_token_admitted(db: CockpitDB
     assert dev2 != dev1
     assert db.verify_device(tok1, now=NOW) is None
     assert db.verify_device(tok2, now=NOW) == dev2
-    assert db.verify_device(tok1, now=NOW) is None      # and again, with the new device's answer cached
+    assert db.verify_device(tok1, now=NOW) is None      # and again, after the new device was admitted
 
 
-def test_an_error_resolving_the_token_refuses_it(db: CockpitDB, monkeypatch) -> None:
-    """Fail closed: a journal that cannot be read raises (the server answers 503), it never answers a cached device."""
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
+def test_an_error_resolving_the_token_refuses_it(db: CockpitDB) -> None:
+    """Fail closed: a journal that cannot be read raises (the server answers 503), it never answers a device."""
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
-    db._held.get().conn.close()                         # a held connection that is broken
+    _held(db).conn.close()                              # a held connection that is broken
     with pytest.raises(sqlite3.Error):
         db.verify_device(tok, now=NOW)
 
@@ -171,16 +141,14 @@ def test_an_error_resolving_the_token_refuses_it(db: CockpitDB, monkeypatch) -> 
 
 def test_the_held_connection_is_read_only(db: CockpitDB) -> None:
     _enrol(db)
-    held = db._held.get()
     with pytest.raises(sqlite3.OperationalError):
-        held.conn.execute("UPDATE paired_devices SET label = 'x'")
+        _held(db).conn.execute("UPDATE paired_devices SET label = 'x'")
 
 
 def test_the_held_connection_reopens_when_the_db_file_is_replaced(db: CockpitDB, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
-    first = db._held.get()
+    first = _held(db)
     # a replacement file: the same journal with the device revoked, moved over the old one (a new inode)
     fresh = db.path.with_name("replacement.db")
     src = sqlite3.connect(db.path)
@@ -196,7 +164,7 @@ def test_the_held_connection_reopens_when_the_db_file_is_replaced(db: CockpitDB,
     os.replace(fresh, db.path)
     spy = _OpenSpy(monkeypatch)
     assert db.verify_device(tok, now=NOW) is None, "answered from the replaced file, not the old connection's"
-    assert db._held.get() is not first
+    assert _held(db) is not first
     assert len(spy.of("cockpit.db")) == 1
 
 
@@ -206,29 +174,31 @@ def test_the_held_connection_is_closed_when_its_thread_ends(db: CockpitDB) -> No
 
     def run() -> None:
         assert db.verify_device(tok, now=NOW) == dev
-        box["conn"] = db._held.get().conn
+        box["conn"] = _held(db).conn
 
     t = threading.Thread(target=run)
     t.start()
     t.join(10)
-    gc.collect()
-    with pytest.raises(sqlite3.ProgrammingError):
+    with pytest.raises(sqlite3.ProgrammingError):       # no collector run: the thread's end closed it
         box["conn"].execute("SELECT 1")
 
 
-def test_each_thread_holds_its_own_connection_and_a_nested_read_is_not_broken(db: CockpitDB) -> None:
+def test_each_thread_holds_its_own_connection_and_reads_never_use_it(db: CockpitDB) -> None:
     dev, tok = _enrol(db)
     got: list[Any] = []
-    t = threading.Thread(target=lambda: got.append(db._held.get()))
+    t = threading.Thread(target=lambda: got.append(_held(db)))
     t.start()
     t.join(10)
-    assert got[0] is not db._held.get()
-    with db._held.read_transaction() as outer:
+    assert got[0] is not _held(db)
+    db._cred.drop()
+    with db.read() as outer:
         assert outer.execute("SELECT count(*) FROM paired_devices").fetchone()[0] == 1
-        with db._held.read_transaction() as inner:          # a read inside a read, one thread: a connection of its own
+        with db.read() as inner:                        # a read inside a read: each its own connection
             assert inner is not outer
             assert inner.execute("SELECT count(*) FROM paired_devices").fetchone()[0] == 1
-        assert db.verify_device(tok, now=NOW) == dev
+    assert len(db.list_devices()) == 1
+    assert getattr(db._cred._local, "held", None) is None, "a journal read opened the credential connection"
+    assert db.verify_device(tok, now=NOW) == dev
 
 
 # --- over HTTP --------------------------------------------------------------------------------------------------------
@@ -237,21 +207,19 @@ def _manifest(port: int, tok: str, conn: Any = None) -> int:
     return _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY, conn=conn)[0]
 
 
-def test_http_a_revoked_device_is_refused_on_the_very_next_request(src, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
+def test_http_a_revoked_device_is_refused_on_the_very_next_request(src) -> None:
     with _serve(src) as (port, httpd):
         dev, tok = _pair(port)
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)    # one keep-alive connection: one server thread
         for _ in range(3):
-            assert _manifest(port, tok, conn) == 200                        # warm: held connection and cache populated
+            assert _manifest(port, tok, conn) == 200                        # warm: the held connection is open
         db = httpd.broker.active_db()
         db.revoke_devices([dev], by="browser", now=datetime.now(timezone.utc))
         assert _manifest(port, tok, conn) == 403
         conn.close()
 
 
-def test_http_a_re_enrolled_device(src, monkeypatch) -> None:
-    monkeypatch.setattr(firejournal, "CRED_CACHE_S", 3600.0)
+def test_http_a_re_enrolled_device(src) -> None:
     with _serve(src) as (port, httpd):
         dev1, tok1 = _pair(port)
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
@@ -417,15 +385,22 @@ def test_http_server_close_stops_the_stamper(src) -> None:
     assert not thread.is_alive()
 
 
-# --- the journal's other reads (D15c) ---------------------------------------------------------------------------------
+# --- the journal's other reads ----------------------------------------------------------------------------------------
 
-def test_journal_reads_share_one_connection_per_thread_and_see_every_commit(db: CockpitDB, monkeypatch) -> None:
-    """MEASURED before: every ``read()`` opened ``cockpit.db`` (N reads, N opens). After: one open for the thread, and
-    each read still sees what was committed before it began (each read is its own BEGIN .. COMMIT)."""
+def test_a_journal_read_opens_and_closes_a_connection_of_its_own(db: CockpitDB, monkeypatch) -> None:
+    """``read()`` holds nothing past its block (the D15c held read was taken back in the review round): each read opens
+    and closes its own connection, and sees what was committed before it began."""
     _enrol(db)
     other = sqlite3.connect(db.path, isolation_level=None)      # a writer that is none of the reader's connections
-    db._held.drop()
-    spy = _OpenSpy(monkeypatch)
+    conns: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def keep(*a: Any, **kw: Any) -> sqlite3.Connection:
+        c = real(*a, **kw)
+        conns.append(c)
+        return c
+
+    monkeypatch.setattr(sqlite3, "connect", keep)
     try:
         for n in range(N_READS):
             other.execute("UPDATE paired_devices SET label = ?", (f"label-{n}",))
@@ -433,23 +408,86 @@ def test_journal_reads_share_one_connection_per_thread_and_see_every_commit(db: 
             assert db.meta("format") is not None
     finally:
         other.close()
-    print(f"MEASURE: {2 * N_READS} journal reads -> {len(spy.of('cockpit.db'))} cockpit.db opens")
-    assert len(spy.of("cockpit.db")) == 1
+    print(f"MEASURE: {2 * N_READS} journal reads -> {len(conns)} cockpit.db opens")
+    assert conns
+    for c in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            c.execute("SELECT 1")
 
 
-def test_a_read_leaves_no_transaction_open_on_the_held_connection(db: CockpitDB) -> None:
-    _enrol(db)
-    assert db.meta("format") is not None
-    assert db._held.get().conn.in_transaction is False
-    with pytest.raises(sqlite3.OperationalError):
-        with db.read() as conn:
-            conn.execute("DELETE FROM paired_devices")      # a read is read-only
-    assert db._held.get().conn.in_transaction is False
-    assert len(db.list_devices()) == 1
+# --- the review round: the credential connection is verify_device's alone ------------------------------------------------
+
+def _revoke_elsewhere(db: CockpitDB, dev: str) -> None:
+    """Revoke ``dev`` through a connection that is none of ``db``'s (as the CLI would)."""
+    other = sqlite3.connect(db.path, isolation_level=None)
+    try:
+        other.execute("UPDATE paired_devices SET revoked_at = '2026-11-19T12:00:01Z' WHERE id = ?", (dev,))
+    finally:
+        other.close()
+
+
+def test_a_cursor_a_read_caller_leaves_behind_does_not_pin_the_credential_check(db: CockpitDB) -> None:
+    """L2 M1: a partly read cursor kept past its ``read()`` block must not hold the snapshot verify_device answers from."""
+    dev, tok = _enrol(db)
+    _enrol(db, "phone")                                 # two rows: one fetchone leaves the statement unfinished
+    assert db.verify_device(tok, now=NOW) == dev
+    with db.read() as conn:
+        leaked = conn.execute("SELECT id FROM paired_devices")
+        leaked.fetchone()
+    _revoke_elsewhere(db, dev)
+    assert db.verify_device(tok, now=NOW) is None, "a revoked device was admitted"
+    del leaked
+
+
+def test_a_credential_check_inside_an_enclosing_read_sees_a_revoke(db: CockpitDB) -> None:
+    """L1 W2: a read open on this thread must not freeze what verify_device sees."""
+    dev, tok = _enrol(db)
+    assert db.verify_device(tok, now=NOW) == dev
+    with db.read() as outer:
+        outer.execute("SELECT count(*) FROM paired_devices").fetchall()
+        _revoke_elsewhere(db, dev)
+        assert db.verify_device(tok, now=NOW) is None, "a revoked device was admitted"
+
+
+def test_a_read_left_open_does_not_freeze_the_credential_check(db: CockpitDB) -> None:
+    """L2 L1: a ``read()`` context entered and never left (an abandoned generator) must not freeze verify_device."""
+    dev, tok = _enrol(db)
+    assert db.verify_device(tok, now=NOW) == dev
+    abandoned = db.read()
+    conn = abandoned.__enter__()
+    conn.execute("SELECT count(*) FROM paired_devices").fetchall()
+    _revoke_elsewhere(db, dev)
+    try:
+        assert db.verify_device(tok, now=NOW) is None, "a revoked device was admitted"
+    finally:
+        abandoned.__exit__(None, None, None)
+
+
+def test_a_broken_credential_connection_refuses_then_is_replaced(db: CockpitDB, monkeypatch) -> None:
+    """L1 W3 / L2 L2: a broken connection refuses (never admits), and the next call opens a new one and answers."""
+    conns: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def keep(*a: Any, **kw: Any) -> sqlite3.Connection:
+        c = real(*a, **kw)
+        conns.append(c)
+        return c
+
+    monkeypatch.setattr(sqlite3, "connect", keep)
+    dev, tok = _enrol(db)
+    assert db.verify_device(tok, now=NOW) == dev
+    assert conns, "verify_device opened its connection here"
+    for c in conns:
+        c.close()                                       # every connection this thread holds is now broken
+    with pytest.raises(sqlite3.Error):
+        db.verify_device(tok, now=NOW)
+    assert db.verify_device(tok, now=NOW) == dev, "the broken connection was kept"
+    _revoke_elsewhere(db, dev)
+    assert db.verify_device(tok, now=NOW) is None
 
 
 def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
-    _enrol(db)
+    _dev, tok = _enrol(db)
     conns: list[sqlite3.Connection] = []
     real = sqlite3.connect
 
@@ -460,11 +498,10 @@ def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monk
 
     monkeypatch.setattr(sqlite3, "connect", keep)
     for _ in range(20):
-        t = threading.Thread(target=lambda: db.list_devices())
+        t = threading.Thread(target=lambda: (db.list_devices(), db.verify_device(tok, now=NOW)))
         t.start()
         t.join(10)
-    gc.collect()
-    assert len(conns) == 20
-    for c in conns:
+    assert len(conns) == 40, "each thread: one journal read, one credential connection"
+    for c in conns:                                     # no collector run: each thread's end closed its own
         with pytest.raises(sqlite3.ProgrammingError):
             c.execute("SELECT 1")

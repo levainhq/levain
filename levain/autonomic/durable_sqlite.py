@@ -21,6 +21,9 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TypeVar
+
+_T = TypeVar("_T")
 
 __all__ = ["HeldRead", "HeldReads", "MIN_SQLITE", "open_durable", "read_transaction", "rollback", "write_transaction"]
 
@@ -192,21 +195,13 @@ def read_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sqli
 
 
 class HeldRead:
-    """One thread's held read connection to one database file, with the file identity it was opened against and a
-    small answer cache the owner keeps beside it (:attr:`cache`; dropped with the connection)."""
+    """One thread's held read connection to one database file, and the file identity it was opened against."""
 
-    __slots__ = ("conn", "ident", "cache")
+    __slots__ = ("conn", "ident")
 
     def __init__(self, conn: sqlite3.Connection, ident: "tuple[int, int] | None") -> None:
         self.conn = conn
         self.ident = ident
-        self.cache: dict = {}
-
-    def data_version(self) -> int:
-        """``PRAGMA data_version``: changes between two calls on this connection exactly when another connection (this
-        process's or another's) committed to the database in between. This connection never writes, so its own commits
-        cannot hide a change. Autocommit, one statement, no transaction left open."""
-        return int(self.conn.execute("PRAGMA data_version").fetchall()[0][0])
 
     def close(self) -> None:
         try:
@@ -219,39 +214,43 @@ class HeldRead:
 
 
 class HeldReads:
-    """A read connection held open per thread, in place of one open per call.
+    """A read connection held open per thread, in place of one open per call, for ONE owner that never hands it out:
+    the only way to read through it is :meth:`run`, which takes a function and returns what it returned.
 
-    ``connect`` opens a connection for one thread (``open_durable(..., check_same_thread=False)``); ``path`` names the
-    database file it opens. :meth:`get` returns this thread's :class:`HeldRead`, opening it on first use, and reopens it
-    when the file at ``path`` is no longer the file the connection was opened against (deleted, replaced, or moved:
-    its device and inode changed). The file is looked at BEFORE the connection is opened, so a file replaced in
-    between makes the next ``get`` reopen, never keep a connection to the old file under the new file's identity.
+    It keeps no reference to its owner (``connect`` and ``path`` are passed to each call), so an owner made per call
+    and dropped closes its connections by refcounting, with no cycle for the collector to find.
 
-    The held connection is ``query_only``, so a write through it is refused by SQLite. Each read runs in its own
-    ``BEGIN`` .. ``COMMIT`` (:meth:`read_transaction`), so it sees the newest commit and no snapshot is pinned between
-    calls. A thread's connection lives in ``threading.local``: it is dropped, and closed, when the thread ends, and
-    when this object is collected. There is no map to grow."""
+    :meth:`run` uses this thread's :class:`HeldRead`, opening it on first use, and reopens it when the file at ``path``
+    is no longer what the connection was opened against: deleted, replaced or moved (device or inode changed). The
+    file is looked at BEFORE the connection is opened, so a change in between makes the next call reopen, never keep a
+    connection to the old file under the new identity.
 
-    def __init__(self, connect: Callable[[], sqlite3.Connection], path: Callable[[], "Path | str"]) -> None:
-        self._connect = connect
-        self._path = path
+    The held connection is ``query_only``, so a write through it is refused by SQLite. Each :meth:`run` is one
+    ``BEGIN`` .. read .. ``COMMIT``; any exception on the connection, the read's own included, closes it and forgets it
+    (so its transaction ends with it) before the exception propagates, and the next call opens a new one. A thread's
+    connection lives in ``threading.local``: it is closed when the thread ends, and when this object is collected.
+    There is no map to grow."""
+
+    def __init__(self) -> None:
         self._local = threading.local()
 
-    def _ident(self) -> "tuple[int, int] | None":
+    @staticmethod
+    def _ident(path: "Path | str") -> "tuple[int, int] | None":
         try:
-            st = os.stat(self._path())
+            st = os.stat(path)
         except OSError:
             return None
         return (st.st_dev, st.st_ino)
 
-    def get(self) -> HeldRead:
-        ident = self._ident()
+    def get(self, connect: Callable[[], sqlite3.Connection], path: "Path | str") -> HeldRead:
+        """This thread's held connection, (re)opened with ``connect`` as the class docstring says."""
+        ident = self._ident(path)
         held: "HeldRead | None" = getattr(self._local, "held", None)
         if held is not None:
             if ident is not None and held.ident == ident:
                 return held
             self.drop()
-        conn = self._connect()
+        conn = connect()
         try:
             conn.execute("PRAGMA query_only = ON")
         except BaseException:
@@ -268,30 +267,17 @@ class HeldReads:
         if held is not None:
             held.close()
 
-    @contextmanager
-    def read_transaction(self) -> Iterator[sqlite3.Connection]:
-        """:func:`read_transaction` on the held connection. A read nested inside another on this thread (the held
-        connection is already inside its ``BEGIN``) takes a fresh connection for the inner one, as the caller would
-        have without a held one. A failed ``BEGIN`` or ``COMMIT`` drops the held connection, so a broken one is never
-        kept."""
-        held = self.get()
-        conn = held.conn
-        if conn.in_transaction:
-            with read_transaction(self._connect) as inner:
-                yield inner
-            return
+    def run(self, connect: Callable[[], sqlite3.Connection], path: "Path | str",
+            read: Callable[[sqlite3.Connection], _T]) -> _T:
+        """``read(conn)`` inside one ``BEGIN`` .. ``COMMIT`` on this thread's held connection. ``read`` must return
+        values, never a cursor or a row source: everything it executed is drained before it returns, so the ``COMMIT``
+        leaves no statement holding the snapshot. Any exception closes and forgets the connection, then propagates."""
+        conn = self.get(connect, path).conn
         try:
             _until_not_busy(conn, lambda: conn.execute("BEGIN"))
-        except BaseException:
-            self.drop()
-            raise
-        try:
-            yield conn
-        except BaseException:
-            rollback(conn)
-            raise
-        try:
+            answer = read(conn)
             conn.execute("COMMIT")
         except BaseException:
             self.drop()
             raise
+        return answer

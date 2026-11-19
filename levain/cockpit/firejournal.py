@@ -31,7 +31,6 @@ import json
 import os
 import re
 import sqlite3
-import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -94,10 +93,6 @@ _ROOT_HOPS = 64                        # pairing_root walks at most this many pa
 OFFER_TTL = timedelta(minutes=10)      # a pairing offer's life
 OFFERS_LIVE = 3                        # live offers at once; a new one past this voids the oldest
 LAST_SEEN_EVERY = timedelta(minutes=1)  # a device's last_seen is stamped at most this often (fail-soft)
-#: How long a thread's answer for one device token is reused while the journal has not changed (seconds). A change to the
-#: journal drops it at once (:meth:`CockpitDB.verify_device`); this only bounds how long an unchanged journal is trusted.
-CRED_CACHE_S = 2.0
-_CRED_CACHE_MAX = 64                   # answers one thread keeps; past this the thread's answers are dropped together
 _DEVICE_ID = re.compile(r"d-[0-9a-f]{12}")
 _LABEL_MAX = 64
 
@@ -658,10 +653,10 @@ def _request_shape(record: Mapping[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------------------------------
 
 class CockpitDB:
-    """``cockpit.db`` in ``data_root``. Every operation opens its own connection; every write is one
-    ``BEGIN IMMEDIATE`` transaction, except :meth:`read` (and :meth:`verify_device`), which run on the calling thread's
-    held read connection (:class:`~levain.autonomic.durable_sqlite.HeldReads`). ``data_root`` must exist: the broker's start
-    sequence checks and owns it (§4.2, §6), so this never creates it."""
+    """``cockpit.db`` in ``data_root``. Every operation opens its own connection, except :meth:`verify_device`, which
+    reads through a connection held per thread that nothing else is ever handed (:attr:`_cred`); every write is one
+    ``BEGIN IMMEDIATE`` transaction. ``data_root`` must exist: the broker's start sequence checks and owns it (§4.2,
+    §6), so this never creates it."""
 
     def __init__(self, data_root: Path | str, *, install_class: str | None = None, owns_lock: bool = False) -> None:
         """``install_class`` is the class this opener serves (None: it migrates nothing) and
@@ -673,12 +668,12 @@ class CockpitDB:
         self._ready = False
         self._install_class = install_class
         self._owns_lock = owns_lock
-        self._held = HeldReads(lambda: self._connect(held=True), lambda: self.path)
+        self._cred = HeldReads()        # verify_device's connection per thread; read() never hands it out
 
     # -- connection -----------------------------------------------------------------------------
 
     def _connect(self, *, held: bool = False) -> sqlite3.Connection:
-        """A new connection. ``held`` is for :attr:`_held` alone: one its owning thread uses and any thread may close."""
+        """A new connection. ``held`` is for :attr:`_cred` alone: one its owning thread uses and any thread may close."""
         if self._ready:
             if not self.path.exists():
                 raise CockpitFormatError(f"journal {self.path} has disappeared")
@@ -773,9 +768,8 @@ class CockpitDB:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        """A consistent read snapshot, on the calling thread's held read connection (``query_only``: a write through
-        it is refused by SQLite)."""
-        with self._held.read_transaction() as conn:
+        """A consistent read snapshot, on a connection of its own that is closed when the block ends."""
+        with read_transaction(self._connect) as conn:
             yield conn
 
     # -- meta ----------------------------------------------------------------------------------
@@ -1254,31 +1248,19 @@ class CockpitDB:
 
     def verify_device(self, token: str, *, now: datetime) -> str | None:
         """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of
-        its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock); the
-        ``last_seen`` stamp is :meth:`stamp_last_seen`, which the caller runs AFTER this answer (F1).
+        its SHA-256, a read and nothing else. ``now`` is unused here (kept for the caller's one clock). The
+        ``last_seen`` stamp is not taken here (:meth:`stamp_last_seen`).
 
-        The lookup runs on the calling thread's held read connection. A device found is remembered on that thread for
-        :data:`CRED_CACHE_S`, keyed by the token's hash AND the journal's ``PRAGMA data_version`` read just before the
-        lookup: any commit by any other connection (a revoke from this server, another process, the CLI) changes the
-        version, so the next call looks the token up again and a revoked device is refused on it. A device NOT found is
-        never remembered. Any error (the version read included) propagates: the caller refuses on it, never admits."""
+        Every call looks the token up, in its own transaction, on the calling thread's credential connection
+        (:attr:`_cred`): no answer is remembered, and no other method reads through that connection. Any error
+        propagates and closes the connection: the caller refuses on it, never admits."""
         del now
         key = _sha256(token)
-        held = self._held.get()
-        version = held.data_version()
-        cached = held.cache.get(key)
-        if cached is not None and cached[1] == version and time.monotonic() - cached[2] < CRED_CACHE_S:
-            return cached[0]
-        with self._held.read_transaction() as conn:
-            row = conn.execute("SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?", (key,)).fetchone()
-        if row is None or row["revoked_at"] is not None:
-            held.cache.pop(key, None)
+        rows = self._cred.run(lambda: self._connect(held=True), self.path, lambda conn: conn.execute(
+            "SELECT id, revoked_at FROM paired_devices WHERE token_hash = ?", (key,)).fetchall())
+        if not rows or rows[0]["revoked_at"] is not None:
             return None
-        device = str(row["id"])
-        if len(held.cache) >= _CRED_CACHE_MAX:
-            held.cache.clear()
-        held.cache[key] = (device, version, time.monotonic())
-        return device
+        return str(rows[0]["id"])
 
     def stamp_last_seen(self, device_id: str, *, now: datetime) -> bool:
         """Stamp ``device_id``'s ``last_seen`` when it is due (at most once per ``LAST_SEEN_EVERY``), fail-soft: the
