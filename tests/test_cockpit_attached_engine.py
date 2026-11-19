@@ -17,7 +17,7 @@ import pytest
 
 from levain.cockpit import engine
 from levain.cockpit import snapshot_host as sh
-from levain.cockpit.derive import DeriveLoop, DeriveResult, File, PanelPlan
+from levain.cockpit.derive import DeriveLoop, DeriveResult, Dir, File, GitRefs, PanelPlan, Poll, Sqlite
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
 from levain.cockpit.results import Read, RowIn
 from levain.cockpit.snapshots import SnapshotReadError, SnapshotReader, SnapshotWriter, encode_body
@@ -745,6 +745,25 @@ def test_a_panel_whose_inputs_are_not_a_tuple_of_the_input_types_is_refused_at_r
     with pytest.raises(engine.CockpitRegistrationError, match="bad_inputs.*inputs"):
         ck.register(list_spec("bad_inputs", Recorder(), inputs=inputs))
     assert "bad_inputs" not in ck.panel_ids
+
+
+@pytest.mark.parametrize("make_input", [
+    lambda: Sqlite([]),
+    lambda: File(3),
+    lambda: File(""),
+    lambda: Dir(None),
+    lambda: GitRefs(b"/r"),
+    lambda: Poll(True),
+    lambda: Poll(float("inf")),
+    lambda: Poll(float("nan")),
+    lambda: Poll(0),
+    lambda: Poll("5"),
+])
+def test_an_input_with_a_field_that_cannot_be_looked_at_is_refused_at_registration_naming_the_panel(make_input) -> None:
+    ck = Cockpit()
+    with pytest.raises(engine.CockpitRegistrationError, match="bad_field.*input"):
+        ck.register(list_spec("bad_field", Recorder(), inputs=(make_input(),)))
+    assert "bad_field" not in ck.panel_ids
 
 
 def test_every_input_type_registers() -> None:

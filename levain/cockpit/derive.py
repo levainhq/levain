@@ -709,7 +709,13 @@ class DeriveLoop:
             version = self._plans_version
         if version != self._pruned_version:
             self._pruned_version = version
-            self._fingerprinter.keep_sqlite({inp.path for p in plans.values() for inp in p.inputs if isinstance(inp, Sqlite)})
+            keep: set[str] = set()
+            for p in plans.values():
+                try:
+                    keep.update(inp.path for inp in p.inputs if isinstance(inp, Sqlite))
+                except Exception:
+                    pass    # a plan whose inputs cannot be read holds no connection, and is degraded alone in `_views`
+            self._fingerprinter.keep_sqlite(keep)
         views, seen = self._views(plans)
         token: Any = _UNSET
         if self._token_fn is not None:

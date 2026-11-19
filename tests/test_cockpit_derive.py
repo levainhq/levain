@@ -2025,3 +2025,18 @@ def test_a_fingerprint_that_raises_for_one_plan_does_not_stop_the_poll(tmp_path,
     g.write_text("22")
     assert loop.run_once(clock.t) == ["good"]                       # the good panel still follows its own input
     loop.stop()
+
+
+def test_a_plan_whose_sqlite_path_is_unhashable_degrades_alone_and_the_other_panels_still_derive(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("1")
+    good = PanelPlan("good", inputs=(File(str(f)),))
+    loop, writer, clock, calls = make([good], backstop_s=1e9)
+    assert loop.run_once(clock.t) == ["good"]
+    # a plan set that changes is the moment the held Sqlite connections are trimmed; the plan is built by hand around the
+    # registration check
+    loop.set_plans([good, PanelPlan("bad", inputs=(Sqlite([]),))])
+    assert loop.run_once(clock.t) == ["bad"]
+    assert writer.of("good") and writer.heartbeats
+    assert "bad: inputs unreadable [TypeError]" in writer.streams[-1]["detail"]
+    loop.stop()

@@ -152,6 +152,21 @@ NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (ve
 BAND_VERB = "band_answer"               # the cockpit verb that answers the NEEDS YOU band by its shorthand (verbs.py)
 
 
+def _input_field_problem(inp: Any) -> str:
+    """What is wrong with the field a derive host looks at for this declared input, or "" when it is usable: a path or repo
+    is a non-empty string, a poll interval a finite number above zero (a bool is not a number here)."""
+    if isinstance(inp, Poll):
+        every = inp.every_s
+        if isinstance(every, bool) or not isinstance(every, (int, float)) or not math.isfinite(every) or every <= 0:
+            return f"every_s must be a finite number greater than 0, got {every!r}"
+        return ""
+    name = "repo" if isinstance(inp, GitRefs) else "path"
+    value = getattr(inp, name, None)
+    if not isinstance(value, str) or not value:
+        return f"{name} must be a non-empty string, got {value!r}"
+    return ""
+
+
 def _canon_text(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
@@ -1295,6 +1310,10 @@ class Cockpit:
             # a derive host hashes and fingerprints these: anything else would be found on its poll thread, not here
             raise CockpitRegistrationError(
                 f"{sid}: inputs must be a tuple of File, Dir, Sqlite, GitRefs or Poll, got {spec.inputs!r}")
+        for inp in spec.inputs:
+            problem = _input_field_problem(inp)
+            if problem:
+                raise CockpitRegistrationError(f"{sid}: input {inp!r}: {problem}")
         if spec.edit_class not in ("", "A", "B", "C"):
             raise CockpitRegistrationError(f"{sid}: edit_class must be '', 'A', 'B' or 'C', got {spec.edit_class!r}")
         for f in spec.facets:
