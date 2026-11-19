@@ -6863,7 +6863,10 @@
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
       if (ev.data.dropDelivered === true) {
         dropHandedClear(ev.data.words);
-        // told to the page's own views (the Desk view's Rotate Desk): the words the server accepted, and whether an envelope was taken with them
+        // told to the page's own views (the Desk view's Rotate Desk): the words the server accepted, and whether an envelope was taken with
+        // them. DISPLAY ONLY, not an authentication: the source check above stops another frame, but the sheet's frame is same-origin (no
+        // sandbox attribute), so a script of this page can raise the same event itself. The server verifies an envelope on its own, whatever
+        // this event says.
         try { document.dispatchEvent(new CustomEvent("levain:drop-delivered", { detail: { words: typeof ev.data.words === "string" ? ev.data.words : "", signed: ev.data.signed === true } })); } catch (e) { /* a view that listens is told nothing */ }
       }
       dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache

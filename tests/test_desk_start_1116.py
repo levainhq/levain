@@ -90,8 +90,9 @@ def test_rotate_desk_hands_the_signing_sheet_the_same_words_and_rotates_nothing_
         {"eval": _STUB % "{}"}, {"tap": "document.querySelector('.dv-zone .dv-start')"},
         {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, LOOK, *_shot("desk_held_1280.png")])
     g = looks(out)[-1]
-    assert g["startText"] == "Rotate Desk" and len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate "), g      # the rotate request, not /fanin
-    assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing is asked until you press one of them" in g["note"], g
+    assert g["startText"] == "Rotate Desk" and len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate desk 25 "), g      # the rotate request naming the desk, not /fanin
+    assert "Only the signature asks" in g["note"] and "Send words only" in g["note"] and "not counted as asked here" in g["note"], g      # Send words only is not an ask
+    assert "nothing is asked until you press one of them" not in g["note"], g
     assert "rotates nothing" in g["note"], g                                   # the page says what it did not do
     assert out["sends"] == []                                                  # the tap filed nothing through the desk port
 
