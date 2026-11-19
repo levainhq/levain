@@ -383,6 +383,7 @@
       const md = document.querySelector(".brand .model");
       if (md) md.textContent = view.brand_model;
     }
+    syncEntityDupe();
     // The operator's state line: their OWN words, reflected back verbatim (no machine
     // interpretation). Hidden when there is no live-context source; "no state set"
     // when present-but-empty; an expired line arrives already dropped by the server.
@@ -9760,6 +9761,17 @@
     return !view || !view.offered_verbs || view.offered_verbs[verb] === true;
   }
 
+  // levain#141 polish: the masthead draws the entity name only where it is not a repeat of the wordmark beside it. The flag
+  // (data-entity-dupe on the masthead) is set wherever either text is written; dashboard.css hides .unit under it. On a bare install the
+  // wordmark is "Levain" and the entity name is another word, so the name stays drawn.
+  function syncEntityDupe() {
+    const mh = document.querySelector(".masthead");
+    const ent = document.getElementById("entity");
+    const wm = document.querySelector(".brand .wordmark");
+    if (!mh || !ent || !wm) return;
+    const norm = (n) => String(n.textContent || "").trim().toLowerCase();
+    if (norm(ent) && norm(ent) === norm(wm)) mh.setAttribute("data-entity-dupe", ""); else mh.removeAttribute("data-entity-dupe");
+  }
   function wireEntityName(entityEl, view) {
     if (!commit || !verbOffered(view, "entity_name")) return;
     const unit = entityEl.parentElement;

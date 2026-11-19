@@ -4112,24 +4112,32 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
 /* Phill's list after using layout A (1119-10). Everything below overrides a layout A rule by coming after it; the only existing
    rules edited in place are two comments (the order line and the glance heading above), which named the old order. */
 
-/* the masthead names the entity once: the brand side's name is the one drawn, at every width. #entity stays in the markup (the page's
-   writer and the rename affordance in dashboard_core.js still find it); it is not drawn. The jar left the masthead: it is drawn in
+/* the masthead names the entity once: the entity name (.unit) is not drawn only where it repeats the wordmark beside it (JS sets
+   data-entity-dupe on the masthead, dashboard_core.js syncEntityDupe); on a bare install the two differ and the name stays drawn.
+   #entity stays in the markup either way (the page's writer and the rename affordance in dashboard_core.js find it). The jar left the masthead: it is drawn in
    #ck-jarbox (the Machine section's stats box) when the page has one. */
-body.ia .masthead .unit { display: none; }
+body.ia .masthead[data-entity-dupe] .unit { display: none; }
 body.ia .masthead .readout { align-items: center; }
 body.ia .masthead .indicators, body.ia .ia-actions { align-items: center; }
 
-/* the masthead stays reachable. In the flow (every place but Home) it sticks to the top; Home's deck is a grid, where a sticky item
-   only sticks inside its own row, so there it is fixed and the deck pads by its measured height (--ia-mast-h, dashboard_places.js).
-   Below a dialog (modal 50, presence sheet 40, jump palette 20) and above the page's own sticky bars. */
-body.ia .deck > .masthead { position: sticky; top: 0; z-index: 15; background: var(--bg); padding-top: calc(var(--sp-5) + env(safe-area-inset-top, 0px)); }
+/* the masthead and the places bar stay reachable ABOVE 720 px. In the flow (every place but Home) they stick to the top; Home's deck is
+   a grid, where a sticky item only sticks inside its own row, so there both are fixed and the deck pads by their measured height
+   (--ia-mast-h: the masthead, --ia-bars-h: both; dashboard_places.js). At 720 px and below nothing is pinned: the masthead scrolls
+   with the page (a pinned one costs a fifth of a phone), and both measures read 0. Below a dialog (modal 50, presence sheet 40,
+   jump palette 20) and above the page's own sticky bars. */
+body.ia .deck > .masthead { background: var(--bg); padding-top: calc(var(--sp-5) + env(safe-area-inset-top, 0px)); }
 body.ia .deck { padding-top: 0; }   /* the bar carries the status-bar inset itself (it stays at the top, and its content stays below the clock) */
-body.ia .deck > .ia-places { top: var(--ia-mast-h, 0px); }
-html.ia-mast-measured body.ia[data-ia-place="home"] .deck { padding-top: var(--ia-mast-h, 0px); }
-html.ia-mast-measured body.ia[data-ia-place="home"] .deck > .masthead {
-  position: fixed; top: 0; left: 0; right: 0; margin: 0 auto; max-width: var(--page-max); box-sizing: border-box; width: 100%; }
-/* a jump (Drop, the Needs count, the List) lands below the bar, never under it */
-body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel[data-ck-panel="tray"], .panel[data-ck-panel="notifications"]) { scroll-margin-top: calc(var(--ia-mast-h, 0px) + var(--sp-4)); }
+@media (min-width: 721px) {
+  body.ia .deck > .masthead { position: sticky; top: 0; z-index: 15; }
+  body.ia .deck > .ia-places { top: var(--ia-mast-h, 0px); z-index: 14; }
+  html.ia-mast-measured body.ia[data-ia-place="home"] .deck { padding-top: var(--ia-bars-h, 0px); }
+  html.ia-mast-measured body.ia[data-ia-place="home"] .deck > .masthead {
+    position: fixed; top: 0; left: 0; right: 0; margin: 0 auto; max-width: var(--page-max); box-sizing: border-box; width: 100%; }
+  html.ia-mast-measured body.ia[data-ia-place="home"] .deck > .ia-places {
+    position: fixed; top: var(--ia-mast-h, 0px); left: 0; right: 0; margin: 0 auto; max-width: var(--page-max); box-sizing: border-box; width: 100%; }
+}
+/* a jump (Drop, the Needs count, the List, any panel or section head) lands below the pinned bars, never under them */
+body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head) { scroll-margin-top: calc(var(--ia-bars-h, 0px) + var(--sp-4)); }
 
 /* the brand keeps room for a two-line tagline beside the readout (at 1101-1180 it fell to three lines); the line wraps, never cut */
 @media (min-width: 1101px) {
@@ -4137,7 +4145,7 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel[data-ck-panel="tray"], .
 }
 /* a touch screen at the widths where the header buttons are icons only: every one of them is a 44 px target */
 @media (pointer: coarse) and (min-width: 1101px) and (max-width: 1500px) {
-  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #calmbtn, #presencebtn) { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
+  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn) { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
   body.ke .masthead .themesw, body.ke .masthead .indicators button { height: auto; }
 }
 
@@ -4172,4 +4180,7 @@ body.ia[data-ia-place="home"] #ck-widgets { order: 25; }
 /* Work at tablet width: the List takes the row, Board and Inbox sit side by side under it (it was three cards at two-up, Inbox alone) */
 @media (min-width: 721px) and (max-width: 1100px) {
   body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { grid-column: 1 / -1 !important; }
+  /* the Machine row: seven panels at two-up left Edits alone on the last row. 2 + 2 + 3: the last three (Jobs, Scheduled jobs, Edits)
+     take a third each, the same span they have from 1101 up. */
+  body.ia[data-ia-place="home"] .panel:is([data-ck-panel="scheduled_jobs"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { grid-column: span 4 !important; }
 }

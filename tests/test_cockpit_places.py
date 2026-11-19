@@ -320,7 +320,7 @@ def test_choosing_a_panel_in_the_jump_box_on_the_desk_leaves_the_desk(tmp_path: 
 def test_drop_on_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
     """The masthead Drop button was a no-op on Memory (the box is not drawn there): it goes Home, then scrolls to and focuses the box."""
     ST = ("(() => { const d = document.getElementById('ck-drop'); const a = document.activeElement;"
-          " return JSON.stringify({place: document.body.dataset.iaPlace, drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom), y: Math.round(scrollY), inBox: !!a && d.contains(a)}); })()")
+          " return JSON.stringify({place: document.body.dataset.iaPlace, drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(Math.max(document.querySelector('.masthead').getBoundingClientRect().bottom, document.querySelector('.ia-places').getBoundingClientRect().bottom)), y: Math.round(scrollY), inBox: !!a && d.contains(a)}); })()")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -391,7 +391,7 @@ def test_the_places_keys_under_an_open_dialog_leave_the_desk_alone(tmp_path: Pat
 def test_drop_on_the_desk_over_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
     """Memory, then the Desk (the page still holds Memory underneath), then Drop: the box is not drawn under Memory, so Drop goes Home."""
     ST = ("(() => { const d = document.getElementById('ck-drop'); return JSON.stringify({place: document.body.dataset.iaPlace, mode: document.body.dataset.mode,"
-          " drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom)}); })()")
+          " drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), mast: Math.round(Math.max(document.querySelector('.masthead').getBoundingClientRect().bottom, document.querySelector('.ia-places').getBoundingClientRect().bottom))}); })()")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [

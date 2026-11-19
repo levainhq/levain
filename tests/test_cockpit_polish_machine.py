@@ -114,7 +114,7 @@ def test_the_row_targets_are_touch_sized_and_the_stats_box_hides_while_empty(tmp
         out = drive_touch(tmp_path, f"{url}/#write_token=T", [{"emulate": {"w": 390, "h": 900, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, SETTLE, {"eval": STATE}])
     (s,) = _states(out)
     assert s["toggle"]["h"] >= 44 and s["calm"]["h"] >= 44 and s["amb"]["h"] >= 44, s
-    assert not (s["jarbox"] and s["jarbox"]["shown"]), s                                              # empty until the header lane draws the jar into it
+    assert not (s["jarbox"] and s["jarbox"]["shown"] and s["jarbox"]["bottom"] <= s["jarbox"]["top"]), s      # drawn into by the jar now (renderJar); an empty box would be hidden by :empty, never an empty strip
 
 
 @needs_browser

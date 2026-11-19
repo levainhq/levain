@@ -162,21 +162,26 @@
     });
   }
 
-  // levain#141 polish: the masthead stays reachable while the page scrolls. Home's deck is a grid, and a sticky grid item only sticks
-  // inside its own grid area (its row), so on Home dashboard.css fixes the masthead and the deck pads by its height. That height is
-  // measured here (--ia-mast-h on the root) because the bar wraps differently at every width. `html.ia-mast-measured` is the switch:
-  // without it (no script) the masthead stays in the flow as it was.
+  // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, ABOVE 720 px. Home's
+  // deck is a grid, and a sticky grid item only sticks inside its own grid area (its row), so on Home dashboard.css fixes both bars and
+  // the deck pads by their height. The heights are measured here (--ia-mast-h: the masthead; --ia-bars-h: masthead + places bar)
+  // because the bars wrap differently at every width. At 720 px and below nothing is pinned (the masthead scrolls with the page: a
+  // pinned one costs a fifth of a phone) and both read 0. `html.ia-mast-measured` is the switch: without script the bars stay in flow.
   function trackMasthead() {
     var m = document.querySelector(".deck > .masthead");
     if (!m) return;
     var root = document.documentElement;
+    var bar = document.querySelector(".deck > .ia-places");
     function set() {
-      var h = Math.ceil(m.getBoundingClientRect().height);
-      if (h > 0) root.style.setProperty("--ia-mast-h", h + "px");
+      var pinned = window.innerWidth > 720;
+      var mh = pinned ? Math.ceil(m.getBoundingClientRect().height) : 0;
+      var bh = pinned && bar ? Math.ceil(bar.getBoundingClientRect().height) : 0;
+      root.style.setProperty("--ia-mast-h", mh + "px");
+      root.style.setProperty("--ia-bars-h", (mh + bh) + "px");
     }
     set();
     root.classList.add("ia-mast-measured");
-    if (typeof ResizeObserver === "function") new ResizeObserver(set).observe(m);
+    if (typeof ResizeObserver === "function") { var ro = new ResizeObserver(set); ro.observe(m); if (bar) ro.observe(bar); }
     window.addEventListener("resize", set);
   }
 

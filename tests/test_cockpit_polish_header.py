@@ -45,7 +45,7 @@ def test_the_masthead_has_no_jar_and_keeps_the_entity_element() -> None:
     """The jar is not in the masthead markup; #entity is (the page's writer and the rename affordance find it), and the CSS names it undrawn."""
     assert 'id="jar"' not in HTML and 'class="jar"' not in HTML
     assert 'id="entity"' in HTML
-    assert re.search(r"body\.ia \.masthead \.unit \{ display: none; \}", CSS)
+    assert re.search(r"body\.ia \.masthead\[data-entity-dupe\] \.unit \{ display: none; \}", CSS)   # hidden only where the entity repeats the wordmark
 
 
 def test_the_notes_come_before_the_drop_in_the_document() -> None:
@@ -107,7 +107,7 @@ ONE = r"""(() => { const R = (e) => e.getBoundingClientRect(), mid = (e) => Math
   const unit = document.querySelector('.masthead .unit'), ent = document.getElementById('entity');
   const ctl = [...document.querySelectorAll('.masthead .ia-act, .masthead #refresh, .masthead #jumpbtn, .masthead .themesw')].filter(e => R(e).width > 0);
   const mids = ctl.map(mid);
-  return JSON.stringify({ unitShown: unit.getClientRects().length > 0, entityText: ent.textContent, word: !!document.querySelector('.masthead .wordmark').getClientRects().length,
+  return JSON.stringify({ unitShown: unit.getClientRects().length > 0, entityText: ent.textContent, wordText: document.querySelector('.masthead .wordmark').textContent, word: !!document.querySelector('.masthead .wordmark').getClientRects().length,
     jarInMasthead: !!document.querySelector('.masthead #jar, .masthead .jar'), spread: Math.max(...mids) - Math.min(...mids), n: ctl.length, sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }); })()"""
 
 
@@ -120,7 +120,7 @@ def test_the_masthead_names_the_entity_once_holds_no_jar_and_keeps_its_controls_
     rows = _vals(out)
     assert len(rows) == 4, out["values"]
     for g, w in zip(rows, (1101, 1180, 1440, 1920)):
-        assert g["unitShown"] is False and g["word"] is True and g["jarInMasthead"] is False, (w, g)
+        assert g["unitShown"] is (g["entityText"].strip().lower() != g["wordText"].strip().lower()) and g["word"] is True and g["jarInMasthead"] is False, (w, g)
         assert g["n"] >= 4 and g["spread"] <= 3, (w, g)                     # the controls are centred on one line
         assert g["sw"] <= g["cw"], (w, g)
 
@@ -236,25 +236,110 @@ def test_home_draws_at_a_glance_between_the_desk_and_work_and_the_document_agree
 
 
 STICKY = r"""(() => { window.scrollTo(0, 700); return new Promise(r => setTimeout(r, 400)).then(() => { const m = document.querySelector('.masthead'), r = m.getBoundingClientRect(), cs = getComputedStyle(m);
-  return JSON.stringify({ scrollY: Math.round(scrollY), top: Math.round(r.top), h: Math.round(r.height), bg: cs.backgroundColor, z: cs.zIndex, vis: r.width > 300 }); }); })()"""
+  const b = document.querySelector('.ia-places'), br = b.getBoundingClientRect(), bs = getComputedStyle(b);
+  return JSON.stringify({ scrollY: Math.round(scrollY), top: Math.round(r.top), bottom: Math.round(r.bottom), pos: cs.position, bg: cs.backgroundColor, z: cs.zIndex, vis: r.width > 300,
+    barTop: Math.round(br.top), barBottom: Math.round(br.bottom), barPos: bs.position, barZ: bs.zIndex, barBg: bs.backgroundColor, root: getComputedStyle(document.documentElement).getPropertyValue('--ia-bars-h').trim() }); }); })()"""
 JUMP_DROP = r"""(() => { window.scrollTo(0, 2500); document.querySelector('.ia-act[data-phone-jump=drop]').click();
-  return new Promise(r => setTimeout(r, 900)).then(() => JSON.stringify({ dropTop: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top),
-    mast: Math.round(document.querySelector('.masthead').getBoundingClientRect().bottom) })); })()"""
+  return new Promise(r => setTimeout(r, 900)).then(() => { const b = document.querySelector('.ia-places').getBoundingClientRect(), m = document.querySelector('.masthead').getBoundingClientRect();
+    return JSON.stringify({ dropTop: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), mast: Math.round(Math.max(m.bottom, b.bottom)) }); }); })()"""
+# a section head scrolled to by a jump (the page's own scrollIntoView honours scroll-margin-top) and the first block under the bars at scroll 0
+HEAD_JUMP = r"""(() => { window.scrollTo(0, 0); const first = document.getElementById('ck-band').getBoundingClientRect().top;
+  const h = document.querySelector('.ia-head[data-ia-head="machine"]'); h.scrollIntoView(); const b = document.querySelector('.ia-places').getBoundingClientRect();
+  return new Promise(r => setTimeout(r, 500)).then(() => JSON.stringify({ firstTop: Math.round(first), headTop: Math.round(h.getBoundingClientRect().top), barBottom: Math.round(b.bottom) })); })()"""
 
 
 @needs_browser
-def test_the_masthead_stays_at_the_top_while_the_page_scrolls_and_a_jump_lands_below_it(tmp_path: Path) -> None:
+def test_the_masthead_and_the_places_bar_stay_pinned_above_720_and_scroll_away_on_a_phone(tmp_path: Path) -> None:
     steps: list = []
-    for w in (390, 820, 1440):
-        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": STICKY}, {"eval": JUMP_DROP}]
+    for w in (390, 720, 820, 1440):
+        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": STICKY}, {"eval": JUMP_DROP}, {"eval": HEAD_JUMP}]
     out = _open(tmp_path, [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, PANELS, SETTLE] + steps)
     rows = _vals(out)
-    assert len(rows) == 6, out["values"]
-    for i, w in enumerate((390, 820, 1440)):
-        st, jump = rows[2 * i], rows[2 * i + 1]
-        assert st["scrollY"] > 100 and st["top"] == 0 and st["vis"], (w, st)        # scrolled, and the bar is still at the top
-        assert st["bg"] not in ("rgba(0, 0, 0, 0)", "transparent"), (w, st)          # with the page's background under it
-        assert jump["dropTop"] >= jump["mast"] - 1, (w, jump)                       # the drop box is not under the bar after a jump to it
+    assert len(rows) == 12, out["values"]
+    for i, w in enumerate((390, 720, 820, 1440)):
+        st, jump, head = rows[3 * i], rows[3 * i + 1], rows[3 * i + 2]
+        assert st["scrollY"] > 100, (w, st)
+        if w <= 720:                                                                # a phone: the masthead is in the flow and scrolls away
+            assert st["pos"] == "static" and st["top"] < 0 and st["root"] == "0px", (w, st)
+            continue
+        assert st["top"] == 0 and st["vis"] and st["pos"] in ("fixed", "sticky"), (w, st)   # scrolled, and the masthead is still at the top
+        assert st["bg"] not in ("rgba(0, 0, 0, 0)", "transparent"), (w, st)           # with the page's background under it
+        assert st["barPos"] in ("fixed", "sticky") and abs(st["barTop"] - st["bottom"]) <= 1, (w, st)   # the places bar pinned directly under it
+        assert st["barBg"] not in ("rgba(0, 0, 0, 0)", "transparent"), (w, st)
+        assert int(st["barZ"]) < int(st["z"]), (w, st)                              # both under every dialog (the z test above), the bar under the masthead
+        assert jump["dropTop"] >= jump["mast"] - 1, (w, jump)                       # the drop box is not under the bars after a jump to it
+        assert head["firstTop"] >= head["barBottom"] - 1, (w, head)                 # nothing on the page sits under the bars at the top of the page
+        assert head["headTop"] >= head["barBottom"] - 1, (w, head)                  # a section head scrolled to lands below the bars
+
+
+def test_the_pinned_places_bar_is_below_the_dialogs() -> None:
+    z = int(re.search(r"body\.ia \.deck > \.ia-places \{[^}]*z-index: (\d+)", CSS).group(1))
+    palette = int(re.search(r"\.palette \{[^}]*z-index: (\d+)", CSS).group(1))
+    sheet = int(re.search(r"\.pr-sheet \{[^}]*z-index: (\d+)", CSS).group(1))
+    assert 5 < z < palette and z < sheet, (z, palette, sheet)
+    assert re.search(r"@media \(min-width: 721px\) \{\s*body\.ia \.deck > \.masthead \{ position: sticky;", CSS)   # the pin is above 720 only
+
+
+def test_the_entity_name_is_hidden_only_where_it_repeats_the_wordmark(tmp_path: Path) -> None:
+    """syncEntityDupe (dashboard_core.js) sets data-entity-dupe on the masthead exactly when the two names are the same word
+    (case-insensitive, trimmed); the CSS hides .unit only under that flag."""
+    assert re.search(r"body\.ia \.masthead\[data-entity-dupe\] \.unit \{ display: none; \}", CSS)
+    assert not re.search(r"body\.ia \.masthead \.unit \{ display: none; \}", CSS)
+    start = CORE.index("  function syncEntityDupe() {")
+    fn = CORE[start:CORE.index("  function wireEntityName", start)]
+    drv = tmp_path / "dupe.js"
+    drv.write_text(r"""
+const mh = { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };
+const ent = { textContent: "" }, wm = { textContent: "" };
+globalThis.document = { querySelector: (s) => (s === ".masthead" ? mh : s === ".brand .wordmark" ? wm : null), getElementById: (i) => (i === "entity" ? ent : null) };
+""" + fn + r"""
+const run = (e, w) => { ent.textContent = e; wm.textContent = w; syncEntityDupe(); return "data-entity-dupe" in mh.attrs; };
+console.log(JSON.stringify([run("flow", "flow"), run("  Flow ", "flow"), run("flow", "Levain"), run("—", "Levain"), run("", ""), run("flow", "flow")]));
+""", encoding="utf-8")
+    import subprocess
+    r = subprocess.run([NODE, str(drv)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout.strip().splitlines()[-1]) == [True, True, False, False, False, True]
+    assert "syncEntityDupe();" in CORE
+
+
+DUPE = r"""(() => { const mh = document.querySelector('.masthead'), u = mh.querySelector('.unit'); const shown = () => u.getClientRects().length > 0;
+  mh.removeAttribute('data-entity-dupe'); const a = shown(); mh.setAttribute('data-entity-dupe', ''); const b = shown(); mh.removeAttribute('data-entity-dupe');
+  return JSON.stringify({ differentShown: a, equalShown: b, flag: mh.hasAttribute('data-entity-dupe'), entity: document.getElementById('entity').textContent,
+    word: document.querySelector('.masthead .wordmark').textContent }); })()"""
+
+
+@needs_browser
+def test_the_entity_name_shows_when_it_differs_and_hides_when_it_repeats_in_the_page(tmp_path: Path) -> None:
+    out = _open(tmp_path, [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, SETTLE, {"eval": DUPE}])
+    g = _vals(out)[0]
+    assert g["differentShown"] is True and g["equalShown"] is False, g
+
+
+MACHINE = r"""(() => { const t0 = document.querySelector('.panel[data-ck-panel="tray"]');
+  for (const k of ['roster', 'agents', 'agent_calls', 'stream', 'scheduled_jobs', 'jobs', 'edits']) { if (!document.querySelector('.panel[data-ck-panel="' + k + '"]')) { const p = document.createElement('section'); p.className = 'panel'; p.dataset.ckPanel = k; p.style.minHeight = '60px'; t0.parentNode.appendChild(p); } }
+  return JSON.stringify({ rows: ['roster', 'agents', 'agent_calls', 'stream', 'scheduled_jobs', 'jobs', 'edits'].map((k) => { const b = document.querySelector('.panel[data-ck-panel="' + k + '"]').getBoundingClientRect(); return [k, Math.round(b.top + scrollY), Math.round(b.left), Math.round(b.width)]; }), machine: 1 }); })()"""
+
+
+@needs_browser
+def test_the_machine_row_is_never_an_orphan_at_tablet_width(tmp_path: Path) -> None:
+    """721-1100: the seven Machine panels draw 2 + 2 + 3 (Edits is never alone on the last row). Panels the fixture lacks are added, placed by the same attributes."""
+    steps: list = []
+    for w in (740, 820, 1000, 1100):
+        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": MACHINE}]
+    out = _open(tmp_path, [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, PANELS, SETTLE] + steps)
+    rows = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"machine"' in v]
+    assert len(rows) == 4, out["values"]
+    for g, w in zip(rows, (740, 820, 1000, 1100)):
+        by = {k: (y, x, wd) for k, y, x, wd in g["rows"]}
+        ys = sorted({v[0] for v in by.values()})
+        assert len(ys) == 3, (w, g)                                                  # three rows
+        last = [k for k in by if by[k][0] == ys[2]]
+        assert sorted(last) == ["edits", "jobs", "scheduled_jobs"], (w, g)          # the last row is the three, not Edits alone
+        assert max(v[1] + v[2] for v in by.values()) <= w, (w, g)
+        assert abs(by["edits"][2] - by["jobs"][2]) <= 2, (w, g)
+        for first in (["roster", "agents"], ["agent_calls", "stream"]):
+            assert by[first[0]][0] == by[first[1]][0] and abs(by[first[0]][2] - by[first[1]][2]) <= 2, (w, g)
 
 
 @needs_browser

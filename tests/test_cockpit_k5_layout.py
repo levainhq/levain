@@ -189,10 +189,11 @@ def test_a_layout_that_only_names_the_retired_now_is_no_saved_layout(tmp_path: P
 
 @needs_browser
 def test_the_entity_name_is_drawn_once_in_the_bar_by_the_brand_at_1440_with_a_saved_layout(tmp_path: Path) -> None:
-    """levain#141 polish: the masthead names the entity once (the brand side's wordmark); #entity stays in the markup, undrawn."""
+    """levain#141 polish: the masthead names the entity once: #entity is hidden only where it repeats the wordmark, and stays in the markup either way."""
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
-        {"eval": "const e = document.getElementById('entity'); [!!e, getComputedStyle(e.closest('.unit')).display, e.getClientRects().length, document.querySelector('.masthead .wordmark').getClientRects().length > 0]"}])[-1]
-    assert out == [True, "none", 0, True], out
+        {"eval": "const e = document.getElementById('entity'), w = document.querySelector('.masthead .wordmark'); [!!e, getComputedStyle(e.closest('.unit')).display, e.getClientRects().length > 0, w.getClientRects().length > 0, e.textContent.trim().toLowerCase() === w.textContent.trim().toLowerCase()]"}])[-1]
+    drawn = not out[4]                                                   # drawn only where it differs from the wordmark (a repeat is hidden)
+    assert out[0] and out[3] and out[2] is drawn and (out[1] != "none") is drawn, out
 
 
 # a full bar just above the stacked-layout breakpoint, in a font wider than the design's: Verdana forced on every element (inline, a <style> is blocked)
