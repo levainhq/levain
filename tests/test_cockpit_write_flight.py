@@ -130,6 +130,40 @@ def test_a_caller_that_keeps_finding_a_flight_older_than_a_write_gives_up_at_its
     assert took < 1.0, took                                # the caller's own budget (0.3s), not the churn's length
 
 
+def test_a_caller_that_waits_out_a_stale_flight_then_joins_a_slow_one_still_gives_up_at_its_own_deadline(monkeypatch) -> None:
+    import levain.cockpit.engine as eng
+    from levain.cockpit.engine import _Flight, _State
+
+    monkeypatch.setattr(eng, "PROCESS_GRACE_S", 0.0)
+    ck, st = Cockpit(), _State()
+    st.epoch = 1
+    stale = _Flight(0.5)
+    stale.epoch = 0                                        # begun before the write the state has seen
+    st.pflight = stale
+    fresh = _Flight(1.0)                                   # begun since the write, and slower than the caller's budget
+    fresh.epoch = 1
+
+    def swap() -> None:                                    # the stale flight ends after most of the caller's budget; a fresh one is in place
+        time.sleep(0.3)
+        with st.lock:
+            st.pflight = fresh
+        stale.out.set_result(None)
+
+    t = threading.Thread(target=swap)
+    t.start()
+    ran: list[int] = []
+    t0 = time.monotonic()
+    try:
+        out = ck._single_flight(st, 0.4, lambda: ran.append(1) or "read", lambda raw: raw, lambda m: ("refused", m))
+        took = time.monotonic() - t0
+    finally:
+        t.join(10)
+        fresh.out.set_result(None)
+    assert out[0] == "refused" and ran == [], out
+    assert took < 0.7, took                                # the caller's own budget (0.4s), not that plus the joined flight's wait
+    assert "0.4s budget" in out[1], out                    # names the budget that ended it: the caller's, not the joined flight's
+
+
 @pytest.mark.parametrize("invalidate", [lambda ck: ck.invalidate_reads(["p"]), lambda ck: ck.invalidate_reads()],
                          ids=["keyed", "global"])
 def test_a_manifest_read_after_a_write_does_not_join_the_entity_read_begun_before_it(invalidate) -> None:

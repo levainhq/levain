@@ -1341,16 +1341,19 @@ class Cockpit:
             # not start beside it, so wait for it to end and look again
             left = give_up - time.monotonic()
             if left <= 0:
-                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
+                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
             try:
                 fl.out.result(timeout=min(wait, left))
             except FutureTimeout:
-                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
+                return refused(f"timed out waiting on the read in flight ({(timeout_s if left < wait else fl.timeout_s):g}s budget)")
         if not owner:
+            left = give_up - time.monotonic()
+            if left <= 0:
+                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
             try:
-                return fl.out.result(timeout=wait)
+                return fl.out.result(timeout=min(wait, left))
             except FutureTimeout:
-                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
+                return refused(f"timed out waiting on the read in flight ({(timeout_s if left < wait else fl.timeout_s):g}s budget)")
 
         try:                               # the owner's flight ends in the finally below from here on
             def work() -> None:
