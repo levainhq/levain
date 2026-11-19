@@ -20,11 +20,13 @@ from levain.dispatch import contract as DC
 from levain.slot import control as C
 from levain.slot import render as RD
 from levain.slot import records as R
+from levain.slot import routemaps as RM
 from levain.slot import runtime_helper as H
 from levain.slot import start as SS
 from levain.slot import wall
 from levain.slot.layout import STORE
 from tests.test_slot_s2f2_runtime_helper import _blob
+from tests.test_slot_3c7_fix_r1 import PIN_POLICY, PIN_ROUTE, write_pinned_generation
 from tests.test_slot_s2f3_start import _world
 from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
@@ -114,7 +116,8 @@ class RealGit:
 
 
 TICKET_FACTS = {"kind": "planner", "job_id": "j", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
-                "egress_routes": [], "reserved_microdollars": 0}
+                "egress_routes": [], "reserved_microdollars": 0,
+                "route": PIN_ROUTE, "routemap_generation": 1, "route_policy_digest": RM.policy_digest(PIN_POLICY)}
 
 
 def _dispatch_rendered(tmp_path, files=None):
@@ -128,7 +131,10 @@ def _dispatch_rendered(tmp_path, files=None):
     w.stage(s, _bundle(tmp_path) if files is None else _bundle_of(tmp_path, files))
     assert w.main(["render", s], _blob())[1]["ok"]
     # start refuses a dispatch alloc with no ticket facts (p71 S8 D4); a planner ticket keeps the neutral exec this file
-    # is about, and start acts on alloc only (§7.1)
+    # is about, and start acts on alloc only (§7.1). levain#136 (S2 route pinning): a ticketed session carries its pin
+    # whole (route, routemap_generation, route_policy_digest) and start re-checks it against the pinned generation
+    # file, so the facts name the route and generation 1 of L/routes/dispatch/ holds it
+    write_pinned_generation(w, 1, [PIN_POLICY])
     a = w.alloc(s)
     (w.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(replace(a, ticket=C.new_handle(), ticket_facts=TICKET_FACTS)))
     return w, la, table, s

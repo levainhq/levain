@@ -18,6 +18,8 @@ TF = {"kind": "executor", "job_id": "j", "run_index": 0, "contract_digest": "sha
 
 # ---- start: the keep/ return and the identity compare for a ticketed passthrough session ---------------------------------
 
+from levain.slot import routemaps as RM
+from tests.test_slot_3c7_fix_r1 import PIN_POLICY, PIN_ROUTE, write_pinned_generation
 from tests.test_slot_g3_gate import (E0, OTHER, PASS, _back_in_keep, _gated, _keep, _la, _tree, env,  # noqa: F401
                                      vendor_installed, vendor_prefix)
 
@@ -53,12 +55,14 @@ def test_a_brokered_dispatch_alloc_runs_no_gate(env):
     from dataclasses import replace
     w, la, _ = env
     s = _gated(w, la, profile=OTHER)
+    write_pinned_generation(w, 1, [PIN_POLICY])           # levain#136: start re-checks the pin against its generation file
     p = w.L / "alloc" / f"{s}.json"
     a = R.parse_alloc(p.read_bytes())
     p.write_bytes(R.alloc_bytes(replace(a, kind="dispatch", auth="brokered", ticket=C.new_handle(),
                                         ticket_facts={k: v for k, v in TF.items() if k in (
                                             "kind", "job_id", "run_index", "contract_digest", "egress_routes",
-                                            "reserved_microdollars")} | {"route": "anthropic", "model_requested": "m"})))
+                                            "reserved_microdollars")} | {"route": PIN_ROUTE, "model_requested": "m", "routemap_generation": 1,
+                                                       "route_policy_digest": RM.policy_digest(PIN_POLICY)})))
     line = w.main(["start", s])[1]
     assert line.get("refused") != "identity-changed", line
     assert _keep(w).exists()                                 # the credential was never touched
