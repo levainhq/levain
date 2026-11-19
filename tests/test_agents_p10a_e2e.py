@@ -326,19 +326,38 @@ def test_p10a_expiry_mid_run(tmp_path):
     assert len(inst.rows()) == 1
 
 
+def _stamp(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def test_p10a_renewal_mid_run(tmp_path):
     """invariant 7: renewal, mid-run. ``levain agents renew`` (a real laptop-key signature) while a run is in flight
     moves only the link's expiry: the in-flight row is untouched, the next tick past the ORIGINAL expiry raises no expiry
-    notice, and the next run is filed under the same link id and the same incarnation."""
-    inst, link, run = _mid_run(tmp_path)
+    notice, and the next run is filed under the same link id and the same incarnation. Every time here comes off the
+    REAL clock (the renew is a real-clock call, and the log refuses to renew a link that has lapsed, so a literal
+    expiry stops working the day the real clock passes it; its ``until`` is real now + 29 days, so a literal year-month
+    prefix stops matching at a year's turn)."""
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+    inst = Install(tmp_path)
+    assert inst.enable("--time", "00:00").rc == 0
+    link = inst.sign_in_log_at(base - timedelta(days=2), inst.link_doc(run_ceiling=3))      # expires base + 27 d
+    launched = _stamp(base - timedelta(hours=1))
+    started = inst.cli("dream", "start", now=launched)
+    assert started.rc == 0 and "claimed and launched oc-" in started.out
+    (run,) = inst.rows()
+    assert (run["state"], run["link_id"], run["launched_at"]) == ("launched", link, launched)
     renewed = inst.cli("agents", "renew", link, "--data-root", str(inst.world.root), "--signing-key", str(inst.key),
                        "--days", "29", spawn_gate=False)
-    assert renewed.rc == 0 and renewed.out.startswith(f"renewed: {link} at seq 6, until 2026-1") and \
-        renewed.err == "Signing data on standard input\n", renewed
+    after = datetime.now(timezone.utc)
+    # the CLI prints utc_stamp(real now + 29 d): the prefix up to the minute is one of the two instants around the call
+    prefixes = {_stamp(base + timedelta(days=29))[:13], _stamp(after + timedelta(days=29))[:13]}
+    assert renewed.rc == 0 and renewed.err == "Signing data on standard input\n" and re.fullmatch(
+        rf"renewed: {link} at seq 6, until ({'|'.join(sorted(prefixes))}).*\n", renewed.out), renewed
     assert inst.rows() == [run]                                                     # the in-flight row is byte for byte as it was
-    tick = inst.cli("agents", "tick", now=utc(2026, 11, 25, 12, 0, 0))
+    past_original = base + timedelta(days=28)                                       # after base + 27 d, before base + 29 d
+    tick = inst.cli("agents", "tick", now=_stamp(past_original))
     assert tick.rc == 6 and "dream-link-expired" not in tick.err and "ended stopped/crash_recovered (takeover)" in tick.err
-    again = inst.cli("dream", "start", now=utc(2026, 11, 25, 12, 1, 0))
+    again = inst.cli("dream", "start", now=_stamp(past_original + timedelta(minutes=1)))
     assert again.rc == 0 and "claimed and launched oc-" in again.out
     old, new = inst.rows("SELECT * FROM agent_occurrences ORDER BY launched_at")
     assert (old["state"], new["state"]) == ("stopped", "launched")
