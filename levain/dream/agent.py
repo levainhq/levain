@@ -1777,6 +1777,18 @@ def _live_bound_refusal(agent_dir: Path | str, inst: DreamInstall, signed: str |
     return f"{lead}: {facts}, but {spec_side}. Every fire of that spec refuses. {_revise_advice(agent_dir, inst)}"
 
 
+def non_default_claude_bin(agent_dir: Path | str) -> str | None:
+    """The install fact ``claude_bin`` when it is not the default program, else None. The install file's writer (the
+    same user) chooses the binary a fire runs, and a live install's link does not bind it (levain#121, ruling
+    np-389e829d (a): same-user trust for 1.0, shown instead): ``agents show`` and the doctor print it. None too when
+    the facts cannot be read; it never raises."""
+    try:
+        b = read_install(agent_dir).claude_bin
+    except Exception:  # noqa: BLE001 - advisory only
+        return None
+    return b if b and b != DEFAULT_CLAUDE_BIN else None
+
+
 def bound_refusal_now(agent_dir: Path | str, spec_hash: object) -> str | None:
     """Read only and advisory: :func:`check_bound`'s refusal of a fire of the spec ``spec_hash`` under the install
     facts in ``agent_dir`` as they stand, or None when it passes. None too when the facts or the spec cannot be read:

@@ -417,12 +417,13 @@ def run_show(args: argparse.Namespace) -> int:
         return _fail("show", f"the store refused it: {exc}")
     _recover_quietly(store)
     # advisory, and the same in both forms: a fire of this spec that the install facts as they stand would refuse
-    refusal = None
+    refusal = claude_bin = None
     if a["name"] == "dream":
         from levain.dream import agent as _da
         refusal = _da.bound_refusal_now(store.directory, a["spec_hash"])
+        claude_bin = _da.non_default_claude_bin(store.directory)
     if args.json:
-        return _show_json(store, a, dream_install_refusal=refusal)
+        return _show_json(store, a, dream_install_refusal=refusal, dream_claude_bin=claude_bin)
     try:
         role, why = role_by_hash(store, a["spec"]["role"]["role_hash"]), "role not resolvable"
     except RoleError as exc:
@@ -436,6 +437,9 @@ def run_show(args: argparse.Namespace) -> int:
                f"expires_at\n" if flags else f"review: {why}\n"))
     if refusal is not None:
         head += f"dream install: a fire of this spec refuses with the facts as they stand: {refusal}\n"
+    if claude_bin is not None:
+        head += (f"dream install: the program a fire runs is {claude_bin!r}, not the default (same-user trust: the "
+                 "link does not bind a live install's program)\n")
     try:
         print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
@@ -460,7 +464,8 @@ def _recover_quietly(store) -> None:
         return
 
 
-def _show_json(store, a: dict, *, dream_install_refusal: str | None = None) -> int:
+def _show_json(store, a: dict, *, dream_install_refusal: str | None = None,
+               dream_claude_bin: str | None = None) -> int:
     """``show --json``: the agent, its occurrences (newest first), and the episodes stored under its agent id in the
     install's episodic store (``session_install.json``). An install with no episodic store says why, never an empty
     list that reads as "no episodes". ``dream_install_refusal`` is always present: the refusal a fire of the dream's
@@ -498,7 +503,7 @@ def _show_json(store, a: dict, *, dream_install_refusal: str | None = None) -> i
     doc = {"agent": {k: a[k] for k in ("name", "agent_id", "version", "versions", "spec_hash", "registration",
                                        "operation", "failure_streak") if k in a},
            "spec": a["spec"], "occurrences": occ, "episodes": episodes, "episodes_note": note,
-           "dream_install_refusal": dream_install_refusal}
+           "dream_install_refusal": dream_install_refusal, "dream_claude_bin": dream_claude_bin}
     try:
         print(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False, default=str))
     except UnicodeEncodeError as exc:

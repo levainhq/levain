@@ -187,6 +187,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
     core.extend(_guarded("queue answers", _check_queue_answers))
+    core.extend(_guarded("dream program", _check_dream_claude_bin))
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -2590,6 +2591,24 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                             "runs as you and names this install's store and cockpit root.")]
     return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
                         "sessions are checked on every tool call.")]
+
+
+def _check_dream_claude_bin(agent_dir: Path | None = None) -> list[CheckResult]:
+    """The ``dream program`` row (levain#121, ruling np-389e829d (a)): a dream install whose ``claude_bin`` is not the
+    default program. The user who writes ``dream_install.json`` chooses the binary a fire runs and a live install's
+    link does not bind it, so it is shown, never silently trusted. No row when the program is the default or there is
+    no readable dream install."""
+    from levain.autonomic.db import default_store_dir
+    from levain.dream import agent as dream_agent
+
+    b = dream_agent.non_default_claude_bin(agent_dir if agent_dir is not None else default_store_dir())
+    if b is None:
+        return []
+    from levain import unshowable
+
+    return [CheckResult("dream program", True, f"the dream install runs {unshowable.mark(b[:200], allow='')!r}, not the "
+                        "default program; the dream's signed link does not bind a live install's program",
+                        "If you did not set it, edit or re-run `levain dream enable` to restore it.", warn=True)]
 
 
 def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, exc: BaseException) -> CheckResult:
