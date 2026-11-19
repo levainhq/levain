@@ -284,3 +284,87 @@ def test_a_verb_that_names_nothing_touches_every_panel(ck) -> None:
     assert reg.touched(ck, ghost, "no-such-panel") == ck.panel_ids
     with pytest.raises(ValueError):
         reg.add_affects("no_such_verb", ["tray"])
+
+
+# --- the under-report class: a write touches every panel that reads the store it changed ---------------------------
+
+# the stores a kernel verb changes, and the panels (by id) that read each store, from the providers' own readers. The
+# table is the test's own: a new kernel verb has to be placed in it, and a panel that reads a store has to be named here.
+_READERS = {
+    "intentions": {"tray", "begin", "memory_glance", "edits"},
+    "episodes": {"episodes", "health", "activity", "memory_glance", "begin", "graph"},
+    "questions": {"decisions", "tray", "activity", "topology"},
+    "review": {"review-queue", "coord-morning"},
+    "drops": {"coord-status", "coord-morning"},
+    "agents": {"agents"},
+    "ledger": {"edits"},
+}
+_WRITES = {
+    "intention_touch": ("intentions", "ledger"), "intention_surface_at": ("intentions", "ledger"),
+    "intention_update": ("intentions", "ledger"), "intention_retarget": ("intentions", "ledger"),
+    "intention_then": ("intentions", "ledger"), "intention_set_disposition": ("intentions", "ledger"),
+    "intention_seed": ("intentions", "ledger"),
+    "intention_keep": ("intentions", "ledger", "episodes"),
+    # a resolve wakes what waited on it into the band (``woke``)
+    "intention_close": ("intentions", "ledger", "questions"), "intention_done_once": ("intentions", "ledger", "questions"),
+    "intention_stop_series": ("intentions", "ledger", "questions"), "intention_promote": ("intentions", "ledger", "questions"),
+    "intention_snooze": ("intentions", "ledger", "questions"), "intention_edit": ("intentions", "ledger", "questions"),
+    "intention_done": ("intentions", "ledger", "questions"), "intention_clear": ("intentions", "ledger", "questions"),
+    "band_agenda": ("intentions", "ledger", "questions"),
+    "list_intake": ("intentions", "ledger", "drops"),
+    "episode_tombstone": ("episodes", "ledger"),
+    "operator_state": ("episodes", "ledger"),               # the line's felt episode is recorded with it
+    "question_answer": ("questions",), "band_answer": ("questions",), "note_dismiss": ("questions",),
+    "review_clear": ("review",), "review_reopen": ("review",), "review_clear_signed": ("review",),
+    "agent_pause": ("agents",), "agent_resume": ("agents",), "agent_renew": ("agents",), "agent_revoke": ("agents",),
+    "agent_retire": ("agents",),
+}
+_UNNAMED = {"undo", "section_edit", "config", "entity_name"}      # what they change cannot be named: every panel
+
+
+def test_every_kernel_verb_is_placed_in_the_write_table() -> None:
+    from levain.cockpit.verbs import KERNEL_VERBS
+
+    assert {v.name for v in KERNEL_VERBS} == set(_WRITES) | _UNNAMED
+
+
+@pytest.mark.parametrize("name", sorted(_WRITES))
+def test_a_verb_names_every_panel_that_reads_what_it_writes(name: str) -> None:
+    from levain.cockpit.verbs import KERNEL_VERBS
+
+    verb = next(v for v in KERNEL_VERBS if v.name == name)
+    need = set().union(*(_READERS[s] for s in _WRITES[name]))
+    assert verb.affects, f"{name} names no panel"
+    assert need <= set(verb.affects), f"{name} leaves out {sorted(need - set(verb.affects))}"
+
+
+@pytest.mark.parametrize("name", sorted(_UNNAMED))
+def test_a_verb_whose_effect_cannot_be_named_touches_every_panel(name: str, ck) -> None:
+    reg = VerbRegistry()
+    assert reg.touched(ck, reg.get(name), "edits") == ck.panel_ids
+
+
+def test_a_legacy_kind_verb_always_names_the_ledger() -> None:
+    from levain.cockpit.verbs import KERNEL_VERBS
+
+    for v in KERNEL_VERBS:
+        if v.legacy_kind:
+            assert "edits" in v.affects or "*" in v.affects, v.name
+
+
+def test_the_ids_the_table_names_are_the_panels_ids() -> None:
+    from levain.cockpit.agents_panel import AGENTS_ID
+    from levain.cockpit.desk_panels import MORNING_ID, REVIEW_ID
+    from levain.cockpit.desk_status import COORD_STATUS_ID
+    from levain.cockpit.engine import DECISIONS_ID
+
+    assert (AGENTS_ID, MORNING_ID, REVIEW_ID, COORD_STATUS_ID, DECISIONS_ID) == (
+        "agents", "coord-morning", "review-queue", "coord-status", "decisions")
+
+
+def test_a_keep_over_a_real_install_touches_what_it_changed(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2a import Rig
+
+    rig = Rig(tmp_path)
+    out = rig.post("intention_keep", "tray", "note", {}, confirm=True)
+    assert {"episodes", "health", "activity", "memory_glance", "begin", "tray", "edits"} <= set(out["touched"])

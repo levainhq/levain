@@ -1482,23 +1482,48 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              legacy_kind="undo", applies_to=lambda r: _facet(r, "undoable") is True),
 )
 
-# The panels an intention write touches beyond the ones offering the verb: the List (a band verb is offered elsewhere), the
-# panels derived from the open intentions, and the edits ledger. An id that is not registered is dropped from ``touched``.
-_INTENTION_AFFECTS = ("tray", "begin", "memory_glance", "edits")
+# The panels a landed write touches beyond the ones offering the verb, by the store the write changes and the panels that
+# read that store. A panel is left out only where its reader was read and takes nothing from the store; where that could not be
+# shown it is in (an unneeded entry costs one background refetch, a missing one leaves the page showing old data after the
+# user's own write). An id that is not registered is dropped from ``touched``.
+_INTENTION_AFFECTS = ("tray", "begin", "memory_glance", "edits")     # the open intentions, and the edits ledger beside them
+# the episodes: the Recent episodes list, health's counts, the activity feed, the memory glance, the figure "where to begin"
+# shows (episodes since the last wrap), and the cognition graph (its nodes are the episodes)
+_EPISODE_AFFECTS = ("episodes", "health", "activity", "memory_glance", "begin", "graph")
+# the question store and the consent queue's band rows: the Decisions panel, the List's band, the activity feed and the topology's
+# waiting nodes. A row filed by a wake lands there too (``_wake_after_resolve``)
+_QUESTION_AFFECTS = ("decisions", "tray", "activity", "topology")
+_REVIEW_AFFECTS = ("review-queue", "coord-morning")                   # the desk's review items (desk_panels.REVIEW_ID, MORNING_ID)
+_DROP_AFFECTS = ("coord-status", "coord-morning")                     # a plain line is a desk drop (desk_status, desk_panels)
+_AGENT_AFFECTS = ("agents",)                                          # the agent store (agents_panel.AGENTS_ID)
+_ALL_PANELS = ("*",)                                                  # what the write changed cannot be named
 _INTENTION_WRITERS = frozenset({"band_agenda", INTAKE_VERB})
-# a verb with a legacy kind lands through ``apply_edit`` and appends to the edits ledger; a tombstone also moves the glance
+# a verb with a legacy kind lands through ``apply_edit`` and appends to the edits ledger
 _LEDGER_AFFECTS = ("edits",)
-_KERNEL_AFFECTS: dict[str, tuple[str, ...]] = {"episode_tombstone": ("edits", "memory_glance")}
+_BAND_INTENTION_VERBS = ("intention_snooze", "intention_edit", "intention_done", "intention_clear", "band_agenda")
+# the four verbs that call ``_wake_after_resolve``: whether they woke anything is the result's, so the panels a wake lands in are
+# named for every one of them
+_RESOLVING_VERBS = ("intention_close", "intention_done_once", "intention_stop_series", "intention_promote")
+_KERNEL_AFFECTS: dict[str, tuple[str, ...]] = {
+    "intention_keep": _EPISODE_AFFECTS,
+    **{v: _QUESTION_AFFECTS for v in (*_BAND_INTENTION_VERBS, *_RESOLVING_VERBS, "question_answer", "band_answer", "note_dismiss")},
+    INTAKE_VERB: _DROP_AFFECTS,
+    "episode_tombstone": _EPISODE_AFFECTS,
+    "operator_state": _EPISODE_AFFECTS,           # the line's felt episode is recorded with it
+    **{v: _REVIEW_AFFECTS for v in ("review_clear", "review_reopen", "review_clear_signed")},
+    **{v: _AGENT_AFFECTS for v in ("agent_pause", "agent_resume", "agent_renew", "agent_revoke", "agent_retire")},
+    **{v: _ALL_PANELS for v in ("undo", "section_edit", "config", "entity_name")},
+}
 
 
 def _with_affects(v: VerbSpec) -> VerbSpec:
+    base: tuple[str, ...] = ()
     if v.name.startswith("intention_") or v.name in _INTENTION_WRITERS:
-        return dataclasses.replace(v, affects=_INTENTION_AFFECTS)
-    if v.name in _KERNEL_AFFECTS:
-        return dataclasses.replace(v, affects=_KERNEL_AFFECTS[v.name])
+        base += _INTENTION_AFFECTS
     if v.legacy_kind:
-        return dataclasses.replace(v, affects=_LEDGER_AFFECTS)
-    return v
+        base += _LEDGER_AFFECTS
+    got = tuple(dict.fromkeys((*base, *_KERNEL_AFFECTS.get(v.name, ()))))
+    return dataclasses.replace(v, affects=got) if got else v
 
 
 KERNEL_VERBS = tuple(_with_affects(v) for v in KERNEL_VERBS)
@@ -1588,9 +1613,12 @@ class VerbRegistry:
     def touched(self, cockpit: "Cockpit", verb: VerbSpec, panel_id: str) -> list[str]:
         """The panel ids a landed fire of ``verb`` (fired on ``panel_id``) changed: every registered panel that offers it, the
         panel it was fired on, and the panels the verb declares it affects (its ``affects`` and a downstream's
-        ``add_affects``). Nothing found means every registered panel: a write never under-reports what it changed."""
+        ``add_affects``). Nothing found, or the ``"*"`` id among them, means every registered panel: a write never under-reports
+        what it changed."""
         have = cockpit.panel_ids
         want = {panel_id, *verb.affects, *self._extra_affects.get(verb.name, ())}
+        if "*" in want:
+            return list(have)
         for pid in have:
             spec = cockpit.spec(pid)
             if spec is not None and verb.name in spec.verbs:
