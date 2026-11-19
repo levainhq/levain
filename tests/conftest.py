@@ -48,11 +48,24 @@ def _close_patched_manifest_pools():
     """A test that patches ``_MANIFEST_POOL_THREADS`` makes a pool of that size in ``_manifest_pools``; shut down any pool
     this test added. The shutdown is bounded (cancel queued work, joined on a daemon thread) so a hung worker fails the
     test's own assertion instead of hanging pytest."""
+    import sys
     import threading
 
-    from levain.cockpit import engine as eng
-    before = set(eng._manifest_pools)
+    # the engine is read from ``sys.modules``, never imported here: a pool exists only once the engine was imported, and
+    # a test that never touches the cockpit must not pay for (or be changed by) importing it
+    def engine():
+        return sys.modules.get("levain.cockpit.engine")
+
+    eng = engine()
+    if eng is not None:
+        with eng._manifest_pools_lock:
+            before = set(eng._manifest_pools)
+    else:
+        before = set()
     yield
+    eng = engine()
+    if eng is None:
+        return
     with eng._manifest_pools_lock:
         made = [eng._manifest_pools.pop(k) for k in list(eng._manifest_pools) if k not in before]
     for pool in made:
