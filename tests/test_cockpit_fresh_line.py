@@ -363,7 +363,7 @@ def test_the_state_words_never_clip_between_the_phone_and_the_tablet(tmp_path: P
 
 @needs_browser
 def test_the_phone_keeps_the_age_number_and_the_words_at_390(tmp_path: Path) -> None:
-    """At 390 the age is the short form and survives beside the words in every state that carries one; the masthead keeps its height."""
+    """At 390 the age is the short form and survives beside the words in every state that carries one (a trouble state now has its own row: see below)."""
     g = [g for g in _bands(tmp_path, (390,), True) if g["presence"]][0]
     rows = {r["k"]: r for r in g["rows"]}
     for k in ("down", "failed", "stale1", "stale2"):
@@ -373,5 +373,92 @@ def test_the_phone_keeps_the_age_number_and_the_words_at_390(tmp_path: Path) -> 
     assert rows["stale2"]["words"] == "Inbox stale +1" and rows["stale2"]["age"] == "4m", rows["stale2"]
     assert rows["failed"]["age"] == "2m" and rows["refused"]["age"] == "", rows
     assert all(not r["stCut"] for r in g["rows"]), g["rows"]
-    heights = {r["h"] for r in g["rows"]}
-    assert max(heights) - min(heights) <= 1, heights
+    heights = {r["k"]: r["h"] for r in g["rows"]}                                  # the live state's 185 px is held in the round-6 test; a trouble state adds one row
+    assert heights["live"] == 185 and heights["updating"] == 185, heights
+
+
+# levain#159 round 6: on a phone the line's words were cut with an ellipsis exactly when they mattered ("Work board unavaila..."), and a phone has
+# no hover for the title. A state that names a panel takes its own row after the buttons' row, whole; the live state keeps the shared row.
+# Names and ages are the page's real ones. Measured at the true device width (mobile + touch), the presence chip shown and hidden.
+PHONE = r"""((presence) => { const F = window.LevainFreshLine.seam, el = document.getElementById('freshline'), m = document.querySelector('.masthead');
+  const pb = document.getElementById('presencebtn'); pb.hidden = !presence; pb.querySelector('.pr-chip-t').textContent = 'Follow here';
+  const now = Date.now(), R = (e) => e.getBoundingClientRect();
+  const base = { now, boot: { wholeDrawn: true, lastWholeAt: now - 5000 }, stream: { state: 'live', lastChunk: now, faults: [], everLive: true }, held: {}, heads: {}, titleOf: () => 'Work board' };
+  const ago = (ms) => new Date(now - ms).toISOString();
+  const states = { live: base,
+    unavailable2: Object.assign({}, base, { heads: { p0: { status: 'error', as_of: ago(240000) }, p9: { status: 'stale', as_of: ago(180000) } } }),
+    stale2: Object.assign({}, base, { heads: { p0: { status: 'stale', as_of: ago(180000) }, p9: { status: 'stale', as_of: ago(240000) } } }),
+    stale1: Object.assign({}, base, { heads: { p0: { status: 'stale', as_of: ago(180000) } } }),
+    down: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 60000 }, stream: { state: 'down', lastChunk: now - 40000, faults: [], everLive: true } }),
+    failed: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 125000, failed: 'HTTP 502', failedAt: now - 1000 } }),
+    refused: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, refused: true } }),
+    updating: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, inflight: true, inflightAt: now - 3000 } }) };
+  const rows = [];
+  for (const k of Object.keys(states)) { F.setInputs(() => states[k]); F.reset(); F.recompute();
+    const st = el.querySelector('.fl-state'), ag = el.querySelector('.fl-age'), l = R(el);
+    const btns = [...m.querySelectorAll('#jumpbtn, .ia-act, .themesw')].filter((e) => e.getClientRects().length > 0), rowBottom = Math.max(...btns.map((e) => R(e).bottom));
+    rows.push({ k, w: innerWidth, state: el.dataset.state, h: Math.round(R(m).height * 10) / 10, words: st.textContent, age: ag.textContent,
+      stCut: st.scrollWidth > st.clientWidth, ageCut: !ag.hidden && ag.scrollWidth > ag.clientWidth, ageShown: !ag.hidden && ag.getClientRects().length > 0,
+      ownRow: l.top >= rowBottom - 0.5, sharesRow: l.top < rowBottom - 0.5, left: Math.round(l.left), brandLeft: Math.round(R(m.querySelector('.brand')).left), right: Math.round(l.right), top: Math.round(l.top), bottom: Math.round(l.bottom),
+      docOver: document.documentElement.scrollWidth > document.documentElement.clientWidth, mastOver: m.scrollWidth > m.clientWidth,
+      presenceBelow: !presence || R(pb).top >= l.bottom - 0.5 }); }
+  F.setInputs(null);
+  return JSON.stringify({ probe: 'phone', presence, rows }); })"""
+
+
+def _phone(tmp_path: Path, widths: tuple, touch: bool = True) -> list[dict]:
+    steps: list = [{"emulate": {"w": widths[0], "h": 900, "dpr": 2 if touch else 1, "mobile": touch}}] + ([{"touch": True}] if touch else []) + [READY, LIVE, SETTLE]
+    for w in widths:
+        for presence in ("true", "false"):
+            steps += [{"emulate": {"w": w, "h": 900, "dpr": 2 if touch else 1, "mobile": touch}}, SETTLE, {"eval": PHONE + "(" + presence + ")"}]
+    (tmp_path / ("touch" if touch else "mouse")).mkdir()
+    return [g for g in _vals(_open(tmp_path / ("touch" if touch else "mouse"), steps, touch=touch)) if g.get("probe") == "phone"]
+
+
+@needs_browser
+def test_a_panel_trouble_state_is_whole_on_its_own_row_on_a_phone(tmp_path: Path) -> None:
+    """'Work board unavailable +1' and 'Work board stale +1' with their ages: nothing cut, a row of their own, no sideways scroll, at 390 / 360 / 320."""
+    for g in _phone(tmp_path, (390, 360, 320)):
+        rows = {r["k"]: r for r in g["rows"]}
+        for k in ("unavailable2", "stale2", "stale1", "down", "failed", "refused"):
+            r = rows[k]
+            where = (r["w"], g["presence"], r)
+            assert r["state"] == ("stale" if k.startswith("stale") or k.startswith("unavail") else k), where
+            assert not r["stCut"] and not r["ageCut"], where                       # nothing truncated: the words and the age are read whole
+            assert r["ownRow"] and not r["sharesRow"], where                        # its own row, below the buttons'
+            assert not r["docOver"] and not r["mastOver"], where
+            assert r["presenceBelow"], where                                        # the presence chip follows it
+            assert r["left"] <= r["brandLeft"] + 1, where                           # left-aligned: it starts where the brand does, not at the right edge
+            assert r["ageShown"] == (k != "refused"), where                         # "not signed in" carries no age; every other trouble state does
+        assert rows["unavailable2"]["words"] == "Work board unavailable +1" and rows["stale2"]["words"] == "Work board stale +1", rows
+        for k in ("live", "updating"):                                              # live (and a live read that says "updating") keeps the buttons' row
+            r = rows[k]
+            assert r["sharesRow"] and not r["stCut"] and not r["docOver"] and not r["mastOver"], (r["w"], g["presence"], r)
+
+
+@needs_browser
+def test_the_live_line_keeps_the_buttons_row_and_the_phone_masthead_height_at_390(tmp_path: Path) -> None:
+    """The accepted look, as the tip had it: live (and "updating") shares the buttons' row and leaves the masthead 185 px (presence chip shown)."""
+    g = [g for g in _phone(tmp_path, (390,)) if g["presence"]][0]
+    rows = {r["k"]: r for r in g["rows"]}
+    assert rows["live"]["sharesRow"] and rows["live"]["h"] == 185, rows["live"]
+    assert rows["updating"]["sharesRow"] and rows["updating"]["h"] == 185, rows["updating"]
+
+
+@needs_browser
+def test_a_trouble_state_adds_one_row_to_the_phone_masthead_at_390(tmp_path: Path) -> None:
+    """The accepted cost: the phone masthead (not pinned) grows when a trouble state arrives, by the line's row, and no more."""
+    g = [g for g in _phone(tmp_path, (390,)) if g["presence"]][0]
+    rows = {r["k"]: r for r in g["rows"]}
+    for k in ("unavailable2", "stale2", "stale1", "down", "failed", "refused"):
+        assert rows[k]["ownRow"] and rows[k]["h"] > rows["live"]["h"], rows[k]
+        assert rows[k]["h"] - rows["live"]["h"] < 60, rows[k]
+
+
+@needs_browser
+def test_a_trouble_state_moves_nothing_at_768_and_1440(tmp_path: Path) -> None:
+    """The pinned masthead (721 and up) is the same height whatever the line says; the phone's own-row rule is not in force there."""
+    for touch, widths in ((True, (768,)), (False, (1440,))):
+        for g in _phone(tmp_path, widths, touch):
+            heights = {r["k"]: r["h"] for r in g["rows"]}
+            assert max(heights.values()) - min(heights.values()) <= 1, (g["rows"][0]["w"], g["presence"], heights)

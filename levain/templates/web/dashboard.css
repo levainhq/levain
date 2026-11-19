@@ -4184,6 +4184,14 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead #freshline { order: 4; flex: 1 1 0; min-width: 7ch; max-width: none; justify-content: flex-end; }
   /* the state words keep their room and the age takes what is left of the row (an ellipsis on the age first, then on the words) */
   body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
+  /* a trouble state is read whole: on the shared row the cut hit the panel's name ("Work board unavaila...") and the age, the very words that say
+     what is wrong, and a phone has no hover to read the title. So it takes its own row after the buttons' (the presence chip, a full row, follows it),
+     left-aligned, the words wrapping rather than cutting and the age after them. The live state (and a live read that says "updating", and the
+     first "connecting") keeps the shared row above; the masthead is not pinned here, and a worse state waits its hold before it speaks, so a flap
+     moves nothing. 721 px and up is untouched: its footprint is fixed on purpose (the block below). */
+  body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) { flex: 1 1 100%; justify-content: flex-start; }
+  body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) :is(.fl-state, .fl-age) {
+    flex: 0 1 auto; overflow: visible; text-overflow: clip; white-space: normal; }
   /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
   body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
   /* its own full row, cut with an ellipsis rather than past the edge: it now carries a read's failure and what to do about it */
