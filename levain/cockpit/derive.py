@@ -47,6 +47,8 @@ LOCK_HOLD_MAX_S = 180.0
 DERIVE_TIMEOUT_S = 120.0
 
 _UNSET = object()
+# How often a panel that re-derives when the watch token moves is re-derived while the token is unknown (None).
+UNKNOWN_TOKEN_S = 5.0
 
 
 # --------------------------------------------------------------------------------------------------- inputs
@@ -399,6 +401,7 @@ class DeriveLoop:
         threads: int = DERIVE_THREADS,
         poll_s: float = 1.0,
         backstop_s: float = 30.0,
+        unknown_token_s: float = UNKNOWN_TOKEN_S,
         token_fn: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.time,
         on_publish: Callable[[str, int, int], None] | None = None,
@@ -411,6 +414,7 @@ class DeriveLoop:
         self._threads_n = max(1, int(threads))
         self._poll_s = poll_s
         self._backstop_s = backstop_s
+        self._unknown_token_s = unknown_token_s
         self._token_fn = token_fn
         self._clock = clock
         self._on_publish = on_publish
@@ -697,6 +701,10 @@ class DeriveLoop:
                 token = self._token_fn()
             except Exception:
                 token = _UNSET
+            else:
+                if token is None:
+                    # a token that is not known cannot say the stores did not move, so it re-derives on the slow tick
+                    token = (None, int(now // self._unknown_token_s))
         if self._last_views is not None and any(
             self._last_views[inp] != fp for inp, fp in seen.items() if inp in self._last_views
         ):

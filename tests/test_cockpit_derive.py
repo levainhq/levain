@@ -1924,3 +1924,14 @@ def test_a_panel_added_to_the_plan_set_is_not_an_input_event_and_a_removed_sqlit
     loop.run_once(clock.t)
     assert writer.streams[-1]["last_event_at"] == clock.t
     loop.stop()
+
+
+def test_an_unknown_token_re_derives_a_no_input_panel_on_the_slow_tick_not_the_backstop():
+    loop, writer, clock, calls = make([PanelPlan("a", on_token=True)], token_fn=lambda: None, backstop_s=1e9)
+    settle(loop, clock)
+    assert calls == ["a"]
+    assert loop.run_once(clock.t) == []                 # within one slow tick: nothing
+    clock.t += 60                                       # well past it and far short of the backstop
+    assert loop.run_once(clock.t) == ["a"]
+    assert loop.run_once(clock.t) == []
+    loop.stop()
