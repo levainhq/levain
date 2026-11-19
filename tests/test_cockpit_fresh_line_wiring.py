@@ -211,11 +211,11 @@ def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_fail
     """B: refetchPanel is the ONE place that says a panel read settled; a caller that does not tell the line (a write's refetch, the topology's replay) is still heard."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
     steps = [READY, LIVE, SETTLE, _run(STUB2), title,
-             _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (12)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
+             _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (unavailable)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
              _sample(3500, "window.__panelFail = null; window.LevainCockpitView.refetchPanel('work_board'); 1")]
     out = _open(tmp_path, steps)
     failed, healed = _samples(out)
-    # the heading a real panel shows ends in its tally ("Inbox (50)"): the line names the panel, not the tally
+    # the heading of an unavailable panel ends in "(unavailable)" ("Work board (unavailable)"): the line names the panel, not that suffix
     assert failed[-1]["state"] == "stale" and failed[-1]["words"] == f"{_title(out)} stale", failed[-1]
     assert healed[-1]["state"] == "live", healed[-1]
 
@@ -229,6 +229,15 @@ def test_a_parenthesis_that_is_part_of_a_panel_title_is_kept_in_the_line(tmp_pat
     out = _open(tmp_path, steps)
     (failed,) = _samples(out)
     assert failed[-1]["state"] == "stale" and failed[-1]["words"] == f"{_title(out)} (remote) stale", failed[-1]
+
+
+@needs_browser
+def test_a_title_that_ends_in_a_number_in_parentheses_keeps_it(tmp_path: Path) -> None:
+    """The count is a pill beside the heading, never in its text, so a trailing '(2026)' is the title's own and only '(unavailable)' is stripped."""
+    steps = [READY, LIVE, SETTLE, _run(STUB2),
+             _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent = 'Annual plan (2026)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1")]
+    (failed,) = _samples(_open(tmp_path, steps))
+    assert failed[-1]["state"] == "stale" and failed[-1]["words"] == "Annual plan (2026) stale", failed[-1]
 
 
 @needs_browser

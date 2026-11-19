@@ -188,8 +188,8 @@
     try {
       var esc = root.CSS && root.CSS.escape ? root.CSS.escape(id) : String(id).replace(/"/g, "");
       var h = document.querySelector('[data-panel-id="' + esc + '"] .phead h2');
-      // the heading adds a count or "(unavailable)" after the name: the line names the panel, not its tally; a parenthesis that is part of the title stays
-      var t = h && h.textContent ? h.textContent.replace(/\s*\((?:\d+|unavailable)\)\s*$/, "").trim() : "";
+      // the heading adds only "(unavailable)" after the name (a count is a sibling pill, never in the h2 text): a parenthesis that is part of the title, a year included, stays
+      var t = h && h.textContent ? h.textContent.replace(/\s*\(unavailable\)\s*$/, "").trim() : "";
       return t || id;
     } catch (_) { return id; }
   }
