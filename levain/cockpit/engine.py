@@ -780,7 +780,8 @@ _manifest_pools_lock = threading.Lock()
 SERVE_COMPOSED_IDS = frozenset({DECISIONS_ID, "edits"})
 NOT_DERIVED_YET = "not derived yet"     # the error text of a panel the host has not published a row for
 WORKER_STATES = ("live", "stale", "down")
-# the heartbeat cadence this reader expects of its host; a host that beats at another rate says so through ``host_state``
+# the heartbeat cadence this reader expects of its host, and the one place the number is stated: ``SnapshotHost`` polls
+# and beats at it unless given another, and a host that beats at another rate says so through ``host_state``
 HEARTBEAT_CADENCE_S = 1.0
 WORKER_LIVE_FACTOR = 3          # a heartbeat no older than this many cadences is a live worker
 WORKER_DOWN_AFTER_S = 30.0      # a heartbeat older than this (or none at all) is a worker that is down; between, stale

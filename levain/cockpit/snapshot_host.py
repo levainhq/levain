@@ -262,9 +262,6 @@ DISCOVER_ID = PSEUDO_PREFIX + "discover"
 ENTITY_ID = PSEUDO_PREFIX + "entity"
 # Every thread a host starts has a name with this prefix, so a test can tell derive threads from request threads.
 DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
-# How often the host's loop looks at the panels' inputs and writes its heartbeat.
-HOST_POLL_S = 1.0
-
 
 
 def _one_line(exc: BaseException) -> str:
@@ -273,6 +270,9 @@ def _one_line(exc: BaseException) -> str:
 
 class SnapshotHost:
     """Derives a cockpit's panels on threads of this process and publishes them to a snapshot store under ``data_root``.
+
+    The loop looks at the panels' inputs and writes its heartbeat every ``poll_s``, by default the cadence the engine
+    expects of a host's heartbeat (``engine.HEARTBEAT_CADENCE_S``), which is the one place that number is stated.
 
     Lifecycle: build (or ``try_open``), ``attach()`` the cockpit to the host's reader, ``start()``, and ``stop()`` at the
     end. A host starts once. Opening takes the store's writer lock, so a second host on the same directory is refused.
@@ -285,7 +285,7 @@ class SnapshotHost:
         *,
         token_fn: "Callable[[], Any] | None" = None,
         clock: Callable[[], float] = time.time,
-        poll_s: float = HOST_POLL_S,
+        poll_s: "float | None" = None,
         heavy: Iterable[str] = HEAVY_PANELS,
     ) -> None:
         self._cockpit = cockpit
@@ -299,7 +299,7 @@ class SnapshotHost:
             self._reader = SnapshotReader(path)
             self._loop = DeriveLoop(
                 self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
-                poll_s=poll_s, token_fn=token_fn, clock=clock, on_publish=None,
+                poll_s=_engine().HEARTBEAT_CADENCE_S if poll_s is None else poll_s, token_fn=token_fn, clock=clock, on_publish=None,
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
@@ -384,8 +384,12 @@ class SnapshotHost:
     def attach(self) -> None:
         """Switch the cockpit to reading this host's rows."""
         self._cockpit.attach_snapshots(
-            self._reader, deriving=self._loop.deriving, pending=self._loop.pending, dirty=self._loop.dirty,
+            self._reader, deriving=self._deriving_panels, pending=self._loop.pending, dirty=self._loop.dirty,
         )
+
+    def _deriving_panels(self) -> list[str]:
+        # the loop is busy with the host's two pseudo-plans too; the cockpit's word is about panels
+        return [pid for pid in self._loop.deriving() if not pid.startswith(PSEUDO_PREFIX)]
 
     def start(self) -> None:
         """Start the loop's threads; every plan's first derive is due at once. Raises RuntimeError on a second start."""

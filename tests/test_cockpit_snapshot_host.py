@@ -517,6 +517,40 @@ class TestLifecycle:
             host.stop(timeout=10)
 
 
+class TestAttachedWords:
+    def test_the_busy_list_the_cockpit_reports_names_panels_never_the_host_s_pseudo_plans(self, tmp_path: Path) -> None:
+        entered, gate = threading.Event(), threading.Event()
+
+        def discoverer(ctx: Any) -> list:
+            entered.set()
+            gate.wait(10)
+            return []
+
+        ck = Cockpit()
+        ck.register(_simple("a"))
+        ck.discover(discoverer)
+        host = SnapshotHost(ck, tmp_path)
+        host.attach()
+        host.start()
+        try:
+            assert entered.wait(10)
+            assert DISCOVER_ID in host.loop.deriving()              # the loop is busy with a pseudo-plan
+            assert not any(p.startswith(PSEUDO_PREFIX) for p in ck.worker_health()["deriving"])
+            assert not any(p.startswith(PSEUDO_PREFIX) for p in ck._deriving_ids())
+        finally:
+            gate.set()
+            host.stop(timeout=10)
+
+    def test_the_default_poll_is_the_cadence_the_engine_expects_of_a_host(self, tmp_path: Path, monkeypatch) -> None:
+        from levain.cockpit import engine
+        monkeypatch.setattr(engine, "HEARTBEAT_CADENCE_S", 0.25)
+        host = SnapshotHost(Cockpit(), tmp_path)
+        try:
+            assert host.loop._poll_s == 0.25
+        finally:
+            host.stop()
+
+
 # ---------------------------------------------------------------------------------------------- the stream probe
 
 
