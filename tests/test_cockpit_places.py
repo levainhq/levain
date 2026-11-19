@@ -517,3 +517,23 @@ def test_the_keys_reach_every_place_and_leave_the_desk_and_room_without_a_retire
     assert [s["place"] for s in states] == ["desk", "room", "home", "desk", "home", "desk", "memory", "room", "memory"], states
     modes = json.loads(out["values"][-1])
     assert modes and set(modes) <= {"board", "memory"}, modes
+
+
+@needs_browser
+def test_a_hidden_hero_draws_no_band_and_no_graph_button_on_home(tmp_path: Path) -> None:
+    """The page hides the hero region and drops body.ke when its page is not drawn (keShell); Home's grid rules must not draw the band or the Show-the-graph button of a hidden hero."""
+    HIDE = "(() => { document.getElementById('ck-hero').hidden = true; document.body.classList.remove('ke'); return 1; })()"
+    DRAWN = ("(() => { const n = (s) => [...document.querySelectorAll(s)].filter(e => e.getClientRects().length > 0).length;"
+             " return JSON.stringify({hero: document.getElementById('ck-hero').hidden, band: n('#ck-band'), skycol: n('#ck-skycol'), toggle: n('[data-ia-graph-toggle]')}); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": DRAWN},                                                            # 0: the hero drawn
+            {"eval": HIDE}, SETTLE,
+            {"eval": DRAWN},                                                            # 1: the hero hidden
+        ])
+    drawn, hidden = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"hero"')]
+    assert drawn["hero"] is False and drawn["band"] == 1 and drawn["toggle"] == 1, drawn
+    assert hidden == {"hero": True, "band": 0, "skycol": 0, "toggle": 0}, hidden
