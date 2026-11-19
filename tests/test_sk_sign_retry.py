@@ -657,3 +657,13 @@ def test_a_mixed_outcome_names_both_and_keeps_the_phone_guidance(rig, plan):
     files = sorted(rig.dir.iterdir())
     assert len(files) == 2 and all(str(f) in text for f in files)
     assert sorted(json.loads(f.read_text())["reason"] is None for f in files) == [False, True]
+
+
+def test_the_classifier_never_raises_whatever_a_malformed_signature_does(monkeypatch):
+    """L3 r2 (complement LOW): it classifies EVIDENCE for the sign path, so no exception type may escape it."""
+    from levain import authority_sig as sig
+    for exc in (IndexError("short read"), struct.error("unpack"), RuntimeError("x")):
+        def boom(_armored, _exc=exc):
+            raise _exc
+        monkeypatch.setattr(sig, "_sshsig_type_flags_counter", boom)
+        assert sig.sk_ecdsa_signature_empty("-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----") is False

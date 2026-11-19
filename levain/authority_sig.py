@@ -175,7 +175,7 @@ def sk_ecdsa_signature_empty(armored: str) -> bool:
         ecdsa = _Wire(inner.string())
         r, s = ecdsa.string(), ecdsa.string()
         ecdsa.end()
-    except (ValueError, UnicodeDecodeError):
+    except Exception:  # noqa: BLE001 - a classifier of EVIDENCE: nothing a malformed input raises may fail the sign that calls it
         return False
     return len(r) == 0 and len(s) == 0
 
