@@ -78,14 +78,28 @@ CRED_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")       # levain.broker.creds.NAME_R
 #: ``$3`` is ``new`` (refuse when the credential already exists: a file of his is never overwritten) or ``replace`` (the
 #: sitting's own T1 file, swapped for the unlimited key). An empty credential is refused before it can be moved into place.
 #: A refusal prints ``cred-refused ...`` and exits 0, so the runner reads it as data.
-INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
-                  # a fresh install has no keys/cred (set-credential makes it): make it 0700, the keys account's, as install_helper does
-                  'if [ ! -d "$d" ]; then mkdir -p "$d"; chmod 0700 "$d"; chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d"; fi; '
+#: Run as root, inside ``keys/``, a directory the keys account owns, so nothing here follows a link or trusts an earlier test:
+#: ``keys/`` itself is the install's (install_helper setup makes it) and is never made here (a root-made parent would be one the
+#: keys account cannot enter); ``keys/cred`` is made by a plain ``mkdir`` (fails on anything present, link included, and never
+#: follows one; mode 0700 at creation) and handed over with ``chown -h`` (never follows), so there is no test-then-make window;
+#: then, made now or found, it must BE a directory (not a link) owned by the keys account with mode exactly 0700, or the install
+#: is refused (an earlier run's failed chown, a wrong mode: fixed by hand, never widened here). The half-written file is
+#: created exclusively (``set -C``; one already present is refused) and handed over with ``chown -h``.
+INSTALL_SCRIPT = ('set -e; k="$1/keys"; d="$k/cred"; n="$2"; u=' + KEYS_USER + '; umask 077; '
+                  'if [ -L "$k" ] || [ ! -d "$k" ]; then cat > /dev/null; '
+                  'echo "cred-refused $n: $k is absent or a link (the install makes it; this never does)"; exit 0; fi; '
+                  'uid=$(id -u "$u"); '
+                  'if mkdir -m 0700 "$d" 2>/dev/null; then chown -h "$u:$u" "$d"; fi; '
+                  'if [ -L "$d" ] || [ -z "$(find "$d" -prune -type d -user "$uid" -perm 700 2>/dev/null)" ]; then cat > /dev/null; '
+                  'echo "cred-refused $n: $d is not a 0700 directory of $u (a link, another owner or another mode): fix it by hand"; '
+                  'exit 0; fi; '
                   'if [ "$3" != replace ] && [ -e "$d/$n.json" ]; then cat > /dev/null; '
                   'echo "cred-refused $n: $d/$n.json already exists"; exit 0; fi; '
-                  'cat > "$d/$n.json.new"; '
+                  'if [ -e "$d/$n.json.new" ] || [ -L "$d/$n.json.new" ]; then cat > /dev/null; '
+                  'echo "cred-refused $n: $d/$n.json.new already exists (another write, or a link)"; exit 0; fi; '
+                  'set -C; cat > "$d/$n.json.new"; set +C; '
                   'if [ ! -s "$d/$n.json.new" ]; then rm -f "$d/$n.json.new"; echo "cred-refused $n: empty credential"; exit 0; fi; '
-                  'chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d/$n.json.new"; mv "$d/$n.json.new" "$d/$n.json"; '
+                  'chown -h "$u:$u" "$d/$n.json.new"; mv "$d/$n.json.new" "$d/$n.json"; '
                   'echo "cred-installed $n"')
 #: Remove ONLY the half-written file, and only when it is PROVABLY ours: stdin carries the exact bytes this run wrote, and the
 #: file is unlinked only if it is a regular file (not a link) equal to them. A ``.json.new`` that differs (another writer's

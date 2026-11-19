@@ -376,13 +376,17 @@ def test_a_transport_failure_after_the_write_leaves_the_file_and_says_so(tmp_pat
 
 
 def _sh(tmp_path, script, name, mode, stdin):
-    """Run the REAL script under /bin/sh against a temp store; chown is a no-op stub (the sitting runs it as root)."""
+    """Run the REAL script under /bin/sh against a temp store; chown is a no-op stub (the sitting runs it as root) and ``id -u``
+    names the test's own uid as the keys account's, so the cred directory (0700, the test's) passes INSTALL_SCRIPT's owner check."""
     store = tmp_path / "store"
     (store / "keys" / "cred").mkdir(parents=True, exist_ok=True)
+    os.chmod(store / "keys" / "cred", 0o700)
     fb = tmp_path / "fakebin"
     fb.mkdir(exist_ok=True)
     (fb / "chown").write_text("#!/bin/sh\nexit 0\n")
+    (fb / "id").write_text(f"#!/bin/sh\necho {os.getuid()}\n")
     os.chmod(fb / "chown", 0o755)
+    os.chmod(fb / "id", 0o755)
     args = ["/bin/sh", "-c", script, "sh", str(store), name] + ([mode] if mode else [])
     r = subprocess.run(args, input=stdin, capture_output=True, text=True, env=dict(os.environ, PATH=f"{fb}:{os.environ['PATH']}"))
     return r, store / "keys" / "cred"
