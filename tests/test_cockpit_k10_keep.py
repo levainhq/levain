@@ -1,6 +1,6 @@
 """K10 KEEP (Phill 10-20, his words): "an intention expanded and I am reading it, a page update closes it; the list scrolled down
 reloads back to the top". An intention row the reader opens stays open (and visible, and closable) and its body keeps its scroll
-across the refresh button and across a real store write seen through the change stream.
+across a re-read of the board and across a real store write seen through the change stream.
 
 The K10 board folds the rows that do not fit a card (`foldRows`); a row that grew past the card on the reader's click used to be
 folded away with the rest, so the open intention vanished on the click and on every redraw. Driven in headless Chrome against a
@@ -65,7 +65,7 @@ def _assert_held(opened: dict[str, Any], after: Any, why: str) -> None:
 
 
 @needs_browser
-def test_the_refresh_button_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) -> None:
+def test_a_re_read_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) -> None:
     _root, src = _long_tray(tmp_path)
     with _serve_plain(src) as url:
         out = _drive(tmp_path, f"{url}/", [
@@ -79,7 +79,7 @@ def test_the_refresh_button_keeps_a_tall_open_intention_and_its_scroll(tmp_path:
             {"eval": STATE},
         ])
     v = out["values"]
-    _assert_held(v[2], v[-1], "the refresh button")
+    _assert_held(v[2], v[-1], "the re-read")
 
 
 @needs_browser

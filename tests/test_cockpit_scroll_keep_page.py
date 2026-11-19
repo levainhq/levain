@@ -70,7 +70,7 @@ def _serve_plain(src: Any) -> _Served:
 
 
 @needs_browser
-def test_the_refresh_button_keeps_the_readers_place(tmp_path: Path) -> None:
+def test_a_re_read_keeps_the_readers_place(tmp_path: Path) -> None:
     out = _reload_keeps_the_scroll(tmp_path, REREAD)
     v = out["values"]
     assert v[1] > 2600, f"the page must be tall enough to scroll: {v}"

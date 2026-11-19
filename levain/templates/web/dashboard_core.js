@@ -1795,7 +1795,7 @@
   // The cognition trace — a phosphor oscilloscope over REAL per-wrap vitals
   // (no-theater rule: every sample is an actual consolidation; the draw-in
   // animation fires only when this renders, and a render only happens on a
-  // real fetch — boot or the refresh button). Channels: episodes compressed
+  // real fetch — a board read). Channels: episodes compressed
   // (mind), graduations validated (identity), links formed+strengthened
   // (operate). Per-channel auto-gain, like a real scope; the legend shows
   // each channel's latest value + its max calibration so the gain is honest.
@@ -3529,7 +3529,7 @@
     const ta = el("textarea", "edit-ta");
     ta.value = doc.body || "";  // .value (not innerHTML) — store text never becomes markup
     ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (intention-108): an involuntary
-    // re-render (visibilitychange / refresh-button) is deferred while value diverges from this.
+    // re-render (visibilitychange / a re-read of the board) is deferred while value diverges from this.
     const controls = el("div", "edit-controls");
     const save = el("button", "edit-save", "save");
     const cancel = el("button", "edit-cancel", "cancel");
@@ -10239,7 +10239,7 @@
 
   // Is the operator mid-edit/capture with text that an involuntary re-render would
   // discard? (intention-108) render() rebuilds the whole #board (+ modal) via
-  // replaceChildren, so a visibilitychange / refresh-button re-read fired while a
+  // replaceChildren, so a visibilitychange / board re-read fired while a
   // textarea is open silently loses the typing. The boot shim calls this to DEFER those
   // passive re-reads — NOT the save's own commit→load reload, which intentionally
   // rebuilds to show saved state (that's the call-site split that avoids breaking save).
@@ -10336,7 +10336,7 @@
       try { renderNotes(currentView); } catch (e) { /* the notes strip keeps what it showed */ }
     }
   }
-  // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
+  // A reload (the tab coming back, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
   // A draw that is allowed while a text field in a redrawn region has focus (an idle field, an empty one) replaces that field:
   // the keyboard would fall to <body>. So the field is known before the draw by the keys the page already finds rows by
