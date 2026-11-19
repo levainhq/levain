@@ -6,6 +6,7 @@ import dataclasses
 import json
 import re
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,9 @@ def test_the_edits_ledger_row_carries_received_at(tmp_path: Path) -> None:
         assert st == 200
     rows = [json.loads(line) for line in (root / ".levain" / "edits.jsonl").read_text().splitlines() if line]
     mine = [r for r in rows if r.get("kind") == "intention_surface_at"]
-    assert mine and mine[-1]["received_at"] and mine[-1]["ts"] >= mine[-1]["received_at"]
+    assert mine and mine[-1]["received_at"]
+    # parsed, not compared as text: isoformat leaves the fraction out at microsecond 0, which reorders the strings
+    assert datetime.fromisoformat(mine[-1]["ts"]) >= datetime.fromisoformat(mine[-1]["received_at"])
 
 
 def test_a_verb_post_prints_its_time_and_a_slow_one_warns(tmp_path: Path, capsys, caplog, monkeypatch) -> None:
