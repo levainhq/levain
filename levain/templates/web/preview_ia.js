@@ -84,18 +84,29 @@
     }
     var tg = t.closest("[data-ia-tag]");
     if (tg) { setTag(Number(tg.dataset.iaTag)); return; }
+    // B: an action button (Drop, Grants, Notifications) opens its sheet over Home; the page's own jump wiring leaves the Desk on any
+    // such click, so Home is entered again under the sheet
+    if (B && actionFromDesk && t.closest(".ia-actions")) { actionFromDesk = false; window.setTimeout(goHome, 0); }
   });
+  // whether an action button was pressed while the Desk (B's Home) was on: read before the page's own capture listener leaves it
+  var actionFromDesk = false;
+  window.addEventListener("click", function (ev) {
+    actionFromDesk = !!(B && deskOn() && ev.target && ev.target.closest && ev.target.closest(".ia-actions"));
+    if (ev.isTrusted) userMoved = true;
+  }, true);
+  var userMoved = false;
 
   // The places keys (KEYS below). Captured before the page's own mode keys, which would
   // otherwise open the retired Morning and Build modes. Never while typing.
   var KEYS = B ? { 1: "home", 2: "room", 3: "memory" } : { 1: "home", 2: "desk", 3: "room", 4: "memory" };
   document.addEventListener("keydown", function (ev) {
-    if (ev.metaKey || ev.ctrlKey || ev.altKey || !/^[1-4]$/.test(ev.key)) return;
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey || !KEYS[ev.key]) return;
+    if (document.getElementById("levain-modal")) return;   // a dialog is open: its keys are its own
     var a = document.activeElement, tag = a && a.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (a && a.isContentEditable)) return;
     ev.stopImmediatePropagation();
     ev.preventDefault();
-    if (KEYS[ev.key]) go(KEYS[ev.key]);
+    go(KEYS[ev.key]);
   }, true);
 
   // ---- the tagline ----
@@ -165,7 +176,7 @@
       // never gets there stays on the drill-down view, which shows everything, and says so in its header.
       var tries = 0;
       (function enter() {
-        if (deskOn() || document.body.dataset.iaDrill) return;
+        if (deskOn() || document.body.dataset.iaDrill || userMoved) return;   // he chose a place first: that choice stands
         if (document.querySelector(".dv-zone")) { goHome(); if (deskOn()) return; }
         if (++tries < 40) window.setTimeout(enter, 250);
       })();

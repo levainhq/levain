@@ -97,7 +97,7 @@
     </nav>
     <div class="ia-back frame" id="ia-back"><button type="button" data-ia-place-btn="home">&larr; Home: the desk</button><span id="ia-back-t"></span></div>
     <section class="ck-needs frame" id="ck-needs" aria-label="Needs you" hidden></section>
-    <!-- The desk drop: directly under the Needs-you row in every view (Phill 10-30; filled by renderDropHero; never replaced by an install). -->
+    <!-- The desk drop (filled by renderDropHero): preview_ia.css places it; Memory hides it (the Drop button stands for it there). -->
     <section class="ck-drop frame" id="ck-drop" aria-label="Drop to the desk" hidden></section>
     <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <div class="ck-secthead frame" id="ck-h-brief" hidden><h3>Today</h3></div>
@@ -106,7 +106,7 @@
     <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <p class="stateline frame" id="state" hidden></p>
     <p class="sub frame" id="store" data-cold>connecting…</p>
-    <!-- Modes 1-4 show subsets of the board; the keys are ignored while typing. -->
+    <!-- The board's panels; preview_ia.css places them by place. The 1-4 keys are the places keys (preview_ia.js KEYS). -->
     <main class="frame"><div class="grid" id="board"></div></main>
     <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
   </div>

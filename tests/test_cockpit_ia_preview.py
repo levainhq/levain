@@ -86,4 +86,8 @@ def test_needs_count_rides_home_at_every_width(name: str) -> None:
     css = (WEB / "preview_ia.css").read_text()
     top_level = re.sub(r"@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", re.sub(r"/\*.*?\*/", "", css, flags=re.S))
     assert re.search(r"body\.ia \.ia-places \{ display: flex !important; \}", top_level)
-    assert not re.search(r"\.ia-places[^{]*\{[^}]*display:\s*none", re.sub(r"/\*.*?\*/", "", css, flags=re.S))
+    bare = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    assert not re.search(r"\.ia-places[^{]*\{[^}]*display:\s*none", bare)
+    # the count's own pill hides only when the count itself is hidden (nothing waits), never by width
+    hides = [m.group(0) for m in re.finditer(r"[^{}]*(?:\.ia-needs|data-nc-needs)[^{]*\{[^}]*display:\s*none[^}]*\}", bare)]
+    assert all(":has([data-nc-needs][hidden])" in h for h in hides), hides

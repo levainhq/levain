@@ -180,7 +180,7 @@ body.ia-b[data-ia-drill="machine"] .ia-graph-toggle { display: none !important; 
    drill-downs under the band. The Desk's rules hide everything but the header; these let the band and the drills through.
    ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════ */
 body.ia-b #ia-drills, body.ia-b #ia-back { display: none; }
-body.ia-b.dv-on .deck > #ck-needs { display: block !important; flex: none; max-height: 36vh; overflow: auto; border-bottom: 1px solid var(--hair);
+body.ia-b.dv-on .deck > #ck-needs:not([hidden]) { display: block !important; flex: none; max-height: 36vh; overflow: auto; border-bottom: 1px solid var(--hair);
   padding-block: var(--sp-3); }
 body.ia-b.dv-on .deck > #ck-needs { order: 1; }
 body.ia-b.dv-on .deck > .dv-zone { order: 3; }
@@ -208,3 +208,5 @@ body.ia-b[data-ia-drill="work"] #ck-needs, body.ia-b[data-ia-drill="work"] #ck-n
 
 /* Memory is a place of its own: the drop box is the Drop button there, not a block at its top */
 body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }
+/* the phone keyboard is up (dv-kb / rv-kb): the ribbon gives its row back, as the masthead does */
+@media (max-width: 720px) { body.ia.dv-kb .deck > #ia-ribbon, body.ia.rv-kb .deck > #ia-ribbon { display: none !important; } }
