@@ -6,8 +6,6 @@ as test_cockpit_k10_agents does); the age-timer test uses the page's fake DOM.""
 from __future__ import annotations
 
 import json
-import sys
-import warnings
 
 from tests._ke_dom import NODE, run_node
 from tests.test_cockpit_f12b_topology_view import TV, _paint, _run
@@ -20,12 +18,10 @@ import pytest
 # The phone first-row geometry this measures (ROW1_AT_13C4D885, with the Modes bar's `.seg` as the second row) is gone with the Modes bar, and Home
 # hides the band's own Calm button (#calmphone): Calm's phone reach is a boarded row (Calm at 480 px and under). The test comes back with that row,
 # measured again on the places page.
-RETIRED_MODES_ROW = pytest.mark.skip(reason="the Modes bar's phone first-row geometry it measures is retired, and Calm's phone button is boarded (Calm at 480 px and under on Home)")
 WAIT = {"eval": "new Promise(r => setTimeout(r, 300))"}
 HTML = "document.documentElement.classList.contains('calm')"
 BTN = "(() => { const b = document.getElementById('calmbtn'); return JSON.stringify([b.getAttribute('aria-pressed'), b.textContent]); })()"
 CLICK = {"eval": "document.getElementById('calmbtn').click(); 1"}
-CLICK_PHONE = {"eval": "document.getElementById('calmphone').click(); 1"}
 # a probe element that asks for an infinite animation: under Calm the page's one rule must win over it
 ANIM = ("(() => { const d = document.createElement('div'); d.style.animation = 'spin 1s linear infinite'; document.body.appendChild(d); "
         "const n = getComputedStyle(d).animationName; d.remove(); return n; })()")
@@ -110,8 +106,6 @@ out.tick = [K.AGE_TICK_MS, K.CALM_AGE_TICK_MS];
     assert out["tick"][1] > out["tick"][0]
 
 
-ABSOLUTE_ROW1_SKIP = ("the ROW1_AT_13C4D885 constants were measured on macOS; Linux headless Chrome (run 40424542908 levainhq/levain, cockpit browser tests "
-                       "Python 3.13) put the tabs' right edge 27 px and the brand's right edge 3 px off them, so the absolute comparison runs on darwin only")
 # the first row's element rects at 13c4d885 (before any Calm control), measured in a scratch checkout of that commit with this test's emulation
 # (fixture of test_cockpit_k7_build, 800 px tall, dpr 2): [left, top, right, bottom]
 ROW1_AT_13C4D885 = {
@@ -161,48 +155,6 @@ def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(widt
     assert any(expect in d for d in _row1_defects(good, width)), _row1_defects(good, width)
 
 
-@RETIRED_MODES_ROW
-@needs_browser
-@pytest.mark.parametrize("width", [320, 375, 430])
-def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):
-    """C8: the phone bar's first row and tabs have the geometry they had at 13c4d885 (the wordmark as whole as it was), and Calm is a
-    text-labelled button of full touch size at the right of the clock and date: in the viewport, overlapping nothing. The masthead copy is
-    hidden on a phone; the two stay in step (label, aria-pressed) whichever is pressed."""
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = """(() => { const q = (s) => document.querySelector(s), r = (e) => { const b = e.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.right), Math.round(b.bottom)]; };
-      const wm = q('.masthead .brand .wordmark'), c = q('#calmphone'), cr = c.getBoundingClientRect(), m = q('#calmbtn');
-      const tr = (e) => { const g = document.createRange(); g.selectNodeContents(e); return g.getBoundingClientRect(); };   // the text's own box: .clock and .date are block-wide
-      const others = [['masthead', q('.masthead').getBoundingClientRect()], ['clock', tr(q('.clockbox .clock'))], ['date', tr(q('.clockbox .date'))],
-        ...['.band-state', '.band-meta'].map((s) => q(s)).filter(Boolean).map((e) => [e.className, tr(e)])];
-      const hit = (a, b) => a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5;
-      const textRight = Math.max(tr(q('.clockbox .clock')).right, tr(q('.clockbox .date')).right);
-      return JSON.stringify({ row1: { brand: r(q('.masthead .brand')), live: r(q('.masthead .livechip')), sync: r(q('#refresh')), jump: r(q('#jumpbtn')), theme: r(q('.masthead .themesw')), tabs: r(q('.masthead .seg')) },
-        wordmarkCut: wm.scrollWidth > wm.clientWidth, cr: [Math.round(cr.left), Math.round(cr.top), Math.round(cr.right), Math.round(cr.bottom)],
-        inside: cr.left >= 0 && cr.right <= innerWidth && cr.top >= 0 && cr.bottom <= innerHeight, h: cr.height, rightOfClock: cr.left >= textRight,
-        overlaps: others.filter(([, b]) => b.width > 0 && hit(cr, b)).map(([n]) => n),
-        text: c.textContent, fontSize: getComputedStyle(c).fontSize, pressed: c.getAttribute('aria-pressed'), label: c.getAttribute('aria-label'), mastheadCalmShown: getComputedStyle(m).display !== 'none',
-        mastheadText: m.textContent, mastheadPressed: m.getAttribute('aria-pressed'), sw: document.documentElement.scrollWidth, vw: innerWidth }); })()"""
-    press_masthead = {"eval": "document.getElementById('calmbtn').click(); 1"}
-    out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 300))"}, {"eval": probe}, CLICK_PHONE, {"eval": probe}, CLICK_PHONE, press_masthead, {"eval": probe}],
-               first={"emulate": {"w": width, "h": 800, "dpr": 2, "mobile": True}})
-    off, on, back = json.loads(out[-6]), json.loads(out[-4]), json.loads(out[-1])
-    if sys.platform != "darwin":
-        warnings.warn(ABSOLUTE_ROW1_SKIP)
-    # off; the phone button pressed (on); the phone button pressed off, then the hidden masthead button pressed on by script (on again)
-    for got in (off, on, back):
-        for key, rect in ROW1_AT_13C4D885[width].items():
-            if sys.platform == "darwin":   # the platform the constants were measured on
-                assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], rect)), (key, got["row1"][key], rect)
-            if got is not off:   # calm moves nothing, on every platform: the font-independent check, so it never compares `off` with itself
-                assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], off["row1"][key])), (key, got["row1"][key], off["row1"][key])
-        assert _row1_defects(got["row1"], width) == [], got["row1"]   # every platform: order, no overlap, inside the viewport, one row
-        assert width == 320 or not got["wordmarkCut"], got   # whole where 13c4d885 had it whole (375 and 430); at 320 it was already the dot alone
-        assert got["inside"] and got["rightOfClock"] and got["h"] >= 36 and not got["overlaps"], got
-        assert got["fontSize"] != "0px" and got["text"] in ("Calm off", "Calm on") and got["mastheadCalmShown"] is False, got
-        assert got["sw"] <= got["vw"], got
-        assert got["text"] == got["mastheadText"] == got["label"] and got["pressed"] == got["mastheadPressed"], got
-    assert (off["text"], on["text"], back["text"]) == ("Calm off", "Calm on", "Calm on"), (off["text"], on["text"], back["text"])
-    assert (off["pressed"], on["pressed"], back["pressed"]) == ("false", "true", "true")
 
 
 # ---- C11: Calm suppresses the sky's EFFECTIVE motion and never writes the user's Ambient preference ----------------------
