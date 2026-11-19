@@ -1115,6 +1115,8 @@ COCKPIT_READ_CACHE_TTL_S = 1.5
 # Attached mode (the cockpit's panels read from snapshots a derive host publishes) is on only when this variable is "1".
 # It is read once, when a server is constructed. Off by default until a write shows in the snapshots it reads.
 COCKPIT_SNAPSHOTS_ENV = "LEVAIN_COCKPIT_SNAPSHOTS"
+# How long ``server_close`` waits for the snapshot host's derive threads: a little past a provider read's own deadline.
+SNAPSHOT_HOST_STOP_S = 15.0
 
 
 class _RouteStats:
@@ -2176,8 +2178,16 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         """Attach ``cockpit`` to a snapshot host when attached mode is on and this server has a data root. A store that
         cannot be opened leaves the cockpit on its own provider path, said once on stderr. The host is attached here and
         started by the caller."""
+        if not self.snapshots_on:
+            return
+        if getattr(cockpit, "attached", False):
+            print("cockpit: this cockpit is already attached to a snapshot reader; no host is opened for this server, "
+                  "and the panels are read from that reader's rows", file=sys.stderr, flush=True)
+            return
         broker = self.broker
-        if not self.snapshots_on or broker is None or getattr(broker, "data_root", None) is None:
+        if broker is None or getattr(broker, "data_root", None) is None:
+            print("cockpit: snapshots not attached (this server has no data root); serving from the providers",
+                  file=sys.stderr, flush=True)
             return
         try:
             Path(broker.data_root).mkdir(parents=True, exist_ok=True)   # the broker makes it on its own start, which is later
@@ -2329,9 +2339,16 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.last_seen_stamper.close()      # no new stamp queues; its thread is waited for, bounded, never held on
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self._close_voice_streams()
-        host, self._snapshot_host = self._snapshot_host, None
+        host = self._snapshot_host
         if host is not None:
-            host.stop()     # the derive threads end before the watcher and the cockpit they feed are torn down
+            # the derive threads end before the watcher and the cockpit they feed are torn down; a derive ends at its
+            # provider's own timeout, so the wait is bounded a little past it. The handle goes only once the host has
+            # stopped: one that still has threads is kept for a later close to finish
+            if host.stop(SNAPSHOT_HOST_STOP_S):
+                print("cockpit: the snapshot host's derive threads did not end in time; the store stays open for them",
+                      file=sys.stderr, flush=True)
+            else:
+                self._snapshot_host = None
         self.stream_watcher.stop()
         if self.room_serve is not None:
             # the pump and the room's child end. stop() waits for a send in flight (an open can take the launcher's

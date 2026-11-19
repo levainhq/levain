@@ -414,6 +414,9 @@ class SnapshotHost:
                 return []
             self._closed = True
         self._writer.close()
+        # ``close`` ends the calling thread's connection. A thread's reader connection can only be used and closed by
+        # that thread, so those of the request and pool threads are not reachable from here; each is freed when the
+        # reader is released, which ends with the cockpit that holds it.
         self._reader.close()
         return []
 

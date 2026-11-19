@@ -422,6 +422,77 @@ class TestClose:
         assert _derive_threads() == []
 
 
+class _StubbornHost:
+    """A host whose stop() answers with threads still alive until told otherwise, and records the timeout it was given."""
+
+    def __init__(self, real: SnapshotHost) -> None:
+        self.real = real
+        self.timeouts: list[Any] = []
+        self.alive: list[Any] = [threading.current_thread()]
+
+    def stop(self, timeout: Any = None) -> list:
+        self.timeouts.append(timeout)
+        return list(self.alive)
+
+
+class TestCloseIsBounded:
+    def test_the_host_is_stopped_with_a_bound_and_its_handle_is_kept_until_stop_returned_clean(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        httpd.get_cockpit()
+        real = httpd._snapshot_host
+        assert real is not None
+        stub = _StubbornHost(real)
+        httpd._snapshot_host = stub        # type: ignore[assignment]
+        try:
+            httpd.server_close()
+            assert len(stub.timeouts) == 1 and isinstance(stub.timeouts[0], (int, float)) and stub.timeouts[0] > 0
+            assert httpd._snapshot_host is stub             # threads were still alive: the handle stays for a retry
+            stub.alive = []
+            httpd.server_close()
+            assert len(stub.timeouts) == 2 and httpd._snapshot_host is None
+        finally:
+            real.stop(timeout=10)
+
+
+class TestOpenSaysTheTrueThing:
+    def test_an_already_attached_cockpit_is_said_to_be_attached_not_served_from_the_providers(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        ck = providers.build_default_cockpit(src)
+        (tmp_path / "other").mkdir()
+        first = SnapshotHost(ck, tmp_path / "other")
+        first.attach()
+        capsys.readouterr()
+        httpd = make_server(src, host="127.0.0.1", port=0, cockpit=ck)
+        try:
+            err = capsys.readouterr().err
+            assert "already attached" in err and "serving from the providers" not in err and err.count("\n") == 1
+            assert httpd._snapshot_host is None and ck.attached is True
+        finally:
+            httpd.server_close()
+            first.stop(timeout=10)
+
+    def test_the_flag_on_with_no_data_root_says_so_once_on_stderr(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            httpd.broker = None
+            capsys.readouterr()
+            httpd.get_cockpit()
+            err = capsys.readouterr().err
+            assert "snapshots not attached" in err and "data root" in err and err.count("\n") == 1
+            assert httpd._snapshot_host is None
+        finally:
+            httpd.server_close()
+
+
 # ---------------------------------------------------------------------------------------------- the probe, on the real server
 
 
