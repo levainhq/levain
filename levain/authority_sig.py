@@ -156,6 +156,25 @@ def _sshsig_type_flags_counter(armored: str) -> tuple[str, int | None, int | Non
     return sig_type, flags, counter
 
 
+def sk_ecdsa_signature_empty(armored: str) -> bool:
+    """True when ``armored`` is an sk-ecdsa SSHSIG whose ECDSA signature is EMPTY: both integers, r and s, have zero
+    length (an 8-byte blob, two length words and nothing after them), though the flags byte and counter that follow
+    look like a good signature's. This is what the Touch ID provider returned on 2026-11-19 (levain#153; 13 recorded
+    failures): the flags were not the discriminator, the blob is. False for anything else, a signature that is
+    non-empty and fails to verify included, and for anything malformed (the caller's own parse names that)."""
+    try:
+        _public_key_blob, sig_blob = _sshsig_fields(armored)
+        inner = _Wire(sig_blob)
+        if not inner.string().decode("ascii").startswith("sk-ecdsa-"):
+            return False
+        ecdsa = _Wire(inner.string())
+        r, s = ecdsa.string(), ecdsa.string()
+        ecdsa.end()
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return len(r) == 0 and len(s) == 0
+
+
 def presence_missing(signature: str, public_key: str) -> bool:
     """True if a FIDO (sk-*) key or signature lacks the user-presence flag, or ``signature`` cannot be
     read for one: the one presence rule for every levain signature check (authority links here, cockpit

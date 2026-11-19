@@ -34,6 +34,10 @@ SK = "sk-ecdsa-sha2-nistp256@openssh.com"
 NS = "levain-authority@levain"
 
 
+# levain#153: real armored signatures from ~/.levain/keys/sign-failures (public data, no message) and the real good one
+_RECORDED = json.loads((Path(__file__).parent / "fixtures" / "sk_empty_signatures_1119.json").read_text())
+
+
 def _s(b: bytes) -> bytes:
     return struct.pack(">I", len(b)) + b
 
@@ -117,6 +121,8 @@ class FakeKeygenSign:
                 self.clock.t += took
             if written == "cancel":
                 return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+            if written == "empty":      # the recorded 11-19 answer: flags 0x21, counter 1, r and s of zero length
+                return subprocess.CompletedProcess(argv, 0, stdout=_RECORDED["empty-0944"].encode(), stderr=b"")
             ns = argv[argv.index("-n") + 1]
             out = self.key.sign(kw["input"], ns, counter=self.signs, sig_flags=written)
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr=b"")
@@ -535,3 +541,62 @@ def test_classify_reads_only_the_first_line(rig):
                   "ssh-keygen could not sign with /k/id (exit 1)"):
         assert ts._classify(KeyError_(first + "\n" + later)) == ("signer-error", first), later
     assert ts._classify(KeyError_("ssh-keygen could not sign (TimeoutExpired)\nmore"))[0] == "timeout"
+
+
+# ---- levain#153: the EMPTY signature (r and s of zero length), named -------------------------------------------------
+
+def test_the_classifier_says_empty_for_the_two_recorded_failures_and_not_for_the_good_signature():
+    from levain.authority_sig import _sshsig_type_flags_counter, sk_ecdsa_signature_empty
+    for name in ("empty-0944", "empty-0209"):       # 08:44 ET at a terminal; 02:09 ET, nobody there
+        assert sk_ecdsa_signature_empty(_RECORDED[name]), name
+        assert _sshsig_type_flags_counter(_RECORDED[name]) == (SK, 0x21, 1)     # flags and counter look good: not the tell
+    assert _sshsig_type_flags_counter(_RECORDED["good"]) == (SK, 0x21, 1)
+    assert not sk_ecdsa_signature_empty(_RECORDED["good"])
+
+
+def test_the_classifier_is_false_for_a_non_empty_unverifiable_or_malformed_signature(rig):
+    from levain.authority_sig import sk_ecdsa_signature_empty
+    flipped = rig.key.sign(MESSAGE, NS, flags=0x01, sig_flags=0x21).decode()
+    assert not sk_ecdsa_signature_empty(flipped)
+    for junk in ("", "nonsense", "-----BEGIN SSH SIGNATURE-----\n!!!\n-----END SSH SIGNATURE-----\n"):
+        assert not sk_ecdsa_signature_empty(junk)
+
+
+def test_two_empty_answers_say_the_key_returned_no_signature_and_the_evidence_says_why(rig):
+    rig.fake.plan = ["empty", "empty"]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 2                       # the retry count is as it was
+    assert text.startswith("the key returned no signature (Touch ID gave nothing back)")
+    assert "empty ECDSA signature (r and s have zero length)" in text and "nothing was signed" in text
+    assert "try again" in text and "phone" in text
+    assert "libcrypto" not in text and "does not verify" not in text
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 2 and all(str(f) in text for f in files)
+    for f in files:
+        ev = json.loads(f.read_text())
+        assert ev["format"] == "levain-sign-failure/1" and ev["reason"] == "empty ECDSA signature (r and s have zero length)"
+        assert ev["flags"] == "0x21" and ev["counter"] == 1 and "ssh_keygen" in ev and "message_sha256" in ev
+
+
+def test_an_empty_first_answer_is_retried_and_a_good_second_is_returned(rig):
+    rig.fake.plan = ["empty", None]
+    assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
+    assert rig.fake.signs == 2
+
+
+def test_a_non_empty_unverifiable_answer_keeps_its_old_text_and_records_no_reason(rig):
+    rig.fake.plan = [0x21, 0x21]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    assert "does not verify" in str(err.value) and "returned no signature" not in str(err.value)
+    for f in rig.dir.iterdir():
+        assert json.loads(f.read_text())["reason"] is None
+
+
+def test_an_empty_answer_with_no_time_for_a_second_touch_is_named_too(rig):
+    rig.fake.plan, rig.fake.durations = ["empty"], [keys._SIGN_TIMEOUT - 1.0]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    assert "the key returned no signature" in str(err.value) and "no second touch was asked for" in str(err.value)
