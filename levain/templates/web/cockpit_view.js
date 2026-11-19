@@ -2642,6 +2642,28 @@
     }
     return items.slice(0, 14);
   }
+  // Focus a panel the jump chose. The poll redraws the whole board (render replaces every panel node), so the node the jump held can be
+  // gone by the time the frame comes, or can be replaced just after it takes focus (focus then falls to <body>). The panel is looked up
+  // again by its id, and for a bounded 3 s (the same bound as the tile-focus ask in the core) a redraw that drops the focus to <body>
+  // hands it to the successor; focus the reader has since put anywhere else is left alone.
+  function landOnPanel(node, scroll) {
+    const id = node.dataset ? node.dataset.ckPanel : "";
+    const live = (n) => n.isConnected || !id ? n : (Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || n);
+    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
+    const first = live(node);
+    focusIt(first, scroll);
+    const board = document.getElementById("board");
+    if (!id || !board || typeof root.MutationObserver !== "function") return;
+    let held = first;
+    const obs = new root.MutationObserver(() => {
+      const a = document.activeElement;
+      if (held.isConnected || (a && a !== document.body)) return;
+      const next = live(held);
+      if (next !== held) { held = next; focusIt(held, false); }
+    });
+    obs.observe(board, { childList: true });
+    root.setTimeout(() => obs.disconnect(), 3000);
+  }
   function openJump() {
     if (palette) return;
     const dlg = el("div", "palette");
@@ -2667,7 +2689,7 @@
         // a panel the current tab hides is reached through the first tab that shows it
         const changed = revealTab(it.node);
         if (it.node.ckShowTab) it.node.ckShowTab();
-        after(changed, () => { it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); });
+        after(changed, () => landOnPanel(it.node, true));
         return; }
       // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
       const changed = revealTab(it.state.p);
