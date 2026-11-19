@@ -2644,7 +2644,7 @@
   }
   // Focus a panel the jump chose. The poll redraws the whole board (render replaces every panel node), so the node the jump held can be
   // gone by the time the frame comes, or can be replaced just after it takes focus (focus then falls to <body>). The panel is looked up
-  // again by its id, and for a bounded 3 s (the same bound as the tile-focus ask in the core) a redraw that drops the focus to <body>
+  // again by its id, and for a bounded 3 s a redraw that drops the focus to <body>
   // hands it to the successor; focus the reader has since put anywhere else is left alone.
   function landOnPanel(node, scroll) {
     const id = node.dataset ? node.dataset.ckPanel : "";
