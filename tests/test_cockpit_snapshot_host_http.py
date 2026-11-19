@@ -458,6 +458,94 @@ class TestCloseIsBounded:
             real.stop(timeout=10)
 
 
+def _watch_data_root(monkeypatch) -> "list[Path]":
+    """Every data root a host was opened on, so a test can look at the store after a failed open."""
+    roots: list[Path] = []
+    real = SnapshotHost.try_open.__func__          # type: ignore[attr-defined]
+
+    def try_open(cls: Any, cockpit: Any, data_root: Any, **kw: Any) -> Any:
+        roots.append(Path(data_root))
+        return real(cls, cockpit, data_root, **kw)
+
+    monkeypatch.setattr(SnapshotHost, "try_open", classmethod(try_open))
+    return roots
+
+
+def _store_is_free(root: Path) -> bool:
+    host, _reason = SnapshotHost.try_open(Cockpit(), root)
+    if host is not None:
+        host.stop()
+    return host is not None
+
+
+class TestAHostIsNeverStranded:
+    def test_an_attach_that_raises_in_get_cockpit_stops_the_host_and_frees_the_store(self, tmp_path: Path, monkeypatch) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        roots = _watch_data_root(monkeypatch)
+        monkeypatch.setattr(SnapshotHost, "attach", lambda self: (_ for _ in ()).throw(RuntimeError("attach refused")))
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            with pytest.raises(RuntimeError, match="attach refused"):
+                httpd.get_cockpit()
+            assert httpd._snapshot_host is None and _derive_threads() == []
+            assert _store_is_free(roots[0])
+        finally:
+            httpd.server_close()
+
+    def test_an_attach_that_raises_in_make_server_stops_the_host_and_frees_the_store(self, tmp_path: Path, monkeypatch) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        roots = _watch_data_root(monkeypatch)
+        monkeypatch.setattr(SnapshotHost, "attach", lambda self: (_ for _ in ()).throw(RuntimeError("attach refused")))
+        ck = providers.build_default_cockpit(src)
+        with pytest.raises(RuntimeError, match="attach refused"):
+            make_server(src, host="127.0.0.1", port=0, cockpit=ck)
+        assert _derive_threads() == []
+        assert _store_is_free(roots[0])
+
+    def test_a_failure_after_the_host_started_in_make_server_leaves_no_thread_and_a_free_store(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        roots = _watch_data_root(monkeypatch)
+        real_start = SnapshotHost.start
+
+        def start_then_fail(self: SnapshotHost) -> None:
+            real_start(self)
+            raise RuntimeError("failed after start")
+
+        monkeypatch.setattr(SnapshotHost, "start", start_then_fail)
+        ck = providers.build_default_cockpit(src)
+        with pytest.raises(RuntimeError, match="failed after start"):
+            make_server(src, host="127.0.0.1", port=0, cockpit=ck)
+        assert _derive_threads() == []
+        assert _store_is_free(roots[0])
+
+    def test_a_failure_after_the_host_started_in_get_cockpit_leaves_no_thread_and_a_free_store(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        _env(monkeypatch, "1")
+        _root, src = _install(tmp_path)
+        roots = _watch_data_root(monkeypatch)
+        real_start = SnapshotHost.start
+
+        def start_then_fail(self: SnapshotHost) -> None:
+            real_start(self)
+            raise RuntimeError("failed after start")
+
+        monkeypatch.setattr(SnapshotHost, "start", start_then_fail)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            with pytest.raises(RuntimeError, match="failed after start"):
+                httpd.get_cockpit()
+            assert httpd._snapshot_host is None and _derive_threads() == []
+            assert _store_is_free(roots[0])
+        finally:
+            httpd.server_close()
+
+
 class TestOpenSaysTheTrueThing:
     def test_an_already_attached_cockpit_is_said_to_be_attached_not_served_from_the_providers(
         self, tmp_path: Path, monkeypatch, capsys

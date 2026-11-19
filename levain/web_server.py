@@ -2198,7 +2198,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         if host is None:
             print(f"cockpit: snapshots not attached ({reason}); serving from the providers", file=sys.stderr, flush=True)
             return
-        host.attach()
+        try:
+            host.attach()
+        except BaseException:
+            host.stop()         # the host holds the store's writer lock from its construction: a failed attach gives it back
+            raise
         self._snapshot_host = host
 
     def _watch_manifest(self) -> dict[str, Any]:
