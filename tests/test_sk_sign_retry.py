@@ -680,6 +680,22 @@ def test_a_mixed_outcome_names_both_and_keeps_the_phone_guidance(rig, plan):
     assert sorted(json.loads(f.read_text())["reason"] is None for f in files) == [False, True]
 
 
+def test_empty_empty_bad_describes_every_attempt_by_its_own_outcome(rig):
+    rig.fake.plan = ["empty", "empty", 0x21]
+    with pytest.raises(KeyError_) as err:
+        rig.sign(MESSAGE)
+    text = str(err.value)
+    assert rig.fake.signs == 3 and rig.clock.sleeps == [1.0, 2.0]
+    assert "both attempts" not in text and "all 3 attempts failed" in text
+    assert "attempt 1 returned no signature" in text and "attempt 2 returned no signature" in text
+    assert "attempt 3 returned a signature that did not verify" in text and "attempt 3 returned no signature" not in text
+    assert all(f"attempt {i} flags" in text for i in (1, 2, 3)) and "attempt 4" not in text
+    assert text.count("empty ECDSA signature (r and s have zero length)") == 2
+    assert "try again" in text and "phone" in text and "nothing was signed" in text
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 3 and all(str(f) in text for f in files)
+
+
 def test_the_classifier_never_raises_whatever_a_malformed_signature_does(monkeypatch):
     """L3 r2 (complement LOW): it classifies EVIDENCE for the sign path, so no exception type may escape it."""
     from levain import authority_sig as sig
@@ -722,6 +738,8 @@ def test_an_empty_answer_with_a_deadline_too_short_for_the_wait_does_not_sleep_p
         sign(MESSAGE)
     assert rig.fake.signs == 1 and rig.clock.sleeps == []
     assert "no second touch was asked for" in str(err.value) and "try again" in str(err.value)
+    # no wait happened here, so the words say what WOULD remain after it, not what was left after it
+    assert "bound would remain after the 1s wait, under 5s" in str(err.value) and "was left after" not in str(err.value)
 
 
 def test_a_wait_that_leaves_no_room_for_the_third_attempt_is_refused_without_sleeping(rig):
