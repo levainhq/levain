@@ -361,14 +361,25 @@ _GIT_VERSION: list[str] = []
 
 
 def _file_digest(path: Path) -> str | None:
-    """A digest of a small file's CONTENT (None when it is absent or unreadable); a file past the cap is digested by its size."""
+    """A digest of a file's CONTENT, from ONE open descriptor. None when it is absent, not a regular file or unreadable. Raises
+    :class:`GitFailed` for a file past the cap: a size is no witness of an edit, so such a file cannot be stamped."""
     try:
-        with open(path, "rb") as fh:
-            raw = fh.read(_FILE_DIGEST_MAX + 1)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > _FILE_DIGEST_MAX:
+                raise GitFailed("a file that changes the diff text is too large to stamp")
+            raw = b""
+            while chunk := os.read(fd, 1 << 20):
+                raw += chunk
+                if len(raw) > _FILE_DIGEST_MAX:
+                    raise GitFailed("a file that changes the diff text is too large to stamp")
+        finally:
+            os.close(fd)
     except OSError:
         return None
-    if len(raw) > _FILE_DIGEST_MAX:
-        return f"big:{os.path.getsize(path)}"
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -412,7 +423,7 @@ def diff_stamp(repo: Path) -> tuple[tuple[str, ...], str]:
     """``(git dirs, digest)``: the digest of everything that changes the text ``git diff-tree -p`` makes (so the patch-id) of a
     commit in this repo, by CONTENT and never by path or time, so the main checkout and its linked worktrees of one repo agree:
     the config git lists, ``objects/info/alternates`` and ``shallow`` and ``info/attributes`` of the common dir, the global
-    attributes file, the work tree's top ``.gitattributes`` and the git version. Raises :class:`GitFailed`."""
+    attributes file, the work tree's top ``.gitattributes``, every tracked ``.gitattributes`` (mode, object and path) and the git version. Raises :class:`GitFailed`."""
     dirs, listed = _config_inputs(repo)
     common = Path(dirs[-1])
     parts: list[Any] = [_git_version(repo)]
@@ -426,6 +437,8 @@ def diff_stamp(repo: Path) -> tuple[tuple[str, ...], str]:
     parts.append(("global attributes", _file_digest(gattr) if gattr is not None else None))
     root = _worktree_root(repo)
     parts.append((".gitattributes", _file_digest(root / ".gitattributes") if root is not None else None))
+    cp = _run(repo, "ls-files", "-s", "-z", "--", ":(glob)**/.gitattributes", ".gitattributes")        # git reads attributes per directory
+    parts.append(("tracked attributes", hashlib.sha256(cp.stdout).hexdigest() if cp.returncode == 0 else "ls-files failed (no index or a bare repo)"))
     return dirs, hashlib.sha256(repr(parts).encode()).hexdigest()
 
 

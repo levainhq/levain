@@ -394,3 +394,42 @@ def test_the_cache_dirs_made_for_the_file_are_private(tmp_path, monkeypatch):
 
 # A concurrent READER while a writer replaces the file is not tested here: os.replace is atomic, so a reader sees one whole file or the other,
 # and the writers test above covers the file being whole after many writers.
+
+
+def test_a_nested_tracked_gitattributes_changes_the_stamp_and_the_cache_is_not_served(tmp_path, cache, monkeypatch):
+    repo = _history(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "blob.dat").write_text("x\n")
+    _commit(repo, "a nested dat file")
+    (repo / "src" / "blob.dat").write_text("y\n")
+    last = _commit(repo, "a nested dat file again")
+    shas = _all_shas(repo)
+    stamp = be.diff_stamp(repo)
+    before = be._patch_ids(repo, shas)
+    be._PID_MEMO.clear()
+    (repo / "src" / ".gitattributes").write_text("*.dat -diff\n")
+    seed.git(repo, "add", "src/.gitattributes")
+    assert be.diff_stamp(repo) != stamp
+    got, runs = _rerun(repo, shas, monkeypatch)
+    assert "diff-tree" in runs and got[last] != before[last]
+
+
+def test_a_file_over_the_cap_cannot_be_stamped_and_the_cache_is_not_used(tmp_path, cache, monkeypatch):
+    repo = _history(tmp_path)
+    shas = _all_shas(repo)
+    monkeypatch.setattr(be, "_FILE_DIGEST_MAX", 100)
+    (repo / ".gitattributes").write_text("# " + "x" * 200 + "\n")
+    with pytest.raises(be.GitFailed):
+        be.diff_stamp(repo)
+    got = be._patch_ids(repo, shas)
+    assert got and not cache.exists() and not be._PID_MEMO            # the read works; nothing is kept under no stamp
+
+
+def test_a_fifo_at_a_stamped_path_does_not_hang(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    code = ("import sys\nfrom pathlib import Path\nfrom levain.desk import board_evidence as be\n"
+            "print(be._file_digest(Path(sys.argv[1])))\n")
+    cp = subprocess.run([sys.executable, "-c", code, str(fifo)], capture_output=True, text=True, timeout=30,
+                        env={**os.environ, "PYTHONPATH": str(Path(be.__file__).parents[2])})
+    assert cp.returncode == 0 and cp.stdout.strip() == "None"
