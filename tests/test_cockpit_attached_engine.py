@@ -737,3 +737,19 @@ def test_set_version_moves_with_the_entity_and_with_a_discovery_error_while_the_
     assert probe.snapshot()[1] == version_b
     rig.ck._discovery_errors = [{"source": "discovery:1", "message": "boom"}]
     assert probe.snapshot()[1] != version_b
+
+
+@pytest.mark.parametrize("inputs", [([],), [File("/x/y")], (File("/x/y"), "/x/z"), "File", (object(),)])
+def test_a_panel_whose_inputs_are_not_a_tuple_of_the_input_types_is_refused_at_registration_naming_it(inputs) -> None:
+    ck = Cockpit()
+    with pytest.raises(engine.CockpitRegistrationError, match="bad_inputs.*inputs"):
+        ck.register(list_spec("bad_inputs", Recorder(), inputs=inputs))
+    assert "bad_inputs" not in ck.panel_ids
+
+
+def test_every_input_type_registers() -> None:
+    from levain.cockpit.derive import Dir, GitRefs, Poll, Sqlite
+
+    ck = Cockpit()
+    ck.register(list_spec("all", Recorder(), inputs=(File("/a"), Dir("/b"), Sqlite("/c"), GitRefs("/d"), Poll(5.0))))
+    assert "all" in ck.panel_ids

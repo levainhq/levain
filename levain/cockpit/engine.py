@@ -1290,6 +1290,10 @@ class Cockpit:
                     f"{sid}: stale_after_s ({spec.stale_after_s}) must be <= 2 x refresh_every_s "
                     f"({spec.refresh_every_s})"
                 )
+        if type(spec.inputs) is not tuple or not all(isinstance(i, (File, Dir, Sqlite, GitRefs, Poll)) for i in spec.inputs):
+            # a derive host hashes and fingerprints these: anything else would be found on its poll thread, not here
+            raise CockpitRegistrationError(
+                f"{sid}: inputs must be a tuple of File, Dir, Sqlite, GitRefs or Poll, got {spec.inputs!r}")
         if spec.edit_class not in ("", "A", "B", "C"):
             raise CockpitRegistrationError(f"{sid}: edit_class must be '', 'A', 'B' or 'C', got {spec.edit_class!r}")
         for f in spec.facets:

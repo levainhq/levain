@@ -639,23 +639,29 @@ class DeriveLoop:
         views: dict[str, InputsView] = {}
         for pid, plan in plans.items():
             parts, unknown, locked, stale = [], [], False, []
-            for inp in plan.inputs:
-                if isinstance(inp, Poll):
-                    continue
-                if inp not in seen:
-                    seen[inp] = self._fingerprinter.fingerprint(inp)
-                fp = seen[inp]
-                if fp is None:
-                    why = self._fingerprinter.why.get(inp)
-                    where = getattr(inp, "path", None) or getattr(inp, "repo", "")
-                    unknown.append(f"{pid}: {type(inp).__name__}({where})" + (f" [{why}]" if why else ""))
-                    parts.append("?")
-                    continue
-                if fp == LOCKED:
-                    locked = True
-                elif fp.startswith(STALE_LOCK + ":"):
-                    stale.append(f"{pid}: stale index.lock {fp[len(STALE_LOCK) + 1:].split('|', 1)[0]}")
-                parts.append(fp)
+            try:
+                for inp in plan.inputs:
+                    if isinstance(inp, Poll):
+                        continue
+                    if inp not in seen:
+                        seen[inp] = self._fingerprinter.fingerprint(inp)
+                    fp = seen[inp]
+                    if fp is None:
+                        why = self._fingerprinter.why.get(inp)
+                        where = getattr(inp, "path", None) or getattr(inp, "repo", "")
+                        unknown.append(f"{pid}: {type(inp).__name__}({where})" + (f" [{why}]" if why else ""))
+                        parts.append("?")
+                        continue
+                    if fp == LOCKED:
+                        locked = True
+                    elif fp.startswith(STALE_LOCK + ":"):
+                        stale.append(f"{pid}: stale index.lock {fp[len(STALE_LOCK) + 1:].split('|', 1)[0]}")
+                    parts.append(fp)
+            except Exception as exc:
+                # one plan whose inputs cannot be looked at is degraded and derives by its timers and the backstop; the
+                # other panels' views, and the poll, go on
+                views[pid] = InputsView("", True, False, (f"{pid}: inputs unreadable [{type(exc).__name__}]",), ())
+                continue
             joined = hashlib.sha256("\x1f".join(parts).encode("utf-8", "surrogateescape")).hexdigest() if parts else ""
             views[pid] = InputsView(joined, bool(unknown), locked, tuple(unknown), tuple(stale))
         return views, seen

@@ -1989,3 +1989,39 @@ def test_a_publish_that_fails_while_the_panel_is_retired_leaves_no_error_for_the
     assert not retirers[0].is_alive() and "a" not in loop._states
     assert "publish:a" not in loop._write_errors
     loop.stop()
+
+
+def _bad_inputs_plan_and_a_good_one(tmp_path):
+    f = tmp_path / "f.txt"
+    f.write_text("1")
+    return [PanelPlan("bad", inputs=([],)), PanelPlan("good", inputs=(File(str(f)),))]
+
+
+def test_a_plan_whose_inputs_cannot_be_looked_at_is_degraded_and_the_other_panels_still_derive(tmp_path):
+    loop, writer, clock, calls = make(_bad_inputs_plan_and_a_good_one(tmp_path), backstop_s=1e9)
+    assert sorted(loop.run_once(clock.t)) == ["bad", "good"]       # the bad one derives on first, by the timers' rules
+    assert writer.of("good") and writer.of("bad")
+    assert writer.streams[-1]["state"] == "degraded" and "bad: inputs unreadable [TypeError]" in writer.streams[-1]["detail"]
+    assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_a_fingerprint_that_raises_for_one_plan_does_not_stop_the_poll(tmp_path, monkeypatch):
+    f, g = tmp_path / "f.txt", tmp_path / "g.txt"
+    f.write_text("1")
+    g.write_text("1")
+    loop, writer, clock, calls = make(
+        [PanelPlan("bad", inputs=(File(str(f)),)), PanelPlan("good", inputs=(File(str(g)),))], backstop_s=1e9)
+    real = loop._fingerprinter.fingerprint
+
+    def fingerprint(inp):
+        if inp == File(str(f)):
+            raise RuntimeError("cannot look")
+        return real(inp)
+
+    monkeypatch.setattr(loop._fingerprinter, "fingerprint", fingerprint)
+    assert sorted(loop.run_once(clock.t)) == ["bad", "good"]
+    assert writer.heartbeats and "bad: inputs unreadable [RuntimeError]" in writer.streams[-1]["detail"]
+    g.write_text("22")
+    assert loop.run_once(clock.t) == ["good"]                       # the good panel still follows its own input
+    loop.stop()
