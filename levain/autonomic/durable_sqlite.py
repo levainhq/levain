@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-__all__ = ["MIN_SQLITE", "open_durable", "read_transaction", "rollback", "write_transaction"]
+__all__ = ["HeldRead", "HeldReads", "MIN_SQLITE", "open_durable", "read_transaction", "rollback", "write_transaction"]
 
 MIN_SQLITE = (3, 35, 0)
 
@@ -122,17 +122,19 @@ def _until_not_busy(conn: sqlite3.Connection, step: Callable[[], object]) -> obj
 
 
 def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
-                 needs: str = "this store", busy_s: float | None = None) -> sqlite3.Connection:
+                 needs: str = "this store", busy_s: float | None = None,
+                 check_same_thread: bool = True) -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
     owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library,
     naming what ``needs`` it. ``busy_s`` (default :data:`BUSY_WAIT_S`) bounds every wait of the open itself (the
     WAL switch, the first read) and is the connection's busy timeout after: a caller on a deadline passes what is
-    left of it, and a lock held past it raises SQLite's own busy error."""
+    left of it, and a lock held past it raises SQLite's own busy error. ``check_same_thread=False`` is for
+    :class:`HeldReads`, whose connection is used by its one owning thread and closed by whichever thread drops it."""
     if min_sqlite is not None and _library_version() < min_sqlite:
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is older than "
                            f"{'.'.join(map(str, min_sqlite))}, which {needs} needs")
     wait = BUSY_WAIT_S if busy_s is None else max(0.0, min(float(busy_s), BUSY_WAIT_S))
-    conn = sqlite3.connect(path, timeout=wait, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=wait, isolation_level=None, check_same_thread=check_same_thread)
     try:
         began = time.monotonic()
         _set_wal(conn, None if busy_s is None else wait)  # sidecars -wal/-shm stay beside the database
@@ -187,3 +189,109 @@ def read_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sqli
         conn.execute("COMMIT")
     finally:
         conn.close()
+
+
+class HeldRead:
+    """One thread's held read connection to one database file, with the file identity it was opened against and a
+    small answer cache the owner keeps beside it (:attr:`cache`; dropped with the connection)."""
+
+    __slots__ = ("conn", "ident", "cache")
+
+    def __init__(self, conn: sqlite3.Connection, ident: "tuple[int, int] | None") -> None:
+        self.conn = conn
+        self.ident = ident
+        self.cache: dict = {}
+
+    def data_version(self) -> int:
+        """``PRAGMA data_version``: changes between two calls on this connection exactly when another connection (this
+        process's or another's) committed to the database in between. This connection never writes, so its own commits
+        cannot hide a change. Autocommit, one statement, no transaction left open."""
+        return int(self.conn.execute("PRAGMA data_version").fetchall()[0][0])
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001 - closing a held connection never raises into its caller
+            pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class HeldReads:
+    """A read connection held open per thread, in place of one open per call.
+
+    ``connect`` opens a connection for one thread (``open_durable(..., check_same_thread=False)``); ``path`` names the
+    database file it opens. :meth:`get` returns this thread's :class:`HeldRead`, opening it on first use, and reopens it
+    when the file at ``path`` is no longer the file the connection was opened against (deleted, replaced, or moved:
+    its device and inode changed). The file is looked at BEFORE the connection is opened, so a file replaced in
+    between makes the next ``get`` reopen, never keep a connection to the old file under the new file's identity.
+
+    The held connection is ``query_only``, so a write through it is refused by SQLite. Each read runs in its own
+    ``BEGIN`` .. ``COMMIT`` (:meth:`read_transaction`), so it sees the newest commit and no snapshot is pinned between
+    calls. A thread's connection lives in ``threading.local``: it is dropped, and closed, when the thread ends, and
+    when this object is collected. There is no map to grow."""
+
+    def __init__(self, connect: Callable[[], sqlite3.Connection], path: Callable[[], "Path | str"]) -> None:
+        self._connect = connect
+        self._path = path
+        self._local = threading.local()
+
+    def _ident(self) -> "tuple[int, int] | None":
+        try:
+            st = os.stat(self._path())
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    def get(self) -> HeldRead:
+        ident = self._ident()
+        held: "HeldRead | None" = getattr(self._local, "held", None)
+        if held is not None:
+            if ident is not None and held.ident == ident:
+                return held
+            self.drop()
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except BaseException:
+            conn.close()
+            raise
+        held = HeldRead(conn, ident)
+        self._local.held = held
+        return held
+
+    def drop(self) -> None:
+        """Close and forget THIS thread's held connection (the next :meth:`get` opens a new one)."""
+        held: "HeldRead | None" = getattr(self._local, "held", None)
+        self._local.held = None
+        if held is not None:
+            held.close()
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """:func:`read_transaction` on the held connection. A read nested inside another on this thread (the held
+        connection is already inside its ``BEGIN``) takes a fresh connection for the inner one, as the caller would
+        have without a held one. A failed ``BEGIN`` or ``COMMIT`` drops the held connection, so a broken one is never
+        kept."""
+        held = self.get()
+        conn = held.conn
+        if conn.in_transaction:
+            with read_transaction(self._connect) as inner:
+                yield inner
+            return
+        try:
+            _until_not_busy(conn, lambda: conn.execute("BEGIN"))
+        except BaseException:
+            self.drop()
+            raise
+        try:
+            yield conn
+        except BaseException:
+            rollback(conn)
+            raise
+        try:
+            conn.execute("COMMIT")
+        except BaseException:
+            self.drop()
+            raise
