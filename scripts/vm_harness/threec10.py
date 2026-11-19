@@ -79,6 +79,8 @@ CRED_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")       # levain.broker.creds.NAME_R
 #: sitting's own T1 file, swapped for the unlimited key). An empty credential is refused before it can be moved into place.
 #: A refusal prints ``cred-refused ...`` and exits 0, so the runner reads it as data.
 INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
+                  # a fresh install has no keys/cred (set-credential makes it): make it 0700, the keys account's, as install_helper does
+                  'if [ ! -d "$d" ]; then mkdir -p "$d"; chmod 0700 "$d"; chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d"; fi; '
                   'if [ "$3" != replace ] && [ -e "$d/$n.json" ]; then cat > /dev/null; '
                   'echo "cred-refused $n: $d/$n.json already exists"; exit 0; fi; '
                   'cat > "$d/$n.json.new"; '
