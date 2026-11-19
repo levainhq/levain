@@ -865,8 +865,9 @@ def signing_public_key(key_path: Path) -> str:
 
 # an EMPTY answer (the provider answered without a usable touch) is asked for again after a wait, up to this many attempts in all
 _SK_EMPTY_ATTEMPTS = 3
-# the waits before attempt 2 and attempt 3 after an empty answer: probe2_run1_1119.txt (1119-14_sign_probe) found a sign a
-# moment after an empty one usually answered, and a longer gap after a second empty
+# the waits before attempt 2 and attempt 3 after an empty answer: a measurement of 2026-11-19, ONE run of three rounds
+# (probe2_run1_1119.txt in levain project_memory 1119-14_sign_probe): a sign about a second after an empty one mostly
+# answered, a longer gap was needed after a second empty. The next failures carry their own timing (elapsed_s in the evidence).
 _EMPTY_RETRY_WAITS_S = (1.0, 2.0)
 _ORDINALS = {2: "second", 3: "third"}
 _SK_RETRIES = 1                # a security-key answer that does not verify is asked for once more, never twice (levain#125)
