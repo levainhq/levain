@@ -1307,8 +1307,8 @@ def _rule_landed_not_closed(ctx: _Ctx, item: Item) -> State | None:
     # There is NO test for a closing trailer here, on purpose: a ``merged`` item that a trailer closed was taken by rule 2,
     # and for ``document``/``run``/``band`` the trailer is not what closes it (the file or the np row is), so commits
     # on main that name it while its own evidence is absent are landed work nobody closed.
-    landed = _landed(ctx, item)
-    if landed is None or ctx.idx.orphans(item.id):
+    landed, standing = _landed_standing(ctx, item)
+    if standing != "closable":          # none, an orphan branch carries more (rule 8), or an unmet item:/band: dependency (rule 7, np-5023a20a)
         return None
     count, last = landed
     return ctx.make(item, "landed_not_closed", _landed_why(count, last), [last.sha])
@@ -1324,10 +1324,37 @@ def _landed_why(count: int, last: MainCommit) -> str:
     return f"{count} commits on main, last {_short(last.sha)}; close it or name what remains"
 
 
-def _unmet(ctx: _Ctx, item: Item) -> list[tuple[str, str, str]]:
-    """``(ref, label, why)`` per dependency not yet met, in link order."""
+def _landed_standing(ctx: _Ctx, item: Item) -> tuple[tuple[int, MainCommit] | None, str]:
+    """``(landed, standing)``: the ONE place that says what landed work means for the item. ``standing`` is ``"none"`` (nothing on
+    main names it), ``"orphan"`` (an orphan branch carries more: the state follows rules 7-8 and the audit says the landed work),
+    ``"waiting"`` (no orphan, but an ``item:``/``band:`` dependency is unmet: rule 7 blocks it, np-5023a20a, and the landed work
+    is only noted) or ``"closable"`` (rule 6). A ``link:``, a gate or any other unmet kind never makes it ``"waiting"``."""
+    landed = _landed(ctx, item)
+    if landed is None:
+        return None, "none"
+    if ctx.idx.orphans(item.id):
+        return landed, "orphan"
+    return landed, ("waiting" if _unmet(ctx, item, ("item", "band")) else "closable")
+
+
+_CUT_WHY = "dependency cut: decide"
+
+
+def _landed_while_blocked(ctx: _Ctx, item: Item, landed: tuple[int, MainCommit]) -> str:
+    """The landed-work wording for an item that waits on an unmet ``item:``/``band:`` dependency. A cut or out-of-1.0 dependency can
+    never clear, so the tail says to resolve or remove it instead of waiting for it."""
+    count, last = landed
+    cut = any(w.startswith(_CUT_WHY) for _, _, w in _unmet(ctx, item, ("item", "band")))
+    tail = "resolve or remove the dependency before closing" if cut else "close it once the dependency clears"
+    return f"{count} commit(s) on main, last {_short(last.sha)}: {tail}"
+
+
+def _unmet(ctx: _Ctx, item: Item, kinds: tuple[str, ...] | None = None) -> list[tuple[str, str, str]]:
+    """``(ref, label, why)`` per dependency not yet met, in link order; ``kinds`` narrows it to those dependency kinds."""
     out = []
     for l in item.depends_on:
+        if kinds is not None and l.kind not in kinds:
+            continue
         if l.kind == "item":
             dep = ctx.items.get(l.ref or "")
             if dep is None:
@@ -1336,7 +1363,7 @@ def _unmet(ctx: _Ctx, item: Item) -> list[tuple[str, str, str]]:
             s = ctx.state_of(dep.id)
             if s.state != "done":
                 # a ruling that the work will not happen: the wait can never end, a human decides the dependent
-                shown = "dependency cut: decide" if s.state in ("cut", "out_of_1_0") else s.state
+                shown = _CUT_WHY if s.state in ("cut", "out_of_1_0") else s.state
                 out.append((dep.id, l.label, f"{shown} ({s.reason})" if s.reason else shown))
         elif l.kind == "band":
             if l.ref in ctx.ev.band_open or l.ref not in ctx.ev.band_resolved:
@@ -1360,9 +1387,15 @@ def _rule_blocked(ctx: _Ctx, item: Item) -> State | None:
     if old:
         ctx.causes[item.id] = "gate_expired"
         return ctx.make(item, "unknown", f"gate \"{old[0].words}\" past its recheck {old[0].recheck}", ())
+    landed, standing = _landed_standing(ctx, item)
+    note = ""
+    if standing == "waiting":           # the note is about the item:/band: blocker (a cut one first): name it first, whatever the link order
+        note = f"; {_landed_while_blocked(ctx, item, landed)}"
+        unmet = sorted(unmet, key=lambda u: (u[0] not in {x[0] for x in _unmet(ctx, item, ("item", "band"))},
+                                             not u[2].startswith(_CUT_WHY)))
     ref, label, why = unmet[0]
     more = f" (+{len(unmet) - 1} more)" if len(unmet) > 1 else ""
-    return ctx.make(item, "blocked", f"waits on {label}: {why}{more}", [u[0] for u in unmet])
+    return ctx.make(item, "blocked", f"waits on {label}: {why}{more}{note}", [u[0] for u in unmet])
 
 
 def _rule_ready_with_start(ctx: _Ctx, item: Item) -> State | None:
@@ -1566,14 +1599,16 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
             why = s.reason
             ctx.focus(folded.items[s.id])
-            gone = _landed(ctx, folded.items[s.id]) if kind == "gate_expired" else None
-            if gone:                    # landed work behind an orphan branch and this gate: rule 6 was skipped, the gate won; say both
-                why = f"{why}; {_landed_why(*gone)}"
+            gone, standing = _landed_standing(ctx, folded.items[s.id]) if kind == "gate_expired" else (None, "none")
+            if gone:                    # landed work and this gate: rule 6 was skipped (an orphan branch, or an unmet item:/band: dependency), the gate won; say both
+                why = f"{why}; " + (_landed_while_blocked(ctx, folded.items[s.id], gone) if standing == "waiting" else _landed_why(*gone))
             audit.append(AuditEntry(kind, s.id, why))
             continue
         old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
         ctx.focus(folded.items[s.id])
-        landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
+        landed, standing = _landed_standing(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else (None, "none")
+        if standing != "orphan":        # only an orphan branch ruled rule 6 out for the audit; a "waiting" row (np-5023a20a) has nothing closable now: no entry
+            landed = None
         if old:                         # a live state beside an expired gate keeps its state; the gate is the one entry
             audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
         elif s.state == "landed_not_closed":
