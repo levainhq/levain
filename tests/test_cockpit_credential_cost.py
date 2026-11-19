@@ -81,6 +81,7 @@ def test_verify_device_opens_one_connection_for_many_lookups(db: CockpitDB, monk
     """MEASURED before the change: every ``verify_device`` opened ``cockpit.db`` once (N calls, N opens). After: the
     first call opens the held connection, the rest open nothing."""
     _dev, tok = _enrol(db)
+    db._held.drop()                 # enrolling read through the held connection too; start this thread from none
     spy = _OpenSpy(monkeypatch)
     for _ in range(N_READS):
         assert db.verify_device(tok, now=NOW) is not None
@@ -414,3 +415,56 @@ def test_http_server_close_stops_the_stamper(src) -> None:
         assert thread is not None
     thread.join(5)
     assert not thread.is_alive()
+
+
+# --- the journal's other reads (D15c) ---------------------------------------------------------------------------------
+
+def test_journal_reads_share_one_connection_per_thread_and_see_every_commit(db: CockpitDB, monkeypatch) -> None:
+    """MEASURED before: every ``read()`` opened ``cockpit.db`` (N reads, N opens). After: one open for the thread, and
+    each read still sees what was committed before it began (each read is its own BEGIN .. COMMIT)."""
+    _enrol(db)
+    other = sqlite3.connect(db.path, isolation_level=None)      # a writer that is none of the reader's connections
+    db._held.drop()
+    spy = _OpenSpy(monkeypatch)
+    try:
+        for n in range(N_READS):
+            other.execute("UPDATE paired_devices SET label = ?", (f"label-{n}",))
+            assert db.list_devices()[0]["label"] == f"label-{n}"
+            assert db.meta("format") is not None
+    finally:
+        other.close()
+    print(f"MEASURE: {2 * N_READS} journal reads -> {len(spy.of('cockpit.db'))} cockpit.db opens")
+    assert len(spy.of("cockpit.db")) == 1
+
+
+def test_a_read_leaves_no_transaction_open_on_the_held_connection(db: CockpitDB) -> None:
+    _enrol(db)
+    assert db.meta("format") is not None
+    assert db._held.get().conn.in_transaction is False
+    with pytest.raises(sqlite3.OperationalError):
+        with db.read() as conn:
+            conn.execute("DELETE FROM paired_devices")      # a read is read-only
+    assert db._held.get().conn.in_transaction is False
+    assert len(db.list_devices()) == 1
+
+
+def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
+    _enrol(db)
+    conns: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def keep(*a: Any, **kw: Any) -> sqlite3.Connection:
+        c = real(*a, **kw)
+        conns.append(c)
+        return c
+
+    monkeypatch.setattr(sqlite3, "connect", keep)
+    for _ in range(20):
+        t = threading.Thread(target=lambda: db.list_devices())
+        t.start()
+        t.join(10)
+    gc.collect()
+    assert len(conns) == 20
+    for c in conns:
+        with pytest.raises(sqlite3.ProgrammingError):
+            c.execute("SELECT 1")

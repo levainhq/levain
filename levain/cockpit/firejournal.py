@@ -659,8 +659,8 @@ def _request_shape(record: Mapping[str, Any]) -> bytes:
 
 class CockpitDB:
     """``cockpit.db`` in ``data_root``. Every operation opens its own connection; every write is one
-    ``BEGIN IMMEDIATE`` transaction, except :meth:`verify_device`, which reads through the calling thread's held read
-    connection (:class:`~levain.autonomic.durable_sqlite.HeldReads`). ``data_root`` must exist: the broker's start
+    ``BEGIN IMMEDIATE`` transaction, except :meth:`read` (and :meth:`verify_device`), which run on the calling thread's
+    held read connection (:class:`~levain.autonomic.durable_sqlite.HeldReads`). ``data_root`` must exist: the broker's start
     sequence checks and owns it (§4.2, §6), so this never creates it."""
 
     def __init__(self, data_root: Path | str, *, install_class: str | None = None, owns_lock: bool = False) -> None:
@@ -773,8 +773,9 @@ class CockpitDB:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
-        """A consistent read snapshot."""
-        with read_transaction(self._connect) as conn:
+        """A consistent read snapshot, on the calling thread's held read connection (``query_only``: a write through
+        it is refused by SQLite)."""
+        with self._held.read_transaction() as conn:
             yield conn
 
     # -- meta ----------------------------------------------------------------------------------
