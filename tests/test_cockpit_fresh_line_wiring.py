@@ -342,3 +342,43 @@ def test_a_token_refusal_on_the_stamp_ends_with_the_refusal_when_a_read_of_anoth
     refused, after = out["values"][-2], out["values"][-1]
     assert refused.startswith("read refused"), refused
     assert after == "", after
+
+
+# the retry of a panel unreadable at the whole draw (no live node): one request of its own, never a manifest and every panel again
+UNREAD_RETRY = r"""(async () => {
+  const wait = async (f, ms) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await new Promise((r) => setTimeout(r, 50)); } return false; };
+  const unavailable = () => { const h = (window.LevainCockpitHeld || {}).work_board; return !!(h && h.err) && !!document.querySelector('[data-panel-id="work_board"] .err'); };
+  window.__panelFail = 'work_board'; window.LevainCockpitTransport.reload();
+  const drawn = await wait(unavailable, 8000);
+  const log = [], real = window.fetch; let fresh = 0;
+  window.fetch = (u, o) => { log.push(String(u)); return real(u, o); };
+  document.addEventListener('levain:fresh', () => { fresh++; });
+  const route = (l) => l.map((u) => u.replace(/^https?:\/\/[^/]+/, '').split('?')[0]);
+  const first = await window.LevainCockpitView.refetchPanel('work_board');
+  const failedLog = route(log.splice(0)), failedFresh = fresh; fresh = 0;
+  window.__panelFail = null;
+  const second = await window.LevainCockpitView.refetchPanel('work_board');
+  const healedLog = route(log.splice(0));
+  const stillUnavailable = unavailable();
+  window.LevainCockpitTransport.reload();
+  const mounted = await wait(() => !unavailable(), 8000);
+  const reloadLog = route(log.splice(0));
+  window.fetch = real;
+  return JSON.stringify({ probe: 'unread', drawn, first, failedLog, failedFresh, second, healedLog, stillUnavailable, mounted, reloadLog });
+})()"""
+
+
+@needs_browser
+def test_the_retry_of_a_panel_unreadable_at_the_whole_draw_is_one_read_of_that_panel_not_a_whole_reload(tmp_path: Path) -> None:
+    """A panel the whole read could not read has no live node. Its retry through refetchPanel is ONE request, to its own route (answered "fault", which the
+    stream bounds without a reload); answering false with no read made every retry step a whole reload of the board. A read that lands answers false."""
+    out = _open(tmp_path, [READY, LIVE, SETTLE, _run(STUB2), {"eval": UNREAD_RETRY}])
+    (g,) = [v for v in _vals(out) if v.get("probe") == "unread"]
+    assert g["drawn"] is True, g
+    assert g["first"] == "fault", g
+    assert len(g["failedLog"]) == 1 and not any("manifest" in u for u in g["failedLog"]), g["failedLog"]   # one read, no manifest, no other panel
+    assert g["failedFresh"] == 1, g                                                                          # the line is told once
+    assert g["second"] is False and g["stillUnavailable"] is True, g                                          # a read that lands: only a whole draw mounts it
+    assert len(g["healedLog"]) == 1 and "work_board" in g["healedLog"][0], g["healedLog"]
+    assert g["mounted"] is True, g
+    assert sum("manifest" in u for u in g["reloadLog"]) == 1, g["reloadLog"]                                  # the one whole reload draws it

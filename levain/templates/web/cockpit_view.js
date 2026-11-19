@@ -1961,6 +1961,15 @@
   }
   async function readInPlace(pid) {
     if (!liveOf(pid).length) {
+      // A panel the whole read could not read is drawn as a plain error card with no live node. Its retry must cost one read of that
+      // panel, not a board: answering false here would make the stream reload every panel on every retry step and every event. A
+      // failed read throws to refetchPanel (the one publisher, answering "fault", which the stream bounds without a reload); a read that
+      // succeeds answers false, because only a whole draw can mount the panel, and that one reload is the right one.
+      const held = root.LevainCockpitHeld && root.LevainCockpitHeld[pid];
+      if (held && held.err) {
+        await readPanel(pid);
+        return false;
+      }
       if (!briefUndrawn(pid)) return false;
       try {
         noteApplied(pid, await readPanel(pid));

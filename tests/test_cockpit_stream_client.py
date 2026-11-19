@@ -289,8 +289,10 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
   {
     const h = boot({});
     h.win.LevainCockpitHeld.a.err = "unavailable";
-    let reloads = 0;
-    h.win.LevainCockpitView.refetchPanel = async () => false;     // an unavailable panel has no node to redraw in place
+    let reloads = 0, reads = 0;
+    // an unavailable panel has no node to redraw in place: the page's refetchPanel makes ONE read of it and answers "fault" while that read fails
+    // (never false without a read, which asked for a whole reload at every step)
+    h.win.LevainCockpitView.refetchPanel = async () => { reads++; return "fault"; };
     // a reload draws the whole board again: the page says so, and the panel is still unavailable
     h.win.LevainCockpitTransport.reload = () => { reloads++; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
     await settle();
@@ -301,13 +303,31 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     };
     (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
     for (let i = 0; i < 40 && await fire(); i++) { /* fake time: every pending timer fires in turn */ }
-    ok(reloads === 3, "an always-unavailable panel reloads the board once per retry step, then waits: " + reloads);
+    ok(reloads === 0, "an always-unavailable panel is read once per retry step and never reloads the board: " + reloads);
+    ok(reads === 3, "the schedule's three single-panel reads, then it waits: " + reads);
     // it recovers on a draw: its count starts over, so the next failure gets the first step again
     delete h.win.LevainCockpitHeld.a.err;
     (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
     h.win.LevainCockpitHeld.a.err = "unavailable";
     (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
     ok(h.live().some((x) => x.ms === 5000), "a panel that recovered starts the schedule over");
+  }
+  // ---- a panel unreadable at the whole draw whose retry read lands: refetchPanel answers false (only a whole draw can mount it), ONE reload ----
+  {
+    const h = boot({});
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    let reloads = 0, reads = 0;
+    h.win.LevainCockpitView.refetchPanel = async () => { reads++; return reads < 2 ? "fault" : false; };
+    h.win.LevainCockpitTransport.reload = () => { reloads++; delete h.win.LevainCockpitHeld.a.err; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
+    await settle();
+    const fire = async () => {
+      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000);
+      if (!t) return false;
+      t.off = true; t.fn(); await settle(); return true;
+    };
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    for (let i = 0; i < 40 && await fire(); i++) { /* fake time */ }
+    ok(reads === 2 && reloads === 1, "one failed read, then the read that lands asks for the one whole draw: reads " + reads + " reloads " + reloads);
   }
   // ---- a new event for an exhausted panel starts its schedule over ----
   {
