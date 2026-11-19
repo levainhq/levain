@@ -4206,6 +4206,26 @@ body.ia[data-ia-place="home"] #ck-band #ck-state-slot { align-self: baseline; } 
 body.ia[data-ia-place="home"] #ck-band .stateline { padding: 0; margin: 0; }
 body.ia[data-ia-place="home"] #ck-band .band-state .ftext { line-height: 1.2; }
 
+/* levain#167 (Phill 11-19): the head block under the places bar. Desktop: a little more room between the places bar and the clock and
+   state line. Phone: the clock and date are one unit; the state line is the hero, its age and edit a quiet line under it; the wrap
+   line and the event count are a separate quiet status row, not the same weight as the state. */
+body.ia[data-ia-place="home"] #ck-band { padding-block-start: var(--sp-5); }
+@media (max-width: 720px) {
+  body.ia[data-ia-place="home"] #ck-band { flex-direction: column; align-items: stretch; gap: var(--sp-5); padding-block-start: var(--sp-5); }
+  body.ia[data-ia-place="home"] #ck-band #ck-state-slot { align-self: stretch; }
+  body.ia[data-ia-place="home"] #ck-band .clockbox { flex-wrap: wrap; column-gap: var(--sp-4); }
+  /* the State label sits tight above its line, the age and edit follow on one quiet line under it */
+  body.ia[data-ia-place="home"] #ck-band .stateline { row-gap: var(--sp-2); column-gap: var(--sp-4); }
+  body.ia[data-ia-place="home"] #ck-band .band-state .ftext { flex: 1 0 100%; font-size: var(--fs-h); }
+  body.ia[data-ia-place="home"] #ck-band .stateline .fage { color: var(--meta); }
+  /* the status row: one hairline above it, wrap and events flowing on a row of their own, meta weight */
+  body.ia[data-ia-place="home"] #ck-band .band-meta {
+    margin: var(--sp-2) 0 0; padding-top: var(--sp-3); border-top: 1px solid var(--hair); flex-direction: row; flex-wrap: wrap;
+    justify-content: flex-start; align-items: baseline; gap: var(--sp-1) var(--sp-5); }
+  body.ia[data-ia-place="home"] #ck-band .band-meta b { color: var(--meta); }
+  body.ia[data-ia-place="home"] #ck-band .band-meta .wrapline { flex-wrap: wrap; row-gap: 0; }
+}
+
 /* Drop to the desk: the card's head (the heading and the sign-in note) and the box take the card's inner padding. Home flattens every
    frame to padding-inline: 0 (the grid supplies the gutter), which left this card's content against its edge. */
 body.ia[data-ia-place="home"] #ck-drop.frame { padding-inline: var(--sp-6); }
