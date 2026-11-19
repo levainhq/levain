@@ -60,6 +60,8 @@ def test_the_head_over_a_decoded_snapshot_says_what_the_head_over_the_providers_
         assert {k: v for k, v in got.items() if k not in new_fields} == \
             {k: v for k, v in want.items() if k not in new_fields}, pid
         assert set(got) - set(want) == {"valid_until", "stale", "pending"}, pid
+        # the rows and the value (and what the read filtered and skipped) a decoded snapshot carries are the provider's own
+        assert decoded.etag_frags() == provider_snap.etag_frags(), pid
         assert manifest[pid]["etag"] == got["etag"] and manifest[pid]["etag"] != want["etag"], pid
         assert decoded.fresh_info is not None and decoded.fresh_info.stale is False, pid
 
