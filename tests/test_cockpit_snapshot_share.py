@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
+from typing import Any
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,18 @@ def ck(tmp_path: Path) -> Cockpit:
     c.read_cache_ttl_s = 1.5
     assert c._specs[PID].refresh_every_s is None
     return c
+
+
+@pytest.fixture(autouse=True)
+def _close_patched_manifest_pools():
+    """A test that patches the pool size makes a pool of that size; shut down any pool this test added."""
+    from levain.cockpit import engine as eng
+    before = set(eng._manifest_pools)
+    yield
+    with eng._manifest_pools_lock:
+        made = [eng._manifest_pools.pop(k) for k in list(eng._manifest_pools) if k not in before]
+    for pool in made:
+        pool.shutdown(wait=True)
 
 
 def _provider_reads(monkeypatch, ck: Cockpit, *, hold: threading.Event | None = None,
@@ -268,10 +281,10 @@ def test_a_refresher_panels_refetch_after_a_watcher_build_is_a_new_entry(ck) -> 
 
 
 def test_concurrent_manifests_share_one_bounded_pool_of_readers(tmp_path: Path, monkeypatch) -> None:
-    # codex L3 r2: each cache-distinct manifest (one per device credential) started its own pool of _MANIFEST_READERS
+    # codex L3 r2: each cache-distinct manifest (one per device credential) started its own pool of _MANIFEST_POOL_THREADS
     from levain.cockpit import engine as eng
 
-    monkeypatch.setattr(eng, "_MANIFEST_READERS", 3)
+    monkeypatch.setattr(eng, "_MANIFEST_POOL_THREADS", 3)
     _r, src, _ids = _install(tmp_path)
     c = build_default_cockpit(src)          # cache off: every manifest computes
     real = c._snap_for
@@ -288,9 +301,19 @@ def test_concurrent_manifests_share_one_bounded_pool_of_readers(tmp_path: Path, 
 
     monkeypatch.setattr(c, "_snap_for", slow)
     creds = [{"class": "token", "name": f"device-{i}", "device_class": None} for i in range(4)]
-    ts = [threading.Thread(target=lambda cr=cr: c.manifest(cr)) for cr in creds]
+    done: dict[str, Any] = {}
+
+    def run(cr: dict) -> None:
+        try:
+            done[cr["name"]] = c.manifest(cr)
+        except BaseException as e:          # noqa: BLE001 - recorded, asserted below
+            done[cr["name"]] = e
+
+    ts = [threading.Thread(target=run, args=(cr,)) for cr in creds]
     [t.start() for t in ts]
     [t.join(60) for t in ts]
+    assert not any(t.is_alive() for t in ts)
+    assert len(done) == 4 and all(isinstance(v, dict) for v in done.values()), done
     assert 0 < peak[0] <= 3
 
 
@@ -301,3 +324,40 @@ def test_nothing_is_shared_where_the_read_cache_is_off(ck, monkeypatch, ttl) -> 
     ck.manifest(NONE)
     ck.panel(PID, credential_class="none")
     assert n[PID] == 2
+
+
+def test_a_manifest_stuck_on_its_panels_does_not_hold_another_credentials_manifest(tmp_path: Path) -> None:
+    # levain#138 L3 r3: pool tasks mostly wait on a panel's flight, so a shared pool too small for two manifests queued a
+    # healthy device's manifest behind another device's hung panels
+    _r, src, _ids = _install(tmp_path)
+    stuck, healthy = build_default_cockpit(src), build_default_cockpit(src)
+    release = threading.Event()
+    real = stuck._snap_for
+
+    def hang(spec, ctx, read_after=None):
+        assert release.wait(30)
+        return real(spec, ctx, read_after)
+
+    stuck._snap_for = hang                  # type: ignore[method-assign]
+    out: dict[str, Any] = {}
+
+    def run(name: str, ck: Cockpit, cred: dict) -> None:
+        try:
+            out[name] = ck.manifest(cred)
+        except BaseException as e:          # noqa: BLE001 - recorded, asserted below
+            out[name] = e
+
+    ta = threading.Thread(target=run, args=("stuck", stuck, {**TOKEN, "name": "device-a"}))
+    tb = threading.Thread(target=run, args=("healthy", healthy, {**TOKEN, "name": "device-b"}))
+    try:
+        ta.start()
+        time.sleep(0.3)                     # the stuck manifest has its panel reads parked
+        tb.start()
+        tb.join(10)
+        assert not tb.is_alive() and "healthy" in out, "the healthy manifest queued behind the stuck one"
+        assert isinstance(out["healthy"], dict)
+    finally:
+        release.set()
+        ta.join(30)
+        tb.join(30)
+    assert isinstance(out["stuck"], dict) and not ta.is_alive()

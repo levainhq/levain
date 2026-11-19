@@ -725,14 +725,14 @@ _UNSET: Any = object()      # attach_server's "board not given", distinct from a
 _READ_CACHE_MAX = 64          # live entries; past it a read simply runs uncached
 _READ_CACHE_JOIN_S = 60.0     # how long a joiner waits for the owner before reading for itself
 _SHARED_STATUSES = ("ok", "empty", "partial")   # the on-demand outcomes later reads may share; a failure is read again
-_MANIFEST_READERS = 16        # manifest panel reads at once, across every manifest in the process (``Cockpit._parallel``)
+_MANIFEST_POOL_THREADS = 64   # threads of the one process-wide manifest pool: a task mostly waits on a panel flight, so this bounds threads, not CPU
 _manifest_pools: dict[int, ThreadPoolExecutor] = {}
 _manifest_pools_lock = threading.Lock()
 
 
 def _manifest_pool(size: int) -> ThreadPoolExecutor:
     """The process's manifest-read pool of ``size`` threads, made on first use (keyed by size, so a test that patches
-    ``_MANIFEST_READERS`` gets a pool of its own size); its idle threads end with the process."""
+    ``_MANIFEST_POOL_THREADS`` gets a pool of its own size); its idle threads end with the process."""
     with _manifest_pools_lock:
         pool = _manifest_pools.get(size)
         if pool is None:
@@ -2375,14 +2375,15 @@ class Cockpit:
 
     @staticmethod
     def _parallel(fn: Callable[[Any], Any], items: list[Any]) -> list[Any]:
-        """``fn`` over ``items`` on the process's one pool of ``_MANIFEST_READERS`` threads, results in ``items`` order;
-        the first failure (in order) is raised after every call has finished. One pool for every manifest, so concurrent
-        manifests (one per credential, install class and transport) share ``_MANIFEST_READERS`` threads instead of each
-        starting its own (L3 r2). A task never submits to the pool (a provider runs on its flight's own worker thread),
-        so a full pool only queues; a hung provider already holds every manifest that reads it through its one flight."""
+        """``fn`` over ``items`` on the process's one pool of ``_MANIFEST_POOL_THREADS`` threads, results in ``items`` order;
+        the first failure (in order) is raised after every call has finished. One pool for every manifest (one per
+        credential, install class and transport) bounds the process's threads where a pool each would not (L3 r2). A task
+        mostly waits on its panel's flight (the provider runs on the flight's own worker thread), so the pool is sized to
+        hold a handful of concurrent manifests without one queuing behind another's slow panel (L3 r3). A task never
+        submits to the pool, so a full pool only queues."""
         if len(items) < 2:
             return [fn(i) for i in items]
-        pool = _manifest_pool(_MANIFEST_READERS)
+        pool = _manifest_pool(_MANIFEST_POOL_THREADS)
         futures = [pool.submit(fn, i) for i in items]
         wait_futures(futures)
         return [f.result() for f in futures]
