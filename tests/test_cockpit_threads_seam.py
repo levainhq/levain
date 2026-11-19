@@ -9,6 +9,7 @@ import pytest
 
 from levain.cockpit import threads
 from levain.web_server import make_server
+from tests.test_cockpit_k7_build import RETIRED_BUILD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _get_status
@@ -59,6 +60,7 @@ def test_the_boot_script_reads_the_flag_and_keeps_the_zone_hidden():
     assert "section.hidden = off || !read || !token();" in js
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_the_real_page_draws_no_threads_zone_when_off_and_one_when_on(tmp_path):
     _root, src, _ids = _install(tmp_path)
@@ -138,6 +140,7 @@ def _quiet_after(until):
     ]
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_the_legacy_substrate_page_also_draws_no_zone_and_stops_polling_when_off(tmp_path):
     _root, src, _ids = _install(tmp_path)
@@ -147,6 +150,7 @@ def test_the_legacy_substrate_page_also_draws_no_zone_and_stops_polling_when_off
     assert hidden is True and second == first, out["values"]     # no thread request after the flag, over two poll periods
 
 
+@RETIRED_BUILD
 @needs_browser
 def test_an_already_mounted_zone_is_torn_down_when_the_flag_arrives_late(tmp_path):
     _root, src, _ids = _install(tmp_path)

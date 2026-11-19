@@ -90,7 +90,7 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
     assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # the next element after the strip in the document, outside the hero
     assert p["bandBottom"] <= p["needs"] and p["needsBottom"] <= p["drop"], p               # under the band, and under the strip (the document order is the narrow order too)
     assert p["drop"] < p["tray"], p                                                         # above the work regions
-    assert p["sky"] is None or (p["sky"] < p["needs"] if view == "1280" else p["needs"] < p["sky"]), p   # the desktop sky card sits above the strip; the narrow page draws it after
+    assert p["sky"] is None or p["needs"] < p["sky"], p   # Home draws the sky card with the machine, after the strip, at every width
     assert p["boxW"] >= (0.55 if view == "1280" else 0.85) * p["hostW"] and p["boxH"] >= 150, p   # the free-text rule: the box fills its card (a side column of drops beside it from 1100px), ~8 rows
     assert p["buttons"][:2] == ["Send", "Add an envelope"], p
 

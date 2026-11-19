@@ -13,54 +13,44 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
 CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css"
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
-TABS = ["needs", "board", "notifications", "grants", "drop", "room", "desk"]
+# the places bar holds places only (levain#141); the actions are masthead buttons and the drivers the bar presses are hidden
+PLACES = ["home", "desk", "room", "memory"]
+JUMPS = ["grants", "drop", "notifications", "room", "desk"]
 
 # where things sit and how the strip draws, as one JSON string
 LAYOUT = """(() => { const q = (s) => document.querySelector(s);
   const heroBox = (e) => { const c = getComputedStyle(e); return [c.paddingTop, c.paddingRight, c.paddingBottom, c.paddingLeft, c.marginTop, c.marginBottom, c.borderTopWidth, c.borderBottomWidth].join(' ') + ' ' + c.backgroundColor + ' ' + c.backgroundImage; }; const top = (e) => e ? Math.round(e.getBoundingClientRect().top + window.scrollY) : null;
   const strip = q('#ck-phonetabs'); const cs = getComputedStyle(strip);
-  return JSON.stringify({ display: cs.display, position: cs.position, tabs: [...strip.querySelectorAll('button')].map(b => b.dataset.phoneJump),
+  return JSON.stringify({ display: cs.display, position: cs.position, tabs: [...strip.querySelectorAll('button')].map(b => b.dataset.iaPlaceBtn),
     tabH: Math.min(...[...strip.querySelectorAll('button')].map(b => Math.round(b.getBoundingClientRect().height))),
     tabsWhole: [...strip.querySelectorAll('button')].every(b => b.scrollWidth <= b.clientWidth), stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), drop: top(q('#ck-drop')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
     vw: document.documentElement.clientWidth, heroDisplay: getComputedStyle(q('#ck-hero')).display, heroBox: heroBox(q('#ck-hero')) }); })()"""
 
 
-def _jump(which: str, panel: str) -> list:
-    """Click one strip tab from the page's top and read where its target landed (px below the viewport's top) and how far the page moved."""
-    return [{"eval": "window.scrollTo(0, 0); 1"},
-            {"eval": f"document.querySelector('[data-phone-jump={which}]').click(); 1"},
-            {"eval": "new Promise(r => setTimeout(r, 700)).then(() => 1)"},
-            {"eval": f"(() => {{ const e = document.querySelector('{panel}'); return JSON.stringify({{ which: '{which}', top: e ? Math.round(e.getBoundingClientRect().top) : null, y: Math.round(window.scrollY) }}); }})()"}]
-
-
 @needs_browser
 @needs_ssh
-def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp_path: Path, monkeypatch) -> None:
+def test_a_phone_gets_the_places_bar_the_needs_before_the_graph_and_a_notifications_button(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": LAYOUT},
-             *_jump("needs", "#ck-needs"), *_jump("board", ".panel[data-ck-panel=\"tray\"]"),
              {"eval": "document.querySelector('[data-phone-jump=notifications]').click(); 1"},
              {"until": "document.querySelector('#levain-modal .nc-root') && 1", "ms": 20000},
              {"eval": "JSON.stringify({ which: 'notifications', modal: !!document.querySelector('#levain-modal .nc-root') })"}]
     with rig.serving():
         values = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
     layout, jumps = values[0], {v["which"]: v for v in values[1:]}
-    assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["tabs"] == TABS
+    assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["tabs"] == PLACES
     assert layout["tabH"] >= 40, layout   # a thumb's height
     assert layout["tabsWhole"], layout    # every tab shows its whole label at 390 (the strip scrolls for the rest)
     assert layout["scrollW"] <= layout["vw"], layout   # no sideways scroll
     # the hero's two children join the deck's column without the hero's own box: it carries none for the flatten to lose
     assert layout["heroDisplay"] == "contents" and layout["heroBox"] == "0px 0px 0px 0px 0px 0px 0px 0px rgba(0, 0, 0, 0) none", layout
-    # the state line (the band), then what waits on him, then the graph
+    # the state line (the band), then what waits on him, then the graph (Home puts the graph with the machine, after the desk and the work)
     assert layout["stripTop"] < layout["band"] < layout["needs"] < layout["sky"], layout
     # the drop sits directly under the strip (Phill 10-30), before the graph
     assert layout["needs"] < layout["drop"] < layout["sky"], layout
-    # the board tab lands its block below the sticky strip; needs is at the top already; Notifications opens the center's focus view (S4.2)
-    j = jumps["board"]
-    assert j["top"] is not None and 40 <= j["top"] < 140 and j["y"] > 0, j
+    # the Notifications button in the masthead opens the center's focus view (S4.2)
     assert jumps["notifications"]["modal"] is True, jumps["notifications"]
-    assert jumps["needs"]["top"] is not None and 40 <= jumps["needs"]["top"] < 140, jumps["needs"]
 
 
 # the Decisions view's reads answer late: the page's own fetch is held 4.5 s for the two the strip's tabs wait on, longer than a
@@ -134,35 +124,9 @@ def test_a_view_closed_and_opened_again_is_not_scrolled_by_the_wait_of_the_one_b
     assert got[1] == {"step": "after", "scrolled": 0}, got
 
 
-def _hidden_jump(mode: str, which: str, panel: str) -> list:
-    """Save `mode` as the page's tab (the way a reader's last tab is kept), click one strip tab and read the panel's state before and after."""
-    return [{"eval": f"window.LevainCockpitKinds.applyMode('{mode}', true); window.scrollTo(0, 0); 1"},
-            {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"},
-            {"eval": f"window.__before = !!document.querySelector('{panel}').getClientRects().length; document.querySelector('[data-phone-jump={which}]').click(); 1"},
-            {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
-            {"eval": f"(() => {{ const e = document.querySelector('{panel}'); return JSON.stringify({{ mode: '{mode}', which: '{which}', drawnBefore: window.__before,"
-                     f" drawnAfter: !!e.getClientRects().length, top: Math.round(e.getBoundingClientRect().top), tab: document.body.dataset.mode }}); }})()"}]
-
-
 @needs_browser
 @needs_ssh
-def test_the_board_tab_reveals_a_panel_the_saved_tab_hides(tmp_path: Path, monkeypatch) -> None:
-    rig = FullRig(tmp_path, monkeypatch)
-    url = f"{rig.origin}/#write_token={TOK}"
-    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, SETTLE]
-    for mode in ("build", "memory"):
-        steps += _hidden_jump(mode, "board", ".panel[data-ck-panel=\"tray\"]")
-    with rig.serving():
-        got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
-    assert len(got) == 2, got
-    for g in got:
-        assert not g["drawnBefore"], g   # the saved tab really hid it
-        assert g["drawnAfter"] and g["tab"] == "board" and 40 <= g["top"] < 140, g   # the tap revealed its tab and landed under the strip
-
-
-@needs_browser
-@needs_ssh
-def test_a_desktop_draws_the_strip_and_keeps_the_graph_above_the_needs(tmp_path: Path, monkeypatch) -> None:
+def test_a_desktop_draws_the_strip_and_the_homes_own_order(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     with rig.serving():
@@ -170,9 +134,9 @@ def test_a_desktop_draws_the_strip_and_keeps_the_graph_above_the_needs(tmp_path:
                                      {"emulate": {"w": 721, "h": 900, "dpr": 1}}, SETTLE, {"eval": LAYOUT}])["values"]
     layouts = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{")]
     assert len(layouts) == 2, layouts
-    for layout in layouts:   # the widest width the narrow block does not reach draws what the desktop does, and the strip at every width (S4.2)
-        assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["heroDisplay"] != "contents", layout
-        assert layout["band"] < layout["sky"] < layout["needs"], layout   # the wide page's own order
+    for layout in layouts:   # the strip at every width (S4.2); Home flattens the hero into its grid and orders the band, the needs, then the graph
+        assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["heroDisplay"] == "contents", layout
+        assert layout["band"] < layout["needs"] < layout["sky"], layout
 
 
 @needs_browser
@@ -206,4 +170,5 @@ def test_the_strip_is_hidden_by_default_and_drawn_in_the_narrow_block_and_the_wi
     drawn = [b for b in blocks if re.search(r"\.ck-phonetabs\s*\{[^}]*display:\s*flex", b)]
     assert len(drawn) == 2 and {d.lstrip().split(")", 1)[0] for d in drawn} == {"(max-width: 720px", "(min-width: 721px"}, "the strip is drawn at every width: the 720px break and the one above it"
     html = HTML.read_text()
-    assert [html.count(f'data-phone-jump="{t}"') for t in TABS] == [1] * len(TABS)
+    assert [html.count(f'data-phone-jump="{t}"') for t in JUMPS] == [1] * len(JUMPS)
+    assert html.count("data-ia-place-btn=") == len(PLACES)

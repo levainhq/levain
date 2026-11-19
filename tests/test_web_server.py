@@ -707,9 +707,10 @@ console.log("OK");
             status, headers, body = _get(base + "/")
         assert status == 200
         assert headers["Content-Type"] == "text/html; charset=utf-8"
-        # the page identifies as Levain AND serves the Morning / Board / Build mode bar
+        # the page identifies as Levain AND serves the places bar (levain#141: the Modes bar is gone)
         assert b"Levain" in body
-        assert b'data-mode-tab="morning"' in body and b'data-mode-tab="build"' in body
+        assert b'data-ia-place-btn="home"' in body and b'data-ia-place-btn="memory"' in body
+        assert b'aria-label="Modes"' not in body
 
     def test_script_routes(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):

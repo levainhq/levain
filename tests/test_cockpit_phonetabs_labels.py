@@ -1,5 +1,6 @@
-"""The phone's jump strip at 390: each tab shows its whole label (none ends in an ellipsis or is cut at its edge), the strip scrolls
-sideways when the labels outrun its width, and it never wraps to a second row. `LEVAIN_TABSTRIP_SHOT=<png path>` keeps the strip's screen."""
+"""The phone's places bar at 390: each place shows its whole label (none ends in an ellipsis or is cut at its edge), the bar scrolls
+sideways (with a fade cue) if its labels ever outrun its width, and it never wraps to a second row. The four places fit at 390, so the
+scroll and cue cases first widen the buttons on purpose (an inline style, as the cue's own observer must catch it). `LEVAIN_TABSTRIP_SHOT=<png path>` keeps the strip's screen."""
 from __future__ import annotations
 
 import json
@@ -12,12 +13,12 @@ STRIP = """(() => { const s = document.querySelector('#ck-phonetabs'); const bs 
   return JSON.stringify({ wrap: getComputedStyle(s).flexWrap, overflowX: getComputedStyle(s).overflowX,
     stripScrolls: s.scrollWidth > s.clientWidth, tops: [...new Set(bs.map(b => Math.round(b.getBoundingClientRect().top)))],
     pageScrollW: document.documentElement.scrollWidth, vw: document.documentElement.clientWidth,
-    tabs: bs.map(b => ({ jump: b.dataset.phoneJump, text: b.textContent.trim(), cut: b.scrollWidth > b.clientWidth, ellipsis: getComputedStyle(b).textOverflow === 'ellipsis' && b.scrollWidth > b.clientWidth })) }); })()"""
+    tabs: bs.map(b => ({ jump: b.dataset.iaPlaceBtn, text: b.textContent.trim(), cut: b.scrollWidth > b.clientWidth, ellipsis: getComputedStyle(b).textOverflow === 'ellipsis' && b.scrollWidth > b.clientWidth })) }); })()"""
 
 
 @needs_browser
 @needs_ssh
-def test_every_phone_tab_shows_its_whole_label_and_the_strip_scrolls_not_wraps(tmp_path: Path, monkeypatch) -> None:
+def test_every_place_shows_its_whole_label_in_one_row_at_390(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, SETTLE]
@@ -28,11 +29,11 @@ def test_every_phone_tab_shows_its_whole_label_and_the_strip_scrolls_not_wraps(t
     with rig.serving():
         values = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
     got = values[-1]
-    assert [t["jump"] for t in got["tabs"]] == ["needs", "board", "notifications", "grants", "drop", "room", "desk"], got
+    assert [t["jump"] for t in got["tabs"]] == ["home", "desk", "room", "memory"], got
     assert all(t["text"] for t in got["tabs"]), got
     assert not [t for t in got["tabs"] if t["cut"] or t["ellipsis"]], got   # every label whole
     assert got["wrap"] == "nowrap" and len(got["tops"]) == 1, got           # one row
-    assert got["stripScrolls"] and got["overflowX"] in ("auto", "scroll"), got   # the overflow goes sideways inside the strip
+    assert not got["stripScrolls"] and got["overflowX"] in ("auto", "scroll"), got   # the four places fit; an overflow would go sideways inside the bar
     assert got["pageScrollW"] <= got["vw"], got                             # never the page
 
 
@@ -43,10 +44,15 @@ TO_END = """(() => { const s = document.querySelector('#ck-phonetabs'); s.scroll
   return new Promise(r => setTimeout(r, 400)).then(() => 1); })()"""
 
 
-def _cue_values(tmp_path: Path, monkeypatch, view: dict, *, scroll_end: bool) -> list[dict]:
+WIDEN = """(() => { document.querySelectorAll('#ck-phonetabs button').forEach(b => {
+  b.style.setProperty('flex', 'none', 'important'); b.style.setProperty('min-width', '140px', 'important'); });
+  return new Promise(r => setTimeout(r, 600)).then(() => 1); })()"""
+
+
+def _cue_values(tmp_path: Path, monkeypatch, view: dict, *, scroll_end: bool, widen: bool = False) -> list[dict]:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
-    steps = [view, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": CUE}]
+    steps = [view, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE] + ([{"eval": WIDEN}] if widen else []) + [{"eval": CUE}]
     if scroll_end:
         steps += [{"eval": TO_END}, {"eval": CUE}]
     with rig.serving():
@@ -57,8 +63,8 @@ def _cue_values(tmp_path: Path, monkeypatch, view: dict, *, scroll_end: bool) ->
 @needs_browser
 @needs_ssh
 def test_strip_cues_the_tabs_off_screen_at_390(tmp_path: Path, monkeypatch) -> None:
-    start, end = _cue_values(tmp_path, monkeypatch, PHONE, scroll_end=True)
-    assert start["scrolls"] and start["right"] and not start["left"], start   # Room is off the right edge: the right edge fades
+    start, end = _cue_values(tmp_path, monkeypatch, PHONE, scroll_end=True, widen=True)
+    assert start["scrolls"] and start["right"] and not start["left"], start   # a place is off the right edge: the right edge fades
     assert end["x"] > 0 and end["left"] and not end["right"], end             # at the far end the fade moves to the left edge
 
 
@@ -69,24 +75,16 @@ def test_strip_has_no_cue_when_every_tab_fits(tmp_path: Path, monkeypatch) -> No
     assert not got["scrolls"] and not got["right"] and not got["left"], got
 
 
-SHRINK = """(() => { document.querySelectorAll('#ck-phonetabs button').forEach(b => { b.style.setProperty('font-size', '1px', 'important');
-  b.style.setProperty('padding', '0', 'important'); b.style.setProperty('width', '8px', 'important'); b.style.setProperty('min-width', '0', 'important');
-  b.style.setProperty('overflow', 'hidden', 'important'); });
-  return new Promise(r => setTimeout(r, 600)).then(() => 1); })()"""
-# Inline styles on the buttons (CSSOM, so a style-src policy allows them): no window resize and no change to the strip's child list,
-# only the labels' width moves. The attribute write is on the button, not a childList/characterData change under the strip.
-UNSHRINK = """(() => { document.querySelectorAll('#ck-phonetabs button').forEach(b => b.style.cssText = '');
-  return new Promise(r => setTimeout(r, 600)).then(() => 1); })()"""
-
-
 @needs_browser
 @needs_ssh
 def test_strip_cue_returns_when_labels_widen_without_a_watched_event(tmp_path: Path, monkeypatch) -> None:
+    """Inline styles on the buttons (CSSOM, so a style-src policy allows them): no window resize and no change to the strip's child
+    list, only the labels' width moves. The attribute write is on the button, not a childList/characterData change under the strip."""
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
-    steps = [PHONE, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": SHRINK}, {"eval": CUE}, {"eval": UNSHRINK}, {"eval": CUE}]
+    steps = [PHONE, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": CUE}, {"eval": WIDEN}, {"eval": CUE}]
     with rig.serving():
         vals = drive_touch(tmp_path, url, steps)["values"]
     fit, widened = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{") and '"cue"' in v]
-    assert not fit["scrolls"] and not fit["right"], (fit, vals)            # the shrunk labels fit: the cue cleared
-    assert widened["scrolls"] and widened["right"], widened        # widened again with no resize or strip mutation: the cue is back
+    assert not fit["scrolls"] and not fit["right"], (fit, vals)    # the four places fit: no cue
+    assert widened["scrolls"] and widened["right"], widened        # widened with no resize or strip mutation: the cue appears
