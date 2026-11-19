@@ -44,15 +44,12 @@
 
   // The masthead's own actions are not places. Drop scrolls to a box Memory does not draw, so from Memory it goes Home first (the
   // attribute changes here; the page's jump scrolls and focuses a frame later, once the box is drawn). Grants and Notifications only
-  // open a dialog, but the page's boot handler leaves the Desk and the Room on any jump: the place is put back on the next tick.
+  // open a dialog, and the page's boot handler leaves the view they were pressed on as it is.
   document.addEventListener("click", function (ev) {
     var a = ev.target && ev.target.closest ? ev.target.closest(".ia-act[data-phone-jump]") : null;
     if (!a) return;
-    // the painted place, not place(): the page's boot handler has already left the Desk or Room by the time this runs, and the
-    // attribute is repainted on the microtask after it
-    var which = a.dataset.phoneJump, was = document.body.dataset.iaPlace;
-    if (which === "drop" && was === "memory") go("home");
-    else if ((which === "grants" || which === "notifications") && (was === "desk" || was === "room")) setTimeout(function () { go(was); }, 0);
+    // the painted place, not place(): the attribute is repainted on the microtask after the state changes
+    if (a.dataset.phoneJump === "drop" && document.body.dataset.iaPlace !== "home") go("home");
   });
 
   document.addEventListener("click", function (ev) {

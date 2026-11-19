@@ -313,21 +313,73 @@ def test_drop_on_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
 
 @needs_browser
 def test_grants_and_notifications_keep_the_desk_they_were_pressed_on(tmp_path: Path) -> None:
-    """The page's boot handler leaves the Desk on any jump, which sent a person Home under the notification sheet."""
-    ST = "JSON.stringify({place: document.body.dataset.iaPlace, sheet: !!document.getElementById('levain-modal')})"
+    """Both buttons only open a dialog: the Desk and the Room they were pressed on are never left (no mount is torn down and re-entered)."""
+    ST = "JSON.stringify({place: document.body.dataset.iaPlace, sheet: !!document.getElementById('levain-modal'), left: window.__left})"
+    # whether either view's class was ever off the body after this point
+    WATCH_VIEW = ("window.__left = 0; new MutationObserver(() => { if (!document.body.classList.contains('dv-on') && !document.body.classList.contains('rv-on')) window.__left++; })"
+                  ".observe(document.body, {attributes: true, attributeFilter: ['class']}); 1")
+    CLOSE = "(() => { const m = document.getElementById('levain-modal'); if (m) m.remove(); document.body.classList.remove('modal-open'); return 1; })()"
+    CLICK = "document.querySelector('.ia-act[data-phone-jump=\"%s\"]').click(); 1"
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
             READY, SETTLE,
             {"eval": PRESS % "desk"}, SETTLE,
+            {"eval": WATCH_VIEW},
+            {"eval": CLICK % "notifications"}, SETTLE, SETTLE,
+            {"eval": ST},                                                               # 0: Desk, notifications
+            {"eval": CLOSE}, {"eval": PRESS % "room"}, SETTLE,
+            {"eval": CLICK % "grants"}, SETTLE, SETTLE,
+            {"eval": ST},                                                               # 1: Room, grants
+        ])
+    desk, room = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{")]
+    assert (desk["place"], desk["sheet"]) == ("desk", True) and desk["left"] == 0, desk
+    assert room["place"] == "room" and room["sheet"] is True and room["left"] == 0, room
+
+
+@needs_browser
+def test_the_places_keys_under_an_open_dialog_leave_the_desk_alone(tmp_path: Path) -> None:
+    """With the presence sheet open on the Desk, 1 to 4 pressed on a button inside it belong to the sheet: the boot handler no longer leaves the Desk first."""
+    SHEET = ("(() => { const s = document.getElementById('pr-sheet'); s.hidden = false; s.style.display = 'block';"
+             " let b = s.querySelector('button'); if (!b) { b = document.createElement('button'); b.textContent = 'x'; s.appendChild(b); } b.focus(); return s.getClientRects().length; })()")
+    PRESSED = ("(() => { const b = document.getElementById('pr-sheet').querySelector('button'); for (const k of ['1', '2', '3', '4']) b.dispatchEvent(new KeyboardEvent('keydown', {key: k, bubbles: true, cancelable: true}));"
+               " return JSON.stringify({place: document.body.dataset.iaPlace, desk: document.body.classList.contains('dv-on')}); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": PRESS % "desk"}, SETTLE,
+            {"eval": SHEET},
+            {"eval": PRESSED}, SETTLE,
+            {"eval": STATE},
+        ])
+    shown = [v for v in out["values"] if isinstance(v, int) and not isinstance(v, bool)]
+    assert shown and shown[0] > 0, out["values"]                                       # the sheet was really drawn
+    pressed = json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith('{"place"')))
+    assert pressed == {"place": "desk", "desk": True}, pressed
+
+
+@needs_browser
+def test_drop_on_the_desk_over_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
+    """Memory, then the Desk (the page still holds Memory underneath), then Drop: the box is not drawn under Memory, so Drop goes Home."""
+    ST = ("(() => { const d = document.getElementById('ck-drop'); return JSON.stringify({place: document.body.dataset.iaPlace, mode: document.body.dataset.mode,"
+          " drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top)}); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, {"until": "document.getElementById('ck-drop') && !document.getElementById('ck-drop').hidden && 1", "ms": 30000}, SETTLE,
+            {"eval": PRESS % "memory"}, SETTLE,
+            {"eval": PRESS % "desk"}, SETTLE,
             {"eval": ST},
-            {"eval": "document.querySelector('.ia-act[data-phone-jump=\"notifications\"]').click(); 1"}, SETTLE, SETTLE,
+            {"eval": "document.querySelector('.ia-act[data-phone-jump=\"drop\"]').click(); 1"}, SETTLE, SETTLE,
             {"eval": ST},
         ])
-    desk, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{")]
-    assert desk["place"] == "desk", desk
-    assert after == {"place": "desk", "sheet": True}, after
+    on_desk, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"place"')]
+    assert on_desk["place"] == "desk" and on_desk["mode"] == "memory" and not on_desk["drawn"], on_desk
+    assert after["place"] == "home" and after["mode"] == "board" and after["drawn"] and abs(after["top"]) <= 2, after
 
 
 @needs_browser

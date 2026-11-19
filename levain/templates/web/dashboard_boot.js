@@ -1619,11 +1619,16 @@
         if (!deskSection || !token()) return;
         ev.stopPropagation();
         setDesk(true);
+      } else if (jump && (jump.dataset.phoneJump === "grants" || jump.dataset.phoneJump === "notifications")) {
+        // these two only open a dialog over the page, so the view the person is in stays as it is
       } else if (jump || (t && t.closest("[data-mode-tab]"))) { setRoom(false); setDesk(false); }
     }, true);
-    // a mode shortcut (1-4) that re-selects the mode already showing changes no attribute, so it is caught here: it leaves the Room too
+    // a mode shortcut (1-4) that re-selects the mode already showing changes no attribute, so it is caught here: it leaves the Room too.
+    // A dialog's keys are its own: with one open the view stays.
     document.addEventListener("keydown", (ev) => {
       if (!(roomOn() || deskOn()) || ev.metaKey || ev.ctrlKey || ev.altKey || !/^[1-4]$/.test(ev.key)) return;
+      const sheet = document.getElementById("pr-sheet");
+      if (document.querySelector(".modal-overlay") || (sheet && sheet.getClientRects().length)) return;
       const a = document.activeElement, tag = a && a.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (a && a.isContentEditable)) return;
       setRoom(false);
