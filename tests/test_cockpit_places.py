@@ -1,4 +1,4 @@
-"""The cockpit page's places bar (levain#141): Home, Desk, Room, Memory, and nothing else in the bar.
+"""The cockpit page's places bar (levain#141): Home, Desk, Room, Memory, Settings, and nothing else in the bar.
 
 What these hold: the page's one bar holds places only, the Needs-you count rides Home on that bar at every width, the page runs its
 scripts in order with dashboard_places.js last, and a real browser lands on a place, moves between places, takes the 1-4 keys, and
@@ -19,7 +19,7 @@ from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_narrow_layout_rig import drive_touch
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
-PLACES = {"home", "desk", "room", "memory"}
+PLACES = {"home", "desk", "room", "memory", "settings"}
 
 
 class _Tags(HTMLParser):
@@ -150,14 +150,14 @@ def test_a_browser_lands_on_home_moves_between_places_and_takes_the_keys(tmp_pat
     states = [v for v in out["values"] if isinstance(v, dict) and "place" in v]
     assert len(states) == 6, out["values"]
     landing, memory, home, key4, key1, phone = states
-    assert landing["bar"] == ["home", "desk", "room", "memory"]
+    assert landing["bar"] == ["home", "desk", "room", "memory", "settings"]
     assert landing["place"] == "home" and landing["current"] == ["home"]
     assert landing["modeTabsShown"] == 0 and landing["tagline"] > 0
     assert memory["place"] == "memory" and memory["current"] == ["memory"] and memory["mode"] == "memory"
     assert home["place"] == "home" and home["current"] == ["home"]
     assert key4["place"] == "memory" and key4["mode"] == "memory"
     assert key1["place"] == "home"
-    assert phone["tagline"] > 0 and phone["bar"] == ["home", "desk", "room", "memory"], phone
+    assert phone["tagline"] > 0 and phone["bar"] == ["home", "desk", "room", "memory", "settings"], phone
 
 
 MODE_KEY = "levain_cockpit_mode"   # cockpit_view.js MODE_KEY: the page keeps the chosen mode in sessionStorage under this key
@@ -431,10 +431,10 @@ def test_the_notifications_button_name_carries_the_unread_count(tmp_path: Path) 
 def test_the_places_buttons_name_their_key() -> None:
     p = _parse()
     got = {a["data-ia-place-btn"]: (a.get("title", ""), a.get("aria-keyshortcuts")) for t, a, stack in p.tags if "data-ia-place-btn" in a and _in_bar(stack)}
-    assert {k: v[1] for k, v in got.items()} == {"home": "1", "desk": "2", "room": "3", "memory": "4"}, got
+    assert {k: v[1] for k, v in got.items()} == {"home": "1", "desk": "2", "room": "3", "memory": "4", "settings": "5"}, got
     assert all(v[0].endswith("(key %s)" % v[1]) for v in got.values()), got
     keys = re.search(r"var KEYS = \{([^}]*)\}", (WEB / "dashboard_places.js").read_text()).group(1)
-    assert {m[1]: m[0] for m in re.findall(r"(\d): \"(\w+)\"", keys)} == {"home": "1", "desk": "2", "room": "3", "memory": "4"}   # the markup says what the script binds
+    assert {m[1]: m[0] for m in re.findall(r"(\d): \"(\w+)\"", keys)} == {"home": "1", "desk": "2", "room": "3", "memory": "4", "settings": "5"}   # the markup says what the script binds
 
 
 @needs_browser
@@ -452,7 +452,7 @@ def test_a_coarse_pointer_gets_44_px_actions_and_places(tmp_path: Path) -> None:
         got.append(json.loads([v for v in out["values"] if isinstance(v, str) and v.startswith("{")][-1]))
     for g in got:
         assert g["coarse"] is True, g                                              # the emulation is a touch device, so the rule under test applies
-        assert len(g["acts"]) == 3 and len(g["places"]) == 4, g
+        assert len(g["acts"]) == 3 and len(g["places"]) == 5, g
         assert min(g["acts"] + g["places"]) >= 44, g
 
 

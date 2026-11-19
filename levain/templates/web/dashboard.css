@@ -4062,3 +4062,20 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
 
 /* Memory is a place of its own and draws no drop box at its top: the Drop button goes Home first (dashboard_places.js), then to the box */
 body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }
+
+/* ── levain#141 polish: the Settings place ───────────────────────────────────────────────────────────────────────────────
+   Settings is the fifth place (dashboard_places.js: key 5, body.ia-settings-on on the board page). Every settings section the page
+   draws (devices_panel.js: Paired devices + Notify tokens, Presence & notification settings: Tap tokens + Voice, and any later one
+   that carries .dev-zone) is drawn here and nowhere else; the board, the hero and every other block are not drawn while it is up
+   (hidden, not removed: their own reads keep running). */
+body.ia:not([data-ia-place="settings"]) .dev-zone { display: none !important; }
+body.ia[data-ia-place="settings"] .deck > :not(.masthead):not(#ck-phonetabs):not(.ia-drivers):not(main.frame) { display: none !important; }
+body.ia[data-ia-place="settings"] main.frame > :not(.dev-zone) { display: none !important; }
+body.ia[data-ia-place="settings"] main.frame { display: block; padding-inline: var(--gutter-ke); }
+body.ia[data-ia-place="settings"] .dev-zone:not([hidden]) { display: block !important; width: 100%; min-width: 0; margin: var(--sp-6) 0 0; }
+body.ia[data-ia-place="settings"] .dev-zone .zone-head { flex-wrap: wrap; }
+/* Memory draws no Needs-you row at all (the Needs count on the Home button stays); Settings has none either */
+body.ia[data-ia-place="memory"] #ck-needs, body.ia[data-ia-place="settings"] #ck-needs { display: none !important; }
+/* The cause of the 100 px panels, fixed at its root: on Home layout A flattens main.frame (display: contents), so a zone appended to
+   it is a grid item of the 12-column deck and, with no span, one track wide. Every zone spans the whole row. */
+body.ia[data-ia-place="home"] .ck-zone { grid-column: 1 / -1 !important; min-width: 0; }

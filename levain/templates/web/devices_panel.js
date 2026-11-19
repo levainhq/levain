@@ -997,6 +997,8 @@
 
   function toSettings() {
     if (!prSetSec || prSetSec.hidden) return;
+    // the settings sections are drawn on the Settings place only (dashboard_places.js): go there, then scroll to and focus the section
+    if (window.LevainPlaces && window.LevainPlaces.openSettings) { window.LevainPlaces.openSettings("presence-settings"); return; }
     prSetSec.scrollIntoView({ block: "start" });
     prSetSec.focus({ preventScroll: true });
   }

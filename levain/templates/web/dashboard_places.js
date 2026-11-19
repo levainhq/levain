@@ -1,9 +1,11 @@
 // levain dashboard_places.js: the places bar of the cockpit page (levain#141: Home plus a bar of places).
 // It draws nothing of its own data and changes no renderer: every panel is the page's own. What it does:
 //   - names the place on the body (data-ia-place) from the page's own state (dv-on, rv-on, data-mode), which dashboard.css reads;
-//   - maps the places bar and the 1-4 keys onto the page's existing wiring (data-mode-tab, data-phone-jump) through the hidden drivers;
+//   - maps the places bar and the 1-5 keys onto the page's existing wiring (data-mode-tab, data-phone-jump) through the hidden drivers;
 //   - Morning and Build are retired in the page's own applyMode (cockpit_view.js), which resolves either to Home, so nothing here
 //     redirects after the fact;
+//   - Settings (key 5) is the board page with body.ia-settings-on; dashboard.css draws only the settings sections there, and
+//     window.LevainPlaces.openSettings(id) is how a link to one of them lands;
 //   - folds the agents graph to a one-line strip that opens on a click;
 //   - adds the section heads Home groups its blocks under.
 (function () {
@@ -16,15 +18,22 @@
   function mode() { return document.body.dataset.mode || "board"; }
   function deskOn() { return document.body.classList.contains("dv-on"); }
   function roomOn() { return document.body.classList.contains("rv-on"); }
+  // Settings is the one place the page has no state of its own for: it is the board page (mode board, so every panel's own read keeps
+  // running underneath) with this body class on, which only go("settings") sets. The Desk, the Room and any other mode leave it.
+  var SETTINGS_ON = "ia-settings-on";
+  function settingsOn() { return document.body.classList.contains(SETTINGS_ON); }
 
   // ---- the place, derived from the page's own state ----
   function place() {
     if (roomOn()) return "room";
     if (deskOn()) return "desk";
     if (mode() === "memory") return "memory";
+    if (settingsOn()) return "settings";
     return "home";
   }
   function paint() {
+    // the flag is only ever true on the board page with no view up: anything else that changed the page's own state ends it
+    if (settingsOn() && (roomOn() || deskOn() || mode() !== "board")) document.body.classList.remove(SETTINGS_ON);
     var p = place();
     if (document.body.dataset.iaPlace !== p) document.body.dataset.iaPlace = p;
     // scoped to the places bar: other controls carry aria-current of their own
@@ -36,11 +45,37 @@
 
   // ---- going to a place ----
   function go(where) {
+    document.body.classList.remove(SETTINGS_ON);
+    if (where === "settings") {
+      clickHidden("[data-ia-mode=board]");   // the page's own wiring leaves the Desk, the Room or Memory for the board page first
+      document.body.classList.add(SETTINGS_ON);
+      paint();
+      return;
+    }
     if (where === "home") return clickHidden("[data-ia-mode=board]");
     if (where === "desk") return clickHidden("[data-ia-jump=desk]");
     if (where === "room") return clickHidden("[data-ia-jump=room]");
     if (where === "memory") return clickHidden("[data-ia-mode=memory]");
   }
+
+  // A link to a settings section goes to the Settings place, then to the section. The section is drawn only once the place is up (a
+  // rendered frame later), so the scroll waits for it.
+  window.LevainPlaces = {
+    place: place,
+    go: go,
+    openSettings: function (id) {
+      go("settings");
+      var tries = 0;
+      (function land() {
+        var n = id && document.getElementById(id);
+        if (n && n.getClientRects().length) {
+          try { n.scrollIntoView({ block: "start" }); n.focus({ preventScroll: true }); } catch (_) { /* no scrolling here */ }
+          return;
+        }
+        if (++tries < 20) requestAnimationFrame(land);
+      })();
+    }
+  };
 
   // The masthead's own actions are not places. Drop scrolls to a box Memory does not draw, so from Memory it goes Home first (the
   // attribute changes here; the page's jump scrolls and focuses a frame later, once the box is drawn). Grants and Notifications only
@@ -69,7 +104,7 @@
 
   // The places keys. Captured before the page's own mode keys, which would otherwise open the retired Morning and Build modes.
   // Never while typing, and never under a dialog: a dialog's keys are its own.
-  var KEYS = { 1: "home", 2: "desk", 3: "room", 4: "memory" };
+  var KEYS = { 1: "home", 2: "desk", 3: "room", 4: "memory", 5: "settings" };
   function dialogOpen() {
     if (document.querySelector(".modal-overlay")) return true;
     var ps = document.getElementById("pr-sheet");

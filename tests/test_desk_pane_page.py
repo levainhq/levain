@@ -500,7 +500,7 @@ def test_the_phone_shows_the_desk_tab_whole_and_the_composer_pinned_with_no_side
                                            until("document.querySelector('.dv-lease-held')"), {"eval": measure}])
     g = json.loads(out["values"][-1])
     assert g["scrollW"] <= g["vw"] and g["scrollH"] <= g["vh"] + 1 and g["bodyOverflow"] == "hidden" and not g["mainShown"], g
-    assert g["tabs"] == ["home", "desk", "room", "memory"] and g["deskWhole"] and g["deskH"] >= 44, g
+    assert g["tabs"] == ["home", "desk", "room", "memory", "settings"] and g["deskWhole"] and g["deskH"] >= 44, g
     assert abs(g["dockBottom"] - g["vh"]) <= 1 and g["sendW"] >= 44 and g["sendH"] >= 44 and g["font"] >= 16, g
     assert g["stateScroll"] <= g["stateW"] + 1, g                      # a long holder wraps, it does not push the page
 
