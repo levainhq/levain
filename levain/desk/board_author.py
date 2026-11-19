@@ -344,8 +344,9 @@ def _facts(repo: Path, shas: Iterable[str]) -> dict[str, _Facts]:
     return out
 
 
-#: From this many ``document``/``run`` closes in one repo, ONE walk of main's first-parent history (0.3 s on this install's 9.6k-commit
-#: repo, loaded) reads every first adder; below it each path is asked on its own (0.05-0.09 s each).
+#: From this many ``document``/``run`` closes in one repo, ONE walk of main's first-parent history reads every first adder; below it
+#: each path is asked on its own. Measured 2026-11-19 (levain 48, return_c155.md): the walk cost about as much as four per-path
+#: asks on this repo, which is where the number comes from.
 WALK_PATHS_FROM = 4
 
 

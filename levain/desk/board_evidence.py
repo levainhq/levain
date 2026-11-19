@@ -358,8 +358,7 @@ _PID_MEMO_MAX = 200_000
 _PID_LOCK = threading.Lock()
 
 
-# The same fact kept ON DISK, so that every ``levain board state`` process does not pay for the whole history again (the cockpit
-# starts one per repo per read). A commit's patch-id is a pure function of its content under the repo's diff config: the KEY is the
+# The same fact kept ON DISK, so that every ``levain board state`` process does not pay for the whole history again. A commit's patch-id is a pure function of its content under the repo's diff config: the KEY is the
 # commit's full sha and nothing else, the VALUE its patch-id (null: a commit with none). One file per repo (named by a hash of its
 # common git dir) under ``<levain home>/cache/board``, holding a digest of the config stamp it was made under: a file made under
 # another config is not read. It holds no message text, path, name or secret. A file that is absent, unreadable, over the size
@@ -369,7 +368,7 @@ _PID_LOCK = threading.Lock()
 # next read derives again. A writer with this user's rights can make the derived "landed" read differently, as it can by editing
 # the items store beside it, the refs or the code: the cache adds no authority.
 PID_CACHE_V = 1
-PID_CACHE_MAX = 60_000                       # entries kept (~5 MB of json); past it the oldest entries are dropped first
+PID_CACHE_MAX = 60_000                       # entries kept; past it the oldest entries are dropped first (``keep``'s shas last)
 PID_CACHE_MAX_BYTES = 16_000_000             # a file larger than this is not read
 _HEX_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
