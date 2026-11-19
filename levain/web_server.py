@@ -6873,6 +6873,7 @@ def run_web_server(
         _open_browser(url, unlocked)
 
     watcher = None
+    stall_watch = None
     try:
         if write:
             # C10 S1: a writable serve supervises the desk, over the directory its Desk panel reads
@@ -6880,6 +6881,17 @@ def run_web_server(
             from levain.desk.supervise import Watcher, default_store
 
             watcher = Watcher(lambda: default_store(_dispatch_dir(getattr(httpd, "consent_reader", None)))).start()
+        if getattr(httpd, "broker", None) is not None:
+            # levain#157: a stall watch beside the serve, dumping under the broker's data root; never fatal to the serve
+            try:
+                from levain.cockpit.stall_watch import StallWatch
+
+                stall_dir = httpd.broker.data_root / "stalls"
+                stall_dir.mkdir(parents=True, exist_ok=True)
+                stall_watch = StallWatch(stall_dir)
+                stall_watch.start()
+            except Exception as exc:
+                print(f"cockpit stall watch not started: {exc}", file=sys.stderr, flush=True)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
@@ -6889,6 +6901,11 @@ def run_web_server(
             if chat_host is not None:
                 chat_host.shutdown()
         finally:
+            if stall_watch is not None:
+                try:
+                    stall_watch.stop()
+                except Exception as exc:
+                    print(f"cockpit stall watch not stopped: {exc}", file=sys.stderr, flush=True)
             if watcher is not None:      # stopped last, and whatever the closes above raised
                 watcher.stop()
     return 0
