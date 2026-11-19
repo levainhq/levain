@@ -581,6 +581,28 @@ def test_a_token_that_resolves_to_no_device_leaves_no_connection_held(db: Cockpi
     assert during - before <= 0, during - before
 
 
+def test_the_stamper_thread_keeps_no_journal_alive_between_stamps(tmp_path: Path) -> None:
+    """L1 N3: once a stamp is written, the stamper thread holds no reference to the journal it wrote through."""
+    import weakref
+
+    from levain.cockpit.last_seen import LastSeenStamper
+
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    db = CockpitDB(root)                                # not a fixture: nothing but this test refers to it
+    dev, _tok = _enrol(db)
+    st = LastSeenStamper()
+    try:
+        assert st.note(db, dev, NOW) is True
+        assert _until(lambda: db.list_devices()[0]["last_seen"] is not None)
+        assert _until(lambda: st._pending == {} and not st._wake.is_set())
+        ref = weakref.ref(db)
+        del db
+        assert _until(lambda: (gc.collect(), ref() is None)[1]), "the stamper thread still holds the journal"
+    finally:
+        st.close()
+
+
 def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
     _dev, tok = _enrol(db)
     conns: list[sqlite3.Connection] = []

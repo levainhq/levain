@@ -68,18 +68,25 @@ class LastSeenStamper:
     def _run(self) -> None:
         while True:
             self._wake.wait()
-            with self._lock:
-                if self._stopped:
-                    return
-                batch, self._pending = self._pending, {}
-                self._wake.clear()
-            for device_id, (db, now) in batch.items():
-                if self._stopped:
-                    return
-                try:
-                    db.stamp_last_seen(device_id, now=now)
-                except Exception:  # noqa: BLE001 - a display stamp never fails anything; the device is retried next window
-                    _log.debug("paired device last_seen stamp skipped", exc_info=True)
+            if not self._stamp_pending():
+                return
+
+    def _stamp_pending(self) -> bool:
+        """Take what is waiting and stamp it. False once stopped. Its own frame holds the batch, so no journal it
+        stamped through is kept alive while the thread waits for the next note."""
+        with self._lock:
+            if self._stopped:
+                return False
+            batch, self._pending = self._pending, {}
+            self._wake.clear()
+        for device_id, (db, now) in batch.items():
+            if self._stopped:
+                return False
+            try:
+                db.stamp_last_seen(device_id, now=now)
+            except Exception:  # noqa: BLE001 - a display stamp never fails anything; the device is retried next window
+                _log.debug("paired device last_seen stamp skipped", exc_info=True)
+        return True
 
     def close(self) -> None:
         """Stop the thread: no further note queues, and the thread ends after the stamp it is on (waited for at most
