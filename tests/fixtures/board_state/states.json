@@ -1583,6 +1583,349 @@
    ],
    "name": "precedence 9 over 10: missing grooming beats ready",
    "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#99"
+    ],
+    [
+     "landed_not_closed",
+     "levain#104"
+    ],
+    [
+     "landed_not_closed",
+     "levain#127"
+    ],
+    [
+     "landed_not_closed",
+     "levain#133"
+    ],
+    [
+     "landed_not_closed",
+     "levain#134"
+    ],
+    [
+     "landed_not_closed",
+     "levain#136"
+    ],
+    [
+     "landed_not_closed",
+     "levain#139"
+    ],
+    [
+     "landed_not_closed",
+     "levain#142"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-d4384dc8": []
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "project_memory/1118-vm/j06_adopt_pass.md": false,
+     "project_memory/1118-vm/leg6/login_pass.txt": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-19T12:00:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#99"
+      ],
+      "sha": "0000000000000000000000000000000000000063"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#104"
+      ],
+      "sha": "0000000000000000000000000000000000000068"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#127"
+      ],
+      "sha": "000000000000000000000000000000000000007f"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#133"
+      ],
+      "sha": "0000000000000000000000000000000000000085"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#134"
+      ],
+      "sha": "0000000000000000000000000000000000000086"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#136"
+      ],
+      "sha": "0000000000000000000000000000000000000088"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#139"
+      ],
+      "sha": "000000000000000000000000000000000000008b"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#142"
+      ],
+      "sha": "000000000000000000000000000000000000008e"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#104": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#127": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#133": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#134": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#136": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#139": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#142": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    },
+    "levain#99": {
+     "column": "ready",
+     "reason_contains": "close it or name what remains",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: Phill's whole-page look on a running preview\", \"done_kind\": \"merged\", \"id\": \"levain#99\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 99\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: levain board trail verify + an export/verify round trip on our real store\", \"done_kind\": \"merged\", \"id\": \"levain#104\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 104\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: dream show and doctor print a non-default claude_bin; the five tests; each lane L3; on main\", \"done_kind\": \"merged\", \"id\": \"levain#127\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 127\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: stage_call.py fixes, keys/cred dir creation, sheet order, data-root perms, repo owner; on main\", \"done_kind\": \"merged\", \"id\": \"levain#133\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 133\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"project_memory/1118-vm/j06_adopt_pass.md\", \"done_kind\": \"run\", \"id\": \"levain#134\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 134\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"T:3c test_route_pinned_across_new_generation passes and S14 W5 passes on a brokered ticket in a VM; on main\", \"done_kind\": \"merged\", \"id\": \"levain#136\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 136\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"project_memory/1118-vm/leg6/login_pass.txt\", \"done_kind\": \"run\", \"id\": \"levain#139\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 139\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"an existing levain install carries the de-cost origin.md wording after a levain update, verified on an install made before the change\", \"done_kind\": \"merged\", \"id\": \"levain#142\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 142\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "11-19 eight rows before the amends: commits on main, no depends, a remainder in the done text or a run row awaiting its run, reads landed-not-closed (the closer's verdict)",
+   "now": "2026-11-19T12:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-d4384dc8": []
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "project_memory/1118-vm/j06_adopt_pass.md": false,
+     "project_memory/1118-vm/leg6/login_pass.txt": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-19T12:00:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#99"
+      ],
+      "sha": "0000000000000000000000000000000000000063"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#104"
+      ],
+      "sha": "0000000000000000000000000000000000000068"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#127"
+      ],
+      "sha": "000000000000000000000000000000000000007f"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#133"
+      ],
+      "sha": "0000000000000000000000000000000000000085"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#134"
+      ],
+      "sha": "0000000000000000000000000000000000000086"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#136"
+      ],
+      "sha": "0000000000000000000000000000000000000088"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#139"
+      ],
+      "sha": "000000000000000000000000000000000000008b"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-19T06:00:00Z",
+      "items": [
+       "levain#142"
+      ],
+      "sha": "000000000000000000000000000000000000008e"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#104": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#127": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#128": {
+     "column": "ready",
+     "reason_contains": "no evidence of work, nothing it waits on",
+     "state": "ready"
+    },
+    "levain#133": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#134": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#136": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#139": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#140": {
+     "column": "ready",
+     "reason_contains": "no evidence of work, nothing it waits on",
+     "state": "ready"
+    },
+    "levain#142": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    },
+    "levain#99": {
+     "column": "backlog",
+     "reason_contains": "close it once the dependency clears",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-18T11:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"an open row nobody closed\", \"done_kind\": \"merged\", \"id\": \"levain#128\", \"op\": \"add\", \"origin\": \"levain 47\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"open row 128\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T11:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"an open row nobody closed\", \"done_kind\": \"merged\", \"id\": \"levain#140\", \"op\": \"add\", \"origin\": \"levain 47\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"open row 140\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: Phill's whole-page look on a running preview\", \"done_kind\": \"merged\", \"id\": \"levain#99\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 99\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: levain board trail verify + an export/verify round trip on our real store\", \"done_kind\": \"merged\", \"id\": \"levain#104\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 104\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: dream show and doctor print a non-default claude_bin; the five tests; each lane L3; on main\", \"done_kind\": \"merged\", \"id\": \"levain#127\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 127\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"remains: stage_call.py fixes, keys/cred dir creation, sheet order, data-root perms, repo owner; on main\", \"done_kind\": \"merged\", \"id\": \"levain#133\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 133\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"project_memory/1118-vm/j06_adopt_pass.md\", \"done_kind\": \"run\", \"id\": \"levain#134\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 134\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"T:3c test_route_pinned_across_new_generation passes and S14 W5 passes on a brokered ticket in a VM; on main\", \"done_kind\": \"merged\", \"id\": \"levain#136\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 136\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"project_memory/1118-vm/leg6/login_pass.txt\", \"done_kind\": \"run\", \"id\": \"levain#139\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 139\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-18T12:00:00Z\", \"by\": \"levain 47\", \"depends_on\": [], \"done\": \"an existing levain install carries the de-cost origin.md wording after a levain update, verified on an install made before the change\", \"done_kind\": \"merged\", \"id\": \"levain#142\", \"op\": \"add\", \"origin\": \"np-a5822971\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"11-19 row 142\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-19T09:00:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"band\", \"ref\": \"np-d4384dc8\"}]}, \"id\": \"levain#99\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:01:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#128\"}]}, \"id\": \"levain#104\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:02:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#128\"}]}, \"id\": \"levain#127\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:03:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#140\"}]}, \"id\": \"levain#133\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:04:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#140\"}]}, \"id\": \"levain#134\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:05:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#140\"}]}, \"id\": \"levain#136\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:06:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#140\"}]}, \"id\": \"levain#139\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}",
+    "{\"at\": \"2026-11-19T09:07:00Z\", \"by\": \"levain 47\", \"fields\": {\"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#128\"}]}, \"id\": \"levain#142\", \"op\": \"amend\", \"v\": 1, \"why\": \"the remaining DONE clause is held by a named open dependency (np-5023a20a / sweep 11-19)\"}"
+   ],
+   "name": "11-19 eight rows after the amends (amend ops add #99 a band depends, #104 #127 #142 an item depends on #128, #133 #134 #136 #139 on #140): all read blocked, never landed-not-closed, run rows included",
+   "now": "2026-11-19T12:00:00Z"
   }
  ],
  "schema": 1

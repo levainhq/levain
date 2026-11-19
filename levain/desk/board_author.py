@@ -344,6 +344,12 @@ def _facts(repo: Path, shas: Iterable[str]) -> dict[str, _Facts]:
     return out
 
 
+#: From this many ``document``/``run`` closes in one repo, ONE walk of main's first-parent history reads every first adder; below it
+#: each path is asked on its own. Measured 2026-11-19 (levain 48, return_c155.md): the walk cost about as much as four per-path
+#: asks on this repo, which is where the number comes from.
+WALK_PATHS_FROM = 4
+
+
 class _Reader:
     """One run's memo: the facts of a repo's commits, the signature verdict per commit, the repo's own git dir."""
 
@@ -353,6 +359,51 @@ class _Reader:
         self._signed: dict[str, tuple[str | None, list[str], Signature]] = {}
         self._seat: dict[tuple[str, str], tuple[SeatClaim, tuple[str, ...]]] = {}
         self._common: dict[str, str | None] = {}
+        self._top_prefix: tuple[str, str] | None = None
+        self._adders: dict[str, dict[str, str]] = {}           # main ref -> every path (and every directory above one) -> its first adder
+        self.walk_paths = False                                # annotate sets it when enough close paths are asked for to make one walk cheaper
+
+    def top_prefix(self) -> tuple[str, str]:
+        """``(git's --show-toplevel, its --show-prefix)`` for the repo as given: asked once per run, not once per item."""
+        if self._top_prefix is None:
+            self._top_prefix = (be._git(self.repo, "rev-parse", "--show-toplevel").strip(),
+                                be._git(self.repo, "rev-parse", "--show-prefix").strip())
+        return self._top_prefix
+
+    def path_adders(self, main_ref: str) -> dict[str, str]:
+        """path -> the first-parent commit on ``main_ref`` that first ADDED it, for every path that history added and every directory
+        above one (a ``document``/``run`` close may name a directory: the first commit that added anything under it). ONE
+        ``git log --first-parent --no-renames --diff-filter=A --name-only`` walk, the same diff the per-path ``git log`` reads, read
+        once for the repo instead of once per item. A failed walk raises and is not kept."""
+        got = self._adders.get(main_ref)
+        if got is None:
+            out = be._git(self.repo, "log", "--first-parent", "--no-renames", "--diff-filter=A", "--name-only", "-z",
+                          "--format=%x00%H", main_ref, "--")
+            got = {}
+            commits: list[tuple[str, list[str]]] = []
+            toks = out.split("\0")
+            i = 0
+            while i < len(toks):
+                if toks[i] == "" and i + 1 < len(toks):          # a path is never empty: an empty token starts a commit
+                    sha, paths = toks[i + 1].strip(), []
+                    i += 2
+                    while i < len(toks) and toks[i] != "":
+                        paths.append(toks[i][1:] if not paths and toks[i].startswith("\n") else toks[i])
+                        i += 1
+                    commits.append((sha, paths))
+                else:
+                    i += 1
+            for sha, paths in reversed(commits):                 # git prints newest first: the oldest adder wins
+                for path in paths:
+                    if not path:
+                        continue
+                    got.setdefault(path, sha)
+                    d = path
+                    while "/" in d:
+                        d = d.rpartition("/")[0]
+                        got.setdefault(d, sha)
+            self._adders[main_ref] = got
+        return got
 
     def prime(self, shas: Iterable[str]) -> None:
         need = [s for s in shas if s not in self._facts]
@@ -593,7 +644,7 @@ def _lexical_rel(path: str, base: str, base_prefix: str) -> str | None:
     return (base_prefix + path[len(base.rstrip("/")) + 1:]).rstrip("/")
 
 
-def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
+def _path_adder(repo: Path, key: str, main_ref: str, reader: _Reader | None = None) -> tuple[str | None, str]:
     """``(the first-parent commit on main that first added the path, "")`` or ``(None, the unattributed text)``. The path
     is :func:`levain.desk.board_evidence.done_path`'s, normalised LEXICALLY (``os.path.normpath``: no symlink followed, no
     ``..`` resolved through the disk) and expressed relative to the repo's toplevel, against the repo as given and against
@@ -602,8 +653,8 @@ def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
     a submodule were added by no superproject commit (git tracks the link, the gitlink). The literal path is the answer."""
     path = os.path.abspath(str(be.done_path(key, repo)))       # abspath: lexical, never resolve/realpath; a relative repo
     given = os.path.abspath(str(repo))                         # (``Path(".")``) is made absolute from the cwd, both alike
-    top = be._git(repo, "rev-parse", "--show-toplevel").strip()
-    prefix = be._git(repo, "rev-parse", "--show-prefix").strip()
+    top, prefix = reader.top_prefix() if reader is not None else (be._git(repo, "rev-parse", "--show-toplevel").strip(),
+                                                                  be._git(repo, "rev-parse", "--show-prefix").strip())
     # the repo as given is tried FIRST (a subdirectory of the toplevel when ``prefix`` is not empty; a tracked link to ``.``
     # given as the repo reads as the whole work tree, not as the commit that added the link), then the toplevel as git names it
     rel = _lexical_rel(path, given, prefix)
@@ -613,6 +664,9 @@ def _path_adder(repo: Path, key: str, main_ref: str) -> tuple[str | None, str]:
         return None, OUTSIDE
     if not rel:
         return None, "unattributed: the path is the repo's whole work tree"
+    if reader is not None and reader.walk_paths:
+        first = reader.path_adders(main_ref).get(rel)
+        return (first, "") if first else (None, NOT_ON_MAIN)
     out = be._git(repo, "log", "--first-parent", "--no-renames", "--diff-filter=A", "--format=%H", "--reverse", main_ref, "--",
                   f":(top,literal){rel}").split()
     return (out[0], "") if out else (None, NOT_ON_MAIN)
@@ -637,7 +691,7 @@ def closer_of_item(repo: Path, item: Any, state_ref: str | None, res: Resolvers,
         return dataclasses.replace(rd.author(writer, item), close_commit=state_ref)
     if kind in ("document", "run"):
         key = (item.done or "").strip()
-        sha, why = _path_adder(Path(repo), key, main_ref)
+        sha, why = _path_adder(Path(repo), key, main_ref, rd)
         if sha is None:
             return Closer("unattributed", None, why)
         c = rd.author(sha, item)
@@ -722,6 +776,12 @@ def annotate(doc: dict[str, Any], items: Mapping[str, Any], repos: Mapping[str |
     for key, shas in by_repo.items():
         with contextlib.suppress(Exception):    # a failed batch is read again per item, where its failure is said
             readers[key].prime(shas)
+    asks: dict[str, int] = {}
+    for s, item, path in todo:
+        if item.done_kind in ("document", "run"):
+            asks[str(path)] = asks.get(str(path), 0) + 1
+    for key, count in asks.items():
+        readers[key].walk_paths = count >= WALK_PATHS_FROM
     n = 0
     for s, item, path in todo:
         refs = s.get("refs") or [None]
