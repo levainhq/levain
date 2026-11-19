@@ -323,6 +323,7 @@
   "tests/test_cockpit_f12b_l3r1.py": 0.4,
   "tests/test_cockpit_f12b_open.py": 0.2,
   "tests/test_cockpit_f12b_topology_view.py": 1.0,
+  "tests/test_cockpit_hlens_topology.py": 0.3,
   "tests/test_cockpit_flip_parity.py": 0.1,
   "tests/test_cockpit_focus_keep_browser.py": 0.9,
   "tests/test_cockpit_fragment_token.py": 0.2,
