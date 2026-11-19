@@ -184,14 +184,16 @@
   // view closing ends the run in flight, so nothing yanks the view back. Declared here because closeModal ends it.
   let phoneJumpRun = 0;
 
-  // The starter jar (masthead): rise level = today's episodes against the entity's own typical
+  // The starter jar (drawn into #ck-jarbox, the stats box in the Machine section, when the page has one; the masthead no longer
+  // carries it, levain#141 polish): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
   // rises for each episode that arrived since the LAST render of the same day, so a bubble is
   // a true new episode, never decoration. status != "ok" -> an empty jar with its reason.
   let jarLastToday = null, jarLastDay = null;
   function renderJar(jar) {
-    const j = document.getElementById("jar");
-    if (!j) return;
+    const j = document.getElementById("ck-jarbox");
+    if (!j) return;   // no box on the page yet: the jar is not drawn, and nothing throws
+    j.classList.add("jar");   // the jar's own styles (dashboard.css .jar) apply wherever it is drawn
     j.replaceChildren();
     if (!jar) { j.hidden = true; jarLastToday = jarLastDay = null; return; }  // baseline resets while hidden
     j.hidden = false;
@@ -334,7 +336,11 @@
       storeEl.textContent = paths.episodic_db || "(store path unknown)";
       storeEl.hidden = !!paths.omitted || !!view.ke;   // a manifest source carries no store path: no line, not a false "unknown"
     }
-    if (entityEl) {
+    // levain#141 polish (fix4): the name is written in two places, the masthead's #entity and the Settings place's "This cockpit"
+    // section (#ck-entity), and each gets the same rename affordance from the same wireEntityName: where the masthead hides its
+    // copy (the name repeats the wordmark) the Settings section is where the rename lives.
+    const entityEls = [entityEl, document.getElementById("ck-entity")].filter(Boolean);
+    if (entityEls.length) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
       // A rename editor open in the masthead (intention-280 — the pre-existing twin of the 247
       // state-line stranding). Unlike renderState (which replaceChildren-rebuilds #state and so
@@ -347,6 +353,7 @@
       // data-saving="1" (doSave) and DOES rebuild: drop the stranded editor + its hidden
       // trigger, un-hide #entity, and let wireEntityName re-add a fresh, visible rename button.
       const displayName = view.entity_name || stem.replace(/\.db$/, "");
+      for (const entityEl of entityEls) {
       const unit = entityEl.parentElement;
       const openNameEditor = unit && unit.querySelector(".name-editor");
       if (openNameEditor && openNameEditor.dataset.saving !== "1") {
@@ -365,6 +372,8 @@
         entityEl.textContent = displayName;
         wireEntityName(entityEl, view);  // Class-A rename affordance (Slice 2a; commit-gated)
       }
+      }
+      syncCockpitSection();
     }
     // Masthead branding override (the surface's identity) — applied ONLY when the payload
     // carries it, so a bare Levain install keeps the HTML-default wordmark/model chrome.
@@ -377,10 +386,7 @@
       // the brand). Keep the " · substrate control" suffix; swap only the wordmark.
       document.title = view.brand_wordmark + " · substrate control";
     }
-    if (view.brand_model) {
-      const md = document.querySelector(".brand .model");
-      if (md) md.textContent = view.brand_model;
-    }
+    syncEntityDupe();
     // The operator's state line: their OWN words, reflected back verbatim (no machine
     // interpretation). Hidden when there is no live-context source; "no state set"
     // when present-but-empty; an expired line arrives already dropped by the server.
@@ -9758,6 +9764,27 @@
     return !view || !view.offered_verbs || view.offered_verbs[verb] === true;
   }
 
+  // levain#141 polish: the masthead draws the entity name only where it is not a repeat of the wordmark beside it. The flag
+  // (data-entity-dupe on the masthead) is set wherever either text is written; dashboard.css hides .unit under it. On a bare install the
+  // wordmark is "Levain" and the entity name is another word, so the name stays drawn.
+  function syncEntityDupe() {
+    const mh = document.querySelector(".masthead");
+    const ent = document.getElementById("entity");
+    const wm = document.querySelector(".brand .wordmark");
+    if (!mh || !ent || !wm) return;
+    const norm = (n) => String(n.textContent || "").trim().toLowerCase();
+    if (norm(ent) && norm(ent) === norm(wm)) mh.setAttribute("data-entity-dupe", ""); else mh.removeAttribute("data-entity-dupe");
+  }
+  // The Settings place's "This cockpit" section is drawn only while it holds the rename control (or its open editor): a section the
+  // page draws like the others, which appear only where there is something to do in them. devices_panel.js reads its `hidden` for the
+  // Settings empty line.
+  function syncCockpitSection() {
+    const sec = document.getElementById("ck-thiscockpit");
+    if (!sec) return;
+    const hide = !sec.querySelector(".name-edit, .name-editor");
+    if (sec.hidden !== hide) sec.hidden = hide;
+    sec.dataset.settled = "1";   // the first render has answered: the Settings empty line may now count this section as absent
+  }
   function wireEntityName(entityEl, view) {
     if (!commit || !verbOffered(view, "entity_name")) return;
     const unit = entityEl.parentElement;

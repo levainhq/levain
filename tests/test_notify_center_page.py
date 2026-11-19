@@ -129,7 +129,7 @@ def test_the_places_bar_draws_at_every_width_and_the_notifications_button_carrie
             OPEN, OPENED, {"eval": opened}, {"eval": filtered}])
     wide, narrow, op, fl = _json(out)
     for lay in (wide, narrow):
-        assert lay["d"] == "flex" and lay["pos"] == "sticky" and lay["tabs"] == ["home", "desk", "room", "memory"], lay
+        assert lay["d"] == "flex" and lay["pos"] in ("sticky", "fixed") and lay["tabs"] == ["home", "desk", "room", "memory", "settings"], lay
         assert lay["vw"] is True and lay["pill"] == str(unread) and lay["stripPills"] == 0, lay
     assert op["rows"] == total and op["sw"] is True and op["title"] == "Notifications", op
     assert fl["narrowed"] == ["B2 backup finished"], fl

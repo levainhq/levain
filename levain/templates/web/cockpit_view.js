@@ -1593,7 +1593,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn"), onHead: paintEventFigures } : { legend: false, size: skySize(), head: true, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.getElementById("ck-mctl") || document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("ck-jarbox") || document.getElementById("jumpbtn"), onHead: paintEventFigures } : { legend: false, size: skySize(), head: true, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -2123,6 +2123,14 @@
   // Returns true when it changed the tab: the places paint on the microtask after the attribute, so a caller that scrolls to the panel
   // waits a frame in that case.
   function revealTab(node) {
+    // Settings draws only the .dev-zone sections: a target drawn anywhere else is hidden while it is up, so the jump leaves Settings
+    // for Home first (the places' own go() clears ia-settings-on); the tab logic below then moves on to Memory if the panel lives there
+    const cl0 = document.body.classList;
+    let leftSettings = false;
+    if (cl0.contains("ia-settings-on") && !(node && node.closest && node.closest(".dev-zone, .ck-thiscockpit"))) {
+      if (root.LevainPlaces && typeof root.LevainPlaces.go === "function") root.LevainPlaces.go("home"); else cl0.remove("ia-settings-on");
+      leftSettings = true;
+    }
     const id = node && node.dataset ? node.dataset.ckPanel : "";
     // a panel the places put on a tab other than the one its table names (Recent episodes sits in Memory) is revealed there
     const placed = id ? PLACED_ON[id] : undefined;
@@ -2134,6 +2142,7 @@
       applyMode(want, true);
       return true;
     }
+    if (leftSettings) return true;
     // the Desk and the Room hide every panel whatever the mode underneath is: the page's own tab for the mode is what leaves them
     const cl = document.body.classList;
     if (cl.contains("dv-on") || cl.contains("rv-on")) {
@@ -2633,6 +2642,48 @@
     }
     return items.slice(0, 14);
   }
+  // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
+  // id (a redraw replaces every panel node), else the node as given.
+  function livePanel(node) {
+    const id = node.dataset ? node.dataset.ckPanel : "";
+    if (node.isConnected || !id) return node;
+    return Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
+  }
+  // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
+  let handOff = null;
+  // Focus a panel the jump chose. A redraw replaces every panel node, so the panel is looked up again by its id, and for 3 s a redraw
+  // that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
+  // hand-off, the 3 s, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
+  // focus back from where they went).
+  function landOnPanel(node, scroll) {
+    if (handOff) handOff.stop();
+    handOff = null;
+    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
+    let held = livePanel(node);
+    focusIt(held, scroll);
+    const board = document.getElementById("board");
+    if (!held.dataset || !held.dataset.ckPanel || !board || typeof root.MutationObserver !== "function") return;
+    const obs = new root.MutationObserver(() => {
+      const a = document.activeElement;
+      if (held.isConnected || (a && a !== document.body)) return;
+      const next = livePanel(held);
+      if (next === held) return;
+      held = next;
+      focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
+      if (document.activeElement === held) me.stop();
+    });
+    const timer = root.setTimeout(() => me.stop(), 3000);
+    const answered = () => me.stop();
+    const me = { stop() {
+      obs.disconnect();
+      root.clearTimeout(timer);
+      for (const t of ["pointerdown", "keydown"]) document.removeEventListener(t, answered, true);
+      if (handOff === me) handOff = null;
+    } };
+    handOff = me;
+    obs.observe(board, { childList: true });
+    for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
+  }
   function openJump() {
     if (palette) return;
     const dlg = el("div", "palette");
@@ -2656,9 +2707,11 @@
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
       if (it.kind === "panel") {
         // a panel the current tab hides is reached through the first tab that shows it
-        const changed = revealTab(it.node);
-        if (it.node.ckShowTab) it.node.ckShowTab();
-        after(changed, () => { it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); });
+        // the panel as the page has it now: a redraw since the list was drawn has replaced the node the list holds
+        const node = livePanel(it.node);
+        const changed = revealTab(node);
+        if (node.ckShowTab) node.ckShowTab();
+        after(changed, () => landOnPanel(node, true));
         return; }
       // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
       const changed = revealTab(it.state.p);

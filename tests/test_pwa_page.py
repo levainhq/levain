@@ -117,7 +117,7 @@ def test_a_status_bar_inset_pushes_the_masthead_below_the_clock(tmp_path: Path) 
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True, "safe": {"top": 59, "bottom": 34, "left": 0, "right": 0}}},
             {"until": "document.querySelector('.masthead') && 1", "ms": 10000},
-            {"eval": "document.querySelector('.masthead').getBoundingClientRect().top >= 59"},
+            {"eval": "document.querySelector('.masthead .brand').getBoundingClientRect().top >= 59"},   # the bar stays at the top (sticky, levain#141 polish) and its content starts below the clock
         ])
     assert out["values"][-1] is True
 

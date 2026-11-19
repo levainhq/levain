@@ -812,10 +812,15 @@ class Cockpit:
         self._rc_scope_gen: dict[Any, int] = {}     # a keyed write's generation per read scope (see ``invalidate_reads``)
         self._rc_refreshing: set[str] = set()       # refresher panels with a write-triggered refresh still running
         self._rc_refresh_dirty: set[str] = set()    # of those, the ones a later write reached while it ran
-        # bumped as each ``read_after`` manifest (the change stream's watcher) returns, before it can announce anything:
-        # part of every manifest and panel cache key, so a page's read after an announcement is never answered from an
-        # entry stored before the build that announced it (an etag can move with no provider read: the day turning)
+        # bumped as a ``read_after`` manifest (the change stream's watcher) returns, before it can announce anything, when
+        # it is the first such build or its panel etags differ from the build before it: part of every manifest and panel
+        # cache key, so a page's read after an announcement is never answered from an entry stored before the build that
+        # announced it (an etag can move with no provider read: the day turning; and a page may have cached before the
+        # stream's first build, which has nothing to compare with). A later build that announces nothing does not move it,
+        # so the page's reads keep sharing what it cached; a build that completes after a newer one is ignored (below)
         self._obs_gen = 0
+        self._obs_etags: dict[str, Any] | None = None       # the last counted watcher build's panel id -> head etag
+        self._obs_after: float | None = None                # the newest ``read_after`` counted into the two above
         self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -2430,7 +2435,9 @@ class Cockpit:
                  transport: dict[str, Any] | None = None, read_after: float | None = None) -> dict[str, Any]:
         """``read_after`` (a ``time.monotonic()`` instant; the change stream's watcher passes its build's start) asks for
         a manifest built only from on-demand reads BEGUN at or after it (``_snap_for``): it is never shared from or into
-        the cache below, the reads it makes are the ones later page reads share, and its return bumps ``_obs_gen``.
+        the cache below, the reads it makes are the ones later page reads share, and its return bumps ``_obs_gen`` when it
+        is the first such build or its panel etags differ from the previous one's (an equal later build does not; a build
+        completing after a newer one is ignored, it neither sets the baseline nor decides a bump).
 
         Otherwise the manifest, shared. KEY = every input this composition reads from the request: the whole credential
         dict (class, name, device_class: it is also hashed into the etag and echoed in the body), ``install_class``
@@ -2443,8 +2450,17 @@ class Cockpit:
         if read_after is not None:
             out = self._manifest_compute(credential, install_class=install_class, transport=transport,
                                          read_after=read_after)
+            # the same map the Watcher diffs (panel ids and their head etags), so this moves exactly when it could announce;
+            # a degraded manifest (no panels, a head that is not a mapping) must not raise inside the watcher. The watcher
+            # is the only ``read_after`` caller and reads as one fixed credential, so the map is not keyed by credential
+            seen = {pid: head.get("etag") for pid, head in (out.get("panels") or {}).items() if isinstance(head, dict)}
             with self._rc_lock:
-                self._obs_gen += 1
+                if self._obs_after is None or read_after >= self._obs_after:
+                    self._obs_after = read_after
+                    prev, self._obs_etags = self._obs_etags, seen
+                    if prev is None or prev != seen:
+                        self._obs_gen += 1
+                # else: a newer build already completed and owns the baseline; this older one decides nothing
             return out
         if (self.read_cache_ttl_s or 0.0) <= 0:
             return self._manifest_compute(credential, install_class=install_class, transport=transport)

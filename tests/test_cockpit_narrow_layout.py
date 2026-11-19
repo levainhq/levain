@@ -14,7 +14,7 @@ CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / 
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
 # the places bar holds places only (levain#141); the actions are masthead buttons and the drivers the bar presses are hidden
-PLACES = ["home", "desk", "room", "memory"]
+PLACES = ["home", "desk", "room", "memory", "settings"]
 JUMPS = ["grants", "drop", "notifications", "room", "desk"]
 
 # where things sit and how the strip draws, as one JSON string
@@ -95,11 +95,11 @@ def test_the_drop_tab_scrolls_to_the_hero_box_and_focuses_it_with_no_view_opened
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, {"until": "document.querySelector('#ck-drop-words:not([aria-disabled=true])')", "ms": 30000}, SETTLE,
              {"eval": "window.scrollTo(0, 2500); 1"}, {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},
              {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
-             {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), modal: !!document.getElementById('levain-modal'),"
+             {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), mast: Math.round(Math.max(document.querySelector('.masthead').getBoundingClientRect().bottom, document.querySelector('.ia-places').getBoundingClientRect().bottom)), modal: !!document.getElementById('levain-modal'),"
                       " focused: document.activeElement === document.getElementById('ck-drop-words') })"}]
     with rig.serving():
         got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")][-1]
-    assert got["modal"] is False and got["focused"] is True and 40 <= got["top"] < 140, got   # below the sticky strip, box focused
+    assert got["modal"] is False and got["focused"] is True and 0 <= got["top"] < 140, got   # the box lands near the top (levain#141 polish: a phone's masthead scrolls with the page, nothing is pinned over it), box focused
 
 
 @needs_browser
@@ -135,7 +135,7 @@ def test_a_desktop_draws_the_strip_and_the_homes_own_order(tmp_path: Path, monke
     layouts = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{")]
     assert len(layouts) == 2, layouts
     for layout in layouts:   # the strip at every width (S4.2); Home flattens the hero into its grid and orders the band, the needs, then the graph
-        assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["heroDisplay"] == "contents", layout
+        assert layout["display"] == "flex" and layout["position"] in ("sticky", "fixed") and layout["heroDisplay"] == "contents", layout
         assert layout["band"] < layout["needs"] < layout["sky"], layout
 
 
