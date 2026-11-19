@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_narrow_layout_rig import drive_touch
@@ -38,8 +40,25 @@ MEASURE = r"""(() => {
     clock: R(clock), date: R(date), clockbox: R(box), boxOfClock: clock.closest('.clockbox') === box && date.closest('.clockbox') === box,
     text: text && R(text), age: age && R(age), meta: R(meta), wrap: R(wrap), events: R(events), eventsText: events.textContent.trim(),    wrapText: wrap.textContent.trim(), metaBorderTop: parseFloat(getComputedStyle(meta).borderTopWidth),
     fsText: text && fs(text), fsAge: age && fs(age), fsDate: fs(date), fsClock: fs(clock),
-    tabsBottom: R(document.getElementById('ck-phonetabs')).bottom,
+    tabsBottom: R(document.getElementById('ck-phonetabs')).bottom, dir: getComputedStyle(band).flexDirection,
   }))), 400); })()"""
+
+# a bare install (no state line, or a hero render that failed): the slot holds a hidden state line, then nothing, and the wrap line is emptied.
+# Each is measured after layout: the band is then the clock row alone, with no gap spent on a row that is not there and no hairline over nothing.
+EMPTIED = r"""(() => {
+  const band = document.getElementById('ck-band'), slot = document.getElementById('ck-state-slot'), meta = document.getElementById('ck-wrapline');
+  const read = () => { const when = document.getElementById('ck-when'), cs = (e) => getComputedStyle(e);
+    return { slot: cs(slot).display, meta: cs(meta).display, metaBorder: parseFloat(cs(meta).borderTopWidth), metaPad: parseFloat(cs(meta).paddingTop),
+      extra: band.getBoundingClientRect().height - parseFloat(cs(band).paddingTop) - parseFloat(cs(band).paddingBottom) - when.getBoundingClientRect().height,
+      sw: document.documentElement.scrollWidth, vw: document.documentElement.clientWidth }; };
+  const line = slot.querySelector('.stateline');
+  const out = { full: read() };
+  meta.replaceChildren();
+  if (line) line.hidden = true;
+  out.hidden = read();
+  slot.replaceChildren();
+  out.absent = read();
+  return JSON.stringify(out); })()"""
 
 
 def _open(tmp_path: Path, steps: list, touch: bool) -> list[dict]:
@@ -58,11 +77,12 @@ def _hit(a: dict, b: dict) -> bool:
 
 
 @needs_browser
-def test_the_phone_head_is_three_ordered_groups(tmp_path: Path) -> None:
-    """At 390 px on Home: the clock row, the state line under it, the status row under a hairline; no overlap, no sideways scroll."""
-    g = _open(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, {"eval": MEASURE}], touch=True)[-1]
+@pytest.mark.parametrize("width", [390, 360])
+def test_the_phone_head_is_three_ordered_groups(tmp_path: Path, width: int) -> None:
+    """At 390 and 360 px on Home: the clock row, the state line under it, the status row under a hairline; no overlap, no sideways scroll."""
+    g = _open(tmp_path, [{"emulate": {"w": width, "h": 844, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, {"eval": MEASURE}], touch=True)[-1]
     clock, date, box, text, age, meta = g["clock"], g["date"], g["clockbox"], g["text"], g["age"], g["meta"]
-    assert g["vw"] == 390, g
+    assert g["vw"] == width, g
     # 1. the clock and the date are one row, in one clockbox
     mid = lambda r: (r["top"] + r["bottom"]) / 2  # noqa: E731
     assert g["boxOfClock"] and abs(mid(clock) - mid(date)) <= 4, g
@@ -100,3 +120,29 @@ def test_the_desktop_and_tablet_head_has_room_under_the_places_bar(tmp_path: Pat
         assert g["tokSp5"] > 0 and g["padTop"] == g["tokSp5"], (w, g)
         assert g["clock"]["top"] - g["tabsBottom"] >= g["tokSp5"] - 0.5, (w, g)
         assert g["sw"] <= g["vw"], (w, g)
+
+
+@needs_browser
+def test_the_breakpoint_is_between_720_and_721(tmp_path: Path) -> None:
+    """At 720 px the band is the phone's column, at 721 the desktop's row; neither scrolls sideways, and both keep the --sp-5 top padding."""
+    steps: list = []
+    for w in (721, 720):
+        steps += [{"emulate": {"w": w, "h": 900, "dpr": 1}}, SETTLE, {"eval": MEASURE}]
+    rows = _open(tmp_path, [{"emulate": {"w": 721, "h": 900, "dpr": 1}}, READY, SETTLE] + steps, touch=False)
+    assert len(rows) == 2, rows
+    for g, w, direction in zip(rows, (721, 720), ("row", "column")):
+        assert g["vw"] == w and g["dir"] == direction, (w, g)
+        assert g["sw"] <= g["vw"] and g["tokSp5"] > 0 and g["padTop"] == g["tokSp5"], (w, g)
+
+
+@needs_browser
+def test_an_empty_state_slot_and_wrap_line_leave_no_gap_and_no_hairline_on_a_phone(tmp_path: Path) -> None:
+    """A bare install has no visible state line or wrap line: the band is the clock row alone, with no 16 px gap spent on the empty slot and no
+    hairline or padding drawn over an empty status row."""
+    g = _open(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, {"eval": EMPTIED}], touch=True)[-1]
+    assert g["full"]["slot"] != "none" and g["full"]["metaBorder"] > 0 and g["full"]["extra"] > 1, g       # the full head spends rows on both
+    for case in ("hidden", "absent"):
+        r = g[case]
+        assert r["slot"] == "none" and r["meta"] == "none", (case, g)
+        assert abs(r["extra"]) <= 1, (case, g)                                                                # the clock row alone: no gap under it
+        assert r["sw"] <= r["vw"], (case, g)
