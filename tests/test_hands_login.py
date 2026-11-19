@@ -835,6 +835,29 @@ def test_a_search_list_without_ours_is_set_again(rig):
     assert (rig.hands_home / ".fake-security-list").read_text().strip() == str(_kc(rig))
 
 
+def test_a_search_list_with_a_foreign_keychain_beside_ours_is_reset_to_ours_alone(rig):
+    # l139 round 3: macOS adds a newly made keychain to the list, so ours can be listed beside a foreign one
+    _login(rig, "claude")
+    (rig.hands_home / ".fake-security-list").write_text(f'"/elsewhere/other.keychain-db"\n"{_kc(rig)}"\n')
+    rig.seclog.unlink()
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+    assert f"list-keychains -d user -s {_kc(rig)}" in _sec_calls(rig)
+    assert (rig.hands_home / ".fake-security-list").read_text().strip().strip('"') == str(_kc(rig))
+
+
+def test_a_search_list_that_is_not_ours_alone_after_it_was_set_is_refused(rig, monkeypatch):
+    real = hands_login._search_list
+    seen = []
+
+    def stuck(hands, vendor, entity_dir):
+        seen.append(1)
+        return real(hands, vendor, entity_dir) + (["/elsewhere/other.keychain-db"] if len(seen) > 1 else [])
+    monkeypatch.setattr(hands_login, "_search_list", stuck)
+    with pytest.raises(hands_login.HandsRefused, match="search list is .*other.keychain-db.* after it was set"):
+        _login(rig, "claude")
+
+
 def test_a_failed_default_set_refuses_then_the_next_login_finishes_it(rig):
     rig.knobs["SEC_SET_FAIL"] = "denied"
     with pytest.raises(hands_login.HandsRefused, match="default-keychain.*denied.*is kept and the next login sets it"):

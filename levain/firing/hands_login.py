@@ -507,11 +507,12 @@ def _conf_program() -> list[str]:
 
 
 def _conf_run(hands: HandsIdentity, vendor: str, op: str, d: str, name: str, extra: str = "", *,
-              entity_dir: Path | str, stdin: bytes | None = None) -> "subprocess.CompletedProcess[bytes] | None":
+              entity_dir: Path | str, stdin: bytes | None = None,
+              sweep: bool = True) -> "subprocess.CompletedProcess[bytes] | None":
     """One helper run as the hands user (under the caller's hands lock); None for exit 2 (absent), the run for exit
     0, :class:`HandsLoginError` with the helper's reason for a refusal or a failure."""
     r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, *_conf_program(), op, d, str(hands.uid), name, extra),
-                             entity_dir=entity_dir, held=True, what=f"{op} {d}/{name}", stdin=stdin)
+                             entity_dir=entity_dir, held=True, what=f"{op} {d}/{name}", stdin=stdin, sweep=sweep)
     if r.returncode == 0:
         return r
     if r.returncode == 2 and op == "read":
@@ -523,10 +524,11 @@ def _conf_run(hands: HandsIdentity, vendor: str, op: str, d: str, name: str, ext
 
 
 def conf_read(hands: HandsIdentity, vendor: str, d: str, name: str, *,
-              entity_dir: Path | str) -> tuple[int, str, str] | None:
+              entity_dir: Path | str, sweep: bool = True) -> tuple[int, str, str] | None:
     """``(uid, mode, text)`` of ``d/name`` read as the hands user without following a link, None when the directory
-    or the file is absent; anything that is not a plain UTF-8 file in a real hands-owned directory raises."""
-    r = _conf_run(hands, vendor, "read", d, name, entity_dir=entity_dir)
+    or the file is absent; anything that is not a plain UTF-8 file in a real hands-owned directory raises.
+    ``sweep=False`` is for a read-only advisory caller: a hang kills the child but sweeps no other hands process."""
+    r = _conf_run(hands, vendor, "read", d, name, entity_dir=entity_dir, sweep=sweep)
     if r is None:
         return None
     head, sep, body = r.stdout.partition(b"\n")
@@ -737,15 +739,19 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
             raise HandsLoginError(f"`security default-keychain` as {hands.user} failed: {_brief(_text(r))}; the "
                                   f"keychain file {ours} is kept and the next login sets it again")
         changed = True
-    if not any(_is_ours(p, hands) for p in _search_list(hands, vendor, entity_dir)):
+    listed = _search_list(hands, vendor, entity_dir)
+    if not (len(listed) == 1 and _is_ours(listed[0], hands)):
         # By design the search list is REPLACED with ours alone ("default and only keychain"): the hands account has
-        # no other keychain, and a list without ours is never merged with.
+        # no other keychain, and a list that is not exactly ours (macOS adds a newly made keychain to the list, so
+        # ours can sit beside a foreign one) is never merged with.
         r = _security(hands, vendor, "list-keychains", "-d", "user", "-s", ours, entity_dir=entity_dir)
         if r.returncode != 0:
             raise HandsLoginError(f"`security list-keychains` as {hands.user} failed: {_brief(_text(r))}; the default "
                                   f"is {ours} and the next login sets the search list again")
-        if not any(_is_ours(p, hands) for p in _search_list(hands, vendor, entity_dir)):
-            raise HandsLoginError(f"{hands.user}'s keychain search list does not hold {ours} after it was set")
+        after_list = _search_list(hands, vendor, entity_dir)
+        if not (len(after_list) == 1 and _is_ours(after_list[0], hands)):
+            raise HandsLoginError(f"{hands.user}'s keychain search list is {after_list or 'empty'} after it was set, "
+                                  f"not {ours} alone")
         changed = True
     if changed:
         after = _default_keychain(hands, vendor, entity_dir)

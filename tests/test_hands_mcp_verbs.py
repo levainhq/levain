@@ -425,6 +425,32 @@ def test_signin_warns_when_the_credential_file_cannot_be_read_or_is_not_json(rig
     assert "is not JSON" in capsys.readouterr().out
 
 
+def test_signin_warns_on_a_deeply_nested_credential_file(rig, capsys, monkeypatch):
+    # l139 round 3: json.loads on a hands-writable, deeply nested file raises RecursionError: warn, never crash
+    rig.register()
+    real = hands_login.conf_read
+    deep = "[" * 100000 + "]" * 100000
+    monkeypatch.setattr(hands_login, "conf_read", lambda *a, **kw: (os.getuid(), "600", deep)
+                        if a[3] == ".credentials.json" else real(*a, **kw))
+    assert signin(rig) == 0
+    assert "is not JSON" in capsys.readouterr().out
+
+
+def test_the_post_signin_credential_check_never_sweeps(rig, monkeypatch):
+    # l139 round 3: the check is advisory and read-only; a hang must not sweep every hands-account process
+    rig.register()
+    real = hands_login.conf_read
+    seen = []
+
+    def spy(*a, **kw):
+        if a[3] == ".credentials.json":
+            seen.append(kw.get("sweep", True))
+        return real(*a, **kw)
+    monkeypatch.setattr(hands_login, "conf_read", spy)
+    assert signin(rig) == 0
+    assert seen == [False]
+
+
 def test_a_conflict_refusal_leaves_no_keychain_made(rig, capsys):
     # l139 round 2: "Nothing was changed" must be true, so the keychain is made only after the conflict checks
     rig.register()

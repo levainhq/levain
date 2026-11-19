@@ -318,14 +318,15 @@ def token_warning(hands: HandsIdentity, name: str, entity_dir: Path | str) -> st
     gone = (f"the vendor kept this sign-in somewhere other than that file, which `levain hands mcp remove {name}` "
             "may not reach")
     try:
-        got = hl.conf_read(hands, VENDOR, hl.config_home(hands, VENDOR), hl._VENDOR[VENDOR]["cred"], entity_dir=entity_dir)
+        got = hl.conf_read(hands, VENDOR, hl.config_home(hands, VENDOR), hl._VENDOR[VENDOR]["cred"], entity_dir=entity_dir,
+                           sweep=False)               # advisory and read-only: a hang must not sweep the hands account
     except (hl.HandsLoginError, hl.HandsRefused, OSError, subprocess.SubprocessError) as exc:
         return f"warning: the credential file {where} could not be read after the sign-in ({exc}); {gone}"
     if got is None:
         return f"warning: no credential file at {where}; {gone}"
     try:
         doc = json.loads(got[2])
-    except ValueError:
+    except (ValueError, RecursionError):             # a deeply nested file (hands-writable) is not parsed, only warned about
         return f"warning: the credential file {where} is not JSON, so no mcpOAuth entry for {name} was found; {gone}"
     oauth = doc.get("mcpOAuth") if isinstance(doc, dict) else None
     if isinstance(oauth, dict) and name in oauth:
