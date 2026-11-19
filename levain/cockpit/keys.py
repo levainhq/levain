@@ -882,15 +882,30 @@ class _SkRefusal:
     carried: str
     detail: str
     evidence: str                # the evidence file's path, or "evidence not written (<why>)"
+    empty: bool = False          # the ECDSA signature inside has empty r and s: the key returned no signature (levain#153)
+    touch: bool = False          # the signer is a Touch ID one (its sidecar says so, or the Apple provider signed it)
+
+
+# what a person reads when the key's answer carried no signature at all (levain#153): the key said "done" and gave nothing back
+# Touch ID is named only when the sign path knows the signer is one (its sidecar's custody, or the Apple provider)
+def _empty_sig_words(touch: bool) -> str:
+    return "the key returned no signature" + (" (Touch ID gave nothing back)" if touch else "")
+
+
+_EMPTY_SIG_REASON = "empty ECDSA signature (r and s have zero length)"
+_EMPTY_SIG_NEXT = "try again, or answer from your phone instead (open the cockpit sign page)"
 
 
 def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
-                        counter: int | None, detail: str, namespace: str, attempt: int) -> str:
+                        counter: int | None, detail: str, namespace: str, attempt: int,
+                        empty: bool = False) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
     (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
     ones are deleted (:func:`_prune_sign_failures`). The file holds the armored signature, its flags byte and counter,
-    BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time.
+    BOTH ssh-keygen verdicts (``detail``), the key fingerprint and the time, and ``reason``: the exact classification
+    when there is one (:data:`_EMPTY_SIG_REASON`: the signature's r and s are empty), else null. ``reason`` is a field
+    added to ``levain-sign-failure/1``; every earlier key is unchanged, and a record from before it has no ``reason``.
 
     The directory is trusted only as this uid's own 0700 directory, opened without following a symlink, and every
     write and prune goes through that one open descriptor; anything else (a symlink, another owner, a looser or
@@ -922,7 +937,8 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
         record = {"format": "levain-sign-failure/1", "time": now.isoformat(), "fingerprint": fp, "namespace": namespace,
                   "algorithm": sig_type, "flags": format(flags, "#04x"), "counter": counter, "attempt": attempt,
                   "message_sha256": hashlib.sha256(message).hexdigest(), "message_bytes": len(message),
-                  "ssh_keygen": detail, "signature": signature}
+                  "ssh_keygen": detail, "signature": signature,
+                  "reason": _EMPTY_SIG_REASON if empty else None}
         body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
         # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
         name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
@@ -1021,6 +1037,10 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             left = deadline - time.monotonic()
             if left < _SK_RETRY_MIN_S:
                 a = failed[0]
+                if a.empty:
+                    raise KeyError_(f"{_empty_sig_words(a.touch)} for {fp} ({a.carried}; {a.evidence}), and no second touch was "
+                                    f"asked for: {max(left, 0.0):.1f}s of the {bound:g}s bound was left, under "
+                                    f"{_SK_RETRY_MIN_S:g}s, so nothing was signed; {_EMPTY_SIG_NEXT}")
                 raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({a.carried}; {a.detail}; "
                                 f"{a.evidence}), and no second touch was asked for: {max(left, 0.0):.1f}s of the "
                                 f"{bound:g}s bound was left, under {_SK_RETRY_MIN_S:g}s, so nothing was signed")
@@ -1039,6 +1059,19 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 return again
             failed.append(again)
         a, b = failed[0], failed[-1]
+        if a.empty and b.empty:
+            raise KeyError_(f"{_empty_sig_words(a.touch or b.touch)} for {fp}, twice ({_EMPTY_SIG_REASON}): "
+                            f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.evidence}); "
+                            f"attempt 2 flags {b.flags:#04x} ({b.carried}; {b.evidence}); "
+                            f"so nothing was signed; {_EMPTY_SIG_NEXT}")
+        if a.empty or b.empty:      # mixed: each attempt is described by its own outcome, and the phone guidance stays
+            which = 1 if a.empty else 2
+            raise KeyError_(f"ssh-keygen did not return a verifiable signature as {fp}, and both attempts failed "
+                            f"(one attempt returned no signature, the other returned a signature that did not verify; "
+                            f"attempt {which} returned no signature): "
+                            f"attempt 1 flags {a.flags:#04x} ({a.carried}; {_EMPTY_SIG_REASON if a.empty else a.detail}; {a.evidence}); "
+                            f"attempt 2 flags {b.flags:#04x} ({b.carried}; {_EMPTY_SIG_REASON if b.empty else b.detail}; {b.evidence}); "
+                            f"so nothing was signed; {_EMPTY_SIG_NEXT}")
         raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp}, and both attempts failed "
                         f"(the key's answer did not check out, and touching again did not help): "
                         f"attempt 1 flags {a.flags:#04x} ({a.carried}; {a.detail}; {a.evidence}); "
@@ -1112,10 +1145,11 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                 except Exception:  # noqa: BLE001 - the counter is evidence only
                     counter = None
                 # kept as evidence, then handed to ``sign`` for its one retry; the file's path rides in the error text
+                empty = _authority_sig.sk_ecdsa_signature_empty(signature)
                 evidence = _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
                                                flags=flags, counter=counter, detail=detail, namespace=namespace,
-                                               attempt=attempt)
-                return _SkRefusal(flags, carried, detail, evidence)
+                                               attempt=attempt, empty=empty)
+                return _SkRefusal(flags, carried, detail, evidence, empty, is_touch)
             raise KeyError_(f"ssh-keygen returned a signature that does not verify as {fp} ({carried}; {detail}), "
                             "so nothing was signed")
         return signature
