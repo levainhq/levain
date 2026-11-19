@@ -128,6 +128,26 @@ def test_the_default_lsof_runner_runs_the_absolute_binary_bounded():
     assert "COMMAND" in cc._run_lsof()
 
 
+def _name_shape_ok(name: str) -> bool:
+    # "@" is a Linux abstract socket (no filesystem path)
+    return name == "" or name.startswith(("/", "@", "->")) or "type=" in name
+
+
+_ABSTRACT = ("systemd-i 108365 runner    3u  unix 0x0000000000000000      0t0 400962 "
+             "@64f09a3c4f7e1cf5/bus/systemd-inhibit/system type=STREAM (CONNECTED)")
+
+
+@pytest.mark.parametrize("row", [
+    _ABSTRACT,
+    "systemd       1 root   14u  unix 0xffff8d2b3c1e4400      0t0   20843 /run/systemd/notify type=DGRAM",
+    "2.1.319 4242 me 9u unix 0x0000000000000000 0t0 41009 ->0x0000000000000000 type=STREAM",
+], ids=["abstract-at", "path", "peer-arrow"])
+def test_the_name_shape_check_accepts_every_real_unix_name_form(row):
+    m = cc._LSOF_ROW.match(row)
+    assert m, row
+    assert _name_shape_ok(m["name"]), row
+
+
 def test_every_unix_row_of_this_hosts_real_lsof_parses():
     """The regex against the real binary's output, not only the fixtures (L3 c-prime deepseek HIGH)."""
     try:
@@ -141,7 +161,7 @@ def test_every_unix_row_of_this_hosts_real_lsof_parses():
     assert not missed, missed[:3]
     for ln in rows:
         name = cc._LSOF_ROW.match(ln)["name"]
-        assert name == "" or name.startswith(("/", "->")) or "type=" in name, ln
+        assert _name_shape_ok(name), ln
 
 
 # --- L3 c-prime: every identifier the socket signal leans on must be there, or it is unknown -------------------------
