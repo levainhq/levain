@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from anneal_memory.spores import IntentionStore
+from tests._cockpit_reread import REREAD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_k4a_needs import DESKTOP
@@ -72,7 +73,7 @@ def test_the_refresh_button_keeps_a_tall_open_intention_and_its_scroll(tmp_path:
             {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
             {"eval": COUNT_RENDERS},
             {"eval": OPEN_AND_SCROLL},
-            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": "window.__r >= 1 && 1"},
             {"eval": "new Promise(r => setTimeout(r, 800))"},
             {"eval": STATE},

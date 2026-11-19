@@ -8,6 +8,7 @@ import json
 import pytest
 from pathlib import Path
 
+from tests._cockpit_reread import REREAD_SETTLED
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
@@ -91,7 +92,7 @@ def test_garbage_in_storage_is_ignored_and_the_board_draws_the_kernel_order(tmp_
 def test_storage_that_throws_still_renders_and_a_click_does_not_break_the_page(tmp_path: Path) -> None:
     out = _run(tmp_path, [
         {"eval": "Storage.prototype.getItem = () => { throw new Error('denied'); }; Storage.prototype.setItem = () => { throw new Error('denied'); }; "
-                 "document.getElementById('refresh').click(); new Promise(r => setTimeout(r, 800)).then(() => 1)"},
+                 + REREAD_SETTLED},
         {"eval": STACKS},
         {"eval": f"{PANEL % 'edits'}.querySelector('.ck-lay-up').click(); {PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"},
         SETTLE,
@@ -125,7 +126,7 @@ def test_a_reorder_and_a_collapse_survive_the_live_refresh_and_a_tab_switch(tmp_
     out = _run(tmp_path, [
         {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"},
         SETTLE, {"eval": STACKS},
-        {"eval": "document.getElementById('refresh').click(); new Promise(r => setTimeout(r, 800)).then(() => 1)"},
+        {"eval": REREAD_SETTLED},
         {"eval": STACKS},
         {"eval": "document.querySelector('[data-mode-tab=\"memory\"]').click(); new Promise(r => setTimeout(r, 300)).then(() => 1)"},
         {"eval": "document.querySelector('[data-mode-tab=\"board\"]').click(); new Promise(r => setTimeout(r, 300)).then(() => 1)"},
@@ -372,7 +373,7 @@ def test_storage_that_refuses_writes_still_lets_the_controls_work_for_the_pages_
     out = _run(tmp_path, [
         {"eval": "Storage.prototype.setItem = () => { throw new Error('quota'); }; 1"},
         {"eval": f"{PANEL % 'edits'}.querySelector('.ck-lay-up').click(); 1"}, SETTLE, {"eval": STACKS},
-        {"eval": "document.getElementById('refresh').click(); new Promise(r => setTimeout(r, 800)).then(() => 1)"}, {"eval": STACKS},
+        {"eval": REREAD_SETTLED}, {"eval": STACKS},
         {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
         {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('[data-layout-reset]').length > 0]"},
     ])

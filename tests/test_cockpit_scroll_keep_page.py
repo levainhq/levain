@@ -13,6 +13,7 @@ from levain.cockpit.engine import ProviderSpec
 from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.results import Read
 from levain.web_server import make_server
+from tests._cockpit_reread import REREAD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 
@@ -70,7 +71,7 @@ def _serve_plain(src: Any) -> _Served:
 
 @needs_browser
 def test_the_refresh_button_keeps_the_readers_place(tmp_path: Path) -> None:
-    out = _reload_keeps_the_scroll(tmp_path, "document.getElementById('refresh').click(); 1")
+    out = _reload_keeps_the_scroll(tmp_path, REREAD)
     v = out["values"]
     assert v[1] > 2600, f"the page must be tall enough to scroll: {v}"
     assert abs(v[3] - 1500) <= 2, f"the scroll was not set: {v}"
@@ -128,7 +129,7 @@ def test_refocusing_the_filter_box_after_a_reload_does_not_scroll_the_page(tmp_p
             # top of #board), and the page keeps that scroll through the reload
             {"eval": f"(() => {{ {box}.focus(); const b = {box}.getBoundingClientRect(); const y = Math.min(document.documentElement.scrollHeight - innerHeight, Math.round(b.bottom + window.scrollY + 300)); window.scrollTo(0, y); const r = {box}.getBoundingClientRect();"
                      " return [window.scrollY, r.bottom < 0 || r.top > innerHeight]; })()"},
-            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": "window.__renders >= 1 && window.__renders"},
             # long enough for the 0ms focus restore to have run and any scroll it caused to land
             {"eval": f"new Promise(r => setTimeout(() => r([window.scrollY, document.activeElement === {box}]), 600))"},

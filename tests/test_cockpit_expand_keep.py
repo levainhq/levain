@@ -10,6 +10,7 @@ from typing import Any
 
 from anneal_memory import Store
 from anneal_memory.spores import IntentionStore
+from tests._cockpit_reread import REREAD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TODAY, _install
 from tests.test_cockpit_scroll_keep_page import _Served, _serve_plain
@@ -98,7 +99,7 @@ def test_refresh_keeps_an_expanded_row(tmp_path: Path) -> None:
             {"eval": COUNT_RENDERS},
             {"eval": _open_in(BOARD, "episodes")},
             {"eval": _held(BOARD)},
-            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": "window.__r >= 1 && 1"},
             {"eval": "new Promise(r => setTimeout(r, 600))"},
             {"eval": _held(BOARD)},
@@ -109,7 +110,7 @@ def test_refresh_keeps_an_expanded_row(tmp_path: Path) -> None:
             {"eval": COUNT_RENDERS},
             {"eval": _open_in(MODAL)},
             {"eval": _held(MODAL)},
-            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": "window.__r >= 1 && 1"},
             {"eval": "new Promise(r => setTimeout(r, 600))"},
             {"eval": _held(MODAL)},
@@ -263,9 +264,9 @@ def test_the_episodes_modal_search_keeps_an_open_row_across_two_rebuilds(tmp_pat
             {"until": f"/matches/.test((document.querySelector('{modal} .ep-search-status') || {{}}).textContent || '') && 1"},
             {"eval": _open_in(modal)},
             # the answer is now held back for 2s; two rebuilds arrive before it lands
-            {"eval": "window.__delay = 2000; window.__r = 0; document.getElementById('refresh').click(); 1"},
+            {"eval": "window.__delay = 2000; window.__r = 0; " + REREAD},
             {"until": "window.__r >= 1 && 1"},
-            {"eval": "document.getElementById('refresh').click(); 1"},
+            {"eval": REREAD},
             {"until": "window.__r >= 2 && 1"},
             {"eval": f"new Promise(r => setTimeout(r, 3500)).then(() => [{_held(modal)}, {_scroll_of(modal)}])"},
         ])
