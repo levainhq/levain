@@ -99,6 +99,15 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
   K.pruneModal();
   ok(ms.seq > seqLive, "a detached modal state is torn down");
   ok(s.seq === seqBoard, "a board state is not touched by pruneModal");
+  // a brief-region panel is not drawn: its announcement is answered "applied" (no board reload), and an id the manifest does not
+  // place in the brief region still answers false
+  {
+    const ke = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} }, generated_at: "2026-10-11T12:00:00+00:00",
+      regions: { header: [], hero: [], brief: ["begin"], widgets: [], zones: [] }, panels: { begin: Object.assign(head("brief", "Where to begin"), { id: "begin" }) }, verbs: {}, errors: [], transport: { writable: false } };
+    V.fromManifest({ manifest: ke, panels: { begin: Object.assign(head("brief", "Where to begin"), { id: "begin", brief: { headline: "x", lines: [] } }) } });
+    ok(await K.refetchPanel("begin") === "applied", "an undrawn brief-region panel needs no reload");
+    ok(await K.refetchPanel("ghost") === false, "a panel the manifest does not place still asks for a reload");
+  }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
 """

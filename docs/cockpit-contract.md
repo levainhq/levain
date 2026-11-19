@@ -16,7 +16,7 @@ Every timestamp (`as_of`, `at`) is ISO-8601.
 |---|---|---|
 | `reading` | `{value, unit, condition, as_of, hi?, lo?, symbol?, sub?: [{label, value, band?, detail?}]}`; `value` is a number or a non-empty string | `value` missing, boolean or null; `unit`/`condition` not strings (empty is fine); `as_of` not ISO; `hi`/`lo` not numbers; a `symbol` outside the token set below; a sub-reading without a label, or a `detail` that is not a string |
 | `line` | `{lines: [{text, label?, at?}]}` | `lines` not a list of objects; a `text` that is not a string; an `at` that is not ISO |
-| `brief` | `{markdown?, lines?: [{label?, text}], headline?, title?, source?, threads?: [{text, domain?, tier?}], overnight?: {episodes, since}}`; at least one of `markdown` / `lines`. `title`/`source` head a brief-region card (its name and what it reads from); `threads` are intentions the page groups by repo; optional, the kernel sends none since the loop fold and an embedder may still send them; `overnight` is episodes since the last wrap (`since` = that wrap's ISO time), present only when both are known | neither present; `markdown`, `headline`, `title` or `source` not a string; a line or thread without `text`; an `overnight` that is not `{episodes: int, since: ISO}` |
+| `brief` | `{markdown?, lines?: [{label?, text}], headline?, title?, source?, threads?: [{text, domain?, tier?}], overnight?: {episodes, since}}`; at least one of `markdown` / `lines`. `title`/`source` name a brief panel and what it reads from (the web page no longer draws a brief-region card; the text cockpit prints them); `threads` are intentions the page groups by repo; optional, the kernel sends none since the loop fold and an embedder may still send them; `overnight` is episodes since the last wrap (`since` = that wrap's ISO time), present only when both are known | neither present; `markdown`, `headline`, `title` or `source` not a string; a line or thread without `text`; an `overnight` that is not `{episodes: int, since: ISO}` |
 | `count-queue` | the `list` contract below; the head's `count` is the queue's big number | as `list` |
 | `ambient` | `{events: [{kind, at, repo, agent, outcome}], legend}` | an event missing any of the five keys; `kind` empty; `at` not ISO; `repo`/`agent` neither string nor null; `outcome` not `ok`/`failed`; `legend` missing or blank. Extra keys on an event are accepted and ignored |
 | `status-dots` | `{metrics: [{label, status?, value?, unit?, read?}], alerts?: [{message, severity?}]}`; `status` is `ok`/`warn`/`bad`/`unknown` (default `unknown`) | a metric without a label; a `status` outside the four; a `value` that is not a finite number or a string; a `unit` or `read` that is not a string; an alert without `message` |
@@ -61,13 +61,13 @@ Notes a provider relies on:
 
 ## Regions and zone layout
 
-`ProviderSpec.region` places a panel. A renderer draws, top to bottom: the **hero**, the **brief**, the
+`ProviderSpec.region` places a panel. A renderer draws, top to bottom: the **hero**, the
 **widgets**, then the three zones (`operate`, `mind`, `identity`) on a three-column grid.
 
 | region | holds | refused |
 |---|---|---|
 | `hero` | a `reading` (at most one) and an `ambient` (at most one); the renderer draws its own clock first, the reading under it, the ambient beside it | a second reading or ambient; any other kind |
-| `brief` | `line` and `brief`, in rank order | any other kind |
+| `brief` | `line` and `brief`, in rank order. The web page draws only the state line from it (in the now band), no card; the text cockpit prints the whole region | any other kind |
 | `widgets` | one answer each: `reading`, `line`, `status-dots`, `metric-grid`, and a `list` or `count-queue` that declares `face="count"` | `brief`, `ambient`, `roster`, `log`, `form`, `board`, and a row-engine kind without `face="count"`. A widget is one answer, never a list |
 | `operate` / `mind` / `identity` | any kind | |
 

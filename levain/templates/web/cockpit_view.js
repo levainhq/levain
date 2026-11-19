@@ -553,7 +553,7 @@
   // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, Now,
   // episodes, Team), Build the live agents (the sessions, edits, results), Memory the mind (the six sections,
   // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
-  // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
+  // region's tabs: a glance tile on Morning and Board, the brief (a region the page no longer draws) on Morning, a work card on Board, a mind or identity card on Memory.
   const ALL_TABS = "morning board build memory";
   // Null-prototype tables: a panel id comes from the wire, and "constructor" or "__proto__" must read as not-in-the-table
   // rather than an inherited function.
@@ -822,7 +822,7 @@
     }
 
     let sectionRef = 0;
-    // `region` is set for a hero / brief / widgets panel: those are drawn bare by the page, always through the
+    // `region` is set for a hero / brief / widgets panel: the hero and widgets are drawn bare by the page (a brief-region panel is read but not drawn), always through the
     // typed external path, never as one of the kernel's own built-in panels (a widget named `health` is not the Health panel)
     const place = (pid, zoneId, region) => {
       const nat = region ? "" : pid;
@@ -1913,8 +1913,11 @@
   // bumped by every board render (K.reset): a panel read begun before one cannot repaint what that render drew
   let boardEpoch = 0;
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
+  // A brief-region panel other than the state line has no copy on the page (the Today card is not drawn): an announcement of it has
+  // nothing to refresh, and answering false would reload the whole board each time it changes.
+  const briefUndrawn = (pid) => { const r = lastManifest && lastManifest.regions; return !!(r && Array.isArray(r.brief) && pid !== "state" && r.brief.indexOf(pid) >= 0); };
   async function refetchPanel(pid) {
-    if (!liveOf(pid).length) return false;
+    if (!liveOf(pid).length) return briefUndrawn(pid) ? "applied" : false;
     // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
     if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
     const gen = (refetchGen.get(pid) || 0) + 1;

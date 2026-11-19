@@ -165,8 +165,8 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
                          capture_output=True, text=True, timeout=30, check=True)
     out = json.loads(run.stdout)
     assert not out.get("missing"), "the boot has no progressive draw block"
-    # the Needs strip's panel is read first, then the hero and the brief, the rest keep the manifest's order
-    assert out["order"] == ["decisions", "activity", "state", "begin", "loops", "tray", "crystals"]
+    # the Needs strip's panel is read first, then the hero and the state line, the rest (a brief-region panel the page does not draw included) keep the manifest's order
+    assert out["order"] == ["decisions", "activity", "state", "loops", "tray", "begin", "crystals"]
     assert out["noRegions"] == ["a", "b"]
     assert out["needs"] == ["decisions"]
     # the board in hand: the landed record itself, a loading marker for each panel still out, nothing for an id the manifest does not list
