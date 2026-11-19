@@ -204,10 +204,10 @@ def test_over_http_two_surface_tokens_never_cross_and_a_post_invalidates(tmp_pat
         # still run after the response, urlopen would return before it had happened
         calls, real = [], ck.invalidate_reads
 
-        def slow_invalidate() -> None:
+        def slow_invalidate(*a, **k) -> None:
             time.sleep(0.5)
             calls.append(time.monotonic())
-            real()
+            real(*a, **k)
 
         ck.invalidate_reads = slow_invalidate
         gen = ck._rc_gen

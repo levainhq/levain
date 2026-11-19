@@ -2375,7 +2375,7 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _presence_cache: Any = _UNSET   # reset per request in handle_one_request
-    _reads_invalidated = False      # likewise: whether this request has dropped the shared read cache yet
+    _reads_invalidated = False      # likewise: whether this request has invalidated its reads yet
     # likewise, a cockpit verb POST: the panel ids its fire reported touching (None: drop every read), the verb name once it
     # reached dispatch, and when do_POST began (monotonic, and as an ISO time for the edits ledger row)
     _write_touched: "frozenset[str] | None" = None
@@ -2502,7 +2502,7 @@ class _Handler(GuardedHandler):
                 pass        # the client went away first
 
     def _admitted_write(self, code: "int | None") -> bool:
-        """Whether THIS request may have written, so the shared read cache must drop what it holds (1106 solid2 r1).
+        """Whether THIS request may have written, so the reads it made stale must be invalidated (1106 solid2 r1).
         A write method (not GET / HEAD) AND either a verified surface or paired credential resolved on this request
         (a write route admitted it, whatever the write then answered), or a 2xx answer (the routes whose credential
         is not a surface token: the pairing claim's code, a notify token, a push receipt's endpoint hash, the chat
@@ -2532,15 +2532,20 @@ class _Handler(GuardedHandler):
 
     def _note_fired(self, result: Any) -> None:
         """Keep what a cockpit verb's answer says it touched, for the invalidation ``send_response`` makes before the status
-        line: a landed fire's ``touched`` panels, or nothing for a dry run. Any other answer leaves the set unset, so every
-        read goes cold as before."""
+        line: a landed fire's ``touched`` panels that are registered, or nothing for a dry run. Any other answer, and a
+        ``touched`` that names no registered panel, leaves the set unset, so every read goes cold."""
         if not isinstance(result, dict):
             return
         touched = result.get("touched")
         if result.get("dry_run") is True:
             self._write_touched = frozenset()
-        elif isinstance(touched, list) and touched and all(isinstance(p, str) for p in touched):
-            self._write_touched = frozenset(touched)
+        elif isinstance(touched, list):
+            cockpit = getattr(self.server, "cockpit", None)
+            known = set(cockpit.panel_ids) if cockpit is not None else set()
+            # only registered panels count; none left means the answer named nothing real, so every read goes cold
+            got = frozenset(p for p in touched if isinstance(p, str) and p in known)
+            if got:
+                self._write_touched = got
 
     def _log_write_time(self) -> None:
         """One stderr line for a cockpit verb POST that reached dispatch: ``cockpit write <verb> <ms> ms``, the time from
@@ -2555,8 +2560,8 @@ class _Handler(GuardedHandler):
             _log.warning("slow cockpit write: verb=%s ms=%d", name, ms)
 
     def send_response(self, code: int, message: "str | None" = None) -> None:
-        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write drops the shared read cache BEFORE its status line is
-        written. Every handler answers through here after its write committed (send_error included), so a client
+        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write invalidates the reads it made stale BEFORE its status line is
+        written: every cached read, or only those of the panels a cockpit verb named (``_invalidate_reads``). Every handler answers through here after its write committed (send_error included), so a client
         that holds the response and reads at once, on any connection, never gets a read cached or begun before the
         write. The ``finally`` in :meth:`handle_one_request` is only the fallback."""
         if not self._reads_invalidated and self._admitted_write(code):

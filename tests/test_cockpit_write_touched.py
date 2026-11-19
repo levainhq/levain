@@ -368,3 +368,36 @@ def test_a_keep_over_a_real_install_touches_what_it_changed(tmp_path: Path) -> N
     rig = Rig(tmp_path)
     out = rig.post("intention_keep", "tray", "note", {}, confirm=True)
     assert {"episodes", "health", "activity", "memory_glance", "begin", "tray", "edits"} <= set(out["touched"])
+
+
+# --- a handler's own ``touched`` is believed only for registered panels --------------------------------------------
+
+
+def test_a_handlers_own_touched_keeps_only_registered_panels(ck) -> None:
+    from levain.cockpit.verbs import _landed
+
+    reg = VerbRegistry()
+    verb = reg.get("intention_surface_at")
+    mixed = _landed(reg, ck, verb, "tray", {"ok": True, "touched": ["health", "no-such-panel", 7, "health"]})
+    assert mixed["touched"] == ["health"]
+    for bad in (["no-such-panel"], [], "tray", None, 3):
+        got = _landed(reg, ck, verb, "tray", {"ok": True, "touched": bad})["touched"]
+        assert got == reg.touched(ck, verb, "tray"), bad
+
+
+def _note(ck, result) -> "frozenset[str] | None":
+    from types import SimpleNamespace
+
+    from levain.web_server import _Handler
+
+    me = SimpleNamespace(server=SimpleNamespace(cockpit=ck), _write_touched=None)
+    _Handler._note_fired(me, result)
+    return me._write_touched
+
+
+def test_the_server_believes_a_touched_only_for_registered_panels(ck) -> None:
+    assert _note(ck, {"touched": ["health", "no-such-panel"]}) == frozenset({"health"})
+    assert _note(ck, {"touched": ["no-such-panel"]}) is None       # the global drop
+    assert _note(ck, {"touched": [3, None]}) is None
+    assert _note(ck, {"touched": []}) is None
+    assert _note(ck, {"dry_run": True, "touched": ["health"]}) == frozenset()
