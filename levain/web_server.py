@@ -2118,6 +2118,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     stream_stop: threading.Event
     room_waiter_gate: threading.BoundedSemaphore
     stream_watcher: "cockpit_stream.Watcher"
+    # A change probe for the watcher (``change_seq()`` and ``snapshot()``, see levain.cockpit.stream): None until set,
+    # and read when ``__init__`` builds the watcher, so a server that has one gets it as a constructor argument.
+    change_probe: Any = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
@@ -2125,7 +2128,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_stop = threading.Event()
         self.room_waiter_gate = threading.BoundedSemaphore(cockpit_room.WAITERS_MAX)
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4),
-                                                     token=self._watch_token)
+                                                     token=self._watch_token, probe=self.change_probe)
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
