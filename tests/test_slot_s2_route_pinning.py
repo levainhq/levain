@@ -193,6 +193,22 @@ def test_front_policy_bytes_of_a_ticketed_alloc_is_the_pinned_entrys(dispatch):
     assert [r["route"] for r in doc["routes"]] == [ROUTE, "github"]
 
 
+def test_front_policy_bytes_names_the_missing_pinned_route_first(dispatch):
+    """A blob that omits the pinned route AND names an id the base map lacks is refused as ticket-routes-mismatch:
+    the membership check runs before any lookup that could refuse for another reason (L3 r2, three lineages)."""
+    d, w = dispatch, dispatch.w
+    p = _policy()
+    _write_generation(w, 1, [p])
+    s = _ticketed(d, _facts(RM.policy_digest(p)))
+    store = H.Store(w.seams)
+    try:
+        with pytest.raises(H.Refused) as ei:
+            H.front_policy_bytes(store, w.alloc(s), ["github", "no-such-route"])
+    finally:
+        store.close()
+    assert ei.value.name == "ticket-routes-mismatch"
+
+
 def test_start_names_the_pinned_routes_secrets_not_route_unknown(dispatch):
     """`start`'s secret names are taken under the session's route types: the pinned route is brokered there too."""
     d, w = dispatch, dispatch.w

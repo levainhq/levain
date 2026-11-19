@@ -861,11 +861,11 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     base = _canon_obj(data, "base-map")
     dispatch = a.kind in FR.DISPATCH_KINDS
     pin = ticket_pin(a)
+    if pin is not None and pin.route not in routes:
+        raise Refused("ticket-routes-mismatch", f"the blob does not name the ticket's route {pin.route}")
     pinned = pinned_route_entry(store, pin, _base_maps(base)[0]) if pin is not None else None
     base_ids = [r for r in routes if pin is None or r != pin.route]
     base_view = {r["route"]: r for r in front_session_routes(base, base_ids, dispatch=dispatch)}
-    if pin is not None and pin.route not in routes:
-        raise Refused("ticket-routes-mismatch", f"the blob does not name the ticket's route {pin.route}")
     routes_view = [_front_entry(pinned, dispatch) if pin is not None and r == pin.route else base_view[r] for r in routes]
     doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session, "routes": routes_view,
            "incarnation": a.lease_seq}
