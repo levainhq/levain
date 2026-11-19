@@ -1351,3 +1351,18 @@ def test_a_set_stream_failure_is_cleared_only_by_a_set_stream_success():
     loop._evaluate(clock.t)  # the stream write landed on the previous poll
     assert writer.streams[-1]["state"] == "ok" and loop.last_publish_error is None
     loop.stop()
+
+
+def test_a_panel_publish_success_does_not_clear_a_failing_stream_write(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("1")
+    loop, writer, clock, _ = make([PanelPlan("a", inputs=(File(str(f)),))], backstop_s=1e9)
+    settle(loop, clock)
+    f.write_text("22")
+    _fail_n(writer, "set_stream", 1)
+    assert loop.run_once(clock.t) == ["a"]  # the stream write fails in the evaluation, then a's publish lands
+    assert "stream" in loop._write_errors and loop.last_publish_error is not None
+    loop._evaluate(clock.t)  # the stream write lands now
+    loop._evaluate(clock.t)
+    assert not loop._write_errors and writer.streams[-1]["state"] == "ok"
+    loop.stop()
