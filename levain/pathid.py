@@ -158,7 +158,12 @@ def _decide(root, path) -> Tuple[bool, bool]:
 
     An unsure side never takes the lexical answer: its spelling is the unresolved one, and a component of it may be a
     link that leads elsewhere. The identity walk then decides, and a match found ABOVE a component that exists and
-    could not be stat'ed is unsure, not inside (that component is where the path could not be placed)."""
+    could not be stat'ed is unsure, not inside (that component is where the path could not be placed).
+
+    Known edge (Diogenes 11-19, ruled levain 48 1119-5, no caller reaches it): a root that does not exist yet, below a
+    directory that stats but refuses the open, answers a sure "not inside" for a path whose text is under it. Diogenes read the
+    ``maybe_inside`` call sites on 11-19 and found none that reaches it. Fix if one does:
+    ``return False, unsure or sr or sp or exc.errno not in _ABSENT`` in the root-stat branch, pinned by a mode-0o311 case."""
     try:
         Path(root), Path(path)
     except TypeError:                                   # not a path at all (None, an int): nothing can be said of it

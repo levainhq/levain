@@ -534,3 +534,21 @@ def test_the_check_and_init_help_say_the_rc_two_list_applies_only_when_the_guard
         out = " ".join(capsys.readouterr().out.split())
         assert "only when the guard runs" in out, sub
         assert "not under --file" in out if sub == "check" else "not under --stdout" in out, sub
+
+
+def test_init_stdout_still_exits_two_when_the_registry_of_a_found_store_cannot_be_read_and_the_help_says_so(tmp_path, capsys, monkeypatch):
+    """Diogenes 11-19: the init help said --stdout never exits 2; run_init reads the tracking plan under --stdout too."""
+    repo = _git_repo(tmp_path / "levain")
+    store = _store_file(tmp_path / "items.jsonl", [("levain#1", None)])
+
+    def boom(*_a, **_k):
+        raise charter._RegistryUnreadable("cannot tell whether levain is tracking: x. Fix the store, then run this again.")
+
+    monkeypatch.setattr(charter, "_tracking_plan", boom)
+    assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(store), "--stdout"]) == 2
+    assert not (repo / "CHARTER.md").exists()
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        main(["charter", "init", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "still exits 2" in out and "gives 0 or 1" not in out
