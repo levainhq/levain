@@ -519,9 +519,9 @@ _DAY_PLAN = (
     f"{_ARRIVAL_CARD} Above your status line (in a `coord reply`, at the top of --text) write at most 5 plain lines of "
     "the day: what you will run today and in what order, and what you are holding until the operator answers. Do not restate a "
     "work line, a `back:`, handoff or `next:` line, or a band item: they are directly below, and a restatement drifts "
-    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. The card carries no "
-    "question: what you need from the operator goes through `coord escalate` or the band's ask tool, which reach a surface "
-    "they answer from. A reply that is neither has no such section: it is the reply as always.")
+    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. The card hands the "
+    "operator no question and no decision: what you need from them is filed first through `coord escalate` or the band's ask "
+    "tool, which reach a surface they answer from, and the card names it by id only, as held. A reply that is neither has no such section: it is the reply as always.")
 _DAY_STATUS_ONLY = (
     f"{_ARRIVAL_CARD} Write only your status line (in a `coord reply`, a one-line --text): the lines Levain derived "
     "are the card.")
