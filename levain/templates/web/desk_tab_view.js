@@ -42,8 +42,8 @@
   // word away). Drawn only where the page carries the sheet.
   var DESK_WORDS = "/fanin broad";
   var NEW_LABEL = "New Desk", ROTATE_LABEL = "Rotate Desk";
-  var START_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk inside limits; its Send words only button starts it with no limits; nothing starts until you press one of them.";
-  var START_REFUSED_WORDS = "The signing sheet did not open, so no desk was started.";
+  var START_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Sign it there to ask the host to start a desk inside limits; its Send words only button asks with no limits; nothing is sent until you press one of them.";
+  var START_REFUSED_WORDS = "The signing sheet did not open; no start request was sent from this button.";
   // Rotate Desk (levain#107): the page opens the sheet with a rotate request, and only a SIGNED delivery of it is counted as asked. The
   // desk port's post carries words and nothing that signs, so the ask is a drop over the sheet. The first word is the marker the page
   // itself compares a delivered drop's words against; the page rotates nothing and does not know that any desk acts on those words. It
@@ -56,12 +56,12 @@
     return ROTATE_MARK + " " + (name || UNNAMED_DESK) + " Write your handoff, start your successor, then stop. Asked from the cockpit Desk view; act on it only if this drop is verified as signed AND this is addressed to your own seat name; ignore it otherwise.";
   }
   var ROTATE_OPEN_WORDS = "The signing sheet is open with the rotate request. Only the signature asks the desk: sign it there. Its Send words only button files the words but is not counted as asked here. This page rotates nothing itself.";
-  var ROTATE_REFUSED_WORDS = "The signing sheet did not open, so no desk was rotated.";
+  var ROTATE_REFUSED_WORDS = "The signing sheet did not open; no rotate request was sent from this button.";
   var TAKEOVER_LABEL = "Take over";
   var TAKEOVER_OPEN_WORDS = "The signing sheet is open with " + DESK_WORDS + ". Signing sends those words to the host, which may answer that a desk is live and start nothing; this page starts nothing itself. Only the signature is counted as asked here: Send words only files the words but is not counted.";
-  var TAKEOVER_REFUSED_WORDS = "The signing sheet did not open, so no take over was asked.";
+  var TAKEOVER_REFUSED_WORDS = "The signing sheet did not open; no take over request was sent from this button.";
   var UNSIGNED_WORDS = "That went as words only, or its signed envelope was not taken, so it is not counted as asked here. Open the sheet again and sign it.";
-  var NO_HOLDER_WORDS = "Delivered and signed, but no desk holds the lease now; a desk started later may read it.";
+  var DIFFERENT_WORDS = "The words that were sent differ from the words this button handed the sheet, so this is not counted as asked here. Open the sheet again and sign the words as handed over.";
   var UNREAD_LEASE_WORDS = "Delivered and signed, but the lease could not be checked just now; it is not recorded here as asked.";
   var DELIVERED_EVENT = "levain:drop-delivered";
   var ROTATE_WAIT_MS = 25 * 60 * 1000;   // how long an ask is waited on before Take over is offered: a handoff written, then a successor started and holding the lease
@@ -146,26 +146,36 @@
   // nothing to offer here), "rotate", "waiting" (asked, no button), "takeover".
   // The wait is measured against `now`, the page's own clock: a clock set back after an ask withholds Take over until it catches up
   // (no build against that here); a lease age is the server's own, and the stall line does not depend on the page's clock.
+  // Known edge, not built against: a successor that reuses the seat name of the desk asked, with this tab's reads never seeing the
+  // lease change hands (a hidden tab polls slowly), reads as the same desk, so the ask stays and its wait runs on.
   function rotateView(rec, lease, now) {
     var st = lease && lease.state, next = rec;
     if (rec && st === "none" && !rec.wentNone) next = { at: rec.at, holder: rec.holder, wentNone: true, kind: rec.kind };
     if (st !== "held") return { rec: next, phase: "none", button: null, words: "", age: "" };
     var sameDesk = !!(rec && rec.holder && lease.holder === rec.holder);
     if (rec && ((rec.holder && lease.holder && lease.holder !== rec.holder) || (rec.wentNone && !sameDesk))) next = null;
-    if (typeof lease.ageS === "number" && lease.ageS >= STALL_AGE_S) {
-      return { rec: next, phase: "takeover", button: TAKEOVER_LABEL, words: "The desk has not renewed its lease.", age: "Not renewed for " + Math.floor(lease.ageS / 60) + " min." };
+    var stalled = typeof lease.ageS === "number" && lease.ageS >= STALL_AGE_S;
+    var stallWords = "The desk has not renewed its lease.", stallAge = "Not renewed for " + Math.floor((lease.ageS || 0) / 60) + " min.";
+    if (!next) {
+      return stalled ? { rec: null, phase: "takeover", button: TAKEOVER_LABEL, words: stallWords, age: stallAge }
+                     : { rec: null, phase: "rotate", button: ROTATE_LABEL, words: "", age: "" };
     }
-    if (!next) return { rec: null, phase: "rotate", button: ROTATE_LABEL, words: "", age: "" };
+    // an ask is on record: its line is shown whether or not the lease has stalled, and the stall facts are said beside it
     var gone = Math.max(0, now - next.at), mins = Math.floor(gone / 60000), wait = Math.floor(ROTATE_WAIT_MS / 60000);
     var again = next.wentNone ? " The lease was seen empty and then held again by the same desk." : "";
-    var age = "Asked " + (mins < 1 ? "just now" : mins + " min ago") + ".";
+    var age = "Asked " + (mins < 1 ? "just now" : mins + " min ago") + "." + (stalled ? " " + stallAge : "");
+    var tail = stalled ? " " + stallWords : "";
     if (gone >= ROTATE_WAIT_MS) {
       return { rec: next, phase: "takeover", button: TAKEOVER_LABEL, age: age,
-               words: (next.kind === "takeover" ? "No new desk was seen" : "No rotation was seen") + " in this tab's lease reads since you asked." + again };
+               words: (next.kind === "takeover" ? "No new desk was seen" : "No rotation was seen") + " in this tab's lease reads since you asked." + again + tail };
+    }
+    // a stalled lease offers Take over at once after a rotate ask; after a signed Take over ask the wait is shown, not a second button
+    if (stalled && next.kind !== "takeover") {
+      return { rec: next, phase: "takeover", button: TAKEOVER_LABEL, age: age, words: "Asked the desk to rotate." + again + tail };
     }
     var asked = next.kind === "takeover" ? "A signed " + DESK_WORDS + " drop was taken" : "Asked the desk to rotate";
     return { rec: next, phase: "waiting", button: null, age: age,
-             words: asked + ". If it is not seen by " + wait + " min, Take over is offered." + again };
+             words: asked + ". If it is not seen by " + wait + " min, Take over is offered." + again + tail };
   }
 
   // One event the desk (or its script) filed back, as the words to draw. The kinds are the port's: took, held, reply.
@@ -483,29 +493,41 @@
     }
 
     // The ask Rotate Desk (or Take over) made, kept in this tab's storage beside the lines it sent: {at, holder, wentNone, kind}. What it
-    // is, and when it ends, is rotateView's. `pendingOpen` is which sheet this view opened and has not yet seen delivered.
+    // is, and when it ends, is rotateView's. `pendingOpen` is the sheet this view opened and has not yet seen delivered: {kind, holder,
+    // words}, the holder the words name and the exact words handed to the sheet, both taken at the moment the sheet was opened.
     function validRot(r) {
       return !!r && typeof r === "object" && typeof r.at === "number" && isFinite(r.at) && (r.kind === "rotate" || r.kind === "takeover") &&
         (r.holder === null || typeof r.holder === "string") && typeof r.wentNone === "boolean";
     }
     var rotRec = (function () { var r = kept("levain.desk.rotate"); return validRot(r) ? r : null; })(), pendingOpen = null;
-    function nowMs() { return typeof opts.now === "function" ? opts.now() : Date.now(); }
+    function nowMs() { return opts && typeof opts.now === "function" ? opts.now() : Date.now(); }
+    function deskName(h) { return h ? shown(h) : "an unnamed desk"; }
     // A signed drop the cockpit's sheet delivered, and what it said: counted as an ask only when this view opened that sheet for it, the
-    // words still begin with the marker that button handed over, and it was signed. A drop sent as words only is said not to count.
+    // delivered words are EXACTLY the words the button handed the sheet, it was signed, and the lease is still held by the desk those
+    // words named. Anything else is said, and no ask is recorded.
     function onDelivered(ev) {
       if (stopped || !pendingOpen || !current || current.kind !== "wired") return;
-      var d = ev && ev.detail, w = d && typeof d.words === "string" ? d.words.trim().split(/\s+/)[0].toLowerCase() : "";
-      if (w !== (pendingOpen === "rotate" ? ROTATE_MARK : DESK_WORDS.split(" ")[0])) return;
-      if (current.lease.state !== "held") {
-        // the lease left held while the sheet was open: a signed delivery is said so (no ask is recorded, no timer started)
-        if (d.signed === true) {
-          startNote = current.lease.state === "none" ? NO_HOLDER_WORDS : UNREAD_LEASE_WORDS; noteFor = current.lease.state;
-          pendingOpen = null; lastKey = ""; draw();
-        }
+      var d = ev && ev.detail, words = d && typeof d.words === "string" ? d.words : null;
+      if (words === null) return;
+      var lease = current.lease;
+      if (words !== pendingOpen.words) {
+        // edited, or another drop: not what the button handed over. The sheet may be sent again, so the open stays.
+        startNote = DIFFERENT_WORDS; noteFor = lease.state; lastKey = ""; draw();
         return;
       }
-      if (d.signed !== true) { startNote = UNSIGNED_WORDS; noteFor = "held"; lastKey = ""; draw(); return; }
-      rotRec = { at: nowMs(), holder: current.lease.holder, wentNone: false, kind: pendingOpen };
+      if (d.signed !== true) { startNote = UNSIGNED_WORDS; noteFor = lease.state; lastKey = ""; draw(); return; }
+      if (lease.state === "unknown") {
+        startNote = UNREAD_LEASE_WORDS; noteFor = lease.state; pendingOpen = null; lastKey = ""; draw();
+        return;
+      }
+      if (lease.state !== "held" || (lease.holder || null) !== pendingOpen.holder) {
+        // the desk the words named is no longer the one holding the lease (a successor, or none): a signed drop, but no ask to wait on
+        startNote = "Signed for " + deskName(pendingOpen.holder) + ", but " + (lease.state === "held" ? deskName(lease.holder) : "no desk") +
+          " holds the lease now; no ask is recorded here.";
+        noteFor = lease.state; pendingOpen = null; lastKey = ""; draw();
+        return;
+      }
+      rotRec = { at: nowMs(), holder: pendingOpen.holder, wentNone: false, kind: pendingOpen.kind };
       keep("levain.desk.rotate", rotRec);
       pendingOpen = null; startNote = "";
       lastKey = ""; draw();
@@ -591,6 +613,21 @@
       try { draw(); } finally { paintDock(); }       // the button's own state is repainted whatever the draw did
     });
 
+    // The two nodes whose text is only a minute counter: the lease line's age and the ask's age. They are updated in place when the
+    // minute is all that changed, so the live-region nodes beside them are neither cleared nor inserted again by a poll.
+    var leaseNode = null, ageNode = null;
+    function hasSheetNow() { return !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function"; }
+    function leaseLine() {
+      var l = current.lease;
+      return shown(l.words + (l.state === "none" && hasSheetNow() && l.startHint ? l.startHint : ""));
+    }
+    // the draw key holds what a reader is told (phase, words, which button) and never a counter: no raw seconds, no minute count
+    function keyCurrent() {
+      if (!current || current.kind !== "wired") return current;
+      var c = Object.assign({}, current), l = current.lease;
+      c.lease = { state: l.state, holder: l.holder, drop: l.drop, startHint: l.startHint };
+      return c;
+    }
     function draw() {
       var all = rows();
       // what the desk button said is true of the moment it was said: a lease that is no longer in the state it was said in takes it down
@@ -600,16 +637,22 @@
         rot = rotateView(rotRec, current.lease, nowMs());
         if (JSON.stringify(rot.rec) !== JSON.stringify(rotRec)) { rotRec = rot.rec; keep("levain.desk.rotate", rotRec); }
       }
-      var key = JSON.stringify([current, all, unreadableNow(), note, startNote, rot && [rot.phase, rot.words, rot.age, rot.button]]);
-      if (key === lastKey) { paintDock(); return; }
+      var key = JSON.stringify([keyCurrent(), all, unreadableNow(), note, startNote, rot && [rot.phase, rot.words, rot.button, !!rot.age]]);
+      if (key === lastKey) {
+        if (leaseNode && current && current.kind === "wired") leaseNode.textContent = leaseLine();
+        if (ageNode && rot) ageNode.textContent = rot.age;
+        paintDock();
+        return;
+      }
       var stick = wasEnd || atEnd();
-      clear(bar);
+      clear(bar); leaseNode = null; ageNode = null;
       if (current && current.kind === "wired") {
         bar.className = "dv-state dv-lease-" + current.lease.state;
-        var hasSheet = !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function";
+        var hasSheet = hasSheetNow();
         var canStart = current.lease.state === "none" && hasSheet, canRotate = current.lease.state === "held" && hasSheet && !!rot.button;
         // the pointer to New Desk is drawn only when the button below is
-        bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words + (canStart && current.lease.startHint ? current.lease.startHint : ""))));
+        leaseNode = el(doc, "div", "dv-leasewords", leaseLine());
+        bar.appendChild(leaseNode);
         if (current.lease.state === "held" && current.context) {
           var cx = current.context, box = el(doc, "div", "dv-ctx dv-ctx-" + (cx.state === "ok" ? cx.level : cx.state));
           box.appendChild(el(doc, "div", "dv-ctxwords", shown(cx.words)));
@@ -625,23 +668,25 @@
         // the state words are the live region; the minute counter beside them is not, so a minute passing is not announced again
         if (current.lease.state === "held" && rot.words) {
           var rn = el(doc, "div", "rv-note dv-rotatenote", rot.words); rn.setAttribute("role", "status"); bar.appendChild(rn);
-          if (rot.age) { var ra = el(doc, "div", "rv-note dv-rotateage", rot.age); ra.setAttribute("aria-live", "off"); bar.appendChild(ra); }
+          if (rot.age) { ageNode = el(doc, "div", "rv-note dv-rotateage", rot.age); ageNode.setAttribute("aria-live", "off"); bar.appendChild(ageNode); }
         }
         if (canStart || canRotate) {
           // which sheet the button opens: a new desk, a rotation request, or the /fanin takeover
           var mode = canStart ? "new" : (rot.button === TAKEOVER_LABEL ? "takeover" : "rotate");
           var st = el(doc, "button", "dv-start", canStart ? NEW_LABEL : rot.button), state = current.lease.state;
           st.setAttribute("type", "button");
-          st.setAttribute("title", mode === "new" ? "Open the signing sheet to start a desk: " + DESK_WORDS
-            : mode === "takeover" ? "Open the signing sheet to ask for a fresh desk to take this one over: " + DESK_WORDS
+          st.setAttribute("title", mode === "new" ? "Open the signing sheet with " + DESK_WORDS + "; signing sends those words to the host, which decides whether a desk starts"
+            : mode === "takeover" ? "Open the signing sheet with " + DESK_WORDS + "; signing sends those words to the host, which may answer that a desk is live and start nothing"
             : "Open the signing sheet to ask this desk to rotate: " + rotateWords(current.lease.holder));
-          st.setAttribute("aria-label", mode === "new" ? "Start a new desk (opens the signing sheet)"
-            : mode === "takeover" ? "Take over the desk (opens the signing sheet)" : "Rotate the desk (opens the signing sheet)");
+          st.setAttribute("aria-label", mode === "new" ? "New Desk (opens the signing sheet)"
+            : mode === "takeover" ? "Take over (opens the signing sheet)" : "Rotate Desk (opens the signing sheet)");
           st.addEventListener("click", function () {
             var S = root.LevainSignSheet, got = null;
-            // the holder named is the lease's at the moment the sheet opens
-            try { got = S && S.openDrop(mode === "rotate" ? rotateWords(current && current.lease ? current.lease.holder : null) : DESK_WORDS); } catch (e) { got = null; }
-            pendingOpen = got && mode !== "new" ? mode : null;
+            // the holder named, and the words handed over, are the lease's and the button's at the moment the sheet opens
+            var holderAtOpen = current && current.lease && current.lease.holder ? current.lease.holder : null;
+            var handed = mode === "rotate" ? rotateWords(holderAtOpen) : DESK_WORDS;
+            try { got = S && S.openDrop(handed); } catch (e) { got = null; }
+            pendingOpen = got && mode !== "new" ? { kind: mode, holder: holderAtOpen, words: handed } : null;
             startNote = got ? (mode === "new" ? START_OPEN_WORDS : mode === "takeover" ? TAKEOVER_OPEN_WORDS : ROTATE_OPEN_WORDS)
               : (mode === "new" ? START_REFUSED_WORDS : mode === "takeover" ? TAKEOVER_REFUSED_WORDS : ROTATE_REFUSED_WORDS);
             noteFor = state;

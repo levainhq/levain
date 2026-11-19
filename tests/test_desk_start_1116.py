@@ -78,7 +78,7 @@ def test_new_desk_hands_the_signing_sheet_the_fanin_words_and_starts_nothing_its
     g = looks(out)[-1]
     assert g["drops"] == ["/fanin broad"], g
     # the sheet also carries "Send words only", which wakes the desk with no limits: the line says both, never "only a signature starts it"
-    assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing starts until you press one of them" in g["note"], g
+    assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing is sent until you press one of them" in g["note"] and "ask the host to start a desk" in g["note"], g
     assert g["startText"] == "New Desk", g
     assert out["sends"] == []         # the tap filed nothing through the desk port
 
@@ -103,7 +103,7 @@ def test_a_refused_open_on_rotate_says_nothing_was_rotated(tmp_path):
         put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held .dv-start')"),
         {"eval": _STUB % "null"}, {"tap": "document.querySelector('.dv-zone .dv-start')"}, {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, LOOK])
     g = looks(out)[-1]
-    assert len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate ") and g["note"] == "The signing sheet did not open, so no desk was rotated.", g
+    assert len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate ") and g["note"] == "The signing sheet did not open; no rotate request was sent from this button.", g
 
 
 @needs_browser
@@ -132,7 +132,7 @@ def test_a_refused_open_says_no_desk_was_started(tmp_path):
         put(get={"status": 200, "json": wired(lease=NONE)}), until("document.querySelector('.dv-start')"),
         {"eval": _STUB % "null"}, {"tap": "document.querySelector('.dv-zone .dv-start')"}, {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, LOOK])
     g = looks(out)[-1]
-    assert g["drops"] == ["/fanin broad"] and g["note"] == "The signing sheet did not open, so no desk was started.", g
+    assert g["drops"] == ["/fanin broad"] and g["note"] == "The signing sheet did not open; no start request was sent from this button.", g
 
 
 @needs_browser

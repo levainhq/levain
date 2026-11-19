@@ -67,6 +67,11 @@ r.unknown = v(ask, {state: "unknown"}, T0 + 60000);
 r.clockBack = v(ask, held(), T0 - 5 * 60000);
 r.takeoverWaiting = v({at: T0, holder: "desk 25", wentNone: false, kind: "takeover"}, held(), T0 + 60000);
 r.takeoverTimedOut = v({at: T0, holder: "desk 25", wentNone: false, kind: "takeover"}, held(), T0 + W);
+const tk = {at: T0, holder: "desk 25", wentNone: false, kind: "takeover"};
+r.stalledRotateAsk = v(ask, held({ageS: S}), T0 + 3 * 60000);
+r.stalledRotateAskTimedOut = v(ask, held({ageS: S}), T0 + W);
+r.stalledTakeoverAsk = v(tk, held({ageS: S}), T0 + 3 * 60000);
+r.stalledTakeoverAskTimedOut = v(tk, held({ageS: S}), T0 + W);
 r.W = W; r.S = S;
 r.words = {rotate: D.rotateWords("desk 25"), unnamed: D.rotateWords(null), blank: D.rotateWords("  "), spaced: D.rotateWords("desk\n 25 "), mark: D.ROTATE_MARK, desk: D.DESK_WORDS};
 console.log(JSON.stringify(r));
@@ -112,6 +117,20 @@ def test_a_stalled_lease_offers_take_over_at_once_with_or_without_an_ask(tmp_pat
     assert "has not renewed" in g["stalledNoAsk"]["words"] and g["stalledNoAsk"]["age"] == "Not renewed for 15 min.", g["stalledNoAsk"]
     assert g["stalledJustUnder"]["button"] == "Rotate Desk", g["stalledJustUnder"]
     assert g["stalledWhileWaiting"]["button"] == "Take over", g["stalledWhileWaiting"]
+
+
+def test_a_recorded_ask_on_a_stalled_lease_is_shown_beside_the_stall_facts(tmp_path):
+    g = _views(tmp_path)
+    r = g["stalledRotateAsk"]                                                       # a rotate ask: the ask line, the stall, and Take over stays offered
+    assert r["rec"] and r["phase"] == "takeover" and r["button"] == "Take over", r
+    assert "Asked the desk to rotate." in r["words"] and "The desk has not renewed its lease." in r["words"], r
+    assert r["age"] == "Asked 3 min ago. Not renewed for 15 min.", r
+    t = g["stalledRotateAskTimedOut"]
+    assert t["button"] == "Take over" and "No rotation was seen" in t["words"] and "has not renewed" in t["words"] and t["age"].startswith("Asked 25 min ago."), t
+    w = g["stalledTakeoverAsk"]                                                     # a signed Take over ask: the waiting state, never a second button
+    assert w["rec"] and w["phase"] == "waiting" and w["button"] is None, w
+    assert "A signed /fanin broad drop was taken" in w["words"] and "has not renewed" in w["words"] and w["age"] == "Asked 3 min ago. Not renewed for 15 min.", w
+    assert g["stalledTakeoverAskTimedOut"]["button"] == "Take over" and "No new desk was seen" in g["stalledTakeoverAskTimedOut"]["words"], g["stalledTakeoverAskTimedOut"]
 
 
 def test_a_rotation_seen_clears_the_ask(tmp_path):
@@ -215,6 +234,7 @@ def test_a_signed_rotate_delivered_shows_asked_the_desk_to_rotate_once_and_draws
         delivered(True), SETTLE, LOOK])
     a, again = looks(out)
     assert a["start"] is None and len(a["rotate"]) == 1 and "Asked the desk to rotate" in a["rotate"][0], a
+    assert json.loads(a["kept"])["holder"] == "desk 25" and json.loads(a["kept"])["kind"] == "rotate", a      # the holder the sheet named when it opened
     assert a["note"] is None, a                                                     # the open-sheet note is over once the ask is made
     assert again["rotate"] == a["rotate"] and again["start"] is None, again         # a second delivery changes nothing
     assert out["sends"] == []
@@ -310,7 +330,7 @@ def test_a_signed_delivery_after_the_lease_left_held_says_so_and_records_no_ask(
         put(get={"status": 200, "json": wired(lease=NONE)}), until("document.querySelector('.dv-lease-none .dv-start')"),
         delivered(True), SETTLE, LOOK])
     g = looks(out)[-1]
-    assert g["note"] == "Delivered and signed, but no desk holds the lease now; a desk started later may read it.", g
+    assert g["note"] == "Signed for desk 25, but no desk holds the lease now; no ask is recorded here.", g
     assert g["kept"] is None and g["rotate"] == [] and g["age"] == [], g                  # no ask record, no timer
 
 
@@ -330,6 +350,96 @@ def test_a_lease_with_no_holder_name_hands_the_sheet_unnamed_desk(tmp_path):
         put(get={"status": 200, "json": wired(lease={"state": "held", "holder": None, "age_s": 60})}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE, LOOK])
     g = looks(out)[-1]
     assert len(g["drops"]) == 1 and g["drops"][0].startswith("/rotate (unnamed desk) Write your handoff"), g
+
+
+@needs_browser
+def test_a_lease_that_passed_to_another_desk_while_the_sheet_was_open_records_no_ask(tmp_path):
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired()}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE,
+        put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 26", "age_s": 5})}),
+        until("document.querySelector('.dv-leasewords') && document.querySelector('.dv-leasewords').textContent.indexOf('desk 26') === 0"),
+        delivered(True), SETTLE, LOOK])
+    g = looks(out)[-1]
+    assert g["note"] == "Signed for desk 25, but desk 26 holds the lease now; no ask is recorded here.", g
+    assert g["kept"] is None and g["rotate"] == [] and g["age"] == [] and g["start"] == "Rotate Desk", g          # no ask, no timer, no wait drawn
+
+
+@needs_browser
+def test_words_the_user_edited_are_not_counted_and_the_exact_words_are_counted_with_the_holder_the_sheet_named(tmp_path):
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired()}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE,
+        delivered(True, "/rotate desk 99 Write your handoff, start your successor, then stop."), SETTLE, LOOK,
+        delivered(True, "/rotate desk 25 Write your handoff, start your successor, then stop. and one more thing"), SETTLE, LOOK,
+        delivered(True), SETTLE, LOOK])
+    edited, appended, exact = looks(out)
+    for g in (edited, appended):
+        assert g["rotate"] == [] and g["kept"] is None and g["start"] == "Rotate Desk", g
+        assert g["note"] and "differ from the words this button handed the sheet" in g["note"] and "not counted as asked here" in g["note"], g
+    assert len(exact["rotate"]) == 1 and "Asked the desk to rotate" in exact["rotate"][0] and json.loads(exact["kept"])["holder"] == "desk 25", exact      # the edited tries left the sheet open
+
+
+@needs_browser
+def test_a_take_over_binds_the_exact_fanin_words_the_same_way_and_shows_waiting_on_a_stalled_lease(tmp_path):
+    stalled = {"state": "held", "holder": "desk 25", "age_s": 16 * 60}
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired(lease=stalled)}), until("document.querySelector('.dv-lease-held .dv-start')"), {"eval": _STUB}, TAP, SETTLE,
+        delivered(True, "/fanin broad now"), SETTLE, LOOK,
+        delivered(True), SETTLE, LOOK])
+    edited, exact = looks(out)
+    assert edited["kept"] is None and edited["start"] == "Take over" and "differ from the words this button handed the sheet" in edited["note"], edited
+    assert exact["drops"] == ["/fanin broad"] and json.loads(exact["kept"]) ["kind"] == "takeover" and json.loads(exact["kept"])["holder"] == "desk 25", exact
+    assert exact["start"] is None, exact                                            # the waiting state: no second Take over button after a signed ask
+    assert "A signed /fanin broad drop was taken" in exact["rotate"][0] and "has not renewed its lease" in exact["rotate"][0], exact
+    assert exact["age"] == ["Asked just now. Not renewed for 16 min."], exact
+
+
+@needs_browser
+def test_a_rotate_ask_on_a_stalled_lease_shows_the_ask_and_keeps_the_take_over_button(tmp_path):
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired()}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE, delivered(True), SETTLE,
+        put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 25", "age_s": 16 * 60})}),
+        until("document.querySelector('.dv-rotatenote') && document.querySelector('.dv-rotatenote').textContent.indexOf('has not renewed') >= 0"), LOOK])
+    g = looks(out)[-1]
+    assert g["start"] == "Take over" and "Asked the desk to rotate." in g["rotate"][0] and "has not renewed its lease" in g["rotate"][0], g
+    assert g["age"] == ["Asked just now. Not renewed for 16 min."] and g["kept"] is not None, g
+
+
+_NUDGE_TWICE = "(() => { document.dispatchEvent(new Event('visibilitychange')); return new Promise(r => setTimeout(r, 1500)).then(() => { document.dispatchEvent(new Event('visibilitychange')); return new Promise(r => setTimeout(r, 1500)).then(() => 1); }); })()"
+_HOLD = "(() => { window.__n = document.querySelector('.dv-rotatenote'); window.__a = document.querySelector('.dv-rotateage'); window.__l = document.querySelector('.dv-leasewords'); return 1; })()"
+_SAME = """JSON.stringify({ sameNote: !!window.__n && window.__n === document.querySelector('.dv-rotatenote') && document.contains(window.__n),
+  sameAge: !!window.__a && window.__a === document.querySelector('.dv-rotateage') && document.contains(window.__a),
+  sameLease: !!window.__l && window.__l === document.querySelector('.dv-leasewords') && document.contains(window.__l),
+  note: window.__n && window.__n.textContent, age: window.__a && window.__a.textContent, lease: window.__l && window.__l.textContent, mark: 'rot' })"""
+
+
+@needs_browser
+def test_a_poll_with_the_same_state_leaves_the_live_region_node_alone_and_a_minute_change_only_replaces_the_age_text(tmp_path):
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [DESKTOP, *_TOKENED, _TAP_DESK, _OPEN, {"eval": _SKEW},
+            put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 25", "age_s": 190})}), HELD_BTN, {"eval": _STUB}, TAP, SETTLE, delivered(True), SETTLE,
+            {"eval": _HOLD},
+            put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 25", "age_s": 205})}),      # the same state, the same minute
+            {"eval": _NUDGE_TWICE}, {"eval": _SAME},
+            skew(3), put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 25", "age_s": 250})}),
+            until("document.querySelector('.dv-rotateage') && document.querySelector('.dv-rotateage').textContent === 'Asked 3 min ago.'"), {"eval": _SAME}])
+        polls = len(stub.gets)
+    same, minute = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"mark":"rot"' in v and '"sameNote"' in v]
+    assert polls >= 4, polls                                                            # the page really read again between the two checks
+    assert same["sameNote"] and same["sameAge"] and same["sameLease"], same             # not cleared, not inserted again: the same nodes
+    assert same["lease"] == "desk 25, renewed 3 min ago" and same["age"] == "Asked just now.", same
+    assert minute["sameNote"] and minute["sameAge"] and minute["sameLease"], minute      # a minute passing replaced text, never a node
+    assert minute["age"] == "Asked 3 min ago." and minute["lease"] == "desk 25, renewed 4 min ago" and minute["note"] == same["note"], (same, minute)
+
+
+@needs_browser
+def test_the_take_over_button_does_not_say_a_desk_will_be_started_or_taken_over(tmp_path):
+    out = _drive_desk(tmp_path, DESKTOP, [
+        put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 25", "age_s": 16 * 60})}),
+        until("document.querySelector('.dv-lease-held .dv-start')"),
+        {"eval": "JSON.stringify({title: document.querySelector('.dv-start').getAttribute('title'), aria: document.querySelector('.dv-start').getAttribute('aria-label'), mark: 'rot'})"}])
+    g = looks(out)[-1]
+    assert "may answer that a desk is live and start nothing" in g["title"] and "fresh desk" not in g["title"] and "take this one over" not in g["title"], g
+    assert g["aria"] == "Take over (opens the signing sheet)", g
 
 
 @needs_browser
@@ -391,4 +501,6 @@ def test_the_event_is_raised_for_a_message_from_the_sheet_frame_and_not_for_a_fo
 def test_the_sheet_says_whether_an_envelope_was_taken_with_the_delivered_drop():
     src = (WEB / "sign.js").read_text()
     # words only (plain) is never "signed", nor is a delivery by a different store than the sheet was opened for
-    assert "dropDelivered: true, words: req.words, signed: !plain && !other && !!(e && e.taken)" in src
+    assert "dropDelivered: true, words: req.words, signed: !plain && !other && sameStore && !!e && e.taken === true" in src
+    # a bound sheet needs a reply that names its store: the comparison is against the store held when the reply came, before it can be adopted
+    assert "const sameStore = boundTo === null || a.body.store_id === boundTo;" in src

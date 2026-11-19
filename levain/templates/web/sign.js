@@ -1191,6 +1191,10 @@
       // A drop answered by a store other than the one held (a kept drop sent again after the store changed) is reported as
       // delivered there, and the sheet stops: it is never re-bound to the store that answered
       const other = otherStore(a.body.store_id);
+      // the store the sheet was bound to when the reply came: a reply for a bound sheet must NAME that store to count as signed
+      // (otherStore alone passes a reply that names none)
+      const boundTo = storeId;
+      const sameStore = boundTo === null || a.body.store_id === boundTo;
       if (storeId === null && typeof a.body.store_id === "string") storeId = a.body.store_id;
       if (other) refuseOther();
       busy = false;
@@ -1206,7 +1210,7 @@
       else say(msg, plain || (e && e.taken) ? "ok" : "bad");
       // the server accepted this drop (a 2xx): the message names the exact words it accepted, so the cockpit's box lets go of
       // them only when it still holds those very words
-      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true, words: req.words, signed: !plain && !other && !!(e && e.taken) } : null);
+      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true, words: req.words, signed: !plain && !other && sameStore && !!e && e.taken === true } : null);
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
