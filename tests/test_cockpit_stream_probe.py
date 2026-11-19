@@ -5,6 +5,7 @@ production cadence."""
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,38 @@ class TestProbeWatcher:
                 w.set_probe(None)
         finally:
             w.stop()
+
+
+class _Churn(_Probe):
+    """A counter that moves on every look, over a snapshot that takes ``cost_s`` to make."""
+
+    cost_s = 0.15
+
+    def change_seq(self) -> int:
+        with self._lock:
+            self.seq_looks += 1
+            self.seq += 1
+            return self.seq
+
+    def snapshot(self) -> tuple[dict[str, str], str]:
+        time.sleep(self.cost_s)
+        return super().snapshot()
+
+
+class TestThrottle:
+    def test_a_counter_that_never_settles_cannot_run_snapshots_back_to_back(self) -> None:
+        probe = _Churn({"a": "1"})
+        w, _feed = _watch(probe)
+        w.subscribe(None)
+        began = time.monotonic()
+        try:
+            time.sleep(1.5)
+        finally:
+            w.stop()
+        window = time.monotonic() - began
+        # each snapshot is followed by at least twice its own duration before the next may start
+        most = window / (3 * probe.cost_s) + 1
+        assert 2 <= probe.snapshots - 1 <= most, (probe.snapshots, most)
 
 
 class TestNoProbeIsUnchanged:

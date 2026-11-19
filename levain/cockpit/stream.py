@@ -26,7 +26,8 @@ A server that reads the panels through a snapshot reader can give the Watcher a 
 the token and the manifest build are then not used). The probe has two methods: ``change_seq()``, a cheap counter
 that moves only when a panel's content or the panel set changed, and ``snapshot()``, which returns
 ``({panel_id: etag}, set_version)``. The Watcher looks at ``change_seq()`` every ``token_s`` and takes a snapshot
-only when it moved, or when ``backstop_s`` has passed since the last one. ``set_version`` is opaque: a change of it
+only when it moved (and ``2 x`` the last snapshot's duration has passed), or when ``backstop_s`` has passed since the
+last one. ``set_version`` is opaque: a change of it
 with the same panel ids announces ``manifest-changed``, like a change of the id set. A counter that cannot be read
 is an unknown one: the snapshot then runs every ``watch_s``."""
 
@@ -225,6 +226,7 @@ class Watcher:
     def _loop_probe(self, stop: threading.Event, seq: Any) -> None:
         last_snap = time.monotonic()
         not_before = 0.0
+        gap = 0.0       # twice the last snapshot's duration: a counter that never settles cannot run snapshots faster than they finish
         while not stop.wait(self.token_s):
             now_seq = self._seq_now()
             t = time.monotonic()
@@ -232,12 +234,13 @@ class Watcher:
             if now_seq is None:
                 due = idle >= self.watch_s
             else:
-                due = now_seq != seq or idle >= self.backstop_s
+                due = (now_seq != seq and idle >= gap) or idle >= self.backstop_s
             if not due or t < not_before:
                 continue
             if self.tick(stop):
                 seq = now_seq
                 last_snap = time.monotonic()
+                gap = 2 * (last_snap - t)
             else:
                 not_before = time.monotonic() + self.watch_s     # a snapshot that fails is retried on the slow tick
 
