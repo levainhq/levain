@@ -506,3 +506,20 @@ def test_two_writers_racing_a_reader_each_read_their_own_write(rig: WriteRig, mo
     assert problems == []
     final = rig.ck.panel("alpha")
     assert rows_of(final) == sorted(f"alpha:{m}" for m in history) and final["stale"] is False
+
+
+# --- a serve that outlives its worker's last run ------------------------------------------------------------------------
+def test_a_row_stamped_by_an_earlier_serve_does_not_answer_this_serves_writes(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    rig.loop.dirty(("alpha",), 50)                               # the last run's generation, long past this one's first
+    rig.loop.run_once(rig.clock.epoch())
+    assert rig.reader.read("alpha").write_gen == 50
+    ck = Cockpit(clock=rig.clock)
+    ck.register(list_spec("alpha", rig.rec))
+    ck.attach_snapshots(rig.reader, dirty=lambda ids, w: None, host_state=lambda: LIVE)
+    ck.invalidate_reads(["alpha"])
+    out = ck.panel("alpha")
+    assert out["stale"] is True and out["pending"] is True
+
+

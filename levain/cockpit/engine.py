@@ -1525,6 +1525,14 @@ class Cockpit:
             if cadence is not None:
                 self._heartbeat_cadence_s = cadence
             self._reader = reader
+        # the rows may be stamped by an earlier life of this serve, whose generations this one's would otherwise start below,
+        # and a row stamped with one of those would pass for the answer to a write it never saw: start above them
+        try:
+            held = max((r.write_gen for r in reader.read_manifest()[1].values()), default=0)
+        except Exception:  # noqa: BLE001 - a store that cannot be read yet has no stamps to start above
+            held = 0
+        with self._rc_lock:
+            self._write_gen = max(self._write_gen, held)
 
     @property
     def attached(self) -> bool:
