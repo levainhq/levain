@@ -708,3 +708,16 @@ def test_a_declared_as_of_is_part_of_the_content_so_a_new_one_is_a_new_generatio
         assert r.snap("alpha").as_of == box["as_of"]
     finally:
         r.close()
+
+
+def test_a_new_generation_of_a_panel_replaces_its_older_ones_in_the_decoded_cache(rig: Rig) -> None:
+    rig.derive()
+    for n in range(4):
+        rig.rec.rows["alpha"] = ["a", f"v{n}"]
+        rig.clock.advance(seconds=1)
+        rig.derive("alpha")
+        rig.snap("alpha")
+        rig.snap("beta")
+    gens = sorted(k[1] for k in rig.ck._attached_snaps if k[0] == "alpha")
+    assert gens == [rig.reader.read("alpha").gen]
+    assert len([k for k in rig.ck._attached_snaps if k[0] == "beta"]) == 1

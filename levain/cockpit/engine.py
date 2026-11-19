@@ -1615,6 +1615,9 @@ class Cockpit:
             except (SnapshotBodyError, ValueError, TypeError) as exc:
                 return self._attached_error(spec, f"the snapshot could not be read: {_safe_str(exc)}", as_of, fresh)
             with self._attached_lock:
+                # an older generation of this panel is never read once a newer one is published: it need not take room
+                for old in [k for k in self._attached_snaps if k[0] == row.id and k[1] < row.gen]:
+                    del self._attached_snaps[old]
                 self._attached_snaps[key] = base
                 while len(self._attached_snaps) > ATTACHED_SNAP_CACHE_MAX:
                     self._attached_snaps.popitem(last=False)
