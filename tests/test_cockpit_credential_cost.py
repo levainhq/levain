@@ -486,6 +486,35 @@ def test_a_broken_credential_connection_refuses_then_is_replaced(db: CockpitDB, 
     assert db.verify_device(tok, now=NOW) is None
 
 
+def _fds() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_journal_objects_made_and_dropped_leave_no_open_file_behind(tmp_path: Path) -> None:
+    """L1 W1: a ``CockpitDB`` made per call and dropped closes what it opened, with the cyclic collector off
+    (refcounting alone). MEASURED before (one held connection shared by read() and verify_device, reached through
+    lambdas that held the CockpitDB): 50 made, read, verified and dropped left 101 file descriptors open."""
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    dev, tok = _enrol(CockpitDB(root))
+    gc.collect()
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        before = _fds()
+        for _ in range(50):
+            one = CockpitDB(root)
+            assert len(one.list_devices()) == 1
+            assert one.verify_device(tok, now=NOW) == dev
+            del one
+        after = _fds()
+    finally:
+        if was:
+            gc.enable()
+    print(f"MEASURE: 50 CockpitDB made, read and verified, dropped -> {after - before} file descriptors still open")
+    assert after - before <= 0, after - before
+
+
 def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monkeypatch) -> None:
     _dev, tok = _enrol(db)
     conns: list[sqlite3.Connection] = []
