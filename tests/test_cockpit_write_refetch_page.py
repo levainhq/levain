@@ -7,8 +7,9 @@ fetch, held open by a gate the test releases, so the order "row repainted, then 
 * touched: one write POST (no dry run: the verb is direct), a GET of ONLY the touched panel, no manifest GET, the row marked
   updated and its next write carrying the response's row version, all before the held GET resolves;
 * no `touched` (an older server): the whole-board path runs (manifest GET, every panel), the view's refetch is never used;
-* de-dup: a stream-style refetch of the same panel while the write's read is in flight is answered by it, another panel
-  is read for itself, and once the read has settled (answered or faulted) a later refetch reads for itself;
+* de-dup: a stream-style refetch of the same panel while the write's read is in flight is never handed that read: it waits
+  for it to settle (bounded: a read that never settles does not hold it, nor a later one, for good) and reads once for
+  itself; another panel is read at once, and once the read has settled (answered or faulted) a later refetch reads for itself;
 * a panel the page cannot repaint in place (answers false) asks one board read (not passive), however many of a write's
   panels answer false, and a board read already in flight is re-read once it ends;
 * the row repaint is visible before the panel read returns (a snooze into the future hides the row, a text edit changes the
@@ -84,6 +85,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
   const V = Object.assign({}, View, opts.real ? {} : {
     refetchPanel: (pid) => {
       env.refetchCalls.push(pid);
+      if (opts.hangFirst && env.refetchCalls.length === 1) return new Promise(() => {});   // a read that never answers
       const mark = () => marks.push("get-resolved:" + pid);
       return (async () => {
         await fetchFn("/cockpit/panel/" + pid + ".json");
@@ -105,7 +107,9 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
   env.manifestGets = (from) => env.gets.slice(from).filter((u) => u.indexOf("/cockpit/manifest.json") >= 0).length;
   env.hold =() => { gated = true; gate = new Promise((r) => { env.releaseGate = r; }); };
   env.start = async () => {
-    new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
+    // opts.scaleTimers: a wait of half a minute or more (the page's own read deadline) runs in tens of milliseconds
+    const timer = opts.scaleTimers ? (f, ms, ...rest) => setTimeout(f, ms >= 30000 ? 40 : ms, ...rest) : setTimeout;
+    new Function("window", "document", "location", "history", "fetch", "console", "setTimeout", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console, timer);
     await new Promise((r) => setTimeout(r, 30));
     return env;
   };
@@ -222,23 +226,41 @@ cases.an_empty_touched_is_no_touched = async () => {
   ok(env.gets.slice(getsBefore).some(isManifest) && env.refetchCalls.length === 0, "the old path ran");
 };
 
-cases.the_stream_announcing_a_refetched_panel_reads_it_once = async () => {
+// A stream announcement is about a change the write's read may predate (another writer, a refresher tick, an agent): the
+// write's read is never handed to it. It waits for that read to settle and then reads once for itself.
+cases.a_stream_announcement_while_the_write_read_is_in_flight_reads_for_itself_after_it = async () => {
   const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
   env.hold();
   await env.snooze();
   await env.tick();
   const a = env.V.refetchPanel("tray");            // as cockpit_stream.js calls it, while the write's read is in flight
+  const a2 = env.V.refetchPanel("tray");           // a second announcement in the same window
   await env.tick();
-  ok(env.refetchCalls.filter((p) => p === "tray").length === 1, "tray read once: " + JSON.stringify(env.refetchCalls));
+  ok(env.refetchCalls.filter((p) => p === "tray").length === 1, "no second read while the write's read is out: " + JSON.stringify(env.refetchCalls));
   env.V.refetchPanel("inbox");
   await env.tick();
-  ok(env.refetchCalls.indexOf("inbox") >= 0, "another panel is read for itself: " + JSON.stringify(env.refetchCalls));
+  ok(env.refetchCalls.indexOf("inbox") >= 0, "another panel is read for itself at once: " + JSON.stringify(env.refetchCalls));
   env.releaseGate();
-  ok((await a) === "applied", "the stream's call got the write's answer");
+  ok((await a) === "applied" && (await a2) === "applied", "the stream's calls got an answer");
   await env.tick();
-  // M3: once the write's read has settled, a later announcement is about a later change and reads for itself
+  ok(env.refetchCalls.filter((p) => p === "tray").length === 2, "the announcements made ONE read of their own after the write's: " + JSON.stringify(env.refetchCalls));
+  // once the write's read has settled, a later announcement reads for itself at once
   const b = await env.V.refetchPanel("tray");
-  ok(b === "applied" && env.refetchCalls.filter((p) => p === "tray").length === 2, "a refetch after the write's read settled made its own read: " + JSON.stringify(env.refetchCalls));
+  ok(b === "applied" && env.refetchCalls.filter((p) => p === "tray").length === 3, "a refetch after the write's read settled made its own read: " + JSON.stringify(env.refetchCalls));
+};
+
+// R itself has no deadline here: a hung read must not hold an announcement for good, nor every announcement after it
+cases.a_write_read_that_never_settles_does_not_absorb_a_later_announcement = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied", { hangFirst: true, scaleTimers: true }).start();
+  await env.snooze();
+  await env.tick();
+  ok(env.refetchCalls.length === 1, "the write's read is out and hung: " + JSON.stringify(env.refetchCalls));
+  const a = env.V.refetchPanel("tray");
+  const first = await Promise.race([a, new Promise((r) => setTimeout(() => r("waited"), 400))]);
+  ok(first === "applied", "the announcement was answered by a read of its own: " + first);
+  ok(env.refetchCalls.length === 2, "one read of its own: " + JSON.stringify(env.refetchCalls));
+  const second = await Promise.race([env.V.refetchPanel("tray"), new Promise((r) => setTimeout(() => r("waited"), 20))]);
+  ok(second === "applied" && env.refetchCalls.length === 3, "a later announcement reads at once, not after another wait: " + second + " " + JSON.stringify(env.refetchCalls));
 };
 
 cases.a_faulted_write_read_is_not_answered_to_a_later_refetch = async () => {
@@ -261,11 +283,12 @@ cases.a_second_write_replaces_the_first_writes_in_flight_read_for_the_dedup = as
   await env.tick();
   env.V.refetchPanel("tray");
   await env.tick();
-  ok(env.refetchCalls.length === 2, "two write reads, and the stream's call joined the second: " + JSON.stringify(env.refetchCalls));
+  ok(env.refetchCalls.length === 2, "two write reads, and the stream's call is waiting on the second: " + JSON.stringify(env.refetchCalls));
   env.releaseGate();
   await env.tick();
+  ok(env.refetchCalls.length === 3, "the stream's call read for itself once they settled: " + JSON.stringify(env.refetchCalls));
   await env.V.refetchPanel("tray");
-  ok(env.refetchCalls.length === 3, "after both settled the next call reads for itself: " + JSON.stringify(env.refetchCalls));
+  ok(env.refetchCalls.length === 4, "after that the next call reads for itself: " + JSON.stringify(env.refetchCalls));
 };
 
 cases.a_panel_that_cannot_repaint_in_place_asks_one_board_read = async () => {
@@ -364,7 +387,8 @@ CASES = [
     "a_row_for_another_row_paints_nothing",
     "a_response_without_touched_runs_the_whole_board_path",
     "an_empty_touched_is_no_touched",
-    "the_stream_announcing_a_refetched_panel_reads_it_once",
+    "a_stream_announcement_while_the_write_read_is_in_flight_reads_for_itself_after_it",
+    "a_write_read_that_never_settles_does_not_absorb_a_later_announcement",
     "a_faulted_write_read_is_not_answered_to_a_later_refetch",
     "a_second_write_replaces_the_first_writes_in_flight_read_for_the_dedup",
     "a_panel_that_cannot_repaint_in_place_asks_one_board_read",

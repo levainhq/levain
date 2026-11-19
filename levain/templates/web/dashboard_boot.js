@@ -1080,10 +1080,13 @@
     }
   }
 
-  // A panel the write refetched is read once for the write and a stream announcement that arrives while that read is still in
-  // flight: such a call through the view answers with it. Once the read has settled (answered, faulted or superseded) the entry
-  // is gone and a later call makes its own read, since a later announcement is about a later change and a fault is never kept.
-  // Only the write's own refetch registers an entry, so the shared read is always one that began with the write's response.
+  // A call through the view for a panel the write refetched, while the write's read R is still in flight, is never handed R: R
+  // began with the write's response, and the announcement behind the call may be about a change R predates (another writer, a
+  // refresher tick, an agent), so R's payload could be the older one and nothing would announce again. The call waits for R to
+  // settle (answered, faulted or superseded) and then makes ONE read of its own, shared by every call that arrived meanwhile.
+  // The wait is bounded by PANEL_TIMEOUT_MS, since R has no deadline of its own; when it runs out the entry is dropped, so a hung
+  // R holds no later call at all. The call carries the panel id only, so there is no etag to compare against R's: a call that
+  // lands in flight always costs the one extra read. Once R has settled its entry is gone and a call reads for itself at once.
   function installRefetchDedup() {
     const V = window.LevainCockpitView;
     if (dedupInstalled || !V || typeof V.refetchPanel !== "function") return;
@@ -1091,8 +1094,22 @@
     viewRefetch = V.refetchPanel;
     V.refetchPanel = function (pid) {
       const w = writeRefetches.get(pid);
-      if (w) return w.done;
-      return viewRefetch.apply(V, arguments);
+      if (!w) return viewRefetch.apply(V, arguments);
+      if (!w.next) {
+        w.next = new Promise(function (resolve, reject) {
+          let went = false, timer = 0;
+          const go = function () {
+            if (went) return;
+            went = true;
+            clearTimeout(timer);
+            if (writeRefetches.get(pid) === w) writeRefetches.delete(pid);
+            try { resolve(viewRefetch.call(V, pid)); } catch (e) { reject(e); }
+          };
+          timer = setTimeout(go, PANEL_TIMEOUT_MS);
+          w.done.then(go);
+        });
+      }
+      return w.next;
     };
   }
 
