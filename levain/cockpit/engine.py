@@ -2238,7 +2238,7 @@ class Cockpit:
                     self.refresh(panel_id)
                 except Exception:  # noqa: BLE001 - the refresher's own cycle reports a bad read; this one is a nudge
                     pass
-                self._drop_scopes([("panel", panel_id)])
+                self._drop_scopes([("panel", panel_id), _RC_SHARED_SCOPE])     # the manifest carries this panel's head too
                 with self._rc_lock:
                     if panel_id not in self._rc_refresh_dirty:
                         self._rc_refreshing.discard(panel_id)

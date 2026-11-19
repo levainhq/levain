@@ -142,6 +142,23 @@ def test_the_refetch_that_races_the_write_refresh_is_not_what_the_page_keeps() -
         ck.stop()
 
 
+def test_a_manifest_read_cached_during_the_write_refresh_is_dropped_when_the_refresh_commits() -> None:
+    prov = _Gated({2})
+    ck = _refresher(prov)
+    cred = {"class": "token", "name": "browser", "device_class": None}
+    try:
+        prov.value = "NEW"
+        ck.invalidate_reads(["p"])                         # the write's refresh (call 2) is held in the provider
+        assert prov.entered[2].wait(5)
+        during = ck.manifest(cred)                         # cached now, carrying the head from before the refresh
+        assert ck.manifest(cred) is during
+        prov.hold[2].set()
+        assert _settled(ck)
+        assert ck.manifest(cred) is not during             # the refresh committed: the manifest is read again
+    finally:
+        ck.stop()
+
+
 def test_a_write_that_lands_while_a_refresh_is_running_gets_a_read_after_it() -> None:
     prov = _Gated({2})
     ck = _refresher(prov)
