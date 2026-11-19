@@ -738,6 +738,8 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
                                   f"keychain file {ours} is kept and the next login sets it again")
         changed = True
     if not any(_is_ours(p, hands) for p in _search_list(hands, vendor, entity_dir)):
+        # By design the search list is REPLACED with ours alone ("default and only keychain"): the hands account has
+        # no other keychain, and a list without ours is never merged with.
         r = _security(hands, vendor, "list-keychains", "-d", "user", "-s", ours, entity_dir=entity_dir)
         if r.returncode != 0:
             raise HandsLoginError(f"`security list-keychains` as {hands.user} failed: {_brief(_text(r))}; the default "

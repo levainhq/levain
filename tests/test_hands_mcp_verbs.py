@@ -7,6 +7,7 @@ no hands user, no keychain, no live app. A real sign-in against a real vendor is
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import threading
@@ -390,6 +391,50 @@ def test_signin_warns_when_the_token_is_not_in_the_credential_file(rig, capsys):
     rig.register("notion")
     assert signin(rig, "notion") == 0
     assert "warning" not in capsys.readouterr().out
+
+
+def test_signin_warns_when_the_file_exists_but_holds_no_entry_for_the_server(rig, capsys):
+    # l139 round 2: an earlier login made the file; this server's token went elsewhere (e.g. the keychain)
+    rig.register()
+    assert signin(rig) == 0
+    capsys.readouterr()
+    rig.knobs["SHIM_NO_CRED"] = "1"
+    rig.register("notion")
+    assert signin(rig, "notion") == 0                        # advisory: the exit code is unchanged
+    out = capsys.readouterr().out
+    assert rig.cred.exists() and "holds no mcpOAuth entry for notion" in out and "levain hands mcp remove notion" in out
+    assert "tok-" not in out
+
+
+def test_signin_warns_when_the_credential_file_cannot_be_read_or_is_not_json(rig, capsys, monkeypatch):
+    rig.register()
+    real = hands_login.conf_read
+
+    def broken(*a, **kw):
+        if a[3] == ".credentials.json":
+            raise hands_login.HandsLoginError("the helper printed junk")
+        return real(*a, **kw)
+    monkeypatch.setattr(hands_login, "conf_read", broken)
+    assert signin(rig) == 0
+    out = capsys.readouterr().out
+    assert "could not be read after the sign-in (the helper printed junk)" in out
+    monkeypatch.setattr(hands_login, "conf_read", lambda *a, **kw: (os.getuid(), "600", "not json {")
+                        if a[3] == ".credentials.json" else real(*a, **kw))
+    rig.register("notion")
+    assert signin(rig, "notion") == 0
+    assert "is not JSON" in capsys.readouterr().out
+
+
+def test_a_conflict_refusal_leaves_no_keychain_made(rig, capsys):
+    # l139 round 2: "Nothing was changed" must be true, so the keychain is made only after the conflict checks
+    rig.register()
+    rig.cfg.parent.mkdir(parents=True, exist_ok=True)
+    rig.cfg.write_text(json.dumps({"mcpServers": {"linear": {"type": "http", "url": "https://foreign.example/mcp"}}}))
+    assert signin(rig) == 1
+    assert "Nothing was changed" in capsys.readouterr().out
+    sec = [ln.split("|", 2)[2] for ln in rig.seclog.read_text().splitlines()] if rig.seclog.exists() else []
+    assert rig.mutating() == [] and not any("create-keychain" in c or " -s " in c for c in sec)
+    assert not (rig.hands_home / "Library" / "Keychains").exists()
 
 
 def test_signin_whose_keychain_create_times_out_never_shows_the_password(rig, capsys, monkeypatch):

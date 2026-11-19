@@ -20,7 +20,8 @@ name in neither the record nor the vendor config changes nothing. A server whose
 revoked can still be removed (taking a login away needs no lease).
 
 The doctor rows read the vendor config's ``mcpServers`` names, urls and callback ports as the hands user (never a
-token: the credential file is stat'ed for owner and mode only) and compare them with the record and the registry
+token: the credential file is stat'ed for owner and mode only; after a sign-in its text is read once, for the
+presence of the ``mcpOAuth`` key, and never printed) and compare them with the record and the registry
 in one function (:func:`server_status`), which ``list`` reads too. The record sits in ``.levain``, which the entity's
 hands can write: it is never followed through a symlink nor written through a predictable temp.
 
@@ -308,8 +309,32 @@ def entry_for_signin(entity_dir: Path | str, cockpit_root: Path | str, name: str
     return e
 
 
+def token_warning(hands: HandsIdentity, name: str, entity_dir: Path | str) -> str | None:
+    """Under the caller's hands lock: None when the hands account's credential file holds an ``mcpOAuth`` entry named
+    ``name``, else the advisory line saying it does not (or that the file could not be read). Only the presence of
+    the key is looked at; the file's text is parsed here and never printed or kept. (Whether the vendor's own key is
+    exactly the server name is as measured in the shim, not yet on a real account: levain#140.)"""
+    where = hl.credential_path(hands, VENDOR)
+    gone = (f"the vendor kept this sign-in somewhere other than that file, which `levain hands mcp remove {name}` "
+            "may not reach")
+    try:
+        got = hl.conf_read(hands, VENDOR, hl.config_home(hands, VENDOR), hl._VENDOR[VENDOR]["cred"], entity_dir=entity_dir)
+    except (hl.HandsLoginError, hl.HandsRefused, OSError, subprocess.SubprocessError) as exc:
+        return f"warning: the credential file {where} could not be read after the sign-in ({exc}); {gone}"
+    if got is None:
+        return f"warning: no credential file at {where}; {gone}"
+    try:
+        doc = json.loads(got[2])
+    except ValueError:
+        return f"warning: the credential file {where} is not JSON, so no mcpOAuth entry for {name} was found; {gone}"
+    oauth = doc.get("mcpOAuth") if isinstance(doc, dict) else None
+    if isinstance(oauth, dict) and name in oauth:
+        return None
+    return f"warning: the credential file {where} holds no mcpOAuth entry for {name}; {gone}"
+
+
 def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, *, emit=None,
-           timeout: float | None = None) -> str:
+           timeout: float | None = None, warn: list[str] | None = None) -> str:
     """Sign ``entry`` in as the hands user. Returns the vendor's one-line view of the server afterwards. Raises
     :class:`HandsMcpRefused` before anything changed, :class:`HandsMcpError` (or :class:`hl.HandsLoginError`) after."""
     name = entry["name"]
@@ -323,11 +348,6 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
         with hl.hands_lock(entity_dir, "an MCP sign-in"):
             try:
                 hl.ensure_config_home(hands, VENDOR, entity_dir=entity_dir)
-                # levain#139: an MCP token is a Claude login too; with no keychain at all its save fails the same way
-                if hl.keychain_needed(VENDOR):
-                    note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
-                    if note:
-                        (emit or hl._write_out)(note)
                 held = vendor_servers(hands, entity_dir, held=True)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
@@ -339,6 +359,16 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
                                  or held[name].get("port") != str(entry["callback_port"])):
                 raise HandsMcpRefused(f"the hands account's {name!r} points elsewhere than its registered entry (url "
                                       f"or callback port); run `levain hands mcp remove {name}` first. Nothing was changed")
+            # levain#139: an MCP token is a Claude login too; with no keychain at all its save fails the same way. Made
+            # only now, after every conflict refusal above ("Nothing was changed" stays true), and before the first
+            # add/login mutation.
+            try:
+                if hl.keychain_needed(VENDOR):
+                    note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
+                    if note:
+                        (emit or hl._write_out)(note)
+            except hl.HandsLoginError as exc:
+                raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
             if name not in held:
                 _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
                                                  "outcome": "adding"})
@@ -367,6 +397,10 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
             view = hl._brief(hl._text(g)) or f"exit {g.returncode}"
             _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
                                              "outcome": SIGNED_IN})
+            if warn is not None:                       # advisory: the exit code does not depend on it
+                w = token_warning(hands, name, entity_dir)
+                if w:
+                    warn.append(w)
             return view
     except hl.HandsRefused as exc:
         raise HandsMcpRefused(str(exc)) from None
@@ -444,7 +478,8 @@ def cmd_signin(entity_dir: Path | str, name: str, cockpit_root: Path | str | Non
         hands = _hands_or_refuse(entity_dir)
         entry = entry_for_signin(entity_dir, root, name)
         print(f"Signing the hands account ({hands.user}) in to {name}. {SIGNIN_NOTICE}")
-        view = signin(hands, entry, entity_dir)
+        warns: list[str] = []
+        view = signin(hands, entry, entity_dir, warn=warns)
     except HandsMcpRefused as exc:
         print(f"hands mcp signin: {exc}")
         return 1
@@ -452,15 +487,8 @@ def cmd_signin(entity_dir: Path | str, name: str, cockpit_root: Path | str | Non
         print(f"hands mcp signin: {exc}")
         return 1
     print(f"hands mcp {name}: the login exited 0; the vendor's own view: {view}")
-    # levain#139 (as `hands login` does): the token is expected in the 0600 file; say so when the vendor kept it elsewhere
-    try:
-        cred = hl.credential_state(hands, VENDOR, entity_dir=entity_dir)
-    except (hl.HandsLoginError, hl.HandsRefused, OSError, subprocess.SubprocessError) as exc:
-        print(f"warning: the credential file could not be read after the sign-in ({exc})")
-    else:
-        if cred is None:
-            print(f"warning: no credential file at {hl.credential_path(hands, VENDOR)}; the vendor kept this sign-in "
-                  f"somewhere else, which `levain hands mcp remove {name}` may not reach")
+    for w in warns:        # levain#139: the token is expected under mcpOAuth.<name> in the 0600 file; say so when it is not
+        print(w)
     return 0
 
 
