@@ -888,4 +888,3 @@ def test_a_cached_head_a_cached_panel_and_a_decoded_snapshot_are_unchanged_by_re
         assert kept() == before
     finally:
         r.close()
-
