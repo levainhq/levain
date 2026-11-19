@@ -293,6 +293,7 @@ class SnapshotHost:
         self._lock = threading.Lock()
         self._started = False
         self._closed = False
+        self._poll_s = _engine().HEARTBEAT_CADENCE_S if poll_s is None else poll_s
         path = Path(data_root) / DB_FILENAME
         self._writer = SnapshotWriter(path)
         reader: "SnapshotReader | None" = None
@@ -300,7 +301,7 @@ class SnapshotHost:
             reader = self._reader = SnapshotReader(path)
             self._loop = DeriveLoop(
                 self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
-                poll_s=_engine().HEARTBEAT_CADENCE_S if poll_s is None else poll_s, token_fn=token_fn, clock=clock, on_publish=None,
+                poll_s=self._poll_s, token_fn=token_fn, clock=clock, on_publish=None,
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
@@ -389,6 +390,7 @@ class SnapshotHost:
         """Switch the cockpit to reading this host's rows."""
         self._cockpit.attach_snapshots(
             self._reader, deriving=self._deriving_panels, pending=self._loop.pending, dirty=self._loop.dirty,
+            heartbeat_cadence_s=self._poll_s if self._poll_s > 0 else None,      # the reader judges the worker live by the beat this host really keeps
         )
 
     def _deriving_panels(self) -> list[str]:

@@ -15,7 +15,7 @@ from typing import Any, Callable
 import pytest
 
 from levain.cockpit.derive import File
-from levain.cockpit.engine import Cockpit, Read, RowIn
+from levain.cockpit.engine import Cockpit, Read, ReadContext, RowIn
 from levain.cockpit.snapshot_host import (
     DERIVE_THREAD_PREFIX, DISCOVER_ID, ENTITY_ID, HEAVY_PANELS, PSEUDO_PREFIX, ServerProbe, SnapshotHost,
 )
@@ -683,3 +683,44 @@ class TestServerProbeTokenFault:
         a = probe.change_seq()
         box["now"] = 5.5
         assert probe.change_seq() != a
+
+
+class TestAttachTellsTheCadence:
+    def _attached(self, tmp_path: Path, poll_s: "float | None"):
+        from datetime import datetime, timezone
+
+        t0 = datetime(2026, 11, 19, 15, 0, tzinfo=timezone.utc)
+        box = {"now": t0}
+        ck = Cockpit(clock=lambda: box["now"])
+        ck.register(_simple("a", rows=[_row(1)]))
+        host = SnapshotHost(ck, tmp_path, **({} if poll_s is None else {"poll_s": poll_s}))
+        host.attach()
+        host.run_once(t0.timestamp())                       # one beat at t0
+        return ck, host, box, t0
+
+    def test_a_host_that_beats_every_five_seconds_reads_live_between_beats_and_stale_only_after_three_missed(
+        self, tmp_path: Path
+    ) -> None:
+        from datetime import timedelta
+
+        ck, host, box, t0 = self._attached(tmp_path, 5.0)
+        try:
+            for gap, worker in ((0, "live"), (4.5, "live"), (10, "live"), (15, "live"), (16, "stale")):
+                box["now"] = t0 + timedelta(seconds=gap)
+                assert ck.worker_health()["worker"] == worker, gap
+            box["now"] = t0 + timedelta(seconds=4.5)
+            assert not ck._snap_for(ck._specs["a"], ReadContext(box["now"])).fresh_info.stale
+        finally:
+            host.stop()
+
+    def test_the_default_cadence_is_the_engine_s_and_reads_stale_after_three_of_its_beats(self, tmp_path: Path) -> None:
+        from datetime import timedelta
+
+        from levain.cockpit import engine
+
+        ck, host, box, t0 = self._attached(tmp_path, None)
+        try:
+            box["now"] = t0 + timedelta(seconds=engine.WORKER_LIVE_FACTOR * engine.HEARTBEAT_CADENCE_S + 1)
+            assert ck.worker_health()["worker"] == "stale"
+        finally:
+            host.stop()

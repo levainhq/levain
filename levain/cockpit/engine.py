@@ -898,6 +898,7 @@ class Cockpit:
         self._host_pending: Callable[[str], bool] | None = None
         self._host_dirty: Callable[[Iterable[str], int], None] | None = None
         self._host_state: Callable[[], Mapping[str, Any]] | None = None
+        self._heartbeat_cadence_s: float | None = None      # how often the attached host beats, when it is not the default
         self._serve_composed: frozenset[str] = SERVE_COMPOSED_IDS
         # what the host cycle last read for the manifest: the entity (with its faults) and the discovery faults. Each is one
         # whole value swapped in, never changed in place
@@ -1440,7 +1441,8 @@ class Cockpit:
     def attach_snapshots(self, reader: Any, *, deriving: Callable[[], Iterable[str]] | None = None,
                          pending: Callable[[str], bool] | None = None,
                          dirty: Callable[[Iterable[str], int], None] | None = None,
-                         host_state: Callable[[], Mapping[str, Any]] | None = None) -> None:
+                         host_state: Callable[[], Mapping[str, Any]] | None = None,
+                         heartbeat_cadence_s: float | None = None) -> None:
         """Switch this cockpit to attached mode: every panel but the serve-composed ones is read from the row a derive host
         published (``reader``, a ``SnapshotReader``), never from its provider; a bare cockpit stays as it is. Attach before
         ``start()``: an attached cockpit starts no refresher threads, and one already running keeps running.
@@ -1448,7 +1450,9 @@ class Cockpit:
         ``deriving()`` and ``pending(panel_id)`` are the host's busy accessors; ``dirty(panel_ids, write_gen)`` is the
         host's write hook, kept for the write path and not called here; ``host_state()`` answers ``{"worker": "live" |
         "stale" | "down", "heartbeat_age_s": float | None}`` for a host that knows its own health better than the
-        file's heartbeat does. All optional. Once only: a second reader is refused (the same reader again is a no-op)."""
+        file's heartbeat does. ``heartbeat_cadence_s`` is how often the host beats when that is not the default
+        (``HEARTBEAT_CADENCE_S``): the file's heartbeat is read as live within ``WORKER_LIVE_FACTOR`` of those. All
+        optional. Once only: a second reader is refused (the same reader again is a no-op)."""
         with self._lock:
             if self._reader is not None:
                 if self._reader is reader:
@@ -1456,6 +1460,10 @@ class Cockpit:
                 raise RuntimeError("this cockpit is already attached to a snapshot reader")
             self._host_deriving, self._host_pending = deriving, pending
             self._host_dirty, self._host_state = dirty, host_state
+            if heartbeat_cadence_s is not None:
+                if not (isinstance(heartbeat_cadence_s, (int, float)) and heartbeat_cadence_s > 0):
+                    raise ValueError("a heartbeat cadence is a positive number of seconds")
+                self._heartbeat_cadence_s = float(heartbeat_cadence_s)
             self._reader = reader
 
     @property
@@ -1566,7 +1574,8 @@ class Cockpit:
         if beat is None:
             return "down", None
         age = max(0.0, now_s - beat)
-        if age <= WORKER_LIVE_FACTOR * HEARTBEAT_CADENCE_S:
+        cadence = HEARTBEAT_CADENCE_S if self._heartbeat_cadence_s is None else self._heartbeat_cadence_s
+        if age <= WORKER_LIVE_FACTOR * cadence:
             return "live", age
         return ("stale" if age <= WORKER_DOWN_AFTER_S else "down"), age
 
