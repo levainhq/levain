@@ -284,6 +284,56 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     release(true); await settle();
     ok(h.live().some((x) => !x.every && x.ms >= 500 && x.ms <= 10000), "after that reload returns, a reload is still scheduled");
   }
+  // ---- a panel that stays unavailable costs the schedule's reads, not a board read every step for as long as the page is open ----
+  {
+    const h = boot({});
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    let reloads = 0;
+    h.win.LevainCockpitView.refetchPanel = async () => false;     // an unavailable panel has no node to redraw in place
+    // a reload draws the whole board again: the page says so, and the panel is still unavailable
+    h.win.LevainCockpitTransport.reload = () => { reloads++; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
+    await settle();
+    const fire = async () => {
+      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000);
+      if (!t) return false;
+      t.off = true; t.fn(); await settle(); return true;
+    };
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    for (let i = 0; i < 40 && await fire(); i++) { /* fake time: every pending timer fires in turn */ }
+    ok(reloads === 3, "an always-unavailable panel reloads the board once per retry step, then waits: " + reloads);
+    // it recovers on a draw: its count starts over, so the next failure gets the first step again
+    delete h.win.LevainCockpitHeld.a.err;
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    ok(h.live().some((x) => x.ms === 5000), "a panel that recovered starts the schedule over");
+  }
+  // ---- a new event for an exhausted panel starts its schedule over ----
+  {
+    const h = boot({});
+    h.win.LevainCockpitView.refetchPanel = async () => "fault";
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    ok(!h.live().some((t) => t.ms === 5000), "exhausted");
+    h.fetches[0].push(frame("panel-changed", "E.1:2", { id: "a", etag: "3" }));
+    await settle();
+    ok(h.live().some((t) => t.ms === 5000), "a new cause starts the schedule over");
+  }
+  // ---- a fault scheduled while the tab is hidden is owed, not lost to a timer that runs unseen ----
+  {
+    const h = boot({});
+    await settle();
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.win.LevainCockpitHeld.a.err = "unavailable";
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    ok(!h.live().some((t) => t.ms === 5000), "paused: no retry timer runs");
+    const retried = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { retried.push(id); return "applied"; };
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    ok(retried.join() === "a", "the owed panel is read once when the tab returns: " + retried);
+  }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
 """

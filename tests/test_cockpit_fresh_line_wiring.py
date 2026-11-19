@@ -15,7 +15,8 @@ import pytest
 
 from tests._ke_dom import WEB
 from tests.test_cockpit_fresh_line import LIVE, _open, _vals
-from tests.test_cockpit_flip_parity import needs_browser
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_places import READY, SETTLE
 
 # The page's own fetch, wrapped in the page: the first `__fails` manifest reads fail (`__mode` "drop": the network, "401": a refused device),
@@ -220,6 +221,17 @@ def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_fail
 
 
 @needs_browser
+def test_a_parenthesis_that_is_part_of_a_panel_title_is_kept_in_the_line(tmp_path: Path) -> None:
+    """The line strips what the heading adds (a count, 'unavailable'), not a title's own closing parenthesis."""
+    title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
+    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+             _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (remote)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1")]
+    out = _open(tmp_path, steps)
+    (failed,) = _samples(out)
+    assert failed[-1]["state"] == "stale" and failed[-1]["words"] == f"{_title(out)} (remote) stale", failed[-1]
+
+
+@needs_browser
 def test_a_failed_read_that_waits_on_an_open_edit_is_read_again_when_the_edit_closes(tmp_path: Path) -> None:
     """F: the line is honest while an edit holds the read ('can't reach', no request), and the read comes on its own once the edit is gone, with no event to say so."""
     steps = [READY, LIVE, SETTLE, _run(STUB2),
@@ -299,3 +311,25 @@ def test_the_stream_facts_say_no_stream_when_none_runs_and_follow_a_panel_read_i
     assert got["hello"]["head"]["status"] == "stale"                                    # the hello's manifest read is the stream's heads
     assert got["applied"]["status"] == "ok" and got["applied"]["as_of"] == "2026-11-19T12:00:00Z", got["applied"]   # a panel read in place clears its stale head
     assert got["overlap"]["reads"] == 2 and got["overlap"]["head"]["status"] == "ok", got["overlap"]              # an older read answering last does not overwrite newer heads
+
+
+STAMP = "((document.getElementById('stamp') || {}).textContent || '')"
+TOKEN_REFUSED_INIT = ("window.prompt = () => null; window.__rej = 999; const real = window.fetch.bind(window);"
+                      "window.fetch = (u, o) => String(u).indexOf('/substrate.json') >= 0 && window.__rej > 0"
+                      " ? Promise.resolve(new Response('{\"message\":\"bad token\"}', { status: 403, headers: { 'content-type': 'application/json' } })) : real(u, o);")
+
+
+@needs_browser
+def test_a_token_refusal_on_the_stamp_ends_with_the_refusal_when_a_read_of_another_kind_lands(tmp_path: Path) -> None:
+    """A wrong or rotated off-box token writes 'read refused' on the stamp; the stamp is a failure text like any other, so a good read that
+    lands without a whole draw (the stream's manifest poll) ends it where it ends the line's refusal, instead of leaving it beside a live line."""
+    _root, src, _ids = _install(tmp_path)
+    steps = [{"init": TOKEN_REFUSED_INIT},
+             {"until": STAMP + ".startsWith('read refused')", "ms": 20000},
+             {"eval": STAMP},
+             {"eval": "(() => { window.__rej = 0; window.LevainStreamFacts = () => ({ pollOkAt: Date.now() + 60000 }); " + TOLD + "; return " + STAMP + "; })()"}]
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/?source=substrate#write_token=T", steps)
+    refused, after = out["values"][-2], out["values"][-1]
+    assert refused.startswith("read refused"), refused
+    assert after == "", after

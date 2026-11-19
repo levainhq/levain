@@ -1426,6 +1426,7 @@
           dropToken();
           failure = { why: "off-box token missing or invalid", at: Date.now(), refused: true };
           status("read refused — off-box token missing or invalid");
+          stampFailure = true;
           boardMark(true);     // refused: no whole draw is coming for this read
           return false;
         }

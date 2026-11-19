@@ -37,7 +37,8 @@
   var lastId = null, pollTag = null, lastConnect = 0, lastChunk = 0;
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
-  var faults = Object.create(null);   // panel id -> { n, timer }: the retry schedule of a panel whose read failed (what failed is the held record's `err`)
+  var faults = Object.create(null);   // panel id -> { timer }: the pending retry of a panel whose read failed (what failed is the held record's `err`)
+  var tries = Object.create(null);    // panel id -> retries taken since its last cause; a whole draw cancels timers but never this, or a panel that stays unavailable would reload the board forever
   var bytesAt = 0;                    // the last bytes of any connection (lastChunk restarts with each connection; this does not)
   var pollOkAt = 0, lastHeads = null, lastHeadsAt = 0;   // the last good manifest read (a 304 counts), the heads it carried and when that read STARTED
   var headSeq = 0, headApplied = 0;                      // manifest reads are numbered by their start: the newer start holds the heads, whichever answers last
@@ -90,10 +91,13 @@
   }
   function cancelFaults() { Object.keys(faults).forEach(clearFault); }
   function scheduleFault(id) {
-    var n = faults[id] ? faults[id].n : 0;
+    var n = tries[id] || 0;
     clearFault(id);
     if (n >= FAULT_RETRY_MS.length) return;
-    var f = { n: n + 1, timer: 0 };
+    // a retry started while hidden would run unseen and spend the budget: it is owed to the visible edge instead
+    if (paused) { if (owed.indexOf(id) < 0) owed.push(id); return; }
+    tries[id] = n + 1;
+    var f = { timer: 0 };
     f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id); } }, FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
@@ -132,13 +136,13 @@
     try { done = V.refetchPanel(id); } catch (_) { done = Promise.resolve("fault"); }
     return Promise.resolve(done).then(function (r) {
       if (r === "superseded") return r;
-      if (r === "applied" || r === true) clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
+      if (r === "applied" || r === true) { clearFault(id); delete tries[id]; }     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
       else if (r === "fault") scheduleFault(id);
       else wantReload();
       return r;
     }, function () { scheduleFault(id); return "fault"; });
   }
-  function onEvent(id) { clearFault(id); return refetch(id); }
+  function onEvent(id) { clearFault(id); delete tries[id]; return refetch(id); }
 
   // ---- the frame parser: events are blank-line separated; `:` lines are comments (the heartbeat) ----
   function onFrame(text) {
@@ -308,7 +312,11 @@
     if (!started) start();
     else if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
     // a panel that whole read could not read (drawn as unavailable) enters the same bounded retry as a refetch that failed
-    if (started) { var h = held(); Object.keys(h).forEach(function (id) { if (h[id] && h[id].err) scheduleFault(id); }); }
+    if (started) {
+      var h = held();
+      Object.keys(tries).forEach(function (id) { if (!(h[id] && h[id].err)) delete tries[id]; });     // it recovered
+      Object.keys(h).forEach(function (id) { if (h[id] && h[id].err) scheduleFault(id); });
+    }
   }
   document.addEventListener("levain:cockpit-held", onDrawn);
 
