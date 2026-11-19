@@ -1961,20 +1961,20 @@
   }
   async function readInPlace(pid) {
     if (!liveOf(pid).length) {
+      if (briefUndrawn(pid)) {
+        try {
+          noteApplied(pid, await readPanel(pid));
+        } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
+        return "applied";
+      }
       // A panel the whole read could not read is drawn as a plain error card with no live node. Its retry must cost one read of that
       // panel, not a board: answering false here would make the stream reload every panel on every retry step and every event. A
       // failed read throws to refetchPanel (the one publisher, answering "fault", which the stream bounds without a reload); a read that
-      // succeeds answers false, because only a whole draw can mount the panel, and that one reload is the right one.
+      // succeeds answers false, because only a whole draw can mount the panel, and that one reload is the right one. (The brief panels
+      // above are never drawn and stay quiet whatever their read says.)
       const held = root.LevainCockpitHeld && root.LevainCockpitHeld[pid];
-      if (held && held.err) {
-        await readPanel(pid);
-        return false;
-      }
-      if (!briefUndrawn(pid)) return false;
-      try {
-        noteApplied(pid, await readPanel(pid));
-      } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
-      return "applied";
+      if (held && held.err) await readPanel(pid);
+      return false;
     }
     // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
     if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
