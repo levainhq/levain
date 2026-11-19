@@ -8,6 +8,7 @@ snapshot's own key and misses on each input; the manifest and heads carry the D1
 today's."""
 from __future__ import annotations
 
+import copy
 import dataclasses
 import threading
 from collections import Counter
@@ -852,3 +853,39 @@ def test_the_stream_window_runs_from_the_end_of_the_read(rig: Rig, monkeypatch: 
     rig.ck._stream_health()
     rig.ck._stream_health()
     assert log == ["read"]                                        # the answer is fresh from when the read ended
+
+
+def test_a_cached_head_a_cached_panel_and_a_decoded_snapshot_are_unchanged_by_requests_through_the_public_paths(
+        tmp_path: Path) -> None:
+    """The caches are read only: nothing a request serves may be written into what they keep, however deep. Each kept value
+    is compared with a deep copy taken before a full set of requests."""
+    ref = {"age": "58m"}
+    specs = {"band": clocked_spec("band", ref)}
+    r = Rig(tmp_path, ("alpha", "band", "mine"), specs={**specs, "mine": composed_spec("mine", {})})
+    try:
+        r.ck.attach_verbs(FakeVerbView())
+        r.ck.mark_serve_composed(["mine"])
+        r.derive()
+
+        def requests() -> None:
+            r.ck.manifest(CRED)
+            for pid in ("alpha", "band"):
+                for kw in ({}, {"profile": "compact"}, {"row": f"{pid}:a"}, {"q": "a"}):
+                    r.ck.panel(pid, **kw)
+            r.ck.panel("mine")
+            r.ck.change_probe().snapshot()
+
+        def kept() -> dict[str, Any]:
+            return {"heads": {k: v for k, (_s, v) in r.ck._head_cache.items()},
+                    "panels": {k: v for k, (_s, v) in r.ck._panel_cache.items()},
+                    "snaps": {k: (v.rows, v.value, v.filtered, v.skipped) for k, v in r.ck._attached_snaps.items()}}
+        requests()
+        before = copy.deepcopy(kept())
+        assert before["heads"] and before["panels"] and before["snaps"]
+        requests()
+        beat(r, 180)                                               # a clock moved: band ages differ per request, not in the caches
+        requests()
+        assert kept() == before
+    finally:
+        r.close()
+
