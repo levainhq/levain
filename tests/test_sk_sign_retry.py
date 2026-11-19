@@ -606,6 +606,22 @@ def test_two_empty_answers_say_the_key_returned_no_signature_and_the_evidence_sa
         assert ev["flags"] == "0x21" and ev["counter"] == 1 and "ssh_keygen" in ev and "message_sha256" in ev
 
 
+def test_every_sign_failure_record_carries_the_sign_step_elapsed_seconds_and_every_old_key(rig):
+    rig.fake.plan = ["empty", "empty"]
+    rig.fake.durations = [1.2344, 2.3456]       # two known touches on the fake clock: a hardcoded or dropped elapsed fails
+    with pytest.raises(KeyError_):
+        rig.sign(MESSAGE)
+    files = sorted(rig.dir.iterdir())
+    assert len(files) == 2
+    evs = [json.loads(f.read_text()) for f in files]
+    assert {e["attempt"]: e["elapsed_s"] for e in evs} == {1: 1.234, 2: 2.346}
+    for ev in evs:
+        assert isinstance(ev["elapsed_s"], float) and not isinstance(ev["elapsed_s"], bool)
+        for key in ("format", "time", "fingerprint", "namespace", "algorithm", "flags", "counter", "attempt",
+                    "message_sha256", "message_bytes", "ssh_keygen", "signature", "reason"):
+            assert key in ev
+
+
 def test_an_empty_first_answer_is_retried_and_a_good_second_is_returned(rig):
     rig.fake.plan = ["empty", None]
     assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
