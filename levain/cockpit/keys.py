@@ -1013,7 +1013,8 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     that wants a shorter bound for its own signer does not have to change the module's global.
 
     A security-key answer that does not verify leaves an evidence file (:func:`_write_sign_failure`, under
-    ``<key dir>/sign-failures``) and may be asked for once more (:data:`_SK_RETRIES`)."""
+    ``<key dir>/sign-failures``) and may be asked for again: once more (:data:`_SK_RETRIES`), or after a wait up to
+    :data:`_SK_EMPTY_ATTEMPTS` attempts when the answers are empty (``sign`` below says which)."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
     public_key = signing_public_key(key_path)
@@ -1025,8 +1026,9 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     def sign(message: bytes) -> str:
         """One signature over ``message``. A security-key (sk-*) answer that carries NO signature (an empty one) is asked
         for again after a short wait, up to :data:`_SK_EMPTY_ATTEMPTS` attempts in all (waits :data:`_EMPTY_RETRY_WAITS_S`); a
-        signature that is there and does not verify is asked for ONCE more, at once (:data:`_SK_RETRIES`), and a run
-        that mixes the two ends at that one retry. Each retry is a new sign over the same message, so a new touch; that
+        signature that is there and does not verify is asked for ONCE more, at once (:data:`_SK_RETRIES`); a third
+        attempt is made only while every answer so far was empty (and that third answer may itself fail to verify), so
+        any run with a verify failure among its first two answers stops at two. Each retry is a new sign over the same message, so a new touch; that
         retry loop is these few lines and nothing else, and ``_once`` itself never retries. Everything else (a cancel, a
         timeout, a missing presence flag, a plain key's bad signature) is final on the first attempt.
 
