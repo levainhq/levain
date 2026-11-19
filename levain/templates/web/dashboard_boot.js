@@ -1106,7 +1106,7 @@
             try { resolve(viewRefetch.call(V, pid)); } catch (e) { reject(e); }
           };
           timer = setTimeout(go, PANEL_TIMEOUT_MS);
-          w.done.then(go);
+          w.done.then(go, go);
         });
       }
       return w.next;
