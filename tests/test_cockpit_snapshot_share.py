@@ -267,6 +267,33 @@ def test_a_refresher_panels_refetch_after_a_watcher_build_is_a_new_entry(ck) -> 
     assert ck.panel("cyc", credential_class="none") is not p1
 
 
+def test_concurrent_manifests_share_one_bounded_pool_of_readers(tmp_path: Path, monkeypatch) -> None:
+    # codex L3 r2: each cache-distinct manifest (one per device credential) started its own pool of _MANIFEST_READERS
+    from levain.cockpit import engine as eng
+
+    monkeypatch.setattr(eng, "_MANIFEST_READERS", 3)
+    _r, src, _ids = _install(tmp_path)
+    c = build_default_cockpit(src)          # cache off: every manifest computes
+    real = c._snap_for
+    peak = [0]
+    lk = threading.Lock()
+
+    def slow(spec, ctx, read_after=None):
+        with lk:
+            peak[0] = max(peak[0], sum(1 for t in threading.enumerate()
+                                       if t.name.startswith("manifest-read") and t.name.split("_")[0] in ("manifest-read",
+                                                                                                       "manifest-read-3")))
+        time.sleep(0.05)
+        return real(spec, ctx, read_after)
+
+    monkeypatch.setattr(c, "_snap_for", slow)
+    creds = [{"class": "token", "name": f"device-{i}", "device_class": None} for i in range(4)]
+    ts = [threading.Thread(target=lambda cr=cr: c.manifest(cr)) for cr in creds]
+    [t.start() for t in ts]
+    [t.join(60) for t in ts]
+    assert 0 < peak[0] <= 3
+
+
 @pytest.mark.parametrize("ttl", [None, 0])
 def test_nothing_is_shared_where_the_read_cache_is_off(ck, monkeypatch, ttl) -> None:
     ck.read_cache_ttl_s = ttl

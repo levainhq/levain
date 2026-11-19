@@ -41,6 +41,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -724,7 +725,19 @@ _UNSET: Any = object()      # attach_server's "board not given", distinct from a
 _READ_CACHE_MAX = 64          # live entries; past it a read simply runs uncached
 _READ_CACHE_JOIN_S = 60.0     # how long a joiner waits for the owner before reading for itself
 _SHARED_STATUSES = ("ok", "empty", "partial")   # the on-demand outcomes later reads may share; a failure is read again
-_MANIFEST_READERS = 16        # panels a manifest reads at once (each read is its own bounded flight; this only bounds the threads)
+_MANIFEST_READERS = 16        # manifest panel reads at once, across every manifest in the process (``Cockpit._parallel``)
+_manifest_pools: dict[int, ThreadPoolExecutor] = {}
+_manifest_pools_lock = threading.Lock()
+
+
+def _manifest_pool(size: int) -> ThreadPoolExecutor:
+    """The process's manifest-read pool of ``size`` threads, made on first use (keyed by size, so a test that patches
+    ``_MANIFEST_READERS`` gets a pool of its own size); its idle threads end with the process."""
+    with _manifest_pools_lock:
+        pool = _manifest_pools.get(size)
+        if pool is None:
+            pool = _manifest_pools[size] = ThreadPoolExecutor(max_workers=size, thread_name_prefix=f"manifest-read-{size}")
+        return pool
 
 
 def _read_key(x: Any) -> str:
@@ -2362,12 +2375,16 @@ class Cockpit:
 
     @staticmethod
     def _parallel(fn: Callable[[Any], Any], items: list[Any]) -> list[Any]:
-        """``fn`` over ``items`` on up to ``_MANIFEST_READERS`` threads, results in ``items`` order; the first failure
-        (in order) is raised after every call has finished."""
+        """``fn`` over ``items`` on the process's one pool of ``_MANIFEST_READERS`` threads, results in ``items`` order;
+        the first failure (in order) is raised after every call has finished. One pool for every manifest, so concurrent
+        manifests (one per credential, install class and transport) share ``_MANIFEST_READERS`` threads instead of each
+        starting its own (L3 r2). A task never submits to the pool (a provider runs on its flight's own worker thread),
+        so a full pool only queues; a hung provider already holds every manifest that reads it through its one flight."""
         if len(items) < 2:
             return [fn(i) for i in items]
-        with ThreadPoolExecutor(max_workers=min(_MANIFEST_READERS, len(items)), thread_name_prefix="manifest-read") as pool:
-            futures = [pool.submit(fn, i) for i in items]
+        pool = _manifest_pool(_MANIFEST_READERS)
+        futures = [pool.submit(fn, i) for i in items]
+        wait_futures(futures)
         return [f.result() for f in futures]
 
     @staticmethod
