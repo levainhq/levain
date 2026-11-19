@@ -155,3 +155,71 @@ def test_the_presence_sheet_link_lands_on_the_section_in_the_settings_place(tmp_
         ])
     got = _probes(out, "link")[0]
     assert got["place"] == "settings" and got["focus"] == "presence-settings" and got["shown"], got
+
+
+HEAD = """(() => { const z = document.querySelector('section.dev-zone[data-zone="devices"]'); const h = z.querySelector('.zone-head'); const a = h.querySelector('a.sign-enrol-link');
+  const ph = document.querySelector('section.dev-zone[data-zone="presence"] .zone-head');
+  const r = a.getBoundingClientRect(); const hr = h.getBoundingClientRect();
+  return JSON.stringify({ probe: 'head', display: getComputedStyle(h).display, pdisplay: getComputedStyle(ph).display, title: h.querySelector('.zone-title').textContent,
+    gloss: (h.querySelector('.zone-gloss') || {}).textContent, href: a.getAttribute('href'), linkH: Math.round(r.height), linkW: Math.round(r.width), headW: Math.round(hr.width),
+    inside: r.right <= hr.right + 1 && r.left >= hr.left - 1 }); })()"""
+EMPTY = """(() => { const e = document.querySelector('.dev-empty'); const r = e.getBoundingClientRect();
+  return JSON.stringify({ probe: 'empty', hidden: e.hidden, display: getComputedStyle(e).display, h: Math.round(r.height), text: e.textContent, place: document.body.dataset.iaPlace }); })()"""
+HIDE_ALL = """(() => { for (const s of document.querySelectorAll('section.dev-zone')) { s.hidden = true; for (const p of s.querySelectorAll('.panel')) p.hidden = true; }
+  const e = document.querySelector('.dev-empty'); return 1; })()"""
+
+
+@needs_browser
+def test_the_devices_head_and_the_passkey_link_draw_on_settings_at_1440_and_390(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    steps_at = lambda emu: [{"emulate": emu}, READY, SETTLE, {"eval": SHOW}, {"eval": PRESS % "settings"}, SETTLE, {"eval": HEAD}]   # noqa: E731
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        wide = _probes(_drive(tmp_path, f"{url}/#write_token=T", steps_at({"w": 1440, "h": 900, "dpr": 1})), "head")
+        phone = _probes(_drive(tmp_path, f"{url}/#write_token=T", steps_at({"w": 390, "h": 800, "dpr": 1, "mobile": True})), "head")
+    for name, runs in (("1440", wide), ("390", phone)):
+        assert len(runs) == 1, (name, runs)
+        h = runs[0]
+        assert h["display"] == "flex" and h["pdisplay"] == "flex", (name, h)       # drawn as the Presence head is
+        assert h["title"] == "Devices" and h["gloss"] == "who holds a key to this cockpit, and who may post to you", (name, h)
+        assert h["href"] == "/enrol" and h["linkH"] >= 44 and h["linkW"] > 0 and h["inside"], (name, h)
+
+
+@needs_browser
+def test_settings_with_no_section_drawn_says_so_and_the_line_leaves_when_one_is(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 390, "h": 800, "dpr": 1, "mobile": True}}, READY, SETTLE,
+            {"eval": PRESS % "settings"}, SETTLE, {"eval": SHOW}, {"eval": EMPTY},      # 0: a section drawn
+            {"eval": "window.LevainDevices && 1"},
+        ])
+        shown = _probes(out, "empty")
+    # the line is driven by devices_panel.js syncSection(); the static contract is held here, the live states by the source below
+    js = (WEB / "devices_panel.js").read_text()
+    assert "emptyLine.hidden = !(section.hidden && (!prSetSec || prSetSec.hidden))" in js
+    css = (WEB / "dashboard.css").read_text()
+    assert 'body.ia:not([data-ia-place="settings"]) .dev-empty { display: none !important; }' in css
+    assert shown and shown[0]["place"] == "settings"
+
+
+NATURAL = """(() => { const e = document.querySelector('.dev-empty');
+  const drawn = [...document.querySelectorAll('section.dev-zone')].filter(s => !s.hidden).length;
+  return JSON.stringify({ probe: 'natural', drawn, lineHidden: e.hidden, display: getComputedStyle(e).display, place: document.body.dataset.iaPlace }); })()"""
+
+
+@needs_browser
+def test_the_empty_line_follows_the_sections_own_state_on_settings(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    steps = [{"emulate": {"w": 390, "h": 800, "dpr": 1, "mobile": True}}, READY, SETTLE,
+             {"eval": PRESS % "settings"}, SETTLE, {"eval": NATURAL}]
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        with_token = _probes(_drive(tmp_path, f"{url}/#write_token=T", steps), "natural")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        no_token = _probes(_drive(tmp_path, f"{url}/", steps), "natural")
+    for run in (with_token, no_token):
+        assert len(run) == 1 and run[0]["place"] == "settings", run
+        n = run[0]
+        # the one invariant, whichever way the reads went: the line is drawn exactly when no section is
+        assert (n["drawn"] == 0) == (n["display"] == "block") and (n["drawn"] == 0) == (not n["lineHidden"]), n
+    assert with_token[0]["drawn"] > 0 and with_token[0]["display"] == "none", with_token
+    assert no_token[0]["drawn"] == 0 and no_token[0]["display"] == "block", no_token

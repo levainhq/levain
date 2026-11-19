@@ -4062,7 +4062,12 @@ body.ia[data-ia-place="memory"] #ck-drop { display: none !important; }
    (hidden, not removed: their own reads keep running). */
 body.ia:not([data-ia-place="settings"]) .dev-zone { display: none !important; }
 body.ia[data-ia-place="settings"] .deck > :not(.masthead):not(#ck-phonetabs):not(.ia-drivers):not(main.frame) { display: none !important; }
-body.ia[data-ia-place="settings"] main.frame > :not(.dev-zone) { display: none !important; }
+body.ia[data-ia-place="settings"] main.frame > :not(.dev-zone):not(.dev-empty) { display: none !important; }
+/* the Devices head (title, gloss, "Make a passkey on this device") drawn as the Presence head is; the empty line shows on Settings only */
+body.ia[data-ia-place="settings"] .dev-zone .zone-head { display: flex; align-items: baseline; }
+body.ia[data-ia-place="settings"] .dev-zone .zone-head .sign-enrol-link { display: inline-flex; align-items: center; min-height: var(--hit-min, 44px); line-height: 1.2; }
+body.ia:not([data-ia-place="settings"]) .dev-empty { display: none !important; }
+body.ia[data-ia-place="settings"] .dev-empty:not([hidden]) { display: block; margin: var(--sp-6) 0 0; color: var(--meta); font-size: var(--fs-meta); }
 body.ia[data-ia-place="settings"] main.frame { display: block; padding-inline: var(--gutter-ke); }
 body.ia[data-ia-place="settings"] .dev-zone:not([hidden]) { display: block !important; width: 100%; min-width: 0; margin: var(--sp-6) 0 0; }
 body.ia[data-ia-place="settings"] .dev-zone .zone-head { flex-wrap: wrap; }

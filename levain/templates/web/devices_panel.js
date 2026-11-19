@@ -192,7 +192,10 @@
     sgrid.appendChild(buildVoice());   // Voice beside Tap tokens; it shows only where the cockpit serves GET /cockpit/voice.json
     prSetSec.appendChild(sgrid);
     const main = document.querySelector("main.frame");
-    if (main) { main.appendChild(section); main.appendChild(prSetSec); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); }
+    // the Settings place's own line for when no section is drawn (every read said "not available"); dashboard.css draws it on Settings only
+    emptyLine = el("p", "dev-empty", "Nothing to set from this browser: sign in on a paired device to manage devices, tokens and voice.");
+    emptyLine.hidden = true;
+    if (main) { main.appendChild(section); main.appendChild(prSetSec); main.appendChild(emptyLine); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); document.body.appendChild(emptyLine); }
     buildChip();
     buildSheet();
   }
@@ -201,6 +204,7 @@
   function syncSection() {
     section.hidden = devPanel.hidden;
     if (prSetSec) prSetSec.hidden = (!prPanel || prPanel.hidden) && (!vcPanel || vcPanel.hidden);
+    if (emptyLine) emptyLine.hidden = !(section.hidden && (!prSetSec || prSetSec.hidden));
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
 
@@ -830,7 +834,7 @@
   const PR_TAP_DEFAULT = ["away", "back", "quiet", "desk", "devices"];
   const PR_MIN = 1, PR_MAX = 1440;                        // custom minutes, as the server allows (1 minute to 24 hours)
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {},
-      prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, prTapList = null, prNote = null,
+      prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, emptyLine = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prState = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
       prDevBtns = {}, prAfterBtns = {}, prAfterCustom = null, prAfterRow = null, prLetsBtns = {}, prUntilBtns = {}, prForRow = null,
       prForBtns = {}, prForCustom = null, prAfterOpen = false, prForOpen = false,
