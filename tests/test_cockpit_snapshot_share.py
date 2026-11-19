@@ -392,15 +392,107 @@ def test_a_read_in_flight_when_a_keyed_write_lands_is_not_shared_after_it(tmp_pa
     state["hold"] = hold = threading.Event()
     t = threading.Thread(target=lambda: c.panel("od", credential_class="none"))
     t.start()
-    assert state["in_read"].wait(10)                         # a read began with the old rows
-    state["rows"] = [_row(1), _row(2)]
-    c.invalidate_reads(["od"], refresh=False)                # the keyed write lands while it runs
-    state["hold"] = None
-    hold.set()
-    t.join(10)
+    try:
+        assert state["in_read"].wait(10)                     # a read began with the old rows
+        state["rows"] = [_row(1), _row(2)]
+        c.invalidate_reads(["od"], refresh=False)            # the keyed write lands while it runs
+    finally:
+        state["hold"] = None
+        hold.set()
+        t.join(10)
+    assert not t.is_alive()
     assert state["reads"] == 1
     later = c.panel("od", credential_class="none")           # a reader after the write: never the pre-write snapshot
     assert state["reads"] == 2 and {r["id"] for r in later["rows"]} == {"r1", "r2"}
+
+
+def test_a_read_begun_before_a_keyed_write_publishes_nothing_when_it_ends_after_it(tmp_path: Path) -> None:
+    """The pre-write read's own callers get its answer; the panel's published state (``snap``, ``fresh``, the commit
+    count) is left as the write left it, and the post-write read that follows is the one that shares."""
+    c, state, _other = _two_panels(tmp_path)
+    st = c._state["od"]
+    assert (st.snap, st.fresh, st.commits) == (None, None, 0)
+    state["hold"] = hold = threading.Event()
+    got: list = []
+    t = threading.Thread(target=lambda: got.append(c.panel("od", credential_class="none")))
+    t.start()
+    try:
+        assert state["in_read"].wait(10)
+        state["rows"] = [_row(1), _row(2)]
+        c.invalidate_reads(["od"], refresh=False)
+    finally:
+        state["hold"] = None
+        hold.set()
+        t.join(10)
+    assert not t.is_alive() and got and {r["id"] for r in got[0]["rows"]} == {"r1"}      # its own caller: the pre-write rows
+    assert (st.snap, st.fresh, st.commits, st.recent) == (None, None, 0, None)           # but nothing of it is published
+    b = c.panel("od", credential_class="none")
+    assert state["reads"] == 2 and {r["id"] for r in b["rows"]} == {"r1", "r2"}
+    assert st.commits == 1 and st.recent is not None and st.recent[0] is st.snap         # B's read is the published one
+    fresh = st.fresh
+    c.panel("od", credential_class="token")                  # inside the window: B's snapshot is shared whatever the credential
+    assert state["reads"] == 2 and st.fresh == fresh
+
+
+class _HookLock:
+    """A lock that runs ``after`` once, after the next release (a write placed between two lock sections of one caller)."""
+
+    def __init__(self) -> None:
+        self._l = threading.Lock()
+        self.after = None
+
+    def __enter__(self):
+        self._l.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._l.release()
+        fn, self.after = self.after, None
+        if fn is not None:
+            fn()
+
+
+def test_a_caller_that_waits_out_a_pre_write_flight_and_then_owns_a_post_write_one_shares(tmp_path: Path) -> None:
+    """B takes its epoch, a keyed write lands, A's older flight is still out: B waits it out, then owns a flight created
+    AFTER the write. That read is post-write, so it shares; the epoch B took at entry must not stop it."""
+    c, state, _other = _two_panels(tmp_path)
+    st = c._state["od"]
+    state["hold"] = hold = threading.Event()
+    ta = threading.Thread(target=lambda: c.panel("od", credential_class="none"))
+    ta.start()
+    real_recent, wrote, real_lock = c._recent_snap, threading.Event(), st.lock
+    hook = _HookLock()
+
+    def write_after_epoch_taken() -> None:
+        state["rows"] = [_row(1), _row(2)]
+        c.invalidate_reads(["od"], refresh=False)
+        wrote.set()
+
+    def recent_then_arm(s, read_after=None):
+        out = real_recent(s, read_after)
+        if s is st and threading.current_thread() is tb:
+            hook.after = write_after_epoch_taken     # the next lock section on B's thread is ``_read_panel``'s epoch capture
+            st.lock = hook
+        return out
+
+    got: list = []
+    tb = threading.Thread(target=lambda: got.append(c.panel("od", credential_class="token")))   # not A's read-cache key: it reaches the flight
+    c._recent_snap = recent_then_arm
+    try:
+        assert state["in_read"].wait(10)                     # A's flight is out with the old rows
+        tb.start()
+        assert wrote.wait(10)                                # B took its epoch, then the keyed write landed
+    finally:
+        state["hold"] = None
+        hold.set()
+        ta.join(10)
+        tb.join(10)
+        c._recent_snap = real_recent
+        st.lock = real_lock
+    assert not ta.is_alive() and not tb.is_alive() and got and {r["id"] for r in got[0]["rows"]} == {"r1", "r2"}
+    assert state["reads"] == 2
+    c.panel("od", credential_class="none")                   # B's read began after the write: inside the window it is shared
+    assert state["reads"] == 2
 
 
 def test_a_keyed_write_leaves_an_untouched_panels_shared_snapshot_alone(tmp_path: Path) -> None:
@@ -409,7 +501,7 @@ def test_a_keyed_write_leaves_an_untouched_panels_shared_snapshot_alone(tmp_path
     c.panel("od2", credential_class="none")
     assert (state["reads"], other["reads"]) == (1, 1)
     c.invalidate_reads(["od"], refresh=False)
-    c.panel("od2", credential_class="none")
+    c.panel("od2", credential_class="token")                 # another class: the read cache cannot answer it, only ``st.recent``
     assert other["reads"] == 1                               # W's point: only the named panel goes cold
     c.panel("od", credential_class="none")
     assert state["reads"] == 2

@@ -1497,8 +1497,11 @@ class Cockpit:
         bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
         # both taken before the read starts: a write after this point makes the read's snapshot unsharable, and a reader that
         # needs a read begun after some instant (``_snap_for``'s ``read_after``) compares against ``begun``
+        # the epoch the flight THIS caller owns was created under (``start``, under ``st.lock``): a keyed write
+        # (``invalidate_reads``) moves the epoch, not ``_rc_gen``, and a read begun before it neither shares nor publishes
+        # (``commit``). A caller that first waited out an older flight owns a later one, so it is the flight's, not the entry's.
         with st.lock:
-            ep = st.epoch      # a keyed write (``invalidate_reads``) moves the epoch, not ``_rc_gen``: it also ends this read's sharing
+            ep = [st.epoch]
         gen, begun = self._rc_gen, time.monotonic()
 
         def produce() -> Any:
@@ -1522,14 +1525,19 @@ class Cockpit:
             shared = spec.refresh_every_s is None and snap.status in _SHARED_STATUSES
             snap._read_mark = (begun, gen)      # every _book outcome is a snapshot this read made, so the mark is its own
             with st.lock:
-                st.snap = snap
-                st.last_completion = done_at or ctx.now
-                st.fresh = (snap.as_of, snap.status)
-                st.recent = (snap, begun, time.monotonic(), gen) if shared and st.epoch == ep else None
-                st.commits += 1
+                # an on-demand panel read begun before a keyed write publishes nothing once the write landed: its snapshot
+                # must neither replace the state a post-write read already published nor end that read's shared snapshot
+                # (the caller still gets its own ``snap``). A refresher's cycle always publishes.
+                if spec.refresh_every_s is not None or st.epoch == ep[0]:
+                    st.snap = snap
+                    st.last_completion = done_at or ctx.now
+                    st.fresh = (snap.as_of, snap.status)
+                    st.recent = (snap, begun, time.monotonic(), gen) if shared else None
+                    st.commits += 1
             return snap
 
         def start() -> None:
+            ep[0] = st.epoch                  # runs under ``st.lock`` at the flight's creation, beside ``fl.epoch``
             st.refresh_started = ctx.now
 
         def end() -> None:

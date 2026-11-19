@@ -208,6 +208,9 @@ def test_an_in_flight_read_of_a_touched_panel_is_not_shared_after_the_write(ck, 
     gate.set()
     t.join(10)
     assert res and res[0] is not after
+    stored = [e.value for e in list(ck._rc.values()) if e.done.is_set()]
+    assert any(v is after for v in stored)                      # the post-write read is stored (the accessor sees values)
+    assert not any(v is res[0] for v in stored)                 # the pre-write owner's result is stored nowhere
     settled = ck.panel("tray", credential_class="token")        # the post-write read moved the commit count in the key (#138)
     assert settled is not res[0]                                # the pre-write owner's result was never stored
     assert ck.panel("tray", credential_class="token") is settled
