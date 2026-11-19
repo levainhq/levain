@@ -641,7 +641,7 @@ def register(subparsers: Any) -> None:
         description=("Write CHARTER.md at the repository root: the name, Export and Plan filled in, every other body a "
                      "<fill: ...> placeholder that `check` reports until it is replaced. Never overwrites. Exits 2, and writes "
                      "nothing, only when the guard runs (init writing into a repository; not under --stdout, where it does not "
-                     "run; there a registry or store pointer that cannot be read still exits 2, and an --items that is not a "
+                     "run; there a registry that cannot be read still exits 2, and an --items that is not a "
                      "store exits 1), when NAME is registered in the board registry at a different repository than the one it would "
                      "write to (a worktree of the registered repo is fine); when the registry, the store pointer or the "
                      "registered checkout cannot be read, so that cannot be told; when --items names something that is neither a store "
