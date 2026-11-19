@@ -20,7 +20,7 @@ __all__ = ["LastSeenStamper"]
 
 _log = logging.getLogger("levain.cockpit.last_seen")
 
-_MAX_DEVICES = 1024     # devices tracked at once; a note past it (after expired ones are dropped) is skipped, fail-soft
+_MAX_DEVICES = 1024     # devices tracked at once, and queued at once; a note past it is skipped, fail-soft
 _JOIN_S = 2.0           # how long close() waits for the thread; the thread is a daemon, so a longer stamp never holds exit
 
 
@@ -47,6 +47,8 @@ class LastSeenStamper:
                 return False
             if mono < self._next_ok.get(device_id, 0.0):
                 return False
+            if len(self._pending) >= _MAX_DEVICES and device_id not in self._pending:
+                return False                            # the thread is behind: the queue holds _MAX_DEVICES at most
             if len(self._next_ok) >= _MAX_DEVICES and device_id not in self._next_ok:
                 self._next_ok = {d: t for d, t in self._next_ok.items() if t > mono}
                 if len(self._next_ok) >= _MAX_DEVICES:

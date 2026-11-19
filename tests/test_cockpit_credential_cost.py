@@ -4,6 +4,7 @@ and the security invariant that a faster path must keep: a revoked device is ref
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import http.client
 import os
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +73,19 @@ class _OpenSpy:
 def _held(db: CockpitDB) -> Any:
     """The calling thread's credential connection (a ``HeldRead``), opened if it is not."""
     return db._cred.get(lambda: db._connect(held=True), db.path)
+
+
+@contextlib.contextmanager
+def _sidecars_kept(db: CockpitDB) -> Iterator[None]:
+    """A reader that is none of ``db``'s, open for the block. The last connection to close deletes ``-wal`` and
+    ``-shm``, and the held connection's identity includes them: without this reader, closing the held connection by
+    hand makes the next call open a new one instead of using the broken one."""
+    other = sqlite3.connect(db.path, isolation_level=None)
+    try:
+        other.execute("SELECT count(*) FROM paired_devices").fetchall()
+        yield
+    finally:
+        other.close()
 
 
 def _lookups(db: CockpitDB) -> list[str]:
@@ -137,9 +152,10 @@ def test_an_error_resolving_the_token_refuses_it(db: CockpitDB) -> None:
     """Fail closed: a journal that cannot be read raises (the server answers 503), it never answers a device."""
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
-    _held(db).conn.close()                              # a held connection that is broken
-    with pytest.raises(sqlite3.Error):
-        db.verify_device(tok, now=NOW)
+    with _sidecars_kept(db):
+        _held(db).conn.close()                          # a held connection that is broken
+        with pytest.raises(sqlite3.Error):
+            db.verify_device(tok, now=NOW)
 
 
 # --- the held connection ----------------------------------------------------------------------------------------------
@@ -305,16 +321,20 @@ def test_http_many_requests_one_stamp_per_device_and_never_on_the_request_thread
 def test_http_a_slow_stamp_holds_no_request(src, monkeypatch) -> None:
     gate = threading.Event()
     calls = _stamp_spy(monkeypatch, gate)
+    stamper: "threading.Thread | None" = None
     try:
-        with _serve(src) as (port, _httpd):
+        with _serve(src) as (port, httpd):
             _dev, tok = _pair(port)
             t0 = time.monotonic()
             for _ in range(5):
                 assert _manifest(port, tok) == 200
             assert _until(lambda: len(calls) == 1)       # the thread is inside the stamp, and is not done
+            stamper = httpd.last_seen_stamper._thread
             assert time.monotonic() - t0 < 10.0
     finally:
         gate.set()
+        if stamper is not None:
+            stamper.join(10)
 
 
 def test_stamper_coalesces_by_device_and_stamps_again_after_the_window(db: CockpitDB, monkeypatch) -> None:
@@ -385,6 +405,8 @@ def test_closing_the_stamper_does_not_hang_on_a_stamp_in_flight(db: CockpitDB, m
         assert st.note(db, "d-000000000000", NOW) is False      # closed: nothing queues
     finally:
         gate.set()
+        if st._thread is not None:
+            st._thread.join(10)
 
 
 def test_http_server_close_stops_the_stamper(src) -> None:
@@ -489,10 +511,12 @@ def test_a_broken_credential_connection_refuses_then_is_replaced(db: CockpitDB, 
     dev, tok = _enrol(db)
     assert db.verify_device(tok, now=NOW) == dev
     assert conns, "verify_device opened its connection here"
-    for c in conns:
-        c.close()                                       # every connection this thread holds is now broken
-    with pytest.raises(sqlite3.Error):
-        db.verify_device(tok, now=NOW)
+    broken = list(conns)                                # before the reader below, which ``keep`` records too
+    with _sidecars_kept(db):
+        for c in broken:
+            c.close()                                  # every connection this thread holds is now broken
+        with pytest.raises(sqlite3.Error):
+            db.verify_device(tok, now=NOW)
     assert db.verify_device(tok, now=NOW) == dev, "the broken connection was kept"
     _revoke_elsewhere(db, dev)
     assert db.verify_device(tok, now=NOW) is None
@@ -509,10 +533,10 @@ def test_journal_objects_made_and_dropped_leave_no_open_file_behind(tmp_path: Pa
     root = tmp_path / "cockpit"
     root.mkdir()
     dev, tok = _enrol(CockpitDB(root))
-    gc.collect()
     was = gc.isenabled()
     gc.disable()
     try:
+        gc.collect()        # an explicit run (the collector is off); none before ``after``: refcounting alone is tested
         before = _fds()
         for _ in range(50):
             one = CockpitDB(root)
@@ -564,13 +588,14 @@ def test_a_token_that_resolves_to_no_device_leaves_no_connection_held(db: Cockpi
         done.wait(30)
         gate.wait(30)
 
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
     gc.collect()
     before = _fds()
-    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
     for t in threads:
         t.start()
     try:
         done.wait(30)
+        gc.collect()
         during = _fds()
     finally:
         gate.set()
@@ -622,3 +647,167 @@ def test_short_lived_threads_leave_no_open_connection_behind(db: CockpitDB, monk
     for c in conns:                                     # no collector run: each thread's end closed its own
         with pytest.raises(sqlite3.ProgrammingError):
             c.execute("SELECT 1")
+
+
+# --- the L3 r1 round: the held connection's identity, its process-wide cap, the stamper's queue bound ------------------
+
+def test_a_same_size_in_place_restore_with_its_mtime_put_back_is_seen(db: CockpitDB) -> None:
+    """L3 r1 (1a): a restore over ``cockpit.db`` that keeps its inode and size and puts its modification time back
+    (``os.utime``) is still seen: the inode's change time moves, and it cannot be set from userland."""
+    dev, tok = _enrol(db)
+    other = sqlite3.connect(db.path, isolation_level=None)
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    restored = db.path.with_name("restored.db")
+    w = sqlite3.connect(restored, isolation_level=None)
+    other.backup(w)
+    other.close()
+    w.execute("UPDATE paired_devices SET revoked_at = '2026-11-19T12:00:01Z'")
+    w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    w.execute("PRAGMA journal_mode = DELETE")
+    w.close()
+    assert db.verify_device(tok, now=NOW) == dev
+    was = os.stat(db.path)
+    assert os.stat(restored).st_size == was.st_size, "the restore is the same size"
+    with open(restored, "rb") as s, open(db.path, "r+b") as t:
+        t.write(s.read())
+        t.truncate()
+    os.utime(db.path, ns=(was.st_atime_ns, was.st_mtime_ns))
+    now = os.stat(db.path)
+    assert (now.st_ino, now.st_size, now.st_mtime_ns) == (was.st_ino, was.st_size, was.st_mtime_ns)
+    assert db.verify_device(tok, now=NOW) is None, "answered from the old contents"
+
+
+def test_a_replaced_wal_file_reopens_the_held_connection(db: CockpitDB, monkeypatch) -> None:
+    """L3 r1 (1b): a ``-wal`` sidecar with a new inode under an unchanged ``cockpit.db`` reopens the held connection."""
+    dev, tok = _enrol(db)
+    for _ in range(2):
+        assert db.verify_device(tok, now=NOW) == dev
+    wal = Path(str(db.path) + "-wal")
+    assert wal.exists()
+    spy = _OpenSpy(monkeypatch)
+    assert db.verify_device(tok, now=NOW) == dev
+    assert spy.of("cockpit.db") == [], "settled: a hit opens nothing"
+    copy = wal.with_name("copy-wal")
+    copy.write_bytes(wal.read_bytes())
+    os.replace(copy, wal)
+    assert db.verify_device(tok, now=NOW) == dev
+    assert len(spy.of("cockpit.db")) == 1, "the held connection was kept across a replaced -wal"
+
+
+def test_the_first_hit_after_a_cold_journal_settles_in_one_open(db: CockpitDB, monkeypatch) -> None:
+    """The open itself makes the ``-wal`` and ``-shm`` sidecars of a journal no connection had open; that is not a
+    replacement, so the next call keeps the connection."""
+    dev, tok = _enrol(db)
+    assert not Path(str(db.path) + "-wal").exists(), "precondition: no connection holds the journal open"
+    spy = _OpenSpy(monkeypatch)
+    for _ in range(5):
+        assert db.verify_device(tok, now=NOW) == dev
+    assert len(spy.of("cockpit.db")) == 1, spy.opens
+
+
+def test_held_connections_are_capped_process_wide_and_over_the_cap_answer_the_same(db: CockpitDB,
+                                                                                   monkeypatch) -> None:
+    """L3 r1 (2): more client threads than the cap each hold at most a cap's worth of connections in all; a thread over
+    the cap answers on a connection it opens and closes, with the same verdict, and a revoke is refused on both."""
+    from levain.autonomic import durable_sqlite
+
+    free, n = 3, 7
+    gc.collect()
+    base = getattr(getattr(durable_sqlite, "_SLOTS", None), "taken", 0)     # slots still held by other tests' journals
+    monkeypatch.setattr(durable_sqlite, "HELD_READS_MAX", base + free, raising=False)
+    cap = free
+    dev, tok = _enrol(db)
+    conns: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def keep(*a: Any, **kw: Any) -> sqlite3.Connection:
+        c = real(*a, **kw)
+        conns.append(c)
+        return c
+
+    monkeypatch.setattr(sqlite3, "connect", keep)
+
+    def is_open(c: sqlite3.Connection) -> bool:
+        try:
+            c.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return False
+        return True
+
+    first: dict[int, Any] = {}
+    second: dict[int, Any] = {}
+    held: dict[int, bool] = {}
+    parked = threading.Barrier(n + 1)
+    turn = [threading.Event() for _ in range(n)]
+    done = [threading.Event() for _ in range(n)]
+
+    def run(i: int) -> None:
+        first[i] = db.verify_device(tok, now=NOW)
+        held[i] = getattr(db._cred._local, "held", None) is not None
+        parked.wait(30)
+        turn[i].wait(30)
+        second[i] = db.verify_device(tok, now=NOW)
+        done[i].set()
+        turn[i].wait(30)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    try:
+        parked.wait(30)
+        gc.collect()
+        open_now = sum(is_open(c) for c in conns)
+        assert first == {i: dev for i in range(n)}, "every thread admitted the live device"
+        assert sum(held.values()) == cap, held
+        assert open_now <= cap, f"{open_now} connections held open by {n} parked threads, cap {cap}"
+        _revoke_elsewhere(db, dev)
+        order = [i for i in range(n) if not held[i]] + [i for i in range(n) if held[i]]
+        for i in order:                                 # the over-cap threads first: every slot is still taken
+            turn[i].set()
+            assert done[i].wait(30)
+            turn[i].clear()
+    finally:
+        for e in turn:
+            e.set()
+        for t in threads:
+            t.join(10)
+    assert second == {i: None for i in range(n)}, "a revoked device was admitted"
+    assert durable_sqlite._SLOTS.taken == base, "a slot outlived its connection"
+
+
+def test_the_stamper_queue_is_bounded_while_the_thread_is_stuck(monkeypatch) -> None:
+    """L3 r1 (3): ``_pending`` never grows past ``_MAX_DEVICES``, however many devices note while a stamp is stuck."""
+    import types
+
+    from levain.cockpit import last_seen
+
+    cap = 4
+    monkeypatch.setattr(last_seen, "_MAX_DEVICES", cap)
+    clock = [1000.0]
+    monkeypatch.setattr(last_seen, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    gate = threading.Event()
+    entered = threading.Event()
+
+    class Stuck:
+        def stamp_last_seen(self, device_id: str, *, now: datetime) -> bool:
+            entered.set()
+            gate.wait(30)
+            return True
+
+    st = last_seen.LastSeenStamper()
+    window = firejournal.LAST_SEEN_EVERY.total_seconds()
+    peak = 0
+    try:
+        assert st.note(Stuck(), "d-first", NOW) is True
+        assert entered.wait(10)
+        for k in range(cap * 5):
+            clock[0] += window + 1                      # every earlier device is out of its window
+            st.note(Stuck(), f"d-{k:04d}", NOW)
+            peak = max(peak, len(st._pending))
+    finally:
+        gate.set()
+        thread = st._thread
+        st.close()
+        if thread is not None:
+            thread.join(10)
+    assert peak <= cap, peak
