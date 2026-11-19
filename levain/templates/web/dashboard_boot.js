@@ -1134,8 +1134,14 @@
       // and would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
       // One write asks for it once, whatever number of its panels answered so, and not at all when a re-read is already owed.
       // A board read that fails says so through the page's own failed-read line (load() sets it).
+      // While a job polls that rebuild would detach the job's live result box, the case the job deferral exists for: the
+      // fallback asks no read now and latches `deferredReload`, which onJobsIdle() flushes as one board read.
       done.then((r) => {
         if ((r !== false && r !== "fault") || boardAsked || pendingReload) return;
+        if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
+          deferredReload = true;
+          return;
+        }
         boardAsked = true;
         load().catch(() => {});
       });

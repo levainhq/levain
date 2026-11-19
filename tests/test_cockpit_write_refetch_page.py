@@ -88,6 +88,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
   const V = Object.assign({}, View, opts.real ? {} : {
     refetchPanel: (pid) => {
       env.refetchCalls.push(pid);
+      if (opts.endJobAtRefetch) env.jobs = false;   // the job ends while the read is out
       if (opts.hangFirst && env.refetchCalls.length === 1) return new Promise(() => {});   // a read that never answers
       const mark = () => marks.push("get-resolved:" + pid);
       return (async () => {
@@ -358,6 +359,36 @@ cases.a_touched_write_during_a_job_refetches_and_owes_a_re_read_when_the_job_end
   ok(env.manifestGets(getsBefore) === 1, "one board read followed the job's end: " + JSON.stringify(env.gets.slice(getsBefore)));
 };
 
+// While a job polls, a refetch that cannot settle its panel (answers false, faults or throws) does NOT ask the non-passive board
+// read now: that rebuild would detach the job's live result box. The latch the write set for the job's end carries the re-read:
+// exactly one board read, when the last job ends.
+cases.a_failing_refetch_during_a_job_leaves_the_board_read_to_the_jobs_end = async () => {
+  const answers = { fault: () => "fault", false: () => false, throws: () => { throw new Error("boom"); } };
+  for (const name of Object.keys(answers)) {
+    const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), answers[name]).start();
+    const getsBefore = env.gets.length;
+    env.jobs = true;
+    await env.snooze();
+    await env.tick(); await env.tick();
+    ok(env.refetchCalls.length === 1, name + ": the touched panel was refetched: " + JSON.stringify(env.refetchCalls));
+    ok(env.manifestGets(getsBefore) === 0, name + ": no board read while the job polls: " + JSON.stringify(env.gets.slice(getsBefore)));
+    env.jobs = false;
+    env.opts().onJobsIdle();
+    await env.tick(); await env.tick();
+    ok(env.manifestGets(getsBefore) === 1, name + ": exactly one board read followed the job's end: " + JSON.stringify(env.gets.slice(getsBefore)));
+  }
+};
+
+// the job ended between the write landing and its refetch settling: no job is left to protect, so the fallback asks as before
+cases.a_failing_refetch_after_the_job_has_ended_asks_the_board_read = async () => {
+  const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "fault", { endJobAtRefetch: true }).start();
+  const getsBefore = env.gets.length;
+  env.jobs = true;
+  await env.snooze();
+  await env.tick(); await env.tick();
+  ok(env.manifestGets(getsBefore) >= 1, "a board read was asked once no job polled: " + JSON.stringify(env.gets.slice(getsBefore)));
+};
+
 cases.a_touched_write_with_no_job_owes_no_re_read_at_idle = async () => {
   const env = await makeEnv(() => ({ ok: true, state: "COMMITTED", touched: ["tray"] }), () => "applied").start();
   const getsBefore = env.gets.length;
@@ -465,6 +496,8 @@ CASES = [
     "a_write_with_two_faulting_panels_asks_the_board_read_once",
     "a_failing_fallback_board_read_leaves_the_pages_failed_read_line",
     "a_touched_write_during_a_job_refetches_and_owes_a_re_read_when_the_job_ends",
+    "a_failing_refetch_during_a_job_leaves_the_board_read_to_the_jobs_end",
+    "a_failing_refetch_after_the_job_has_ended_asks_the_board_read",
     "a_touched_write_with_no_job_owes_no_re_read_at_idle",
     "a_write_from_an_open_form_reads_the_board_non_passively",
     "a_native_panel_with_a_board_read_in_flight_is_re_read_after_it",
