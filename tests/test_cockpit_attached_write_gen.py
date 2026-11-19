@@ -19,8 +19,10 @@ from typing import Any
 import pytest
 
 from levain.cockpit import engine
+from levain.cockpit import snapshot_host as sh
 from levain.cockpit.derive import DeriveLoop, PanelPlan
 from levain.cockpit.engine import Cockpit
+from levain.cockpit.snapshots import encode_body
 from tests.test_cockpit_attached_engine import CRED, PANELS, Recorder, Rig, list_spec
 
 LIVE = {"worker": "live", "heartbeat_age_s": 0.0}
@@ -69,6 +71,14 @@ class WriteRig(Rig):
             raise self.fail
         if self.forward:
             self.loop.dirty(ids, write_gen)
+
+    def publish_by_hand(self, pid: str, write_gen: int) -> None:
+        """A row for ``pid`` stamped with ``write_gen``, published as the loop would, and the cockpit told (a late host)."""
+        status, body = sh.encode_snap(self.ck.derive_panel(pid))
+        now = self.clock.epoch()
+        gen = self.writer.publish(pid, status=status, body=encode_body(body), started_at=now, derived_at=now, duration_ms=1,
+                                  write_gen=write_gen)
+        self.ck.note_publish(pid, gen, write_gen)
 
     def host_runs(self) -> None:
         """Start the loop's own threads: from here the host answers a write by itself."""
@@ -138,3 +148,361 @@ def test_a_bare_cockpit_never_tells_a_host(tmp_path: Path) -> None:
         assert told == []
     finally:
         r.close()
+
+
+# --- the read: post-write data -------------------------------------------------------------------------------------------
+def rows_of(payload: dict[str, Any]) -> list[str]:
+    return sorted(r["id"] for r in payload["rows"])
+
+
+def test_a_panel_read_after_a_write_returns_post_write_data_without_waiting_out_the_bound(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)          # a pass that needed the bound would be a pass of 30 s
+    rig.derive()
+    rig.host_runs()
+    assert rows_of(rig.ck.panel("alpha")) == ["alpha:a", "alpha:b"]
+    rig.rec.rows["alpha"] = ["a", "z"]
+    rig.ck.invalidate_reads(["alpha"])
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    assert time.monotonic() - t0 < 10.0
+    assert rows_of(out) == ["alpha:a", "alpha:z"] and out["stale"] is False and out["pending"] is False
+
+
+def test_a_manifest_after_a_write_carries_the_post_write_head(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.host_runs()
+    before = rig.ck.manifest(CRED)["panels"]
+    rig.rec.rows["alpha"] = ["a", "z", "y"]
+    rig.ck.invalidate_reads(["alpha"])
+    t0 = time.monotonic()
+    after = rig.ck.manifest(CRED)["panels"]
+    assert time.monotonic() - t0 < 10.0
+    assert after["alpha"]["count"] == 3 and after["alpha"]["stale"] is False and after["alpha"]["etag"] != before["alpha"]["etag"]
+    assert after["beta"]["etag"] == before["beta"]["etag"]
+
+
+def test_the_read_is_woken_by_the_publish_and_not_by_the_bound(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    stamps: list[float] = []
+
+    def answer() -> None:
+        time.sleep(0.2)
+        rig.publish_by_hand("alpha", 0)           # a row that is no answer to the write: the read stays where it is
+        time.sleep(0.2)
+        stamps.append(time.monotonic())
+        rig.publish_by_hand("alpha", 1)
+
+    t = threading.Thread(target=answer)
+    t.start()
+    out = rig.ck.panel("alpha")
+    done = time.monotonic()
+    t.join()
+    assert out["stale"] is False and stamps and 0 <= done - stamps[0] < 2.0
+    assert rig.ck.write_wait_counts() == {"waits": 1, "timeouts": 0}
+
+
+# --- the bounded fallback -------------------------------------------------------------------------------------------------
+def test_a_host_that_never_derives_is_served_stale_and_pending_within_the_bound(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.3)
+    rig.derive()
+    rig.forward = False
+    rig.rec.rows["alpha"] = ["a", "z"]
+    rig.ck.invalidate_reads(["alpha"])
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    took = time.monotonic() - t0
+    assert 0.25 <= took < 1.5
+    assert rows_of(out) == ["alpha:a", "alpha:b"]               # the older row
+    assert out["stale"] is True and out["pending"] is True
+    assert rig.ck.write_wait_counts() == {"waits": 1, "timeouts": 1}
+    # a bound that has run out is not paid again by every read behind it
+    t1 = time.monotonic()
+    again = rig.ck.panel("alpha")
+    assert time.monotonic() - t1 < 0.2 and again["stale"] is True and again["pending"] is True
+    assert rig.ck.write_wait_counts()["waits"] == 1
+    # the host answers late: the panel is current, and the flags go with it
+    rig.forward = True
+    rig.host_runs()
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.wait_published("alpha", 2)
+    out = rig.ck.panel("alpha")
+    assert rows_of(out) == ["alpha:a", "alpha:z"] and out["stale"] is False and out["pending"] is False
+
+
+def test_a_late_row_clears_the_flags_without_another_write(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.ck.panel("alpha")["stale"] is True
+    rig.publish_by_hand("alpha", 1)
+    out = rig.ck.panel("alpha")
+    assert out["stale"] is False and out["pending"] is False
+
+
+def test_a_new_write_after_a_lapsed_bound_waits_again(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    rig.ck.panel("alpha")
+    rig.ck.invalidate_reads(["alpha"])
+    rig.ck.panel("alpha")
+    assert rig.ck.write_wait_counts() == {"waits": 2, "timeouts": 2}
+
+
+def test_a_down_worker_is_not_waited_for(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    r = WriteRig(tmp_path)
+    try:
+        r.derive()
+        r.ck._host_state = lambda: {"worker": "down", "heartbeat_age_s": 99.0}
+        r.forward = False
+        r.ck.invalidate_reads(["alpha"])
+        t0 = time.monotonic()
+        out = r.ck.panel("alpha")
+        assert time.monotonic() - t0 < 5.0 and out["stale"] is True
+        assert r.ck.write_wait_counts()["waits"] == 0
+    finally:
+        r.close()
+
+
+# --- the double call ------------------------------------------------------------------------------------------------------
+def test_the_second_call_of_one_write_is_answered_by_a_derive_begun_after_it(rig: WriteRig, monkeypatch) -> None:
+    """The server calls ``invalidate_reads`` before the response and again after it. Each call's ``dirty`` is answered by a
+    derive that began after it, so the read behind the second call is satisfied and never waits for a generation no derive
+    stamps, including when a derive began between the two calls and stamped only the first."""
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.host_runs()
+    rig.rec.rows["alpha"] = ["a", "z"]
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.wait_published("alpha", 1)                      # a derive began between the calls and stamped the first
+    rig.ck.invalidate_reads(["alpha"], refresh=False)
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    assert time.monotonic() - t0 < 10.0
+    assert rows_of(out) == ["alpha:a", "alpha:z"] and out["stale"] is False and out["pending"] is False
+    assert rig.dirty_calls == [(("alpha",), 1), (("alpha",), 2)]
+    assert rig.reader.read("alpha").write_gen == 2
+
+
+def test_two_calls_with_no_derive_between_are_answered_by_one(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.rec.rows["alpha"] = ["a", "z"]
+    rig.ck.invalidate_reads(["alpha"])
+    rig.ck.invalidate_reads(["alpha"], refresh=False)
+    before = rig.rec.count("alpha")
+    rig.host_runs()
+    out = rig.ck.panel("alpha")
+    assert out["stale"] is False and rows_of(out) == ["alpha:a", "alpha:z"]
+    assert rig.reader.read("alpha").write_gen == 2
+    assert rig.rec.count("alpha") - before in (1, 2)           # the loop may take the second call as a derive of its own, never more
+
+
+# --- the manifest: one deadline -------------------------------------------------------------------------------------------
+def test_a_manifest_takes_one_shared_deadline_for_every_touched_panel(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.4)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads()                                  # both panels
+    t0 = time.monotonic()
+    heads = rig.ck.manifest(CRED)["panels"]
+    took = time.monotonic() - t0
+    assert 0.35 <= took < 0.75                                 # one bound, not one per panel
+    assert heads["alpha"]["stale"] is True and heads["alpha"]["pending"] is True
+    assert heads["beta"]["stale"] is True and heads["beta"]["pending"] is True
+    assert rig.ck.write_wait_counts() == {"waits": 1, "timeouts": 1}
+
+
+def test_the_change_stream_does_not_wait_for_a_write(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.forward = False
+    probe = rig.ck.change_probe()
+    before, _v = probe.snapshot()
+    rig.ck.invalidate_reads(["alpha"])
+    t0 = time.monotonic()
+    after, _v = probe.snapshot()
+    rig.ck.manifest(CRED, read_after=time.monotonic())
+    assert time.monotonic() - t0 < 5.0
+    assert after["alpha"] != before["alpha"] and after["beta"] == before["beta"]    # announced: the panel is now said to be pending
+    assert rig.ck.write_wait_counts()["waits"] == 0
+    rig.publish_by_hand("alpha", 1)
+    settled, _v = probe.snapshot()
+    assert settled["alpha"] == before["alpha"]                 # and announced again when the row lands
+
+
+# --- nothing waited for when nothing was written ------------------------------------------------------------------------
+def test_a_read_with_no_write_waits_for_nothing(rig: WriteRig) -> None:
+    rig.derive()
+    rig.ck.panel("alpha")
+    rig.ck.manifest(CRED)
+    assert rig.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}
+
+
+def test_a_write_to_one_panel_makes_only_that_panels_reads_wait(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.ck.panel("beta")["stale"] is False
+    assert rig.ck.write_wait_counts()["waits"] == 0
+    heads = rig.ck.manifest(CRED)["panels"]
+    assert heads["alpha"]["stale"] is True and heads["beta"]["stale"] is False
+    assert rig.ck.write_wait_counts()["waits"] == 1
+
+
+def test_a_serve_composed_panel_is_never_waited_for(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    r = WriteRig(tmp_path, ("alpha", "gamma"))
+    try:
+        r.ck.mark_serve_composed(["gamma"])
+        r.derive()
+        r.forward = False
+        r.ck.invalidate_reads(["gamma"])
+        r.ck.invalidate_reads()
+        t0 = time.monotonic()
+        r.ck.panel("gamma")
+        assert time.monotonic() - t0 < 5.0 and r.ck.write_wait_counts()["waits"] == 0
+    finally:
+        r.close()
+
+
+def test_an_attached_cockpit_with_no_dirty_hook_tells_no_one_and_waits_for_no_one(tmp_path: Path) -> None:
+    r = Rig(tmp_path, attach=False)
+    try:
+        r.ck.attach_snapshots(r.reader, host_state=lambda: LIVE)
+        r.derive()
+        r.ck.invalidate_reads(["alpha"])
+        t0 = time.monotonic()
+        out = r.ck.panel("alpha")
+        assert time.monotonic() - t0 < 1.0 and out["stale"] is False
+        assert r.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}
+    finally:
+        r.close()
+
+
+def test_a_bare_cockpit_never_waits_and_reads_the_provider_after_a_write(tmp_path: Path) -> None:
+    r = Rig(tmp_path, attach=False)
+    try:
+        r.ck.panel("alpha")
+        r.rec.rows["alpha"] = ["a", "z"]
+        r.ck.invalidate_reads(["alpha"])
+        out = r.ck.panel("alpha")
+        assert rows_of(out) == ["alpha:a", "alpha:z"] and "stale" not in out
+        assert r.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}
+    finally:
+        r.close()
+
+
+# --- a host that raises ---------------------------------------------------------------------------------------------------
+def test_a_host_that_raises_does_not_fail_the_write_and_its_panel_reads_stale_at_once(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)           # a wait for a host that cannot answer would show as time
+    rig.derive()
+    rig.fail = RuntimeError("the host is gone")
+    rig.ck.invalidate_reads(["alpha"])                           # does not raise
+    rig.ck.invalidate_reads()
+    assert rig.ck.host_dirty_errors == 2 and rig.ck.last_host_dirty_error is rig.fail
+    t0 = time.monotonic()
+    head = rig.ck.manifest(CRED)["panels"]["alpha"]
+    assert time.monotonic() - t0 < 5.0
+    assert head["stale"] is True and head["pending"] is False   # the older row, said to be old; nothing is coming for it
+    assert rig.ck.write_wait_counts()["waits"] == 0
+
+
+def test_a_later_write_the_host_takes_clears_a_panel_marked_unsent(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.fail = RuntimeError("the host is gone")
+    rig.ck.invalidate_reads(["alpha"])
+    rig.fail = None
+    rig.host_runs()
+    rig.ck.invalidate_reads(["alpha"])
+    out = rig.ck.panel("alpha")
+    assert out["stale"] is False and out["pending"] is False
+    assert rig.ck.host_dirty_errors == 1                         # the record of the failure stays
+
+
+def test_a_panel_marked_unsent_is_current_again_once_a_derive_began_after_the_write(rig: WriteRig) -> None:
+    rig.derive()
+    rig.fail = RuntimeError("the host is gone")
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.ck.panel("alpha")["stale"] is True
+    rig.clock.advance(31)                                        # the loop's own backstop re-derives it, with no write behind it
+    rig.loop.run_once(rig.clock.epoch())
+    assert rig.reader.read("alpha").write_gen == 0
+    assert rig.ck.panel("alpha")["stale"] is False
+
+
+# --- no lock is held while a read waits ---------------------------------------------------------------------------------
+def test_a_waiting_read_holds_no_cockpit_lock(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 1.5)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    got: list[Any] = []
+    t = threading.Thread(target=lambda: got.append(rig.ck.panel("alpha")))
+    t.start()
+    time.sleep(0.3)
+    assert rig.ck.write_wait_counts()["waits"] == 1 and t.is_alive()       # it is inside the wait
+    for lock in (rig.ck._rc_lock, rig.ck._lock, rig.ck._attached_lock, rig.ck._head_lock):
+        assert lock.acquire(timeout=0.5)
+        lock.release()
+    rig.ck.invalidate_reads(["beta"])                            # a write goes through while it waits
+    t.join()
+    assert got[0]["stale"] is True
+
+
+# --- two writers racing a reader ------------------------------------------------------------------------------------------
+def test_two_writers_racing_a_reader_each_read_their_own_write(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 20.0)
+    rig.derive()
+    rig.host_runs()
+    history: list[str] = []
+    mu = threading.Lock()
+    problems: list[Any] = []
+    stop = threading.Event()
+
+    def writer(tag: str) -> None:
+        try:
+            for i in range(6):
+                marker = f"{tag}{i}"
+                with mu:
+                    history.append(marker)
+                    rig.rec.rows["alpha"] = list(history)
+                rig.ck.invalidate_reads(["alpha"])
+                rig.ck.invalidate_reads(["alpha"], refresh=False)          # the server's second call of one write
+                out = rig.ck.panel("alpha")
+                # the other writer may have asked for a newer row since, so the flags are not this read's to assert
+                if f"alpha:{marker}" not in rows_of(out):
+                    problems.append((marker, rows_of(out)))
+        except BaseException as exc:  # noqa: BLE001
+            problems.append(exc)
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                rig.ck.panel("alpha")
+                rig.ck.manifest(CRED)
+        except BaseException as exc:  # noqa: BLE001
+            problems.append(exc)
+
+    rd = threading.Thread(target=reader)
+    ws = [threading.Thread(target=writer, args=(tag,)) for tag in ("x", "y")]
+    rd.start()
+    for w in ws:
+        w.start()
+    for w in ws:
+        w.join(60)
+    stop.set()
+    rd.join(30)
+    assert not any(t.is_alive() for t in [rd, *ws])
+    assert problems == []
+    final = rig.ck.panel("alpha")
+    assert rows_of(final) == sorted(f"alpha:{m}" for m in history) and final["stale"] is False

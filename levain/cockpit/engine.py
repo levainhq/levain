@@ -805,6 +805,9 @@ WORKER_LIVE_FACTOR = 3          # a heartbeat no older than this many cadences i
 WORKER_DOWN_AFTER_S = 30.0      # a heartbeat older than this (or none at all) is a worker that is down; between, stale
 STALE_CADENCE_FACTOR = 2        # a row older than this many of its panel's cadences is stale though the worker lives
 ATTACHED_SNAP_CACHE_MAX = 256   # decoded snapshots kept, one per (panel, generation)
+# how long a read of a panel a write touched waits for the row that answers the write (D7), counted from the start of the read
+# (a manifest takes one bound for all its panels); then it serves the older row, marked stale and pending
+WRITE_WAIT_S = 2.0
 # the head layer's caches (attached mode): composed panel heads are small and many (one per panel and request class); whole
 # panel payloads carry rows, so fewer are kept
 HEAD_CACHE_MAX = 256
@@ -924,12 +927,22 @@ class Cockpit:
         self._host_pending: Callable[[str], bool] | None = None
         self._host_dirty: Callable[[Iterable[str], int], None] | None = None
         self._host_state: Callable[[], Mapping[str, Any]] | None = None
-        # D7 (attached mode only), all under ``_rc_lock``: the serve's write generation, which only grows; the panels whose
-        # last ``dirty`` call raised; how many raised and the last one
+        # D7 (attached mode only), all under ``_rc_lock``: the serve's write generation, which only grows; per panel, the
+        # generation its row must be stamped with at least and the instant of the write that asked for it; the panels whose
+        # last ``dirty`` call raised; how many raised and the last one; per panel, the generation a read has waited out the
+        # bound for (it is not waited for again); how many reads blocked for a row and how many of those gave up
         self._write_gen = 0
+        self._write_required: dict[str, tuple[int, float]] = {}
         self._write_unsent: set[str] = set()
         self.host_dirty_errors = 0
         self.last_host_dirty_error: BaseException | None = None
+        self._write_lapsed: dict[str, int] = {}
+        self._write_waits = 0
+        self._write_wait_timeouts = 0
+        # what a blocked read sleeps on: ``_pub_ticket`` moves, and the condition is notified, whenever the host says it
+        # published (``note_publish``). Its lock guards the ticket and nothing else
+        self._pub_cv = threading.Condition(threading.Lock())
+        self._pub_ticket = 0
         self._heartbeat_cadence_s: float | None = None      # how often the attached host beats, when it is not the default
         self._serve_composed: frozenset[str] = SERVE_COMPOSED_IDS
         # what the host cycle last read for the manifest: the entity (with its faults) and the discovery faults. Each is one
@@ -1678,6 +1691,11 @@ class Cockpit:
         if row is None:
             return self._attached_error(spec, NOT_DERIVED_YET, None, _Fresh(None, None, True, pending), hint=True)
         fresh = self._fresh_of(spec, row, meta, _epoch(ctx.now))
+        owed, unsent = self._write_owed(spec.id, row)
+        if owed:
+            # a write asked for a row this one is not: it is the older row, and says so. A derive is owed for it, unless the
+            # host was never told of the write
+            fresh = dataclasses.replace(fresh, stale=True, pending=fresh.pending or not unsent)
         as_of = fresh.derived_at
         if row.status in ("error", "timeout"):
             return self._attached_error(spec, row.error or ("the derive timed out" if row.status == "timeout"
@@ -2631,7 +2649,13 @@ class Cockpit:
         """Every listed panel's head in one pass over ONE read of the store (``read_manifest``: the meta and every row in
         one transaction), and that read's meta. A panel that is not serve-composed is composed from its row with no further
         read of the store; a serve-composed one reads its own stores under the request, in the manifest pool, as a bare
-        cockpit reads every panel, and is told it is fresh (it is read now)."""
+        cockpit reads every panel, and is told it is fresh (it is read now).
+
+        A read that is not an observation first waits, under one bound for all the panels, for the rows the writes that
+        touched them asked for (``_await_writes``). ``read_after`` marks an observation (the change stream's): it waits for
+        nothing, and sees a panel a write asked for as stale and pending until its row lands."""
+        if read_after is None:
+            self._await_writes([s.id for s in specs if not self.serve_composed(s.id)])
         try:
             stored: Any = self._reader.read_manifest()
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
@@ -2901,7 +2925,8 @@ class Cockpit:
     def _note_write(self, panel_ids: "list[str] | None") -> None:
         """D7, attached mode only (a bare cockpit returns at once: it has no host to tell). Every call advances the write
         generation, and the panels the write touched (the ids named, or every panel served from a row when none were) that are
-        registered are told to the host with it, outside every lock of this cockpit. A host whose hook raises does not fail the
+        registered are told to the host with it, outside every lock of this cockpit; each such panel's row is from then on
+        required to answer the write (``_write_owed``, ``_await_writes``). A host whose hook raises does not fail the
         write: the failure is counted and kept (``host_dirty_errors``, ``last_host_dirty_error``) and those panels are
         remembered as unsent until a later call reaches the host."""
         if self._reader is None:
@@ -2910,9 +2935,13 @@ class Cockpit:
         ids = [pid for pid in (specs if panel_ids is None else panel_ids)
                if pid in specs and not self.serve_composed(pid)]
         dirty = self._host_dirty
+        at = _epoch(self._clock())
         with self._rc_lock:
             self._write_gen += 1
             write_gen = self._write_gen
+            if dirty is not None:      # with no host to tell, no row will ever answer the write, so none is asked for
+                for pid in ids:
+                    self._write_required[pid] = (write_gen, at)
         if dirty is None or not ids:
             return
         try:
@@ -2925,6 +2954,81 @@ class Cockpit:
         else:
             with self._rc_lock:
                 self._write_unsent.difference_update(ids)
+
+    def note_publish(self, panel_id: str, gen: int, write_gen: int) -> None:
+        """The host's word that it published a row (the shape of a derive loop's ``on_publish``): wakes every read blocked
+        for a row. The arguments are not trusted to say whether the row answers a write: a woken read looks at the row."""
+        with self._pub_cv:
+            self._pub_ticket += 1
+            self._pub_cv.notify_all()
+
+    def write_wait_counts(self) -> dict[str, int]:
+        """How many reads of a panel a write touched had to block for its row (``waits``), and how many of those gave up at
+        the bound (``timeouts``) and served the older row."""
+        with self._rc_lock:
+            return {"waits": self._write_waits, "timeouts": self._write_wait_timeouts}
+
+    def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
+        """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and
+        whether the host was never told of it. A row answers a write once it is stamped with the write's generation, or, for
+        a write the host was never told of, once a derive began after the write. An answered write is forgotten."""
+        with self._rc_lock:
+            req = self._write_required.get(panel_id)
+            if req is None:
+                return False, False
+            unsent = panel_id in self._write_unsent
+            if row is not None and (row.write_gen >= req[0] or (unsent and row.started_at > req[1])):
+                del self._write_required[panel_id]
+                self._write_lapsed.pop(panel_id, None)
+                return False, False
+            return True, unsent
+
+    def _await_writes(self, panel_ids: list[str]) -> None:
+        """Block, bounded by ``WRITE_WAIT_S`` from here (ONE bound for every panel named), until each of these panels has a
+        row stamped for the write that touched it. It returns early for a panel the host was never told of, one whose bound
+        a read already ran out for this write, and a worker that is down; it holds no lock of this cockpit while it waits,
+        and sleeps on the host's publish notice (``note_publish``), never on a timer it polls. A read that gives up leaves
+        the panel's row as it is: the head says so (``_write_owed``)."""
+        with self._rc_lock:
+            owed = {pid: req[0] for pid in panel_ids
+                    if (req := self._write_required.get(pid)) is not None and pid not in self._write_unsent
+                    and self._write_lapsed.get(pid, 0) < req[0]}
+        if not owed:
+            return
+        try:
+            meta = self._reader.meta()
+        except Exception:  # noqa: BLE001 - a store that cannot be read is an answer the read itself gives
+            return
+        if self._worker_health(meta, _epoch(self._clock()))[0] == "down":
+            return
+        deadline = time.monotonic() + WRITE_WAIT_S
+        blocked = False
+        while True:
+            with self._pub_cv:
+                ticket = self._pub_ticket          # taken before the rows are looked at: a publish after it is not missed
+            behind: dict[str, int] = {}
+            for pid, need in owed.items():
+                try:
+                    row = self._reader.read(pid)
+                except Exception:  # noqa: BLE001
+                    return
+                if row is None or row.write_gen < need:
+                    behind[pid] = need
+            if not behind:
+                return
+            left = deadline - time.monotonic()
+            with self._rc_lock:
+                if not blocked:
+                    blocked = True
+                    self._write_waits += 1
+                if left <= 0:
+                    self._write_wait_timeouts += 1
+                    for pid, need in behind.items():
+                        self._write_lapsed[pid] = max(self._write_lapsed.get(pid, 0), need)
+                    return
+            owed = behind
+            with self._pub_cv:
+                self._pub_cv.wait_for(lambda: self._pub_ticket != ticket, timeout=left)
 
     def _drop_scopes(self, scopes: list) -> None:
         """Advance these read scopes' generation and delete their entries, in-flight ones included."""
@@ -3261,6 +3365,8 @@ class Cockpit:
         spec = specs_map.get(panel_id)
         if spec is None:
             return None
+        if self._reader is not None and not self.serve_composed(panel_id):
+            self._await_writes([panel_id])
         snap = self._snap_for(spec, ctx)
         if snap.fresh_info is not None:
             # attached: a read with no ``q`` is the head layer's; a search composes its own head (the hidden rows are let in)
