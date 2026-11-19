@@ -1166,8 +1166,8 @@
 .livechip[data-state="stale"]::before { background: var(--warn); }
 
 
-/* ═══════════════════════════ the KE page (body.ke): hero, brief, widgets, a 3-column zone grid ═══════════════════════════
-   A manifest that declares hero / brief / widgets draws these; a pre-KE manifest keeps every rule above unchanged. */
+/* ═══════════════════════════ the KE page (body.ke): hero, widgets, a 3-column zone grid ═══════════════════════════
+   A manifest that declares hero / brief / widgets draws the hero and widgets (the brief region is not drawn); a pre-KE manifest keeps every rule above unchanged. */
 body.ke { --gutter: var(--gutter-ke); }
 body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 

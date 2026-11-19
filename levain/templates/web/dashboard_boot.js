@@ -198,7 +198,7 @@
   // BEGIN progressive draw
   // The first board is drawn as its panels land, never held for the whole set: the manifest, then at once every panel's shell
   // (each one loading, a third state beside drawn and unavailable), then each panel as its read answers, the Needs strip's panel
-  // first and the page's top (the hero, the brief) next. These are the pure parts: which ids are read first, the board in hand
+  // first and the page's top (the hero, and the state line the now band shows) next; the brief region's other panels, which the page no longer draws, queue with the rest. These are the pure parts: which ids are read first, the board in hand
   // (a landed panel's body, a loading marker for each one still out), and the pacing of the draws.
   const PARTIAL_GAP_MS = 250;        // two partial draws are at least this far apart, and at least PARTIAL_IDLE x the last draw's own time (a slow phone renders slowly)
   const PARTIAL_IDLE = 4;
@@ -213,7 +213,7 @@
   function drawOrder(manifest, ids) {
     const r = (manifest && manifest.regions) || {};
     const first = [];
-    for (const id of [].concat(NEEDS_PANELS, r.hero || [], r.brief || [])) if (ids.indexOf(id) >= 0 && first.indexOf(id) < 0) first.push(id);
+    for (const id of [].concat(NEEDS_PANELS, r.hero || [], (r.brief || []).filter((b) => b === "state"))) if (ids.indexOf(id) >= 0 && first.indexOf(id) < 0) first.push(id);
     return first.concat(ids.filter((id) => first.indexOf(id) < 0));
   }
   // The panels the board is drawn from: each landed panel's own record, and a loading marker for every one still out.
