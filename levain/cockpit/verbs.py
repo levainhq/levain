@@ -1493,9 +1493,9 @@ _EPISODE_AFFECTS = ("episodes", "health", "activity", "memory_glance", "begin", 
 # the question store and the consent queue's band rows: the Decisions panel, the List's band, the activity feed and the topology's
 # waiting nodes. A row filed by a wake lands there too (``_wake_after_resolve``)
 _QUESTION_AFFECTS = ("decisions", "tray", "activity", "topology")
-_REVIEW_AFFECTS = ("review-queue", "coord-morning")                   # the desk's review items (desk_panels.REVIEW_ID, MORNING_ID)
-_DROP_AFFECTS = ("coord-status", "coord-morning")                     # a plain line is a desk drop (desk_status, desk_panels)
-_AGENT_AFFECTS = ("agents",)                                          # the agent store (agents_panel.AGENTS_ID)
+_REVIEW_AFFECTS = ("review-queue", "coord-morning")                   # the desk's review queue and its morning card
+_DROP_AFFECTS = ("coord-status", "coord-morning")                     # a plain line is stored as a desk drop
+_AGENT_AFFECTS = ("agents",)                                          # the agent store
 _ALL_PANELS = ("*",)                                                  # what the write changed cannot be named
 _INTENTION_WRITERS = frozenset({"band_agenda", INTAKE_VERB})
 # a verb with a legacy kind lands through ``apply_edit`` and appends to the edits ledger
