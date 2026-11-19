@@ -154,7 +154,7 @@ def test_reset_layout_clears_the_key_and_redraws_the_kernel_order(tmp_path: Path
     out = _run(tmp_path, [
         {"eval": f"{PANEL % 'edits'}.querySelector('.ck-lay-up').click(); {PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"},
         SETTLE, {"eval": STACKS}, {"eval": STORED},
-        {"eval": "const b = document.querySelector('[data-layout-reset]'); "   # the control sits in a zone head (which Home does not draw): present, not measured
+        {"eval": "const b = [...document.querySelectorAll('[data-layout-reset]')].filter(x => x.getClientRects().length > 0)[0]; "
                  "const r = [b.textContent.trim(), !!b.closest('.zone-head'), !!b.closest('.masthead')]; b.click(); r"},
         SETTLE, {"eval": STACKS}, {"eval": STORED}, {"eval": f"{PANEL % 'tray'}.classList.contains('ck-collapsed')"},
         {"eval": "document.querySelectorAll('[data-layout-reset]').length"},
@@ -168,7 +168,7 @@ def test_reset_layout_clears_the_key_and_redraws_the_kernel_order(tmp_path: Path
 
 @needs_browser
 def test_no_saved_layout_draws_no_reset_control_and_a_saved_one_draws_it_in_the_zone_head_only(tmp_path: Path) -> None:
-    ALL = "[...document.querySelectorAll('[data-layout-reset]')].map(b => [!!b.closest('.zone-head'), !!b.closest('.masthead')])"
+    ALL = "[...document.querySelectorAll('[data-layout-reset]')].filter(b => b.getClientRects().length > 0).map(b => [!!b.closest('.zone-head'), !!b.closest('.masthead')])"
     for width in (1440, 390):
         none = _run(tmp_path / f"n{width}", [{"eval": ALL}, {"eval": "document.querySelectorAll('.masthead [data-layout-reset]').length"}], width=width)
         assert none == [[], 0], (width, none)

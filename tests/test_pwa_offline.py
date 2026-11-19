@@ -55,7 +55,7 @@ def _cold_open(tmp_path: Path, *, drop_shell: bool, hang: bool = True, retry: bo
     profiles = tmp_path / "chrome-profiles"       # the rig's Chrome profile lands here, so a rig killed mid-cleanup leaks nothing outside
     profiles.mkdir(exist_ok=True)
     env = {**os.environ, "SW_OFFLINE_DROP_SHELL": "1" if drop_shell else "0", "SW_OFFLINE_WAIT_MS": "20000",
-           "SW_OFFLINE_TMP": str(profiles), "SW_OFFLINE_RETRY": "1" if retry else "0", "SW_OFFLINE_RETRY_TEXT": "Morning"}
+           "SW_OFFLINE_TMP": str(profiles), "SW_OFFLINE_RETRY": "1" if retry else "0", "SW_OFFLINE_RETRY_TEXT": "Memory"}
     proc = subprocess.Popen([NODE, str(RIG), CHROME, f"http://localhost:{port}/"], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
     try:
@@ -111,7 +111,7 @@ def test_a_cold_open_with_a_silent_origin_paints_the_cached_shell(tmp_path: Path
     assert "/" in online["keys"] and online["controlled"], online     # the shell really was installed before the origin went quiet
     tab = cold["offline"]
     assert cold["ms"] is not None and cold["ms"] < PAINT_BUDGET_MS, (cold["ms"], tab.get("readyState"), tab.get("html", "")[-200:])
-    assert "Morning" in tab["text"], tab["text"]       # the cockpit's own page, drawn from the cached shell
+    assert "Memory" in tab["text"], tab["text"]       # the cockpit's own page, drawn from the cached shell
 
 
 @needs_browser
@@ -124,13 +124,13 @@ def test_a_cold_open_with_a_silent_origin_and_no_shell_shows_the_offline_page(tm
     # the origin is back: Retry is a fresh navigation (the timed-out probes were aborted, nothing queued ahead of it) and the
     # cockpit itself paints, inside one deadline's budget
     again = cold["retry"]
-    assert again["ms"] is not None and again["ms"] < PAINT_BUDGET_MS and "Morning" in again["retry"]["text"], again
+    assert again["ms"] is not None and again["ms"] < PAINT_BUDGET_MS and "Memory" in again["retry"]["text"], again
 
 
 @needs_browser
 def test_a_cold_open_with_a_refusing_origin_still_paints_the_shell_and_the_page(tmp_path: Path) -> None:
     """The case that always worked (the connection is refused at once): kept, so the deadline never replaces it."""
     _, cold = _cold_open(tmp_path, drop_shell=False, hang=False)
-    assert cold["ms"] is not None and cold["ms"] < PAINT_BUDGET_MS and "Morning" in cold["offline"]["text"], cold
+    assert cold["ms"] is not None and cold["ms"] < PAINT_BUDGET_MS and "Memory" in cold["offline"]["text"], cold
     _, cold = _cold_open(tmp_path / "b", drop_shell=True, hang=False)
     assert cold["ms"] is not None and cold["ms"] < PAINT_BUDGET_MS and OFFLINE_TEXT in cold["offline"]["text"], cold

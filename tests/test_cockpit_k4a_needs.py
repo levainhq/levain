@@ -168,7 +168,7 @@ def test_time_left_reads_in_whole_units_never_minutes_and_seconds(tmp_path: Path
 
 
 @needs_browser
-def test_a_record_click_lights_its_card_and_build_draws_one_bar(tmp_path: Path, monkeypatch) -> None:
+def test_a_record_click_lights_its_card_and_memory_draws_one_bar(tmp_path: Path, monkeypatch) -> None:
     _waiting(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
@@ -176,9 +176,9 @@ def test_a_record_click_lights_its_card_and_build_draws_one_bar(tmp_path: Path, 
             {"eval": "(() => { const id = document.querySelector('#ck-needs .needs-consent').dataset.needsId; const ok = window.LevainNeeds.go(id);"
                      " return JSON.stringify({id, ok, lit: document.querySelectorAll('.needs-lit').length, none: window.LevainNeeds.go('consent:nope')}); })()"},
             {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('.needs-lit').length), 2000))"},
-            {"eval": "(() => { window.LevainCockpitKinds.applyMode('build', true); return new Promise(r => setTimeout(() => { const n = document.getElementById('ck-needs');"
+            {"eval": "(() => { window.LevainCockpitKinds.applyMode('memory', true); return new Promise(r => setTimeout(() => { const n = document.getElementById('ck-needs');"
                      " r(JSON.stringify({bar: getComputedStyle(n.querySelector('.needs-bar')).display, grid: getComputedStyle(n.querySelector('.needs-grid')).display,"
-                     " chips: n.querySelectorAll('.needs-chip-btn').length, btn: /Open on Board/.test(n.innerText)})); }, 300)); })()"}])["values"]
+                     " chips: n.querySelectorAll('.needs-chip-btn').length, btn: /Open on Home/.test(n.innerText)})); }, 300)); })()"}])["values"]
     a, gone, bar = json.loads(out[-3]), out[-2], json.loads(out[-1])
     assert a["ok"] is True and a["lit"] == 1 and a["none"] is False, a
     assert gone == 0, gone                                              # the light ends by itself: no class left behind

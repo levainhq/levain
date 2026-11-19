@@ -1,6 +1,6 @@
 """A sparse install (every new user's) keeps the designed shape (K2_L1L2 L2-1 / L2-7): an empty card is its header and one line, not a
-populated height. (The Morning-only cases, the glance tiles filling Morning's row and the full-width Morning Tray, went with the Morning
-mode: Home places the glance as a small auto-fill grid and the Tray as one of three work columns.)"""
+populated height. (The full-width Morning Tray went with the Morning mode: Home places the Tray as one of three work columns; the glance tiles
+still fill their row, on Home.)"""
 
 from __future__ import annotations
 
@@ -14,6 +14,23 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         return _drive(tmp_path, f"{url}/#write_token=T", [{"until": "document.querySelector('.ck-widgets .ck-card.w')"}, *steps])["values"]
+
+
+@needs_browser
+def test_a_sparse_glance_shares_the_row_between_its_tiles(tmp_path: Path) -> None:
+    """Restored from Morning onto Home, where the glance lives now: the tiles fill the row (an auto-fit grid, not an auto-fill one that
+    leaves its unused tracks empty), never a lone small tile and a void."""
+    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+      const w = document.querySelector('.ck-widgets');
+      const cs = [...w.querySelectorAll(':scope > .ck-card.w')].filter(c => getComputedStyle(c).display !== 'none');
+      const W = w.getBoundingClientRect().width;
+      return { n: cs.length, shape: w.dataset.shape, place: document.body.dataset.iaPlace, shares: cs.map(c => c.getBoundingClientRect().width / W) }; })()"""}])
+    got = vals[1]
+    n, shares = got["n"], got["shares"]
+    assert got["place"] == "home" and n >= 1, got
+    assert got["shape"] == ("strip" if n < 4 else "tiles"), got                # the shape follows the count
+    assert max(shares) - min(shares) < 0.03, got                                # equal tiles
+    assert sum(shares) > 0.85, got                                              # together they fill the row: no lone small tile, no void
 
 
 @needs_browser

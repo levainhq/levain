@@ -179,14 +179,14 @@ def test_there_is_no_open_loops_panel_and_a_parked_someday_wears_a_badge(tmp_pat
             {"eval": f"JSON.stringify({{parked: [...{TRAY}.querySelectorAll('.row[data-parked]')].map(r => r.textContent), "
                      f"chips: [...{TRAY}.querySelectorAll('.list-parked')].map(c => c.textContent), "
                      f"plain: {TRAY}.querySelectorAll('.row:not([data-parked]) .list-parked').length}})"},
-            {"eval": "location.hash = '#build'; 1"},
-            {"until": "document.body.dataset.mode === 'build' && 1"},
+            {"eval": "location.hash = '#memory'; 1"},
+            {"until": "document.body.dataset.mode === 'memory' && 1"},
             {"eval": f"JSON.stringify({{loops: !!{loops}}})"},
         ])
     v = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
-    board, badge, build = v[-3], v[-2], v[-1]
+    board, badge, memory = v[-3], v[-2], v[-1]
     assert board["loops"] is False and board["hs"] is True, board       # no Open loops panel on the Board
-    assert build["loops"] is False, build                               # nor on Build
+    assert memory["loops"] is False, memory                           # nor on Memory
     assert len(badge["parked"]) == 1 and "a parked loop" in badge["parked"][0], badge
     assert badge["chips"] == ["parked"] and badge["plain"] == 0, badge  # one badge, on the parked row only
 

@@ -563,6 +563,10 @@
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", agents: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
+  // Where the places put a panel whose tab list says otherwise, and the panels no place draws (the jump box lists neither a panel it
+  // could only land on hidden, nor a row inside one).
+  const PLACED_ON = tableOf({ episodes: "memory" });
+  const NOT_DRAWN = tableOf({ notifications: 1, topology: 1 });
   const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });
   function modesOf(e) {
     return TABS_OF_ID[e.id] || TABS_OF_REGION[e.region || e.zone] || "board";
@@ -1023,6 +1027,7 @@
   const FILTER_KEY = "levain_cockpit_filter:";
   const MODE_KEY = "levain_cockpit_mode";
   const MODES = ["morning", "board", "build", "memory"];
+  const RETIRED_MODES = ["morning", "build"];
   const SEARCH_DEBOUNCE_MS = 250;
   const STORE_LIMIT = 50;
   let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
@@ -2096,11 +2101,15 @@
       try { dropSky(s); s.body.replaceChildren(); paintSky(s, s.body, s.data.sky); } catch (_) { /* the next paint remounts */ }
     }
   }
+  // Morning and Build are retired: a request for either, from the address, a stored choice, a key or a jump, is Home ("board") before
+  // any attribute is written, so no path can pass through a mode that has no place on the page.
   function applyMode(m, fromReader) {
     if (MODES.indexOf(m) < 0) m = "board";
+    const retired = RETIRED_MODES.indexOf(m) >= 0;
+    if (retired) m = "board";
     document.body.dataset.mode = m;
     save(MODE_KEY, m);
-    if (fromReader) writeHash(m);
+    if (fromReader || retired) writeHash(m);   // a retired name in the address is rewritten, so a reload does not name it again
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
@@ -2111,9 +2120,23 @@
   }
   // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
   // tab list (page chrome) is on every tab.
+  // Returns true when it changed the tab: the places paint on the microtask after the attribute, so a caller that scrolls to the panel
+  // waits a frame in that case.
   function revealTab(node) {
+    const id = node && node.dataset ? node.dataset.ckPanel : "";
+    // a panel the places put on a tab other than the one its table names (Recent episodes sits in Memory) is revealed there
+    const placed = id ? PLACED_ON[id] : undefined;
+    if (placed) {
+      if (document.body.dataset.mode === placed) return false;
+      applyMode(placed, true);
+      return true;
+    }
     const tabs = ((node && node.dataset && node.dataset.modes) || "").split(" ").filter(Boolean);
-    if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
+    if (document.body.dataset.mode && tabs.length && tabs.indexOf(document.body.dataset.mode) < 0) {
+      applyMode(tabs.indexOf("board") >= 0 ? "board" : tabs[0], true);
+      return true;
+    }
+    return false;
   }
   // The grids are laid out from what a mode shows: the glance is a strip sharing its row (tiles from four), and a zone grid is six
   // tracks under three, four under two, one under one.
@@ -2586,11 +2609,12 @@
     const items = [];
     for (const h of document.querySelectorAll("#board .panel > .phead h2")) {
       const panel = h.closest(".panel");
+      if (NOT_DRAWN[panel.dataset.ckPanel]) continue;
       if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel });
     }
     if (terms.length) {
       for (const s of states) {
-        if (!onPage(s) || !s.searchable) continue;
+        if (!onPage(s) || !s.searchable || NOT_DRAWN[s.pid]) continue;
         const d = s.data, hays = d.hays || [], its = itemsOf(d);
         let n = 0;
         its.forEach((it, i) => {
@@ -2624,17 +2648,22 @@
     const close = () => { dlg.remove(); palette = null; };
     const choose = (it) => {
       close();
+      // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
+      const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
       if (it.kind === "panel") {
         // a panel the current tab hides is reached through the first tab that shows it
-        revealTab(it.node);
+        const changed = revealTab(it.node);
         if (it.node.ckShowTab) it.node.ckShowTab();
-        it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
+        after(changed, () => { it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); });
+        return; }
       // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
-      revealTab(it.state.p);
+      const changed = revealTab(it.state.p);
       if (it.state.p.ckShowTab) it.state.p.ckShowTab();
       it.state.setQuery(it.q, true);
-      it.state.p.scrollIntoView({ block: "start" });
-      if (it.state.filterInput) it.state.filterInput.focus();
+      after(changed, () => {
+        it.state.p.scrollIntoView({ block: "start" });
+        if (it.state.filterInput) it.state.filterInput.focus();
+      });
     };
     const draw = () => {
       list.replaceChildren();
@@ -2698,6 +2727,8 @@
       if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.dlg.remove(), palette = null; else openJump(); return; }
       if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
       if (document.querySelector(".modal-overlay")) return;
+      const sheet = document.getElementById("pr-sheet");
+      if (sheet && sheet.getClientRects().length) return;   // the presence sheet is a dialog too: its keys are its own
       if (ev.key === "/") {
         const all = visibleFilters();
         if (!all.length) return;

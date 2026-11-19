@@ -7,7 +7,7 @@ import json
 
 from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _run, _intention, _value
 from tests.test_cockpit_flip_parity import needs_browser
-from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
+from tests.test_cockpit_k7_build import DESKTOP, RETIRED_BUILD, _sessions_fixture
 
 LC = "document.querySelector('#k7-sessions .lc')"
 CARD = "document.querySelector('#k7-sessions .k7-card')"
@@ -35,6 +35,7 @@ def _lost_value() -> dict:
     return v
 
 
+@RETIRED_BUILD      # guarded the Build Sessions card's what-closing-it-would-lose panel (#k7-sessions)
 @needs_browser
 def test_the_panel_sits_right_of_the_sessions_card_at_1440_and_below_it_under_1440_and_on_a_phone(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -49,6 +50,7 @@ def test_the_panel_sits_right_of_the_sessions_card_at_1440_and_below_it_under_14
         assert got["lc"][1] >= got["card"][1] - 1 and got["scroll"] <= 0, (first, got)                                              # below it, no horizontal scroll
 
 
+@RETIRED_BUILD      # guarded the Build Sessions card's what-closing-it-would-lose panel (#k7-sessions)
 @needs_browser
 def test_through_the_real_provider_each_live_session_is_a_line_and_an_unread_tree_never_says_nothing_at_risk(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -64,6 +66,7 @@ def test_through_the_real_provider_each_live_session_is_a_line_and_an_unread_tre
     assert second == first, second                                                                                                      # the lens does not change the panel: it is its own
 
 
+@RETIRED_BUILD      # guarded the Build Sessions card's what-closing-it-would-lose panel (#k7-sessions)
 @needs_browser
 def test_a_session_with_work_to_lose_shows_its_chips_and_files_and_the_clear_ones_one_line_at_the_bottom(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -85,6 +88,7 @@ def test_a_session_with_work_to_lose_shows_its_chips_and_files_and_the_clear_one
     assert got["order"].index("lc-sess") < got["order"].index("lc-quiet") < got["order"].index("lc-foot"), got
 
 
+@RETIRED_BUILD      # guarded the Build Sessions card's what-closing-it-would-lose panel (#k7-sessions)
 @needs_browser
 def test_no_live_sessions_is_one_line_in_the_panel(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -94,6 +98,7 @@ def test_no_live_sessions_is_one_line_in_the_panel(tmp_path, monkeypatch):
     assert out[-1] == "Lost if closed No live sessions, so nothing to lose.", out
 
 
+@RETIRED_BUILD      # guarded the Build Sessions card's what-closing-it-would-lose panel (#k7-sessions)
 @needs_browser
 def test_a_faulted_topology_provider_leaves_the_panel_one_unavailable_line(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)

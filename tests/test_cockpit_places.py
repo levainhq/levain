@@ -13,8 +13,10 @@ import re
 from html.parser import HTMLParser
 from pathlib import Path
 
+from tests._ke_dom import NODE, run_node
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
+from tests.test_cockpit_narrow_layout_rig import drive_touch
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 PLACES = {"home", "desk", "room", "memory"}
@@ -158,20 +160,218 @@ def test_a_browser_lands_on_home_moves_between_places_and_takes_the_keys(tmp_pat
     assert phone["tagline"] > 0 and phone["bar"] == ["home", "desk", "room", "memory"], phone
 
 
+MODE_KEY = "levain_cockpit_mode"   # cockpit_view.js MODE_KEY: the page keeps the chosen mode in sessionStorage under this key
+# every value the body's data-mode takes from here on, in order: each record's old value, then the value at the callback. A mode the page
+# writes and another script replaces in the same turn is still seen, as the old value of the next record.
+WATCH = ("window.__modes = []; new MutationObserver((rs) => { for (const r of rs) window.__modes.push(r.oldValue); window.__modes.push(document.body.dataset.mode); })"
+         ".observe(document.body, {attributes: true, attributeFilter: ['data-mode'], attributeOldValue: true}); 1")
+KEY = "document.dispatchEvent(new KeyboardEvent('keydown', {key: '%s', bubbles: true, cancelable: true})); 1"
+
+
 @needs_browser
 def test_a_stored_retired_mode_lands_on_home(tmp_path: Path) -> None:
-    """Morning and Build are retired; a mode stored by an older page sends the page to Home, not to a mode with no tab."""
+    """Morning and Build are retired; a mode kept by an older page (read from sessionStorage under the page's own key) opens Home."""
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
             READY,
-            {"eval": "localStorage.setItem('levain_cockpit_mode', 'morning'); window.__old = 1; location.reload(); 1"},
+            {"eval": f"sessionStorage.setItem('{MODE_KEY}', 'morning'); history.replaceState(null, '', location.pathname); window.__old = 1; location.reload(); 1"},
             {"until": "!window.__old && document.body.dataset.iaPlace && 1"}, SETTLE,
             {"eval": STATE},
+            {"eval": f"sessionStorage.getItem('{MODE_KEY}')"},
+            {"eval": WATCH},
             {"eval": "location.hash = '#build'; 1"}, SETTLE,
             {"eval": STATE},
+            {"eval": "JSON.stringify([window.__modes, location.hash, sessionStorage.getItem('%s')])" % MODE_KEY},
         ])
     states = [v for v in out["values"] if isinstance(v, dict) and "place" in v]
     assert [s["place"] for s in states] == ["home", "home"], out["values"]
-    assert all(s["mode"] not in ("morning", "build") for s in states), states
+    assert all(s["mode"] == "board" for s in states), states
+    assert "board" in out["values"], out["values"]                                  # the kept value was read, then replaced by Home's
+    modes, frag, kept = json.loads(out["values"][-1])
+    assert "morning" not in modes and "build" not in modes, modes                  # the retired mode was never written, not even for a moment
+    assert frag == "#board" and kept == "board", (frag, kept)
+
+
+@needs_browser
+def test_the_keys_and_the_jump_never_pass_through_a_retired_mode(tmp_path: Path) -> None:
+    """Keys 1 and 3 under the presence sheet, and the address, used to open Morning and Build for a moment: the page's own mode setter is the gate."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": WATCH},
+            {"eval": "(() => { const s = document.getElementById('pr-sheet'); s.hidden = false; s.style.display = 'block'; return s.getClientRects().length; })()"},
+            {"eval": KEY % "3"}, {"eval": KEY % "1"}, {"eval": KEY % "4"}, SETTLE,
+            {"eval": "(() => { document.getElementById('pr-sheet').hidden = true; return 1; })()"},
+            {"eval": "window.LevainCockpitKinds.applyMode('build', true); window.LevainCockpitKinds.applyMode('morning'); 1"}, SETTLE,
+            {"eval": STATE},
+            {"eval": "JSON.stringify(window.__modes)"},
+        ])
+    vals = out["values"]
+    sheet_shown = [v for v in vals if isinstance(v, int) and not isinstance(v, bool)]
+    assert sheet_shown and sheet_shown[0] > 0, vals                                 # the sheet was really drawn
+    modes = json.loads(vals[-1])
+    assert "morning" not in modes and "build" not in modes, modes
+    state = [v for v in vals if isinstance(v, dict) and "place" in v][-1]
+    assert state["place"] == "home" and state["mode"] == "board", state             # nothing the sheet was open over moved the page to Memory either
+
+
+def test_the_page_resolves_a_retired_mode_before_it_writes_any_attribute(tmp_path: Path) -> None:
+    out = run_node(r"""
+const modes = [], written = [];
+document.body.dataset = new Proxy({}, { set(t, k, v) { if (k === "mode") modes.push(v); t[k] = v; return true; } });
+globalThis.location = { hash: "#build", search: "", pathname: "/" };
+globalThis.history = { replaceState: (a, b, url) => written.push(url) };
+const kept = {};
+globalThis.sessionStorage = { getItem: (k) => kept[k] || null, setItem: (k, v) => { kept[k] = v; }, removeItem: (k) => { delete kept[k]; } };
+for (const m of ["morning", "build", "board", "memory", "bogus"]) K.applyMode(m);
+out.modes = modes;
+out.stored = kept.levain_cockpit_mode;
+out.written = written;
+""", tmp_path)
+    assert out["modes"] == ["board", "board", "board", "memory", "board"], out
+    assert out["written"] == ["/#board", "/#board"], out                            # a retired name is rewritten out of the address; a plain first paint writes nothing
+
+
+def test_the_jump_box_reveals_episodes_in_memory_and_lists_no_panel_that_no_place_draws(tmp_path: Path) -> None:
+    out = run_node(r"""
+const modes = [];
+document.body.dataset = new Proxy({ mode: "board" }, { set(t, k, v) { if (k === "mode") modes.push(v); t[k] = v; return true; } });
+globalThis.location = { hash: "", search: "", pathname: "/" };
+globalThis.history = { replaceState() {} };
+const panel = (id, title, modes) => { const p = new N("section"); p.dataset.ckPanel = id; if (modes) p.dataset.modes = modes; p.title = title; return p; };
+const ids = [["episodes", "Recent episodes", "board"], ["tray", "List", "morning board"], ["notifications", "Notifications", "board"],
+  ["topology", "Topology", "build"], ["agents", "Agents", "build"], ["crystals", "Crystals", "memory"]];
+const panels = ids.map(([id, t, m]) => panel(id, t, m));
+const heads = panels.map((p) => Object.assign(new N("h2"), { text: p.title, closest: () => p }));
+globalThis.document.querySelectorAll = (sel) => (sel === "#board .panel > .phead h2" ? heads : []);
+out.listed = K.jumpItems("").map((i) => i.label);
+const by = (id) => panels.find((p) => p.dataset.ckPanel === id);
+out.fromHome = [K.revealTab(by("episodes")), document.body.dataset.mode];
+out.fromMemory = [K.revealTab(by("episodes")), document.body.dataset.mode];       // already there: no change
+document.body.dataset.mode = "board";
+out.agents = [K.revealTab(by("agents")), document.body.dataset.mode];             // its tab is retired: Home, where the machine draws it
+out.crystals = [K.revealTab(by("crystals")), document.body.dataset.mode];
+""", tmp_path)
+    assert "Recent episodes" in out["listed"] and "Agents" in out["listed"], out
+    assert "Notifications" not in out["listed"] and "Topology" not in out["listed"], out
+    assert out["fromHome"] == [True, "memory"] and out["fromMemory"] == [False, "memory"], out
+    assert out["agents"] == [True, "board"] and out["crystals"] == [True, "memory"], out
+
+
+@needs_browser
+def test_choosing_recent_episodes_in_the_jump_box_ends_on_the_drawn_panel(tmp_path: Path) -> None:
+    """From Home and from Memory the choice lands on Memory with the panel drawn (it ended on Home, with the panel hidden, from Memory)."""
+    SHOWN = "(() => { const p = document.querySelector('.panel[data-ck-panel=\"episodes\"]'); return JSON.stringify({place: document.body.dataset.iaPlace, shown: !!p && p.getClientRects().length > 0}); })()"
+    CHOOSE = ("(() => { document.getElementById('jumpbtn').click(); const i = document.querySelector('.palette-input'); i.value = 'recent episodes';"
+              " i.dispatchEvent(new Event('input')); const items = [...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent);"
+              " i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return JSON.stringify(items); })()")
+    LISTED = ("(() => { document.getElementById('jumpbtn').click(); const i = document.querySelector('.palette-input');"
+              " const t = [...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent); i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return JSON.stringify(t); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": LISTED},
+            {"eval": CHOOSE}, SETTLE, {"eval": SHOWN},                                # 2: chosen from Home
+            {"eval": PRESS % "home"}, SETTLE,
+            {"eval": PRESS % "memory"}, SETTLE,
+            {"eval": CHOOSE}, SETTLE, {"eval": SHOWN},                                # 3: chosen from Memory
+        ])
+    strs = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith(("{", "["))]
+    listed, chosen1, shown1, chosen2, shown2 = strs
+    assert any("episodes" in t.lower() for t in chosen1), chosen1                  # the fixture offers the panel
+    assert not [t for t in listed if t in ("Notifications", "Topology")], listed
+    assert shown1 == {"place": "memory", "shown": True}, shown1
+    assert shown2 == {"place": "memory", "shown": True}, shown2
+
+
+@needs_browser
+def test_drop_on_memory_goes_home_and_reaches_the_box(tmp_path: Path) -> None:
+    """The masthead Drop button was a no-op on Memory (the box is not drawn there): it goes Home, then scrolls to and focuses the box."""
+    ST = ("(() => { const d = document.getElementById('ck-drop'); const a = document.activeElement;"
+          " return JSON.stringify({place: document.body.dataset.iaPlace, drawn: d.getClientRects().length > 0, top: Math.round(d.getBoundingClientRect().top), y: Math.round(scrollY), inBox: !!a && d.contains(a)}); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, {"until": "document.getElementById('ck-drop') && !document.getElementById('ck-drop').hidden && 1", "ms": 30000}, SETTLE,
+            {"eval": PRESS % "memory"}, SETTLE,
+            {"eval": ST},
+            {"eval": "document.querySelector('.ia-act[data-phone-jump=\"drop\"]').click(); 1"}, SETTLE, SETTLE,
+            {"eval": ST},
+        ])
+    on_memory, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{")]
+    assert on_memory["place"] == "memory" and not on_memory["drawn"] and on_memory["y"] == 0, on_memory
+    assert after["place"] == "home" and after["drawn"], after
+    assert after["y"] > 0 and abs(after["top"]) <= 2, after                       # the page's own jump ran: the box is scrolled to the top of the view
+
+
+@needs_browser
+def test_grants_and_notifications_keep_the_desk_they_were_pressed_on(tmp_path: Path) -> None:
+    """The page's boot handler leaves the Desk on any jump, which sent a person Home under the notification sheet."""
+    ST = "JSON.stringify({place: document.body.dataset.iaPlace, sheet: !!document.getElementById('levain-modal')})"
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": PRESS % "desk"}, SETTLE,
+            {"eval": ST},
+            {"eval": "document.querySelector('.ia-act[data-phone-jump=\"notifications\"]').click(); 1"}, SETTLE, SETTLE,
+            {"eval": ST},
+        ])
+    desk, after = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{")]
+    assert desk["place"] == "desk", desk
+    assert after == {"place": "desk", "sheet": True}, after
+
+
+@needs_browser
+def test_the_notifications_button_name_carries_the_unread_count(tmp_path: Path) -> None:
+    """Its aria-label replaces its content for assistive tech, so the pill's count is carried into the label (the page writes the pill)."""
+    NAME = "document.querySelector('.ia-act[data-phone-jump=\"notifications\"]').getAttribute('aria-label')"
+    SET = ("(() => { const p = document.querySelector('[data-nc-unread]'); p.hidden = %s; p.textContent = '%s'; return new Promise(r => setTimeout(r, 100)).then(() => 1); })()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE,
+            {"eval": NAME},
+            {"eval": SET % ("false", "3")}, {"eval": NAME},
+            {"eval": SET % ("false", "99+")}, {"eval": NAME},
+            {"eval": SET % ("true", "0")}, {"eval": NAME},
+        ])
+    names = [v for v in out["values"] if isinstance(v, str) and v.startswith("Notifications")]
+    assert names == ["Notifications", "Notifications, 3 unread", "Notifications, 99+ unread", "Notifications"], out["values"]
+
+
+def test_the_places_buttons_name_their_key() -> None:
+    p = _parse()
+    got = {a["data-ia-place-btn"]: (a.get("title", ""), a.get("aria-keyshortcuts")) for t, a, stack in p.tags if "data-ia-place-btn" in a and _in_bar(stack)}
+    assert {k: v[1] for k, v in got.items()} == {"home": "1", "desk": "2", "room": "3", "memory": "4"}, got
+    assert all(v[0].endswith("(key %s)" % v[1]) for v in got.values()), got
+    keys = re.search(r"var KEYS = \{([^}]*)\}", (WEB / "dashboard_places.js").read_text()).group(1)
+    assert {m[1]: m[0] for m in re.findall(r"(\d): \"(\w+)\"", keys)} == {"home": "1", "desk": "2", "room": "3", "memory": "4"}   # the markup says what the script binds
+
+
+@needs_browser
+def test_a_coarse_pointer_gets_44_px_actions_and_places(tmp_path: Path) -> None:
+    H = ("JSON.stringify({coarse: matchMedia('(pointer: coarse)').matches, w: innerWidth,"
+         " acts: [...document.querySelectorAll('.ia-act')].map(b => Math.round(b.getBoundingClientRect().height)),"
+         " places: [...document.querySelectorAll('.ia-places [data-ia-place-btn]')].map(b => Math.round(b.getBoundingClientRect().height))})")
+    _root, src, _ids = _install(tmp_path)
+    got = []
+    for w in (390, 820):
+        (tmp_path / str(w)).mkdir()
+        _r, s2, _i = _install(tmp_path / str(w))
+        with _serve(s2, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+            out = drive_touch(tmp_path / str(w), f"{url}/#write_token=T", [{"emulate": {"w": w, "h": 900, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, {"eval": H}])
+        got.append(json.loads([v for v in out["values"] if isinstance(v, str) and v.startswith("{")][-1]))
+    for g in got:
+        assert g["coarse"] is True, g                                              # the emulation is a touch device, so the rule under test applies
+        assert len(g["acts"]) == 3 and len(g["places"]) == 4, g
+        assert min(g["acts"] + g["places"]) >= 44, g

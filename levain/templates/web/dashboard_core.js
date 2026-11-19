@@ -7921,8 +7921,8 @@
     openModal(findEntry(currentView, entryKey(entry)) || entry, opener || null, true);
     return true;
   }
-  // The one orange bar Build and Memory draw in place of the cards (CSS shows it only there): dot, "Needs you", the count, one chip
-  // per waiting item (its tool and first words, or the question's), the soonest clock, and "Open on Board". A chip goes to Board
+  // The one orange bar Memory draws in place of the cards (CSS shows it only there): dot, "Needs you", the count, one chip
+  // per waiting item (its tool and first words, or the question's), the soonest clock, and "Open on Home". A chip goes Home
   // too, with its card lit. A consent chip says its tool at once and adds the command's first words when the body arrives.
   const NEEDS_CHIPS = 6, NEEDS_CHIP_WORDS = 26;
   function needsFirstWords(display, tool) {
@@ -7971,7 +7971,7 @@
       bar.appendChild(soon);
       if (!consentTicker && typeof window.setInterval === "function") consentTicker = window.setInterval(tickConsent, 1000);
     }
-    const open = el("button", "needs-history needs-open", "Open on Board");
+    const open = el("button", "needs-history needs-open", "Open on Home");
     open.type = "button";
     open.addEventListener("click", () => needsToBoard(""));
     bar.appendChild(open);

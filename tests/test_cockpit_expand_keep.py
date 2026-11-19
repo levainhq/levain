@@ -87,11 +87,13 @@ def _assert_modal_held(opened: list[Any], before: list[Any], held: list[Any], sc
     assert scroll is not None and abs(scroll - scrolled) <= 3, f"{why}: the modal scroll moved from {scrolled} to {scroll}"
 
 
+# the episodes panel lives in Memory now (Home does not draw it), so these three open on the Memory place
+
 @needs_browser
 def test_refresh_keeps_an_expanded_row(tmp_path: Path) -> None:
     _root, src = _install_long(tmp_path)
     with _serve_plain(src) as url:
-        out = _drive(tmp_path, f"{url}/", [
+        out = _drive(tmp_path, f"{url}/#memory", [
             {"until": f"({OPENABLE})(document.querySelector('{BOARD}')).length > 0 && 1"},
             {"eval": COUNT_RENDERS},
             {"eval": _open_in(BOARD, "episodes")},
@@ -135,7 +137,7 @@ def test_a_store_write_keeps_an_expanded_row(tmp_path: Path) -> None:
     with _serve_plain(src) as url:
         t.start()
         try:
-            out = _drive(tmp_path, f"{url}/", [
+            out = _drive(tmp_path, f"{url}/#memory", [
                 {"until": f"({OPENABLE})(document.querySelector('{BOARD}')).length > 0 && 1"},
                 {"eval": COUNT_RENDERS},
                 {"eval": _open_in(BOARD, "episodes")},
@@ -252,7 +254,7 @@ def test_the_episodes_modal_search_keeps_an_open_row_across_two_rebuilds(tmp_pat
               " const i = document.querySelector('#levain-modal .ep-search-input'); i.value = 'needle';"
               " i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return 1; })()")
     with _serve_plain(src) as url:
-        out = _drive(tmp_path, f"{url}/", [
+        out = _drive(tmp_path, f"{url}/#memory", [
             {"until": f"({OPENABLE})(document.querySelector('{BOARD}')).length > 0 && 1"},
             {"eval": COUNT_RENDERS},
             {"eval": "[...document.querySelectorAll('#board .panel')].find(p => p.dataset.panelId === 'episodes' || /^Recent episodes/.test(p.querySelector('h2').textContent)).querySelector('.pexpand').click(); 1"},

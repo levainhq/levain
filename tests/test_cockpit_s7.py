@@ -13,6 +13,7 @@ from tests.test_cockpit_activity import _session
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
+from tests.test_cockpit_k7_build import RETIRED_BUILD
 
 TODAY = date(2026, 10, 20)
 
@@ -96,6 +97,7 @@ def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     assert got["title"] == "Where to begin" and got["source"]
 
 
+@RETIRED_BUILD      # guarded the Build tab's compact Activity strip (the Event graph at ~85 px, header "Activity")
 @needs_browser
 def test_build_draws_the_activity_band_as_the_compact_strip_and_board_the_full_chart(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
@@ -119,3 +121,21 @@ def test_build_draws_the_activity_band_as_the_compact_strip_and_board_the_full_c
     assert b["head"] == "Activity" and b["win"] == "last 14 h" and b["legend"] == "none", b
     assert b["canvas"] < 100 and b["h"] < 160, b                       # the mock's band is ~85 px
     assert d["head"] is None and d["canvas"] >= 160 and d["h"] > b["h"] + 100, d   # Board keeps its full chart
+
+
+@needs_browser
+def test_home_draws_the_event_graph_in_full_once_the_strip_is_opened(tmp_path: Path) -> None:
+    """The Board half of the retired Build strip test: the full chart (no "Activity" strip head, a canvas of the chart's height) is what Home draws
+    once its folded graph strip is opened."""
+    _root, src, _ids = _install(tmp_path)
+    _session(_root, "s-a", str(tmp_path), timedelta(minutes=3))
+    probe = ("JSON.stringify({head: (document.querySelector('.sky-head-title') || {}).textContent || null,"
+             " canvas: document.querySelector('.sky-canvas').getBoundingClientRect().height})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP,
+            {"until": "document.querySelector('#ck-hlens [data-tv=events]') && document.querySelector('[data-ia-graph-toggle]')"},
+            {"eval": "document.querySelector('[data-ia-graph-toggle]').click(); document.querySelector('#ck-hlens [data-tv=events]').click(); 1"},
+            {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events' && document.querySelector('.sky-canvas')"},
+            {"eval": "new Promise(r => setTimeout(r, 500)).then(() => 1)"}, {"eval": probe}])
+    d = json.loads(out["values"][-1])
+    assert d["head"] is None and d["canvas"] >= 160, d

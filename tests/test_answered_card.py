@@ -121,7 +121,7 @@ def _home(tmp_path: Path, monkeypatch) -> QuestionStore:
 # the selector the page's "Needs you" tab jumps to, read from the page source so the test follows it
 JUMP_SELECTOR = re.search(r'needs: "([^"]+)"', CORE[CORE.index("const PHONE_JUMP_TARGET"):]).group(1)
 
-# Both strip states read the page in build mode, where only the bar draws the strip: an answered card is not drawn there
+# Both strip states read the page on Memory, where only the bar draws the strip: an answered card is not drawn there
 STRIP = ("JSON.stringify({rows: document.querySelectorAll('#ck-needs .needs-row').length,"
          " headline: !!document.querySelector('#ck-needs .needs-headline'), pill: !!document.querySelector('#ck-needs .needs-count'),"
          " count: (document.querySelector('#ck-needs .needs-headline .needs-tab[data-needs-tab=you]') || {}).textContent || null,"   # the count rides the tab's label now
@@ -133,8 +133,8 @@ STRIP = ("JSON.stringify({rows: document.querySelectorAll('#ck-needs .needs-row'
          " ticking: document.querySelectorAll('#ck-needs .needs-settled-tag [data-age-at]').length,"
          " lines: [...document.querySelectorAll('#ck-needs .needs-answered .consent-note')].map(n => n.textContent),"
          " strip: 1})") % json.dumps(JUMP_SELECTOR)
-BUILD_HIDES = ("(window.LevainCockpitKinds.applyMode('build', true), JSON.stringify({hidden: [...document.querySelectorAll('#ck-needs .needs-answered')]"
-               ".every(n => getComputedStyle(n).display === 'none'), n: document.querySelectorAll('#ck-needs .needs-answered').length, build: 1}))")
+MEMORY_HIDES = ("(window.LevainCockpitKinds.applyMode('memory', true), JSON.stringify({hidden: [...document.querySelectorAll('#ck-needs .needs-answered')]"
+               ".every(n => getComputedStyle(n).display === 'none'), n: document.querySelectorAll('#ck-needs .needs-answered').length, memory: 1}))")
 
 
 @needs_browser
@@ -147,12 +147,12 @@ def test_an_answered_card_shows_its_answer_and_moves_no_count(tmp_path: Path, mo
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
-            {"eval": STRIP}, {"eval": BUILD_HIDES}])
-    seen, build = _values(out, '"strip"'), _values(out, '"build"')
+            {"eval": STRIP}, {"eval": MEMORY_HIDES}])
+    seen, memory = _values(out, '"strip"'), _values(out, '"memory"')
     assert seen["rows"] == 1 and seen["count"] == "Needs you (1)" and seen["cards"] == 1 and seen["waiting"] and seen["jump"], seen
     assert seen["label"] == "Just answered" and seen["ticking"] == 1, seen     # the age in the tag is the page's ticking one
     assert seen["lines"][0].startswith("Answered: ship \u00b7 Ship it tonight") and seen["lines"][0].endswith("via cli"), seen
-    assert build == {"hidden": True, "n": 1, "build": 1}, build                 # build and memory draw the bar alone
+    assert memory == {"hidden": True, "n": 1, "memory": 1}, memory               # Memory draws the bar alone (Build is retired)
 
 
 @needs_browser
@@ -164,12 +164,12 @@ def test_a_strip_of_only_answered_cards_has_no_headline_pill_or_jump_and_keeps_t
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
-            {"eval": STRIP}, {"eval": BUILD_HIDES}])
-    seen, build = _values(out, '"strip"'), _values(out, '"build"')
+            {"eval": STRIP}, {"eval": MEMORY_HIDES}])
+    seen, memory = _values(out, '"strip"'), _values(out, '"memory"')
     assert seen["headline"] is False and seen["pill"] is False and seen["history"] is False and seen["rows"] == 0, seen
     assert seen["waiting"] is False and seen["jump"] is False, seen              # the "Needs you" tab has nothing to jump to
     assert seen["cards"] == 3 and seen["label"] == "Just answered", seen         # five answered, the newest three kept
-    assert build["hidden"] is True and build["n"] == 1, build
+    assert memory["hidden"] is True and memory["n"] == 1, memory
 
 
 ROWS = "[...document.querySelectorAll('#levain-modal [data-question-row]')]"

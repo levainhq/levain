@@ -17,6 +17,10 @@ from tests.test_cockpit_k7_build import _sessions_fixture
 
 import pytest
 
+# The phone first-row geometry this measures (ROW1_AT_13C4D885, with the Modes bar's `.seg` as the second row) is gone with the Modes bar, and Home
+# hides the band's own Calm button (#calmphone): Calm's phone reach is a boarded row (Calm at 480 px and under). The test comes back with that row,
+# measured again on the places page.
+RETIRED_MODES_ROW = pytest.mark.skip(reason="the Modes bar's phone first-row geometry it measures is retired, and Calm's phone button is boarded (Calm at 480 px and under on Home)")
 WAIT = {"eval": "new Promise(r => setTimeout(r, 300))"}
 HTML = "document.documentElement.classList.contains('calm')"
 BTN = "(() => { const b = document.getElementById('calmbtn'); return JSON.stringify([b.getAttribute('aria-pressed'), b.textContent]); })()"
@@ -157,6 +161,7 @@ def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(widt
     assert any(expect in d for d in _row1_defects(good, width)), _row1_defects(good, width)
 
 
+@RETIRED_MODES_ROW
 @needs_browser
 @pytest.mark.parametrize("width", [320, 375, 430])
 def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):

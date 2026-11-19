@@ -108,7 +108,7 @@ def test_a_downstream_hero_reading_draws_no_weather_card_and_the_wrap_line_overl
         assert others == [], f"the last-wrap line overlaps: {others}"
         assert no_hscroll is True
         assert not weather and not refresh and not icon
-        assert band == "grid", f"the hero band lost its stylesheet rules: display is {band!r}"
+        assert band == "flex", f"the hero band lost its stylesheet rules: display is {band!r}"   # Home draws the band as the one now line, a flex row
         assert title == "Reading", "a downstream hero reading shows its own title"
 
 

@@ -62,10 +62,10 @@
     <!-- The places bar: places only, at every width. Its buttons drive the page through the hidden drivers below (dashboard_places.js);
          the Needs count rides Home so it shows from every place. Drop, Grants and Notifications are the masthead's buttons, not places. -->
     <nav class="ck-phonetabs ia-places" id="ck-phonetabs" aria-label="Places">
-      <button type="button" data-ia-place-btn="home">Home<span class="ia-needs"><span class="ia-needs-w">Needs</span><span class="ck-tabcount ck-needs-count" data-nc-needs hidden></span></span></button>
-      <button type="button" data-ia-place-btn="desk">Desk</button>
-      <button type="button" data-ia-place-btn="room">Room</button>
-      <button type="button" data-ia-place-btn="memory">Memory</button>
+      <button type="button" data-ia-place-btn="home" title="Home (key 1)" aria-keyshortcuts="1">Home<span class="ia-needs"><span class="ia-needs-w">Needs</span><span class="ck-tabcount ck-needs-count" data-nc-needs hidden></span></span></button>
+      <button type="button" data-ia-place-btn="desk" title="Desk (key 2)" aria-keyshortcuts="2">Desk</button>
+      <button type="button" data-ia-place-btn="room" title="Room (key 3)" aria-keyshortcuts="3">Room</button>
+      <button type="button" data-ia-place-btn="memory" title="Memory (key 4)" aria-keyshortcuts="4">Memory</button>
     </nav>
     <!-- The places bar drives the page's own wiring through these (data-mode-tab: cockpit_view.js; data-phone-jump: dashboard_boot.js). -->
     <div class="ia-drivers" hidden>
@@ -90,7 +90,7 @@
       </div>
     </section>
     <section class="ck-needs frame" id="ck-needs" aria-label="Needs you" hidden></section>
-    <!-- The desk drop (filled by renderDropHero; never replaced by an install): dashboard.css places it by place; Memory hides it (the Drop button stands for it there). -->
+    <!-- The desk drop (filled by renderDropHero; never replaced by an install): dashboard.css places it by place; Memory does not draw it (the Drop button goes Home first, then to the box). -->
     <section class="ck-drop frame" id="ck-drop" aria-label="Drop to the desk" hidden></section>
     <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
