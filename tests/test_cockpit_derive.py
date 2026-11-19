@@ -8,10 +8,11 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 
 import pytest
 
-from levain.cockpit import derive
+from levain.cockpit import derive, snapshots
 from levain.cockpit.derive import (
     DeriveLoop,
     DeriveResult,
@@ -256,7 +257,7 @@ def test_first_derive_publishes_and_nothing_moves_means_nothing_derives(tmp_path
 def test_body_is_canonical_json_bytes():
     loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: ok({"b": 1, "a": "é"}))
     loop.run_once(clock.t)
-    assert writer.of("a")[0]["body"] == '{"a":"é","b":1}'.encode("utf-8")
+    assert writer.of("a")[0]["body"] == snapshots.encode_body({"b": 1, "a": "é"}) == b'{"a":"\\u00e9","b":1}'
 
 
 def test_file_input_move_derives(tmp_path):
@@ -455,14 +456,29 @@ def test_exception_publishes_error_keeps_last_body_and_the_loop_continues():
     loop.stop()
 
 
-def test_error_before_any_good_body_publishes_null_body():
+def test_error_before_any_good_body_asks_the_writer_to_keep_the_stored_body():
     def fn(pid):
         raise RuntimeError("nope")
 
     loop, writer, clock, _ = make([PanelPlan("a")], fn=fn)
     loop.run_once(clock.t)
     pub = writer.of("a")[0]
-    assert pub["status"] == "error" and pub["body"] == b"null"
+    assert pub["status"] == "error" and pub["body"] is None
+    loop.stop()
+
+
+def test_nan_body_is_an_error_publish_naming_the_value_problem():
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: ok({"x": float("nan")}))
+    loop.run_once(clock.t)
+    pub = writer.of("a")[0]
+    assert pub["status"] == "error" and pub["error"].startswith("ValueError") and "JSON" in pub["error"]
+    loop.stop()
+
+
+def test_lone_surrogate_body_publishes_ok():
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: ok({"n": "x\ud83dy"}))
+    loop.run_once(clock.t)
+    assert writer.of("a")[0]["status"] == "ok"
     loop.stop()
 
 
@@ -486,7 +502,7 @@ def test_a_failing_writer_does_not_kill_the_loop():
     loop.stop()
 
 
-def test_dir_past_the_bound_degrades_the_stream_and_derives_each_poll(tmp_path, monkeypatch):
+def test_dir_past_the_bound_degrades_the_stream_naming_panel_and_input(tmp_path, monkeypatch):
     monkeypatch.setattr(derive, "DIR_ENTRIES_MAX", 2)
     d = tmp_path / "big"
     d.mkdir()
@@ -497,14 +513,48 @@ def test_dir_past_the_bound_degrades_the_stream_and_derives_each_poll(tmp_path, 
     stream = writer.streams[-1]
     assert stream["id"] == "inputs" and stream["state"] == "degraded"
     assert "a" in stream["detail"] and "Dir" in stream["detail"] and str(d) in stream["detail"]
-    # None means cannot tell: treated as changed.
-    assert loop.run_once(clock.t) == ["a"]
+    # None means cannot tell, but never "changed": no back-to-back derives
+    assert loop.run_once(clock.t) == []
     for i in range(3):
         (d / f"f{i}").unlink()
     assert loop.run_once(clock.t) == ["a"]  # the fingerprint is real again: one derive from the changed state
     assert loop.run_once(clock.t) == []
     assert writer.streams[-1]["state"] == "ok"
     loop.stop()
+
+
+def test_none_fingerprint_derives_at_most_once_per_backstop(tmp_path, monkeypatch):
+    monkeypatch.setattr(derive, "DIR_ENTRIES_MAX", 2)
+    d = tmp_path / "big"
+    d.mkdir()
+    for i in range(3):
+        (d / f"f{i}").write_text("x")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(Dir(str(d)),)), PanelPlan("b", inputs=(Dir(str(d)),), backstop_s=50.0)], backstop_s=30.0)
+    for _ in range(100):
+        loop.run_once(clock.t)
+        clock.t += 1
+    # first derive, then one per backstop: 30 s for a (t=30, 60, 90), 50 s for b (t=50)
+    assert len(writer.of("a")) == 1 + 3 and len(writer.of("b")) == 1 + 1
+    loop.stop()
+
+
+def test_none_fingerprint_does_not_rewake_the_loop_into_back_to_back_derives(tmp_path, monkeypatch):
+    monkeypatch.setattr(derive, "DIR_ENTRIES_MAX", 2)
+    d = tmp_path / "big"
+    d.mkdir()
+    for i in range(3):
+        (d / f"f{i}").write_text("x")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(Dir(str(d)),))], poll_s=0.01, backstop_s=1e9)
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: len(pubs) == 1)
+        deadline = time.monotonic() + WAIT
+        while len(writer.heartbeats) < 8 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(writer.heartbeats) >= 8
+    finally:
+        loop.stop()
+    assert len(writer.of("a")) == 1
 
 
 def test_heartbeat_and_ok_stream_each_poll(tmp_path):
@@ -527,7 +577,7 @@ def test_stream_last_event_moves_with_an_input(tmp_path):
     loop.run_once(clock.t)
     clock.t += 10
     loop.run_once(clock.t)
-    assert writer.streams[-1]["last_event_at"] == 1000.0
+    assert writer.streams[-1]["last_event_at"] is None  # nothing has moved yet
     f.write_text("changed")
     clock.t += 10
     loop.run_once(clock.t)
@@ -631,3 +681,295 @@ def test_loop_threads_publish_and_react_to_dirty():
         loop.stop()
     assert writer.of("a")[-1]["write_gen"] == 5
     assert writer.heartbeats
+
+
+# ------------------------------------------------------------------------------------------ L1/L2 round
+
+
+def test_per_plan_backstop():
+    loop, writer, clock, calls = make([PanelPlan("fast"), PanelPlan("heavy", heavy=True, backstop_s=300.0)], backstop_s=30.0)
+    settle(loop, clock)
+    clock.t += 30
+    assert loop.run_once(clock.t) == ["fast"]
+    clock.t = 1000.0 + 299
+    assert "heavy" not in loop.run_once(clock.t)
+    clock.t = 1000.0 + 300
+    assert "heavy" in loop.run_once(clock.t)
+    loop.stop()
+
+
+def test_input_moving_during_its_own_derive_derives_once_more(tmp_path):
+    f = tmp_path / "f"
+    f.write_text("1")
+    runs = []
+
+    def fn(pid):
+        runs.append(1)
+        if len(runs) == 1:
+            f.write_text("moved while deriving")
+        return ok(len(runs))
+
+    loop, writer, clock, _ = make([PanelPlan("a", inputs=(File(str(f)),))], fn=fn, backstop_s=1e9)
+    assert loop.run_once(clock.t) == ["a"]
+    assert loop.run_once(clock.t) == ["a"]
+    assert loop.run_once(clock.t) == []
+    assert len(runs) == 2
+    loop.stop()
+
+
+def test_index_lock_in_a_linked_worktree_holds_the_panel(repo, tmp_path):
+    wt = tmp_path / "wt"
+    git(repo, "worktree", "add", "-q", str(wt), "-b", "wtbranch")
+    gitdir = (wt / ".git").read_text().split("gitdir:", 1)[1].strip()
+    lock = os.path.join(gitdir, "index.lock")
+    open(lock, "w").close()
+    assert fingerprint(GitRefs(str(wt))) == "locked"
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(GitRefs(str(wt)),)), PanelPlan("b")])
+    assert loop.run_once(clock.t) == ["b"]
+    os.unlink(lock)
+    assert loop.run_once(clock.t) == ["a"]
+    loop.stop()
+
+
+def test_a_stale_index_lock_stops_holding_the_panel_and_degrades_the_stream(repo):
+    lock = repo / ".git" / "index.lock"
+    lock.write_text("")
+    old = time.time() - derive.LOCK_HOLD_MAX_S - 10
+    os.utime(lock, (old, old))
+    assert fingerprint(GitRefs(str(repo))).startswith(derive.STALE_LOCK + ":")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(GitRefs(str(repo)),))], backstop_s=1e9)
+    assert loop.run_once(clock.t) == ["a"]
+    stream = writer.streams[-1]
+    assert stream["state"] == "degraded" and "stale index.lock" in stream["detail"] and str(lock) in stream["detail"]
+    assert loop.run_once(clock.t) == []  # the lock is still there but the panel is not re-derived for it
+    git(repo, "update-ref", "refs/heads/side", "HEAD")  # a ref move: git commit itself would refuse under the lock
+    assert loop.run_once(clock.t) == ["a"]
+    loop.stop()
+
+
+def test_a_young_lock_past_the_hold_limit_in_the_fake_future_is_stale(repo, monkeypatch):
+    lock = repo / ".git" / "index.lock"
+    lock.write_text("")
+    assert fingerprint(GitRefs(str(repo))) == "locked"
+    monkeypatch.setattr(derive, "LOCK_HOLD_MAX_S", 0.0)
+    assert fingerprint(GitRefs(str(repo))).startswith(derive.STALE_LOCK)
+
+
+def test_a_hung_derive_publishes_timeout_once_keeps_busy_and_is_never_started_twice():
+    gate, entered = threading.Event(), threading.Event()
+    runs = []
+
+    def fn(pid):
+        runs.append(1)
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("late")
+
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=50.0)], fn=fn, poll_s=0.01, backstop_s=1.0)
+    loop.start()
+    try:
+        assert entered.wait(WAIT)
+        clock.t += 49
+        time.sleep(0.05)
+        assert writer.of("a") == []
+        clock.t += 2  # now past the deadline (also past the backstop, which must not start a second derive)
+        assert writer.wait_for(lambda pubs: any(p["status"] == "timeout" for p in pubs))
+        pub = writer.of("a")[0]
+        assert pub["status"] == "timeout" and pub["body"] is None and "still running" in pub["error"]
+        deadline = time.monotonic() + WAIT
+        while time.monotonic() < deadline and not (writer.streams and writer.streams[-1]["state"] == "degraded"):
+            time.sleep(0.005)
+        assert writer.streams[-1]["state"] == "degraded" and "a: derive timeout" in writer.streams[-1]["detail"]
+        time.sleep(0.1)
+        assert len(runs) == 1 and len(writer.of("a")) == 1  # one timeout publish, no second derive
+        gate.set()
+        assert writer.wait_for(lambda pubs: any(p["status"] == "ok" for p in pubs))  # the late result still lands
+    finally:
+        gate.set()
+        loop.stop()
+    assert loop._states["a"].busy is False
+
+
+def test_a_base_exception_in_derive_does_not_leave_the_panel_busy():
+    def fn(pid):
+        raise SystemExit("bye")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn)
+    with pytest.raises(SystemExit):
+        loop.run_once(clock.t)
+    assert loop._states["a"].busy is False
+    pub = writer.of("a")[0]
+    assert pub["status"] == "error" and pub["error"].startswith("SystemExit")
+    # in a worker thread the thread survives and the panel is derived again
+    loop.stop()
+
+
+def test_a_worker_thread_survives_a_system_exit_in_derive():
+    calls = []
+
+    def fn(pid):
+        calls.append(1)
+        if len(calls) == 1:
+            raise SystemExit("bye")
+        return ok("fine")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: len(pubs) >= 1)
+        loop.dirty(["a"], 1)
+        assert writer.wait_for(lambda pubs: any(p["status"] == "ok" for p in pubs))
+    finally:
+        loop.stop()
+
+
+def test_past_valid_until_is_published_as_no_expiry():
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: ok(valid_until=clock.t - 5), backstop_s=1e9)
+    settle(loop, clock)
+    assert writer.of("a")[0]["valid_until"] is None
+    loop.stop()
+
+
+def test_a_failed_publish_keeps_the_dirty_write_owed_and_degrades_the_stream():
+    loop, writer, clock, _ = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    real = writer.publish
+
+    def boom(*a, **k):
+        raise OSError("disk")
+
+    writer.publish = boom
+    loop.dirty(["a"], 6)
+    assert loop.run_once(clock.t) == ["a"]
+    loop.run_once(clock.t)
+    assert "OSError" in writer.streams[-1]["detail"] and writer.streams[-1]["state"] == "degraded"
+    writer.publish = real
+    assert loop.run_once(clock.t) == ["a"]  # the owed write derives again, still stamped
+    assert writer.of("a")[-1]["write_gen"] == 6
+    loop.run_once(clock.t)
+    assert writer.streams[-1]["state"] == "ok"
+    loop.stop()
+
+
+def test_an_exception_in_a_poll_does_not_end_the_poll_thread(monkeypatch):
+    loop, writer, clock, _ = make([PanelPlan("a")], poll_s=0.01)
+    real = loop._views
+    n = []
+
+    def flaky():
+        n.append(1)
+        if len(n) == 1:
+            raise RuntimeError("bad input")
+        return real()
+
+    monkeypatch.setattr(loop, "_views", flaky)
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: len(pubs) >= 1)
+    finally:
+        loop.stop()
+
+
+def test_token_unset_at_first_derive_then_a_value_is_a_move():
+    box = {"v": None}
+
+    def token_fn():
+        if box["v"] is None:
+            raise RuntimeError("no token yet")
+        return box["v"]
+
+    loop, writer, clock, calls = make([PanelPlan("a", on_token=True)], token_fn=token_fn, backstop_s=1e9)
+    settle(loop, clock)
+    box["v"] = 1
+    assert loop.run_once(clock.t) == ["a"]
+    assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_a_publish_racing_stop_lands_before_stop_returns(tmp_path):
+    w = snapshots.SnapshotWriter(tmp_path / snapshots.DB_FILENAME)
+    entered, gate = threading.Event(), threading.Event()
+
+    def fn(pid):
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok({"late": True})
+
+    loop = DeriveLoop(w, {"a": PanelPlan("a")}, fn, poll_s=0.01, threads=1)
+    loop.start()
+    assert entered.wait(WAIT)
+    stopper = threading.Thread(target=loop.stop)
+    stopper.start()
+    time.sleep(0.05)
+    assert stopper.is_alive()  # stop() waits for the running derive
+    gate.set()
+    stopper.join(WAIT * 2)
+    assert not stopper.is_alive()
+    w.close()  # the owner closes after stop(): nothing is publishing any more
+    snap = snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME).read("a")
+    assert snap is not None and snap.status == "ok" and loop.last_publish_error is None
+
+
+def test_restart_after_a_timed_out_stop_does_not_resume_the_old_threads():
+    gate, entered = threading.Event(), threading.Event()
+
+    def fn(pid):
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("x")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    before = set(derive_threads())
+    loop.start()
+    assert entered.wait(WAIT)
+    loop.stop(timeout=0.05)  # the worker is still inside the derive
+    loop.start()
+    gate.set()
+    assert writer.wait_for(lambda pubs: len(pubs) >= 1)
+    loop.stop()
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline and set(derive_threads()) - before:
+        time.sleep(0.01)
+    assert set(derive_threads()) - before == set()
+
+
+def test_unknown_input_detail_carries_the_failure_type(tmp_path, monkeypatch):
+    d = tmp_path / "d"
+    d.mkdir()
+    real = os.scandir
+
+    def deny(path):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(derive.os, "scandir", deny)
+    loop, writer, clock, _ = make([PanelPlan("a", inputs=(Dir(str(d)),))])
+    loop.run_once(clock.t)
+    assert "PermissionError" in writer.streams[-1]["detail"]
+    monkeypatch.setattr(derive.os, "scandir", real)
+    loop.stop()
+
+
+def test_sqlite_fingerprint_reopens_when_the_db_file_is_replaced(tmp_path):
+    path = tmp_path / "s.db"
+
+    def make_db(v):
+        c = sqlite3.connect(path)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE t(x)")
+        c.execute("INSERT INTO t VALUES (?)", (v,))
+        c.commit()
+        c.close()
+
+    make_db(1)
+    fp = derive._Fingerprinter()
+    try:
+        a = fp.fingerprint(Sqlite(str(path)))
+        held = fp._conns[str(path)][0]
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(str(path) + suffix):
+                os.unlink(str(path) + suffix)
+        make_db(2)
+        b = fp.fingerprint(Sqlite(str(path)))
+        assert b != a and fp._conns[str(path)][0] is not held
+    finally:
+        fp.close()

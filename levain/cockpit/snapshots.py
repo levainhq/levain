@@ -9,23 +9,31 @@ is the Python implementation of it. Stdlib only.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-CONTRACT = "levain-cockpit-snapshots/1"
+CONTRACT_NAME = "levain-cockpit-snapshots"
 CONTRACT_MAJOR = 1
+CONTRACT = f"{CONTRACT_NAME}/{CONTRACT_MAJOR}"
 DB_FILENAME = "snapshots.db"
+LOCK_SUFFIX = ".lock"
 DECODED_CACHE_MAX = 256
+# A reader's thread connection is checked against the file on disk (device and inode) at most this often.
+READER_REVALIDATE_S = 1.0
+# The wal file is truncated back to this size after a checkpoint (sqlite's journal_size_limit, bytes).
+JOURNAL_SIZE_LIMIT = 4 * 1024 * 1024
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS panel (
     id TEXT PRIMARY KEY,
     gen INTEGER NOT NULL,
@@ -57,9 +65,21 @@ class ContractMismatch(Exception):
     """The store carries a contract major this code does not speak."""
 
 
+class WriterLocked(Exception):
+    """Another process holds the snapshot store's writer lock."""
+
+
+class SnapshotReadError(Exception):
+    """A read failed for a reason other than "the worker has not run" (busy, locked, I/O)."""
+
+
 def encode_body(obj: Any) -> bytes:
-    """Canonical UTF-8 JSON: equal values give equal bytes, so equal `body_sha`."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    """Canonical JSON bytes: equal values give equal bytes, so equal `body_sha`.
+
+    Keys sorted, no whitespace, every non-ASCII character escaped (so a lone surrogate encodes instead of raising and
+    the bytes are plain ASCII), and NaN/Infinity refused with ValueError (they are not JSON).
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
 
 
 def _sha(body: bytes) -> str:
@@ -67,13 +87,16 @@ def _sha(body: bytes) -> str:
 
 
 def _check_contract(value: str | None) -> None:
-    """Raise ContractMismatch unless `value` names this code's contract major. None (no contract row yet) passes."""
+    """Raise ContractMismatch unless `value` names this code's contract and major. None (no contract row) passes."""
     if value is None:
         return
+    name, _, major_text = value.rpartition("/")
     try:
-        major = int(value.rsplit("/", 1)[1])
-    except (IndexError, ValueError):
+        major = int(major_text)
+    except ValueError:
         raise ContractMismatch(f"unreadable snapshot contract {value!r}") from None
+    if name != CONTRACT_NAME:
+        raise ContractMismatch(f"snapshot contract {value!r} is not {CONTRACT_NAME!r}")
     if major != CONTRACT_MAJOR:
         raise ContractMismatch(f"snapshot contract {value!r}: this code speaks major {CONTRACT_MAJOR}")
 
@@ -102,14 +125,27 @@ def _snap(row: tuple) -> PanelSnap:
 
 
 class SnapshotWriter:
-    """The one writer. Used from one thread at a time; the caller serialises its publishes."""
+    """The one writer. Used from one thread at a time; the caller serialises its publishes.
+
+    Holds an exclusive lock on `<path>.lock` for its lifetime (WriterLocked when another process has it).
+    """
 
     def __init__(self, path: str | os.PathLike, *, pid: int | None = None, now: float | None = None) -> None:
         self.path = os.fspath(path)
-        self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+        self._lock_fd = os.open(self.path + LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            self._db.execute("PRAGMA journal_mode=WAL")
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self._lock_fd)
+            raise WriterLocked(f"another process holds {self.path + LOCK_SUFFIX}") from None
+        self._db: sqlite3.Connection | None = None
+        try:
+            self._db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+            mode = self._db.execute("PRAGMA journal_mode=WAL").fetchone()
+            if mode is None or str(mode[0]).lower() != "wal":
+                raise sqlite3.OperationalError(f"journal_mode stayed {mode[0] if mode else None!r}, not wal")
             self._db.execute("PRAGMA synchronous=NORMAL")
+            self._db.execute(f"PRAGMA journal_size_limit={int(JOURNAL_SIZE_LIMIT)}")
             try:
                 row = self._db.execute("SELECT value FROM meta WHERE key='contract'").fetchone()
             except sqlite3.OperationalError:
@@ -121,8 +157,9 @@ class SnapshotWriter:
                 self._set_meta("contract", CONTRACT)
                 self._set_meta("worker_pid", str(os.getpid() if pid is None else pid))
                 self._set_meta("worker_started_at", repr(float(started)))
+                self._db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('publish_seq', '0')")
         except BaseException:
-            self._db.close()
+            self.close()
             raise
 
     def _tx(self):
@@ -136,7 +173,7 @@ class SnapshotWriter:
         panel_id: str,
         *,
         status: str,
-        body: bytes,
+        body: bytes | None,
         started_at: float,
         derived_at: float,
         duration_ms: float,
@@ -147,38 +184,79 @@ class SnapshotWriter:
     ) -> int:
         """Store one panel's snapshot in one transaction and return its gen.
 
-        An identical body and status keep gen (only the timing fields move); a changed body or status bumps it.
+        An identical body and status keep gen (only the timing fields move, the body is not rewritten); a changed body
+        or status bumps gen, and meta `publish_seq` goes up by one in the same transaction. `body=None` keeps the
+        stored body and changes only the other columns (a panel with no stored row then gets the body `null`).
         """
-        sha = _sha(body)
         with self._tx():
             row = self._db.execute(
                 "SELECT gen, body_sha, status, write_gen FROM panel WHERE id=?", (panel_id,)
             ).fetchone()
-            if row is None:
-                gen, wg = 1, write_gen
+            if body is None:
+                if row is None:
+                    body = encode_body(None)
+                    sha = _sha(body)
+                else:
+                    sha = row[1]
             else:
-                gen = row[0] if (row[1] == sha and row[2] == status) else row[0] + 1
+                sha = _sha(body)
+            if row is None:
+                gen, wg, changed = 1, write_gen, True
+            else:
+                changed = not (row[1] == sha and row[2] == status)
+                gen = row[0] + 1 if changed else row[0]
                 wg = max(row[3], write_gen)
-            self._db.execute(
-                f"INSERT OR REPLACE INTO panel({_PANEL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (panel_id, gen, derived_at, started_at, duration_ms, valid_until, inputs_fp, wg, status, error, sha,
-                 body),
-            )
+            if row is not None and row[1] == sha:
+                self._db.execute(
+                    "UPDATE panel SET gen=?, derived_at=?, started_at=?, duration_ms=?, valid_until=?, inputs_fp=?,"
+                    " write_gen=?, status=?, error=? WHERE id=?",
+                    (gen, derived_at, started_at, duration_ms, valid_until, inputs_fp, wg, status, error, panel_id),
+                )
+            else:
+                self._db.execute(
+                    f"INSERT OR REPLACE INTO panel({_PANEL_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (panel_id, gen, derived_at, started_at, duration_ms, valid_until, inputs_fp, wg, status, error,
+                     sha, body),
+                )
+            if changed:
+                self._db.execute(
+                    "INSERT INTO meta(key, value) VALUES ('publish_seq', '1')"
+                    " ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                )
         return gen
 
     def heartbeat(self, now: float) -> None:
         with self._tx():
             self._set_meta("heartbeat_at", repr(float(now)))
 
-    def set_stream(self, stream_id: str, *, state: str, last_event_at: float | None, detail: str = "") -> None:
+    def set_stream(self, stream_id: str, *, state: str, last_event_at: float | None, detail: str = "") -> bool:
+        """Write the stream row; True when it was written. An unchanged row is not rewritten.
+
+        "Unchanged" compares state, detail and last_event_at, so a stream that only repeats itself commits nothing.
+        """
+        row = self._db.execute(
+            "SELECT state, last_event_at, detail FROM stream WHERE id=?", (stream_id,)
+        ).fetchone()
+        if row == (state, last_event_at, detail):
+            return False
         with self._tx():
             self._db.execute(
                 "INSERT OR REPLACE INTO stream(id, state, last_event_at, detail) VALUES (?,?,?,?)",
                 (stream_id, state, last_event_at, detail),
             )
+        return True
 
     def close(self) -> None:
-        self._db.close()
+        if self._db is not None:
+            try:
+                self._db.close()
+            finally:
+                self._db = None
+        if self._lock_fd is not None:
+            try:
+                os.close(self._lock_fd)  # closing the descriptor drops the flock
+            finally:
+                self._lock_fd = None
 
 
 class _Tx:
@@ -189,101 +267,160 @@ class _Tx:
         self._db.execute("BEGIN IMMEDIATE")
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self._db.execute("ROLLBACK" if exc_type else "COMMIT")
+        if exc_type:
+            self._db.execute("ROLLBACK")
+            return
+        try:
+            self._db.execute("COMMIT")
+        except BaseException:
+            try:
+                self._db.execute("ROLLBACK")  # a failed COMMIT leaves the transaction open
+            except sqlite3.Error:
+                pass
+            raise
+
+
+def _absent(exc: sqlite3.Error) -> bool:
+    return "no such table" in str(exc)
+
+
+def _uri(path: str) -> str:
+    abspath = os.path.abspath(path)
+    if abspath.startswith("//"):
+        abspath = "/" + abspath.lstrip("/")  # a leading // would parse as a URI authority
+    return "file:" + urllib.parse.quote(abspath, safe="/") + "?mode=ro"
 
 
 class SnapshotReader:
-    """A read-only view, one connection per thread. A missing file answers None / {} (the worker has not run)."""
+    """A read-only view, one connection per thread. A missing file answers None / {} (the worker has not run).
+
+    The connection a thread holds is checked against the file on disk (see READER_REVALIDATE_S) and reopened when the
+    file was replaced. Only an absent file or table reads as "not there"; any other sqlite failure raises
+    SnapshotReadError.
+    """
 
     def __init__(self, path: str | os.PathLike) -> None:
         self.path = os.fspath(path)
         self._local = threading.local()
-        self._cache: OrderedDict[tuple[str, int], Any] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int, str], Any] = OrderedDict()
         self._cache_lock = threading.Lock()
 
     def _conn(self) -> sqlite3.Connection | None:
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            return conn
-        if not os.path.exists(self.path):
+        now = time.monotonic()
+        slot = getattr(self._local, "slot", None)  # (conn, st_dev, st_ino, checked_at)
+        if slot is not None and now - slot[3] < READER_REVALIDATE_S:
+            return slot[0]
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            self.close()
             return None
-        uri = "file:" + self.path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=5.0)
-        self._local.conn = conn
+        if slot is not None:
+            if (st.st_dev, st.st_ino) == (slot[1], slot[2]):
+                self._local.slot = (slot[0], slot[1], slot[2], now)
+                return slot[0]
+            self.close()
+        try:
+            conn = sqlite3.connect(_uri(self.path), uri=True, isolation_level=None, timeout=5.0)
+        except sqlite3.OperationalError as exc:
+            if not os.path.exists(self.path):
+                return None
+            raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
+        self._local.slot = (conn, st.st_dev, st.st_ino, now)
         return conn
 
-    def _meta_on(self, conn: sqlite3.Connection) -> dict[str, str]:
+    def close(self) -> None:
+        """Close this thread's connection (a later call on this thread opens a new one)."""
+        slot = getattr(self._local, "slot", None)
+        self._local.slot = None
+        if slot is not None:
+            try:
+                slot[0].close()
+            except sqlite3.Error:
+                pass
+
+    def _read(self, work: Callable[[sqlite3.Connection, dict[str, str]], Any], empty: Callable[[], Any]) -> Any:
+        """Run `work(conn, meta)` in one read transaction; `empty()` when the file, a table or the contract row is absent."""
+        conn = self._conn()
+        if conn is None:
+            return empty()
         try:
-            meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
-        except sqlite3.OperationalError:
-            return {}  # a file with no schema yet
-        _check_contract(meta.get("contract"))
-        return meta
+            conn.execute("BEGIN")
+            try:
+                try:
+                    meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
+                    _check_contract(meta.get("contract"))
+                    if "contract" not in meta:
+                        return empty()
+                    return work(conn, meta)
+                except sqlite3.OperationalError as exc:
+                    if _absent(exc):
+                        return empty()
+                    raise
+            finally:
+                try:
+                    conn.execute("COMMIT")
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+        except sqlite3.Error as exc:
+            raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
 
     def data_version(self) -> int:
-        """`PRAGMA data_version` on this thread's connection; 0 while the file is absent."""
+        """`PRAGMA data_version` on this thread's connection; 0 while the file is absent.
+
+        It moves when another connection commits anything, heartbeats included: it is a "the file changed" gate, not a
+        "a panel changed" signal (that is meta `publish_seq`).
+        """
         conn = self._conn()
         if conn is None:
             return 0
-        return int(conn.execute("PRAGMA data_version").fetchone()[0])
+        try:
+            return int(conn.execute("PRAGMA data_version").fetchone()[0])
+        except sqlite3.Error as exc:
+            raise SnapshotReadError(f"{type(exc).__name__}: {exc}") from exc
 
     def read(self, panel_id: str) -> PanelSnap | None:
-        conn = self._conn()
-        if conn is None:
-            return None
-        conn.execute("BEGIN")
-        try:
-            self._meta_on(conn)
-            try:
-                row = conn.execute(f"SELECT {_PANEL_COLS} FROM panel WHERE id=?", (panel_id,)).fetchone()
-            except sqlite3.OperationalError:
-                return None
-        finally:
-            conn.execute("COMMIT")
-        return _snap(row) if row else None
+        def work(conn, meta):
+            row = conn.execute(f"SELECT {_PANEL_COLS} FROM panel WHERE id=?", (panel_id,)).fetchone()
+            return _snap(row) if row else None
+
+        return self._read(work, lambda: None)
 
     def read_all(self) -> dict[str, PanelSnap]:
         """Every panel from one read transaction, so all rows come from one end-mark."""
-        conn = self._conn()
-        if conn is None:
-            return {}
-        conn.execute("BEGIN")
-        try:
-            self._meta_on(conn)
-            try:
-                rows = conn.execute(f"SELECT {_PANEL_COLS} FROM panel").fetchall()
-            except sqlite3.OperationalError:
-                return {}
-        finally:
-            conn.execute("COMMIT")
-        return {r[0]: _snap(r) for r in rows}
+
+        def work(conn, meta):
+            return {r[0]: _snap(r) for r in conn.execute(f"SELECT {_PANEL_COLS} FROM panel").fetchall()}
+
+        return self._read(work, dict)
+
+    def read_manifest(self) -> tuple[dict[str, str], dict[str, PanelSnap]]:
+        """(meta, every panel) from one read transaction: `publish_seq` and the panels' gens agree."""
+
+        def work(conn, meta):
+            return dict(meta), {r[0]: _snap(r) for r in conn.execute(f"SELECT {_PANEL_COLS} FROM panel").fetchall()}
+
+        return self._read(work, lambda: ({}, {}))
 
     def meta(self) -> dict[str, str]:
-        conn = self._conn()
-        if conn is None:
-            return {}
-        conn.execute("BEGIN")
-        try:
-            return self._meta_on(conn)
-        finally:
-            conn.execute("COMMIT")
+        return self._read(lambda conn, meta: dict(meta), dict)
 
     def streams(self) -> dict[str, dict]:
-        conn = self._conn()
-        if conn is None:
-            return {}
-        try:
+        def work(conn, meta):
             rows = conn.execute("SELECT id, state, last_event_at, detail FROM stream").fetchall()
-        except sqlite3.OperationalError:
-            return {}
-        return {r[0]: {"state": r[1], "last_event_at": r[2], "detail": r[3]} for r in rows}
+            return {r[0]: {"state": r[1], "last_event_at": r[2], "detail": r[3]} for r in rows}
+
+        return self._read(work, dict)
 
     def decoded(self, snap: PanelSnap) -> Any:
-        """`json.loads(snap.body)`, cached by (id, gen) in a bounded LRU (DECODED_CACHE_MAX).
+        """`json.loads(snap.body)`, cached by (id, gen, body_sha) in a bounded LRU (DECODED_CACHE_MAX).
 
         The cached object is shared between callers: treat it as read-only.
         """
-        key = (snap.id, snap.gen)
+        key = (snap.id, snap.gen, snap.body_sha)
         with self._cache_lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
