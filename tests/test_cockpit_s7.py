@@ -13,7 +13,6 @@ from tests.test_cockpit_activity import _session
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
-from tests.test_cockpit_k7_build import RETIRED_BUILD
 
 TODAY = date(2026, 10, 20)
 
@@ -95,32 +94,6 @@ def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     got = _begin()
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got and "overnight" not in got
     assert got["title"] == "Where to begin" and got["source"]
-
-
-@RETIRED_BUILD      # guarded the Build tab's compact Activity strip (the Event graph at ~85 px, header "Activity")
-@needs_browser
-def test_build_draws_the_activity_band_as_the_compact_strip_and_board_the_full_chart(tmp_path: Path) -> None:
-    _root, src, _ids = _install(tmp_path)
-    # the header lens draws when the topology holds something; a key-absent intention was a task there, and is a List row now,
-    # so the install holds one live session for the graph to draw
-    _session(_root, "s-a", str(tmp_path), timedelta(minutes=3))
-    probe = ("JSON.stringify({h: document.querySelector('.skycard').getBoundingClientRect().height,"
-             " head: (document.querySelector('.sky-head-title') || {}).textContent || null,"
-             " canvas: document.querySelector('.sky-canvas').getBoundingClientRect().height,"
-             " win: (document.querySelector('.sky-head-win') || {}).textContent || null,"
-             " legend: getComputedStyle(document.querySelector('.skycard .ck-legend') || document.body).display})")
-    shown = {}
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        for tab in ("build", "board"):
-            # K11 (ab3e3d36): the header's cold-open lens is the Agents graph and the Activity band is its Event graph lens, so the
-            # band is looked at on that lens
-            shown[tab] = json.loads(_drive(tmp_path, f"{url}/#write_token=T&{tab}", [DESKTOP,
-                {"until": "document.querySelector('#ck-hlens [data-tv=events]')"}, {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"},
-                {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events' && document.querySelector('.sky-canvas')"}, {"eval": probe}])["values"][-1])
-    b, d = shown["build"], shown["board"]
-    assert b["head"] == "Activity" and b["win"] == "last 14 h" and b["legend"] == "none", b
-    assert b["canvas"] < 100 and b["h"] < 160, b                       # the mock's band is ~85 px
-    assert d["head"] is None and d["canvas"] >= 160 and d["h"] > b["h"] + 100, d   # Board keeps its full chart
 
 
 @needs_browser

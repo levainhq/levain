@@ -6,13 +6,9 @@ import copy
 import json
 from typing import Any
 
-import pytest
-
-from levain.cockpit import Cockpit, ProviderSpec, Read
-from levain.cockpit.results import Fault
-from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _paint, _run, _intention, _value
+from tests.test_cockpit_f12b_topology_view import NARROW, TV, _paint, _run, _value
 from tests.test_cockpit_flip_parity import needs_browser
-from tests.test_cockpit_k7_build import DESKTOP, RETIRED_BUILD, _sessions_fixture
+from tests.test_cockpit_k7_build import _sessions_fixture
 from tests.test_cockpit_topology import _good, _panel
 
 
@@ -52,23 +48,6 @@ def test_a_node_with_work_to_lose_carries_an_at_risk_mark_in_both_lenses_and_unk
 # --- codex MED + complement MED-2: a faulted provider hidden -------------------------------------------------
 
 
-@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
-@needs_browser
-def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_either_view(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    import levain.cockpit.topology as topo
-    monkeypatch.setattr(topo, "topology_reader", lambda **kw: (lambda ctx: Fault("the session records are gone")))
-    probe = ("JSON.stringify({line: [...document.querySelectorAll('#ck-hlens .k7-none.err, #ck-hlens .tv-fault')].map(n => n.textContent), "
-             "rows: document.querySelectorAll('#k7-sessions .k7-srow').length})")
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": probe}], first=MID, until=CARD)
-    got = json.loads(out[-1])
-    assert any("Topology unavailable: " in t and "the session records are gone" in t for t in got["line"]), got   # the list view, not only topology
-    assert got["rows"] == 3, got                                                                                  # the list still draws
-    panel = ("(() => { const p = document.querySelector('[data-ck-panel=\"topology\"]'); return p ? getComputedStyle(p).display : 'absent'; })()")
-    out = _run(tmp_path, src, [{"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": "new Promise(r => setTimeout(r, 600))"}, {"eval": panel}], first=MID, until=CARD)
-    assert out[-1] != "none", out                                                                                  # a faulted panel is not hidden by a broad selector
-
-
 # --- codex MED: a waiting task with no card ------------------------------------------------------------------
 
 
@@ -89,21 +68,6 @@ def test_a_waiting_task_with_no_card_is_never_listed_and_no_header_counts_it(tmp
 
 
 # --- codex MED + glm LOW + complement 7: one ResizeObserver --------------------------------------------------
-
-
-@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
-@needs_browser
-def test_a_second_render_leaves_one_live_resize_observer_not_two(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    js = ("(() => { const Real = window.ResizeObserver; const made = [];"
-          "window.ResizeObserver = class { constructor(cb) { this.r = new Real(cb); this.live = false; made.push(this); }"
-          "  observe(n) { this.live = true; this.r.observe(n); } disconnect() { this.live = false; this.r.disconnect(); } };"
-          "const c = document.querySelector('#k7-sessions .k7-card'); const v = %s;"
-          "for (let i = 0; i < 3; i++) { for (const o of c.querySelectorAll('.tv')) o.remove(); c.appendChild(window.LevainTopologyView.render(v, {})); }"
-          "const live = made.filter(m => m.live).length; window.ResizeObserver = Real; return JSON.stringify({made: made.length, live}); })()") % json.dumps(_value())
-    out = _run(tmp_path, src, [{"eval": js}])
-    got = json.loads(out[-1])
-    assert got["made"] >= 1 and got["live"] == 1, got
 
 
 # --- codex MED: parent cycles --------------------------------------------------------------------------------
@@ -128,21 +92,6 @@ def test_the_provider_value_is_refused_when_parents_form_a_cycle():
 
 
 # --- complement MED-1: a throw kills the card ----------------------------------------------------------------
-
-
-@RETIRED_BUILD      # guarded the topology renderer as the Build Sessions card drew it (#k7-sessions)
-@needs_browser
-def test_a_renderer_that_throws_leaves_the_list_and_one_line_not_a_dead_card(tmp_path, monkeypatch):
-    root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _intention(root)
-    probe = ("JSON.stringify({rows: document.querySelectorAll('#k7-sessions .k7-srow').length, tv: !!%s, "
-             "text: document.querySelector('#ck-hlens').innerText.replace(/\\s+/g, ' ')})") % TV
-    out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-                               {"until": TV + ".querySelector('.tv-task')"},
-                               {"eval": "window.LevainTopologyView.render = () => { throw new Error('boom'); }; document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"},
-                               {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}])
-    got = json.loads(out[-1])
-    assert got["tv"] is False and got["rows"] == 3 and "topology could not be drawn" in got["text"], got
 
 
 # --- complement MED-3: the signature carries only what is drawn ---------------------------------------------

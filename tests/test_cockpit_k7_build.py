@@ -5,13 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
 
 from levain.cockpit.providers import build_default_cockpit
 from levain.consent.listing import read_listing
@@ -21,8 +19,6 @@ from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _fixture, _put, _stamp
 from tests._h4 import h4_home
 
-RETIRED_BUILD = pytest.mark.skip(reason="the Build mode is retired (levain#141): a stored mode, hash or jump that names it lands on Home, so the view this test drives "
-                                 "is not reachable; it goes with the Build painters")
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 BUILD = "#write_token=T&build"
 ROWS = "[...document.querySelectorAll('#k7-sessions .k7-srow')]"
@@ -248,92 +244,6 @@ def test_a_list_row_carries_its_age_as_the_integer_the_kernel_sends_not_the_badg
 # --- the page ----------------------------------------------------------------------------------------
 
 
-@RETIRED_BUILD
-@needs_browser
-def test_build_draws_sessions_large_with_who_what_context_and_since(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify({head: document.querySelector('#k7-sessions .k7-card-h').innerText.replace(/\\s+/g, ' '), "
-             "gloss: document.querySelector('#k7-sessions .k7-head').innerText.replace(/\\s+/g, ' '), "
-             "rows: " + ROWS + ".map(r => ({live: r.classList.contains('live'), waiting: r.classList.contains('waiting'), agent: r.querySelector('.k7-agent').textContent, "
-             "repo: (r.querySelector('.k7-repo') || {}).textContent, cwd: r.querySelector('.k7-cwd').textContent, said: r.querySelector('.k7-tool').textContent, "
-             "meter: r.querySelector('.k7-meter-v').textContent, fill: r.querySelector('.k7-bar > i').style.width, when: r.querySelector('.k7-when').textContent}))})")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
-    got = json.loads(out[-1])
-    assert got["head"].startswith("Sessions 3 2 live · 1 quiet"), got
-    assert "Who is working right now, and how much room they have left." in got["gloss"], got
-    by = {r["agent"] + ("-" + ("live" if r["live"] else "quiet")): r for r in got["rows"]}
-    cx, cc, q = by["codex-live"], by["claude_code-live"], by["claude_code-quiet"]
-    assert re.fullmatch(r"Edit money\.py · \d+ s ago", cx["said"]), cx
-    assert cx["meter"] == "25%" and cx["fill"] == "25%" and not cx["waiting"], cx     # 62K of Codex's 248K window
-    assert cc["waiting"] and cc["said"] == "waiting on a decision (Bash)" and cc["meter"] == "124K of 200K warn" and cc["fill"] == "62%", cc
-    assert q["said"].startswith("last hook ") and q["meter"] == "not read" and q["when"].startswith("last active "), q
-    assert cx["when"].startswith("since ") and cx["repo"] == "codex-work" and cx["cwd"] == "/…/codex-work", cx
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_a_session_at_the_warn_line_is_marked_over_for_both_agents_and_the_label_says_what_it_is_measured_against(tmp_path, monkeypatch):
-    root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _put(root, "claude_code", SID_CC, str(tmp_path / "work"), timedelta(minutes=3), transcript=_claude_tx(tmp_path, "cc2", 210_000))
-    _put(root, "codex", SID_CX, CWD_CX, timedelta(seconds=20), transcript=_codex_tx(tmp_path, "cx2", 210_000, 258_000))
-    probe = ("JSON.stringify(" + ROWS + ".map(r => [r.querySelector('.k7-agent').textContent, r.querySelector('.k7-meter').classList.contains('over'), "
-             "(r.querySelector('.k7-over') || {textContent: ''}).textContent, r.querySelector('.k7-meter-v').textContent]))")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
-    got = json.loads(out[-1])
-    cx = [r for r in got if r[0] == "codex"][0]
-    cc = [r for r in got if r[0] == "claude_code" and r[1]][0]                   # the live Claude Code row (the quiet one reads nothing)
-    assert cx[1:] == [True, "OVER", "81%"], got                                  # 210K of a 258K window, past the 200K warn line
-    assert cc[1:3] == [True, "OVER"] and cc[3] == "210K of 200K warn", got
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_a_quiet_session_with_a_pending_request_shows_waiting_and_two_pending_say_so(tmp_path, monkeypatch):
-    root, src = _sessions_fixture(tmp_path, monkeypatch)
-    home = tmp_path / "levain_home"
-    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
-    q.file(agent="claude_code", agent_session_id=SID_Q, tool_name="Edit", tool_input={}, cwd=CWD_CC, hold=timedelta(minutes=5), event_id="eq1")
-    q.file(agent="claude_code", agent_session_id=SID_CC, tool_name="Write", tool_input={}, cwd=CWD_CC, hold=timedelta(minutes=5), event_id="e9")
-    probe = "JSON.stringify(" + ROWS + ".map(r => [r.classList.contains('live'), r.classList.contains('waiting'), r.querySelector('.k7-tool').textContent]))"
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"]
-    rows = json.loads(out[-1])
-    assert [False, True, "waiting on a decision (Edit)"] in rows, rows         # quiet, and it still waits
-    assert [True, True, "waiting on a decision (Write +1)"] in rows, rows       # two pending: the newest, and one more
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_a_present_limits_panel_that_cannot_be_read_draws_not_counting_on_every_row(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-
-    def boom(_q):
-        raise RuntimeError("limits store unreadable")
-    _limits_module(monkeypatch, boom)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
-                     {"eval": "JSON.stringify([...document.querySelectorAll('#k7-sessions .k7-limits')].map(l => [l.textContent, l.className]))"}])["values"]
-    assert json.loads(out[-1]) == [["limits: not counting", "k7-limits over"]] * 3
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_a_tick_moves_the_ago_words_in_place_and_keeps_the_focus_on_all_details(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify({focus: document.activeElement && document.activeElement.className, "
-             "ago: [...document.querySelectorAll('#k7-sessions .k7-tool[data-k7-at]')].map(t => t.textContent)})")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [
-            DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"},   # the list is up before the focus is placed
-            {"eval": "document.querySelector('#k7-sessions .k7-open').focus(); 1"}, {"eval": probe},
-            {"eval": "new Promise(r => setTimeout(r, 7000))"}, {"eval": probe}])["values"]
-    before, after = json.loads(out[-3]), json.loads(out[-1])
-    assert before["focus"] == after["focus"] == "k7-open", (before, after)       # focus survives a tick longer than the old 5 s repaint
-    assert before["ago"] != after["ago"], (before, after)                         # ...and the "N s ago" words still moved
-
-
 @needs_browser
 def test_the_no_results_placeholder_goes_when_a_jobs_panel_appears(tmp_path, monkeypatch):
     """The placeholder is drawn while no jobs panel exists; the moment one is on the page (a job store that appears while the
@@ -346,59 +256,6 @@ def test_the_no_results_placeholder_goes_when_a_jobs_panel_appears(tmp_path, mon
         out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('.k7-results-none')"}, {"eval": count},
                      {"eval": add}, {"eval": "new Promise(r => setTimeout(r, 2500))"}, {"eval": count}])["values"]
     assert (out[-4], out[-1]) == (1, 0), out
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_the_limits_line_is_drawn_amber_over_and_red_not_counting(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    m = lambda status, value: {"key": "calls", "label": "tool calls", "value": value, "limit": 500, "status": status}  # noqa: E731
-    _limits_module(monkeypatch, {"as_of": "x", "sessions": [
-        {"agent": "claude_code", "session": SID_CC, "halted": None, "counting": True, "metrics": [m("amber", 412)]},
-        {"agent": "codex", "session": SID_CX, "halted": None, "counting": False, "metrics": []},
-        {"agent": "claude_code", "session": "zq-session-id-q-8814", "counting": True, "halted": {"kind": "tool calls"}, "metrics": []}]})
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-limits')"},
-                     {"eval": "JSON.stringify([...document.querySelectorAll('#k7-sessions .k7-limits')].map(l => [l.textContent, l.className]))"}])["values"]
-    assert sorted(json.loads(out[-1])) == [["halted: tool calls", "k7-limits over"], ["limits: not counting", "k7-limits over"],
-                                           ["tool calls 412/500", "k7-limits amber"]]
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_without_the_limits_panel_the_page_draws_no_limits_line(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    monkeypatch.setitem(sys.modules, "levain.consent.limits", None)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, LIST_VIEW, {"until": "document.querySelector('#k7-sessions .k7-srow')"},
-                     {"eval": "JSON.stringify([document.querySelectorAll('#k7-sessions .k7-srow').length, document.querySelectorAll('#k7-sessions .k7-limits').length])"}])["values"]
-    assert json.loads(out[-1]) == [3, 0]                 # the three rows are drawn, none carries a limits line
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_sessions_stays_a_count_tile_on_morning_and_is_not_one_on_build(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    tile = "[...document.querySelectorAll('.ck-widgets .ck-card.w')].find(c => /^Sessions/i.test(c.innerText))"
-    probe = (f"JSON.stringify({{tile: !!{tile}, tileShown: getComputedStyle({tile}).display !== 'none', "
-             "big: document.getElementById('k7-sessions') && getComputedStyle(document.getElementById('k7-sessions')).display})")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        morning = _drive(tmp_path, f"{url}/#write_token=T&morning", [DESKTOP, {"until": tile}, {"eval": probe}])["values"][-1]
-        build = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": tile}, {"until": "document.querySelector('#k7-sessions .k7-srow')"}, {"eval": probe}])["values"][-1]
-    assert json.loads(morning) == {"tile": True, "tileShown": True, "big": "none"}, morning
-    assert json.loads(build) == {"tile": True, "tileShown": False, "big": "block"}, build
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_the_all_details_button_opens_the_full_list_behind_the_tile(tmp_path, monkeypatch):
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-open')"},
-                     {"eval": "document.querySelector('#k7-sessions .k7-open').click(); 1"},
-                     {"until": "document.getElementById('levain-modal')"},
-                     {"eval": "document.querySelectorAll('#levain-modal .sess-tx-btn').length"}])["values"]
-    assert out[-1] >= 3                                   # every session, each with its transcript button
 
 
 @needs_browser
@@ -425,52 +282,7 @@ def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, 
     assert not any("{" in r[1] for r in got["rows"]), got          # never the raw result body
 
 
-@RETIRED_BUILD
-@needs_browser
-def test_build_places_results_left_and_edits_right_and_the_open_loops_card_is_gone(tmp_path, monkeypatch):
-    from levain.jobs import JobRuntime, JobStore
-
-    root, src, _ids = _install(tmp_path)
-    store = JobStore(root / ".levain" / "jobs.json")
-    t = datetime.now(timezone.utc).isoformat()
-    store.create("j1", "consult review", t)
-    store.claim_running("j1", t)
-    store.finish("j1", "done", {"ok": True}, None, t)
-    probe = ("(() => { const r = (s) => { const e = document.querySelector(s); const b = e.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.width), Math.round(b.height)]; };"
-             "return JSON.stringify({jobs: r('[data-ck-panel=jobs]'), edits: r('[data-ck-panel=edits]'), loops: !!document.querySelector('[data-ck-panel=loops]'), "
-             "zone: document.querySelector('.ck-zone[data-zone=operate] .zone-head').innerText.replace(/\\s+/g, ' '), "
-             "edits_text: document.querySelector('[data-ck-panel=edits]').innerText}); })()")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", job_runtime=JobRuntime(store)) as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row')"},
-                     {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}])["values"]
-    g = json.loads(out[-1])
-    assert g["zone"].startswith("Results & edits") and "What the sessions produced." in g["zone"], g
-    assert g["loops"] is False, g                                                  # the loop fold: no Open loops card
-    assert g["jobs"][0] < g["edits"][0] and g["jobs"][1] == g["edits"][1], g       # Results is the left column, edits the right, on one row (no hole below edits)
-    assert abs(g["jobs"][2] - g["edits"][2]) <= 8, g                              # two halves
-    assert "Edits appear here once a session writes a file." in g["edits_text"], g
-
-
 # --- a bare install --------------------------------------------------------------------------------
-
-
-@RETIRED_BUILD
-@needs_browser
-def test_a_bare_install_says_one_line_per_section_and_draws_no_empty_card(tmp_path, monkeypatch):
-    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
-    _root, src, _ids = _install(tmp_path)
-    src.anneal.intentions_json.unlink(missing_ok=True)                  # K10: an open loop is work the Sessions card draws, so "bare" means no loop either
-    probe = ("JSON.stringify({sess: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' '), rows: document.querySelectorAll('#k7-sessions .k7-srow').length, "
-             "tabs: document.querySelectorAll('#k7-sessions .k7-srows').length, "
-             "results: (document.querySelector('.k7-results-none') || {innerText: ''}).innerText.replace(/\\s+/g, ' '), "
-             "zone: document.querySelector('.ck-zone[data-zone=operate] .zone-head').innerText.replace(/\\s+/g, ' ')})")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('#k7-sessions .k7-none')"}, {"eval": probe}])["values"]
-    g = json.loads(out[-1])
-    assert "No agent session yet: start Claude Code or Codex in a workspace." in g["sess"] and g["sess"].startswith("Sessions Who is working"), g
-    assert g["rows"] == 0 and g["tabs"] == 0, g
-    assert "No results yet" in g["results"], g
-    assert g["zone"].startswith("Results & edits"), g
 
 
 def test_results_list_newest_finish_first_even_when_the_store_orders_by_filing(tmp_path, monkeypatch):
