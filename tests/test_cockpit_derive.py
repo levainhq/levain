@@ -856,11 +856,11 @@ def test_an_exception_in_a_poll_does_not_end_the_poll_thread(monkeypatch):
     real = loop._views
     n = []
 
-    def flaky():
+    def flaky(*args):
         n.append(1)
         if len(n) == 1:
             raise RuntimeError("bad input")
-        return real()
+        return real(*args)
 
     monkeypatch.setattr(loop, "_views", flaky)
     loop.start()
@@ -1165,7 +1165,7 @@ def test_a_pending_publish_error_clears_when_the_panel_no_longer_owes_one(tmp_pa
     assert "publish:a" in loop._write_errors and loop.last_publish_error is not None
     f.write_text("1")  # the input goes back to what the store already reflects
     st = loop._states["a"]
-    st.inputs_fp = loop._views()[0]["a"].fp
+    st.inputs_fp = loop._views(loop._plans)[0]["a"].fp
     loop._evaluate(clock.t)
     assert not loop._write_errors and loop.last_publish_error is None
     assert writer.streams[-1]["state"] == "ok"  # the same poll that pruned it wrote the stream clean
@@ -1365,4 +1365,535 @@ def test_a_panel_publish_success_does_not_clear_a_failing_stream_write(tmp_path)
     loop._evaluate(clock.t)  # the stream write lands now
     loop._evaluate(clock.t)
     assert not loop._write_errors and writer.streams[-1]["state"] == "ok"
+    loop.stop()
+
+
+# ------------------------------------------------------------------------------------------ a dynamic plan set
+
+
+def _wait_until(pred, timeout=WAIT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+def test_set_plans_adds_a_panel_that_derives_on_the_next_run():
+    loop, writer, clock, calls = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    loop.set_plans([PanelPlan("a"), PanelPlan("b")])
+    assert loop.run_once(clock.t) == ["b"]
+    assert calls == ["a", "b"]
+    loop.stop()
+
+
+def test_set_plans_keeps_the_history_of_a_changed_plan_and_derives_again_only_when_its_inputs_changed(tmp_path):
+    f, g = tmp_path / "f", tmp_path / "g"
+    f.write_text("1")
+    g.write_text("1")
+    loop, writer, clock, calls = make([PanelPlan("a", inputs=(File(str(f)),))], backstop_s=1e9)
+    settle(loop, clock)
+    # cadence, flags and the timeout change; the inputs are equal: the fingerprint it derived from still holds
+    loop.set_plans([PanelPlan("a", inputs=(File(str(f)),), every_s=500.0, heavy=True, on_token=True, timeout_s=7.0)])
+    assert loop.run_once(clock.t) == []
+    assert loop._plans["a"].every_s == 500.0
+    clock.t += 500
+    assert loop.run_once(clock.t) == ["a"]  # the new cadence is the one in force
+    # other inputs: a different fingerprint, so it derives again
+    loop.set_plans([PanelPlan("a", inputs=(File(str(g)),), every_s=500.0)])
+    assert loop.run_once(clock.t) == ["a"]
+    assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_set_plans_keeps_a_dirty_mark_across_a_plan_change():
+    loop, writer, clock, calls = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    loop.dirty(["a"], 6)
+    loop.set_plans([PanelPlan("a", every_s=1e9)])
+    assert loop.run_once(clock.t) == ["a"]
+    assert writer.of("a")[-1]["write_gen"] == 6
+    loop.stop()
+
+
+def test_set_plans_retires_the_ids_it_leaves_out():
+    loop, writer, clock, calls = make([PanelPlan("a"), PanelPlan("b")], backstop_s=30.0)
+    settle(loop, clock)
+    loop.set_plans([PanelPlan("a")])
+    assert "b" not in loop._states and "b" not in loop._plans
+    loop.dirty(["b"], 3)  # no longer a panel of the loop: ignored
+    clock.t += 31
+    assert loop.run_once(clock.t) == ["a"]
+    assert len(writer.of("b")) == 1
+    assert not loop.pending("b") and loop.deriving() == []
+    loop.stop()
+
+
+def test_retire_of_an_unknown_id_is_a_no_op_and_a_duplicate_id_in_set_plans_raises():
+    loop, writer, clock, calls = make([PanelPlan("a")], backstop_s=1e9)
+    settle(loop, clock)
+    loop.retire("nope")
+    with pytest.raises(ValueError):
+        loop.set_plans([PanelPlan("a"), PanelPlan("a", every_s=5.0)])
+    assert loop._plans["a"].every_s is None  # the failed call changed nothing
+    assert loop.run_once(clock.t) == []
+    loop.stop()
+
+
+def test_set_plans_before_start_then_the_loop_derives_exactly_that_set():
+    loop, writer, clock, calls = make([])
+    loop.set_plans([PanelPlan("a"), PanelPlan("b")])
+    loop.set_plans([PanelPlan("b"), PanelPlan("c")])
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: {"b", "c"} <= {p["id"] for p in pubs})
+    finally:
+        loop.stop()
+    assert {p["id"] for p in writer.publishes} == {"b", "c"}
+
+
+def test_a_derive_running_when_its_panel_is_retired_finishes_but_is_never_published(tmp_path):
+    w = snapshots.SnapshotWriter(tmp_path / snapshots.DB_FILENAME)
+    reader = snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME)
+    gate, entered, returned = threading.Event(), threading.Event(), threading.Event()
+    n = []
+
+    def fn(pid):
+        n.append(1)
+        if len(n) == 2:
+            entered.set()
+            assert gate.wait(WAIT * 4)
+            returned.set()
+        return ok({"n": len(n)})
+
+    loop = DeriveLoop(w, {"a": PanelPlan("a")}, fn, poll_s=0.01, threads=2, backstop_s=1e9)
+    loop.start()
+    try:
+        assert _wait_until(lambda: reader.read("a") is not None)
+        assert reader.read("a").gen == 1
+        loop.dirty(["a"], 5)
+        assert entered.wait(WAIT)
+        assert loop.pending("a")
+        loop.retire("a")  # does not wait for the running derive
+        assert not loop.pending("a") and loop.deriving() == []
+        gate.set()
+        assert returned.wait(WAIT)
+    finally:
+        gate.set()
+        loop.stop()
+    snap = reader.read("a")
+    assert snap.gen == 1 and snap.write_gen == 0 and snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME).decoded(snap) == {"n": 1}
+    assert loop.last_publish_error is None
+    w.close()
+
+
+def test_a_retired_derive_never_publishes_a_timeout_either():
+    gate, entered = threading.Event(), threading.Event()
+
+    def fn(pid):
+        entered.set()
+        assert gate.wait(WAIT * 4)
+        return ok("late")
+
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=50.0)], fn=fn, poll_s=0.01, backstop_s=1e9)
+    loop.start()
+    try:
+        assert entered.wait(WAIT)
+        loop.retire("a")
+        clock.t += 100  # past the deadline of the derive that is still running
+        time.sleep(0.1)
+        gate.set()
+    finally:
+        gate.set()
+        loop.stop()
+    assert writer.of("a") == []
+    assert loop.last_publish_error is None
+
+
+def test_a_job_queued_for_a_panel_that_is_retired_is_dropped():
+    gate = threading.Event()
+    calls = []
+
+    def fn(pid):
+        calls.append(pid)
+        if pid == "a":
+            assert gate.wait(WAIT * 4)
+        return ok(pid)
+
+    # one worker: "a" (first by id) holds it while "z" waits in the queue
+    loop, writer, clock, _ = make([PanelPlan("a"), PanelPlan("z")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9)
+    loop.start()
+    try:
+        assert _wait_until(lambda: loop.deriving() == ["a", "z"])
+        loop.retire("z")
+        assert loop.deriving() == ["a"]
+        gate.set()
+        assert writer.wait_for(lambda pubs: any(p["id"] == "a" for p in pubs))
+        time.sleep(0.1)
+    finally:
+        gate.set()
+        loop.stop()
+    assert calls == ["a"] and writer.of("z") == []
+
+
+def test_a_retired_panel_added_back_is_not_derived_while_its_old_derive_still_runs():
+    gate, entered = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active, peak, n = [0], [0], [0]
+
+    def fn(pid):
+        with lock:
+            n[0] += 1
+            mine = n[0]
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            if mine == 1:
+                entered.set()
+                assert gate.wait(WAIT * 4)
+            return ok({"call": mine})
+        finally:
+            with lock:
+                active[0] -= 1
+
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=fn, poll_s=0.01, threads=3, backstop_s=1e9)
+    loop.start()
+    try:
+        assert entered.wait(WAIT)
+        loop.retire("a")
+        loop.set_plans([PanelPlan("a")])
+        time.sleep(0.15)  # polls pass: the added-back panel is held while the old derive runs
+        assert n[0] == 1 and writer.of("a") == []
+        gate.set()
+        assert writer.wait_for(lambda pubs: len([p for p in pubs if p["id"] == "a"]) >= 1)
+    finally:
+        gate.set()
+        loop.stop()
+    assert peak[0] == 1
+    assert [json.loads(p["body"]) for p in writer.of("a")] == [{"call": 2}]  # the old result was discarded
+
+
+def test_deriving_and_pending_name_the_queued_and_running_panels_and_hand_out_copies():
+    gate = threading.Event()
+
+    def fn(pid):
+        if pid == "a":
+            assert gate.wait(WAIT * 4)
+        return ok(pid)
+
+    loop, writer, clock, _ = make([PanelPlan("a"), PanelPlan("m"), PanelPlan("z")], fn=fn, poll_s=0.01, threads=1,
+                                  backstop_s=1e9)
+    assert loop.deriving() == [] and not loop.pending("a") and not loop.pending("nope")
+    loop.start()
+    try:
+        assert _wait_until(lambda: loop.deriving() == ["a", "m", "z"])  # one running, two queued
+        assert loop.pending("a") and loop.pending("m") and loop.pending("z") and not loop.pending("nope")
+        got = loop.deriving()
+        got.append("junk")
+        got.clear()
+        assert loop.deriving() == ["a", "m", "z"]
+        gate.set()
+        assert _wait_until(lambda: loop.deriving() == [])
+        assert not loop.pending("a")
+    finally:
+        gate.set()
+        loop.stop()
+
+
+def test_set_plans_and_retire_from_a_thread_storm_leave_a_consistent_loop():
+    ids = [f"p{i}" for i in range(8)]
+    errors = []
+
+    def fn(pid):
+        time.sleep(0.001)
+        return ok(pid)
+
+    loop, writer, clock, _ = make([PanelPlan(i) for i in ids[:4]], fn=fn, poll_s=0.005, threads=3, backstop_s=0.02)
+    stop = threading.Event()
+
+    def churn(seed):
+        import random
+        rng = random.Random(seed)
+        try:
+            for _ in range(150):
+                if rng.random() < 0.3:
+                    loop.retire(rng.choice(ids))
+                else:
+                    loop.set_plans([PanelPlan(i) for i in rng.sample(ids, rng.randint(0, len(ids)))])
+                loop.deriving()
+                loop.pending(rng.choice(ids))
+                loop.dirty([rng.choice(ids)], rng.randint(1, 9))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def watch():
+        try:
+            while not stop.is_set():
+                assert set(loop.deriving()) <= set(ids)
+                loop.last_publish_error
+                time.sleep(0.001)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    watcher = threading.Thread(target=watch)
+    loop.start()
+    watcher.start()
+    try:
+        storm = [threading.Thread(target=churn, args=(s,)) for s in range(6)]
+        for t in storm:
+            t.start()
+        for t in storm:
+            t.join()
+        assert errors == []
+        loop.set_plans([PanelPlan(i) for i in ids[:5]])
+        assert writer.wait_for(lambda pubs: {"p0", "p1", "p2", "p3", "p4"} <= {p["id"] for p in pubs})
+        assert set(loop._states) == set(loop._plans) == set(ids[:5])
+        loop.retire("p0")
+        n_after_retire = len(writer.of("p0"))
+        time.sleep(0.15)  # many polls and backstop periods pass
+    finally:
+        stop.set()
+        watcher.join()
+        loop.stop()
+    assert errors == []
+    assert len(writer.of("p0")) == n_after_retire  # nothing published for a retired id once retire() returned
+    assert loop.deriving() == [] and not derive_threads()
+
+
+# ------------------------------------------------------------------------------------------ the on_publish hook
+
+
+def test_on_publish_fires_once_per_publish_that_moved_the_gen_or_the_write_gen_and_after_the_row_is_readable(tmp_path):
+    w = snapshots.SnapshotWriter(tmp_path / snapshots.DB_FILENAME)
+    reader = snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME)
+    clock = FakeClock()
+    body = {"v": 1}
+    seen = []
+
+    def hook(pid, gen, write_gen):
+        row = reader.read(pid)
+        locks_free = []
+        for lk in (loop._lock, loop._write_lock):  # called with neither loop lock held
+            locks_free.append(lk.acquire(timeout=1.0))
+            if locks_free[-1]:
+                lk.release()
+        seen.append((pid, gen, write_gen, row.gen, row.write_gen, all(locks_free)))
+
+    loop = DeriveLoop(w, {"a": PanelPlan("a", every_s=10.0)}, lambda pid: ok(dict(body)), clock=clock, backstop_s=1e9,
+                      on_publish=hook)
+    loop.run_once(clock.t)
+    assert seen == [("a", 1, 0, 1, 0, True)]
+    clock.t += 10
+    assert loop.run_once(clock.t) == ["a"]  # derived again, same body, nothing moved: no call
+    assert len(seen) == 1
+    loop.dirty(["a"], 5)
+    loop.run_once(clock.t)  # same body, but the write_gen moved
+    assert seen[-1] == ("a", 1, 5, 1, 5, True) and len(seen) == 2
+    body["v"] = 2
+    clock.t += 10
+    loop.run_once(clock.t)  # the body changed: the gen moved
+    assert seen[-1] == ("a", 2, 5, 2, 5, True) and len(seen) == 3
+    assert loop.last_hook_error is None and loop.hook_errors == 0
+    loop.stop()
+    w.close()
+
+
+def test_on_publish_fires_on_the_derive_thread_and_a_timeout_row_that_carries_a_write_gen_also_fires():
+    gate, entered = threading.Event(), threading.Event()
+    calls = []
+    fired = []
+
+    def fn(pid):
+        calls.append(pid)
+        if len(calls) == 2:
+            entered.set()
+            assert gate.wait(WAIT * 4)
+        return ok("x")
+
+    def hook(pid, gen, write_gen):
+        fired.append((pid, write_gen, threading.current_thread().name))
+
+    loop, writer, clock, _ = make([PanelPlan("a", timeout_s=50.0)], fn=fn, poll_s=0.01, backstop_s=1e9, on_publish=hook)
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: len(pubs) == 1)
+        loop.dirty(["a"], 8)
+        assert entered.wait(WAIT)
+        clock.t += 60
+        assert writer.wait_for(lambda pubs: any(p["status"] == "timeout" for p in pubs))
+        assert _wait_until(lambda: any(f[1] == 8 for f in fired))
+    finally:
+        gate.set()
+        loop.stop()
+    assert fired[0][0] == "a" and fired[0][2].startswith("derive-")
+    assert ("a", 8) in [(f[0], f[1]) for f in fired]
+
+
+def test_a_raising_hook_is_swallowed_counted_and_the_loop_goes_on():
+    seen = []
+
+    def hook(pid, gen, write_gen):
+        seen.append(pid)
+        raise RuntimeError("hook broke")
+
+    loop, writer, clock, _ = make([PanelPlan("a"), PanelPlan("b")], poll_s=0.01, backstop_s=1e9, on_publish=hook)
+    loop.start()
+    try:
+        assert writer.wait_for(lambda pubs: len(pubs) >= 2)
+        assert _wait_until(lambda: loop.hook_errors == 2)
+        assert isinstance(loop.last_hook_error, RuntimeError)
+        assert loop.last_publish_error is None  # a hook failure is not a write failure
+        loop.dirty(["a", "b"], 2)
+        assert writer.wait_for(lambda pubs: len(pubs) >= 4)
+        assert _wait_until(lambda: loop.hook_errors == 4)
+    finally:
+        loop.stop()
+    assert len(seen) == 4 and len(writer.publishes) == 4 and not derive_threads()
+
+
+def test_a_hook_error_clears_when_a_later_call_succeeds_and_the_count_stays():
+    seen = []
+
+    def hook(pid, gen, write_gen):
+        seen.append(write_gen)
+        if len(seen) == 1:
+            raise RuntimeError("once")
+
+    loop, writer, clock, _ = make([PanelPlan("a")], poll_s=0.01, backstop_s=1e9, on_publish=hook)
+    loop.start()
+    try:
+        assert _wait_until(lambda: loop.hook_errors == 1 and isinstance(loop.last_hook_error, RuntimeError))
+        loop.dirty(["a"], 4)
+        assert _wait_until(lambda: len(seen) == 2 and loop.last_hook_error is None)
+    finally:
+        loop.stop()
+    assert loop.hook_errors == 1 and seen == [0, 4]
+
+
+def test_a_hook_that_exits_does_not_take_a_worker_thread_down():
+    seen = []
+
+    def hook(pid, gen, write_gen):
+        seen.append(pid)
+        if len(seen) == 1:
+            raise SystemExit(3)
+
+    loop, writer, clock, _ = make([PanelPlan("a")], poll_s=0.01, threads=1, backstop_s=1e9, on_publish=hook)
+    loop.start()
+    try:
+        assert _wait_until(lambda: loop.hook_errors == 1)
+        loop.dirty(["a"], 1)
+        assert writer.wait_for(lambda pubs: len(pubs) >= 2)
+        assert _wait_until(lambda: len(seen) == 2)
+        assert len(derive_threads()) >= 2  # the poll thread and the one worker are alive
+    finally:
+        loop.stop()
+    assert loop.hook_errors == 1 and loop.last_hook_error is None
+
+
+def test_run_once_raises_a_hook_that_exits_as_it_does_for_a_derive():
+    def hook(pid, gen, write_gen):
+        raise SystemExit(4)
+
+    loop, writer, clock, _ = make([PanelPlan("a")], on_publish=hook)
+    with pytest.raises(SystemExit):
+        loop.run_once(clock.t)
+    assert loop.hook_errors == 1 and len(writer.of("a")) == 1
+    loop.stop()
+
+
+# ------------------------------------------------------------------------------------------ write-first ordering
+
+
+def test_dirty_panels_derive_before_the_input_and_timer_ones_and_carry_the_write_gen(tmp_path):
+    f = tmp_path / "f"
+    f.write_text("1")
+    loop, writer, clock, calls = make(
+        [PanelPlan("a", inputs=(File(str(f)),)), PanelPlan("b", every_s=10.0), PanelPlan("c"), PanelPlan("z")],
+        backstop_s=1e9,
+    )
+    settle(loop, clock)
+    f.write_text("22")  # a is due by its input
+    clock.t += 10  # b is due by its timer
+    loop.dirty(["z"], 7)  # z sorts last by id and has the newest derive
+    ran = loop.run_once(clock.t)
+    assert ran == ["z", "a", "b"]
+    assert writer.of("z")[-1]["write_gen"] == 7 and writer.of("a")[-1]["write_gen"] == 0
+    loop.stop()
+
+
+def test_a_panel_dirtied_while_it_waits_in_the_queue_jumps_the_queue():
+    gate, entered = threading.Event(), threading.Event()
+
+    def fn(pid):
+        if pid == "a":
+            entered.set()
+            assert gate.wait(WAIT * 4)
+        return ok(pid)
+
+    loop, writer, clock, _ = make(
+        [PanelPlan(i) for i in ("a", "b", "c", "z")], fn=fn, poll_s=0.01, threads=1, backstop_s=1e9
+    )
+    loop.start()
+    try:
+        assert entered.wait(WAIT)  # "a" holds the one worker; the rest wait in id order
+        assert _wait_until(lambda: loop.deriving() == ["a", "b", "c", "z"])
+        loop.dirty(["z"], 7)
+        gate.set()
+        assert writer.wait_for(lambda pubs: len(pubs) == 4)
+    finally:
+        gate.set()
+        loop.stop()
+    assert [p["id"] for p in writer.publishes] == ["a", "z", "b", "c"]
+    assert writer.of("z")[0]["write_gen"] == 7
+
+
+# ------------------------------------------------------------------------------------------ an unknown status
+
+
+def test_an_unknown_status_is_published_as_partial_with_its_error_text(tmp_path):
+    w = snapshots.SnapshotWriter(tmp_path / snapshots.DB_FILENAME)
+    loop = DeriveLoop(
+        w,
+        {"a": PanelPlan("a"), "b": PanelPlan("b")},
+        lambda pid: DeriveResult(status="stale", body={"rows": [1]}, error="reason kept" if pid == "a" else None),
+        clock=FakeClock(),
+    )
+    loop.run_once(1000.0)
+    reader = snapshots.SnapshotReader(tmp_path / snapshots.DB_FILENAME)
+    a, b = reader.read("a"), reader.read("b")
+    assert a.status == "partial" and a.error == "reason kept" and reader.decoded(a) == {"rows": [1]}
+    assert b.status == "partial" and "stale" in b.error  # no text given: the status it was is named
+    loop.stop()
+    w.close()
+
+
+def test_an_unknown_status_reaches_the_writer_as_partial():
+    loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: DeriveResult(status="bogus", body=1, error="e"))
+    loop.run_once(clock.t)
+    pub = writer.of("a")[0]
+    assert pub["status"] == "partial" and pub["error"] == "e" and pub["body"] == b"1"
+    loop.stop()
+
+
+def test_a_panel_added_to_the_plan_set_is_not_an_input_event_and_a_removed_sqlite_input_closes_its_connection(tmp_path):
+    f = tmp_path / "f"
+    f.write_text("1")
+    db = tmp_path / "x.db"
+    sqlite3.connect(db).close()
+    loop, writer, clock, _ = make(
+        [PanelPlan("a", inputs=(File(str(f)),)), PanelPlan("s", inputs=(Sqlite(str(db)),))], backstop_s=1e9
+    )
+    settle(loop, clock)
+    assert str(db) in loop._fingerprinter._conns
+    assert writer.streams[-1]["last_event_at"] is None
+    loop.set_plans([PanelPlan("a", inputs=(File(str(f)),)), PanelPlan("n", inputs=(File(str(tmp_path / "other")),))])
+    assert loop.run_once(clock.t) == ["n"]
+    assert writer.streams[-1]["last_event_at"] is None  # a new input appearing is not an input moving
+    assert loop._fingerprinter._conns == {}  # the vanished panel's sqlite connection was closed
+    f.write_text("22")
+    loop.run_once(clock.t)
+    assert writer.streams[-1]["last_event_at"] == clock.t
     loop.stop()
