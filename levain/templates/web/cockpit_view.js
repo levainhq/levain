@@ -2642,27 +2642,47 @@
     }
     return items.slice(0, 14);
   }
-  // Focus a panel the jump chose. The poll redraws the whole board (render replaces every panel node), so the node the jump held can be
-  // gone by the time the frame comes, or can be replaced just after it takes focus (focus then falls to <body>). The panel is looked up
-  // again by its id, and for a bounded 3 s a redraw that drops the focus to <body>
-  // hands it to the successor; focus the reader has since put anywhere else is left alone.
-  function landOnPanel(node, scroll) {
+  // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
+  // id (a redraw replaces every panel node), else the node as given.
+  function livePanel(node) {
     const id = node.dataset ? node.dataset.ckPanel : "";
-    const live = (n) => n.isConnected || !id ? n : (Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || n);
-    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
-    const first = live(node);
-    focusIt(first, scroll);
+    if (node.isConnected || !id) return node;
+    return Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
+  }
+  // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
+  let handOff = null;
+  // Focus a panel the jump chose. A redraw replaces every panel node, so the panel is looked up again by its id, and for 3 s a redraw
+  // that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
+  // hand-off, the 3 s, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
+  // focus back from where they went).
+  function landOnPanel(node, scroll) {
+    if (handOff) handOff.stop();
+    handOff = null;
+    const focusIt = (n) => { if (scroll) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
+    let held = livePanel(node);
+    focusIt(held);
     const board = document.getElementById("board");
-    if (!id || !board || typeof root.MutationObserver !== "function") return;
-    let held = first;
+    if (!held.dataset || !held.dataset.ckPanel || !board || typeof root.MutationObserver !== "function") return;
     const obs = new root.MutationObserver(() => {
       const a = document.activeElement;
       if (held.isConnected || (a && a !== document.body)) return;
-      const next = live(held);
-      if (next !== held) { held = next; focusIt(held, false); }
+      const next = livePanel(held);
+      if (next === held) return;
+      held = next;
+      focusIt(held);
+      if (document.activeElement === held) me.stop();
     });
+    const timer = root.setTimeout(() => me.stop(), 3000);
+    const answered = () => me.stop();
+    const me = { stop() {
+      obs.disconnect();
+      root.clearTimeout(timer);
+      for (const t of ["pointerdown", "keydown"]) document.removeEventListener(t, answered, true);
+      if (handOff === me) handOff = null;
+    } };
+    handOff = me;
     obs.observe(board, { childList: true });
-    root.setTimeout(() => obs.disconnect(), 3000);
+    for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
   }
   function openJump() {
     if (palette) return;
@@ -2687,9 +2707,11 @@
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
       if (it.kind === "panel") {
         // a panel the current tab hides is reached through the first tab that shows it
-        const changed = revealTab(it.node);
-        if (it.node.ckShowTab) it.node.ckShowTab();
-        after(changed, () => landOnPanel(it.node, true));
+        // the panel as the page has it now: a redraw since the list was drawn has replaced the node the list holds
+        const node = livePanel(it.node);
+        const changed = revealTab(node);
+        if (node.ckShowTab) node.ckShowTab();
+        after(changed, () => landOnPanel(node, true));
         return; }
       // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
       const changed = revealTab(it.state.p);
