@@ -410,7 +410,8 @@ def test_a_new_rev_from_the_operator_reopens_a_shut_gate_and_the_same_rev_stays_
 
 def test_refresh_connections_are_capped_by_the_refresh_semaphore(env, monkeypatch):
     ep, d, store, cert, mp = env
-    monkeypatch.setattr(C, "REFRESH_CONNS", 2)
+    cap = 2
+    monkeypatch.setattr(C, "REFRESH_CONNS", cap)
     names = ["vendor", "vendor-b", "vendor-c"]
     fd = os.open(str(d), os.O_RDONLY | os.O_DIRECTORY)
     for n in names:
@@ -424,14 +425,34 @@ def test_refresh_connections_are_capped_by_the_refresh_semaphore(env, monkeypatc
         ep.hold = asyncio.Event()
         w, s = _writer(d), store()
         waits = [asyncio.ensure_future(C.fresh(w, s, n)) for n in names]
-        await asyncio.sleep(0.5)
-        held = ep.calls
-        ep.hold.set()
-        got = await asyncio.gather(*waits)
+        # Wait on the condition (the cap is reached), not on a fixed sleep: on 2026-11-19 (gh run 44586987577) a fixed
+        # 0.5 s sleep found no connection up on a loaded CI runner. Then a 0.5 s settle shows whether a third
+        # connection slipped past the semaphore. The settle is a time-bounded negative check, so a third connection
+        # later than the settle could be missed (a known edge: no semaphore state is observable from the test).
+        try:
+            deadline = time.monotonic() + 20.0
+            while ep.calls < cap and not any(f.done() for f in waits) and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            for f in waits:
+                if f.done():
+                    f.result()   # a failed fresh() surfaces its own exception, not a timeout assert below
+            assert ep.calls >= cap, f"the refresh connections never reached the cap of {cap} within 20 s " \
+                                    f"(calls={ep.calls})"
+            await asyncio.sleep(0.5)
+            held = ep.calls
+            ep.hold.set()
+            got = await asyncio.gather(*waits)
+        except BaseException:
+            ep.hold.set()
+            for f in waits:
+                f.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+            w.close()
+            raise
         w.close()
         return held, ep.calls, got
     held, calls, got = run(go())
-    assert held == 2 and calls == 3
+    assert held == cap and calls == len(names)
     assert all(c.secret.startswith("new-access-") for c in got)
 
 

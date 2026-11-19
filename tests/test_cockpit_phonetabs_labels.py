@@ -29,11 +29,11 @@ def test_every_place_shows_its_whole_label_in_one_row_at_390(tmp_path: Path, mon
     with rig.serving():
         values = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
     got = values[-1]
-    assert [t["jump"] for t in got["tabs"]] == ["home", "desk", "room", "memory"], got
+    assert [t["jump"] for t in got["tabs"]] == ["home", "desk", "room", "memory", "settings"], got
     assert all(t["text"] for t in got["tabs"]), got
     assert not [t for t in got["tabs"] if t["cut"] or t["ellipsis"]], got   # every label whole
     assert got["wrap"] == "nowrap" and len(got["tops"]) == 1, got           # one row
-    assert not got["stripScrolls"] and got["overflowX"] in ("auto", "scroll"), got   # the four places fit; an overflow would go sideways inside the bar
+    assert not got["stripScrolls"] and got["overflowX"] in ("auto", "scroll"), got   # the five places fit; an overflow would go sideways inside the bar
     assert got["pageScrollW"] <= got["vw"], got                             # never the page
 
 
@@ -86,5 +86,5 @@ def test_strip_cue_returns_when_labels_widen_without_a_watched_event(tmp_path: P
     with rig.serving():
         vals = drive_touch(tmp_path, url, steps)["values"]
     fit, widened = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{") and '"cue"' in v]
-    assert not fit["scrolls"] and not fit["right"], (fit, vals)    # the four places fit: no cue
+    assert not fit["scrolls"] and not fit["right"], (fit, vals)    # the five places fit: no cue
     assert widened["scrolls"] and widened["right"], widened        # widened with no resize or strip mutation: the cue appears

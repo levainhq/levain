@@ -15,9 +15,8 @@ from tests.test_cockpit_k7_build import _sessions_fixture
 
 import pytest
 
-# The phone first-row geometry this measures (ROW1_AT_13C4D885, with the Modes bar's `.seg` as the second row) is gone with the Modes bar, and Home
-# hides the band's own Calm button (#calmphone): Calm's phone reach is a boarded row (Calm at 480 px and under). The test comes back with that row,
-# measured again on the places page.
+# The phone first-row geometry this measured (ROW1_AT_13C4D885, with the Modes bar's `.seg` as the second row) went with the Modes bar. Since
+# levain#151 Calm is one button in the Machine card's control row at every width; tests/test_cockpit_polish_machine.py holds its placement.
 WAIT = {"eval": "new Promise(r => setTimeout(r, 300))"}
 HTML = "document.documentElement.classList.contains('calm')"
 BTN = "(() => { const b = document.getElementById('calmbtn'); return JSON.stringify([b.getAttribute('aria-pressed'), b.textContent]); })()"

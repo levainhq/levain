@@ -220,7 +220,8 @@ from pathlib import Path  # noqa: E402
 
 from tests.test_pair_card_w1b import _drive, needs_browser  # noqa: E402
 
-READY = "document.querySelectorAll('.dev-list .dev-row').length === 4"
+# the Paired devices section is drawn on the Settings place only (levain#141 polish): the page is taken there while it is awaited
+READY = "(document.querySelector('.ia-places [data-ia-place-btn=settings]').click(), document.querySelectorAll('.dev-list .dev-row').length === 4)"
 CLICK_REVOKE = ("(() => { const b = [...document.querySelectorAll('.dev-list .dev-btn')].find((x) =>"
                 " x.getAttribute('aria-label').includes('%s')); b.click(); return 1; })()")
 CARD = ("JSON.stringify({items: [...document.querySelectorAll('.dev-confirm-item .dev-name')].map((n) => n.textContent),"

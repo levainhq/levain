@@ -14,7 +14,8 @@ from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
 from tests.test_pair_card_w1b import _drive, needs_browser
 
-READY = "document.querySelector('.dev-zone') && !document.querySelector('.dev-zone').hidden && document.querySelectorAll('.dev-row').length"
+# the Paired devices section is drawn on the Settings place only (levain#141 polish): the page is taken there while it is awaited
+READY = "(document.querySelector('.ia-places [data-ia-place-btn=settings]').click(), document.querySelector('.dev-zone') && !document.querySelector('.dev-zone').hidden && document.querySelectorAll('.dev-row').length)"
 ROWS = "JSON.stringify([...document.querySelectorAll('.dev-list .dev-name')].map((n) => n.textContent))"
 TABS = "JSON.stringify([...document.querySelectorAll('.dev-tabs .ck-tab')].map((b) => [b.textContent, b.getAttribute('aria-selected')]))"
 PICK = "[...document.querySelectorAll('.dev-tabs .ck-tab')].find((b) => b.textContent.startsWith('%s')).click() || 1"

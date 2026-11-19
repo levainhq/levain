@@ -192,7 +192,10 @@
     sgrid.appendChild(buildVoice());   // Voice beside Tap tokens; it shows only where the cockpit serves GET /cockpit/voice.json
     prSetSec.appendChild(sgrid);
     const main = document.querySelector("main.frame");
-    if (main) { main.appendChild(section); main.appendChild(prSetSec); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); }
+    // the Settings place's own line for when no section is drawn (every read said "not available"); dashboard.css draws it on Settings only
+    emptyLine = el("p", "dev-empty", "Nothing to set from this browser: sign in on a paired device to manage devices, tokens and voice.");
+    emptyLine.hidden = true;
+    if (main) { main.appendChild(section); main.appendChild(prSetSec); main.appendChild(emptyLine); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); document.body.appendChild(emptyLine); }
     buildChip();
     buildSheet();
   }
@@ -201,6 +204,24 @@
   function syncSection() {
     section.hidden = devPanel.hidden;
     if (prSetSec) prSetSec.hidden = (!prPanel || prPanel.hidden) && (!vcPanel || vcPanel.hidden);
+    syncEmpty();
+  }
+  // The Settings empty line says "nothing to set" only once every settings read has answered at least once (drawn, 404, 403 or failed:
+  // each marks its section settled) and the "This cockpit" section has had its first render, so it never flashes while the reads are
+  // still out. It is shown when no section is drawn, "This cockpit" (dashboard_core.js syncCockpitSection) included.
+  const settled = { dev: false, pr: false, vc: false };
+  let ckObserved = false;
+  function settle(which) { if (!settled[which]) { settled[which] = true; syncEmpty(); } }
+  function syncEmpty() {
+    if (!emptyLine) return;
+    const ck = document.getElementById("ck-thiscockpit");
+    if (ck && !ckObserved && typeof MutationObserver === "function") {
+      ckObserved = true;
+      new MutationObserver(syncEmpty).observe(ck, { attributes: true, attributeFilter: ["hidden", "data-settled"] });
+    }
+    const none = section.hidden && (!prSetSec || prSetSec.hidden) && (!ck || ck.hidden);
+    const ready = settled.dev && settled.pr && settled.vc && (!ck || ck.dataset.settled === "1");
+    emptyLine.hidden = !(ready && none);
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
 
@@ -290,6 +311,9 @@
   // One read and one paint. Resolves true when the panel is as current as it can be (including "nothing to show here"),
   // false when the read failed and said so.
   async function readOnce() {
+    try { return await readOnceInner(); } finally { settle("dev"); }
+  }
+  async function readOnceInner() {
     if (gone) return true;
     const tok = token();
     if (!tok) { devShown(false); return true; }
@@ -830,7 +854,7 @@
   const PR_TAP_DEFAULT = ["away", "back", "quiet", "desk", "devices"];
   const PR_MIN = 1, PR_MAX = 1440;                        // custom minutes, as the server allows (1 minute to 24 hours)
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {},
-      prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, prTapList = null, prNote = null,
+      prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, emptyLine = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prState = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
       prDevBtns = {}, prAfterBtns = {}, prAfterCustom = null, prAfterRow = null, prLetsBtns = {}, prUntilBtns = {}, prForRow = null,
       prForBtns = {}, prForCustom = null, prAfterOpen = false, prForOpen = false,
@@ -997,6 +1021,8 @@
 
   function toSettings() {
     if (!prSetSec || prSetSec.hidden) return;
+    // the settings sections are drawn on the Settings place only (dashboard_places.js): go there, then scroll to and focus the section
+    if (window.LevainPlaces && window.LevainPlaces.openSettings) { window.LevainPlaces.openSettings("presence-settings"); return; }
     prSetSec.scrollIntoView({ block: "start" });
     prSetSec.focus({ preventScroll: true });
   }
@@ -1225,6 +1251,9 @@
     return prRunning;
   }
   async function readPresenceOnce() {
+    try { await readPresenceInner(); } finally { settle("pr"); }
+  }
+  async function readPresenceInner() {
     if (prGone) return;
     const tok = token();
     if (!tok || tok === prRefused) { prShow(false); return; }
@@ -1389,8 +1418,15 @@
   // the token look in start(), and when the page is focused or shown again.
   let vcDone = false, vcBusy = false, vcTries = 0;
   const VC_MAX_TRIES = 6;
+  // A probe skipped because another is still out (vcBusy: a voice.json slower than the retry) has learned nothing, so it does not
+  // settle the Settings empty line; the probe that is out settles it when its answer comes (L3 r1: codex, gemini, deepseek). The tries
+  // clause counts only with no probe out: the sixth probe is out while vcTries is already at the limit (L3 r2: deepseek, codex, complement).
   async function voiceProbe() {
-    if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return;
+    let ran = false;
+    try { ran = await voiceProbeInner(); } finally { if (ran || vcDone || (!vcBusy && vcTries >= VC_MAX_TRIES)) settle("vc"); }
+  }
+  async function voiceProbeInner() {
+    if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return false;
     vcBusy = true; vcTries++;
     let state = null, final = false;
     try {
@@ -1404,10 +1440,11 @@
       paintVoice();
       vcPanel.hidden = false;
       syncSection();
-      return;
+      return true;
     }
     vcBusy = false;
     if (final) vcDone = true;
+    return true;
   }
   // After the first read the spend would freeze at that moment, so a focus or a return to the tab reads voice.json again and
   // repaints from the answer. A failed or odd answer leaves what is on screen as it was.

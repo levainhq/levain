@@ -31,15 +31,12 @@
     <header class="masthead frame">
       <div class="brand">
         <div class="wordmark">Levain</div>
-        <div class="model">what needs you, what is moving, what it remembers</div>
-        <div class="ia-tagline" id="ia-tagline">what needs you, what is moving, what it remembers</div>
       </div>
       <div class="readout">
         <div class="unit">
           <span class="unit-label">Unit</span>
           <span class="entity" id="entity">—</span>
         </div>
-        <div class="jar" id="jar" hidden></div>
         <div class="indicators">
           <span class="ia-actions" role="group" aria-label="Actions">
             <button type="button" class="ia-act" data-phone-jump="drop" aria-label="Drop to the desk" title="Drop to the desk"><span class="ia-ico" aria-hidden="true">&#9998;</span><span class="ia-lbl">Drop</span></button>
@@ -49,7 +46,6 @@
           <span class="stamp" id="stamp"></span>
           <button id="presencebtn" class="pr-chip" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-controls="pr-sheet" aria-label="Presence"><span class="pr-dot" aria-hidden="true"></span><span class="pr-chip-t"></span></button>
           <button id="refresh" type="button">Sync</button>
-          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
@@ -66,6 +62,7 @@
       <button type="button" data-ia-place-btn="desk" title="Desk (key 2)" aria-keyshortcuts="2">Desk</button>
       <button type="button" data-ia-place-btn="room" title="Room (key 3)" aria-keyshortcuts="3">Room</button>
       <button type="button" data-ia-place-btn="memory" title="Memory (key 4)" aria-keyshortcuts="4">Memory</button>
+      <button type="button" data-ia-place-btn="settings" title="Settings (key 5)" aria-keyshortcuts="5">Settings</button>
     </nav>
     <!-- The places bar drives the page's own wiring through these (data-mode-tab: cockpit_view.js; data-phone-jump: dashboard_boot.js). -->
     <div class="ia-drivers" hidden>
@@ -76,12 +73,15 @@
     </div>
     <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
       <div class="band frame" id="ck-band">
-        <button id="calmphone" type="button" data-calm-toggle aria-pressed="false">Calm off</button>
         <div class="when" id="ck-when"></div>
         <div class="band-state" id="ck-state-slot"></div>
         <div class="band-meta" id="ck-wrapline"></div>
       </div>
       <div class="skycol frame" id="ck-skycol">
+        <div class="ck-mctl" id="ck-mctl" role="group" aria-label="Machine view controls">
+          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
+          <div id="ck-jarbox" class="ck-jarbox"></div>
+        </div>
         <div class="skycard" id="ck-skycard">
           <div class="ck-hlens" id="ck-hlens" hidden></div>
           <div id="ck-sky"></div>
@@ -90,16 +90,26 @@
       </div>
     </section>
     <section class="ck-needs frame" id="ck-needs" aria-label="Needs you" hidden></section>
+    <!-- The notes sit before the drop in the document, as Home draws them (needs, notes, the Desk head, the drop), so Tab walks the page top to bottom. -->
+    <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <!-- The desk drop (filled by renderDropHero; never replaced by an install): dashboard.css places it by place; Memory does not draw it (the Drop button goes Home first, then to the box). -->
     <section class="ck-drop frame" id="ck-drop" aria-label="Drop to the desk" hidden></section>
-    <section class="ck-notes frame" id="ck-notes" aria-label="Notes from agents" hidden></section>
     <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
     <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <p class="stateline frame" id="state" hidden></p>
     <p class="sub frame" id="store" data-cold>connecting…</p>
     <!-- The board's panels; dashboard.css places them by place. Keys 1-4 are the places keys (dashboard_places.js), ignored while typing. -->
-    <main class="frame"><div class="grid" id="board"></div></main>
-    <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
+    <main class="frame">
+      <!-- levain#141 polish (fix4): the Settings place's first section. It holds the entity's name and the rename control (the same
+           wireEntityName the masthead uses), so the rename is reachable where the masthead hides the name (it repeats the wordmark).
+           Drawn on Settings only, and only while it holds the control (dashboard_core.js syncCockpitSection). It is not a .dev-zone
+           (the devices script's own sections are, and tests and code look the first one up); dashboard.css gives it the same rules. -->
+      <section class="ck-thiscockpit" id="ck-thiscockpit" data-zone="cockpit" aria-labelledby="ck-thiscockpit-t" hidden>
+        <div class="zone-head"><h2 class="zone-title" id="ck-thiscockpit-t">This cockpit</h2><span class="zone-gloss">its name, as every device shows it</span></div>
+        <div class="unit ck-unit"><span class="unit-label">Name</span><span class="entity" id="ck-entity">—</span></div>
+      </section>
+      <div class="grid" id="board"></div>
+    </main>
   </div>
 
 <!-- The canonical render core (shared, transport-agnostic) + this surface's thin
