@@ -560,4 +560,4 @@ def test_the_collapsed_graph_strip_hides_the_event_graph_too(tmp_path: Path) -> 
     assert shut["lens"] == "events" and shut["canvas"] > 0, shut                       # the fixture has an Event graph to hide
     assert not shut["sky"]["shown"] and not shut["legend"]["shown"], shut              # collapsed: it is not drawn
     assert opened["sky"]["shown"] and opened["sky"]["h"] > 0, opened                   # the toggle opens it
-    assert shut["card"]["h"] >= shut["toggle"]["h"] and shut["toggle"]["y"] + shut["toggle"]["h"] <= shut["card"]["y"] + shut["card"]["h"] + 1, shut   # the toggle stays inside the one-line card
+    assert shut["toggle"]["h"] > 0 and shut["toggle"]["y"] + shut["toggle"]["h"] <= shut["card"]["y"] + 1, shut   # the toggle sits in the Machine control row above the card (levain#141 polish: it no longer floats over the card)

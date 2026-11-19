@@ -293,11 +293,8 @@ def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_i
     assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["brandRight"] and geo["readoutRight"] <= geo["mastRight"], geo
     assert geo["nameW"] >= 40, geo                                           # the name is not squeezed out (the labelled action buttons took its room at 1100 to 1340)
     assert calm["shown"] and calm["focused"] and calm["name"] in ("Calm off", "Calm on") and calm["title"] == calm["name"], calm
-    if width <= 1280:
-        assert calm["label"] == "0px", calm                                  # the icon form: the visible text is gone, the name stays
-        assert calm["w"] <= calm["bound"], (calm["w"], calm["bound"])                             # and the button is only its padding + the glyph's measured width, not a label-wide key
-    else:
-        assert calm["label"] != "0px" and calm["w"] > 60, calm               # wide enough for the labelled form
+    # levain#141 polish: Calm left the masthead for the Machine card's control row, so it is the labelled form at every width (the masthead's icon band is gone)
+    assert calm["label"] != "0px" and calm["w"] > 60, calm
 
 
 @needs_browser
@@ -511,16 +508,16 @@ CALM_ON = ("(() => { const b = document.getElementById('calmbtn'), bg = () => ge
 
 
 @needs_browser
-def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs_pressed_button(tmp_path: Path) -> None:
+def test_calm_on_in_the_machine_row_has_a_filled_background_at_1180(tmp_path: Path) -> None:
+    # levain#141 polish: Calm is in the Machine control row; its pressed state is the row's filled key (--card-2), no longer the masthead icon band's
     got = _run(tmp_path, [{"eval": CALM_ON}], width=1180)[-1]
     assert got["offPressed"] == "false" and got["onPressed"] == "true", got
-    assert got["theme"], got
     assert got["on"] != got["off"], got
-    assert got["on"] == got["theme"], got
 
 
 @needs_browser
-def test_calm_on_at_1440_keeps_the_labelled_look_with_no_filled_background(tmp_path: Path) -> None:
+def test_calm_on_at_1440_has_the_same_filled_background_as_at_1180(tmp_path: Path) -> None:
+    # was: the masthead's labelled Calm kept an unfilled look at 1440; the Machine row's key is one look at every width
     got = _run(tmp_path, [{"eval": CALM_ON}], width=1440)[-1]
     assert got["offPressed"] == "false" and got["onPressed"] == "true", got
-    assert got["on"] == got["off"], got
+    assert got["on"] != got["off"], got

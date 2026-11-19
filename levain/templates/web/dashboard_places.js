@@ -97,7 +97,7 @@
       var open = !document.body.classList.contains("ia-graph-open");
       document.body.classList.toggle("ia-graph-open", open);
       g.setAttribute("aria-expanded", open ? "true" : "false");
-      g.textContent = open ? "Hide the graph" : "Show the graph";
+      g.textContent = open ? "Hide the graphs" : "Show the graphs";
       window.dispatchEvent(new Event("resize"));   // the sky mounts at the size its card has; a card that just opened has one now
     }
   });
@@ -129,8 +129,9 @@
     b.className = "ia-graph-toggle";
     b.setAttribute("data-ia-graph-toggle", "");
     b.setAttribute("aria-expanded", "false");
-    b.textContent = "Show the graph";
-    col.insertBefore(b, col.firstChild);
+    b.textContent = "Show the graphs";
+    var row = document.getElementById("ck-mctl") || col;   // the Machine control row: Show/Hide the graphs, Calm, Ambient
+    row.insertBefore(b, row.firstChild);
   }
 
   // ---- the section heads: children of the deck, which the page never repaints; dashboard.css orders and shows them on Home only ----

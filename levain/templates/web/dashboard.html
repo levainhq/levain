@@ -49,7 +49,6 @@
           <span class="stamp" id="stamp"></span>
           <button id="presencebtn" class="pr-chip" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-controls="pr-sheet" aria-label="Presence"><span class="pr-dot" aria-hidden="true"></span><span class="pr-chip-t"></span></button>
           <button id="refresh" type="button">Sync</button>
-          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
@@ -77,12 +76,15 @@
     </div>
     <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
       <div class="band frame" id="ck-band">
-        <button id="calmphone" type="button" data-calm-toggle aria-pressed="false">Calm off</button>
         <div class="when" id="ck-when"></div>
         <div class="band-state" id="ck-state-slot"></div>
         <div class="band-meta" id="ck-wrapline"></div>
       </div>
       <div class="skycol frame" id="ck-skycol">
+        <div class="ck-mctl" id="ck-mctl" role="group" aria-label="Machine view controls">
+          <button id="calmbtn" type="button" data-calm-toggle aria-pressed="false" aria-label="Calm off" title="Calm off">Calm off</button>
+          <div id="ck-jarbox" class="ck-jarbox"></div>
+        </div>
         <div class="skycard" id="ck-skycard">
           <div class="ck-hlens" id="ck-hlens" hidden></div>
           <div id="ck-sky"></div>
