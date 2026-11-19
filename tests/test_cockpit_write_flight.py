@@ -48,6 +48,11 @@ def _cockpit(store: _Store, *, refresh_every_s: float | None = None) -> Cockpit:
     return ck
 
 
+def _plain(pid: str) -> ProviderSpec:
+    return ProviderSpec(id=pid, kind="triage-list", title=pid, priority="feed", read=_Store().read, order="time.desc",
+                        facets=frozenset({"at"}), version_fields=("id",))
+
+
 def _title(body: dict) -> str:
     return body["rows"][0]["title"]
 
@@ -123,6 +128,77 @@ def test_a_caller_that_keeps_finding_a_flight_older_than_a_write_gives_up_at_its
         t.join(10)
     assert out[0] == "refused" and ran == [], out
     assert took < 1.0, took                                # the caller's own budget (0.3s), not the churn's length
+
+
+@pytest.mark.parametrize("invalidate", [lambda ck: ck.invalidate_reads(["p"]), lambda ck: ck.invalidate_reads()],
+                         ids=["keyed", "global"])
+def test_a_manifest_read_after_a_write_does_not_join_the_entity_read_begun_before_it(invalidate) -> None:
+    from levain.cockpit.engine import ReadContext
+
+    seen: list[str] = []
+    gate, started = threading.Event(), threading.Event()
+    box = {"value": "OLD"}
+
+    def entity(ctx) -> dict:
+        now = box["value"]
+        seen.append(now)
+        if len(seen) == 1:
+            started.set()
+            gate.wait(10)
+        return {"name": now}
+
+    ck = Cockpit(entity=entity)
+    ck.register(_plain("p"))
+    early: list = []
+    t = threading.Thread(target=lambda: early.append(ck._entity(ReadContext(ck._clock()))))
+    t.start()
+    assert started.wait(5)
+    box["value"] = "NEW"                                   # the write lands while the manifest's entity read is out
+    invalidate(ck)
+    late: list = []
+    t2 = threading.Thread(target=lambda: late.append(ck._entity(ReadContext(ck._clock()))))
+    t2.start()
+    time.sleep(0.3)
+    gate.set()
+    t.join(10)
+    t2.join(10)
+    assert not t.is_alive() and not t2.is_alive()
+    assert early[0][0]["name"] == "OLD" and late[0][0]["name"] == "NEW" and seen == ["OLD", "NEW"]
+
+
+@pytest.mark.parametrize("invalidate", [lambda ck: ck.invalidate_reads(["p"]), lambda ck: ck.invalidate_reads()],
+                         ids=["keyed", "global"])
+def test_a_manifest_read_after_a_write_does_not_join_the_discovery_read_begun_before_it(invalidate) -> None:
+    from levain.cockpit.engine import ReadContext
+
+    seen: list[str] = []
+    gate, started = threading.Event(), threading.Event()
+    box = {"value": "OLD"}
+
+    def discoverer(ctx) -> list:
+        now = box["value"]
+        seen.append(now)
+        if len(seen) == 1:
+            started.set()
+            gate.wait(10)
+        return [_plain(f"d-{now}")]
+
+    ck = Cockpit()
+    ck.register(_plain("p"))
+    ck.discover(discoverer)
+    t = threading.Thread(target=lambda: ck._ensure_discovered(ReadContext(ck._clock())))
+    t.start()
+    assert started.wait(5)
+    box["value"] = "NEW"
+    invalidate(ck)
+    t2 = threading.Thread(target=lambda: ck._ensure_discovered(ReadContext(ck._clock())))
+    t2.start()
+    time.sleep(0.3)
+    gate.set()
+    t.join(10)
+    t2.join(10)
+    assert not t.is_alive() and not t2.is_alive()
+    assert seen == ["OLD", "NEW"] and "d-NEW" in ck.panel_ids
 
 
 def test_a_write_to_another_panel_leaves_the_flight_shared() -> None:

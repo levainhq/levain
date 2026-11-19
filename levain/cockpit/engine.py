@@ -2192,8 +2192,13 @@ class Cockpit:
 
         Either way the named panels' write epoch advances: a provider read begun before this call is never joined by a
         reader arriving after it (``_single_flight`` waits it out and reads afresh), so what the older read saw cannot
-        be handed to, or stored for, a reader of the new generation."""
+        be handed to, or stored for, a reader of the new generation. The manifest's own entity and discovery reads keep
+        persistent states too, and every write drops the manifest's entries: their epoch advances with it."""
         states = self._state
+        manifest_states = [self._entity_state, *self._discovery_states]
+        for st in manifest_states:
+            with st.lock:
+                st.epoch += 1
         if panel_ids is None:
             for st in list(states.values()):
                 with st.lock:
