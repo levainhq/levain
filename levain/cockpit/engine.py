@@ -924,6 +924,12 @@ class Cockpit:
         self._host_pending: Callable[[str], bool] | None = None
         self._host_dirty: Callable[[Iterable[str], int], None] | None = None
         self._host_state: Callable[[], Mapping[str, Any]] | None = None
+        # D7 (attached mode only), all under ``_rc_lock``: the serve's write generation, which only grows; the panels whose
+        # last ``dirty`` call raised; how many raised and the last one
+        self._write_gen = 0
+        self._write_unsent: set[str] = set()
+        self.host_dirty_errors = 0
+        self.last_host_dirty_error: BaseException | None = None
         self._heartbeat_cadence_s: float | None = None      # how often the attached host beats, when it is not the default
         self._serve_composed: frozenset[str] = SERVE_COMPOSED_IDS
         # what the host cycle last read for the manifest: the entity (with its faults) and the discovery faults. Each is one
@@ -1484,7 +1490,7 @@ class Cockpit:
         ``start()``: an attached cockpit starts no refresher threads, and one already running keeps running.
 
         ``deriving()`` and ``pending(panel_id)`` are the host's busy accessors; ``dirty(panel_ids, write_gen)`` is the
-        host's write hook, kept for the write path and not called here; ``host_state()`` answers ``{"worker": "live" |
+        host's write hook, called by ``invalidate_reads`` for the panels a write touched; ``host_state()`` answers ``{"worker": "live" |
         "stale" | "down", "heartbeat_age_s": float | None}`` for a host that knows its own health better than the
         file's heartbeat does. ``heartbeat_cadence_s`` is how often the host beats when that is not the default
         (``HEARTBEAT_CADENCE_S``): the file's heartbeat is read as live within ``WORKER_LIVE_FACTOR`` of those. All
@@ -2877,6 +2883,7 @@ class Cockpit:
             with self._rc_lock:
                 self._rc_gen += 1
                 self._rc.clear()
+            self._note_write(None)
             return
         ids = [p for p in dict.fromkeys(panel_ids) if isinstance(p, str)]
         for pid in ids:
@@ -2889,6 +2896,35 @@ class Cockpit:
         if refresh:
             for pid in ids:
                 self._refresh_in_background(pid)
+        self._note_write(ids)
+
+    def _note_write(self, panel_ids: "list[str] | None") -> None:
+        """D7, attached mode only (a bare cockpit returns at once: it has no host to tell). Every call advances the write
+        generation, and the panels the write touched (the ids named, or every panel served from a row when none were) that are
+        registered are told to the host with it, outside every lock of this cockpit. A host whose hook raises does not fail the
+        write: the failure is counted and kept (``host_dirty_errors``, ``last_host_dirty_error``) and those panels are
+        remembered as unsent until a later call reaches the host."""
+        if self._reader is None:
+            return
+        specs = self._specs
+        ids = [pid for pid in (specs if panel_ids is None else panel_ids)
+               if pid in specs and not self.serve_composed(pid)]
+        dirty = self._host_dirty
+        with self._rc_lock:
+            self._write_gen += 1
+            write_gen = self._write_gen
+        if dirty is None or not ids:
+            return
+        try:
+            dirty(tuple(ids), write_gen)
+        except Exception as exc:  # noqa: BLE001 - a host that cannot be told is no fault of the write that is being answered
+            with self._rc_lock:
+                self._write_unsent.update(ids)
+                self.host_dirty_errors += 1
+                self.last_host_dirty_error = exc
+        else:
+            with self._rc_lock:
+                self._write_unsent.difference_update(ids)
 
     def _drop_scopes(self, scopes: list) -> None:
         """Advance these read scopes' generation and delete their entries, in-flight ones included."""
