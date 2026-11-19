@@ -939,7 +939,7 @@ class Cockpit:
         self._head_cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]" = OrderedDict()
         self._panel_cache: "OrderedDict[tuple, tuple[ProviderSpec, Any]]" = OrderedDict()
         self._head_lock = threading.Lock()
-        self._streams_read: "tuple[float, dict[str, Any]] | None" = None
+        self._streams_read: "tuple[float, dict[str, Any], float] | None" = None   # (read ended, the line, read began)
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -2650,11 +2650,11 @@ class Cockpit:
         """The derive loop's input-watch stream as the manifest's ``freshness.stream``: ``state`` (ok or degraded) and
         ``last_event_at`` (ISO). Both None while there is no row or the table cannot be read. The row is in a table of its
         own, so it is read at most once per ``STREAMS_READ_TTL_S`` and shared."""
-        now = time.monotonic()
+        began = time.monotonic()
         with self._head_lock:
             held = self._streams_read
-        if held is not None and now - held[0] < STREAMS_READ_TTL_S:
-            return held[1]
+        if held is not None and began - held[0] < STREAMS_READ_TTL_S:
+            return dict(held[1])
         row: Mapping[str, Any] = {}
         try:
             row = self._reader.streams().get(INPUTS_STREAM_ID) or {}
@@ -2662,9 +2662,13 @@ class Cockpit:
             row = {}
         at = row.get("last_event_at")
         out = {"state": row.get("state"), "last_event_at": _iso_epoch(at) if isinstance(at, (int, float)) else None}
+        # the window runs from the end of the read; a read that began before the held one did is older than it, so it
+        # is told what the cache holds and never replaces it
         with self._head_lock:
-            self._streams_read = (now, out)
-        return out
+            held = self._streams_read
+            if held is None or began >= held[2]:
+                self._streams_read = held = (time.monotonic(), out, began)
+        return dict(held[1])
 
     @staticmethod
     def _stamp_band_age(out: dict[str, Any], now: datetime) -> dict[str, Any]:

@@ -796,3 +796,59 @@ def test_a_band_row_whose_since_cannot_be_set_against_the_clock_reads_with_no_ag
             assert got["rows"][0]["id"] == "band:a" and "band_age" not in got["rows"][0]["facets"]
     finally:
         r.close()
+
+
+def _stream_reader(rig: Rig, monkeypatch: pytest.MonkeyPatch, reads: "list[tuple[str, Any]]") -> list[str]:
+    """The reader's stream row answers from ``reads`` in order: (state, a gate the read waits on or None). Returns the call log."""
+    log: list[str] = []
+    lock = threading.Lock()
+
+    def streams() -> dict[str, Any]:
+        with lock:
+            state, gate = reads[len(log)]
+            log.append(state)
+        if gate is not None:
+            gate.wait(10)
+        return {engine.INPUTS_STREAM_ID: {"state": state, "last_event_at": None}}
+    monkeypatch.setattr(rig.reader, "streams", streams)
+    return log
+
+
+def test_a_slow_stream_read_that_finishes_last_does_not_overwrite_a_newer_one(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = threading.Event()
+    log = _stream_reader(rig, monkeypatch, [("ok", gate), ("degraded", None)])
+    ck = rig.ck
+    slow: list[dict[str, Any]] = []
+    t = threading.Thread(target=lambda: slow.append(ck._stream_health()))
+    t.start()
+    while not log:
+        engine.time.sleep(0.001)                                  # the first read is under way and waiting
+    engine.time.sleep(0.01)
+    assert ck._stream_health()["state"] == "degraded"             # a later request reads the newer state and stores it
+    gate.set()
+    t.join(10)
+    assert slow and slow[0]["state"] == "degraded"                # the older read is told what the cache holds
+    assert ck._stream_health()["state"] == "degraded" and len(log) == 2
+
+
+def test_the_stream_health_a_caller_gets_is_its_own_copy(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stream_reader(rig, monkeypatch, [("ok", None)])
+    first = rig.ck._stream_health()
+    first["state"] = "edited"
+    assert rig.ck._stream_health()["state"] == "ok"
+    rig.ck.manifest(CRED)["freshness"]["stream"]["state"] = "edited again"
+    assert rig.ck._stream_health()["state"] == "ok"
+
+
+def test_the_stream_window_runs_from_the_end_of_the_read(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine, "STREAMS_READ_TTL_S", 0.25)
+    log: list[str] = []
+
+    def slow() -> dict[str, Any]:
+        log.append("read")
+        engine.time.sleep(0.3)                                    # longer than the window
+        return {engine.INPUTS_STREAM_ID: {"state": "ok", "last_event_at": None}}
+    monkeypatch.setattr(rig.reader, "streams", slow)
+    rig.ck._stream_health()
+    rig.ck._stream_health()
+    assert log == ["read"]                                        # the answer is fresh from when the read ended
