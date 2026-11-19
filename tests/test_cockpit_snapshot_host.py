@@ -724,3 +724,69 @@ class TestAttachTellsTheCadence:
             assert ck.worker_health()["worker"] == "stale"
         finally:
             host.stop()
+
+
+class TestFirstDiscovery:
+    """After a restart the discovered panels must answer at once from the last run's rows, not wait for the first cycle."""
+
+    def _cockpit(self, calls: Calls, gate: "threading.Event | None" = None) -> Cockpit:
+        ck = Cockpit()
+        ck.register(_recorded("fixed", calls))
+        found = _recorded("found", calls)
+
+        def discoverer(ctx: Any) -> list:
+            if gate is not None:
+                gate.wait(30)
+            return [found]
+
+        ck.discover(discoverer)
+        return ck
+
+    def _a_run_that_left_a_row_for_the_discovered_panel(self, root: Path) -> None:
+        first = SnapshotHost(self._cockpit(Calls()), root)
+        t = time.time()
+        first.run_once(t)
+        first.run_once(t + 1)
+        assert first.reader.read("found") is not None
+        first.stop()
+
+    def test_a_restarted_host_answers_a_discovered_panel_at_once_after_the_first_discovery(self, tmp_path: Path) -> None:
+        self._a_run_that_left_a_row_for_the_discovered_panel(tmp_path)
+        ck = self._cockpit(Calls())
+        host = SnapshotHost(ck, tmp_path)
+        try:
+            assert "found" not in ck.panel_ids                 # before: the panel is not known yet
+            assert host.prime_discovery() is True
+            host.attach()
+            assert "found" in ck.panel_ids and "found" in _plan_map(host)
+            answer = ck.panel("found")
+            assert answer is not None and answer["rows"]       # the last run's row, served at once
+        finally:
+            host.stop()
+
+    def test_a_discoverer_slower_than_the_bound_does_not_hold_the_open(self, tmp_path: Path, monkeypatch) -> None:
+        from levain.cockpit import snapshot_host as sh
+
+        monkeypatch.setattr(sh, "FIRST_DISCOVERY_BOUND_S", 0.2)
+        gate = threading.Event()
+        ck = self._cockpit(Calls(), gate)
+        host = SnapshotHost(ck, tmp_path)
+        try:
+            began = time.monotonic()
+            assert host.prime_discovery() is False
+            assert time.monotonic() - began < 5.0
+            host.attach()                                      # the open goes on; the cycle finds the panel later
+            assert "found" not in ck.panel_ids
+        finally:
+            gate.set()
+            host.stop()
+
+    def test_a_discoverer_that_raises_does_not_stop_the_open(self, tmp_path: Path) -> None:
+        ck = Cockpit()
+        ck.discover(lambda ctx: 1 / 0)
+        host = SnapshotHost(ck, tmp_path)
+        try:
+            assert host.prime_discovery() is True
+            host.attach()
+        finally:
+            host.stop()

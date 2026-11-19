@@ -2199,6 +2199,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             print(f"cockpit: snapshots not attached ({reason}); serving from the providers", file=sys.stderr, flush=True)
             return
         try:
+            # discovery runs once, bounded, before the cockpit reads this host's rows: a relaunched serve answers a
+            # discovered panel from the last run's row at once rather than "unknown panel" until the first cycle
+            host.prime_discovery()
             host.attach()
         except BaseException:
             host.stop()         # the host holds the store's writer lock from its construction: a failed attach gives it back
