@@ -127,10 +127,12 @@ def test_choosing_the_event_graph_survives_a_reload(tmp_path, monkeypatch):
         {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"},
         {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events'"}, {"eval": probe},
         {"eval": "location.reload(); 1"}, {"eval": "new Promise(r => setTimeout(r, 1500))"},
-        {"until": "document.querySelector('#ck-hlens .tv-seg-b')"}, {"eval": probe}])
-    before, after = json.loads(out[-5]), json.loads(out[-1])
+        {"until": "document.querySelector('#ck-hlens .tv-seg-b')"}, {"eval": probe},
+        # Home folds the graph to a strip that the page's toggle opens: the band is drawn once it is open
+        {"eval": "document.querySelector('[data-ia-graph-toggle]').click(); getComputedStyle(document.getElementById('ck-sky')).display"}])
+    before, after, opened = json.loads(out[-6]), json.loads(out[-2]), out[-1]
     assert before["hl"] == "events" and before["tv"] is False and before["pressed"] == ["Event graph"], before
-    assert after == before and after["sky"] != "none", after
+    assert {k: v for k, v in after.items() if k != "sky"} == {k: v for k, v in before.items() if k != "sky"} and opened != "none", (before, after, opened)
 
 
 @needs_browser
