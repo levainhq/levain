@@ -2611,12 +2611,14 @@ def _check_dream_claude_bin(agent_dir: Path | None = None) -> list[CheckResult]:
                     "the program the link was signed for, or sign a new link for this one (`levain dream enable "
                     "--help`).")
     facts_hint = "Fix the facts file the note names; a fire is refused until it can be read."
+    program_wrong = v.bound is not True  # unknown counts as maybe wrong: the invariant is still true
+    bound_hint = "The signed link binds this program: nothing to fix unless you did not mean to run it."
     if v.note is None:
-        hint = program_hint
+        hint = program_hint if program_wrong else bound_hint
     elif v.program is None:
         hint = facts_hint
     else:
-        hint = f"{facts_hint} Then: {program_hint}"
+        hint = f"{facts_hint} Then: {program_hint}" if program_wrong else facts_hint
     return [CheckResult("dream program", True, line, hint, warn=True)]
 
 

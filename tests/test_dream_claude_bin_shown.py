@@ -56,6 +56,8 @@ def test_a_program_the_link_binds_says_a_fire_runs_it(env, capsys):
     (row,) = doctor._check_dream_claude_bin(env["ag"])
     assert row.ok and row.warn and f"a fire runs {bin_!r} (bound by the signed link)" in row.detail
     assert FALSE_CLAIM not in row.detail
+    # L3 r3 (complement, gemini): a program the link binds must not be told to 'restore the program the link was signed for'
+    assert INVARIANT not in row.hint.lower() and "nothing to fix" in row.hint
 
 
 def test_a_program_the_link_does_not_bind_is_a_refusal_never_a_run(env, capsys):
