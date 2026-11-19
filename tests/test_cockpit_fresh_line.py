@@ -191,6 +191,35 @@ facts.stream = { state: 'connecting', everLive: false, faults: [] }; tell(); adv
 F.reset(); facts.boot = { wholeDrawn: false, lastWholeAt: 0 }; facts.stream = { state: 'connecting' }; tell();
 live(); facts.stream = { state: 'connecting', everLive: true, faults: [] }; tell(); advance(3100); out.reconnect = snap();
 
+// 11. a paused stream (a tab that has just returned, the stream not yet run again) is not live: it paints no "live" before the stream has spoken
+F.reset(); live(); tell();
+facts.stream = { state: 'down', since: fake.now, lastChunk: fake.now - 2000, faults: [], everLive: true }; tell(); advance(3100);
+const w3 = F.writes().length;
+facts.stream = { state: 'paused', faults: [], everLive: true }; tell(); advance(100);
+out.pausedFromDown = { snap: snap(), liveWrites: F.writes().slice(w3).filter((w) => w.key === 'live').length };
+facts.stream = { state: 'connecting', faults: [], everLive: true }; tell(); advance(500); live(); tell();
+out.resumedLive = { snap: snap(), last: F.writes()[F.writes().length - 1] };
+F.reset(); live(); tell();
+facts.stream = { state: 'paused', faults: [], everLive: true }; tell(); advance(1000); facts.stream = { state: 'connecting', faults: [], everLive: true }; tell(); advance(500); live(); tell(); advance(5000);
+out.pausedFromLive = { writes: F.writes().length, snap: snap() };
+
+// 12. entering "down" waits the hold whatever state it comes from: a recovery from a failed read into a stream that is still connecting is not "stream down" yet
+F.reset(); live(); tell();
+facts.boot = Object.assign({}, facts.boot, { failed: 'HTTP 502', failedAt: fake.now }); tell(); advance(3100); out.failedFirst = snap().state;
+facts.boot = Object.assign({}, facts.boot, { failed: '', failedAt: 0 }); facts.stream = { state: 'connecting', faults: [], everLive: true }; tell();
+out.afterFail0 = snap().state; advance(2900); out.afterFail2900 = snap().state; advance(300); out.afterFail3200 = snap().state;
+
+// 13. a hold pending when the tab hides is dropped; the tab seen again judges afresh and waits a whole hold of its own
+F.reset(); live(); tell();
+facts.stream = { state: 'down', since: fake.now, lastChunk: fake.now - 2000, faults: [], everLive: true }; tell(); advance(1000);
+out.holdArmed = F.armed().hold;
+Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange'));
+out.holdOnHide = F.armed().hold;
+advance(1950);
+Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+facts.stream = { state: 'connecting', faults: [], everLive: true }; document.dispatchEvent(new Event('visibilitychange'));
+advance(100); out.afterSeen100 = snap().state; advance(2700); out.afterSeen2800 = snap().state; advance(400); out.afterSeen3200 = snap().state;
+
 F.setInputs(null); F.setClock(null); F.setTimers({ setInterval: (f, m) => setInterval(f, m), clearInterval: (t) => clearInterval(t), setTimeout: (f, m) => setTimeout(f, m), clearTimeout: (t) => clearTimeout(t) });
 out.probe = 'states';
 return JSON.stringify(out); })()
@@ -234,6 +263,15 @@ def test_every_state_from_a_faked_clock_and_faked_facts(tmp_path: Path) -> None:
     assert g["seen"]["state"] == "down", g["seen"]                                                         # and repainted when seen
     assert g["slowHello5"]["state"] == "connecting" and g["slowHello9"]["state"] == "down", (g["slowHello5"], g["slowHello9"])   # a first connection waits out the longer hold
     assert g["reconnect"]["state"] == "down", g["reconnect"]                                               # a reconnect after the stream was live waits only the flap hold
+    # D(a): a paused stream is never "live": the state the page was in stays until the stream has run again, and no "live" is written meanwhile
+    assert g["pausedFromDown"]["snap"]["state"] == "down" and g["pausedFromDown"]["liveWrites"] == 0, g["pausedFromDown"]
+    assert g["resumedLive"]["snap"]["state"] == "live" and g["resumedLive"]["last"] == {"key": "live", "announce": True}, g["resumedLive"]
+    assert g["pausedFromLive"]["writes"] == 1 and g["pausedFromLive"]["snap"]["state"] == "live", g["pausedFromLive"]     # only the first paint: the return flap writes nothing
+    # D(b): entering "down" waits the hold even from a failed read
+    assert (g["failedFirst"], g["afterFail0"], g["afterFail2900"], g["afterFail3200"]) == ("failed", "failed", "failed", "down"), g
+    # D(c): a pending hold is dropped on hide and starts again on seen
+    assert g["holdArmed"] is True and g["holdOnHide"] is False, (g["holdArmed"], g["holdOnHide"])
+    assert (g["afterSeen100"], g["afterSeen2800"], g["afterSeen3200"]) == ("live", "live", "down"), g
 
 
 # the layout: the longest words with a long panel name, at the widths the page has rules for

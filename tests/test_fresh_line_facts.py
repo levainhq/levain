@@ -147,7 +147,7 @@ def test_the_state_is_the_first_match_of_the_table(tmp_path: Path) -> None:
     assert k["refused"] == "refused" and k["refusedBeatsFailed"] == "refused" and k["failed"] == "failed"
     assert k["failedColdBeatsConnecting"] == "failed"              # a refusal or a failure is said before the board has ever been drawn
     assert k["downState"] == "down" and k["downConnecting"] == "down"
-    assert k["paused"] == "live" and k["noStreamScript"] == "live"  # a hidden tab and a page without the stream script say nothing
+    assert k["paused"] == "down" and k["noStreamScript"] == "live"  # a paused stream is not live (the hold keeps the page's words until it has run again); a page without the script says nothing
     assert k["stale"] == "stale" and k["fault"] == "stale"          # a stale head, or a panel the page could not read
     assert k["downBeatsStale"] == "down" and k["failedBeatsDown"] == "failed"
     assert k["unreadIsNotStale"] == "live"
@@ -191,6 +191,12 @@ def test_a_failed_read_ages_from_the_last_read_never_from_heartbeats(tmp_path: P
 def test_the_first_connection_of_a_stream_waits_longer_than_a_reconnect(tmp_path: Path) -> None:
     first, reconnect, down, hold, hold_first = _run(tmp_path)["hold"]
     assert first == hold_first and reconnect == hold and down == hold and hold_first > hold
+
+
+def test_stale_panels_without_a_read_time_have_a_total_order(tmp_path: Path) -> None:
+    a_first, b_first, with_time = _run(tmp_path)["order"]
+    assert a_first == "A stale +1" and b_first == "B stale +1", (a_first, b_first)   # no NaN order: the given order stands
+    assert with_time == "C stale +2", with_time                                       # the one with a read time is the oldest known
 
 
 def test_a_panel_the_page_never_read_is_unavailable_and_one_it_read_once_is_stale(tmp_path: Path) -> None:

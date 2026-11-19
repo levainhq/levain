@@ -15,9 +15,10 @@
  * On a phone-width screen the age is written in its short form (STRINGS.ageShort) so its number survives beside the state words.
  *
  * Speech. The state words sit alone in the role="status" span; the age and the "updating" cue sit in a sibling span outside it, so a
- * ticking age is never announced. The words are written only when the state changes. A worse state is held HOLD_MS before it is
- * written (a stream reconnect flap does not speak); a recovery to live is spoken only if the worse state was; the first
- * connecting-to-live is silent. */
+ * ticking age is never announced. The words are written only when the state changes. A worse state, and any entry into "down" (whatever
+ * state it comes from), is held HOLD_MS before it is written (a stream reconnect flap does not speak); a hold pending when the tab hides
+ * is dropped and judged afresh when it is seen. A recovery to live is spoken only if the worse state was; the first connecting-to-live
+ * is silent. */
 (function (root) {
   "use strict";
 
@@ -57,7 +58,7 @@
   var PHONE_QUERY = "(max-width: 720px)";   // where the age is written in its short form
   var UPDATING_MS = 1000;      // a read shorter than this shows no cue
   var TICK_FAST_MS = 5000, TICK_SLOW_MS = 30000, FAST_UNTIL_MS = 60000;
-  // worse = higher; a state moves to a lower rank at once and to a higher one after HOLD_MS
+  // worse = higher; a state moves to a lower rank at once and to a higher one after its hold (and "down" is always entered after one)
   var RANK = { live: 0, connecting: 1, stale: 2, down: 3, failed: 4, refused: 5 };
   var AGED = { stale: true, down: true, failed: true };   // the states that show an age and so need the clock
 
@@ -139,13 +140,16 @@
   // opts.short: the phone's forms (the age without its words)
   function decide(facts, now, opts) {
     var f = facts, key, words = "", age = "", ageFrom = null, title = "", short = !!(opts && opts.short), holdMs = HOLD_MS, ageNow = now;
-    var stale = f.panels.filter(function (p) { return p.stale; }).sort(function (a, b) { return (a.asOfMs || Infinity) - (b.asOfMs || Infinity); });
+    // oldest read first; a panel with no read time sorts last, and those keep the order they came in (a total order: no NaN)
+    var when = function (p) { return p.asOfMs || Infinity; };
+    var stale = f.panels.filter(function (p) { return p.stale; }).sort(function (a, b) { var x = when(a), y = when(b); return x === y ? 0 : (x < y ? -1 : 1); });
     var st = f.stream.state;
-    var streamBad = st === "down" || st === "connecting" || st === "off";
+    // a paused stream (the tab has just come back) is not live either: it has not spoken yet
+    var streamBad = st === "down" || st === "connecting" || st === "off" || st === "paused";
     if (f.read.state === "refused") key = "refused";
     else if (f.read.state === "failed") key = "failed";
     else if (f.read.state === "none") key = "connecting";
-    else if (streamBad) { key = "down"; if (st === "connecting" && !f.stream.everLive) holdMs = HOLD_FIRST_MS; }
+    else if (streamBad) { key = "down"; if ((st === "connecting" || st === "paused") && !f.stream.everLive) holdMs = HOLD_FIRST_MS; }
     else if (stale.length) key = "stale";
     else key = "live";
 
@@ -279,8 +283,9 @@
       wantTick(d);
       return;
     }
-    if (worse(d.key, current.key)) {
-      // the state we are in stays on screen until the worse one has lasted HOLD_MS
+    if (worse(d.key, current.key) || d.key === "down") {
+      // the state we are in stays on screen until the worse one has lasted its hold; "down" always waits (a stream's flap is the same
+      // flap whether the page was fine, failed or refused before it)
       if (holdKey !== d.key) {
         cancelHold();
         holdKey = d.key;
@@ -327,7 +332,8 @@
       phone = typeof root.matchMedia === "function" ? root.matchMedia(PHONE_QUERY) : null;
       if (phone && typeof phone.addEventListener === "function") phone.addEventListener("change", onSeen);
     } catch (_) { phone = null; }
-    document.addEventListener("visibilitychange", function () { if (!document.hidden) onSeen(); else { stopTick(); } });
+    // a hold pending when the tab hides is dropped: the connection it judged is gone, and the tab seen again judges the new one
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) onSeen(); else { stopTick(); cancelHold(); } });
     recompute();
   }
 
