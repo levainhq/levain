@@ -42,7 +42,7 @@ SWAPS = [
     ("needs_you", "landing", "precedence 3 over 4"),
     ("landing", "in_flight", "precedence 4 over 5"),
     ("in_flight", "landed_not_closed", "precedence 5 over 6"),
-    # np-5023a20a: this pair is pinned by the link/gate cases (landed holds); an unmet item:/band: dependency is "7 over 6"
+    # np-5023a20a: this pair is pinned by the link/gate cases (landed holds); the item/band cases ("7 over 6") are pinned below
     ("landed_not_closed", "blocked", "precedence 6 over 7"),
     ("blocked", "ready_with_start", "precedence 7 over 8"),
     ("ready_with_start", "needs_grooming", "precedence 8 over 9"),
@@ -63,6 +63,21 @@ def test_swapping_two_adjacent_rules_turns_the_named_fixture_red(monkeypatch, fi
     rules[i], rules[i + 1] = rules[i + 1], rules[i]
     monkeypatch.setattr(bs, "_RULES", tuple(rules))
     assert _red(case_prefix), f"swapping {first}/{second} left {case_prefix!r} green: the order is unprotected"
+
+
+def test_the_item_band_exception_to_rule_6_is_pinned_by_its_fixtures_and_the_swap_by_the_link_gate_ones(monkeypatch):
+    """np-5023a20a: a swapped 6/7 table gives the item/band cases the same answer (blocked), so the swap is caught by the link/gate
+    cases; dropping the exception itself (rule 6 taking an item/band-blocked row) is caught by the "7 over 6" cases."""
+    rules = list(bs._RULES)
+    i = [n for n, _ in rules].index("landed_not_closed")
+    swapped = list(rules)
+    swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+    monkeypatch.setattr(bs, "_RULES", tuple(swapped))
+    assert _red("precedence 6 over 7: landed-not-closed beats an unmet"), "a swapped 6/7 table left the link/gate cases green"
+    monkeypatch.setattr(bs, "_RULES", tuple(rules))
+    real = bs._landed_standing
+    monkeypatch.setattr(bs, "_landed_standing", lambda ctx, item: (lambda r: (r[0], "closable" if r[1] == "waiting" else r[1]))(real(ctx, item)))
+    assert _red("precedence 7 over 6"), "dropping the item/band exception left its fixtures green"
 
 
 #: removing one check: the case that exists for that cause must go red
