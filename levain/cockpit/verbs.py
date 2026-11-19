@@ -1614,8 +1614,11 @@ class VerbRegistry:
         """The panel ids a landed fire of ``verb`` (fired on ``panel_id``) changed: every registered panel that offers it, the
         panel it was fired on, and the panels the verb declares it affects (its ``affects`` and a downstream's
         ``add_affects``). Nothing found, or the ``"*"`` id among them, means every registered panel: a write never under-reports
-        what it changed."""
+        what it changed. A downstream verb that declares neither (``affects``, ``add_affects``) changes panels the kernel
+        cannot know, so it touches every registered panel."""
         have = cockpit.panel_ids
+        if self.is_downstream(verb.name) and not verb.affects and not self._extra_affects.get(verb.name):
+            return list(have)
         want = {panel_id, *verb.affects, *self._extra_affects.get(verb.name, ())}
         if "*" in want:
             return list(have)

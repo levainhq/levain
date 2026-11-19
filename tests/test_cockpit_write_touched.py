@@ -391,6 +391,49 @@ def test_a_handlers_own_touched_adds_to_the_registrys_answer_for_registered_pane
     assert _landed(reg, ck, verb, "tray", {"ok": True, "touched": ["tray"]})["touched"] == base
 
 
+def _downstream_rig(tmp_path: Path):
+    from levain.cockpit import ProviderSpec, Read
+    from levain.cockpit.verbs import VerbSpec
+    from tests.test_cockpit_k2a import Rig
+
+    spec = VerbSpec("note_it", "note", "records a note", "panel", fields=("text",), floor="C1",
+                    tier_fn=lambda *a: "C1", idempotent=True, fire=lambda scope, p, target, confirm: {"summary": "noted"})
+    r = Rig(tmp_path, extra={"note_it": spec})
+    r.ck.register(ProviderSpec("ext:notes", "line", "Notes", "feed", lambda ctx: Read(value={"lines": []}),
+                               verbs=("note_it",)))
+    return r
+
+
+def _fire_note(r) -> dict:
+    from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, dispatch
+
+    return dispatch(registry=r.reg, cockpit=r.ck, scope=r.src.write_scope, credential=CRED, install_class=INSTALL_CLASS,
+                    route="cockpit", req={"verb": "note_it", "panel_id": "ext:notes", "params": {"text": "hi"},
+                                          "idempotency_key": "k1"})
+
+
+def test_a_downstream_verb_that_declares_nothing_touches_every_panel(tmp_path: Path) -> None:
+    r = _downstream_rig(tmp_path)
+    assert r.reg.is_downstream("note_it")
+    assert _fire_note(r)["touched"] == r.ck.panel_ids              # a write never under-reports what it changed
+
+
+def test_a_downstream_verb_that_declares_its_panels_touches_those(tmp_path: Path) -> None:
+    r = _downstream_rig(tmp_path)
+    r.reg.add_affects("note_it", ["health"])
+    got = _fire_note(r)["touched"]
+    assert got == [p for p in r.ck.panel_ids if p in {"ext:notes", "health"}]
+
+
+def test_a_downstream_verbspec_that_declares_affects_touches_those(tmp_path: Path) -> None:
+    from levain.cockpit.verbs import VerbSpec
+
+    r = _downstream_rig(tmp_path)
+    own = dataclasses.replace(r.reg.get("note_it"), affects=("health",))
+    assert isinstance(own, VerbSpec)
+    assert r.reg.touched(r.ck, own, "ext:notes") == [p for p in r.ck.panel_ids if p in {"ext:notes", "health"}]
+
+
 def test_a_downstream_dry_run_carries_no_touched_and_fires_nothing(tmp_path: Path) -> None:
     from levain.cockpit import ProviderSpec, Read
     from levain.cockpit.verbs import VerbSpec
