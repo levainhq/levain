@@ -254,6 +254,43 @@ def test_the_probe_snapshot_reads_a_serve_composed_store_afresh_inside_the_read_
         r.close()
 
 
+class OfferingView(FakeVerbView):
+    """A verb view whose row actions name the verbs the ROW'S panel offers, each panel's offer changeable by the test: the
+    stand-in for ``offered(registry, cockpit, panel_id)`` reading that panel's spec."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.offer: dict[str, list[str]] = {}
+
+    def row_actions(self, panel_id: str, row: dict[str, Any], *a: Any, **k: Any) -> list:
+        return [{"verb": v} for v in self.offer.get(panel_id, [])]
+
+
+def _payload(rig: Rig, rows: Any) -> dict[str, Any]:
+    ck, spec = rig.ck, rig.spec("alpha")
+    auth = ck.authority()
+    ctx = ReadContext(auth.now, authority=auth)
+    snap = dataclasses.replace(rig.snap("alpha"), rows=rows)
+    return ck._attached_panel(spec, snap, ctx, auth, "alpha", "full", None, "none")
+
+
+def test_a_row_that_takes_another_panels_offer_is_never_served_from_a_payload_kept_before_that_offer_changed(rig: Rig) -> None:
+    """A now-view row's actions come from its SOURCE panel's spec, which the payload's key does not hold: such a payload
+    is composed every time, so a changed offer of the source panel shows at once."""
+    view = OfferingView()
+    rig.ck.attach_verbs(view)
+    rig.derive()
+    rows = [{**r, "panel_id": "beta"} for r in rig.snap("alpha").rows]
+    view.offer["beta"] = ["dismiss"]
+    assert [a["verb"] for a in _payload(rig, rows)["rows"][0]["actions"]] == ["dismiss"]
+    view.offer["beta"] = ["dismiss", "snooze"]                    # the source panel's spec now offers another verb
+    assert [a["verb"] for a in _payload(rig, rows)["rows"][0]["actions"]] == ["dismiss", "snooze"]
+    own = rig.snap("alpha").rows                                  # a row of the panel's own offer is kept as ever
+    view.offer["alpha"] = ["done"]
+    first = _payload(rig, own)
+    assert _payload(rig, own) == first and any(k[1] == "alpha" for k in rig.ck._panel_cache)
+
+
 # --- 1. one read transaction per manifest ------------------------------------------------------------------------------------
 def _count_reads(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> Counter:
     calls: Counter = Counter()

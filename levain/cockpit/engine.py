@@ -3232,11 +3232,19 @@ class Cockpit:
         profile and row, and nothing else, so it is composed once per distinct key and shared read-only. That covers the
         rows' provenance and actions (each is a function of those and of the row), the log sentences (the verb labels
         of the class under that policy) and the compact projection. Set per request, on copies: a roster's health text
-        (a clock function), and every row's ``band_age``. A row lookup that finds nothing raises and stores nothing."""
+        (a clock function), every row's ``band_age``, and the head's ``as_of`` and ``valid_until`` (``_stamp_fresh``). A payload
+        with a row that takes another panel's actions is not kept (that panel's spec is not in the key). A row lookup that
+        finds nothing raises and stores nothing."""
         rkey = self._request_key(credential_class, ctx.today, auth)
         if spec.kind == "roster":
             head = self._attached_head(spec, snap, credential_class, ctx.today, auth, ctx.now, rkey)
             return self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
+        if any(isinstance(r, dict) and (r.get("panel_id") or panel_id) != panel_id for r in snap.rows or ()):
+            # a row that takes its actions from ANOTHER panel's spec (a now-view row) depends on that spec, which this
+            # panel's key does not hold: such a payload is composed every time, as a roster's is
+            head = self._cached_head(spec, snap, credential_class, ctx.today, auth, rkey)
+            out = self._panel_body(spec, snap, head, ctx, auth, panel_id, profile, None, row, credential_class, None)
+            return self._stamp_fresh(self._stamp_band_age(out, ctx.now), snap)
         key = ("panel", *self._snap_key(spec, snap), *rkey, profile, row)
         out = self._cache_get(self._panel_cache, key)
         if out is None:
