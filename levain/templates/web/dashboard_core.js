@@ -506,7 +506,7 @@
       modalReturnFocus = more;      // closing the focus view lands back on the control he pressed (its successor is found by closeModal)
     });
     panel.appendChild(more);
-    if (more.isConnected) giveTileFocus(more, "tray");   // a closed full list left no control to return to: the one drawn now is given the focus, only while focus is on the body (if .pexpand holds it the ask is dropped and focus stays there), and only if the ask is still live; a fold on a panel not yet in the page leaves the ask for the next)
+    if (more.isConnected) giveTileFocus(more, "tray");   // a closed full list left no control to return to: the one drawn now is given the focus, only while focus is on the body (if .pexpand holds it the ask is dropped and focus stays there), and only if the ask is still live; a fold on a panel not yet in the page leaves the ask for the next
     return hidden > 0;
   }
   function foldRowsAt(body, panel) {
