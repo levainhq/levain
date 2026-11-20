@@ -961,3 +961,72 @@ def test_a_symlinked_keychains_directory_is_refused(rig, tmp_path):
     with pytest.raises(hands_login.HandsRefused, match="not a directory"):
         _login(rig, "claude")
     assert list(elsewhere.iterdir()) == [] and rig.calls() == []
+
+
+# --- levain#201: the vendor preflight asks the hands uid, not the operator ----------------------------------------
+
+def _vendor_behind_a_closed_home(rig, tmp_path, monkeypatch, vendor="claude"):
+    """The vendor is a link on the hands PATH into a directory only the operator can enter (a vendor link into the
+    operator's 0700 home). The operator's own lookup follows it; the injected probe answers as the hands uid would,
+    which cannot, and records what it was asked."""
+    closed = tmp_path / "operator-home-0700"
+    closed.mkdir()
+    real = closed / vendor
+    real.write_text((rig.bindir / vendor).read_text())
+    real.chmod(0o755)
+    (rig.bindir / vendor).unlink()
+    (rig.bindir / vendor).symlink_to(real)
+    asked: list[str] = []
+
+    def hands_probe(hands, v, **kw):
+        asked.append(v)
+        return not os.path.realpath(rig.bindir / v).startswith(str(closed))
+    monkeypatch.setattr(hands_login, "vendor_probe", hands_probe, raising=False)
+    return asked
+
+
+@pytest.mark.parametrize("vendor", ["claude", "codex"])
+def test_a_login_with_the_vendor_behind_a_closed_home_refuses_by_name_before_any_lock(rig, tmp_path, monkeypatch,
+                                                                                    capsys, vendor):
+    asked = _vendor_behind_a_closed_home(rig, tmp_path, monkeypatch, vendor)
+    assert hands_login.cmd_hands_login(rig.entity, vendor) == 1
+    out = capsys.readouterr().out
+    assert vendor in out and "the hands account cannot run it" in out and out.rstrip().endswith("the login was not started")
+    assert asked == [vendor]
+    assert rig.calls() == []                         # no keychain, no mkdir, no login, no sweep: before the lock
+    fd = hands_live.take_exclusive(rig.entity)
+    assert fd is not None                            # the hands lock was never held
+    os.close(fd)
+
+
+def test_a_vendor_the_hands_uid_can_run_passes_the_login_preflight(rig, monkeypatch):
+    monkeypatch.setattr(hands_login, "vendor_probe", lambda hands, v, **kw: True, raising=False)
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st is not None and st.logged_in
+
+
+def test_the_default_probe_is_a_read_only_run_as_hands_that_follows_links(rig, tmp_path, monkeypatch):
+    monkeypatch.setattr(confinement, "HANDS_PATH", "/usr/bin:/bin")       # no codex of this host's own behind the rig's
+    seen: list[list[str]] = []
+    real = hands_live.run_bounded
+
+    def spy(argv, **kw):
+        seen.append(list(argv))
+        return real(argv, **kw)
+    import unittest.mock as mock
+    with mock.patch.object(hands_live, "run_bounded", spy):
+        assert hands_login.vendor_probe(rig.h, "claude", entity_dir=rig.entity) is True
+        (rig.bindir / "codex").unlink()
+        (rig.bindir / "codex").symlink_to(tmp_path / "nowhere")                  # a dangling link is not runnable
+        assert hands_login.vendor_probe(rig.h, "codex", entity_dir=rig.entity) is False
+    assert len(seen) == 2
+    for argv in seen:
+        assert argv[:2] == ["/usr/bin/env", "-i"] and "/bin/sh" in argv and " -x " in " ".join(argv)
+        assert not any(w in argv for w in ("rm", "/bin/rm", "mkdir", "/bin/mkdir", "chmod", "/bin/chmod"))
+    assert not any(ln.startswith("SWEEP") for ln in rig.log.read_text().splitlines()) if rig.log.exists() else True
+
+
+def test_a_probe_that_cannot_run_is_a_refusal_not_a_pass(rig):
+    rig.broken = True
+    with pytest.raises(hands_login.HandsRefused, match="a password is required"):
+        _login(rig, "claude")

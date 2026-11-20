@@ -303,6 +303,39 @@ def _as_hands_argv(hands: HandsIdentity, vendor: str, *argv: str) -> list[str]:
     return [*_launch_prefix(hands, vendor), *argv]
 
 
+#: The one exit code the vendor probe's script uses for "the hands uid cannot run it"; any other non-zero exit is the
+#: probe itself failing (the sudo rule, the launcher), which is never read as an answer.
+_PROBE_NO = 42
+#: Run as the hands user under the hands PATH: the lookup and the execute test both happen as that uid, so a link into a
+#: directory only the operator can enter fails here as it will at the start. Writes nothing.
+_PROBE_SH = f'p=$(command -v "$1") || exit {_PROBE_NO}; [ -f "$p" ] && [ -x "$p" ] || exit {_PROBE_NO}'
+
+
+def vendor_probe(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> bool:
+    """Whether the HANDS uid finds ``vendor`` on its PATH and can execute it, asked of that uid by a read-only run (no
+    lock, no sweep: nothing it starts outlives it). Tests replace this function; no second account is needed to
+    exercise the refusal. A probe that cannot run raises :class:`HandsLoginError`, never answers False."""
+    r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, "/bin/sh", "-c", _PROBE_SH, "sh", vendor),
+                             entity_dir=entity_dir, held=False, sweep=False, what=f"the {vendor} check")
+    if r.returncode == 0:
+        return True
+    if r.returncode == _PROBE_NO:
+        return False
+    raise HandsLoginError(f"could not check {vendor} as {hands.user}: {_brief(_text(r)) or f'exit {r.returncode}'}")
+
+
+def vendor_refusal(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> str | None:
+    """Why the hands account cannot run ``vendor``, or None. Asked of the hands uid (:func:`vendor_probe`), not judged
+    as the operator: a vendor link into the operator's own home passes an operator-side lookup and then ends the start in
+    its own error after the locks. Callers ask it BEFORE any lock."""
+    if vendor_probe(hands, vendor, entity_dir=entity_dir):
+        return None
+    from levain.firing import confinement
+    return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}) or the hands account cannot run it "
+            f"(a link into the operator's home, say); install {vendor} where the hands account can run it, under "
+            "/usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors puts claude and codex there)")
+
+
 def _lstat(hands: HandsIdentity, vendor: str, path: str, *, entity_dir: Path | str,
            held: bool, sweep: bool = True) -> tuple[str, int, str, str] | None:
     """``(type, uid, owner, mode)`` of ``path`` read AS the hands user, not following a symlink; None only when stat
@@ -897,6 +930,14 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     if refusal:
         raise HandsRefused(refusal)
     say = emit or _write_out
+    try:
+        gone = vendor_refusal(hands, vendor, entity_dir=entity_dir)      # before the lock: nothing is held or changed
+    except HandsRefused:
+        raise
+    except HandsLoginError as exc:
+        raise HandsRefused(f"{exc}; the login was not started") from None
+    if gone is not None:
+        raise HandsRefused(f"{gone}; the login was not started")
     with hands_lock(entity_dir, "a login"):
         try:
             ensure_config_home(hands, vendor, entity_dir=entity_dir)

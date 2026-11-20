@@ -142,7 +142,8 @@ def vendor_missing(vendor: str) -> str | None:
     a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one installed only in the
     operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare ``env: claude: No
     such file or directory`` after the locks, the sweep and the prepare. Looked up as the operator, on that PATH and
-    nothing else: a binary the operator cannot see there the hands account cannot either."""
+    nothing else: a binary the operator cannot see there the hands account cannot either. That rules a vendor out and
+    never in (a link into the operator's own home passes it): :func:`hands_cannot_run` asks the hands uid."""
     import shutil
     from levain.firing import confinement
     if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
@@ -150,6 +151,12 @@ def vendor_missing(vendor: str) -> str | None:
     return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}); install {vendor} where the "
             "hands account can run it, under /usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors "
             "puts claude and codex there)")
+
+
+def hands_cannot_run(vendor: str, entity_dir: Path | str) -> str | None:
+    """Why the hands uid cannot run ``vendor``, or None, asked of that uid by a read-only run and before any lock
+    (:func:`levain.firing.hands_login.vendor_refusal`, shared with ``hands login``)."""
+    return hl.vendor_refusal(hl.load_hands_identity(entity_dir), vendor, entity_dir=entity_dir)
 
 
 def project_layer(workspace: Path, vendor: str) -> Path | None:
@@ -754,7 +761,10 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
         raise HandsChatRefused(f"{refusal}; no chat was started")
     if vendor not in VENDORS:
         raise HandsChatRefused(f"unknown vendor {vendor!r}; one of {', '.join(VENDORS)}")
-    missing = vendor_missing(vendor)
+    try:        # lock-free, and before any lock: the hands uid is asked whether it can run the vendor
+        missing = vendor_missing(vendor) or hands_cannot_run(vendor, entity_dir)
+    except hl.HandsLoginError as exc:
+        raise HandsChatRefused(f"{exc}; no chat was started") from None
     if missing is not None:
         raise HandsChatRefused(f"{missing}; no chat was started")
     try:

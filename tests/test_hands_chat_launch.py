@@ -873,3 +873,37 @@ def test_the_other_refused_paths_keep_the_refusal_text_without_the_marketplaces_
     text = str(info.value)
     assert "known_marketplaces" not in text and text.endswith("hold; remove it; no chat was started"), text
     assert_released(rig)
+
+
+# --- levain#201: the launch asks the hands uid whether it can run the vendor, before any lock --------------------
+
+@pytest.mark.parametrize("vendor", ["claude", "codex"])
+def test_a_vendor_link_into_a_closed_home_is_refused_by_name_before_any_lock(rig, monkeypatch, tmp_path, vendor):
+    """The operator's lookup follows a link into the operator's 0700 home and passes; the hands uid cannot enter
+    that directory, and the launch used to die in its own error after the locks, the sweep and the prepare."""
+    from levain.firing import confinement
+    closed = tmp_path / "operator-home-0700"
+    closed.mkdir()
+    real = closed / vendor
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    bindir = tmp_path / "hands-bin"
+    bindir.mkdir()
+    (bindir / vendor).symlink_to(real)
+    monkeypatch.setattr(confinement, "HANDS_PATH", str(bindir))
+    monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    asked = []
+
+    def hands_probe(hands, v, **kw):
+        asked.append((hands.user, v))
+        return False                                  # what the hands uid gets from the closed directory
+    monkeypatch.setattr(hands_login, "vendor_probe", hands_probe, raising=False)
+    rig.register("alpha", callback_port=49601)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused) as info:
+        launch(rig, vendor, spawn=fake)
+    msg = str(info.value)
+    assert vendor in msg and "the hands account cannot run it" in msg and msg.endswith("no chat was started")
+    assert asked == [("levain-hands", vendor)]
+    assert fake.started == [] and rig.events == []          # no sweep, no prepare: refused before the locks
+    assert_released(rig)
