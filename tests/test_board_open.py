@@ -1,6 +1,6 @@
 """``levain board open`` (levain#179): the open items of the derived board, a read verb that stores nothing.
 
-The set is taken from ``board_state.STATE_COLUMN``, so these tests name the constants and never restate a list of states. The
+The open and closed states are pinned by literal below (and tied to ``board_state.STATE_COLUMN``), never taken from the code under test. The
 mutation tests run the real verb over a real git world and a scratch store: a close that lands drops an item from the view, an
 unsigned band clear does not, a decision to cut does, and the verb writes neither the store nor the repo."""
 from __future__ import annotations
@@ -81,18 +81,28 @@ def _doc(states=STATES, **extra) -> dict:
                  "reason": f"why {s}", "refs": [], "as_of": None, "kind": STATE_KIND[s]} for n, s in enumerate(states, 1)], **extra}
 
 
-def test_the_open_states_are_every_state_outside_the_off_and_done_columns():
-    closed = {s for s, c in STATE_COLUMN.items() if c in board_cli.CLOSED_COLUMNS}
-    assert set(board_cli.OPEN_STATES) == set(STATES) - closed
-    assert closed and set(board_cli.OPEN_STATES) and not closed & set(board_cli.OPEN_STATES)
-    assert set(board_cli.CLOSED_COLUMNS) <= set(COLUMNS)
+# The sets are pinned by literal, never taken from the code under test: a closed column that grows (or an open state that is
+# quietly ruled closed) must fail here. A state added to the board fails ``test_every_state_is_ruled_open_or_closed`` until it is ruled.
+OPEN_BY_RULING = {"needs_you", "landing", "in_flight", "landed_not_closed", "blocked", "ready_with_start", "needs_grooming", "ready", "unknown"}
+CLOSED_BY_RULING = {"cut", "parked", "out_of_1_0", "done"}
+
+
+def test_every_state_is_ruled_open_or_closed_once():
+    assert not OPEN_BY_RULING & CLOSED_BY_RULING
+    assert OPEN_BY_RULING | CLOSED_BY_RULING == set(STATE_COLUMN)
+
+
+def test_the_open_states_are_the_literal_ruling_and_the_closed_columns_are_off_and_done():
+    assert set(board_cli.CLOSED_COLUMNS) == {"off", "done"}
+    assert set(board_cli.OPEN_STATES) == OPEN_BY_RULING
+    assert {s for s in STATE_COLUMN if not board_cli._is_open({"state": s})} == CLOSED_BY_RULING
     assert "unknown" in board_cli.OPEN_STATES                  # fail closed: an item the board cannot read is never "not open"
 
 
 def test_the_view_holds_exactly_the_open_states_whatever_a_state_is_named():
     doc = _doc()
     view = board_cli.open_view(doc)
-    assert {i["state"] for i in view["items"]} == set(board_cli.OPEN_STATES)
+    assert {i["state"] for i in view["items"]} == OPEN_BY_RULING
     assert all(i in doc["items"] for i in view["items"])                       # the document's own dicts: no key added
     assert set(view) == {"schema", "as_of", "items", "audit", "problems", "reader"}
 
@@ -116,7 +126,7 @@ def test_unknown_prints_first_then_the_boards_column_order():
 
 def test_each_item_line_carries_its_id_title_and_reason_and_the_header_its_counts():
     lines = board_cli.open_lines(_doc())
-    n_open = len(board_cli.OPEN_STATES)
+    n_open = len(OPEN_BY_RULING)
     assert lines[0] == f"open: {n_open} of {len(STATES)} items, as of 2026-11-12T20:00:00Z"
     ready = [ln for ln in lines if "title of ready_with_start" in ln]
     assert ready and "why ready_with_start" in ready[0] and ready[0].lstrip().startswith("levain#")
@@ -245,7 +255,7 @@ def test_the_json_is_the_open_selection_with_the_documents_own_items_and_no_new_
     _, out_open, _ = open_run(capsys, items, "--json")
     state, opened = json.loads(out_state), json.loads(out_open)
     assert set(opened) == {"schema", "as_of", "items", "audit", "problems", "reader"}
-    assert opened["items"] == [i for i in state["items"] if i["state"] in board_cli.OPEN_STATES]
+    assert opened["items"] == [i for i in state["items"] if i["state"] in OPEN_BY_RULING]
     assert opened["audit"] == state["audit"] and opened["problems"] == state["problems"]
 
 
@@ -274,7 +284,7 @@ def test_in_flight_naming_a_done_item_and_a_cut_item_reports_both():
 def test_in_flight_naming_every_closed_state_is_reported_and_every_open_state_is_not():
     for state in STATES:
         got = board_cli.in_flight_drift(_body("levain#1"), _board_with(n1=state))
-        assert bool(got) == (state not in board_cli.OPEN_STATES), state
+        assert bool(got) == (state in CLOSED_BY_RULING), state
 
 
 def test_in_flight_naming_an_open_item_or_no_board_id_reports_nothing():
