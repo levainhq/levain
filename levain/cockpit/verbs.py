@@ -42,7 +42,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
 from levain.cockpit.effects import INTAKE_TIERS, INTAKE_VERB, intake_kind_of
@@ -188,9 +188,6 @@ class VerbSpec:
     # verb's effect answers to that verb's raise too, so a raise is never stepped around by a second door. ``list_intake``
     # names ``intention_seed`` for a drop or a talk (both plant an intention_seed effect); None for every other verb
     policy_also: Callable[[dict[str, Any]], tuple[str, ...]] | None = None
-    # panel ids, beside the panels that offer this verb, whose content a landed fire changes (a panel derived from what the
-    # verb writes). Ids that name no registered panel are dropped when the response's ``touched`` is built
-    affects: tuple[str, ...] = ()
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
     # §3.4, §4.1): it may raise a tier, never lower one
@@ -1482,52 +1479,6 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              legacy_kind="undo", applies_to=lambda r: _facet(r, "undoable") is True),
 )
 
-# The panels a landed write touches beyond the ones offering the verb, by the store the write changes and the panels that
-# read that store. A panel is left out only where its reader was read and takes nothing from the store; where that could not be
-# shown it is in (an unneeded entry costs one background refetch, a missing one leaves the page showing old data after the
-# user's own write). An id that is not registered is dropped from ``touched``.
-_INTENTION_AFFECTS = ("tray", "begin", "memory_glance", "edits")     # the open intentions, and the edits ledger beside them
-# the episodes: the Recent episodes list, health's counts, the activity feed, the memory glance, the figure "where to begin"
-# shows (episodes since the last wrap), and the cognition graph (its nodes are the episodes)
-_EPISODE_AFFECTS = ("episodes", "health", "activity", "memory_glance", "begin", "graph")
-# the question store and the consent queue's band rows: the Decisions panel, the List's band, the activity feed and the topology's
-# waiting nodes. A row filed by a wake lands there too (``_wake_after_resolve``)
-_QUESTION_AFFECTS = ("decisions", "tray", "activity", "topology")
-_REVIEW_AFFECTS = ("review-queue", "coord-morning")                   # the desk's review queue and its morning card
-_DROP_AFFECTS = ("coord-status", "coord-morning")                     # a plain line is stored as a desk drop
-_AGENT_AFFECTS = ("agents",)                                          # the agent store
-_ALL_PANELS = ("*",)                                                  # what the write changed cannot be named
-_INTENTION_WRITERS = frozenset({"band_agenda", INTAKE_VERB})
-# a verb with a legacy kind lands through ``apply_edit`` and appends to the edits ledger
-_LEDGER_AFFECTS = ("edits",)
-_BAND_INTENTION_VERBS = ("intention_snooze", "intention_edit", "intention_done", "intention_clear", "band_agenda")
-# the four verbs that call ``_wake_after_resolve``: whether they woke anything is the result's, so the panels a wake lands in are
-# named for every one of them
-_RESOLVING_VERBS = ("intention_close", "intention_done_once", "intention_stop_series", "intention_promote")
-_KERNEL_AFFECTS: dict[str, tuple[str, ...]] = {
-    "intention_keep": _EPISODE_AFFECTS,
-    **{v: _QUESTION_AFFECTS for v in (*_BAND_INTENTION_VERBS, *_RESOLVING_VERBS, "question_answer", "band_answer", "note_dismiss")},
-    INTAKE_VERB: _DROP_AFFECTS,
-    "episode_tombstone": _EPISODE_AFFECTS,
-    "operator_state": _EPISODE_AFFECTS,           # the line's felt episode is recorded with it
-    **{v: _REVIEW_AFFECTS for v in ("review_clear", "review_reopen", "review_clear_signed")},
-    **{v: _AGENT_AFFECTS for v in ("agent_pause", "agent_resume", "agent_renew", "agent_revoke", "agent_retire")},
-    **{v: _ALL_PANELS for v in ("undo", "section_edit", "config", "entity_name")},
-}
-
-
-def _with_affects(v: VerbSpec) -> VerbSpec:
-    base: tuple[str, ...] = ()
-    if v.name.startswith("intention_") or v.name in _INTENTION_WRITERS:
-        base += _INTENTION_AFFECTS
-    if v.legacy_kind:
-        base += _LEDGER_AFFECTS
-    got = tuple(dict.fromkeys((*base, *_KERNEL_AFFECTS.get(v.name, ()))))
-    return dataclasses.replace(v, affects=got) if got else v
-
-
-KERNEL_VERBS = tuple(_with_affects(v) for v in KERNEL_VERBS)
-
 LEGACY_KINDS: dict[str, str] = {v.legacy_kind: v.name for v in KERNEL_VERBS if v.legacy_kind}
 
 # K8: the kernel verbs a device credential (a phone passkey) may fire, each as a signed broker pending; the broker
@@ -1550,7 +1501,6 @@ class VerbRegistry:
         self._specs: dict[str, VerbSpec] = {}
         self._downstream: dict[str, ActionVerb] = {}
         self._downstream_names: set[str] = set()
-        self._extra_affects: dict[str, tuple[str, ...]] = {}
         for v in KERNEL_VERBS:
             self._add(v)
         for name, spec in (downstream or {}).items():
@@ -1598,36 +1548,6 @@ class VerbRegistry:
 
     def get(self, name: str) -> VerbSpec | None:
         return self._specs.get(name)
-
-    def add_affects(self, verb: str, panel_ids: "Iterable[str]") -> None:
-        """A downstream names panels (ids the kernel cannot know) whose content ``verb`` changes, beside the panels that
-        offer it and the verb's own ``affects``: they join the response's ``touched``. An id that is not registered when a
-        fire lands is dropped there."""
-        if verb not in self._specs:
-            raise ValueError(f"no verb {verb!r} is registered")
-        ids = [p for p in panel_ids]
-        if not all(isinstance(p, str) and p for p in ids):
-            raise ValueError("panel ids must be non-empty strings")
-        self._extra_affects[verb] = tuple(dict.fromkeys((*self._extra_affects.get(verb, ()), *ids)))
-
-    def touched(self, cockpit: "Cockpit", verb: VerbSpec, panel_id: str) -> list[str]:
-        """The panel ids a landed fire of ``verb`` (fired on ``panel_id``) changed: every registered panel that offers it, the
-        panel it was fired on, and the panels the verb declares it affects (its ``affects`` and a downstream's
-        ``add_affects``). Nothing found, or the ``"*"`` id among them, means every registered panel: a write never under-reports
-        what it changed. A downstream verb that declares neither (``affects``, ``add_affects``) changes panels the kernel
-        cannot know, so it touches every registered panel."""
-        have = cockpit.panel_ids
-        if self.is_downstream(verb.name) and not verb.affects and not self._extra_affects.get(verb.name):
-            return list(have)
-        want = {panel_id, *verb.affects, *self._extra_affects.get(verb.name, ())}
-        if "*" in want:
-            return list(have)
-        for pid in have:
-            spec = cockpit.spec(pid)
-            if spec is not None and verb.name in spec.verbs:
-                want.add(pid)
-        got = [pid for pid in have if pid in want]
-        return got or list(have)
 
     def names(self) -> list[str]:
         return list(self._specs)
@@ -2015,8 +1935,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                           panel_version=req.get("panel_version"))
     _require_confirm(verb, req)
     if registry.is_downstream(verb.name):
-        return _landed(registry, cockpit, verb, panel_id,
-                       _fire_downstream(registry, verb, scope, params, req, job_runtime, panel_id))
+        return _fire_downstream(registry, verb, scope, params, req, job_runtime, panel_id)
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
@@ -2042,22 +1961,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     if verb.binding == "value":
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)
-    return _landed(registry, cockpit, verb, panel_id, verb.fire(scope, params, target, req.get("confirm") is True))
-
-
-def _landed(registry: VerbRegistry, cockpit: "Cockpit", verb: VerbSpec, panel_id: str,
-            result: dict[str, Any]) -> dict[str, Any]:
-    """A C1 fire's result with the panels it changed (``touched``, never empty). The effect's own ``row`` (the row as the
-    write left it, when the write held it) passes through untouched. A handler that names its own ``touched`` ADDS to the
-    registry's answer, for the ids that are registered panels: the set is never narrower than what the registry reports."""
-    if not isinstance(result, dict):
-        return result
-    got = registry.touched(cockpit, verb, panel_id)
-    supplied = result.get("touched")
-    if isinstance(supplied, list):
-        want = {*got, *(p for p in supplied if isinstance(p, str))}
-        got = [p for p in cockpit.panel_ids if p in want]
-    return {**result, "touched": got}
+    return verb.fire(scope, params, target, req.get("confirm") is True)
 
 
 def _check_seen(req: dict[str, Any], intent: str | None) -> None:
