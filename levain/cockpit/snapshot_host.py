@@ -305,7 +305,7 @@ class SnapshotHost:
             reader = self._reader = SnapshotReader(path)
             self._loop = DeriveLoop(
                 self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
-                poll_s=self._poll_s, token_fn=token_fn, clock=clock, on_publish=None,
+                poll_s=self._poll_s, token_fn=token_fn, clock=clock, on_publish=self._tell_cockpit_published,
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
         except BaseException:
@@ -415,6 +415,13 @@ class SnapshotHost:
         False when a slower discoverer is still running: the cycle takes its panels in when it lands."""
         bound = FIRST_DISCOVERY_BOUND_S if bound_s is None else bound_s
         return self._first_discovery.wait(bound)
+
+    def _tell_cockpit_published(self, panel_id: str, gen: int, write_gen: int) -> None:
+        """The loop's publish notice, passed on to the cockpit: it wakes a read that is waiting for a write's row (D7). A
+        cockpit that has no such hook (a stand-in in a test) is simply not told."""
+        note = getattr(self._cockpit, "note_publish", None)
+        if note is not None:
+            note(panel_id, gen, write_gen)
 
     def _deriving_panels(self) -> list[str]:
         # the loop is busy with the host's two pseudo-plans too; the cockpit's word is about panels
