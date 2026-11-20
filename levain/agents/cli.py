@@ -67,6 +67,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.set_defaults(func=run_role_show)
     _add_p2_parsers(verbs)
     _add_operator_parsers(verbs)
+    _add_session_install_parsers(verbs)
     _add_signing_parsers(verbs)
     _add_revoke_parsers(verbs)
     # the verbs above open the agent store; `fence` never does and `tick` says its own refusal, so they are added after
@@ -659,6 +660,79 @@ def run_attach(args: argparse.Namespace) -> int:
         print(f"created the operator agent {got.record_id}")
     print(f"{agent['name']} {agent['agent_id']}: attached to {got.record_id} as role {got.role_name}"
           + ("" if got.attached else " (already)"))
+    return 0
+
+
+# ---- the store's session install: `session-install` writes session_install.json through session_wire.write_install ----
+
+def _add_session_install_parsers(verbs: argparse._SubParsersAction) -> None:
+    si = verbs.add_parser(
+        "session-install", help="Write the store's session install facts (launcher, episodic store, workspaces, cockpit root).",
+        allow_abbrev=False,
+        description="Write <store dir>/session_install.json, the one source of the launcher and the paths a session "
+                    "agent may use, through session_wire.write_install. The file is replaced whole by what "
+                    "these flags give; a call that is refused writes nothing and leaves the old file as it was. "
+                    "--launcher must name a registered launcher. Prints what it wrote. Give --store-dir before "
+                    "`session-install`.")
+    si.add_argument("--cockpit-root", dest="cockpit_root", type=Path, required=True,
+                    help="The cockpit's data root (an absolute path to an existing directory).")
+    si.add_argument("--launcher", default=None, help="The registered launcher's name (default: none named).")
+    si.add_argument("--episodic-path", dest="episodic_path", type=Path, default=None,
+                    help="The episodic store file the agents' episodes are read from and written to (absolute).")
+    si.add_argument("--values", default=None, metavar="JSON",
+                    help="A JSON object: the values handed to the role's slots.")
+    si.add_argument("--workspace", dest="workspace", action="append", nargs="+", default=None,
+                    metavar="AGENT_ID REPO [BRANCH]",
+                    help="AGENT_ID REPO [BRANCH]: the agent's repo (an absolute path) and the local branch staged "
+                         "(default: the repo's checked-out HEAD). Repeat for more agents.")
+    si.set_defaults(func=run_session_install)
+
+
+def _install_workspaces(entries) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for entry in entries or ():
+        if len(entry) not in (2, 3):
+            raise ValueError("--workspace takes AGENT_ID REPO [BRANCH]")
+        if entry[0] in out:
+            raise ValueError(f"--workspace names {entry[0]!r} twice")
+        out[entry[0]] = {"repo": entry[1], **({"branch": entry[2]} if len(entry) == 3 else {})}
+    return out
+
+
+def run_session_install(args: argparse.Namespace) -> int:
+    from levain.agents import session_wire
+
+    try:
+        values = None if args.values is None else json.loads(args.values)
+        if values is not None and not isinstance(values, dict):
+            raise ValueError("--values is not a JSON object")
+        workspaces = _install_workspaces(args.workspace)
+    except ValueError as exc:      # json.JSONDecodeError is one
+        return _fail("session-install", f"{exc} (nothing written)")
+    if args.launcher is not None and args.launcher not in session_wire.LAUNCHERS:
+        return _fail("session-install", f"launcher {args.launcher!r} is not registered: "
+                                        f"{', '.join(sorted(session_wire.LAUNCHERS)) or 'none'} are (nothing written)")
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        path = session_wire.write_install(store.directory, cockpit_root=args.cockpit_root, launcher=args.launcher,
+                                          episodic_path=args.episodic_path, values=values, workspaces=workspaces)
+    except session_wire.InstallRefused as exc:
+        return _fail("session-install", f"{exc} (nothing written)")
+    except OSError as exc:
+        return _fail("session-install", f"cannot write the install ({exc})")
+    try:
+        install = session_wire.read_install(store.directory)      # what was written, read back by read_install
+    except session_wire.InstallRefused as exc:
+        return _fail("session-install", f"wrote {path} but cannot read it back: {exc}")
+    print(f"wrote {path}")
+    print(f"cockpit_root: {install.cockpit_root}")
+    print(f"launcher: {install.launcher if install.launcher is not None else '(none)'}")
+    print(f"episodic_path: {install.episodic_path if install.episodic_path is not None else '(none)'}")
+    print(f"values: {json.dumps(dict(install.values), sort_keys=True, ensure_ascii=False)}")
+    for agent, ws in sorted(install.workspaces.items()):
+        print(f"workspace {agent}: {ws.repo}" + (f" @ {ws.branch}" if ws.branch is not None else ""))
     return 0
 
 
