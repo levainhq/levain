@@ -253,7 +253,8 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     sources = [(t, seam_classes.KIND_CLASSES.get(t, {}).get("COUNTED")) for t in sorted(seam_classes.COUNTED & present)]
 
     head_lines = _header(conn, kind, read_at, head, floor, floor_open, handoff)
-    handoff_lines = _guard("Handoff section", lambda: _handoff_section(conn, handoff, sources, head), failed,
+    board_read = _BoardRead(store)         # the one read of the board this brief makes: the handoff's drift and the Board block share it
+    handoff_lines = _guard("Handoff section", lambda: _handoff_section(store, conn, handoff, sources, head, board_read), failed,
                            critical=True)
     # the counts and the detail are one read of the window: either failing leaves the window unread
     counts, rows, since_lines = _guard("Since", lambda: _since(conn, sources, floor, head), failed, critical=True,
@@ -272,7 +273,7 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
                   else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
     rest = _collapse_zeros(read_at, unseq_lines,
                            _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
-                           _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
+                           _guard("Board", lambda: _board(store, conn, read_at, board_read), failed), band_lines, card_lines)
     # read on its own: a band that could not be read says nothing about the away marks; only this row's own failure
     # beside an unread band repeats what the band line already says
     missing = _guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)
@@ -370,7 +371,53 @@ def _header(conn: sqlite3.Connection, kind: str, read_at: str, head: int, floor:
     return lines
 
 
-def _handoff_section(conn: sqlite3.Connection, handoff: Any, sources: list, head: int) -> list[str]:
+class _BoardRead:
+    """One brief's one read of the board, taken the first time a section asks and shared by the rest, so the handoff's drift lines and
+    the Board block never judge two snapshots (the one the first read saw, the one a moment later saw). What the read raised is kept
+    and raised again for the next asker: a board that could not be read is as unread for both. A brief that names no board id in
+    ``in_flight`` and has no Board block to draw reads nothing here."""
+
+    def __init__(self, store: CoordStore) -> None:
+        self._store = store
+        self._outcome: tuple[dict[str, Any] | None, Exception | None] | None = None
+
+    def get(self) -> dict[str, Any]:
+        from levain.desk import board_cli
+
+        if self._outcome is None:
+            try:
+                code, doc, err = board_cli.read_board(consent_dir=self._store.directory)     # the store being rendered, not the process's home
+                self._outcome = (doc, None) if doc is not None else (
+                    None, CoordError(err or f"levain board state exited {code} with no board"))
+            except Exception as exc:  # noqa: BLE001 - kept: each section says it in its own words
+                self._outcome = (None, exc)
+        doc, exc = self._outcome
+        if exc is not None:
+            raise exc
+        assert doc is not None
+        return doc
+
+
+def _in_flight_drift(board: _BoardRead, body: dict) -> list[str]:
+    """The lines saying an ``in_flight`` entry names a board item the board no longer reads as open, beside the list.
+    A board that cannot be read (or read no item and says why) is one line here and never fails the section; with no board id named,
+    the board is not read."""
+    from levain.desk import board_cli
+
+    if not board_cli.in_flight_ids(body):
+        return []
+    try:
+        doc = board.get()
+        problems = board_cli.problem_lines(doc)
+        if problems and not doc["items"]:       # a store that read no item says nothing about any id: not "no drift"
+            raise CoordError("the board read no item: " + "; ".join(p.strip() for p in problems[:2]))
+        return [f"  {line}" for line in board_cli.in_flight_drift(body, doc)]
+    except Exception as exc:  # noqa: BLE001 - named on its line; the handoff's own lines stand
+        return [f"  in_flight vs the board: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"]
+
+
+def _handoff_section(store: CoordStore, conn: sqlite3.Connection, handoff: Any, sources: list, head: int,
+                     board: _BoardRead | None = None) -> list[str]:
     if handoff is None:
         return ["Handoff section: absent (no seam_handoffs row)"]
     body = json.loads(handoff.body)
@@ -379,6 +426,7 @@ def _handoff_section(conn: sqlite3.Connection, handoff: Any, sources: list, head
              f"  state: {body['state_line']}"]
     for entry in body["in_flight"]:
         lines.append(f"  in flight: {entry['item']} (owner {entry['owner']}): {entry['why']}")
+    lines += _in_flight_drift(board or _BoardRead(store), body)
     if body["next"].strip():
         lines.append(f"  next: {body['next']}")
     for entry in body["contingencies"]:
@@ -530,28 +578,28 @@ def _missing_close(conn: sqlite3.Connection, present: set[str], qdir: Path) -> l
     return [f"Missing close: operator seam began {began} ({who} away); no operator close {prior}"]
 
 
-def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[str]:
+def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str, board: _BoardRead | None = None) -> list[str]:
     """The one board block (T7, levain#101): ``levain board state``'s own read (:func:`levain.desk.board_cli.read_board`,
     T3), never the v1 ready queue, which is retired and takes no more rows. A board that cannot be read raises, so the
-    brief's guard says ``Board: cannot-derive`` and never an empty board. Board changes are not in the ordered ``gseq``
+    brief's guard says ``Board: cannot-derive`` and never an empty board. It lists the OPEN items (``board_cli.open_view``), capped, and
+    names ``levain board open`` as where the rest are read. Board changes are not in the ordered ``gseq``
     stream the Since section reads (the board is a JSONL store, which no SQLite snapshot can join), so this block is the
     open's one account of the board."""
     from levain.desk import board_cli
 
-    code, doc, err = board_cli.read_board(consent_dir=store.directory)     # the store being rendered, not the process's home
-    if doc is None:
-        raise CoordError(err or f"levain board state exited {code} with no board")
+    doc = (board or _BoardRead(store)).get()
     items = doc["items"]
     audit = doc["audit"]
     problems = board_cli.problem_lines(doc)         # a repo that could not be read says so: never "0 items" over a failed read
     if not items and not audit and not problems:
         return ["Board: 0 items"]
-    lines = [f"Board: {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
+    open_items = board_cli.open_view(doc)["items"]  # the open ones, in the order ``levain board open`` draws them: done and cut are not spent slots
+    lines = [f"Board: {len(open_items)} open of {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
              f"(levain board state, as of {doc.get('as_of') or 'unknown'})"]
-    for it in items[:_LIST_LINES]:
+    for it in open_items[:_LIST_LINES]:
         lines.append(_cap(f"  {it['id']} [{it['state']}] {it['reason']}"))
-    if len(items) > _LIST_LINES:
-        lines.append(f"  ... {len(items) - _LIST_LINES} more not listed")
+    if len(open_items) > _LIST_LINES:
+        lines.append(f"  ... {len(open_items) - _LIST_LINES} more open not listed: read them with `levain board open`")
     for a in audit[:_LIST_LINES]:
         lines.append(_cap(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}"))
     if len(audit) > _LIST_LINES:

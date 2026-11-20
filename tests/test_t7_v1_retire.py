@@ -293,9 +293,27 @@ def test_the_desks_open_prints_one_board_block_from_the_boards_own_read(desk, mo
     calls = _fake_board(monkeypatch)
     text = seam.open_brief(store, store.directory, "operator", datetime.now(timezone.utc)).text.splitlines()
     block = [ln for ln in text if ln.startswith("Board:")]
-    assert len(block) == 1 and "2 item(s), 1 audit entry" in block[0]
+    assert len(block) == 1 and "1 open of 2 item(s), 1 audit entry" in block[0]
     assert "  levain#101 [ready] the claim reader landed" in text and "  audit unknown: flow#9: a trailer names it" in text
+    assert not any(ln.startswith("  flow#9 [") for ln in text)                 # a done item is not an open one
     assert calls == [None]
+
+
+def test_the_open_block_lists_open_items_first_whatever_the_store_order_and_names_the_verb_for_the_rest(desk, monkeypatch):
+    from datetime import datetime, timezone
+
+    from levain.desk import seam
+
+    store, token = desk
+    done = [{"id": f"levain#{n}", "state": "done", "reason": "merged"} for n in range(1, seam._LIST_LINES + 5)]        # first in store order
+    cut = [{"id": "levain#900", "state": "cut", "reason": "decided"}]
+    live = [{"id": f"levain#{n}", "state": "ready", "reason": "r"} for n in range(1000, 1000 + seam._LIST_LINES + 2)]
+    _fake_board(monkeypatch, doc={**DOC, "items": done + cut + live, "audit": []})
+    text = seam.open_brief(store, store.directory, "operator", datetime.now(timezone.utc)).text.splitlines()
+    block = [ln for ln in text if ln.startswith("  levain#")]
+    assert len(block) == seam._LIST_LINES and all("[ready]" in ln for ln in block)          # no slot spent on done or cut
+    assert any(ln.startswith(f"Board: {seam._LIST_LINES + 2} open of {len(done) + 1 + seam._LIST_LINES + 2} item(s)") for ln in text)
+    assert "  ... 2 more open not listed: read them with `levain board open`" in text
 
 
 def test_an_unreadable_board_says_cannot_derive_never_an_empty_board(desk, monkeypatch):
