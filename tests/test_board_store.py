@@ -1195,3 +1195,40 @@ def test_the_config_read_back_can_be_written_back(home, tmp_path, capsys):
     assert isinstance(conf["tiers"]["levain"], tuple)
     assert bs.write_config(d, conf["producers"], conf["no_land_waiter"], conf["tiers"]) is False
     assert _conf(d)["tiers"] == {"levain": ["light", "heavy"]}
+
+
+def test_a_signed_add_is_refused_when_the_vocabulary_moved_during_the_ceremony(home, tmp_path, capsys, monkeypatch):
+    from levain.desk import board_sign
+    d = use(capsys, tmp_path / "store")
+    real = board_sign.ceremony
+
+    def ceremony(seal, record):
+        bs.set_tiers(d, "levain", ["heavy"])        # a `board tiers` run while the prompt waited
+        return real(seal, record)
+    monkeypatch.setattr(board_sign, "ceremony", ceremony)
+    rc, _, err = run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b", "--tier", "light", *SIGNED)
+    assert rc == 2 and "heavy" in err and lines(d) == []
+
+
+def test_a_malformed_tiers_refusal_names_the_command_that_exists(home, tmp_path, capsys):
+    d = use(capsys, tmp_path / "store")
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": {"levain": "x"}}))
+    assert "board tiers levain" in _add(capsys, "light")[2] and "--tiers" not in _add(capsys, "light")[2]
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": 5}))
+    assert "by hand" in _add(capsys, "light")[2]
+
+
+def test_board_tiers_creates_nothing_in_a_directory_that_is_not_a_store(home, tmp_path, capsys):
+    d = tmp_path / "gone"
+    d.mkdir()
+    with pytest.raises(bs.BoardError):
+        bs.set_tiers(d, "levain", ["a"])
+    assert list(d.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad", [[], (), "", 0, False])
+def test_write_config_refuses_a_falsy_tiers_that_is_not_none_or_an_empty_mapping(home, tmp_path, capsys, bad):
+    d = use(capsys, tmp_path / "store")
+    with pytest.raises(bs.BoardError):
+        bs.write_config(d, [], False, bad)
+    assert bs.write_config(d, [], False, {}) in (True, False) and bs.write_config(d, [], False, None) is False

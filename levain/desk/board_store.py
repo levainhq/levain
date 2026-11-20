@@ -756,7 +756,8 @@ def _write_record(target: Target, fd: int, path: Path, raw: bytes, rec: dict, em
 
 def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filename: str = ITEMS_NAME,
             parse: Callable[[bytes], Any] = _records_from,
-            seal: Callable[[dict], dict] | None = None) -> tuple[dict, bool]:
+            seal: Callable[[dict], dict] | None = None,
+            recheck: Callable[[Any, dict], None] | None = None) -> tuple[dict, bool]:
     """Under the exclusive lock, hand ``build(parse(raw))`` the parsed bytes of ``<store dir>/<filename>`` (``parse`` is the
     per-file record reader: ``_records_from`` for the items file, the registry's reader for ``repos.jsonl``; it may raise
     BoardError); ``build`` returns ``(record, write)`` and may raise BoardError. A file that ends in an unterminated line (only
@@ -775,6 +776,10 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
     and bytes; an mtime alone is no change), else the write is refused (:data:`SIGNED_CHAIN_MOVED`, never a re-read: a second
     prompt is never shown for one write). Under that second lock ``board_sign.earn`` replays the authority log and the signed
     record must verify, or BoardError is raised and nothing is written.
+
+    ``recheck(parsed, record)`` (a sealed write only) runs under that second lock, once the signature verifies and before the
+    write, for what the store's own files cannot tell the build: a check that reads something else (the board config's tiers)
+    and may have moved during the ceremony. It raises BoardError to refuse.
 
     No open creates a store file: a missing file reads as no bytes (absent is taken from the same :func:`_store_seen`
     reading the write is checked against, fix 7), and a first record is published whole by :func:`_publish_first` (written
@@ -836,6 +841,8 @@ def _append(target: Target, build: Callable[[Any], tuple[dict, bool]], *, filena
             if (not absent and (not _same_file(fd, path) or _read_fd(fd) != raw)) or _store_seen(target.store_dir) != seen:
                 raise BoardError(SIGNED_CHAIN_MOVED)        # moved during the ceremony: never sign twice for one write
             sealed = board_sign.earn(target, seal, sealed)     # the authority log replayed now; the signed record must verify
+            if recheck is not None:
+                recheck(parse(raw), sealed)         # raw is what the check above just found on disk, so this is the stored file
             if _store_seen(target.store_dir) != seen or (
                     path.exists() if absent else (not _same_file(fd, path) or os.fstat(fd).st_size != len(raw))):
                 raise BoardError(SIGNED_CHAIN_MOVED)        # every post-seal mismatch refuses: a re-build would seal again
@@ -1004,7 +1011,7 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author, source=source), seal), True
 
     _preflight(seal, author)
-    rec, written = _append(target, build, seal=seal)
+    rec, written = _append(target, build, seal=seal, recheck=_tier_recheck(target))
     return rec["id"], written
 
 
@@ -1073,7 +1080,7 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
         return _graded(target, build_record("amend", item_id, by, {"fields": out, "why": why}, now, author=author, source=source), seal), True
 
     _preflight(seal, author)
-    return _append(target, build, seal=seal)[0]["id"]
+    return _append(target, build, seal=seal, recheck=_tier_recheck(target))[0]["id"]
 
 
 def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None,
@@ -1164,11 +1171,28 @@ def tier_vocabulary(target: Target, repo: str) -> tuple[str, ...] | None:
     if not is_store(target):
         return None
     declared, bad = _tiers_state(target.store_dir)
-    problem = bad.get(repo) or bad.get(None)
+    problem = bad.get(repo)
     if problem:
-        raise BoardError(f"the board config {Path(target.store_dir) / CONFIG_NAME} declares tiers that cannot be used: {problem}; "
-                         f"fix it with `levain board use --tiers`")
+        raise BoardError(f"the board config {Path(target.store_dir) / CONFIG_NAME} declares tiers for {repo!r} that cannot be used: "
+                         f"{problem}; declare them again with `levain board tiers {repo} NAME ...`")
+    if bad.get(None):
+        raise BoardError(f"the board config {Path(target.store_dir) / CONFIG_NAME} declares tiers that cannot be used: "
+                         f"{bad[None]}; repair board.json by hand")
     return declared.get(repo)
+
+
+def _tier_recheck(target: Target) -> Callable[[Any, dict], None]:
+    """The tier check again for a signed add or amend, under the lock it is re-taken with: the repo and tier come from the
+    record about to be written (an amend's repo from the stored item), through the same :func:`check_tier` the build calls."""
+    def recheck(recs: list[dict], rec: dict) -> None:
+        if rec.get("op") == "add":
+            repo, tier = rec.get("repo"), rec.get("tier")
+        else:
+            repo = next((r.get("repo") for r in recs if r.get("op") == "add" and r.get("id") == rec.get("id")), None)
+            tier = (rec.get("fields") or {}).get("tier")
+        if tier is not None:
+            check_tier(target, repo, tier)
+    return recheck
 
 
 def check_tier_shape(tier: Any) -> None:
@@ -1187,7 +1211,7 @@ def check_tier(target: Target, repo: str, tier: Any) -> None:
 
 
 def _tiers_doc(tiers: Any) -> dict[str, list[str]]:
-    if not tiers:
+    if tiers is None or (isinstance(tiers, Mapping) and not tiers):
         return {}
     if not isinstance(tiers, Mapping):
         raise BoardError("the board config's tiers must map a repo name to its list of tiers")
@@ -1344,7 +1368,7 @@ def set_tiers(store_dir: Path | str, repo: str, names: Sequence[str]) -> bool:
     if len(set(names)) != len(names):
         raise BoardError(f"tiers for {repo!r} name a tier twice: {', '.join(names)}")
     try:
-        with store_lock(store_dir, exclusive=True, setup=True):
+        with store_lock(store_dir, exclusive=True):
             doc = _config_file(store_dir)
             if doc is None:
                 doc = _config_doc([], False)
