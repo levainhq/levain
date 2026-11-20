@@ -91,7 +91,11 @@ class _Stub:
 def _stub_ssl(monkeypatch, x509_ca, capath):
     import collections
     import ssl
-    paths = collections.namedtuple("P", "capath")(capath)
+    # measured on CPython: a list-valued SSL_CERT_DIR makes get_default_verify_paths().capath None (the whole joined
+    # string is tested as one directory), so the list is only readable from the environment variable
+    P = collections.namedtuple("P", "capath openssl_capath openssl_capath_env")
+    paths = P(None if os.pathsep in capath else capath, "", "SSL_CERT_DIR")
+    monkeypatch.setenv("SSL_CERT_DIR", capath) if os.pathsep in capath else monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     monkeypatch.setattr(ssl, "create_default_context", lambda: _Stub(x509_ca))
     monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: paths)
 
@@ -175,3 +179,19 @@ def test_run_doctor_prints_the_trust_row_when_the_store_is_empty(tmp_path, capsy
 def test_the_readme_install_section_names_the_command():
     text = (Path(__file__).resolve().parent.parent / "README.md").read_text()
     assert "Install Certificates.command" in text
+
+
+def test_a_real_list_valued_ssl_cert_dir_with_a_populated_directory_leaves_no_row(tmp_path):
+    """The real interpreter reports capath None for a list-valued SSL_CERT_DIR: the variable is what the probe reads."""
+    import subprocess
+    empty, full = tmp_path / "a", tmp_path / "b"
+    empty.mkdir()
+    full.mkdir()
+    (full / "x.pem").write_text("x")
+    env = {"PATH": os.environ.get("PATH", ""), "SSL_CERT_FILE": "/dev/null",
+           "SSL_CERT_DIR": os.pathsep.join([str(empty), str(full)])}
+    repo = str(Path(__file__).resolve().parents[1])
+    out = subprocess.run([sys.executable, "-I", "-c",
+                          f"import sys;sys.path.insert(0, {repo!r});from levain import doctor;print(doctor._tls_store_probe())"],
+                         capture_output=True, text=True, env=env, timeout=60)
+    assert "'capath_readable': True" in out.stdout, out.stdout + out.stderr

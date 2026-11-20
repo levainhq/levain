@@ -2056,8 +2056,10 @@ def _tls_store_probe() -> dict:
     x509_ca = int(ssl.create_default_context().cert_store_stats().get("x509_ca", 0))
     readable = False
     if x509_ca == 0:
-        # SSL_CERT_DIR may name several directories, joined by os.pathsep; the default context takes each one
-        capath = ssl.get_default_verify_paths().capath or ""
+        # SSL_CERT_DIR may name several directories, joined by os.pathsep; the default context takes each one. CPython
+        # reports `capath` None for such a list (measured), so the variable is read first.
+        paths = ssl.get_default_verify_paths()
+        capath = os.environ.get(paths.openssl_capath_env or "SSL_CERT_DIR") or paths.capath or paths.openssl_capath or ""
         for part in (p for p in capath.split(os.pathsep) if p):
             try:
                 if os.path.isdir(part) and os.access(part, os.R_OK):
