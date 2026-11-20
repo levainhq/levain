@@ -6,8 +6,8 @@ at once). CI runs the whole shard matrix for nothing (the repo is public), so a 
 
     python3 scripts/ci_full.py [BRANCH]            (BRANCH defaults to the current branch; push it first)
 
-It dispatches `test.yml` on BRANCH (the workflow_dispatch trigger; a branch that is not main or land/** runs Python 3.12
-only, and the `hold` job waits while a land/** run exists, so a dispatch never queues ahead of a landing), finds the run it
+It dispatches `test.yml` on BRANCH (its workflow_dispatch trigger; the workflow's own `if:` and matrix arms decide what a seat-branch dispatch
+runs and when it starts: read them in test.yml, not here), finds the run it
 made by branch + head sha + creation time, polls it, and prints the conclusion, the wall time read from the run, the run URL
 and every job that did not pass. Exit status: 0 the run succeeded, 1 it did not, 2 a usage or dispatch problem (the
 branch is not pushed at the local tip, gh failed), 3 the wait timed out (the run keeps going; the URL is printed).
