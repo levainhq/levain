@@ -143,18 +143,18 @@ def test_a_large_rows_list_round_trips_in_linear_time() -> None:
 
     A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
     times the same round trip at a small row count and at a much larger one (_SMALL_ROWS, _BIG_ROWS), in the same test
-    on the same box. One untimed round trip of the small size runs first, so the first timed small run does not pay
-    cold-start costs. The _PAIRS attempts then alternate small, big, small, big, the time ratio is taken per pair, and
+    on the same box. One untimed round trip of each size runs first, so the first timed runs do not pay cold-start
+    costs. The _PAIRS attempts then alternate small, big, small, big, the time ratio is taken per pair, and
     the MEDIAN pair ratio is gated. The test fails when that median reaches _GROWTH_ALLOWANCE times the size ratio. The
     median is robust both ways: a stall that lands on one small run (which would collapse that pair's ratio) or on one
-    big run (which would inflate it) moves one pair, and one pair cannot decide the verdict, so a noisy box neither
-    hides a regression nor fails a clean codec. That catches growth well past linear, such as a size-quadratic blowup
+    big run (which would inflate it) moves one pair, and one pair cannot decide the verdict. That catches growth well past linear, such as a size-quadratic blowup
     in the encode or the decode, whose ratio nears the square of the size ratio, provided it shows in most pairs. It
     misses a regression that appears in fewer than half the pairs, a constant-factor slowdown, and a mild superlinear
     one that stays under the bound. The big round trip must also decode back to the same change-detection text as the
     original."""
     small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
-    _round_trip(small)  # warm-up, untimed
+    _round_trip(small)  # warm-up, untimed, at both sizes: the first timed big run pays no cold-start costs either
+    _round_trip(big)
     ratios: list[float] = []
     last_back: _Snap | None = None
     for _ in range(_PAIRS):
