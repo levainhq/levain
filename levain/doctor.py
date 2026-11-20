@@ -3378,7 +3378,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
         CheckResult("python interpreter", True, f"{py} ({py_version})")
     )
 
-    from levain.manifest import resolve_anneal_bin
+    from levain.manifest import pip_invocation, resolve_anneal_bin
 
     # intention-751: report the ONE anneal levain's interpreter resolves, which is the one init
     # wires, instead of whatever PATH finds first.
@@ -3420,26 +3420,41 @@ def _check_runtime(install: Path) -> list[CheckResult]:
                 "anneal-memory module", f"importable via {sys.executable}", module_version, script_failure + disagree
             )
         )
-    elif script_version is not None:
-        results.append(
-            CheckResult(
-                "anneal-memory module",
-                True,
-                f"not importable under levain's interpreter ({sys.executable}), though the script {am_cli} runs",
-                f"`levain` imports anneal-memory under {sys.executable}: {sys.executable} -m pip install anneal-memory",
-                warn=True,
-            )
-        )
     else:
+        # No module under sys.executable is a FAILURE whatever the script says: `levain` imports
+        # anneal_memory under THIS interpreter and anneal-memory is a hard dependency (L3 r2 MED).
         results.append(
             CheckResult(
                 "anneal-memory",
                 False,
                 f"not installed for levain's interpreter ({sys.executable})",
-                f"Install with: {sys.executable} -m pip install anneal-memory",
+                f"Install with: {pip_invocation()} install anneal-memory",
             )
         )
     return results
+
+
+def _script_shebang(path: str) -> str:
+    """The interpreter named on the script's first line ("" when unreadable or not a shebang)."""
+    try:
+        with open(path, "rb") as handle:
+            first = handle.readline(512).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+    return first[2:].strip() if first.startswith("#!") else ""
+
+
+def _script_remedy(where: str, requirement: str) -> str:
+    """The remedy for a CLI-SCRIPT row. The script runs under its own shebang interpreter, which need
+    not be `sys.executable`, so no pip command is aimed at an interpreter here: it names the script
+    (and its shebang interpreter when the first line gives one) and leaves the install to that env."""
+    shebang = _script_shebang(where)
+    text = f"Reinstall anneal-memory in the environment of the script {where}"
+    if shebang:
+        text += f" (its shebang interpreter: {shebang})"
+    if requirement:
+        text += f", at {shlex.quote(requirement)}"
+    return text
 
 
 def _anneal_version_result(
@@ -3465,10 +3480,7 @@ def _anneal_version_result(
                 "Judged for the anneal-memory script's own interpreter (its shebang), which need not be "
                 "the one doctor runs under."
             )
-            hint = (
-                f"Reinstall into the environment that owns {where}, with that environment's python: "
-                f"python -m pip install -U {shlex.quote(requirement)}"
-            )
+            hint = _script_remedy(where, requirement)
         else:
             scope = (
                 f"Judged for the interpreter doctor runs under ({sys.executable}); a `levain serve` "
@@ -3479,12 +3491,17 @@ def _anneal_version_result(
             name, False, f"{where} ({version}), but levain requires {requirement}{tail}. {scope}", hint
         )
     if verdict is None:
-        fix = f"; or install the declared range: {pip_invocation()} install -U {shlex.quote(requirement)}"
+        if script_scope:
+            remedy = _script_remedy(where, requirement)
+            fix = f"; or {remedy[0].lower()}{remedy[1:]}"
+        else:
+            fix = f"; or install the declared range: {pip_invocation()} install -U {shlex.quote(requirement)}"
         return CheckResult(
             name,
             True,
             f"{where} ({version}){tail}; levain's anneal-memory range was NOT checked ({why})",
-            "Compare the version above with levain's anneal-memory requirement by hand" + (fix if requirement else ""),
+            "Compare the version above with levain's anneal-memory requirement by hand"
+            + (fix if requirement or script_scope else ""),
             warn=True,
         )
     return CheckResult(name, True, f"{where} ({version}){tail}")
