@@ -2571,9 +2571,10 @@
   }
   // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
   let handOff = null;
-  // Focus a panel the jump chose. A redraw replaces the nodes, so the panel is looked up again by its key, and for 3 s a redraw anywhere
+  const HAND_OFF_MS = 3000;
+  // Focus a panel the jump chose. A redraw replaces the nodes, so the panel is looked up again by its key, and for HAND_OFF_MS a redraw anywhere
   // on the page that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
-  // hand-off, the 3 s, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
+  // hand-off, HAND_OFF_MS, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
   // focus back from where they went).
   function landOnPanel(node, scroll) {
     if (handOff) handOff.stop();
@@ -2591,7 +2592,7 @@
       focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
       if (document.activeElement === held) me.stop();
     });
-    const timer = root.setTimeout(() => me.stop(), 3000);
+    const timer = root.setTimeout(() => me.stop(), HAND_OFF_MS);
     const answered = () => me.stop();
     const me = { stop() {
       obs.disconnect();
