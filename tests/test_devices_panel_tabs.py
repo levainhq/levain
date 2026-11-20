@@ -239,10 +239,10 @@ def _nf_mint(name: str, *, urgent: bool, cap: str) -> list[dict]:
 def _nf_settle(name: str) -> dict:
     """A mint is settled when its new-token block shows (the card has cleared its fields by then) or the card has said why it sent nothing."""
     shown = f"document.querySelector('.nf-new') && !document.querySelector('.nf-new').hidden && document.querySelector('.nf-new').dataset.name === {json.dumps(name)}"
-    return {"until": f"({shown}) || (document.querySelector('.nf-note') && !document.querySelector('.nf-note').hidden && 1)", "ms": 10000}
+    return {"until": f"({shown}) || (document.querySelector('.nf-note') && document.querySelector('.nf-note').textContent !== '' && 1)", "ms": 10000}
 
 
-NF_STATE = ("JSON.stringify({mints: window.__mints, note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+NF_STATE = ("JSON.stringify({mints: window.__mints, note: document.querySelector('.nf-note').textContent,"
             " cap: document.querySelector('.nf-urgent-cap').value, box: document.querySelector('.nf-urgent').checked,"
             " bad: document.querySelector('.nf-urgent-cap').validity.badInput, aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
 # the line the card shows for a cap it will not send, and for an unticked Urgent box over a typed cap
@@ -368,7 +368,7 @@ NF_HOLD = ("(() => { const g = window.fetch.bind(window); window.__posts = 0; wi
            " window.fetch = (u, o) => { if (!(String(u).endsWith('/webpush/notify/tokens') && o && o.method === 'POST')) return g(u, o);"
            " window.__posts++; return new Promise((r) => window.__releases.push(() => r(g(u, o)))); };"
            " window.__release = () => { window.__releases.splice(0).forEach((f) => f()); return 1; }; return 1; })()")
-NF_HELD_STATE = ("JSON.stringify({posts: window.__posts, note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+NF_HELD_STATE = ("JSON.stringify({posts: window.__posts, note: document.querySelector('.nf-note').textContent,"
                  " aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
 
 
@@ -424,7 +424,7 @@ NF_REVOKE_FAILS = {"eval": ("(() => { const f = window.fetch.bind(window);"
                             " window.fetch = (u, o) => String(u).endsWith('/webpush/notify/tokens/revoke')"
                             " ? Promise.resolve(new Response(JSON.stringify({message: 'refused for the test'}), {status: 500})) : f(u, o); return 1; })()")}
 NF_ROWS_STATE = ("JSON.stringify({rows: Array.from(document.querySelectorAll('.nf-row')).map((r) => r.dataset.name),"
-                 " note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+                 " note: document.querySelector('.nf-note').textContent,"
                  " aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
 
 
@@ -451,34 +451,87 @@ def test_a_revoke_while_the_cap_refusal_shows_takes_the_field_mark_with_the_note
     assert "keep-a" not in stored and "keep-b" in stored and "refused" not in stored, stored
 
 
-# levain#196: the refused cap field names the reason to assistive technology (aria-describedby to the note, the note a polite live region)
-# and shows it without colour (a thicker border and an inset marker, read here as computed style)
-NF_LINK = ("(() => { const c = document.querySelector('.nf-urgent-cap'); const id = c.getAttribute('aria-describedby');"
-           " const n = id ? document.getElementById(id) : null; const cs = getComputedStyle(c);"
-           " return JSON.stringify({aria: c.getAttribute('aria-invalid'), id: id, same: !!n && n === document.querySelector('.nf-note'),"
-           " text: n ? n.textContent : null, shown: !!n && !n.hidden && getComputedStyle(n).display !== 'none',"
-           " live: document.querySelector('.nf-note').getAttribute('role') || document.querySelector('.nf-note').getAttribute('aria-live'),"
-           " width: cs.borderTopWidth, shadow: cs.boxShadow}); })()")
+# levain#196: a refused field names its reason to assistive technology (aria-describedby to the note) and shows it without colour
+# (a thicker border on the inline-start side, read here as computed style). The note is rendered and empty when idle and only its
+# text changes; a refusal tied to a field is carried by the link and the focus, so the note is not also announced, and a message
+# tied to no field is announced politely.
+def _nf_link(field: str) -> dict:
+    return {"eval": ("(() => { const c = document.querySelector('%s'); const id = c.getAttribute('aria-describedby');"
+                     " const note = document.querySelector('.nf-note'); const n = id ? document.getElementById(id) : null; const cs = getComputedStyle(c);"
+                     " const ns = getComputedStyle(note);"
+                     " return JSON.stringify({aria: c.getAttribute('aria-invalid'), id: id, same: !!n && n === note,"
+                     " text: n ? n.textContent : null, note: note.textContent, hidden: note.hidden, display: ns.display, height: note.offsetHeight,"
+                     " margin: ns.marginTop, live: note.getAttribute('aria-live'), role: note.getAttribute('role'),"
+                     " left: cs.borderLeftWidth, right: cs.borderRightWidth, top: cs.borderTopWidth, shadow: cs.boxShadow,"
+                     " focused: document.activeElement === c}); })()") % field}
+
+
+NF_CAP_LINK = _nf_link('.nf-urgent-cap')
+NF_NAME_LINK = _nf_link('.nf-name')
+NF_RTL = {"eval": "(() => { document.documentElement.dir = 'rtl'; return 1; })()"}
+NF_LTR = {"eval": "(() => { document.documentElement.dir = 'ltr'; return 1; })()"}
+NF_TYPE_NAME = {"eval": ("(() => { const c = document.querySelector('.nf-name'); c.focus(); c.select();"
+                         " return document.execCommand('insertText', false, 'x') ? 1 : 0; })()")}
+
+
+def _px(v: str) -> float:
+    return float(v.removesuffix("px"))
 
 
 @needs_browser
-def test_the_refused_cap_field_is_described_by_the_visible_refusal_and_looks_invalid_without_colour(tmp_path, monkeypatch) -> None:
+def test_the_refused_cap_field_is_described_by_the_refusal_and_looks_invalid_without_colour(tmp_path, monkeypatch) -> None:
     retype = {"eval": NF_RETYPE % json.dumps("21")}
-    steps = [{"eval": NF_LINK}]                                                                                         # 0: the unmarked field
-    steps += _nf_mint("forgot-tick", urgent=False, cap="20") + [_nf_settle("forgot-tick"), {"eval": NF_LINK}]            # 1: refused
-    steps += [retype, {"eval": NF_LINK}]                                                                                # 2: edited
-    steps += _nf_mint("whole", urgent=True, cap="1.5") + [_nf_settle("whole"), {"eval": NF_LINK}]                        # 3: refused as not whole
-    steps += [NF_SUBMIT_NAMELESS, {"eval": NF_LINK}]                                                                    # 4: another note replaces it
+    steps = [NF_CAP_LINK]                                                                                               # 0: idle
+    steps += _nf_mint("forgot-tick", urgent=False, cap="20") + [_nf_settle("forgot-tick"), NF_CAP_LINK]                  # 1: refused
+    steps += [retype, NF_CAP_LINK]                                                                                      # 2: edited
+    steps += _nf_mint("whole", urgent=True, cap="1.5") + [_nf_settle("whole"), NF_CAP_LINK]                              # 3: refused as not whole
+    steps += [NF_SUBMIT_NAMELESS, NF_CAP_LINK]                                                                          # 4: another note replaces it
+    steps += [_nf_mint("whole", urgent=True, cap="1.5")[0], NF_SUBMIT, _nf_settle("whole"), NF_RTL, NF_CAP_LINK, NF_LTR]   # 5: refused, right to left
     seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
-    assert len(seen) == 5, seen
-    plain, refused, edited, whole, nameless = seen
+    assert len(seen) == 6, seen
+    plain, refused, edited, whole, nameless, rtl = seen
     assert plain["aria"] is None and plain["id"] is None, plain
+    # idle: the live region is rendered (never hidden) and empty, and takes no room
+    assert plain["note"] == "" and plain["hidden"] is False and plain["display"] != "none" and plain["live"] == "polite", plain
+    assert plain["height"] == 0 and plain["margin"] == "0px", plain
     for marked, words in ((refused, NF_TICK), (whole, NF_WHOLE)):
         assert marked["aria"] == "true" and marked["id"], marked
-        assert marked["same"] is True and marked["shown"] is True and words in marked["text"], marked     # the link resolves to the visible refusal
-        assert marked["live"] in ("status", "polite"), marked                                              # the note is a live region
-        assert float(marked["width"].removesuffix("px")) > float(plain["width"].removesuffix("px")), (plain, marked)   # a thicker border, not a colour
-        assert marked["shadow"] != plain["shadow"] and marked["shadow"] != "none", (plain, marked)          # and an inset marker
+        assert marked["same"] is True and words in marked["text"] and marked["hidden"] is False and marked["height"] > 0, marked   # the link resolves to the visible refusal
+        assert marked["live"] == "off" and marked["focused"] is True, marked                                # one channel: the link and the focus, not the live region
+        assert _px(marked["left"]) > _px(marked["right"]) and _px(marked["left"]) > _px(plain["left"]), (plain, marked)    # a thicker inline-start border, not a colour
+        assert _px(marked["top"]) > _px(plain["top"]) and marked["shadow"] == "none", (plain, marked)
+    assert _px(rtl["right"]) > _px(rtl["left"]) and _px(rtl["right"]) > _px(plain["right"]), (plain, rtl)      # the thick side follows the direction
     for gone in (edited, nameless):
         assert gone["aria"] is None and gone["id"] is None, gone                                           # the link goes with the mark
-        assert gone["width"] == plain["width"] and gone["shadow"] == plain["shadow"], (plain, gone)
+        assert gone["left"] == plain["left"] and gone["top"] == plain["top"], (plain, gone)
+    assert edited["note"] == "" and edited["live"] == "polite" and edited["height"] == 0, edited
+    assert edited["hidden"] is False and edited["display"] != "none", edited                              # emptied by its text alone, never hidden
+
+
+@needs_browser
+def test_a_message_tied_to_no_field_is_announced_politely_and_describes_no_field(tmp_path, monkeypatch) -> None:
+    steps = _nf_mint("keep-a", urgent=True, cap="") + [_nf_settle("keep-a")]
+    steps += [NF_REVOKE_FAILS, NF_REVOKE("keep-a"),
+              {"until": "document.querySelector('.nf-note') && document.querySelector('.nf-note').textContent.startsWith('Could not change') && 1", "ms": 10000},
+              NF_CAP_LINK, NF_NAME_LINK]
+    seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
+    cap, name = seen
+    for state in (cap, name):
+        assert "refused for the test" in state["note"] and state["live"] == "polite" and state["role"] == "status", state
+        assert state["aria"] is None and state["id"] is None and state["hidden"] is False, state
+
+
+@needs_browser
+def test_the_refused_empty_name_is_marked_and_described_like_the_cap_field_until_a_name_is_typed(tmp_path, monkeypatch) -> None:
+    steps = [NF_NAME_LINK, NF_SUBMIT_NAMELESS, NF_NAME_LINK, NF_CAP_LINK, NF_TYPE_NAME, NF_NAME_LINK]
+    seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 4, seen
+    plain, refused, cap_side, typed = seen
+    assert plain["aria"] is None and plain["id"] is None, plain
+    assert refused["aria"] == "true" and refused["id"] and refused["same"] is True and refused["text"] == NF_NAME_NOTE, refused
+    assert refused["live"] == "off" and refused["focused"] is True, refused                                  # one channel: the link and the focus
+    assert _px(refused["left"]) > _px(refused["right"]) and _px(refused["left"]) > _px(plain["left"]), (plain, refused)
+    assert _px(refused["top"]) > _px(plain["top"]) and refused["shadow"] == "none", (plain, refused)
+    assert cap_side["aria"] is None and cap_side["id"] is None, cap_side                                     # the cap field is not marked by the name refusal
+    assert typed["aria"] is None and typed["id"] is None and typed["note"] == "" and typed["live"] == "polite", typed   # a typed name takes the mark, the link and the note
+    assert typed["left"] == plain["left"] and typed["top"] == plain["top"], (plain, typed)

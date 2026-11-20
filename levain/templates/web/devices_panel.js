@@ -377,6 +377,7 @@
     nfUrgentCap.type = "number"; nfUrgentCap.min = "1"; nfUrgentCap.step = "1"; nfUrgentCap.inputMode = "numeric";
     nfUrgentCap.placeholder = "optional";
     nfUrgentCap.addEventListener("input", () => nfClearCapRefusal());
+    nfName.addEventListener("input", () => nfClearNameRefusal());
     capLab.appendChild(nfUrgentCap);
     boxes.appendChild(capLab);
     form.appendChild(boxes);
@@ -387,8 +388,8 @@
     body.appendChild(form);
     nfNew = el("div", "dev-link nf-new"); nfNew.hidden = true;
     body.appendChild(nfNew);
-    nfNote = el("p", "dev-note nf-note"); nfNote.hidden = true;
-    nfNote.id = "nf-note"; nfNote.setAttribute("role", "status"); nfNote.setAttribute("aria-live", "polite");   // a polite live region: its text is read when it changes
+    nfNote = el("p", "dev-note nf-note");     // rendered and empty while idle, so the live region exists before its text arrives; only the text is toggled
+    nfNote.id = "nf-note"; nfNote.setAttribute("role", "status"); nfNote.setAttribute("aria-live", "polite");
     body.appendChild(nfNote);
     nfPanel.appendChild(body);
     setTimeout(readNotify, 2500);
@@ -397,20 +398,32 @@
     return nfPanel;
   }
   function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
-  // the two lines the cap field owns: the tick-Urgent line is made untrue by ticking the box, and either is stale once the value is edited.
-  // nfSay is the only function that writes the shared note, and it sets or removes aria-invalid on the cap field in the same call, so the
-  // mark is on exactly while the note is one of these two lines: any other message, including "", takes the mark off. nfClearCapRefusal
-  // (the cap field's input, the Urgent box's change) clears only when the note is one of the two, so it never clears another message
+  // a refusal is tied to the field it is about: the cap lines to the cap field, the name line to the name field. nfSay is the only
+  // function that writes the shared note. For a line a field owns it marks that field aria-invalid, points its aria-describedby at the
+  // note, and turns the note's live announcement off, since the focus the caller gives the field reads the description; any other
+  // message, including "", leaves every field unmarked and the note polite. The tick-Urgent line is made untrue by ticking the box, and
+  // either cap line is stale once the value is edited; the clear functions below only clear a line the field owns
   const NF_CAP_NEEDS_URGENT = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
   const NF_CAP_WHOLE = "Urgent per hour must be a whole number above zero, or left empty.";
+  const NF_NAME_NEEDED = "Give the notify token a name.";
+  function nfOwner(msg) {
+    if (msg === NF_CAP_NEEDS_URGENT || msg === NF_CAP_WHOLE) return nfUrgentCap;
+    return msg === NF_NAME_NEEDED ? nfName : null;
+  }
   function nfSay(msg) {
-    nfNote.textContent = msg; nfNote.hidden = !msg;
-    // the describedby link is set and removed with the mark, so a screen reader reads the reason while the field is invalid and only then
-    if (msg === NF_CAP_NEEDS_URGENT || msg === NF_CAP_WHOLE) { nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.setAttribute("aria-describedby", nfNote.id); }
-    else { nfUrgentCap.removeAttribute("aria-invalid"); nfUrgentCap.removeAttribute("aria-describedby"); }
+    const owner = nfOwner(msg);
+    nfNote.setAttribute("aria-live", owner ? "off" : "polite");
+    nfNote.textContent = msg;
+    for (const f of [nfUrgentCap, nfName]) {
+      if (f === owner) { f.setAttribute("aria-invalid", "true"); f.setAttribute("aria-describedby", nfNote.id); }
+      else { f.removeAttribute("aria-invalid"); f.removeAttribute("aria-describedby"); }
+    }
   }
   function nfClearCapRefusal() {
-    if (nfNote.textContent === NF_CAP_NEEDS_URGENT || nfNote.textContent === NF_CAP_WHOLE) nfSay("");
+    if (nfOwner(nfNote.textContent) === nfUrgentCap) nfSay("");
+  }
+  function nfClearNameRefusal() {
+    if (nfOwner(nfNote.textContent) === nfName) nfSay("");
   }
   function paintNotify(tokens) {
     nfList.replaceChildren();
@@ -456,7 +469,7 @@
     if (nfBusy) return;     // a second mint would replace the first one's only shown secret; a dropped submit leaves the note and the field mark as they were
     nfSay("");
     const name = nfName.value.trim();
-    if (!name) { nfSay("Give the notify token a name."); return; }
+    if (!name) { nfSay(NF_NAME_NEEDED); nfName.focus(); return; }
     // the cap rides along only on an urgent token; a value in the field with Urgent unticked is refused, never dropped, and what was typed stays;
     // a whole number the page can hold exactly is sent, and what the server allows beyond that stays the server's to say
     let cap = null;
