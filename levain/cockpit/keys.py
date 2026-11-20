@@ -881,7 +881,9 @@ _SK_RETRY_MIN_S = 5.0
 # held back from each ssh-keygen sign child's wait (never more than half of what is left), so an answer that comes in the
 # last moment that child is given still leaves its check room to run inside the same deadline
 _VERIFY_RESERVE_S = 1.0
-_SIGN_FAILURE_KEEP = 20        # evidence files kept per key directory; older ones are deleted when a new one is written
+# evidence files kept per key directory; older ones are deleted when a new one is written. Raised from 20 on 2026-11-20
+# (levain#191): the directory had filled to the old 20, so each further failing sign would have deleted the oldest evidence
+_SIGN_FAILURE_KEEP = 200
 _SIGN_FAILURE_DIR = "sign-failures"
 _SIGN_FAILURE_PREFIX = "sigfail-"
 
