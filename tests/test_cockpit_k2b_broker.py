@@ -190,6 +190,7 @@ def test_sign_returns_a_pending_that_fires_only_on_a_valid_signature(broker, int
 
     done = broker.submit(pid, phone.sign(record))
     assert (done["state"], done["decision_kind"], done["label"]) == ("COMMITTED", "ALLOWED", "signed · reported")
+    assert done["panel_id"] == out["panel_id"] == "tray"          # the panel it was fired on rides every answer (S3c)
     assert _disposition(intentions, "k.seed") == "agenda"
     assert _rows(broker, "SELECT signer_fp FROM pendings") == [(phone.fingerprint,)]
     # a resubmitted signature after the outcome returns it and fires nothing again
