@@ -8,7 +8,7 @@ test could not see (project_memory/1119-46_review/known_edge_tab_order_165.md; t
 What this pins, in the order the failures fire:
   1. the page is settled (BOARD_SETTLED, then two walks a beat apart that agree), so a late panel cannot make the order flap;
   2. no Tab stop has a positive tabindex (real Tab order puts those first, which this walk does not model);
-  3. every Tab stop on Home belongs to a block (a `[data-ck-panel]` or one of the hero blocks) or to the header / phone tabs: a stop in
+  3. every Tab stop on Home belongs to a block (a `[data-ck-panel]` or one of the hero blocks) or to the masthead / phone tabs: a stop in
      NO block fails and names itself, so a new block can never be silently ignored (the block is found from the page, not from a list here);
   4. the set of blocks that hold stops is EXPECTED_BLOCKS exactly: a new block fails (add it), a vanished one fails (the walk proved nothing);
   5. every block except the named ones walks in the order it is drawn, each block placed by its own rect (the first stop's rect for a
@@ -37,9 +37,9 @@ ROW_TOLERANCE_PX = 12
 # is named and skipped; a stop in neither lands in `unfiled`. Positions come from each block's first stop.
 WALK = """(() => {
   const BLOCK = '[data-ck-panel], #ck-needs, #ck-drop, #ck-notes, #ck-skycol, #ck-widgets';
-  const CHROME = 'header, #ck-phonetabs';
+  const CHROME = 'header.masthead, #ck-phonetabs';
   const stops = [...document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]')]
-    .filter((e) => e.tabIndex >= 0 && !e.disabled && !e.closest('[inert]') && [...e.getClientRects()].some((r) => r.height > 0) && getComputedStyle(e).visibility !== 'hidden');
+    .filter((e) => e.tabIndex >= 0 && !e.matches(':disabled') && !e.closest('[inert]') && [...e.getClientRects()].some((r) => r.height > 0) && getComputedStyle(e).visibility !== 'hidden');
   const key = (b) => (b.matches('[data-ck-panel]') ? 'panel:' + b.dataset.ckPanel : '#' + b.id);
   const seen = [], unfiled = [], positive = [];
   for (const e of stops) {
@@ -47,7 +47,7 @@ WALK = """(() => {
     const b = e.closest(BLOCK);
     if (!b) { if (!e.closest(CHROME)) unfiled.push(e.tagName + '.' + String(e.className).slice(0, 40) + '#' + e.id); continue; }
     const k = key(b);
-    if (!seen.some((x) => x.block === k)) { let r = b.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) r = e.getBoundingClientRect(); seen.push({ block: k, top: Math.round(r.top + window.scrollY), bottom: Math.round(r.bottom + window.scrollY), left: Math.round(r.left) }); }
+    if (!seen.some((x) => x.block === k)) { let r = b.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) r = e.getBoundingClientRect(); seen.push({ block: k, top: Math.round(r.top + window.scrollY), left: Math.round(r.left) }); }
   }
   return JSON.stringify({ walk: seen, unfiled, positive });
 })()"""
@@ -74,8 +74,11 @@ def test_tab_walks_home_in_the_drawn_order_except_the_one_named_block(tmp_path: 
             READY, BOARD_SETTLED,
             {"eval": WALK}, beat, {"eval": WALK},
         ])
-    first, second = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"walk"')][-2:]
-    assert first == second, (first, second)                               # settled: a second walk a beat later agrees
+    walks = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"walk"')]
+    assert len(walks) == 2, out["values"]                                 # both walks answered (a throw inside one would show here)
+    first, second = walks
+    stable = lambda w: ([b["block"] for b in w["walk"]], w["unfiled"], w["positive"])   # the order and the sets, not pixels: a 1 px reflow is not a flake
+    assert stable(first) == stable(second), (first, second)               # settled: a second walk a beat later agrees
     assert not first["positive"], first["positive"]                       # no positive tabindex (this walk does not model it)
     assert not first["unfiled"], first["unfiled"]                         # every stop is in a block or the chrome: a new block is seen, never ignored
     walk = first["walk"]
