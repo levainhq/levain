@@ -303,3 +303,13 @@ def test_a_failed_sudo_is_the_promised_routes_trust_result_not_a_traceback(monke
     with pytest.raises(SystemExit):
         SC.mode_stage(T_args(tmp_path, sudo_askpass=str(ask)))
     assert capsys.readouterr().out.splitlines()[-1].startswith("stage-failed routes-trust: ")
+
+
+def test_an_unconfirmed_helper_removal_stops_the_sitting_at_w1(tmp_path, monkeypatch):
+    """A swallowed removal error left the guest login on the guest for W2-W10: W1 itself is now ERROR."""
+    order = []
+    w = _askpass_world(order)
+    monkeypatch.setattr(W.sudo_askpass, "remove", lambda *a, **k: (_ for _ in ()).throw(OSError("ssh dropped")))
+    _w, ev, (status, _s, path) = T.go(tmp_path, w, sudo_askpass=PATH)
+    assert status != "PASS" and path.exists()
+    assert "not confirmed removed" in path.read_text() or any("not confirmed removed" in str(e) for e in ev.__dict__.values())

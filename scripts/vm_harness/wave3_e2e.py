@@ -501,6 +501,9 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
                     askpass["staged"] = False
                 except (GuestError, OSError, subprocess.SubprocessError, ValueError):
                     pass                   # still marked staged: the end-of-run cleanup retries and reports it
+            if askpass["staged"]:          # the removal did not confirm: stop here, later waves must not run beside it
+                raise StepFail("the sudo-askpass helper (it holds the guest login) was not confirmed removed after "
+                               "the stage call; the end-of-run cleanup retries it", status="ERROR")
         line = next((ln.strip() for ln in lines if ln.startswith("staged gen=")), "")
         m = re.fullmatch(r"staged gen=([0-9]+)", line)
         if rc != 0 or not m or int(m.group(1)) < 1:
