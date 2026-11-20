@@ -59,6 +59,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from scripts.vm_harness import sudo_askpass
 from scripts.vm_harness.driver import GuestError
 from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, cd_run, profile_named
 from scripts.vm_harness.journey8 import LEVAIN_ROOT, StepResult, levain_argv
@@ -193,6 +194,7 @@ class Config:
     poll_s: float = 10.0
     settle_wait_s: float = 120.0
     settle_poll_s: float = 5.0
+    sudo_askpass: str = ""                             # a guest path: the SUDO_ASKPASS helper W1 stages for the stage call's sudo -A
 
 
 def dispatch_dir(cfg: Config) -> str:
@@ -423,7 +425,22 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
             raise StepFail(f"no cred-installed line (exit 0, {install_answer(out, cfg.cred)}): install result UNCERTAIN", status="ERROR")
         cred["state"] = "confirmed"
 
+    askpass = {"staged": False}
+
     def cleanup() -> list[str]:
+        """The staged askpass helper goes first (it holds the guest login), then the credential's removal."""
+        problems: list[str] = []
+        if askpass["staged"]:
+            try:
+                sudo_askpass.remove(stdin_run, cfg.sudo_askpass)
+                askpass["staged"] = False
+            except (GuestError, OSError, subprocess.SubprocessError) as e:
+                problems.append(f"the sudo askpass helper {cfg.sudo_askpass} NOT confirmed removed ({type(e).__name__}: {e}); remove it by hand")
+        for p in problems:
+            ev.log(scrub("cleanup: " + p))
+        return problems + cred_cleanup()
+
+    def cred_cleanup() -> list[str]:
         if cred["state"] == "none":
             return []
         if cred["state"] == "uncertain":
@@ -460,7 +477,12 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
             raise StepFail("no --stage-call: the guest command that stages the route map, template and verifier is the sitting's to name",
                            status="UNBOUND")
         install_key()
-        lines, rc = capture(guest, cfg.stage_call, 600)
+        stage_call = cfg.stage_call
+        if cfg.sudo_askpass:
+            askpass["staged"] = True       # set first: a half-written helper is still removed
+            sudo_askpass.stage(stdin_run, cfg.profile, cfg.sudo_askpass)
+            stage_call = stage_call + ("--sudo-askpass", cfg.sudo_askpass)
+        lines, rc = capture(guest, stage_call, 600)
         line = next((ln.strip() for ln in lines if ln.startswith("staged gen=")), "")
         m = re.fullmatch(r"staged gen=([0-9]+)", line)
         if rc != 0 or not m or int(m.group(1)) < 1:
@@ -680,6 +702,7 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--cred", default="or-key")
     ap.add_argument("--levain-root", default=LEVAIN_ROOT)
     ap.add_argument("--stage-call", default="", help="the guest command (one quoted string) that stages and prints 'staged gen=<n>'")
+    ap.add_argument("--sudo-askpass", default="", help="a guest path: W1 stages a SUDO_ASKPASS helper there (the profile's guest login) and the stage call runs the install helper with `sudo -A`; removed at the end")
     ap.add_argument("--signing-key", default="", help="the guest path of the enrolled key `dispatch sign` and `authorise` use")
     ap.add_argument("--data-root", default="")
     ap.add_argument("--template", default="wave3-r0")
@@ -693,7 +716,7 @@ def main(argv: Sequence[str]) -> int:
     profile = profile_named(a.profile)
     cfg = Config(profile, a.install, a.repo, a.cred, a.levain_root, tuple(shlex.split(a.stage_call)), a.signing_key, a.data_root,
                  a.template, a.write_path, a.onto, a.goal, a.overrun_goal, a.agent, "", os.environ.get(KEY_ENV),
-                 tolerance_pct=a.tolerance_pct)
+                 tolerance_pct=a.tolerance_pct, sudo_askpass=a.sudo_askpass)
     from scripts.vm_harness import vm_run
     from scripts.vm_harness.driver import AdapterError, VmAdapters
     from scripts.vm_harness.host_profile import ProfileMismatch

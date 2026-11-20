@@ -35,7 +35,7 @@ def _args(tmp_path: Path, **kw) -> argparse.Namespace:
              signing_key="/private/var/levain/dispatch/w3-key", key_pub=str(root / "key.pub"), prep_dir=str(root / "admin" / "w3"),
              custody="tpm", models=SC.DEFAULT_MODELS, backends="", cred="or-key", template="wave3-r0", write_path="wave3/hello.txt",
              verifier_id="wave3-bb", verifier_argv="python3 -m pytest -q", price_in=2_000_000, price_out=8_000_000,
-             price_source="https://openrouter.ai/models", no_pin=False, dry_submit=False, repo=str(root / "repo"), git="git")
+             price_source="https://openrouter.ai/models", no_pin=False, dry_submit=False, sudo_askpass="", repo=str(root / "repo"), git="git")
     d.update(kw)
     return argparse.Namespace(**d)
 

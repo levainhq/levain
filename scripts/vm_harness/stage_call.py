@@ -81,6 +81,32 @@ def run(argv, *, stdin=None, env=None, timeout=300):
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
 
+SUDO = "/usr/bin/sudo"                   # levain.hands_live.SUDO; this file is copied alone into the guest
+
+
+def routes_trust_via_askpass(askpass, *, helper=None):
+    """A replacement for ``levain.dispatch.cli.ROUTES_TRUST_HELPER`` that runs ``sudo -A <install helper> routes-trust``.
+    The product's own caller runs sudo without -A, which a non-interactive rig cannot answer: the helper's sudoers rule
+    authenticates every call. ``askpass`` is the staged SUDO_ASKPASS program, handed to sudo and nothing else of the
+    operator's environment; the password is the program's, never this process's. Same ``(data, replace=)`` call and
+    ``(rc, stdout, stderr)`` answer as the product's."""
+    def call(data: bytes, *, replace: bool = False):
+        path = helper
+        if path is None:
+            from levain.slot import layout
+            path = str(layout.install_helper_path("darwin" if sys.platform == "darwin" else "linux"))
+        if not os.path.isfile(path):
+            return 127, "", f"the install helper {path} is not installed: slots are not set up on this host"
+        try:
+            p = subprocess.run([SUDO, "-A", path, "routes-trust", *(["--replace"] if replace else [])], input=data,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, cwd="/",
+                               env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "SUDO_ASKPASS": str(askpass)})
+        except OSError as e:
+            return 1, '{"ok":false,"refused":"sudo-failed"}\n', f"could not run {SUDO} {path}: {e.strerror or e}"
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+    return call
+
+
 def json_in(text: str):
     """The last line-start ``{`` or ``[`` that decodes (wave3_e2e._json_in's rule)."""
     for m in reversed(list(re.finditer(r"(?m)^[\[{]", text))):
@@ -371,6 +397,8 @@ def mode_stage(a) -> int:
     except Exception as e:                                                   # noqa: BLE001
         die("key", f"{type(e).__name__}: {e}")
     bodies = build_bodies(a)
+    if a.sudo_askpass and not a.dry_submit and not os.access(a.sudo_askpass, os.X_OK):
+        die("sudo-askpass", f"--sudo-askpass {a.sudo_askpass} is not an executable file on this guest (the host stages it before this call)")
     if a.dry_submit:
         # HOST TEST ONLY: `levain dispatch config` refuses any process with a claude/codex ancestor (cli._refuse_an_agent), so the
         # store steps run through the same product API the CLI calls (ControlStore.init / .accept, item_bytes, ssh_signer)
@@ -387,7 +415,8 @@ def mode_stage(a) -> int:
         from levain.contracts.canon import canonical_bytes
         from levain.dispatch import cli as dcli
         req = canonical_bytes({"format": dcli.ROUTES_TRUST_REQUEST, "store_id": init["store_id"], "fingerprint": fp, "public_key": pub})
-        prc, pout, perr = dcli.ROUTES_TRUST_HELPER(req)
+        helper = routes_trust_via_askpass(a.sudo_askpass) if a.sudo_askpass else dcli.ROUTES_TRUST_HELPER
+        prc, pout, perr = helper(req)
         ans = json_in(pout)
         if not (isinstance(ans, dict) and ans.get("ok") is True):
             die("routes-trust", f"rc={prc} {(pout + perr).strip()[-300:]}")
@@ -707,6 +736,7 @@ def main(argv) -> int:
     ap.add_argument("--price-in", type=int, default=2_000_000, help="microdollars per million input tokens (PLACEHOLDER: replace from OpenRouter's page)")
     ap.add_argument("--price-out", type=int, default=8_000_000, help="microdollars per million output tokens (PLACEHOLDER)")
     ap.add_argument("--price-source", default="https://openrouter.ai/models")
+    ap.add_argument("--sudo-askpass", default="", help="stage: a SUDO_ASKPASS program (operator-owned, 0700) that answers the install helper's sudo password; the route trust is then pinned with `sudo -A` (default: the product's own sudo call)")
     ap.add_argument("--no-pin", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--dry-submit", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--work", default="", help="selfcheck: a fresh scratch directory")
