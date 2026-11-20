@@ -11,6 +11,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import statistics
 import time
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -119,16 +120,50 @@ def test_a_snapshot_with_no_odd_values_decodes_to_an_equal_snapshot_field_for_fi
             assert getattr(back, f.name) == getattr(s, f.name), f.name
 
 
-def test_a_large_rows_list_round_trips_fast() -> None:
-    rows = [_row(i, band_age="5m", repo=f"repo{i % 9}", alpha=[i, i + 1], mid={"b": i, "a": 2}) for i in range(5000)]
-    s = _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
+def _big_snap(n: int) -> _Snap:
+    rows = [_row(i, band_age="5m", repo=f"repo{i % 9}", alpha=[i, i + 1], mid={"b": i, "a": 2}) for i in range(n)]
+    return _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
+
+
+def _round_trip(s: _Snap) -> tuple[float, _Snap]:
     t0 = time.perf_counter()
     status, body = sh.encode_snap(s)
     raw = snapshots.encode_body(body)
     back = sh.decode_snap(status, json.loads(raw), as_of=s.as_of)
-    took = time.perf_counter() - t0
-    assert took < 1.0, took
-    assert _frags(back) == _frags(s)
+    return time.perf_counter() - t0, back
+
+
+_SMALL_ROWS, _BIG_ROWS = 250, 5000  # the step between the two timed sizes
+_PAIRS = 5  # small and big attempts, interleaved; odd so the median is one measured pair
+_GROWTH_ALLOWANCE = 3  # the time ratio may reach this multiple of the size ratio
+
+
+def test_a_large_rows_list_round_trips_in_linear_time() -> None:
+    """The round trip of a big rows list must not cost far more than its size ratio over a small one.
+
+    A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
+    times the same round trip at a small row count and at a much larger one (_SMALL_ROWS, _BIG_ROWS), in the same test
+    on the same box. One untimed round trip of each size runs first, so the first timed runs do not pay cold-start
+    costs. The _PAIRS attempts then alternate small, big, small, big, the time ratio is taken per pair, and
+    the MEDIAN pair ratio is gated. The test fails when that median reaches _GROWTH_ALLOWANCE times the size ratio. The
+    median is robust both ways: a stall that lands on one small run (which would collapse that pair's ratio) or on one
+    big run (which would inflate it) moves one pair, and one pair cannot decide the verdict. That catches growth well past linear, such as a size-quadratic blowup
+    in the encode or the decode, whose ratio nears the square of the size ratio, provided it shows in most pairs. It
+    misses a regression that appears in fewer than half the pairs, a constant-factor slowdown, and a mild superlinear
+    one that stays under the bound. The big round trip must also decode back to the same change-detection text as the
+    original."""
+    small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
+    _round_trip(small)  # warm-up, untimed, at both sizes: the first timed big run pays no cold-start costs either
+    _round_trip(big)
+    ratios: list[float] = []
+    last_back: _Snap | None = None
+    for _ in range(_PAIRS):
+        small_took, _discard = _round_trip(small)
+        big_took, last_back = _round_trip(big)
+        ratios.append(big_took / small_took)
+    bound = _GROWTH_ALLOWANCE * (_BIG_ROWS / _SMALL_ROWS)
+    assert statistics.median(ratios) < bound, (ratios, bound)
+    assert last_back is not None and _frags(last_back) == _frags(big)
 
 
 # --- rule 1: as_of is never in the body --------------------------------------------------------------------------------
