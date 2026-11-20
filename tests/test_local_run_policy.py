@@ -54,6 +54,11 @@ def test_lf_narrows_only_with_failures_to_rerun_and_a_tests_subdirectory_narrows
     cache.mkdir(parents=True)
     (cache / "lastfailed").write_text('{"tests/test_x.py::test_y": true}')
     assert p.refuse_bare_full(cfg, NO_ENV) is None
+    cfg.known_args_namespace.cacheclear = True                                 # --lf --cache-clear empties the cache first
+    assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
+    cfg.known_args_namespace.cacheclear = False
+    (cache / "lastfailed").write_bytes(b"\xff\xfe")                            # unreadable cache state is not a narrowing
+    assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
     (cache / "lastfailed").write_text("{}")
     assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
     assert p.refuse_bare_full(_config(cwd=ROOT / "tests" / "ci"), NO_ENV) is None   # started inside a tests/ subdirectory

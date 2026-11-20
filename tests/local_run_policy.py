@@ -57,7 +57,7 @@ def has_last_failed(root_dir):
     """True when pytest's cache holds failures to rerun: `--lf` on an empty cache runs everything, so only then it narrows."""
     try:
         return bool(Path(root_dir, ".pytest_cache", "v", "cache", "lastfailed").read_text(encoding="utf-8").strip("{} \n"))
-    except OSError:
+    except (OSError, UnicodeError):
         return False
 
 
@@ -106,7 +106,7 @@ def refuse_bare_full(config, env=None):
         getattr(ns, "keyword", ""),
         getattr(ns, "markexpr", ""),
         bool(getattr(ns, "collectonly", False)),
-        bool(getattr(ns, "lf", False)) and has_last_failed(config.rootpath),
+        bool(getattr(ns, "lf", False)) and not getattr(ns, "cacheclear", False) and has_last_failed(config.rootpath),
         whole,
         inside_tests_subdir(config.invocation_params.dir, config.rootpath),
     ):
@@ -137,5 +137,5 @@ def background_qos(env=None, platform=None):
 
         libc = ctypes.CDLL(None, use_errno=True)
         return libc.setpriority(_PRIO_DARWIN_PROCESS, 0, _PRIO_DARWIN_BG) == 0
-    except (OSError, AttributeError):
+    except Exception:
         return False     # a priority that cannot be set must never fail the run it was meant to quiet
