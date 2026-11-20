@@ -75,7 +75,17 @@ def test_a_registry_that_raises_after_the_signature_was_spent_leaves_the_write_u
             return real.get(name)
 
         def touched(self, *a: Any) -> Any:
+            called.append(a)
             raise RuntimeError("the registry cannot say")
 
+    called: list[Any] = []
     rig.reg = Raising()
+    assert _note(rig, _answer()) is None
+    assert called                                # the raise happened inside the call under test, not before it
+
+    class RaisingGet:
+        def get(self, name: str) -> Any:
+            raise RuntimeError("the registry cannot say")
+
+    rig.reg = RaisingGet()
     assert _note(rig, _answer()) is None

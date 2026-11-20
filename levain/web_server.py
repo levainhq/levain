@@ -2781,19 +2781,19 @@ class _Handler(GuardedHandler):
         as it was. A replayed answer, a refusal, a decided pending still settling (its effect has not committed: a derive
         begun now could read the older state and be taken as the answer), and a verb the registry does not know leave the set
         unset. It never fails the answer: the signature is spent by the time it runs."""
-        cockpit = getattr(self.server, "cockpit", None)
-        registry = getattr(self.server, "verb_registry", None)
-        if cockpit is None or registry is None or not cockpit.attached or not isinstance(answer, dict):
-            return
-        if answer.get("replay") is True or answer.get("state") not in _SIGNED_APPLIED_STATES:
-            return
-        verb, panel = answer.get("verb"), answer.get("panel_id")
-        spec = registry.get(verb) if isinstance(verb, str) else None
-        if spec is None or not isinstance(panel, str):
-            return
         try:
+            cockpit = getattr(self.server, "cockpit", None)
+            registry = getattr(self.server, "verb_registry", None)
+            if cockpit is None or registry is None or not cockpit.attached or not isinstance(answer, dict):
+                return
+            if answer.get("replay") is True or answer.get("state") not in _SIGNED_APPLIED_STATES:
+                return
+            verb, panel = answer.get("verb"), answer.get("panel_id")
+            spec = registry.get(verb) if isinstance(verb, str) else None
+            if spec is None or not isinstance(panel, str):
+                return
             touched = frozenset(registry.touched(cockpit, spec, panel))
-        except Exception:  # noqa: BLE001 - a registry that cannot say leaves the write unkeyed, as if the verb were unknown
+        except Exception:  # noqa: BLE001 - what cannot be read leaves the write unkeyed (every read dropped, as before S3c)
             return
         if touched:
             self._write_touched = touched
