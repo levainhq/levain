@@ -65,7 +65,7 @@ STATE = """JSON.stringify((() => { const h = document.documentElement; const ids
   return { stateEff: stateEff, heroOpacity: getComputedStyle(document.getElementById('ck-hero')).opacity, stateInHero: !!st && !!st.closest('#ck-hero'),
     dropInert: !!dropEl && !!dropEl.closest('[inert]'), dropPresent: !!dropEl, inert: present.filter((id) => document.getElementById(id).hasAttribute('inert')), present: present, whole: h.hasAttribute('data-board-whole'),
     tiles: w.querySelectorAll('.ck-card').length, opacity: getComputedStyle(w).opacity, focusableFound: !!focusable, focused: focused,
-    live: { sync: live('#refresh'), nav: live('[data-phone-jump]'), theme: live('[data-theme-set]'), tab: live('[data-mode-tab]'), masthead: live('.masthead') },
+    live: { fresh: live('#freshline'), nav: live('[data-phone-jump]'), theme: live('[data-theme-set]'), tab: live('[data-mode-tab]'), masthead: live('.masthead') },
     inertElsewhere: [...document.querySelectorAll('[inert]')].filter((n) => ids.indexOf(n.id) < 0).length }; })())""".replace("REGIONS", json.dumps(REGIONS))
 
 # a press at the centre of the first tile in the viewport, whatever the page's hit test says: the driver's tap step presses where `contains` says
@@ -84,7 +84,7 @@ def _boot(tmp_path: Path):
 
 @needs_browser
 def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_says_so(tmp_path: Path) -> None:
-    """Partial: every region the draw replaces carries inert (the masthead, the nav, Sync and the theme switch do not), the part is dimmed, a tile
+    """Partial: every region the draw replaces carries inert (the masthead, the nav, the freshness line and the theme switch do not), the part is dimmed, a tile
     on it cannot take focus, a press at the tile's centre lands outside it (the probe: CDP mouse events skip inert nodes), and the positive
     signal is absent. After the whole draw: nothing is inert, the signal is there, and when the signal appeared nothing was inert any more and
     the tiles were drawn (same turn). The same focus attempt and the same press now reach the tile (the controls that show the probes can
@@ -109,7 +109,7 @@ def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_s
     assert part["inert"] == part["present"] and "ck-widgets" in part["inert"] and "board" in part["inert"], part   # every region the draw replaces
     assert float(part["opacity"]) < 1, part                                   # inert has no look of its own: the part is dimmed
     assert part["focusableFound"] and part["focused"] is False, part          # nothing on the part takes focus
-    assert all(part["live"].values()) and part["inertElsewhere"] == 0, part   # the masthead, the nav, Sync and the theme switch stay live
+    assert all(part["live"].values()) and part["inertElsewhere"] == 0, part   # the masthead, the nav, the freshness line and the theme switch stay live
     assert part["dropPresent"] and part["dropInert"] is False, part          # the drop is never replaced by the whole draw: it stays live (its tab focuses the box)
     assert part["stateInHero"] and (part["stateEff"] is None or abs(part["stateEff"] - float(part["heroOpacity"])) < 0.01), part   # dimmed once, through the hero
     assert hits_part and all(h["inTile"] is False for h in hits_part), hits_part   # the press went to the page behind, never into the tile

@@ -61,7 +61,7 @@ EDITOR = r"""(() => { document.querySelector('#ck-thiscockpit .name-edit').click
 OFFER_RENAME = r"""(() => { const orig = window.LevainDashboard.render;
   window.LevainDashboard.render = (v, o) => orig(Object.assign({}, v, { offered_verbs: Object.assign({}, v && v.offered_verbs, { entity_name: true }) }),
     Object.assign({}, o, { commit: (o && o.commit) || (async () => ({ ok: true })) }));
-  document.getElementById('refresh').click(); return 1; })()"""
+  return window.LevainCockpitTransport.reload().then(() => 1); })()"""
 
 
 @needs_browser

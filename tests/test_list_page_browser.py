@@ -310,7 +310,8 @@ def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None
 
 _MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0;"
            "window.matchMedia=function(q){const m=o(q);if(/max-width:\\s*720px/.test(q)){const a=m.addEventListener.bind(m);"
-           "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
+           # counts the LIST's placeholder listener only: another module (the freshness line, levain#159) may watch the same width once
+           "m.addEventListener=function(t,f,c){if(f&&f.name==='setPlaceholders')window.__mqAdds++;return a(t,f,c);};}return m;};})()")
 
 _LISTFIX_PROBE = f"""(() => {{
   const T = document.querySelector('#levain-modal .modal-body') || {TRAY}; const rows = [];

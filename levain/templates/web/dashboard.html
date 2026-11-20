@@ -45,7 +45,10 @@
           </span>
           <span class="stamp" id="stamp"></span>
           <button id="presencebtn" class="pr-chip" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-controls="pr-sheet" aria-label="Presence"><span class="pr-dot" aria-hidden="true"></span><span class="pr-chip-t"></span></button>
-          <button id="refresh" type="button">Sync</button>
+          <!-- The freshness line (levain#159): how current the page is. It is the page's one .livechip; fresh_line.js writes it and
+               cockpit_stream.js adopts it. The state words sit alone in the role=status span (the only part spoken); the age beside
+               it is outside it, so a ticking age is never announced. Static here so the first paint already has the slot. -->
+          <span class="livechip" id="freshline" data-state="connecting" title="Connecting: the board is being read."><span class="fl-state" role="status">connecting</span><span class="fl-age" hidden></span></span>
           <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
@@ -121,6 +124,7 @@
 <script src="/pwa_install.js"></script>
 <script src="/pair_card.js"></script>
 <script src="/dashboard_boot.js"></script>
+<script src="/fresh_line.js"></script>
 <script src="/cockpit_stream.js"></script>
 <script src="/dashboard_chat.js"></script>
 <script src="/devices_panel.js"></script>

@@ -20,6 +20,7 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 
 from levain.cockpit.keys import fingerprint_of
+from tests._cockpit_reread import REREAD
 from tests._phone_fixtures import _enrol
 from tests.test_cockpit_consent_sheet_page import FRAME as CONSENT_FRAME  # noqa: F401  (the sheet's frame, for reference)
 from tests.test_cockpit_consent_sheet_page import _ConsentRig
@@ -613,7 +614,7 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"tap": _REVOKE, **{**_TAP_UNTIL, "until": f"window.__getCalls >= 1 && (window.__tapped = {_CARD}) && 1"}},
             # a board read (Sync) while the prompt is up: the card is replaced, and the one the tap was on is off the page. The card's
             # lock is read in the same evaluation that sees the replacement (a read of the page's own may land between two steps)
-            {"do": "document.querySelector('#refresh').click(); 1",
+            {"do": REREAD,
              "until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && ({_REVOKE}.disabled ? 'locked' : 'unlocked')", "ms": 30000},
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
@@ -622,7 +623,7 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             # card plain, never the old refusal again
             {"eval": f"window.__shown = {_CARD}; window.__failList = 1; 1"},
             # every listing read fails: the redraw is a card with NO sign line (no note element), and it is seen here
-            {"do": "document.querySelector('#refresh').click(); 1", "every": 8000,
+            {"do": REREAD, "every": 8000,
              "until": (f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected"
                        f" && !{_CARD}.querySelector('.sign-note') && 1"), "ms": 45000},
             {"eval": "window.__failList = 0; 1"},
@@ -632,7 +633,7 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             # read in the SAME evaluation that sees the
             # card (the wait's own value): every redraw leaves the slot empty until its fill answers, so a read in a step of its
             # own can land on no card at all
-            {"do": "document.querySelector('#refresh').click(); 1", "every": 16000,
+            {"do": REREAD, "every": 16000,
              "until": (f"(() => {{ const c = {_CARD}; if (!c || c === window.__shown || window.__shown.isConnected) return null;"
                        f" const n = c.querySelector('.sign-note'); return n ? {{note: n.textContent}} : null; }})()"), "ms": 60000},
             {"eval": "window.__getCalls"},
@@ -680,7 +681,7 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
             {"eval": f"window.__shown = {_CARD2}; 1"},
             # the card's note and lock are read in the evaluation that sees the card, and only a card drawn WITH its sign line
             # counts (b11: a card drawn with no listing has no note, and a redraw leaves the slot empty until its fill answers)
-            {"do": "document.querySelector('#refresh').click(); 1",
+            {"do": REREAD,
              "until": (f"(() => {{ const c = {_CARD2}; if (!c || c === window.__shown || window.__shown.isConnected) return null;"
                        f" const n = c.querySelector('.sign-note'), b = c.querySelector('.grant-revoke');"
                        f" return n && b ? {{note: n.textContent, disabled: b.disabled}} : null; }})()"), "ms": 30000},

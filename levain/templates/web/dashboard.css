@@ -194,12 +194,11 @@
   }
   .indicators { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; justify-content: flex-end; }
   .stamp { font-variant-numeric: tabular-nums; color: var(--meta); font: var(--fw-regular) var(--fs-meta) var(--sans); }
-  button#refresh, button#jumpbtn, button#calmbtn {
+  button#jumpbtn, button#calmbtn {
     background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4);
     color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer;
   }
-  button#refresh:hover, button#jumpbtn:hover, button#calmbtn:hover { color: var(--text); border-color: var(--hair-2); }
-  button#refresh:disabled { opacity: .5; cursor: default; }
+  button#jumpbtn:hover, button#calmbtn:hover { color: var(--text); border-color: var(--hair-2); }
   button#calmbtn[aria-pressed="true"] { color: var(--text); border-color: var(--hair-2); }
 
   /* the operator's state line: their own words, reflected back, with its age */
@@ -836,7 +835,6 @@
      The smallest control labels bump up a hair so the bigger target is also legible. */
   @media (pointer: coarse) {
     .tab,
-    button#refresh,
     .edit-btn,
     .name-edit,
     .edit-save,
@@ -855,7 +853,6 @@
     .scope-tb { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .scope-ch { padding: var(--sp-3) var(--sp-3); font-size: var(--fs-micro); }
     .tab { padding: var(--sp-4) var(--sp-5); }
-    button#refresh { padding: var(--sp-3) var(--sp-4); }
 
     /* iOS Safari fixes, gated to coarse so desktop is PROVABLY untouched (not
        merely a no-op there — codex L3): 16px form fields stop the focus jump-zoom
@@ -1154,12 +1151,22 @@
   .pw { margin-left: auto; font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
   .pl-none { color: var(--meta); cursor: default; }
 
-/* the freshness chip: whether the page is being told when panels move */
-.livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--meta); display: inline-flex; align-items: center; gap: var(--sp-2); }
-.livechip::before { content: ""; width: 7px; height: 7px; border-radius: var(--r-pill); background: var(--faint); }
+/* the freshness line (levain#159, fresh_line.js): the dot, the state words, then the age beside them. The words and the age are
+   two spans so that only the words are in the live region (the age ticks and is never spoken). Where the line is short of room
+   the age is cut first and then the words, each with an ellipsis, so the text itself never wraps to a second line (where the CHIP sits in a
+   wrapping masthead is the rules at 720 px and 1100 px below); the full sentence is its title.
+   data-state names the state (connecting, live, stale: a panel, down: the change stream, failed: a read, refused); the dot's
+   colour is never the only signal, the words carry it. Nothing here animates. */
+.livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--meta); display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; max-width: 34ch; }
+.livechip::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: var(--r-pill); background: var(--faint); }
 .livechip[data-state="live"]::before { background: var(--ok); }
-.livechip[data-state="stale"] { color: var(--label); }
-.livechip[data-state="stale"]::before { background: var(--warn); }
+.livechip:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) { color: var(--label); }
+.livechip:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"])::before { background: var(--warn); }
+.livechip .fl-state, .livechip .fl-age { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.livechip .fl-state { flex: 0 1 auto; }
+.livechip .fl-age { flex: 0 100 auto; color: var(--meta); }
+.livechip .fl-age::before { content: "\00b7\00a0"; }
+.livechip .fl-age[hidden] { display: none; }
 
 
 /* ═══════════════════════════ the KE page (body.ke): hero, widgets, a 3-column zone grid ═══════════════════════════
@@ -1198,14 +1205,14 @@ body.ke .band-meta .events .bad { color: var(--accent); }
 .wx-side .rd-sub, .wx-side .rd-b { display: block; margin: 0; padding: 0; border: 0; font-size: var(--fs-meta); color: var(--label); }
 .wx-src { font-size: var(--fs-micro); color: var(--meta); margin-top: calc(var(--sp-2) * -1); }
 
-/* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
+/* THE BAR (F6): brand, the four tabs, the status cluster, the freshness line, Jump, the theme switch. ONE control row at --ctl-md. */
 body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
 body.ke .masthead .seg { height: var(--seg-h); box-sizing: border-box; padding: 3px; border-radius: var(--r-md); align-items: stretch; flex: none; }
 body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
 /* the page's switches (tabs, theme, the lens switch) are one material: a recessed track, the chosen key raised and lit */
 body.ke .masthead .seg, body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
 body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
-/* one control height across the bar: the tab track, the theme track and the Sync / Jump keys share --seg-h with the lens switch */
+/* one control height across the bar: the tab track, the theme track and the Jump key share --seg-h with the lens switch */
 body.ke .masthead .themesw { height: var(--seg-h); box-sizing: border-box; padding: 3px; align-items: stretch; }
 body.ke .masthead .themesw button { height: auto; }
 body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
@@ -1531,9 +1538,9 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 
 /* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
-/* THE BAR ON A NARROW SCREEN. Two rows: the brand with the status dot, Sync and the theme switch; then the four tabs across the width.
-   Under 1100px (960 until 1023+13, when the jar and the live dot overlapped the tabs between 961 and 1040; 1040 until 1027+4, when a wide font's bar overlapped them between 1041 and 1099) the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
-   the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
+/* THE BAR ON A NARROW SCREEN. Two rows: the brand and the theme switch; then the four tabs across the width.
+   Under 1100px (960 until 1023+13, when the jar and the live dot overlapped the tabs between 961 and 1040; 1040 until 1027+4, when a wide font's bar overlapped them between 1041 and 1099) the transient status line and the jar sit on a third row; under 480px Jump becomes its icon and
+   the keyboard cues go (the freshness line stays, in words, on every width): a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
 @media (width <= 1100px) {   /* range form: a zoomed page's fractional width (1100.5) falls in one band, never between two */
   body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); column-gap: var(--sp-3); padding-block: var(--sp-4); }
   body.ke .masthead .brand { order: 0; margin-right: auto; }
@@ -1567,8 +1574,6 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
 }
 @media (max-width: 480px) {
-  body.ke .masthead .stamp { display: none; }
-  body.ke .masthead .livechip { font-size: 0; gap: 0; }
   body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
   body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
   body.ke .band { position: relative; }
@@ -3344,7 +3349,7 @@ form.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-to
   .pr-sheet-link { min-height: var(--hit-min, 44px); display: flex; align-items: center; }
 }
 @media (max-width: 480px) {
-  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch, and the phone is his main surface: the chip is its own full-width row under the tabs, the word and its tail written out */
+  /* a phone's first row has no room for words beside the brand and the theme switch, and the phone is his main surface: the chip is its own full-width row under the tabs, the word and its tail written out */
   body.ke .masthead .indicators .pr-chip { order: 4; flex: 1 1 100%; width: auto; justify-content: flex-start; padding: 0 var(--sp-4); min-height: var(--hit-min, 44px); }
   .pr-chip-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pr-chip-w { font-weight: var(--fw-semibold); }
@@ -4020,7 +4025,7 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia .masthead .brand { flex: 1 1 calc(100% - 140px); order: 1; min-width: 0; }
   body.ia .masthead .readout { display: contents; }
   body.ia .masthead .themesw { order: 2; flex: none; }
-  body.ia .masthead .indicators, body.ia .masthead .indicators > *, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn, #stamp) { order: 3; }
+  body.ia .masthead .indicators, body.ia .masthead .indicators > *, body.ia .masthead :is(#jumpbtn, #presencebtn, #stamp) { order: 3; }
   body.ia .masthead .unit { order: 4; }
   body.ia .masthead .indicators { gap: var(--sp-2); }
   body.ia .ia-act { min-width: 38px; min-height: 38px; padding: 0; justify-content: center; }
@@ -4156,26 +4161,52 @@ body.ia .deck { padding-top: 0; }   /* the masthead carries the status-bar inset
 html { scroll-padding-top: var(--ia-bars-h, 0px); }
 body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .ck-thiscockpit) { scroll-margin-top: var(--sp-4); }
 
-/* a touch screen, at every width: each masthead control (the presence chip, Sync, Jump, the theme buttons, the three actions) is a 44 px target;
+/* a touch screen, at every width: each masthead control (the presence chip, Jump, the theme buttons, the three actions) is a 44 px target;
    the actions (in the block above) and the theme buttons, which are icons only, are 44 wide as well */
 @media (pointer: coarse) {
-  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#refresh, #jumpbtn, #presencebtn) { min-height: var(--hit-min, 44px); }
+  body.ia .masthead .indicators button, body.ia .masthead .themesw button, body.ia .masthead .ia-act, body.ia .masthead :is(#jumpbtn, #presencebtn) { min-height: var(--hit-min, 44px); }
   body.ia .masthead .themesw button { min-width: var(--hit-min, 44px); }   /* the icon-only ones are 44 wide too (the Drop / Grants / Notifications buttons are, in the block above) */
   body.ke .masthead .themesw, body.ke .masthead .indicators button { height: auto; }
 }
-/* the three theme buttons are 44 wide on touch (144 px with their padding, 36 px each before), so on a phone the brand leaves them 164 px
-   on its row, not 140: the brand and the theme switch stay one row and Drop, Grants, Notifications, Sync and Jump keep theirs */
-@media (pointer: coarse) and (max-width: 720px) {
+/* the three theme buttons are 44 wide up to 720 px whatever the pointer (144 px with their padding, 36 px each before), so the brand leaves
+   them 164 px on its row, not 140: the brand and the theme switch stay one row, which also leaves the freshness line the room of the
+   buttons' row instead of sharing it with the switch (a mouse at 481 to 720), and Drop, Grants, Notifications and Jump keep theirs */
+@media (max-width: 720px) {
   body.ia .masthead .brand { flex-basis: calc(100% - 164px); }
 }
 
-/* the phone's header: Drop, Grants, Notifications, Sync and Jump are one row (the presence chip takes its own row after them, and the
-   read-time line the one after that), where the chip used to sit between them and push Sync and Jump onto a row of their own */
+/* the phone's header: Drop, Grants, Notifications and Jump are one row, and the freshness line is right-aligned after them on that row
+   (its text is cut with an ellipsis before it wraps); the presence chip takes its own row after them, and the transient status line the one after that,
+   where the chip used to sit between them and push Jump onto a row of its own */
 @media (max-width: 720px) {
-  body.ia .masthead .indicators > .ia-actions, body.ia .masthead #refresh, body.ia .masthead #jumpbtn { order: 3; }
-  body.ia .masthead #presencebtn { order: 4; }
-  body.ia .masthead #stamp { order: 5; }
+  body.ia .masthead .indicators > .ia-actions, body.ia .masthead #jumpbtn { order: 3; }
+  /* a zero basis keeps it on the buttons' row whatever it says (it takes the row's remaining room and cuts with an ellipsis), and right-aligned */
+  body.ia .masthead #freshline { order: 4; flex: 1 1 0; min-width: 7ch; max-width: none; justify-content: flex-end; }
+  /* the state words keep their room and the age takes what is left of the row (an ellipsis on the age first, then on the words) */
+  body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
+  /* a trouble state is read whole: on the shared row the cut hit the panel's name ("Work board unavaila...") and the age, the very words that say
+     what is wrong, and a phone has no hover to read the title. So it takes its own row after the buttons' (the presence chip, a full row, follows it),
+     left-aligned, the words wrapping rather than cutting and the age after them. The live state (and a live read that says "updating", and the
+     first "connecting") keeps the shared row above. The row comes when a trouble state speaks (a worse state waits its hold first, so a flap
+     does not move the page) and goes when the page is live again; the masthead is not pinned here. 721 px and up is untouched: its footprint
+     is fixed on purpose (the block below). */
+  body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) { flex: 1 1 100%; justify-content: flex-start; }
+  body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) :is(.fl-state, .fl-age) {
+    flex: 0 1 auto; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
+  body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
+  /* its own full row, cut with an ellipsis rather than past the edge: it now carries a read's failure and what to do about it */
+  body.ia .masthead #stamp { order: 6; flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
+/* Between the phone and the desktop bar the masthead wraps and is pinned, so the line's footprint must not depend on what it says: a
+   zero basis with a floor that holds the dot and the longest state words, and the room left over is the age's. A line sized by its text
+   took its own row when a trouble state arrived and moved the bar and everything under it. */
+@media (min-width: 721px) and (max-width: 1100px) {
+  body.ia .masthead #freshline { flex: 1 1 0; min-width: 18ch; max-width: none; justify-content: flex-end; }
+  body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
+}
+/* the transient status line (#stamp) is empty until a read, a notice or a refusal writes it: empty, it takes no row */
+body.ia .masthead .stamp:empty { display: none; }
 
 /* the now line: the clock and date, the state line and the wrap line share one baseline where they share a row; the state line's
    own top padding (the page's block rule) is what hung it below the clock. Where they wrap, each is its own row. */
@@ -4183,6 +4214,28 @@ body.ia[data-ia-place="home"] #ck-band { align-items: baseline; }
 body.ia[data-ia-place="home"] #ck-band #ck-state-slot { align-self: baseline; }   /* the page's own rule pins it to the start of the row */
 body.ia[data-ia-place="home"] #ck-band .stateline { padding: 0; margin: 0; }
 body.ia[data-ia-place="home"] #ck-band .band-state .ftext { line-height: 1.2; }
+
+/* levain#167 (Phill 11-19): the head block under the places bar. Desktop: a little more room between the places bar and the clock and
+   state line. Phone: the clock and date are one unit; the state line is the hero, its age and edit a quiet line under it; the wrap
+   line and the event count are a separate quiet status row, not the same weight as the state. */
+body.ia[data-ia-place="home"] #ck-band { padding-block-start: var(--sp-5); }
+@media (max-width: 720px) {
+  body.ia[data-ia-place="home"] #ck-band { flex-direction: column; align-items: stretch; gap: var(--sp-5); }
+  body.ia[data-ia-place="home"] #ck-band #ck-state-slot { align-self: stretch; }
+  /* a slot with no visible state line and an empty wrap line are not rows: no gap spent on them, no hairline drawn over nothing */
+  body.ia[data-ia-place="home"] #ck-band #ck-state-slot:not(:has(.stateline:not([hidden]))) { display: none; }
+  body.ia[data-ia-place="home"] #ck-band .band-meta:empty { display: none; }
+  body.ia[data-ia-place="home"] #ck-band .clockbox { flex-wrap: wrap; column-gap: var(--sp-4); }
+  /* the State label sits tight above its line, the age and edit follow on one quiet line under it */
+  body.ia[data-ia-place="home"] #ck-band .stateline { row-gap: var(--sp-2); column-gap: var(--sp-4); }
+  body.ia[data-ia-place="home"] #ck-band .band-state .ftext { flex: 1 0 100%; font-size: var(--fs-h); }
+  /* the status row: one hairline above it, wrap and events flowing on a row of their own, meta weight */
+  body.ia[data-ia-place="home"] #ck-band .band-meta {
+    margin: var(--sp-2) 0 0; padding-top: var(--sp-3); border-top: 1px solid var(--hair); flex-direction: row; flex-wrap: wrap;
+    justify-content: flex-start; align-items: baseline; gap: var(--sp-1) var(--sp-5); }
+  body.ia[data-ia-place="home"] #ck-band .band-meta b { color: var(--meta); }
+  body.ia[data-ia-place="home"] #ck-band .band-meta .wrapline { flex-wrap: wrap; row-gap: 0; }
+}
 
 /* Drop to the desk: the card's head (the heading and the sign-in note) and the box take the card's inner padding. Home flattens every
    frame to padding-inline: 0 (the grid supplies the gutter), which left this card's content against its edge. */
