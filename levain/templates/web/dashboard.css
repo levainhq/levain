@@ -3806,8 +3806,9 @@ body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="jobs"], [data-ck-panel="edits"]) { height: 260px !important; max-height: none; }
 body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !important; min-height: 0; }
 /* a folded card is its header: the fixed heights above (and the Board's pair height) are for a card with a body, and they are !important, so the fold
-   says it again here, one class above them so it also wins the phone heights further down */
-body.ia[data-ia-place="home"] .panel.ck-collapsed[data-ck-panel] { height: auto !important; min-height: 0 !important; }
+   says it again here, one class above them so it also wins the phone heights further down; `align-self: start` because a folded empty card is a
+   `.ck-fold` (stretch), which would otherwise stretch its auto height to the tallest card beside it in the row */
+body.ia[data-ia-place="home"] .panel.ck-collapsed[data-ck-panel] { height: auto !important; min-height: 0 !important; align-self: start; }
 body.ia[data-ia-place="home"] .panel.ck-collapsed[data-ck-panel] > :not(.phead) { display: none !important; }   /* the slim empty-card bar draws its body as a flex row, which outranks the generic hide */
 body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
 
