@@ -17,7 +17,7 @@ digest) AND CONTROL's own answer (each route's policy digest and backends) equal
 at a generation above both the store's top and CONTROL's active one. A changed input is never skipped; a same-input re-run
 submits nothing.
 
-MODES (all run as the guest operator ``admin``, which has passwordless sudo; none runs as root itself):
+MODES (all run as the guest operator ``admin``; none runs as root itself; the install-helper call asks sudo through ``--sudo-askpass``):
   prep      the signing key + the cockpit authority log the stage needs (see PREREQUISITES). Run once, before W1.
   repo      the target repo for wave3 --repo (one commit on main, world-readable, owned by the dispatch account). Run once.
   policy    sign a NEW provider_policy generation from the arguments (stage keeps an identical active one).
