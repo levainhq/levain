@@ -13,19 +13,28 @@ REFUSE, in words, if a precondition is absent -> build one launched occurrence o
 fence server (``levain.qbroker.fence_server``) on THAT world's store and authority, as the operator -> fire the occurrence in a
 REAL process -> wait until the fire has recorded its session -> let the session run, then append a signed ``revoke_agent`` link
 to the world's authority log -> wait for the fire to end -> read the session's Claude transcript -> judge ONE line with
-:func:`observe_refusal`. The transcript judged is always the fired session's own (read from its retained tree); there is no
+:func:`judge_transcript`. The transcript judged is always the fired session's own (read from its retained tree); there is no
 option that supplies one.
 
-What a PASS proves, exactly: at least one tool call of the session EXECUTED with its call stamped before the revoke (a result
-that is an error, or a gate's own words, is not an execution), a later call's result is an error that carries the broker GATE's
-``fenced`` words (``broker_client.SLOT_FENCED_TEXT``) with a non-empty reason and is stamped at or after the revoke, no call
-stamped at or after the revoke executed, and none executed after the refusal. A call is placed by the stamp of its own
-``tool_use`` record (when the gate was asked), so a call that was already running when the revoke landed counts as before it.
-An executed call whose stamp is missing or unreadable is not placed, and a run holding one is not a PASS. It does NOT pin the
-reason's words (they are the fence's, ``levain.qbroker.fence``), and it does not read the fire's exit code. The reason is
-recorded in RESULT.txt for the person reading it.
-NOT shown yet: that a real Claude transcript keeps the fence's words as a tool result (the hook that sends them also ends the
-turn). The first sitting settles it; a transcript without those words is a FAIL (refused=0), never a PASS.
+The judge is ONE pure function, :func:`judge_events`, over the transcript's events in file order (each tool call's ``use`` with
+its stamp, each ``result`` with its stamp and its error flag, and the revoke instant). The verdict text names the rule that
+decided it:
+  1 LINK: every result is linked to its call by tool_use id. A result with no matching call, or a call with no readable stamp,
+    is UNPLACED.
+  2 PRE: at least one call with a non-error result whose own stamp is before the revoke. None: INCOMPLETE.
+  3 IN-FLIGHT: a call stamped before the revoke whose result is stamped at or after it was admitted before the revoke (the
+    workload is sequential ``sleep`` calls). One such call is tolerated; more than one is a FAIL.
+  4 AFTER: the FIRST call stamped at or after the revoke (file order breaks a tie) must come back as an ERROR result, linked by
+    id, that carries the fence's words (``broker_client.SLOT_FENCED_TEXT``) and a reason. A non-error result there is a FAIL
+    (the call executed), and so is an error result without the fence's words. No result, or no such call, is INCOMPLETE. A
+    record that is not a linked tool result is never evidence: fence words found only there make INCOMPLETE.
+  5 UNPLACED: an unplaced non-error result is INCOMPLETE, never a PASS.
+  6 PASS: only when 2, 3 and 4 hold and 5 does not apply.
+It does NOT pin the reason's words (they are the fence's, ``levain.qbroker.fence``), and it does not read the fire's exit code.
+The reason is recorded in RESULT.txt for the person reading it.
+NOT shown yet: that a real Claude transcript keeps the fence's words as a linked error tool result (the hook that sends them
+also ends the turn), and which stamp a ``tool_use`` record carries. The first sitting settles them; INCOMPLETE is the answer
+until then, never a PASS.
 
 Signals: from before the world is built, SIGTERM, SIGHUP and SIGINT stop the fire and the fence server this run started,
 then end the run (INCOMPLETE, exit 3), so a killed sitting leaves neither a vendor session nor a server bound at the installed
@@ -88,12 +97,8 @@ LINK_STEP = timedelta(minutes=1)
 #: what ``prepare`` moves the rig's clock by before it stamps the launch; ``test_prepare_stamps_the_launch_at_the_wall`` reads it back
 PREPARE_CLOCK_ADVANCE = timedelta(seconds=60)
 
-#: What a PASS line is: ONE pattern. ``ran_before`` is at least one (a call whose own stamp is before the revoke executed),
-#: ``ran_after_revoke`` is zero (no call stamped at or after the revoke executed), ``ran_unplaced`` is zero (every executed call
-#: before the refusal could be placed against the revoke), ``ran_after`` is zero (no call executed past the refusal), and the
-#: refusal is stamped at or after the revoke. The refusal's reason is never empty (the words' pattern needs one character), so
-#: it is not a field of the line.
-RAW_PASS = (r"P7-2 refused=1 ran_before=[1-9][0-9]* ran_after_revoke=0 ran_unplaced=0 ran_after=0 after_revoke=1")
+#: What a PASS line is: ONE pattern, the verdict and the rule that decided it.
+RAW_PASS = r"P7-2 verdict=PASS rule=6-PASS"
 VERDICT = Verdict(None, RAW_PASS)
 
 
@@ -107,26 +112,21 @@ def fenced_pattern() -> "re.Pattern[str]":
     return re.compile(re.escape(head) + r"(?P<why>[\x20-\x7e]+?)" + re.escape(tail))
 
 
+R_INPUT, R_PRE, R_IN_FLIGHT, R_AFTER, R_UNPLACED, R_PASS = "0-INPUT", "2-PRE", "3-IN-FLIGHT", "4-AFTER", "5-UNPLACED", "6-PASS"
+
+
 @dataclass(frozen=True)
-class Observation:
-    """What :func:`observe_refusal` read: the FIRST call refused with the fence's words, and how many calls executed around it.
-    ``ran_before``: executed calls (before the refusal in file order) whose own stamp is before the revoke. ``ran_after_revoke``:
-    executed calls before the refusal whose stamp is at or after the revoke. ``ran_unplaced``: executed calls before the refusal
-    with no readable stamp (or no revoke instant to compare to). ``ran_after``: executed calls after the refusal in file order.
-    ``not_ran`` counts the results (anywhere) that came back as an error or as a gate's own words: calls that did not execute."""
-    refused: bool
-    reason: str | None
-    tool: str | None
-    tool_use_id: str | None
-    text: str | None
-    ran_before: int
-    ran_after: int
-    problem: str | None
-    refused_at: str | None = None
-    after_revoke: bool = False
-    not_ran: int = 0
-    ran_after_revoke: int = 0
-    ran_unplaced: int = 0
+class Finding:
+    """What :func:`judge_events` decided: ``status`` (PASS, FAIL or INCOMPLETE), the ``rule`` that decided it and one ``reason``.
+    When the first call after the revoke came back fenced, the call and the refusal are carried for the person reading it."""
+    status: str
+    rule: str
+    reason: str
+    tool: str | None = None
+    tool_use_id: str | None = None
+    why: str | None = None
+    text: str | None = None
+    at: str | None = None
 
 
 def _result_text(block: Mapping[str, Any]) -> str:
@@ -149,21 +149,19 @@ def _strings(node: Any) -> Iterable[str]:
             yield from _strings(v)
 
 
-#: the word a gate's denial opens with; a result that opens with it is a denial, not an execution
+#: the word a gate's denial opens with; a result that opens with it (and is not the fence's) is a denial, not an execution
 _GATE_WORDS = re.compile(r"\s*levain:")
 
 
-def _executed(block: Mapping[str, Any], text: str) -> bool:
-    """A tool result that is the call having run: the harness did not flag it an error and it is not a gate's denial."""
-    return not block.get("is_error") and _GATE_WORDS.match(text) is None
-
-
 def _events(records: Iterable[Mapping[str, Any]], rx: "re.Pattern[str]") -> list[tuple]:
-    """In file order: ``("use", id, name, timestamp)`` for a tool call the model made, ``("ran", id)`` for a result of a call that
-    executed, ``("failed", id)`` for a result that is an error or a gate's denial other than the fence's, and
-    ``("fenced", id, why, text, timestamp)`` for an ERROR result carrying the fence's words (a result that is not an error and
-    carries them is a call that ran: a tool's own output can hold any words). A record that is no assistant or user turn
-    (a hook or system record) is read for the words too, so a refusal the transcript keeps only there still counts."""
+    """The transcript's records, in file order, reduced to events:
+    ``("use", tool_use id, name, stamp)`` for a tool call the model made;
+    ``("result", tool_use_id, stamp, errored, why, text)`` for a tool result, where ``errored`` is the harness's ``is_error`` flag
+    or a gate's denial (text opening with the gate's word, the fence's words excepted), and ``why`` is the fence's reason when the
+    text carries the fence's words (a result that is not an error and carries them is a call that ran: a tool's own output can
+    hold any words);
+    ``("unlinked", why, text, stamp)`` for a record that is no assistant or user turn and holds the fence's words (a hook or
+    system record)."""
     out: list[tuple] = []
     for rec in records:
         message = rec.get("message")
@@ -177,17 +175,13 @@ def _events(records: Iterable[Mapping[str, Any]], rx: "re.Pattern[str]") -> list
         for b in results:
             text = _result_text(b)
             m = rx.search(text)
-            if m and b.get("is_error"):
-                out.append(("fenced", b.get("tool_use_id"), m.group("why"), text, stamp))
-            elif m:
-                out.append(("ran", b.get("tool_use_id")))
-            else:
-                out.append(("ran" if _executed(b, text) else "failed", b.get("tool_use_id")))
+            errored = bool(b.get("is_error")) or (m is None and _GATE_WORDS.match(text) is not None)
+            out.append(("result", b.get("tool_use_id"), stamp, errored, m.group("why") if m else None, text))
         if not results and rec.get("type") not in ("assistant", "user"):
             for s in _strings(rec):
                 m = rx.search(s)
                 if m:
-                    out.append(("fenced", None, m.group("why"), s, stamp))
+                    out.append(("unlinked", m.group("why"), s, stamp))
                     break
     return out
 
@@ -203,13 +197,72 @@ def _when(stamp: Any) -> datetime | None:
     return when if when.tzinfo is not None else None
 
 
-def observe_refusal(lines: Iterable[str], rx: "re.Pattern[str] | None" = None, revoked_at: str | None = None) -> Observation:
-    """Decide from a Claude transcript (JSON lines) whether a tool call was refused with the fence's reason, and what executed
-    around it. Pure: no clock, no file, no levain call but the pattern (``rx`` replaces :func:`fenced_pattern`). A line that is
-    not JSON is skipped. Only the FIRST refusal is read; a result that is an error or a gate's words counts as a call that did
-    not execute. ``after_revoke`` is true only when ``revoked_at`` (an ISO instant) and the refusal's own timestamp both read
-    and the refusal is at or after it. An executed call is placed against the revoke by the stamp of its own ``tool_use``
-    record (the instant the gate was asked): before it, at or after it, or not placed when that stamp is missing or unreadable."""
+def judge_events(events: Sequence[tuple], revoked: datetime | None) -> Finding:
+    """PASS, FAIL or INCOMPLETE for a run's events (see the module's rules 1 to 6; the reason names the rule). Pure. A FAIL that
+    the events already show is reported before an INCOMPLETE."""
+    if revoked is None:
+        return Finding("INCOMPLETE", R_INPUT, "no readable revoke instant to place the calls against")
+    uses = [e for e in events if e[0] == "use"]
+    results = [e for e in events if e[0] == "result"]
+    known = {e[1] for e in uses if e[1] is not None}
+    result_of: dict[Any, tuple] = {}
+    for r in results:
+        if r[1] in known:
+            result_of.setdefault(r[1], r)
+    orphans = [r for r in results if r[1] not in known]
+    unplaced = sum(1 for r in orphans if not r[3])
+    unlinked_fence = any(e[0] == "unlinked" for e in events) or any(r[4] for r in orphans)
+    pre = in_flight = 0
+    after: list[tuple] = []
+    for order, u in enumerate(uses):
+        res = result_of.get(u[1])
+        called = _when(u[3])
+        ran = res is not None and not res[3]
+        if called is None:
+            unplaced += 1 if ran else 0
+        elif called >= revoked:
+            after.append((called, order, u, res))
+        elif ran:
+            done = _when(res[2])
+            if done is None:
+                unplaced += 1
+            else:
+                pre += 1
+                in_flight += 1 if done >= revoked else 0
+    if in_flight > 1:
+        return Finding("FAIL", R_IN_FLIGHT, "rule 3 IN-FLIGHT: more than one call in flight across the revoke: a stale fence "
+                                            "or a parallel workload")
+    first = min(after, key=lambda a: (a[0], a[1])) if after else None
+    if first is not None and first[3] is not None:
+        res = first[3]
+        if not res[3]:
+            return Finding("FAIL", R_AFTER, "rule 4 AFTER: a call executed after the revoke (the first call stamped at or "
+                                            "after it came back as a result, not an error)", first[2][2], first[2][1])
+        if not res[4]:
+            return Finding("FAIL", R_AFTER, "rule 4 AFTER: the first call after the revoke was refused by something other "
+                                            "than the fence (an error result without the fence's words)", first[2][2], first[2][1],
+                           None, res[5], res[2] if isinstance(res[2], str) else None)
+    if pre == 0:
+        return Finding("INCOMPLETE", R_PRE, "rule 2 PRE: no call ran before the revoke: rerun in a fresh world with a larger "
+                                            "--revoke-after-s (its timer starts when the session is recorded)")
+    if first is None or first[3] is None:
+        if unlinked_fence:
+            return Finding("INCOMPLETE", R_AFTER, "rule 4 AFTER: the fence's words appear only in an unlinked record: the "
+                                                  "transcript shape is not the one this judge reads")
+        return Finding("INCOMPLETE", R_AFTER, "rule 4 AFTER: no call after the revoke" if first is None else
+                       "rule 4 AFTER: no result for the first call after the revoke")
+    if unplaced:
+        return Finding("INCOMPLETE", R_UNPLACED, "rule 5 UNPLACED: a non-error result could not be placed against the revoke "
+                                                 "(no matching call, or a stamp that is missing or unreadable)")
+    res = first[3]
+    return Finding("PASS", R_PASS, "rule 6 PASS: a call ran under the live fence and the first call after the revoke came back "
+                                   "as the fence's error", first[2][2], first[2][1], res[4], res[5],
+                   res[2] if isinstance(res[2], str) else None)
+
+
+def judge_transcript(lines: Iterable[str], rx: "re.Pattern[str] | None" = None, revoked_at: str | None = None) -> Finding:
+    """:func:`judge_events` over a Claude transcript (JSON lines) and the revoke instant (an ISO string). Pure: no clock, no
+    file, no levain call but the pattern (``rx`` replaces :func:`fenced_pattern`). A line that is not JSON is skipped."""
     rx = rx or fenced_pattern()
     records = []
     for ln in lines:
@@ -223,53 +276,12 @@ def observe_refusal(lines: Iterable[str], rx: "re.Pattern[str] | None" = None, r
         if isinstance(rec, dict):
             records.append(rec)
     if not records:
-        return Observation(False, None, None, None, None, 0, 0, "the transcript holds no JSON record")
-    events = _events(records, rx)
-    names = {e[1]: e[2] for e in events if e[0] == "use"}
-    called = {e[1]: _when(e[3]) for e in events if e[0] == "use"}
-    not_ran = sum(1 for e in events if e[0] == "failed")
-    first = next((i for i, e in enumerate(events) if e[0] == "fenced"), None)
-    if first is None:
-        ran = sum(1 for e in events if e[0] == "ran")
-        return Observation(False, None, None, None, None, ran, 0, "no tool call came back with the fence's words",
-                           not_ran=not_ran)
-    _, tool_use_id, why, text, stamp = events[first]
-    revoked, refused = _when(revoked_at), _when(stamp)
-    placed = [(called.get(e[1]) if revoked is not None else None) for e in events[:first] if e[0] == "ran"]
-    before = sum(1 for w in placed if w is not None and w < revoked)
-    at_or_after = sum(1 for w in placed if w is not None and w >= revoked)
-    return Observation(True, why or None, names.get(tool_use_id), tool_use_id, text, before,
-                       sum(1 for e in events[first + 1:] if e[0] == "ran"), None,
-                       stamp if isinstance(stamp, str) else None,
-                       revoked is not None and refused is not None and refused >= revoked, not_ran,
-                       at_or_after, len(placed) - before - at_or_after)
+        return Finding("INCOMPLETE", R_INPUT, "the transcript holds no JSON record")
+    return judge_events(_events(records, rx), _when(revoked_at))
 
 
-def raw_line(o: Observation) -> str:
-    return (f"P7-2 refused={int(o.refused)} ran_before={o.ran_before} ran_after_revoke={o.ran_after_revoke} "
-            f"ran_unplaced={o.ran_unplaced} ran_after={o.ran_after} after_revoke={int(o.after_revoke)}")
-
-
-def diagnose(o: Observation) -> str:
-    """The cause a non-pass names (what the page for a FAIL would read)."""
-    if not o.refused:
-        return (f"{o.problem}: the revoke was not seen by the fence (the fence server, the broker's RemoteFences, or the "
-                "session's GATE), or the session ended before it made another call, or the transcript does not keep the "
-                "fence's words as a tool result; read the transcript")
-    if o.ran_after_revoke:
-        return (f"{o.ran_after_revoke} call(s) stamped at or after the revoke EXECUTED before the refusal: the fence did not "
-                "stop the first call it should have; read the transcript")
-    if o.ran_unplaced:
-        return (f"{o.ran_unplaced} executed call(s) before the refusal have no readable stamp (or no revoke instant was "
-                "given), so their order against the revoke is not shown; read the transcript")
-    if o.ran_before == 0:
-        return ("no call stamped before the revoke had executed: the revoke landed before the session ran a call (rerun with a "
-                "larger --revoke-after-s), or the calls before it were errors or other gate answers "
-                f"({o.not_ran} such result(s))")
-    if o.ran_after:
-        return f"{o.ran_after} call(s) executed AFTER the refusal: the session went on past the fence"
-    return ("the refusal is not shown to be at or after the revoke (its timestamp is earlier, or is absent or unreadable): "
-            "another cause may have fenced the session first; read the transcript")
+def raw_line(f: Finding) -> str:
+    return f"P7-2 verdict={f.status} rule={f.rule}"
 
 
 def expected_text(cfg: "FenceConfig") -> str:
@@ -277,13 +289,13 @@ def expected_text(cfg: "FenceConfig") -> str:
         f"P7-2 fence: expected verdict, os={cfg.profile.name}",
         "ONE session of a role that runs Bash calls in a row, revoked by a signed revoke_agent link while it runs:",
         f"  raw line must fullmatch /{VERDICT.pattern}/",
-        "  the refused call is an error result that carries broker_client.SLOT_FENCED_TEXT with the fence's reason and is "
-        "stamped at or after the revoke; a call stamped before the revoke executed; none stamped at or after it executed; none "
-        "after the refusal (an error or a gate's own words is not an execution)",
-        "reading a non-pass: refused=0 = the fence never fired (or the transcript has no such result); ran_before=0 = the "
-        "revoke was early, or the earlier calls did not execute; ran_after_revoke>0 = a call executed past the revoke; "
-        "ran_unplaced>0 = an executed call has no readable stamp; ran_after>0 = the session ran on; after_revoke=0 = the "
-        "refusal is not shown to follow the revoke",
+        "  the first call stamped at or after the revoke comes back as an error result, linked by tool_use id, that carries "
+        "broker_client.SLOT_FENCED_TEXT with the fence's reason; a call stamped before the revoke ran (one call in flight "
+        "across the revoke is tolerated); a result that cannot be placed is never a pass",
+        "reading a non-pass: rule 2-PRE = no call ran before the revoke (INCOMPLETE); 3-IN-FLIGHT = more than one call in flight "
+        "(FAIL); 4-AFTER = the first call after the revoke executed, or was refused by something other than the fence (FAIL), or "
+        "has no linked result or the fence's words are only in an unlinked record (INCOMPLETE); 5-UNPLACED = a non-error result "
+        "could not be placed (INCOMPLETE); 0-INPUT = no transcript record or no revoke instant (INCOMPLETE)",
         "NOT read back: the fire's exit code, the model's own words, the reason's exact text",
     ])
 
@@ -569,46 +581,71 @@ class Run:
 
 class _Children:
     """The processes this run started. They are stopped on the way out of a normal run and by the handler of a signal: the same
-    stop for both. Stopping is idempotent. A process added with ``group=True`` was started in its own process group, and is
-    stopped by signalling that group."""
+    stop for both. Stopping is idempotent. A process added with ``group=True`` was started in its own process group; its group id
+    is kept when it is added, and the stop signals that GROUP whether or not the leader is still running, then checks the
+    group is empty and kills what is left."""
 
     def __init__(self) -> None:
-        self.procs: list[tuple[subprocess.Popen, bool]] = []
+        self.procs: list[tuple[subprocess.Popen, int | None]] = []
         self.stopping = False
 
     def add(self, proc: "subprocess.Popen", *, group: bool = False) -> "subprocess.Popen":
-        self.procs.append((proc, group))
+        pgid: int | None = None
+        if group:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except ProcessLookupError:
+                pgid = proc.pid
+            if pgid == os.getpgrp():
+                pgid = None         # never signal this run's own group
+        self.procs.append((proc, pgid))
         return proc
 
     @staticmethod
-    def _send(proc: "subprocess.Popen", group: bool, sig: int) -> None:
+    def _send(proc: "subprocess.Popen", pgid: int | None, sig: int) -> None:
         try:
-            if group:
-                os.killpg(proc.pid, sig)
+            if pgid is not None:
+                os.killpg(pgid, sig)
             else:
                 proc.send_signal(sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
+    @staticmethod
+    def _populated(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+
+    def _stop(self, proc: "subprocess.Popen", pgid: int | None) -> None:
+        if pgid is None and proc.poll() is not None:
+            return
+        self._send(proc, pgid, signal.SIGTERM)
+        end = time.monotonic() + STOP_GRACE_S
+        try:
+            proc.wait(timeout=max(0.0, end - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+        while pgid is not None and proc.poll() is not None and self._populated(pgid) and time.monotonic() < end:
+            time.sleep(0.05)
+        if proc.poll() is None or (pgid is not None and self._populated(pgid)):
+            self._send(proc, pgid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=STOP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                pass
+
     def stop_all(self) -> None:
-        """Newest first: SIGTERM, then SIGKILL after :data:`STOP_GRACE_S`. A grouped process is signalled as a group while its
-        leader is running, which reaches its descendants that stayed in the group; one that left the group (a session of its
-        own), or one that outlives a leader that already exited, is not reached."""
+        """Newest first: SIGTERM, then SIGKILL once :data:`STOP_GRACE_S` has passed and the process (or, for a grouped one, its
+        group) is still there. A descendant that left the group (a session of its own) is not reached."""
         if self.stopping:
             return
         self.stopping = True
         try:
-            for proc, group in reversed(self.procs):
-                if proc.poll() is None:
-                    self._send(proc, group, signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=STOP_GRACE_S)
-                    except subprocess.TimeoutExpired:
-                        self._send(proc, group, signal.SIGKILL)
-                        try:
-                            proc.wait(timeout=STOP_GRACE_S)
-                        except subprocess.TimeoutExpired:
-                            pass
+            for proc, pgid in reversed(self.procs):
+                self._stop(proc, pgid)
         finally:
             self.stopping = False
 
@@ -703,8 +740,8 @@ def run(cfg: FenceConfig, facts: Facts, *, run_once: Callable[[FenceConfig], Run
         return "REFUSED", ev.write_result("\n".join(["RESULT: REFUSED", head, "P7-2: REFUSED", *problems]) + "\n")
     try:
         got = run_once(cfg)
-        obs = observe_refusal(got.transcript, revoked_at=got.revoked_at)
-        status, body = _verdict(cfg, ev, head, got, obs)
+        found = judge_transcript(got.transcript, revoked_at=got.revoked_at)
+        status, body = _verdict(cfg, ev, head, got, found)
     except BaseException as exc:  # noqa: BLE001 - no verdict was observed: INCOMPLETE, whatever raised
         line = (f"P7-2: ERROR, no verdict observed ({type(exc).__name__}: {exc}); if the vendor session started late, rerun in "
                 "a fresh world with a larger --revoke-after-s (its timer starts when the session is recorded)")
@@ -713,22 +750,23 @@ def run(cfg: FenceConfig, facts: Facts, *, run_once: Callable[[FenceConfig], Run
     return status, ev.write_result("\n".join(body) + "\n")
 
 
-def _verdict(cfg: FenceConfig, ev: Evidence, head: str, got: Run, obs: Observation) -> tuple[str, list[str]]:
-    """``(status, RESULT lines)`` for a transcript that was read. Writes ``transcript.jsonl`` and logs the verdict line."""
+def _verdict(cfg: FenceConfig, ev: Evidence, head: str, got: Run, found: Finding) -> tuple[str, list[str]]:
+    """``(status, RESULT lines)`` for a transcript that was read. Writes ``transcript.jsonl`` and logs the verdict line. PASS also
+    has to fullmatch the one expected pattern."""
     (cfg.evidence / "transcript.jsonl").write_text("\n".join(got.transcript) + "\n")
-    raw = raw_line(obs)
+    raw = raw_line(found)
     ok, _ = judge([raw], 0, VERDICT)
-    status = "PASS" if ok else "FAIL"
+    status = "FAIL" if found.status == "PASS" and not ok else found.status
     row = next((o for o in got.show.get("occurrences") or [] if isinstance(o, Mapping) and o.get("occurrence_id") == got.oid), {})
     body = ["RESULT: " + status, head, f"P7-2: {status} raw={raw!r} expected=/{VERDICT.pattern}/",
             f"session={got.session_key} revoked_at={got.revoked_at} fire_rc={got.fire_rc} "
-            f"row state={row.get('state')} reason={row.get('reason')}"]
-    if obs.refused:
-        body += [f"refused call: tool={obs.tool} tool_use_id={obs.tool_use_id} at={obs.refused_at}",
-                 f"refused with reason: {obs.reason}", f"refusal text: {(obs.text or '')[:600]}"]
-    body.append(f"results that were errors or gate answers other than the fence's: {obs.not_ran}")
-    if not ok:
-        body.append("diagnosis: " + diagnose(obs))
+            f"row state={row.get('state')} reason={row.get('reason')}", f"judge: {found.reason}"]
+    if found.tool_use_id:
+        body.append(f"first call after the revoke: tool={found.tool} tool_use_id={found.tool_use_id} at={found.at}")
+    if found.why:
+        body += [f"refused with reason: {found.why}"]
+    if found.text:
+        body.append(f"result text: {found.text[:600]}")
     ev.log(body[2])
     return status, body
 

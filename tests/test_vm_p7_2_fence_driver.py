@@ -1,6 +1,6 @@
-"""P7-2's VM driver (``scripts/vm_harness/p7_2_fence_driver.py``): the pure decision 'a tool call was refused with the fence's reason'
-from a recorded transcript, the argument handling, and the exit codes. NO guest, NO vendor session, NO fence server runs here:
-``main`` is driven with a fake facts probe and a fake run. The two rig tests build the real world (ssh-keygen links, the real agent
+"""P7-2's VM driver (``scripts/vm_harness/p7_2_fence_driver.py``): the pure judge of a recorded transcript (one table of sequences), the argument handling,
+and the exit codes. NO guest, NO vendor session, NO fence server runs here:
+``main`` is driven with a fake facts probe and a fake run. The rig tests build the real world (ssh-keygen links, the real agent
 store) to read back what the driver's clock helpers stamp, and to check the revoke it appends is one the fence answers. The
 process handling (the children's stop, the signal handlers) is run against real scratch processes that only sleep: no fence
 server and no vendor session is started."""
@@ -28,14 +28,16 @@ from scripts.vm_harness import p7_2_fence_driver as D
 DRIVER = Path(D.__file__)
 WHY = "the agent is barred"
 REVOKED = "2026-11-20T10:00:00+00:00"
-EARLY = "2026-11-20T09:59:50.250Z"
+BEFORE = "2026-11-20T09:59:40.000Z"        # a call asked of the gate before the revoke
+DONE = "2026-11-20T09:59:45.000Z"          # a result that came back before the revoke
+STRADDLE = "2026-11-20T10:00:05.000Z"      # a result that came back after the revoke
+AFTER_1 = "2026-11-20T10:00:10.000Z"       # a call asked of the gate after the revoke
+AFTER_2 = "2026-11-20T10:00:20.000Z"
 LATE = "2026-11-20T10:00:30.250Z"
-CALL = "2026-11-20T09:59:40.000Z"          # a call asked of the gate before the revoke
-CALL_LATE = "2026-11-20T10:00:10.000Z"     # a call asked of the gate after the revoke
 ORIGINAL_ANSWERS = getattr(D, "socket_answers", None)
 
 
-def _use(i, name="Bash", at=CALL):
+def _use(i, name="Bash", at=BEFORE):
     rec = {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": f"toolu_{i}", "name": name, "input": {"command": "sleep 15"}}]}}
     if at is not None:
@@ -43,7 +45,7 @@ def _use(i, name="Bash", at=CALL):
     return rec
 
 
-def _result(i, text, at=None, **extra):
+def _result(i, text, at=DONE, **extra):
     rec = {"type": "user", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": f"toolu_{i}", "content": text, **extra}]}}
     if at is not None:
@@ -55,171 +57,147 @@ def _fenced(i, at=LATE, why=WHY, **extra):
     return _result(i, SLOT_FENCED_TEXT.format(why=why), at, **{"is_error": True, **extra})
 
 
-def _observe(*records, **kw):
-    return D.observe_refusal(_lines(*records), revoked_at=REVOKED, **kw)
+def _hook(text, at=LATE):
+    return {"type": "system", "subtype": "hook", "content": text, "timestamp": at}
 
 
 def _lines(*records):
     return [json.dumps(r) for r in records]
 
 
+def _judge(*records, **kw):
+    return D.judge_transcript(_lines(*records), revoked_at=REVOKED, **kw)
+
+
+def _ok(i, at=BEFORE, done=DONE):
+    """A call asked at ``at`` whose result executed and came back at ``done``."""
+    return [_use(i, at=at), _result(i, "ok", done)]
+
+
+FENCED_WORDS = SLOT_FENCED_TEXT.format(why=WHY)
 REFUSED = _lines(
     {"type": "user", "message": {"role": "user", "content": "Use the Bash tool to run sleep 15"}},
-    _use(1), _result(1, "ok"),
-    _use(2), _result(2, "ok"),
-    _use(3), _fenced(3, is_error=True),
+    *_ok(1), *_ok(2), _use(3, at=AFTER_1), _fenced(3),
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "It was refused."}]}},
 )
-NOT_REFUSED = _lines(_use(1), _result(1, "ok"), _use(2), _result(2, "ok"),
+NOT_REFUSED = _lines(*_ok(1), *_ok(2),
                      {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}})
 
 
-# --- the pure decision -------------------------------------------------------------------------------------------------
+# --- the pure decision: one table -------------------------------------------------------------------------------------------
 
-def test_a_transcript_with_a_refused_call_is_read_with_its_reason_and_what_ran_around_it():
-    o = D.observe_refusal(REFUSED, revoked_at=REVOKED)
-    assert (o.refused, o.reason, o.tool, o.tool_use_id) == (True, WHY, "Bash", "toolu_3")
-    assert (o.ran_before, o.ran_after, o.problem, o.refused_at, o.after_revoke) == (2, 0, None, LATE, True)
-    assert D.raw_line(o) == ("P7-2 refused=1 ran_before=2 ran_after_revoke=0 ran_unplaced=0 ran_after=0 "
-                             "after_revoke=1")
-    assert D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
+#: (id, records in file order, expected status, the rule it is decided by, a phrase the reason holds)
+ROWS = [
+    ("clean pass: two calls before, the first call after is fenced",
+     [*_ok(1), *_ok(2), _use(3, at=AFTER_1), _fenced(3)], "PASS", "6-PASS", "rule 6 PASS"),
+    ("one call in flight across the revoke is tolerated",
+     [*_ok(1, done=DONE), *_ok(2, at="2026-11-20T09:59:59.000Z", done=STRADDLE), _use(3, at=AFTER_1), _fenced(3)],
+     "PASS", "6-PASS", "rule 6 PASS"),
+    ("two calls in flight across the revoke",
+     [*_ok(1, done="2026-11-20T10:00:02.000Z"), *_ok(2, at="2026-11-20T09:59:59.000Z", done=STRADDLE),
+      _use(3, at=AFTER_1), _fenced(3)], "FAIL", "3-IN-FLIGHT", "more than one call in flight"),
+    ("a call executed after the revoke, then a fenced call",
+     [*_ok(1), _use(2, at=AFTER_1), _result(2, "ok", LATE), _use(3, at=AFTER_2), _fenced(3)],
+     "FAIL", "4-AFTER", "a call executed after the revoke"),
+    ("an ordinary error after the revoke, then a fenced call",
+     [*_ok(1), _use(2, at=AFTER_1), _result(2, "boom", LATE, is_error=True), _use(3, at=AFTER_2), _fenced(3)],
+     "FAIL", "4-AFTER", "refused by something other than the fence"),
+    ("another gate's denial as the first call after the revoke",
+     [*_ok(1), _use(2, at=AFTER_1), _result(2, "levain: the limits gate could not run", LATE), _use(3, at=AFTER_2), _fenced(3)],
+     "FAIL", "4-AFTER", "refused by something other than the fence"),
+    ("the fence's words in a result that is NOT an error count as the call having run",
+     [*_ok(1), _use(2, at=AFTER_1), _result(2, FENCED_WORDS, LATE)], "FAIL", "4-AFTER", "a call executed after the revoke"),
+    ("the fence's words only in an unlinked system record",
+     [*_ok(1), *_ok(2), _hook(FENCED_WORDS)], "INCOMPLETE", "4-AFTER", "only in an unlinked record"),
+    ("a call after the revoke with no result, and the words only in an unlinked record",
+     [*_ok(1), _use(2, at=AFTER_1), _hook(FENCED_WORDS)], "INCOMPLETE", "4-AFTER", "only in an unlinked record"),
+    ("an error result with the fence's words that matches no call",
+     [*_ok(1), _fenced(9)], "INCOMPLETE", "4-AFTER", "only in an unlinked record"),
+    ("a call after the revoke with no result",
+     [*_ok(1), _use(2, at=AFTER_1)], "INCOMPLETE", "4-AFTER", "no result for the first call"),
+    ("no call after the revoke",
+     [*_ok(1), *_ok(2)], "INCOMPLETE", "4-AFTER", "no call after the revoke"),
+    ("no call ran before the revoke",
+     [_use(1, at=AFTER_1), _fenced(1)], "INCOMPLETE", "2-PRE", "--revoke-after-s"),
+    ("the calls before the revoke all errored",
+     [_use(1), _result(1, "denied", DONE, is_error=True), _use(2, at=AFTER_1), _fenced(2)],
+     "INCOMPLETE", "2-PRE", "no call ran before the revoke"),
+    ("a non-error result that matches no call",
+     [*_ok(1), _result(9, "ok", DONE), _use(2, at=AFTER_1), _fenced(2)], "INCOMPLETE", "5-UNPLACED", "could not be placed"),
+    ("an error result that matches no call does not block a pass",
+     [*_ok(1), _result(9, "boom", DONE, is_error=True), _use(2, at=AFTER_1), _fenced(2)], "PASS", "6-PASS", "rule 6 PASS"),
+    ("a call with no stamp whose result executed",
+     [*_ok(1), _use(2, at=None), _result(2, "ok", DONE), _use(3, at=AFTER_1), _fenced(3)],
+     "INCOMPLETE", "5-UNPLACED", "could not be placed"),
+    ("a call with an unreadable stamp whose result executed",
+     [*_ok(1), _use(2, at="yesterday"), _result(2, "ok", DONE), _use(3, at=AFTER_1), _fenced(3)],
+     "INCOMPLETE", "5-UNPLACED", "could not be placed"),
+    ("a call before the revoke whose result has no readable stamp",
+     [*_ok(1), *_ok(2, done=None), _use(3, at=AFTER_1), _fenced(3)], "INCOMPLETE", "5-UNPLACED", "could not be placed"),
+    ("the first call after the revoke is picked by stamp, not file order",
+     [*_ok(1), _use(3, at=AFTER_2), _result(3, "ok", LATE), _use(2, at=AFTER_1), _fenced(2)], "PASS", "6-PASS", "rule 6 PASS"),
+    ("a tie in stamp is broken by file order: the fenced call first",
+     [*_ok(1), _use(2, at=AFTER_1), _fenced(2), _use(3, at=AFTER_1), _result(3, "ok", LATE)], "PASS", "6-PASS", "rule 6 PASS"),
+    ("a tie in stamp is broken by file order: the executed call first",
+     [*_ok(1), _use(2, at=AFTER_1), _result(2, "ok", LATE), _use(3, at=AFTER_1), _fenced(3)],
+     "FAIL", "4-AFTER", "a call executed after the revoke"),
+    ("the fenced result's words are read from a result whose content is a list of text parts",
+     [*_ok(1), _use(2, at=AFTER_1),
+      _result(2, [{"type": "text", "text": FENCED_WORDS}], LATE, is_error=True)], "PASS", "6-PASS", "rule 6 PASS"),
+]
+
+
+@pytest.mark.parametrize("records, status, rule, phrase", [r[1:] for r in ROWS], ids=[r[0] for r in ROWS])
+def test_the_verdict_table(records, status, rule, phrase):
+    f = _judge(*records)
+    assert (f.status, f.rule) == (status, rule), f
+    assert phrase in f.reason, f.reason
+    assert (D.judge([D.raw_line(f)], 0, D.VERDICT)[0]) == (status == "PASS")
+
+
+def test_a_pass_carries_the_refused_call_and_its_reason():
+    f = D.judge_transcript(REFUSED, revoked_at=REVOKED)
+    assert (f.status, f.tool, f.tool_use_id, f.why, f.at) == ("PASS", "Bash", "toolu_3", WHY, LATE)
+    assert D.raw_line(f) == "P7-2 verdict=PASS rule=6-PASS" and FENCED_WORDS in (f.text or "")
 
 
 def test_a_transcript_with_no_refused_call_is_not_a_pass():
-    o = D.observe_refusal(NOT_REFUSED, revoked_at=REVOKED)
-    assert (o.refused, o.reason, o.ran_before, o.ran_after) == (False, None, 2, 0)
-    assert o.problem and "fence's words" in o.problem
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
+    f = D.judge_transcript(NOT_REFUSED, revoked_at=REVOKED)
+    assert f.status == "INCOMPLETE" and not D.judge([D.raw_line(f)], 0, D.VERDICT)[0]
 
 
 def test_a_reason_that_holds_a_parenthesis_is_read_whole():
     why = "the occurrence left launched (now stopped)"
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2, why=why))
-    assert o.reason == why
-
-
-def test_a_refusal_that_is_the_first_call_is_not_a_pass():
-    o = _observe(_use(1), _fenced(1))
-    assert (o.refused, o.ran_before) == (True, 0)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "no call stamped before the revoke" in D.diagnose(o)
-
-
-def test_a_call_that_completes_after_the_refusal_is_not_a_pass():
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2), _use(3), _result(3, "ok"))
-    assert (o.refused, o.ran_before, o.ran_after) == (True, 1, 1)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "AFTER the refusal" in D.diagnose(o)
+    assert _judge(*_ok(1), _use(2, at=AFTER_1), _fenced(2, why=why)).why == why
 
 
 def test_the_models_own_quote_of_the_words_is_not_a_refused_call():
-    quote = {"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "text", "text": SLOT_FENCED_TEXT.format(why=WHY)}]}}
-    o = _observe(_use(1), _result(1, "ok"), quote)
-    assert o.refused is False
-
-
-def test_a_refusal_kept_only_in_a_hook_record_counts_and_only_the_first_is_read():
-    hook = {"type": "system", "subtype": "hook", "content": SLOT_FENCED_TEXT.format(why=WHY), "timestamp": LATE}
-    o = _observe(_use(1), _result(1, "ok"), hook, hook)
-    assert (o.refused, o.reason, o.tool_use_id, o.ran_before, o.ran_after, o.after_revoke) == (True, WHY, None, 1, 0, True)
-
-
-def test_a_result_whose_content_is_a_list_of_text_parts_is_read():
-    o = _observe(_use(1), _result(1, "ok"), _use(2),
-                 _result(2, [{"type": "text", "text": SLOT_FENCED_TEXT.format(why=WHY)}], LATE, is_error=True))
-    assert (o.refused, o.reason) == (True, WHY)
-
-
-def test_a_result_that_is_an_error_is_not_a_call_that_ran():
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _result(2, "boom", is_error=True), _use(3), _fenced(3),
-                 _use(4), _result(4, "boom", is_error=True))
-    assert (o.ran_before, o.ran_after, o.not_ran) == (1, 0, 2)
-    assert D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-
-
-def test_a_gates_own_denial_is_not_a_call_that_ran():
-    from levain.consent.broker_client import SLOT_LIMITS_FAILED_TEXT
-    denial = SLOT_LIMITS_FAILED_TEXT.format(why="the counter")
-    o = _observe(_use(1), _result(1, denial), _use(2), _fenced(2), _use(3), _result(3, denial))
-    assert (o.ran_before, o.ran_after, o.not_ran) == (0, 0, 2)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "errors or other gate answers" in D.diagnose(o)
-
-
-def test_calls_that_all_errored_before_the_refusal_are_not_a_pass():
-    o = _observe(_use(1), _result(1, "denied", is_error=True), _use(2), _fenced(2))
-    assert o.ran_before == 0 and not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-
-
-def test_a_refusal_stamped_before_the_revoke_is_not_a_pass():
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2, at=EARLY))
-    assert (o.refused, o.ran_before, o.ran_after, o.after_revoke) == (True, 1, 0, False)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-    assert "at or after the revoke" in D.diagnose(o)
-
-
-def test_a_refusal_at_the_instant_of_the_revoke_follows_it():
-    assert _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2, at=REVOKED)).after_revoke is True
-
-
-@pytest.mark.parametrize("at", [None, "", "yesterday", "2026-11-20T10:00:30"])
-def test_a_refusal_with_no_readable_timestamp_is_not_a_pass(at):
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2, at=at))
-    assert o.refused and o.after_revoke is False
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-
-
-def test_a_judgement_with_no_revoke_instant_is_not_a_pass():
-    o = D.observe_refusal(REFUSED)
-    assert o.refused and o.after_revoke is False and not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-
-
-@pytest.mark.parametrize("lines", [[], [""], ["not json", "{"], ["[1, 2]"]])
-def test_a_transcript_with_no_record_is_not_a_pass(lines):
-    o = D.observe_refusal(lines, revoked_at=REVOKED)
-    assert o.refused is False and o.problem == "the transcript holds no JSON record"
+    quote = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": FENCED_WORDS}]}}
+    assert _judge(*_ok(1), _use(2, at=AFTER_1), quote).status == "INCOMPLETE"
 
 
 def test_a_fence_text_with_no_reason_is_not_matched():
     head, tail = SLOT_FENCED_TEXT.split("{why}")
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _result(2, head + tail, LATE))
-    assert o.refused is False
+    f = _judge(*_ok(1), _use(2, at=AFTER_1), _result(2, head + tail, LATE, is_error=True))
+    assert (f.status, f.rule) == ("FAIL", "4-AFTER") and "other than the fence" in f.reason
+
+
+@pytest.mark.parametrize("at", [None, "", "yesterday", "2026-11-20T10:00:30"])
+def test_a_judgement_with_no_readable_revoke_instant_is_incomplete(at):
+    f = D.judge_transcript(REFUSED, revoked_at=at)
+    assert (f.status, f.rule) == ("INCOMPLETE", "0-INPUT")
+
+
+@pytest.mark.parametrize("lines", [[], [""], ["not json", "{"], ["[1, 2]"]])
+def test_a_transcript_with_no_record_is_incomplete(lines):
+    f = D.judge_transcript(lines, revoked_at=REVOKED)
+    assert (f.status, f.reason) == ("INCOMPLETE", "the transcript holds no JSON record")
 
 
 def test_the_pattern_is_built_from_the_broker_clients_words():
     rx = D.fenced_pattern()
     assert rx.search(SLOT_FENCED_TEXT.format(why="x")).group("why") == "x"
     assert rx.search("levain: STOPPED by a budget the operator set") is None
-
-
-def test_a_call_that_executed_after_the_revoke_then_a_fenced_call_is_not_a_pass():
-    o = _observe(_use(1), _result(1, "ok"), _use(2, at=CALL_LATE), _result(2, "ok", LATE), _use(3, at=CALL_LATE), _fenced(3))
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-    assert (o.refused, o.ran_before, o.ran_after_revoke, o.ran_unplaced, o.ran_after, o.after_revoke) == (True, 1, 1, 0, 0, True)
-    assert "stamped at or after the revoke EXECUTED" in D.diagnose(o)
-
-
-def test_a_call_already_running_when_the_revoke_landed_counts_as_before_it():
-    """Its result is stamped after the revoke, but it was asked of the gate before: the clean sequence."""
-    o = _observe(_use(1), _result(1, "ok", EARLY), _use(2), _result(2, "ok", LATE), _use(3, at=CALL_LATE), _fenced(3))
-    assert (o.ran_before, o.ran_after_revoke, o.ran_unplaced, o.ran_after) == (2, 0, 0, 0)
-    assert D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
-
-
-@pytest.mark.parametrize("stamp", [None, "", "yesterday", "2026-11-20T09:59:40"])
-def test_an_executed_call_with_no_readable_stamp_is_not_placed_and_is_not_a_pass(stamp):
-    o = _observe(_use(1), _result(1, "ok"), _use(2, at=stamp), _result(2, "ok"), _use(3, at=CALL_LATE), _fenced(3))
-    assert (o.ran_before, o.ran_after_revoke, o.ran_unplaced) == (1, 0, 1)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "no readable stamp" in D.diagnose(o)
-
-
-def test_the_fences_words_in_a_result_that_is_not_an_error_are_a_call_that_ran():
-    words = SLOT_FENCED_TEXT.format(why=WHY)
-    o = _observe(_use(1), _result(1, words, LATE), _use(2), _result(2, "echo: " + words, LATE))
-    assert (o.refused, o.ran_before) == (False, 2) and o.problem and "fence's words" in o.problem
-
-
-def test_the_fences_words_in_an_error_result_are_the_refusal_and_a_later_clean_result_does_not_undo_it():
-    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2), _use(3), _result(3, "ok"))
-    assert (o.refused, o.tool_use_id, o.ran_after) == (True, "toolu_2", 1)
 
 
 # --- import and arguments ----------------------------------------------------------------------------------------------
@@ -292,14 +270,15 @@ def test_a_run_that_observes_the_refused_call_exits_zero_and_records_the_reason(
     rc, out = _exit(tmp_path, capsys, extra=["--vendor-ready"])
     assert rc == 0 and "RESULT: PASS" in out.out
     assert f"refused with reason: {WHY}" in out.out and f"tool=Bash tool_use_id=toolu_3 at={LATE}" in out.out
+    assert "judge: rule 6 PASS" in out.out
     result = (tmp_path / "ev" / "RESULT.txt").read_text()
     assert "expected sha256 " + (tmp_path / "ev" / "EXPECTED.txt").read_text().split("sha256: ")[1].strip() in result
     assert (tmp_path / "ev" / "transcript.jsonl").read_text().splitlines() == REFUSED
 
 
-def test_a_run_that_does_not_observe_the_refused_call_exits_nonzero(tmp_path, capsys):
+def test_a_run_that_does_not_observe_the_refused_call_is_incomplete(tmp_path, capsys):
     rc, out = _exit(tmp_path, capsys, run_once=_run_with(NOT_REFUSED), extra=["--vendor-ready"])
-    assert rc == 1 and "RESULT: FAIL" in out.out and "diagnosis:" in out.out
+    assert rc == 3 and "RESULT: INCOMPLETE" in out.out and "judge: rule 4 AFTER" in out.out
 
 
 def test_a_missing_precondition_refuses_with_exit_two_and_fires_nothing(tmp_path, capsys):
@@ -318,10 +297,10 @@ def test_a_run_that_raises_is_incomplete_not_a_pass(tmp_path, capsys):
     assert "--revoke-after-s" in out.out
 
 
-def test_a_run_whose_refusal_is_stamped_before_the_revoke_exits_nonzero(tmp_path, capsys):
-    early = _lines(_use(1), _result(1, "ok"), _use(2), _fenced(2, at=EARLY))
-    rc, out = _exit(tmp_path, capsys, run_once=_run_with(early), extra=["--vendor-ready"])
-    assert rc == 1 and "RESULT: FAIL" in out.out and "at or after the revoke" in out.out
+def test_a_run_whose_first_call_after_the_revoke_executed_exits_one(tmp_path, capsys):
+    ran = _lines(*_ok(1), _use(2, at=AFTER_1), _result(2, "ok", LATE))
+    rc, out = _exit(tmp_path, capsys, run_once=_run_with(ran), extra=["--vendor-ready"])
+    assert rc == 1 and "RESULT: FAIL" in out.out and "judge: rule 4 AFTER: a call executed after the revoke" in out.out
 
 
 def test_a_run_ended_by_a_signal_is_incomplete(tmp_path, capsys):
@@ -669,6 +648,47 @@ def test_the_stop_reaches_what_the_fire_started_in_its_group(wired, tmp_path):
             os.kill(int(pidfile.read_text()), signal.SIGKILL)
 
 
+@pytest.mark.parametrize("ignores_term", [False, True], ids=["terminated", "kill-after-grace"])
+def test_a_descendant_that_outlives_an_exited_leader_is_stopped(tmp_path, monkeypatch, ignores_term):
+    """The leader starts a long-lived child in its group and exits at once; the stop still reaches the group."""
+    monkeypatch.setattr(D, "STOP_GRACE_S", 0.5)
+    pidfile = tmp_path / "child.pid"
+    child = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)" if ignores_term
+             else "import time; time.sleep(300)")
+    leader = [sys.executable, "-c",
+              "import subprocess, sys\n"
+              f"p = subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+              f"open({str(pidfile)!r}, 'w').write(str(p.pid))"]
+    children = D._Children()
+    proc = children.add(subprocess.Popen(leader, start_new_session=True), group=True)
+    try:
+        assert proc.wait(timeout=30) == 0
+        grandchild = int(pidfile.read_text())
+        assert not _gone(grandchild)
+        children.stop_all()
+        assert _wait_gone(grandchild)
+    finally:
+        if pidfile.exists() and not _gone(int(pidfile.read_text())):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
+def test_a_group_whose_members_are_all_gone_is_stopped_without_error():
+    children = D._Children()
+    proc = children.add(subprocess.Popen(EXIT(0), start_new_session=True), group=True)
+    proc.wait(timeout=30)
+    children.stop_all()
+    assert proc.poll() == 0
+
+
+def test_a_process_added_without_a_group_is_never_signalled_as_one(monkeypatch):
+    sent = []
+    monkeypatch.setattr(D.os, "killpg", lambda *a: sent.append(a))
+    children = D._Children()
+    proc = children.add(subprocess.Popen(SLEEP))
+    children.stop_all()
+    assert proc.poll() is not None and sent == []
+
+
 def test_the_earlier_signal_handlers_are_put_back():
     before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     with D.stops_children_on_signals():
@@ -759,7 +779,7 @@ class Recording(original):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         with open(work / "pids", "a") as f:
-            f.write(str(self.pid) + "\\\\n")
+            f.write(str(self.pid) + "\\n")
 subprocess.Popen = Recording
 class Rig:
     def __init__(self, root):
