@@ -1771,3 +1771,28 @@ def test_charter_guard_returns_none_only_for_no_store_an_unregistered_name_and_t
     (sdir / "store.id").write_text("x")
     monkeypatch.setenv("LEVAIN_BOARD_ITEMS", str(tmp_path / "elsewhere"))              # env names a store other than the pointer's: two stores
     assert isinstance(charter._wrong_repo("init", "alpha", top, None), str)
+
+
+STUB_RUN_TEXT = "<!-- levain: tracked stub -->\nThis file is retired; state lives on the Levain board (levain board state).\n"
+
+
+def test_repos_reports_a_stub_that_keeps_a_hand_copy_of_board_items_and_lets_free_text_stand(decision_seal, store, tmp_path, mkrepo, capsys):
+    """levain#179: the stub's first line is the marker and the rest is free text, except a list item or checkbox that names a
+    board id: that is the board's items copied by hand, which drifts, and the check says so."""
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha", retire=[{"repo": "alpha", "path": "next.md"}])
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    where = os.path.realpath(a) + "/next.md"
+    for fine in (STUB_RUN_TEXT, "<!-- levain: tracked stub -->\n# alpha\nsee alpha#1 for the first item, and alpha#2.\n",
+                 "<!-- levain: tracked stub -->\n- no ids in this list item\n- 12 items, see the board\n", "<!-- levain: tracked stub -->\n"):
+        (a / "next.md").write_text(fine)
+        rc, out, _ = run(capsys, "repos")
+        assert rc == 0 and "stale" not in out, fine
+    for copy in ("- [ ] alpha#1 the first thing\n", "* alpha#1: the first thing\n", "  1. alpha#1 the first thing\n", "[x] alpha#1 done\n"):
+        (a / "next.md").write_text(STUB_RUN_TEXT + copy)
+        rc, out, _ = run(capsys, "repos")
+        assert rc == 3 and f"stale: {where} is a stub that holds a hand copy of board items (alpha#1)" in out, copy
+    (a / "next.md").write_text(STUB_RUN_TEXT + "- [ ] alpha#1 a\n- [ ] alpha#2 b\n- [ ] alpha#1 c\n- [ ] flow#9 d\n- [ ] flow#10 e\n")
+    assert "(alpha#1, alpha#2, flow#9, +1 more)" in run(capsys, "repos")[1]
+    (a / "next.md").write_text("pre-track content\n- [ ] alpha#1 a\n")
+    assert f"stale: {where} still holds pre-track content" in run(capsys, "repos")[1]      # the marker rule is first and unchanged

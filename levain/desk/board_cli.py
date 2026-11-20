@@ -43,7 +43,6 @@ import dataclasses
 import errno
 import json
 import os
-import re
 import stat
 import sys
 import time
@@ -885,17 +884,13 @@ def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, An
     return out
 
 
-#: A board id inside free text (the store's own grammar, not a third one), not the tail of a longer token or number.
-_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9._#-])(?:" + bs.ID_RE.pattern + r")(?![0-9A-Za-z_])")
-
-
 def in_flight_ids(body: Any) -> list[str]:
     """The board ids a seam handoff body's ``in_flight`` entries name in their ``item`` text, in order, each once."""
     entries = body.get("in_flight") if isinstance(body, dict) else None
     found: list[str] = []
     for entry in entries if isinstance(entries, list) else []:
         text = entry.get("item") if isinstance(entry, dict) else None
-        found += [i for i in _ID_IN_TEXT.findall(text) if i not in found] if isinstance(text, str) else []
+        found += [i for i in br.ID_IN_TEXT.findall(text) if i not in found] if isinstance(text, str) else []
     return found
 
 

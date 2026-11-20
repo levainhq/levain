@@ -83,6 +83,12 @@ __all__ = ["REPOS_NAME", "STUB_MARKER", "TRACKING_AUDIT_HOURS", "ack_torn", "aba
 
 REPOS_NAME = "repos.jsonl"
 STUB_MARKER = "<!-- levain: tracked stub -->"
+#: A board id inside free text (the store's own id grammar), not the tail of a longer token or number: the one definition readers
+#: of free text share.
+ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9._#-])(?:" + bs.ID_RE.pattern + r")(?![0-9A-Za-z_])")
+#: A line that is a list item or a checkbox: the shape a hand copy of board items takes.
+_LIST_LINE = re.compile(r"\s*(?:(?:[-*+]|[0-9]+[.)])\s+|\[[ xX]\]\s+)")
+STUB_READ_MAX = 65536                       # bytes of a stub read for the check; a stub is a few lines
 TRACKING_AUDIT_HOURS = 72
 CHARTER_REF = "refs/remotes/origin/main"
 LAUNCH_WORDS = "first seat launched here"
@@ -1321,8 +1327,10 @@ def _next_step_core(target: bs.Target, cur: rf.Repo) -> tuple[str, tuple[dict, d
 
 
 def _stale_stubs(view: View, cur: rf.Repo) -> list[str]:
-    """I3: each retired path of a tracked repo that does not begin with the stub marker. A path is read in the repo it names,
-    through that repo's registered path. A file that is gone holds nothing and is not stale."""
+    """I3: each retired path of a tracked repo that does not begin with the stub marker, or that does and then keeps a hand copy of
+    board items (a list item or checkbox line naming a board id: the board is the source, a copy of it drifts). A stub's other
+    text is free. A path is read in the repo it names, through that repo's registered path. A file that is gone holds nothing and
+    is not stale."""
     out = []
     for e in cur.retire:
         owner = view.fold.repos.get(e["repo"])
@@ -1331,14 +1339,21 @@ def _stale_stubs(view: View, cur: rf.Repo) -> list[str]:
             continue
         p = Path(owner.path) / e["path"]
         try:
-            head = p.open("rb").readline().decode("utf-8", "replace").strip()
+            with p.open("rb") as fh:
+                text = fh.read(STUB_READ_MAX).decode("utf-8", "replace")
         except FileNotFoundError:
             continue
         except OSError as exc:
             out.append(f"{p}: unreadable ({type(exc).__name__})")
             continue
-        if head != STUB_MARKER:
+        head, _, rest = text.partition("\n")
+        if head.strip() != STUB_MARKER:
             out.append(f"stale: {p} still holds pre-track content; the board is the source since {cur.track_at}")
+            continue
+        copied = list(dict.fromkeys(i for ln in rest.splitlines() if _LIST_LINE.match(ln) for i in ID_IN_TEXT.findall(ln)))
+        if copied:
+            out.append(f"stale: {p} is a stub that holds a hand copy of board items ({', '.join(copied[:3])}"
+                       f"{f', +{len(copied) - 3} more' if len(copied) > 3 else ''}); the board is the source since {cur.track_at}")
     return out
 
 
