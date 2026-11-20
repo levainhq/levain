@@ -477,12 +477,13 @@ class _Snap:
     # the freshness facts of a snapshot an attached cockpit read from its row; None on a snapshot a provider read made. An
     # init field so ``dataclasses.replace`` carries it; it is no part of what the snapshot says, so it never takes part in equality
     fresh_info: "_Fresh | None" = field(default=None, compare=False)
-    # the instant the provider declared this content goes out of date (``Read.valid_until``, ISO). Advisory (R13): outside
-    # equality and the stored body, so a derive that moves only this does not move the row's generation
-    valid_until: str | None = field(default=None, compare=False)
     # the row this snapshot was decoded from, ``(gen, body_sha)``; None when no row stands behind it. The attached head's etag
     # and its caches are keyed on it, so no serialisation of the content is needed to tell one snapshot from another
     row_key: "tuple[int, str] | None" = field(default=None, compare=False)
+    # the instant the provider declared this content goes out of date (``Read.valid_until``, ISO). Advisory (R13): outside
+    # equality and the stored body, so a derive that moves only this does not move the row's generation. Last, so no
+    # positional caller shifts
+    valid_until: str | None = field(default=None, compare=False)
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
@@ -3917,7 +3918,8 @@ def _valid_until_iso(raw: Any) -> str | None:
         # a naive time is read as local time, Python's own rule for a naive datetime, not as UTC the way ``_parse_iso`` does
         if dt.tzinfo is None:
             dt = dt.astimezone()
-        if dt.astimezone(timezone.utc).year > 9998:     # the reader's ISO conversion must never meet an out-of-range instant
+        # the reader's ISO and epoch conversions must never meet an out-of-range instant
+        if not 1970 <= dt.astimezone(timezone.utc).year <= 9998:
             return None
         dt.timestamp()
         return dt.isoformat()

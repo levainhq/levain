@@ -49,8 +49,6 @@ DERIVE_TIMEOUT_S = 120.0
 _UNSET = object()
 # How often a panel that re-derives when the watch token moves is re-derived while the token is unknown (None).
 UNKNOWN_TOKEN_S = 5.0
-# A heavy derive yields to quick ones for a few seconds, never longer: after this wait it queues as light.
-HEAVY_YIELD_S = 5.0
 
 
 # --------------------------------------------------------------------------------------------------- inputs
@@ -363,20 +361,14 @@ def due_panels(
         if reason is not None:
             due.append((pid, reason))
 
-    due.sort(key=lambda item: queue_order(item[0], plans.get(item[0]), states[item[0]]))
+    due.sort(key=lambda item: queue_order(item[0], states[item[0]]))
     return due
 
 
-def queue_order(
-    pid: str, plan: PanelPlan | None, st: PanelState, waited: float | None = None
-) -> tuple[int, int, float, str]:
-    """The one order panels are derived in: dirty first (a write's reader is waiting), then light before heavy so a slow
-    derive does not hold a quick one behind it (a dirty heavy panel still beats a clean light one), then the oldest
-    derived_at (never derived first), then the id. `waited` is how long the job has sat in the live queue (None for one
-    evaluation batch, which does not wait): a heavy job that has waited HEAVY_YIELD_S counts as light."""
-    heavy = plan is not None and plan.heavy and (waited is None or waited < HEAVY_YIELD_S)
-    return (0 if st.dirty_gen is not None else 1, 1 if heavy else 0,
-            st.derived_at if st.derived_at is not None else -1.0, pid)
+def queue_order(pid: str, st: PanelState) -> tuple[int, float, str]:
+    """The one order panels are derived in: dirty first (a write's reader is waiting), then the oldest derived_at (never
+    derived first), then the id. It is fair because a panel just derived has the newest derived_at, so it sorts last."""
+    return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, pid)
 
 
 @dataclass
@@ -386,7 +378,6 @@ class _Job:
     fp: str
     token: Any
     st: PanelState  # the state the job was made for: a panel retired and added again is a different state
-    queued_at: float = 0.0  # the loop clock when the job went into the queue
 
 
 # --------------------------------------------------------------------------------------------------- the loop
@@ -806,7 +797,6 @@ class DeriveLoop:
                 for job in jobs:
                     if self._states.get(job.pid) is job.st and not job.st.busy:  # not retired since the poll
                         job.st.busy = True
-                        job.queued_at = self._clock()
                         self._queue[job.pid] = job
                 if jobs:
                     self._cv.notify_all()
@@ -819,13 +809,12 @@ class DeriveLoop:
                     self._cv.wait()
                 if self._stopping:
                     return
-                now = self._clock()
-                pid = min(self._queue, key=lambda p: self._queue_key(p, now))
+                pid = min(self._queue, key=self._queue_key)
                 job = self._queue.pop(pid)
             self._run_job(job, self._clock())
 
-    def _queue_key(self, pid: str, now: float) -> tuple[int, int, float, str]:
-        return queue_order(pid, self._plans.get(pid), self._states[pid], now - self._queue[pid].queued_at)
+    def _queue_key(self, pid: str) -> tuple[int, float, str]:
+        return queue_order(pid, self._states[pid])
 
     # ---- one derive
 

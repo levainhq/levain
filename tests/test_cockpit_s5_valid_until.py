@@ -1,4 +1,4 @@
-"""S5 of the read layer: a provider's own ``valid_until``, a per-panel backstop, and heavy panels derived last. A real
+"""S5 of the read layer: a provider's own ``valid_until``, a per-panel backstop, and and one order for the queue. A real
 ``SnapshotHost`` is driven with ``run_once``; the loop's finish time is the wall clock, so each test starts at the
 real ``time.time()`` and moves only the instant it hands ``run_once``."""
 
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from levain.cockpit.derive import HEAVY_YIELD_S, PanelPlan, due_panels, queue_order
+from levain.cockpit.derive import PanelPlan, due_panels, queue_order
 from levain.cockpit.engine import Cockpit, CockpitRegistrationError, Read
 from levain.cockpit.snapshot_host import SnapshotHost
 
@@ -45,11 +45,22 @@ def _head(ck: Cockpit, pid: str) -> dict[str, Any]:
     return ck.manifest(NONE_CRED)["panels"][pid]
 
 
-def _provider(pid: str, until: "list[float | None]", iso: Any = _iso, **kw: Any):
-    """A panel whose every read returns the same rows and the next ``valid_until`` from ``until`` (the last one repeats)."""
+class _T0:
+    """The test's start instant, taken after the host is built; a provider reads it lazily, so no setup time moves it."""
+
+    value = 0.0
+
+    def start(self) -> float:
+        self.value = time.time()
+        return self.value
+
+
+def _provider(pid: str, until: "list[float | None]", t0: _T0, iso: Any = _iso, **kw: Any):
+    """A panel whose every read returns the same rows and the next ``valid_until`` from ``until`` (offsets from ``t0``;
+    the last one repeats)."""
     def read(ctx):
         t = until.pop(0) if len(until) > 1 else until[0]
-        return Read(rows=(_row(1),), valid_until=None if t is None else iso(t))
+        return Read(rows=(_row(1),), valid_until=None if t is None else iso(t0.value + t))
 
     return _simple(pid, read=read, **kw)
 
@@ -70,6 +81,8 @@ def fixed_tz():
 
 _FAR = "9999-12-31T23:59:59-23:59"  # past UTC year 9999: its epoch form is out of range
 
+_PRE_EPOCH = "1969-12-31T23:59:59+00:00"  # before the epoch: its epoch form must never be taken
+
 _VALUES: "dict[str, Any]" = {
     "aware": _iso,
     # a naive one is local time (here a zone west of UTC, where reading it as UTC would put it in the past)
@@ -78,43 +91,47 @@ _VALUES: "dict[str, Any]" = {
     "naive_datetime": lambda t: datetime.fromtimestamp(t),
     "year_9999_string": lambda t: _FAR,
     "year_9999_datetime": lambda t: datetime.fromisoformat(_FAR),
+    "before_1970_string": lambda t: _PRE_EPOCH,
+    "before_1970_datetime": lambda t: datetime.fromisoformat(_PRE_EPOCH),
 }
 
 
 @pytest.mark.parametrize("case", list(_VALUES))
 def test_a_declared_valid_until_is_served_in_the_attached_head(host_for, fixed_tz, case: str) -> None:
     ck = Cockpit()
-    t0 = time.time()
-    ck.register(_provider("a", [t0 + 100], iso=_VALUES[case]))
+    clock = _T0()
+    ck.register(_provider("a", [100], clock, iso=_VALUES[case]))
     host = host_for(ck)
     host.attach()
+    t0 = clock.start()
     host.run_once(t0)
     served = _head(ck, "a")["valid_until"]
-    if case.startswith("year_9999"):
+    if case.startswith(("year_9999", "before_1970")):
         assert served is None  # no bound, and the head still builds
     else:
-        assert datetime.fromisoformat(served).timestamp() == pytest.approx(t0 + 100)
+        assert datetime.fromisoformat(served).timestamp() == pytest.approx(t0 + 100, abs=0.01)
 
 
 def test_a_derive_that_moves_only_valid_until_keeps_the_generation(host_for) -> None:
-    t0 = time.time()
+    clock = _T0()
     ck = Cockpit()
-    ck.register(_provider("a", [t0 + 100, t0 + 200], backstop_s=5))
+    ck.register(_provider("a", [100, 200], clock, backstop_s=5))
     host = host_for(ck)
-    t0 = time.time()  # after the setup: a slow one cannot push the derive's finish past the instants below
+    t0 = clock.start()  # after the setup: a slow one cannot push the derive's finish past the instants below
     host.run_once(t0)
     first = host.reader.read("a")
     assert "a" in host.run_once(t0 + 6)
     again = host.reader.read("a")
     assert again.gen == first.gen == 1 and again.body_sha == first.body_sha
-    assert again.valid_until == pytest.approx(t0 + 200) and first.valid_until == pytest.approx(t0 + 100)
+    assert again.valid_until == pytest.approx(t0 + 200, abs=0.01) and first.valid_until == pytest.approx(t0 + 100, abs=0.01)
 
 
 def test_the_panel_is_due_at_its_valid_until_and_not_before(host_for) -> None:
-    t0 = time.time()
+    clock = _T0()
     ck = Cockpit()
-    ck.register(_provider("a", [t0 + 100], backstop_s=100000, stale_after_s=100000))
+    ck.register(_provider("a", [100], clock, backstop_s=100000, stale_after_s=100000))
     host = host_for(ck)
+    t0 = clock.start()
     host.run_once(t0)
     assert "a" not in host.run_once(t0 + 99)
     assert "a" in host.run_once(t0 + 101)
@@ -127,7 +144,7 @@ def test_a_per_panel_backstop_reaches_the_plan_and_re_derives_with_no_input_move
     host = host_for(ck)
     plans = {p.id: p for p in host._plans()}
     assert plans["a"].backstop_s == 5 and plans["b"].backstop_s is None
-    t0 = time.time()
+    t0 = time.time()  # after the host is built
     host.run_once(t0)
     assert "a" not in host.run_once(t0 + 4)
     assert "a" in host.run_once(t0 + 6)
@@ -144,44 +161,33 @@ def test_a_backstop_that_is_not_positive_and_finite_is_refused(bad: Any) -> None
             ck.register(_simple("b", backstop_s=bad, stale_after_s=900))
 
 
-def test_the_queue_orders_dirty_first_then_light_before_heavy_then_oldest(host_for) -> None:
+def test_the_queue_orders_dirty_first_then_never_derived_then_oldest(host_for) -> None:
     ck = Cockpit()
     host = host_for(ck)
     loop = host._loop
-    ids = ["heavy_dirty", "light_new", "light_old", "light_never", "heavy_clean"]
-    loop.set_plans([PanelPlan(id=i, heavy=i.startswith("heavy")) for i in ids])
-    ages = {"heavy_dirty": 50.0, "light_new": 60.0, "light_old": 10.0, "light_never": None, "heavy_clean": 5.0}
+    ids = ["dirty", "new", "old", "never", "oldest"]
+    loop.set_plans([PanelPlan(id=i) for i in ids])
+    ages = {"dirty": 50.0, "new": 60.0, "old": 10.0, "never": None, "oldest": 5.0}
     for pid, age in ages.items():
         loop._states[pid].derived_at = age
-    loop._states["heavy_dirty"].dirty_gen = 1
-    want = ["heavy_dirty", "light_never", "light_old", "light_new", "heavy_clean"]
-    def key(pid: str, waited: "float | None" = 0.0):
-        return queue_order(pid, loop._plans.get(pid), loop._states[pid], waited)
-
-    assert sorted(reversed(ids), key=key) == want
-    # due_panels reads the same order: every panel here is due at a backstop, so the one function decides
+    loop._states["dirty"].dirty_gen = 1
+    want = ["dirty", "never", "oldest", "old", "new"]
+    assert sorted(reversed(ids), key=lambda pid: queue_order(pid, loop._states[pid])) == want
+    # the live queue's key and due_panels read the same order: every panel here is due at a backstop
+    assert sorted(reversed(ids), key=loop._queue_key) == want
     due = due_panels(loop._plans, loop._states, {}, None, now=1e9, backstop_s=1.0)
     assert [pid for pid, _ in due] == want
 
 
-def test_a_heavy_job_that_has_waited_the_yield_sorts_before_a_light_one_queued_now(host_for) -> None:
-    ck = Cockpit()
-    loop = host_for(ck)._loop
-    loop.set_plans([PanelPlan(id="h", heavy=True), PanelPlan(id="l")])
-    loop._states["h"].derived_at = loop._states["l"].derived_at = 10.0
-    light_now = queue_order("l", loop._plans["l"], loop._states["l"], 0.0)
-    assert queue_order("h", loop._plans["h"], loop._states["h"], HEAVY_YIELD_S) < light_now
-    assert queue_order("h", loop._plans["h"], loop._states["h"], 0.0) > light_now
-    assert queue_order("h", loop._plans["h"], loop._states["h"], None) > light_now  # a batch never waits
-
-
 def test_an_expiry_that_passes_during_its_own_derive_is_stored_and_not_re_derived_every_poll(host_for) -> None:
-    t0 = time.time() - 10  # the real now is past t0 + 1, so the reader sees the stored bound as passed
+    clock = _T0()
     ck = Cockpit()
-    ck.register(_provider("a", [t0 + 1], backstop_s=100000, stale_after_s=100000))
-    host = host_for(ck, clock=lambda: t0 + 2)  # the derive finishes at t0 + 2
+    ck.register(_provider("a", [1], clock, backstop_s=100000, stale_after_s=100000))
+    host = host_for(ck, clock=lambda: clock.value + 2)  # the derive finishes at t0 + 2
     host.attach()
+    t0 = clock.start() - 10  # the real now is past t0 + 1, so the reader sees the stored bound as passed
+    clock.value = t0
     host.run_once(t0)
-    assert host.reader.read("a").valid_until == pytest.approx(t0 + 1)
+    assert host.reader.read("a").valid_until == pytest.approx(t0 + 1, abs=0.01)
     assert _head(ck, "a")["stale"] is True
     assert "a" not in host.run_once(t0 + 3)
