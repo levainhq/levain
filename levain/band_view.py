@@ -3755,21 +3755,23 @@ ASK_NOTE = ("The row takes 2-6 options (keys lowercase a-z, 0-9, _ or -); when t
 
 def _shown_lines(directory: Path | str, fact: TurnFact, session: str) -> list[str] | None:
     """The lines of the block this turn's prompt hook showed the seat (what every reply reprints), read before the
-    Stop commit that can clear them; ``[]`` when none or unreadable, ``None`` when a view with items kept no block (the
-    lines are unknown)."""
+    Stop commit that can clear them; ``[]`` when there is none, ``None`` when the lines are unknown (a view with items
+    kept no block, a staged record that exists and cannot be read, or a read that failed)."""
     try:
         if not fact.band:
             return []
         if fact.coord:
             got = _read_staged(directory, session)
-            return [] if got is None else got[0]["block"].splitlines()
+            if got is None:
+                return None if _session_file(directory, session, "staged").exists() else []
+            return got[0]["block"].splitlines()
         row = _view_row(QuestionStore(directory), fact.viewer)
         if row is None:
             return []
         view, _gen, block = row
         return None if block is None and view.open_list else (block or "").splitlines()
     except Exception:
-        return []
+        return None
 
 
 def _ask_reason(directory: Path | str, fact: TurnFact, rec: dict | None, payload: dict, message: str,
