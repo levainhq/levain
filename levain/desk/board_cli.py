@@ -43,6 +43,7 @@ import dataclasses
 import errno
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -58,7 +59,7 @@ from levain.desk import board_producers as bp
 from levain.desk.board_state import (COLUMNS, EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, STATE_COLUMN, STATE_KIND, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["CLOSED_COLUMNS", "EXTRA_KEYS", "ITEMS_ENV", "OPEN_STATES", "READ_BY_CLI", "only_repo", "open_lines", "open_view", "read_board", "register", "run_open",
+__all__ = ["CLOSED_COLUMNS", "EXTRA_KEYS", "ITEMS_ENV", "OPEN_STATES", "READ_BY_CLI", "in_flight_drift", "in_flight_ids", "only_repo", "open_lines", "open_view", "read_board", "register", "run_open",
            "run_state", "state_doc", "table_lines"]
 
 ITEMS_ENV = bs.ITEMS_ENV
@@ -881,6 +882,33 @@ def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, An
     out = {"schema": kept.get("schema"), "as_of": kept.get("as_of"), "items": items, "audit": kept.get("audit", []),
            "problems": kept.get("problems", []), "reader": kept.get("reader", {})}
     out.update({k: kept[k] for k in ("repo_filter", "reader_scope") if k in kept})
+    return out
+
+
+#: A board id inside free text (the store's own grammar, not a third one), not the tail of a longer token or number.
+_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9._#-])(?:" + bs.ID_RE.pattern + r")(?![0-9A-Za-z_])")
+
+
+def in_flight_ids(body: Any) -> list[str]:
+    """The board ids a seam handoff body's ``in_flight`` entries name in their ``item`` text, in order, each once."""
+    entries = body.get("in_flight") if isinstance(body, dict) else None
+    found: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        text = entry.get("item") if isinstance(entry, dict) else None
+        found += [i for i in _ID_IN_TEXT.findall(text) if i not in found] if isinstance(text, str) else []
+    return found
+
+
+def in_flight_drift(body: Any, doc: dict[str, Any]) -> list[str]:
+    """One line for each board id a handoff's ``in_flight`` names that the board reads outside the open set (done, cut, parked,
+    out of 1.0): a hand-kept list that has drifted from the board. A name the board does not hold, or holds open, says nothing.
+    A report only: a handoff is written once under its lease, so nothing here refuses it."""
+    by_id = {i.get("id"): i for i in doc.get("items", [])}
+    out = []
+    for iid in in_flight_ids(body):
+        found = by_id.get(iid)
+        if found is not None and not _is_open(found):
+            out.append(f"in_flight names {iid}, which the board reads as {found.get('state')}: it is not open")
     return out
 
 

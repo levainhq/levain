@@ -247,3 +247,43 @@ def test_the_json_is_the_open_selection_with_the_documents_own_items_and_no_new_
     assert set(opened) == {"schema", "as_of", "items", "audit", "problems", "reader"}
     assert opened["items"] == [i for i in state["items"] if i["state"] in board_cli.OPEN_STATES]
     assert opened["audit"] == state["audit"] and opened["problems"] == state["problems"]
+
+
+# ------------------------------------------------------------------------------------------------ the in_flight drift check
+def _body(*names: str) -> dict:
+    return {"state_line": "s", "in_flight": [{"item": n, "owner": "seat", "why": "w"} for n in names], "next": "", "contingencies": [],
+            "notes": "", "attested_operator_present": False, "attested_walked": False}
+
+
+def _board_with(**states: str) -> dict:
+    """``levain#<n>`` for each ``n<k>=state`` keyword, a document of that many items."""
+    doc = _doc(())
+    for key, state in states.items():
+        doc["items"].append({"id": f"levain#{key[1:]}", "repo": "levain", "title": "t", "tier": None, "state": state,
+                             "column": STATE_COLUMN[state], "reason": "r", "refs": [], "as_of": None, "kind": STATE_KIND[state]})
+    return doc
+
+
+def test_in_flight_naming_a_done_item_and_a_cut_item_reports_both():
+    doc = _board_with(n1="done", n2="cut", n3="in_flight")
+    got = board_cli.in_flight_drift(_body("levain#1", "levain#2: S4 polish", "levain#3"), doc)
+    assert got == ["in_flight names levain#1, which the board reads as done: it is not open",
+                   "in_flight names levain#2, which the board reads as cut: it is not open"]
+
+
+def test_in_flight_naming_every_closed_state_is_reported_and_every_open_state_is_not():
+    for state in STATES:
+        got = board_cli.in_flight_drift(_body("levain#1"), _board_with(n1=state))
+        assert bool(got) == (state not in board_cli.OPEN_STATES), state
+
+
+def test_in_flight_naming_an_open_item_or_no_board_id_reports_nothing():
+    doc = _board_with(n1="ready", n2="unknown")
+    assert board_cli.in_flight_drift(_body("levain#1", "levain#2"), doc) == []
+    assert board_cli.in_flight_drift(_body("the s4 lane", "levain#99", "Levain#1", "alevain#1x", "levain#1x2"), doc) == []
+    assert board_cli.in_flight_drift({"in_flight": "not a list"}, doc) == [] and board_cli.in_flight_drift(None, doc) == []
+
+
+def test_an_id_is_found_inside_text_but_a_token_that_only_ends_like_one_is_not():
+    assert board_cli.in_flight_ids(_body("see levain#12.", "levain#12 again", "x-levain#3", "levain#305x", "Levain#4", "other.repo#7")) == \
+        ["levain#12", "x-levain#3", "other.repo#7"]

@@ -7,6 +7,7 @@ is written. Stdlib plus levain's own readers.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -127,11 +128,17 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             if problems and not doc["items"]:
                 raise RuntimeError("the board read no item: " + "; ".join(p.strip() for p in problems[:2]))
             items = board_cli.open_view(doc)["items"]
+            # no new body exists yet: the last handoff's in_flight is what a desk carries forward, so it is what is checked
+            has_handoffs = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone()
+            last = conn.execute("SELECT body FROM seam_handoffs ORDER BY handoff_id DESC LIMIT 1").fetchone() if has_handoffs else None
+            drift = board_cli.in_flight_drift(json.loads(last[0]), doc) if last else []
+            stale = "".join(f"; the last handoff's {d}" for d in drift)
             if not items:
-                return "board: 0 open items"
+                return "board: 0 open items" + stale
             unread = f" (+{len(problems)} problem line(s) in the read)" if problems else ""
             return (f"board: {len(items)} open ({_ids([str(i['id']) for i in items])}){unread}: read them with `{lv} board open`; "
-                    "do not copy them into in_flight: in_flight names only live work the board does not hold, with its owner and why")
+                    "do not copy them into in_flight: in_flight names only live work the board does not hold, with its owner and why"
+                    + stale)
 
         def unacked() -> str:
             if not open_tables_present(conn):

@@ -253,7 +253,7 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     sources = [(t, seam_classes.KIND_CLASSES.get(t, {}).get("COUNTED")) for t in sorted(seam_classes.COUNTED & present)]
 
     head_lines = _header(conn, kind, read_at, head, floor, floor_open, handoff)
-    handoff_lines = _guard("Handoff section", lambda: _handoff_section(conn, handoff, sources, head), failed,
+    handoff_lines = _guard("Handoff section", lambda: _handoff_section(store, conn, handoff, sources, head), failed,
                            critical=True)
     # the counts and the detail are one read of the window: either failing leaves the window unread
     counts, rows, since_lines = _guard("Since", lambda: _since(conn, sources, floor, head), failed, critical=True,
@@ -370,7 +370,23 @@ def _header(conn: sqlite3.Connection, kind: str, read_at: str, head: int, floor:
     return lines
 
 
-def _handoff_section(conn: sqlite3.Connection, handoff: Any, sources: list, head: int) -> list[str]:
+def _in_flight_drift(store: CoordStore, body: dict) -> list[str]:
+    """The lines saying an ``in_flight`` entry names a board item the board no longer reads as open, beside the list. This section
+    is never cut, so a board that cannot be read is one line here and never fails the section; with no board id named, the board is not read."""
+    from levain.desk import board_cli
+
+    if not board_cli.in_flight_ids(body):
+        return []
+    try:
+        code, doc, err = board_cli.read_board(consent_dir=store.directory)
+        if doc is None:
+            raise CoordError(err or f"levain board state exited {code} with no board")
+        return [f"  {line}" for line in board_cli.in_flight_drift(body, doc)]
+    except Exception as exc:  # noqa: BLE001 - named on its line; the handoff's own lines stand
+        return [f"  in_flight vs the board: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"]
+
+
+def _handoff_section(store: CoordStore, conn: sqlite3.Connection, handoff: Any, sources: list, head: int) -> list[str]:
     if handoff is None:
         return ["Handoff section: absent (no seam_handoffs row)"]
     body = json.loads(handoff.body)
@@ -379,6 +395,7 @@ def _handoff_section(conn: sqlite3.Connection, handoff: Any, sources: list, head
              f"  state: {body['state_line']}"]
     for entry in body["in_flight"]:
         lines.append(f"  in flight: {entry['item']} (owner {entry['owner']}): {entry['why']}")
+    lines += _in_flight_drift(store, body)
     if body["next"].strip():
         lines.append(f"  next: {body['next']}")
     for entry in body["contingencies"]:

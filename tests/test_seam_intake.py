@@ -611,3 +611,20 @@ def test_plan_on_no_store_says_so(tmp_path, capsys):
     q.mkdir(mode=0o700)
     assert main(["coord", "close", "--plan", "--queue-dir", str(q)]) == 1
     assert "there is no desk store here" in capsys.readouterr().err
+
+
+def test_plan_reports_a_stale_in_flight_entry_of_the_last_handoff_beside_the_board_line(tmp_path, capsys, monkeypatch):
+    """levain#179: no new body exists when the plan is read, so the last handoff's in_flight (what a desk carries forward) is
+    checked against the board: an entry naming a done or cut item is a report line; an open one or a free-text one is not."""
+    w = World(tmp_path, capsys)
+    fake_board(monkeypatch, board_doc(("levain#1", "done"), ("levain#2", "cut"), ("levain#3", "ready")))
+    entries = [{"item": n, "owner": "seat-9", "why": "w"} for n in ("levain#1", "levain#2: S4", "levain#3", "the s4 lane")]
+    w.run("coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path, _body(in_flight=entries))), "--request-id", "r1",
+          "--token", str(w.token), "--queue-dir", str(w.q))
+    line = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
+    assert line.startswith("board: 1 open (levain#3)")
+    assert "; the last handoff's in_flight names levain#1, which the board reads as done: it is not open" in line
+    assert "; the last handoff's in_flight names levain#2, which the board reads as cut: it is not open" in line
+    assert "in_flight names levain#3" not in line
+    fake_board(monkeypatch, board_doc(("levain#3", "ready")))
+    assert "the last handoff's" not in seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
