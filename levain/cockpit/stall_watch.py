@@ -17,6 +17,7 @@ Two captures, each saying what it holds:
   released the interpreter by then; it shows what the other threads were waiting in.
 
 The loop does nothing but arm, sleep, compare and, on a late wake, report. Below the threshold it walks no stack.
+The module also keeps a dead process's scratch file as a dump, so a process killed during a stall leaves its stacks.
 
 The dump is plain file writes, written before anything is printed (a stderr write can block on a lock a stalled thread
 holds); it does not use ``logging``, whose handler locks a stalled thread could hold. Its thread names come from a copy
@@ -27,6 +28,7 @@ opened, by the watch thread itself, not by the code that starts it.
 from __future__ import annotations
 
 import codecs
+import errno
 import faulthandler
 import os
 import stat
@@ -36,7 +38,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TextIO
 
 INTERVAL_S = 0.1      # how long each sleep asks for; nothing in the loop runs faster than this
 LATE_S = 1.0          # a wake later than this (past the INTERVAL_S it asked for) is a stall; also the live timer's span
@@ -47,10 +49,14 @@ MAX_THREADS = 64      # the fallback dump lists at most this many threads (the l
 MAX_FRAMES = 40       # the fallback dump keeps at most this many innermost frames per thread
 MAX_DUMP_BYTES = 262144  # no dump file grows past this many bytes of body; the rest is cut with a one-line note
 MAX_NAME_TRIES = 8    # a kept dead process's dump asks this many names for a free one before it gives up
-MAX_ARM_FAILURES = 3 # this many arms of the live timer failing in a row turn the live capture off; a success resets it
+MAX_ARM_FAILURES = 3  # this many arms of the live timer failing in a row turn the live capture off; a success resets it
 
 DIR_MODE = 0o700      # the stalls directory, when this module makes it
 FILE_MODE = 0o600     # every file this module makes in it
+
+# An open of a dead process's scratch that fails with one of these says nothing is left to keep: the file is gone, a
+# symlink or fifo we refuse to follow, or not ours to read. Any other error says nothing about the file: it stays.
+_SCRATCH_GONE_ERRNOS = frozenset({errno.ENOENT, errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EACCES, errno.EPERM})
 
 DUMP_PREFIX = "stall-"
 DUMP_SUFFIX = ".txt"
@@ -221,8 +227,10 @@ class StallWatch:
 
         An existing directory must be a real directory (not a symlink, not a file): otherwise the live capture and the
         dumps are both off, said once. One owned by this user is set to :data:`DIR_MODE`. Scratch files of processes
-        that are gone are kept as dumps when they hold text, then removed; one of a live process is never touched. A failure leaves the watch running with no
-        live capture; a dump then fails with its own stderr line."""
+        that are gone are kept as dumps when each is a non-empty readable regular file, then removed; one that is empty,
+        not a regular file, unreadable (EACCES) or gone is removed unkept, and one that could not be kept stays for the
+        next start. One of a live process is never touched. A failure leaves the watch running with no live capture; a
+        dump then fails with its own stderr line."""
         self._dumps_off = False
         self._arm_failures = 0
         try:
@@ -263,8 +271,9 @@ class StallWatch:
             say(f"cockpit stall: live capture off: {type(exc).__name__}: {exc}")
 
     def _remove_dead_scratches(self) -> None:
-        """Delete the scratch files in the directory that belong to a process that no longer exists. A non-empty one is
-        first kept as a dump (see :meth:`_keep_dead_scratch`); one that could not be kept is left in place."""
+        """Delete the scratch files in the directory that belong to a process that no longer exists. A non-empty
+        readable regular file is first kept as a dump (see :meth:`_keep_dead_scratch`); one that is empty, not a regular
+        file, unreadable (EACCES) or gone is deleted unkept; one that could not be kept stays in place."""
         try:
             names = [p.name for p in self._dir.iterdir()]
         except OSError:
@@ -320,7 +329,7 @@ class StallWatch:
 
     # ---- the dump --------------------------------------------------------------------------------------------
 
-    def _open_new_dump(self, path: Path):
+    def _open_new_dump(self, path: Path) -> TextIO:
         """Create ``path`` as a new dump file and return its text handle; an existing file is never opened."""
         # O_EXCL: never overwrite an earlier dump; FILE_MODE: the stacks are the cockpit's own, not the host's to read
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), FILE_MODE)
@@ -362,16 +371,25 @@ class StallWatch:
 
     def _keep_dead_scratch(self, scratch: Path, pid: int) -> bool:
         """Keep a dead process's non-empty scratch as a dump named for its pid and "killed". True when the scratch may
-        now be deleted: it was kept, or it is empty, not a plain file or not readable. False when the dump could not
-        be written, so the scratch stays for the next start.
+        now be deleted: it was kept, or it is empty, not a plain file, gone, or not ours to read (an open that fails
+        with one of :data:`_SCRATCH_GONE_ERRNOS`). False when the scratch must stay for the next start: the dump could
+        not be written, or anything else went wrong (an open failing for EMFILE, EIO and the like, an unforeseen
+        error); each says so in one stderr line naming the pid and the error.
 
         The scratch holds what faulthandler wrote while a stall was going; a process that was killed in the stall never
         reached the late wake that would have written a report from it. The dump takes the same byte budget as any
-        other, takes a name no file has, and counts in :data:`KEEP_DUMPS`; the trim never deletes it."""
+        other, takes a name no file has, and counts in :data:`KEEP_DUMPS`. The trim in this call keeps it; a later
+        dump's trim deletes it once :data:`KEEP_DUMPS` newer dumps exist.
+
+        A kill during the keep leaves a possibly partial dump plus the intact scratch, and the next start keeps the
+        scratch again. A write that fails every time leaves the scratch in place and says so on every start."""
         try:
             fd = os.open(scratch, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-        except OSError:
-            return True
+        except OSError as exc:
+            if exc.errno in _SCRATCH_GONE_ERRNOS:
+                return True
+            say(f"cockpit stall: dump of dead process {pid}'s stacks not written: {type(exc).__name__}: {exc}")
+            return False
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
@@ -394,8 +412,9 @@ class StallWatch:
                 return False
             try:
                 with handle:
-                    handle.write(f"cockpit stall: process {pid} ended with live stacks in its scratch file, last written "
-                                 f"{written}; no late-wake report was written from them\n")
+                    handle.write(f"cockpit stall: process {pid} ended without stopping its watch; its scratch file held "
+                                 f"live stacks, last written {written}, size {info.st_size} bytes; a late-wake report "
+                                 f"may or may not have been written from them\n")
                     _copy_fd(fd, handle, _Budget(MAX_DUMP_BYTES), "\n--- live stacks: left by that process ---\n")
             except Exception as exc:
                 say(f"cockpit stall: dump of dead process {pid}'s stacks not written: {type(exc).__name__}: {exc}")
@@ -406,8 +425,9 @@ class StallWatch:
                 return False
             self._trim_dumps(keep=path)
             return True
-        except Exception:
-            return True              # not readable or not statable: the scratch goes as it did before
+        except Exception as exc:
+            say(f"cockpit stall: dump of dead process {pid}'s stacks not written: {type(exc).__name__}: {exc}")
+            return False             # anything unforeseen: the scratch stays, the line above is the signal
         finally:
             os.close(fd)
 

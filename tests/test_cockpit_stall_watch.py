@@ -2,6 +2,7 @@
 Two cases use real time and a real faulthandler timer: the stop/start race and the interpreter-holding thread."""
 from __future__ import annotations
 
+import errno
 import faulthandler
 import os
 import stat
@@ -476,6 +477,143 @@ def test_a_scratch_that_cannot_be_read_does_not_crash_prepare_and_is_removed_as_
         assert watch._scratch is not None             # the watch still has its own live capture
         assert not dead.exists()                      # as before: removed, with no dump
         assert watch.dumps() == []
+    finally:
+        watch._close_live()
+
+
+def _open_failing_for(monkeypatch, target, err: int) -> None:
+    """Make os.open raise OSError(err) for ``target`` only; every other open is the real one."""
+    real_open = os.open
+
+    def fake_open(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(target):
+            raise OSError(err, os.strerror(err))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+
+@pytest.mark.parametrize("err", [errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EINTR, errno.EIO])
+def test_an_open_that_fails_for_a_reason_about_the_process_leaves_the_dead_scratch_and_says_so(tmp_path, monkeypatch,
+                                                                                               capsys, err):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    _open_failing_for(monkeypatch, dead, err)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert dead.read_bytes() == STACK_TEXT         # kept for the next start, not deleted unread
+        assert killed_dumps(tmp_path) == []
+        said = capsys.readouterr().err
+        assert f"{pid}" in said and "not written" in said and os.strerror(err) in said
+    finally:
+        watch._close_live()
+
+
+@pytest.mark.parametrize("err", [errno.ENOENT, errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EACCES, errno.EPERM])
+def test_an_open_that_says_gone_refused_or_not_ours_still_deletes_the_dead_scratch(tmp_path, monkeypatch, err):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    _open_failing_for(monkeypatch, dead, err)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert not dead.exists()
+        assert killed_dumps(tmp_path) == []
+    finally:
+        watch._close_live()
+
+
+def test_a_symlink_scratch_is_refused_and_the_link_is_deleted_not_its_target(tmp_path):
+    target = tmp_path / "elsewhere.txt"
+    target.write_bytes(STACK_TEXT)
+    stalls = tmp_path / "stalls"
+    stalls.mkdir()
+    link = stalls / stall_watch.scratch_name(_gone_pid())
+    link.symlink_to(target)
+    watch = StallWatch(stalls)
+    watch._prepare()
+    try:
+        assert not link.is_symlink() and not link.exists()
+        assert target.read_bytes() == STACK_TEXT      # never followed, never touched
+        assert killed_dumps(stalls) == []
+    finally:
+        watch._close_live()
+
+
+def test_an_unforeseen_error_while_keeping_leaves_the_dead_scratch_and_says_so(tmp_path, monkeypatch, capsys):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+
+    def odd_mtime(seconds):
+        raise ValueError("year out of range")
+
+    monkeypatch.setattr(stall_watch.time, "gmtime", odd_mtime)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert dead.read_bytes() == STACK_TEXT
+        assert killed_dumps(tmp_path) == []
+        said = capsys.readouterr().err
+        assert f"{pid}" in said and "not written" in said and "ValueError" in said
+    finally:
+        watch._close_live()
+
+
+def test_a_write_that_fails_midway_removes_the_partial_dump_and_keeps_the_scratch(tmp_path, monkeypatch, capsys):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    seen = []
+
+    def fail_after_create(fd, handle, budget, banner):
+        seen.append(len(killed_dumps(tmp_path)))      # the dump file already exists when the copy starts
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(stall_watch, "_copy_fd", fail_after_create)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert seen == [1]
+        assert killed_dumps(tmp_path) == []           # the partial one is gone
+        assert dead.read_bytes() == STACK_TEXT
+        assert "not written" in capsys.readouterr().err
+    finally:
+        watch._close_live()
+
+
+def test_a_later_dumps_trim_can_delete_a_kept_dump_once_keep_dumps_newer_ones_exist(tmp_path):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        for i in range(KEEP_DUMPS - 1):
+            (tmp_path / f"stall-2099010{i % 10}T000000000000Z-{i:06d}.txt").write_text(f"newer {i}")
+        assert kept.exists() and len(watch.dumps()) == KEEP_DUMPS     # full, the kept one still inside
+        watch._write_dump(1.5)                                         # the 21st: the trim has no protected dump
+        assert not kept.exists()
+        assert len(watch.dumps()) == KEEP_DUMPS
+    finally:
+        watch._close_live()
+
+
+def test_the_kept_dump_header_names_the_pid_and_the_scratch_size_and_claims_no_cause(tmp_path):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        header = kept.read_text().splitlines()[0]
+        assert header.startswith(f"cockpit stall: process {pid} ended without stopping its watch; ")
+        assert f"size {len(STACK_TEXT)} bytes" in header
+        assert header.endswith("a late-wake report may or may not have been written from them")
+        assert "no late-wake report was written" not in header
+        assert f"killed-pid{pid}-" in kept.name
     finally:
         watch._close_live()
 
