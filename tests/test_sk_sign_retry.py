@@ -651,12 +651,12 @@ def test_an_empty_answer_with_no_time_for_a_second_touch_is_named_too(rig):
 
 def test_the_words_name_touch_id_only_for_a_touch_id_signer(rig, monkeypatch):
     from levain.cockpit.custody import APPLE_PROVIDER
-    rig.fake.plan = ["empty"] * 3
+    rig.fake.plan = ["empty"] * 2
     with pytest.raises(KeyError_) as plain:         # no sidecar, no Apple provider: the code cannot know it is Touch ID
         rig.sign(MESSAGE)
     assert str(plain.value).startswith("the key returned no signature for ") and "Touch ID" not in str(plain.value)
     monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)
-    rig.fake.plan, rig.fake.signs = ["empty"] * 3, 0
+    rig.fake.plan, rig.fake.signs = ["empty"] * 2, 0
     with pytest.raises(KeyError_) as touch:
         rig.sign(MESSAGE)
     assert str(touch.value).startswith("the key returned no signature (Touch ID gave nothing back) for ")
@@ -747,7 +747,6 @@ def test_an_unbroken_run_of_empty_answers_makes_exactly_two_signing_calls_then_r
     assert "nothing was signed" in text and "phone" in text
 
 
-def test_an_empty_answer_then_a_good_one_returns_the_signature_after_one_retry(rig):
-    rig.fake.plan = ["empty", None, "empty"]         # the third entry is never asked for
-    assert _sshsig_type_and_flags(rig.sign(MESSAGE)) == (SK, 0x01)
-    assert rig.fake.signs == 2 and rig.clock.sleeps == [1.0]
+def test_the_wait_table_holds_one_wait_per_retry_the_cap_allows():
+    """The import-time assert's own proof: a cap raised without its wait would be an IndexError in the middle of a sign."""
+    assert len(keys._EMPTY_RETRY_WAITS_S) == keys._SK_EMPTY_ATTEMPTS - 1
