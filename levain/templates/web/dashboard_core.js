@@ -64,7 +64,12 @@
     return p;
   };
   function appendBanner(host, entry) {
-    for (const b of entry.banner || []) host.appendChild(richEl("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
+    // data-bn is the line's index: a read that moves only its digits (an age, a count) repaints the line in place (cockpit_view readInPlace)
+    (entry.banner || []).forEach((b, i) => {
+      const n = richEl("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text);
+      n.dataset.bn = String(i);
+      host.appendChild(n);
+    });
   }
   const kv = (parent, k, v) => {
     const row = el("div", "kv");
@@ -11528,5 +11533,6 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
-  window.LevainDashboard = { dayYearWords, releaseLoading, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  function setRichText(node, text) { node.textContent = ""; codeSpansInto(node, String(text != null ? text : "")); }
+  window.LevainDashboard = { setRichText, dayYearWords, releaseLoading, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
