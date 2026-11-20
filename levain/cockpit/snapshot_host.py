@@ -376,7 +376,10 @@ class SnapshotHost:
             return DeriveResult("error", None, error="the panel is no longer registered")
         status, body = encode_snap(snap)
         # a failed derive's row carries its message on the row (the store keeps no body for it)
-        until = datetime.fromisoformat(snap.valid_until).timestamp() if snap.valid_until else None
+        try:
+            until = datetime.fromisoformat(snap.valid_until).timestamp() if snap.valid_until else None
+        except (ValueError, OverflowError, OSError):    # no bound, never an error row
+            until = None
         return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None,
                             valid_until=until)
 

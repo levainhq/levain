@@ -9,6 +9,7 @@ said only by a read that confirmed its source. An exception escaping a provider 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Union
 
 
@@ -52,11 +53,11 @@ class Read:
     # snapshot and reported only on a request that carries a ``q``, so a query-less read never reports what it hides
     hidden_skipped: tuple[tuple[int, str], ...] = ()
     hidden_note: str = ""        # a sentence for the note line of a search that reaches the hidden part
-    # the instant the provider knows this content goes out of date (its next due, an expiry, a day rollover): an ISO string;
-    # give it an offset; a naive one is read as local time. Advisory (levain#157 D6, R13): meant for a derive host to
+    # the instant the provider knows this content goes out of date (its next due, an expiry, a day rollover): an ISO string or a
+    # datetime; give it an offset; a naive one is read as local time. Advisory (levain#157 D6, R13): meant for a derive host to
     # re-derive the panel at, and to be served as a head field; never part of the content, so a derive that moves only
     # this changes nothing a client holds. Last of the fields so no positional caller's arguments shift.
-    valid_until: str | None = None
+    valid_until: str | datetime | None = None
 
 
 @dataclass(frozen=True)

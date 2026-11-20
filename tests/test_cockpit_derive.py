@@ -856,10 +856,11 @@ def test_a_worker_thread_survives_a_system_exit_in_derive():
         loop.stop()
 
 
-def test_past_valid_until_is_published_as_no_expiry():
+def test_past_valid_until_is_published_as_declared_and_not_kept_for_scheduling():
     loop, writer, clock, _ = make([PanelPlan("a")], fn=lambda pid: ok(valid_until=clock.t - 5), backstop_s=1e9)
     settle(loop, clock)
-    assert writer.of("a")[0]["valid_until"] is None
+    assert writer.of("a")[0]["valid_until"] == clock.t - 5  # the store keeps it: a reader marks the row stale
+    assert loop._states["a"].valid_until is None
     loop.stop()
 
 
@@ -1058,7 +1059,7 @@ def test_valid_until_that_passed_during_the_derive_does_not_hot_loop():
 
     loop._derive_fn = slow
     settle(loop, clock)
-    assert writer.of("a")[0]["valid_until"] is None
+    assert writer.of("a")[0]["valid_until"] is not None  # published as declared
     assert loop.run_once(clock.t) == []
     loop.stop()
 

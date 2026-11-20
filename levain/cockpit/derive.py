@@ -49,6 +49,8 @@ DERIVE_TIMEOUT_S = 120.0
 _UNSET = object()
 # How often a panel that re-derives when the watch token moves is re-derived while the token is unknown (None).
 UNKNOWN_TOKEN_S = 5.0
+# A heavy derive yields to quick ones for a few seconds, never longer: after this wait it queues as light.
+HEAVY_YIELD_S = 5.0
 
 
 # --------------------------------------------------------------------------------------------------- inputs
@@ -365,11 +367,15 @@ def due_panels(
     return due
 
 
-def queue_order(pid: str, plan: PanelPlan | None, st: PanelState) -> tuple[int, int, float, str]:
+def queue_order(
+    pid: str, plan: PanelPlan | None, st: PanelState, waited: float | None = None
+) -> tuple[int, int, float, str]:
     """The one order panels are derived in: dirty first (a write's reader is waiting), then light before heavy so a slow
     derive does not hold a quick one behind it (a dirty heavy panel still beats a clean light one), then the oldest
-    derived_at (never derived first), then the id."""
-    return (0 if st.dirty_gen is not None else 1, 1 if plan is not None and plan.heavy else 0,
+    derived_at (never derived first), then the id. `waited` is how long the job has sat in the live queue (None for one
+    evaluation batch, which does not wait): a heavy job that has waited HEAVY_YIELD_S counts as light."""
+    heavy = plan is not None and plan.heavy and (waited is None or waited < HEAVY_YIELD_S)
+    return (0 if st.dirty_gen is not None else 1, 1 if heavy else 0,
             st.derived_at if st.derived_at is not None else -1.0, pid)
 
 
@@ -380,6 +386,7 @@ class _Job:
     fp: str
     token: Any
     st: PanelState  # the state the job was made for: a panel retired and added again is a different state
+    queued_at: float = 0.0  # the loop clock when the job went into the queue
 
 
 # --------------------------------------------------------------------------------------------------- the loop
@@ -799,6 +806,7 @@ class DeriveLoop:
                 for job in jobs:
                     if self._states.get(job.pid) is job.st and not job.st.busy:  # not retired since the poll
                         job.st.busy = True
+                        job.queued_at = self._clock()
                         self._queue[job.pid] = job
                 if jobs:
                     self._cv.notify_all()
@@ -811,12 +819,13 @@ class DeriveLoop:
                     self._cv.wait()
                 if self._stopping:
                     return
-                pid = min(self._queue, key=self._queue_key)
+                now = self._clock()
+                pid = min(self._queue, key=lambda p: self._queue_key(p, now))
                 job = self._queue.pop(pid)
             self._run_job(job, self._clock())
 
-    def _queue_key(self, pid: str) -> tuple[int, int, float, str]:
-        return queue_order(pid, self._plans.get(pid), self._states[pid])
+    def _queue_key(self, pid: str, now: float) -> tuple[int, int, float, str]:
+        return queue_order(pid, self._plans.get(pid), self._states[pid], now - self._queue[pid].queued_at)
 
     # ---- one derive
 
@@ -838,6 +847,7 @@ class DeriveLoop:
             st.running_since, st.run_fp, st.run_write_gen, st.timed_out = started, job.fp, write_gen, False
         body: bytes | None = None
         status, error, valid_until = "error", None, None
+        state_valid_until: float | None = None
         finished: float | None = None
         published = False
         notice: tuple[str, int, int] | None = None
@@ -859,9 +869,11 @@ class DeriveLoop:
                     fatal = exc
             finished = self._clock()
             duration_ms = max(0, int(round((finished - started) * 1000)))
-            # A valid_until at or before the finish would re-derive on every poll: treat it as no expiry, also in the store.
-            if valid_until is not None and valid_until <= finished:
-                valid_until = None
+            # A valid_until at or before the finish would re-derive on every poll, so the state does not keep it
+            # (state_valid_until is None); the store keeps the bound as declared, so a reader marks the row stale.
+            state_valid_until = valid_until
+            if state_valid_until is not None and state_valid_until <= finished:
+                state_valid_until = None
             with self._write_lock:
                 # the failure is recorded under the write lock too, as _publish_timeouts does: a retire that takes the
                 # lock next then clears it, so a retired panel's error never outlives it
@@ -901,7 +913,7 @@ class DeriveLoop:
                     st.derived_at = finished
                     st.inputs_fp = job.fp
                     st.token = job.token
-                    st.valid_until = valid_until
+                    st.valid_until = state_valid_until
                 st.busy = False
                 if st.detached:  # a retired panel's derive has ended: its id may be derived again
                     st.detached = False

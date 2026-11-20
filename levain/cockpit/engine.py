@@ -267,8 +267,6 @@ class ProviderSpec:
     region: str = "operate"           # "hero", "brief", "widgets", a zone id, or the legacy "header"
     rank: int = 0
     refresh_every_s: float | None = None
-    # this panel's derive backstop in seconds, in place of the host loop's default; None keeps the default
-    backstop_s: float | None = None
     stale_after_s: float = 900.0
     optional: bool = False
     # a source the substrate only creates on first use (the intention store): absent before it was ever seen is an EMPTY panel,
@@ -330,6 +328,9 @@ class ProviderSpec:
     # input types are derive.py's). Empty: the host keeps the panel on its clock. Carried by ``replaced`` and
     # ``with_verbs`` like every field.
     inputs: "tuple[File | Dir | Sqlite | GitRefs | Poll, ...]" = ()
+    # this panel's derive backstop in seconds, in place of the host loop's default; None keeps the default. Last, so no
+    # positional caller's arguments shift.
+    backstop_s: float | None = None
 
     def __post_init__(self) -> None:
         # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
@@ -3906,15 +3907,21 @@ def _parse_iso(s: str) -> datetime:
 
 
 def _valid_until_iso(raw: Any) -> str | None:
-    """``Read.valid_until`` as an ISO instant with its zone, or None: it is advisory, so a value that is not a readable
-    ISO string is no bound rather than a fault of the read."""
-    if not isinstance(raw, str) or not raw:
-        return None
+    """``Read.valid_until`` (an ISO string or a datetime) as an ISO instant with its zone, or None: it is advisory, so a
+    value that is not a readable instant, or one whose UTC or epoch form is out of range, is no bound rather than a
+    fault of the read."""
     try:
-        dt = datetime.fromisoformat(raw)
+        dt = datetime.fromisoformat(raw) if isinstance(raw, str) and raw else raw
+        if not isinstance(dt, datetime):
+            return None
         # a naive time is read as local time, Python's own rule for a naive datetime, not as UTC the way ``_parse_iso`` does
-        return (dt.astimezone() if dt.tzinfo is None else dt).isoformat()
-    except (ValueError, OverflowError, OSError):    # astimezone() on an out-of-range naive time
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        if dt.astimezone(timezone.utc).year > 9998:     # the reader's ISO conversion must never meet an out-of-range instant
+            return None
+        dt.timestamp()
+        return dt.isoformat()
+    except (ValueError, OverflowError, OSError):    # an out-of-range time in astimezone() or timestamp()
         return None
 
 
