@@ -1751,7 +1751,19 @@
       s.body.replaceChildren(el("p", "err", "unavailable — the board could not be drawn"));
     }
   }
+  // A read that failed on a panel that already shows rows keeps them (s.stale says why); only a panel that never had rows is drawn as
+  // unavailable (s.fault). A quiet line under the rows says the refresh failed; a tile (widget) has no room for a line, so it shows none (levain#173).
+  const STALE_SAY = "could not refresh just now: showing the last read";
   function paintBody(s) {
+    paintRows(s);
+    const old = s.body && s.body.querySelector ? s.body.querySelector(".stale-note") : null;
+    if (old) old.remove();
+    if (!s.stale || s.fault || s.ctx.widget) return;
+    const note = el("p", "xnote stale-note", STALE_SAY);
+    note.title = String(s.stale);
+    s.body.appendChild(note);
+  }
+  function paintRows(s) {
     const d = s.data, sr = d.search || {};
     if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
     dropSky(s);
@@ -1942,6 +1954,12 @@
       heads[pid] = Object.assign({}, heads[pid], nx);
     }
   }
+  // a failed read of a panel that is drawn with rows keeps the rows (stale); one drawn as unavailable stays unavailable (fault)
+  // (the stale repaint keeps what the reader expanded and the scroll, as a good read's repaint does)
+  function failRead(s, why) {
+    why = String(why);
+    if (s.fault) { s.fault = why; paint(s); } else { s.stale = why; repaintKeeping(s); }
+  }
   function noteFault(pid, why) {
     const heldMap = root.LevainCockpitHeld;
     if (heldMap && heldMap[pid]) heldMap[pid] = Object.assign({}, heldMap[pid], { err: String(why || "read failed") });
@@ -1989,7 +2007,7 @@
     if (boardEpoch !== epoch) return false;
     const live = liveOf(pid);
     if (!live.length) return false;
-    if (fault) { for (const s of live) { s.fault = fault; paint(s); } noteFault(pid, fault); return "fault"; }
+    if (fault) { for (const s of live) failRead(s, fault); noteFault(pid, fault); return "fault"; }
     const core = root.LevainDashboard;
     if (!lastManifest || !core) return false;
     let view, entry, data;
@@ -1999,7 +2017,7 @@
       data = view.extra_panels[pid];
     } catch (e) {
       const why = "could not be mapped (" + (e && e.message ? e.message : e) + ")";
-      for (const s of live) { s.fault = why; paint(s); }
+      for (const s of live) failRead(s, why);
       noteFault(pid, why);
       return "fault";
     }
@@ -2009,6 +2027,7 @@
     for (const s of live) {
       s.data = data;
       s.fault = "";
+      s.stale = "";
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
@@ -2517,7 +2536,7 @@
     const I = topoInfo();
     const TV = I.TV, ts = I.ts, tfault = I.tfault || "", tv = I.tv;
     // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
-    const sig = JSON.stringify([s.fault || "", lines.map((l) => [l.sess, l.repo]), s.data.empty || "", I.lens, I.lens === "events" ? tfault : "",
+    const sig = JSON.stringify([s.fault || "", s.stale ? 1 : 0, lines.map((l) => [l.sess, l.repo]), s.data.empty || "", I.lens, I.lens === "events" ? tfault : "",
                                 tv ? TV.signature(tv, "agents") : (TV && ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
     if (sig === k7Sig && !sec.hidden) {
       for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
@@ -2559,6 +2578,8 @@
       if (q) card.appendChild(q);
       card.classList.add("k7-lone");
     } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
+    // a failed refresh that kept the rows says so under them (levain#173)
+    if (s.stale && !s.fault) card.appendChild(el("p", "k7-none err", "Sessions could not refresh just now: showing the last read"));
     // Lost if closed (F12c): its own panel, right of the card from 1440 px, below it under that; drawn whenever the topology feed is
     let lost = null;
     try { if (TV && TV.renderLost) lost = tfault ? TV.renderLostFault(tfault) : tv ? TV.renderLost(tv) : null; } catch (e) { lost = null; }

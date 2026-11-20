@@ -297,7 +297,7 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     h.win.LevainCockpitTransport.reload = () => { reloads++; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
     await settle();
     const fire = async () => {
-      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000);
+      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000 && x.ms !== 120000);
       if (!t) return false;
       t.off = true; t.fn(); await settle(); return true;
     };
@@ -321,7 +321,7 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     h.win.LevainCockpitTransport.reload = () => { reloads++; delete h.win.LevainCockpitHeld.a.err; (h.listeners["levain:cockpit-held"] || []).forEach((f) => f()); return Promise.resolve(true); };
     await settle();
     const fire = async () => {
-      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000);
+      const t = h.live().find((x) => !x.every && x.ms !== 8000 && x.ms !== 32000 && x.ms !== 120000);
       if (!t) return false;
       t.off = true; t.fn(); await settle(); return true;
     };
@@ -374,7 +374,7 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
     for (let i = 0; i < 40 && poll; i++) {
       poll.fn(); await settle();
-      for (const t of h.live().filter((x) => !x.every && ![1000, 8000, 32000].includes(x.ms))) { t.off = true; t.fn(); await settle(); }
+      for (const t of h.live().filter((x) => !x.every && ![1000, 8000, 32000, 120000].includes(x.ms))) { t.off = true; t.fn(); await settle(); }
     }
     ok(n >= 30, "the manifest changed on every poll: " + n);
     ok(reloads <= 3, "reconciliation reloads the board at most the retry steps, not once per change: " + reloads);
@@ -439,6 +439,47 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     h.fetches[0].push(frame("hello", "E.1:2", { epoch: "E.1", resync: true }));
     await settle();
     ok(calls.length === before + 1 && h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "a fresh fault is read again and has retry steps left: " + (calls.length - before));
+  }
+  // ---- levain#173: a panel whose read failed holds the head's etag, so the etag compare alone would never read it again ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    ok(!h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "the bounded steps are spent");
+    // past the bounded steps a SLOW timer still reads the panel, spending nothing, and keeps going while it fails
+    const slow = h.live().filter((t) => !t.every && t.ms === 120000);
+    ok(slow.length === 1, "one slow timer is pending once the steps are spent: " + JSON.stringify(h.live().map((t) => t.ms)));
+    for (let k = 0; k < 2; k++) {
+      const before = calls.length, t = h.live().find((x) => x.ms === 120000);
+      t.off = true; t.fn(); await settle();
+      ok(calls.length === before + 1 && calls[calls.length - 1] === "a", "the slow timer reads the panel once (round " + k + "): " + (calls.length - before));
+      ok(h.live().filter((x) => x.ms === 120000).length === 1, "and a failed slow read schedules the next one, only one");
+    }
+    ok(!calls.includes("b"), "a panel that never failed is not read: " + calls);
+    // a good slow read ends the chain
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "applied"; };
+    const t2 = h.live().find((x) => x.ms === 120000); t2.off = true; t2.fn(); await settle();
+    ok(!h.live().some((x) => x.ms === 120000), "a good slow read leaves no timer");
+  }
+  // ---- levain#173: the visible edge gives a faulted panel a fresh budget ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    h.win.LevainCockpitHeld.a.etag = "1"; h.win.LevainCockpitHeld.a.err = "Load failed";
+    const before = calls.length;
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    ok(calls.slice(before).includes("a"), "the visible edge reads a panel whose last read failed, though its steps were spent: " + calls.slice(before));
+    ok(h.live().some((t) => t.ms === 5000), "and its retry steps start over");
   }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });

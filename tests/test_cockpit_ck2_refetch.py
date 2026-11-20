@@ -28,6 +28,7 @@ class N {
   replaceChildren(...ks) { this.kids.forEach((k) => { k.parent = null; }); this.kids = []; this.append(...ks); }
   setAttribute(k, v) { this.attrs[k] = v; }
   addEventListener() {}
+  remove() { if (this.parent) { this.parent.kids = this.parent.kids.filter((k) => k !== this); this.parent = null; } }
   querySelector(sel) { const c = sel.replace(".", ""); const walk = (n) => { for (const k of n.kids) { if (k.tag === c || k.className.split(" ").includes(c)) return k; const r = walk(k); if (r) return r; } return null; }; return walk(this); }
   closest(sel) { const cs = sel.split(",").map((s) => s.trim().replace(".", "")); let n = this; while (n) { if (cs.some((c) => n.className.split(" ").includes(c))) return n; n = n.parent; } return null; }
 }
@@ -89,6 +90,29 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
   r = await K.refetchPanel("p");
   ok(r === false, "a changed title declines");
   ok(renders === 0 && replaced === 0, "a declined refetch builds nothing");
+  // levain#173: a read that fails (WebKit's bare TypeError "Load failed" is the real one) keeps the rows the panel shows and says so quietly;
+  // a panel that was drawn as unavailable stays unavailable; the next good read clears the line
+  {
+    const shown = painted[painted.length - 1], before = painted.length;
+    globalThis.LevainCockpitTransport = { readJson: async () => { throw new TypeError("Load failed"); } };
+    const rf = await K.refetchPanel("p");
+    ok(rf === "fault", "a failed read answers fault: " + rf);
+    ok(painted.length > before && painted[painted.length - 1] === shown, "the rows are painted again, none lost: " + painted.slice(before - 1));
+    ok(!s.fault && s.stale === "Load failed", "the panel keeps its rows and records why it is stale: " + JSON.stringify([s.fault, s.stale]));
+    const note = s.body.querySelector(".stale-note");
+    ok(!!note && /showing the last read/.test(note.textContent), "one quiet line says the refresh failed: " + (note && note.textContent));
+    const rf2 = await K.refetchPanel("p");
+    ok(rf2 === "fault" && s.body.kids.filter((k) => k.className.split(" ").includes("stale-note")).length === 1, "a second failure keeps ONE line");
+    globalThis.LevainCockpitTransport = { readJson: async () => globalThis.__next };
+    globalThis.__next = payload(7);
+    ok(await K.refetchPanel("p") === "applied" && !s.stale && !s.body.querySelector(".stale-note"), "a good read clears the line and the reason");
+    s.fault = "never read";
+    globalThis.LevainCockpitTransport = { readJson: async () => { throw new TypeError("Load failed"); } };
+    await K.refetchPanel("p");
+    ok(s.fault === "Load failed" && !s.stale && !s.body.querySelector(".stale-note"), "a panel drawn as unavailable stays unavailable: " + JSON.stringify([s.fault, s.stale]));
+    s.fault = "";
+    globalThis.LevainCockpitTransport = { readJson: async () => globalThis.__next };
+  }
   // a modal copy ends with its modal body: pruneModal tears down only the detached modal state
   const mp = new N("div"); mp.live = true; mp.className = "modal-body";
   const ms = K.fill(mp, view.extra_panels.p, { rows: () => {}, entry, modal: true });
