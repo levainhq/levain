@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -720,3 +721,83 @@ def test_a_store_that_cannot_be_read_at_attach_leaves_an_earlier_lifes_stamps_no
         assert out["stale"] is False and out["pending"] is False
     finally:
         r.close()
+
+
+# --- concurrent writes and what each one was told ---------------------------------------------------------------------------
+def test_a_later_success_of_an_older_write_does_not_clear_what_a_newer_write_failed_to_tell(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def dirty(ids: Any, write_gen: int) -> None:
+        if write_gen == 1:
+            first_in.set()
+            assert release.wait(10)                      # the older write's call is still on its way to the host
+            return
+        raise RuntimeError("the host is gone")           # the newer write's call fails first
+
+    rig.ck._host_dirty = dirty
+    older = threading.Thread(target=lambda: rig.ck.invalidate_reads(["alpha"]))
+    older.start()
+    assert first_in.wait(10)
+    rig.ck.invalidate_reads(["alpha"])
+    release.set()
+    older.join(10)
+    t0 = time.monotonic()
+    head = rig.ck.manifest(CRED)["panels"]["alpha"]
+    assert time.monotonic() - t0 < 5.0
+    assert head["stale"] is True and head["pending"] is False   # the host was never told of the newer write
+    assert rig.ck.write_wait_counts()["waits"] == 0
+
+
+def test_a_later_failure_of_an_older_write_does_not_mark_a_newer_write_the_host_took_as_unsent(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    first_in = threading.Event()
+    release = threading.Event()
+
+    def dirty(ids: Any, write_gen: int) -> None:
+        if write_gen == 1:
+            first_in.set()
+            assert release.wait(10)
+            raise RuntimeError("the host is gone")       # the older write's call fails after the newer one went through
+        return                                           # the host takes the newer write and (deaf) never answers it
+
+    rig.ck._host_dirty = dirty
+    older = threading.Thread(target=lambda: rig.ck.invalidate_reads(["alpha"]))
+    older.start()
+    assert first_in.wait(10)
+    rig.ck.invalidate_reads(["alpha"])
+    release.set()
+    older.join(10)
+    head = rig.ck.manifest(CRED)["panels"]["alpha"]
+    assert head["stale"] is True and head["pending"] is True     # a derive is owed for it: the host was told
+    assert rig.ck.write_wait_counts() == {"waits": 1, "timeouts": 1}
+
+
+def test_the_instant_of_a_write_is_taken_in_the_order_its_generation_is(rig: WriteRig) -> None:
+    rig.forward = False
+    base = rig.ck._clock
+    mu = threading.Lock()
+    taken: list[Any] = []
+    first_in = threading.Event()
+
+    def clock() -> Any:
+        with mu:
+            k = len(taken) + 1
+            value = base() + timedelta(seconds=k)
+            taken.append(value)
+        if k == 1:
+            first_in.set()
+            time.sleep(0.3)                                # the first writer is slow between reading the clock and going on
+        return value
+
+    rig.ck._clock = clock
+    older = threading.Thread(target=lambda: rig.ck.invalidate_reads(["alpha"]))
+    older.start()
+    assert first_in.wait(10)
+    rig.ck.invalidate_reads(["alpha"])
+    older.join(10)
+    gen, at = rig.ck._write_required["alpha"]
+    assert gen == 2 and at == max(v.timestamp() for v in taken)

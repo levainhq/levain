@@ -933,13 +933,13 @@ class Cockpit:
         self._host_dirty: Callable[[Iterable[str], int], None] | None = None
         self._host_state: Callable[[], Mapping[str, Any]] | None = None
         # D7 (attached mode only), all under ``_rc_lock``: the serve's write generation, which only grows; per panel, the
-        # generation its row must be stamped with at least and the instant of the write that asked for it; the panels whose
-        # last ``dirty`` call raised; how many raised and the last one; per panel, the generation a read has waited out the
+        # generation its row must be stamped with at least and the instant of the write that asked for it; per panel, the
+        # latest generation whose ``dirty`` call raised (``_unsent_for``); how many raised and the last one; per panel, the generation a read has waited out the
         # bound for (it is not waited for again); how many reads blocked for a row and how many of those gave up
         self._write_gen = 0
         self._write_stamps_unknown = False      # attached over a store whose stamps could not be read: no stamp answers a write
         self._write_required: dict[str, tuple[int, float]] = {}
-        self._write_unsent: set[str] = set()
+        self._write_unsent: dict[str, int] = {}
         self.host_dirty_errors = 0
         self.last_host_dirty_error: BaseException | None = None
         self._write_lapsed: dict[str, int] = {}
@@ -1241,7 +1241,7 @@ class Cockpit:
         self._state = states
         with self._rc_lock:      # a panel that is registered again starts with no write asked of it
             self._write_required.pop(sid, None)
-            self._write_unsent.discard(sid)
+            self._write_unsent.pop(sid, None)
             self._write_lapsed.pop(sid, None)
 
     def _is_composed(self, panel_id: str, specs_map: dict[str, ProviderSpec] | None = None) -> bool:
@@ -2962,10 +2962,10 @@ class Cockpit:
         specs = self._specs
         ids = [pid for pid in panel_ids if pid in specs and not self.serve_composed(pid)]
         dirty = self._host_dirty
-        at = _epoch(self._clock())
         with self._rc_lock:
             self._write_gen += 1
             write_gen = self._write_gen
+            at = _epoch(self._clock())       # with the generation, so a later generation never carries an earlier instant
             if dirty is not None:      # with no host to tell, no row will ever answer the write, so none is asked for
                 for pid in ids:
                     self._write_required[pid] = (write_gen, at)
@@ -2975,12 +2975,15 @@ class Cockpit:
             dirty(tuple(ids), write_gen)
         except Exception as exc:  # noqa: BLE001 - a host that cannot be told is no fault of the write that is being answered
             with self._rc_lock:
-                self._write_unsent.update(ids)
+                for pid in ids:
+                    self._write_unsent[pid] = max(self._write_unsent.get(pid, 0), write_gen)
                 self.host_dirty_errors += 1
                 self.last_host_dirty_error = exc
         else:
             with self._rc_lock:
-                self._write_unsent.difference_update(ids)
+                for pid in ids:
+                    if self._write_unsent.get(pid, 0) <= write_gen:
+                        self._write_unsent.pop(pid, None)
 
     def note_publish(self, panel_id: str, gen: int, write_gen: int) -> None:
         """The host's word that it published a row (the shape of a derive loop's ``on_publish``): wakes every read blocked
@@ -3004,6 +3007,12 @@ class Cockpit:
             return False
         return row.started_at > req[1] or (row.write_gen >= req[0] and not self._write_stamps_unknown)
 
+    def _unsent_for(self, panel_id: str, req: "tuple[int, float]") -> bool:
+        """Whether the host was never told of the write ``req`` stands for: the last call that failed for this panel carried
+        that write's generation or a later one, and no call that carried a generation at least as late has gone through
+        since. Called under ``_rc_lock``."""
+        return self._write_unsent.get(panel_id, 0) >= req[0]
+
     def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
         """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and
         whether the host was never told of it. The answer depends on the row handed in and the panel's requirement alone:
@@ -3012,7 +3021,7 @@ class Cockpit:
             req = self._write_required.get(panel_id)
             if req is None or self._answers_write(row, req):
                 return False, False
-            return True, panel_id in self._write_unsent
+            return True, self._unsent_for(panel_id, req)
 
     def _await_writes(self, panel_ids: list[str]) -> None:
         """Block, bounded by ``WRITE_WAIT_S`` from here (ONE bound for every panel named), until each of these panels has a
@@ -3022,7 +3031,7 @@ class Cockpit:
         the panel's row as it is: the head says so (``_write_owed``)."""
         with self._rc_lock:
             owed = {pid: req for pid in panel_ids
-                    if (req := self._write_required.get(pid)) is not None and pid not in self._write_unsent
+                    if (req := self._write_required.get(pid)) is not None and not self._unsent_for(pid, req)
                     and self._write_lapsed.get(pid, 0) < req[0]}
         if not owed:
             return
