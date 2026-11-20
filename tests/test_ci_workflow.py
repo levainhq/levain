@@ -11,7 +11,8 @@ JOBS = WF["jobs"]
 GATE_CLAUSE = "!(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true')"
 # stage0 (the invariant tests) skips only where the gate skips everything.
 STAGE0_IF = "${{ always() && !cancelled() && " + GATE_CLAUSE + " }}"
-# The heavy jobs wait on the gate alone: stage0 runs beside them (landing throughput, 11-17), not in front of them.
+# The heavy jobs wait on the gate and on `hold` (the seat-dispatch admission job, 11-19; skipped on every other run):
+# stage0 runs beside them (landing throughput, 11-17), not in front of them.
 HEAVY_IF = "${{ always() && !cancelled() && " + GATE_CLAUSE + " }}"
 
 
@@ -44,8 +45,8 @@ def _needs(name, jobs=None):
 
 
 def _heavy():
-    """The jobs fed by the gate alone, bar the verified marker and stage0 itself: the suite's heavy jobs."""
-    return [n for n, j in JOBS.items() if n not in ("verified", "stage0") and set(_needs(n)) == {"gate"}]
+    """The jobs fed by the gate and the hold, bar the verified marker and stage0 itself: the suite's heavy jobs."""
+    return [n for n, j in JOBS.items() if n not in ("verified", "stage0") and set(_needs(n)) == {"gate", "hold"}]
 
 
 # (gate result, skip output, heavy job runs?). The skip output is "" when the gate did not run or failed before writing.
@@ -70,7 +71,7 @@ def test_there_are_heavy_jobs():
 
 def test_stage0_runs_the_invariant_tests_alone_behind_the_gate():
     job = JOBS["stage0"]
-    assert _needs("stage0") == ["gate"]
+    assert _needs("stage0") == ["gate", "hold"]
     assert job["if"] == STAGE0_IF
     runs = " ".join(s.get("run", "") for s in job["steps"])
     assert "-m invariant" in runs
@@ -182,7 +183,8 @@ def test_the_verified_job_needs_a_successful_gate_that_said_skip():
 
 
 # Jobs that run no suite. `gate` is the skip-lookup job (it only decides); `verified` exists only when the gate said skip.
-NO_TESTS = {"gate": "the skip lookup: decides, runs no tests", "verified": "runs only when the gate skipped the suite"}
+NO_TESTS = {"gate": "the skip lookup: decides, runs no tests", "verified": "runs only when the gate skipped the suite",
+            "hold": "the seat-dispatch admission wait: runs no tests, only on a seat dispatch"}
 
 STATUS_FN = re.compile(r"\b(always|cancelled|success|failure)\(\)")
 
@@ -201,14 +203,16 @@ def evaluate_job_if(cond, results, outputs, event, ref, cancelled=False):
     py = expr.replace("!cancelled()", "(not CANCELLED)").replace("always()", "True")
     py = re.sub(r"needs\.([\w-]+)\.result", lambda g: "R[%r]" % g.group(1), py)
     py = re.sub(r"needs\.([\w-]+)\.outputs\.skip", lambda g: "O[%r]" % g.group(1), py)
+    py = re.sub(r"startsWith\(github\.ref, ('[^']*')\)", r"SW(\1)", py)
     py = py.replace("github.event_name", "EV").replace("github.ref", "REF")
     py = py.replace("&&", " and ").replace("||", " or ")
     py = re.sub(r"!(?!=)", " not ", py)
-    leftover = re.sub(r"\b(True|and|or|not|EV|REF|CANCELLED)\b|[RO]\['[\w-]+'\]|'[^']*'|==|!=|[()\s]", "", py)
+    leftover = re.sub(r"\b(True|and|or|not|EV|REF|SW|CANCELLED)\b|[RO]\['[\w-]+'\]|'[^']*'|==|!=|[()\s]", "", py)
     assert leftover == "", (cond, leftover)
     if py.strip():
         value = bool(eval(py, {"__builtins__": {}}, {"R": results, "O": outputs, "EV": event, "REF": ref,
-                                                     "CANCELLED": cancelled}))
+                                                     "CANCELLED": cancelled,
+                                                     "SW": lambda prefix: ref.casefold().startswith(prefix.casefold())}))
     else:
         value = True
     return value
@@ -370,7 +374,7 @@ def test_no_run_line_expands_a_branch_name_or_an_api_string():
 
 def test_the_pytest_matrix_no_longer_waits_on_the_plan_job():
     # it waits on the gate and on nothing else: the shard list is static, so no planning job sits in front
-    assert sorted(_needs("test")) == ["gate"]
+    assert sorted(_needs("test")) == ["gate", "hold"]
     assert JOBS["plan"]["name"] == "plan test shards"
     assert not any("plan" in _needs(n) for n in JOBS)
 
