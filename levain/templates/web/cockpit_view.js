@@ -1649,7 +1649,10 @@
   // chrome rebuilt, which only the one mount path (render) does.
   function shapeOf(entry, data) {
     const sr = data.search || {};
-    return JSON.stringify([entry.title, entry.edit_class || "", entry.source || "", entry.modes || "", entry.banner || null,
+    // digits are data: an age ("last read 5m") and a count in a title or a banner repaint in place (readInPlace), so they do not make a shape
+    const digitless = (t) => String(t).replace(/\d+/g, "#");
+    const banner = entry.banner && entry.banner.length ? entry.banner.map((b) => [b.tone || "", !!b.alert, digitless(b.text)]) : null;
+    return JSON.stringify([digitless(entry.title), entry.edit_class || "", entry.source || "", entry.modes || "", banner,
       data.kind, !!data.typed, data.error || "", data.markdown != null, data.note || "", data.footer || "",
       sr.on === true, sr.scope || "", sr.fields || [],
       data.action ? [data.action.verb, data.action.fields] : null, data.form ? data.form.verb : null,
@@ -2025,6 +2028,17 @@
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
+      // the title and the banner lines move with the digits the shape lets through (a count, an age): repainted where they stand
+      const h2 = s.p && s.p.querySelector ? s.p.querySelector(".phead h2") : null;
+      if (h2 && h2.textContent !== String(entry.title)) h2.textContent = entry.title;
+      s.title = entry.title;
+      // a banner line is drawn into the panel or into its body node; either way it carries its index in data-bn
+      if (s.p && s.p.querySelectorAll) {
+        for (const n of Array.from(s.p.querySelectorAll("[data-bn]"))) {
+          const b = (entry.banner || [])[Number(n.dataset.bn)];
+          if (b && n.textContent !== String(b.text)) { if (core.setRichText) core.setRichText(n, b.text); else n.textContent = b.text; }
+        }
+      }
       repaintKeeping(s);   // a body repainted in place keeps the rows the reader expanded and its scroll position
       const sr = data.search || {};
       if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
