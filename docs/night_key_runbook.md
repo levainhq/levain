@@ -1,4 +1,4 @@
-# ND-8 runbook: install the TAOSERV night key (a step for Phill's hands; nothing here has been run)
+# ND-8 runbook: install the TAOSERV night key (a step for Phill's hands; steps 0 to 3 and probes 1 to 17 have run, see the status below)
 
 Board row levain#17. Code: `levain/desk/night_key.py` (stdlib only, one file). Tests: `tests/test_night_key.py`.
 Design: `project_memory/1112-15_night_desk/night_desk_design.md` 2.7 and 8.1. The row's gate says "his go; after the Sat 11-14
@@ -7,13 +7,13 @@ upgrade; a `sudo -l` read first": steps 0 and 1 are that read.
 **RUN ON TAOSERV 11-15 (levain 6, the desk's go, signed np-dedaa950 (a)):** steps 0 to 3 and probes 1 to 16 were executed
 from the laptop with `soupcan@transalliesohio.org` as the admin path (proved before and after); `systemctl start
 logrotate.service` was not run (it would rotate and reload every due stanza), and step 5 was not. Probe 17 ran 11-20 at 16:17
-(desk 49, on his word, fan-in log note ND-8 PROBE 17): every pass clause of its row was met (exit 0, the site back at 200
-within 3 s, `accepted` then `ok` with the same sha256, the rate file holding one apache2 entry, the journal showing the stop and
-start). Two measured
+(desk 49, on his word, fan-in log note ND-8 PROBE 17): its row was met (exit 0, the site back, `accepted` then `ok` with the
+same sha256, the journal showing the restart) and so was the rate-file check after the table; the site was back at 200 within 3 s
+(an observation, not a clause of the row). Two measured
 corrections are in the text: the logrotate stanza needs `su root root` (`/var/log` is group-writable, so logrotate
 refused it without), and probe 9 exited 255 after `PTY allocation request failed` rather than 2 (no PTY was granted).
 The seat's machine address in the probes is the IP with `-o HostKeyAlias=transalliesohio.org`: the name is behind
-Cloudflare, which does not carry SSH. The rest of this file is still the original text.
+Cloudflare, which does not carry SSH. The rest of this file is the original text, apart from the note in section 4.
 
 **UNVERIFIED ON TAOSERV (the part not run).** Nothing below was executed by a build lane. Every path, the account name, the file modes, the
 sudoers shape, the ACLs, the logrotate stanza and the sshd keywords are written from Ubuntu defaults and the OpenSSH manual,
@@ -238,11 +238,16 @@ Define once in that shell:
 ```
 nk() { SSH_AUTH_SOCK= ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.levain/night/known_hosts -i ~/.levain/night/taoserv_night "$@"; }
 ```
-The name `TAOSERV` in the probe commands below does not resolve under `-F /dev/null` (the name is behind Cloudflare, which does not
-carry SSH). The form that ran on 11-20 was `nk -o HostKeyAlias=transalliesohio.org nightkey@172.233.220.105 <words>`: the address
-in place of `nightkey@TAOSERV`, plus the alias, which mirrors the pin in the laptop's `~/.ssh/config`. Read every `nightkey@TAOSERV` below that way.
-`BatchMode` will not prompt for an unknown host key, so first put TAOSERV's host key in `~/.levain/night/known_hosts`
-(`ssh-keyscan -t ed25519 TAOSERV > ~/.levain/night/known_hosts`, then compare `ssh-keygen -lf ~/.levain/night/known_hosts`
+Use the address and the alias, never the bare name `TAOSERV`, for every ssh, sftp, scp and ssh-keyscan call here: the name does not
+resolve under `-F /dev/null` (it is behind Cloudflare, which does not carry SSH). The form that ran on 11-20 was
+`nk -o HostKeyAlias=transalliesohio.org nightkey@172.233.220.105 <words>`: the address in place of `nightkey@TAOSERV`, plus the
+alias, the pin the laptop's `~/.ssh/config` carries for `transalliesohio.org` (the address is that file's, not this runbook's).
+Probes 12 and 13 take the same `-o HostKeyAlias=transalliesohio.org`, and an expected output that names `nightkey@TAOSERV` prints the
+address instead. The seat's own generated config (levain#47) was found on 11-20 to carry no alias: levain#206.
+`BatchMode` will not prompt for an unknown host key, so first put TAOSERV's host key in `~/.levain/night/known_hosts`, filed
+under the alias name `transalliesohio.org` (the installed file's one entry is; `ssh-keyscan` takes no `-o`, so scan the address and
+rewrite its first field: `ssh-keyscan -t ed25519 172.233.220.105 | sed 's/^[^ ]*/transalliesohio.org/' > ~/.levain/night/known_hosts`,
+a form this seat did not run; then compare `ssh-keygen -lf ~/.levain/night/known_hosts`
 with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on TAOSERV: the fingerprints must be identical).
 After each probe, on TAOSERV: `sudo tail -n 2 /var/log/levain-night-key.log`. Every log line is
 `<UTC time> verb=<verb or -> outcome=<outcome> sha256=<hash of the exact request> src=<the seat's address>`, and never
