@@ -2053,7 +2053,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self._consent_sheet = sheet
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
-    # the ChatService the work thread's Stop acts through; None serves none of it
+    # the ChatService the Room's reads and voice speak through (serve_room, voice.speak); None serves none of it
     chat_service: "ChatService | None" = None
     # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
     room_host: "cockpit_room.RoomHost | None" = None
