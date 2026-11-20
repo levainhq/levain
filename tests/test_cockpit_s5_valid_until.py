@@ -1,6 +1,6 @@
-"""S5 of the read layer: a provider's own ``valid_until``, a per-panel backstop, and and one order for the queue. A real
-``SnapshotHost`` is driven with ``run_once``; the loop's finish time is the wall clock, so each test starts at the
-real ``time.time()`` and moves only the instant it hands ``run_once``."""
+"""S5 of the read layer: a provider's own ``valid_until``, a per-panel backstop, and one order for the queue. A real
+``SnapshotHost`` is driven with ``run_once``. A test that times a re-derive hands the host its own clock, so the loop's
+finish time is the test's instant and a slow runner cannot move it; the others start at the real ``time.time()``."""
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ def test_a_derive_that_moves_only_valid_until_keeps_the_generation(host_for) -> 
     clock = _T0()
     ck = Cockpit()
     ck.register(_provider("a", [100, 200], clock, backstop_s=5))
-    host = host_for(ck)
+    host = host_for(ck, clock=lambda: clock.value)  # the derive finishes at the test's t0, never later
     t0 = clock.start()  # after the setup: a slow one cannot push the derive's finish past the instants below
     host.run_once(t0)
     first = host.reader.read("a")
@@ -130,7 +130,7 @@ def test_the_panel_is_due_at_its_valid_until_and_not_before(host_for) -> None:
     clock = _T0()
     ck = Cockpit()
     ck.register(_provider("a", [100], clock, backstop_s=100000, stale_after_s=100000))
-    host = host_for(ck)
+    host = host_for(ck, clock=lambda: clock.value)
     t0 = clock.start()
     host.run_once(t0)
     assert "a" not in host.run_once(t0 + 99)
@@ -141,10 +141,11 @@ def test_a_per_panel_backstop_reaches_the_plan_and_re_derives_with_no_input_move
     ck = Cockpit()
     ck.register(_simple("a", rows=[_row(1)], backstop_s=5))
     ck.register(_simple("b", rows=[_row(1)]))
-    host = host_for(ck)
+    clock = _T0()
+    host = host_for(ck, clock=lambda: clock.value)
     plans = {p.id: p for p in host._plans()}
     assert plans["a"].backstop_s == 5 and plans["b"].backstop_s is None
-    t0 = time.time()  # after the host is built
+    t0 = clock.start()
     host.run_once(t0)
     assert "a" not in host.run_once(t0 + 4)
     assert "a" in host.run_once(t0 + 6)
@@ -184,9 +185,9 @@ def test_an_expiry_that_passes_during_its_own_derive_is_stored_and_not_re_derive
     ck = Cockpit()
     ck.register(_provider("a", [1], clock, backstop_s=100000, stale_after_s=100000))
     host = host_for(ck, clock=lambda: clock.value + 2)  # the derive finishes at t0 + 2
-    host.attach()
     t0 = clock.start() - 10  # the real now is past t0 + 1, so the reader sees the stored bound as passed
     clock.value = t0
+    host.attach()
     host.run_once(t0)
     assert host.reader.read("a").valid_until == pytest.approx(t0 + 1, abs=0.01)
     assert _head(ck, "a")["stale"] is True
