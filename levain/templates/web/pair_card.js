@@ -266,12 +266,15 @@
   }
   const SUBSCRIBE_LOST = "Pings may have been turned on, but no answer came back. Check the Devices panel before trying again.";
   function turnOnFailed(e) { return "Could not turn pings on. Nothing was changed; try again, or reload the page. (" + ((e && e.message) || e) + ")"; }
-  // Only the iOS Home Screen app keeps its storage apart from the browser's, so only it signs in once of its own: the pair card says so.
-  // A code comes from the Devices panel of a device that is already paired.
+  // The pair card draws only when this surface holds no key. An iOS Home Screen app is known to keep its storage apart from Safari's, so
+  // it says so; any other installed app (a desktop one, levain#171) says only what is true on every engine: it holds no key yet, and where
+  // the code comes from (Chrome shares a profile's storage with its tabs, so it never claims a separate sign-in). A tab draws no note.
+  const CODE_FROM = "get one from the Devices panel on any device that is already paired.";
   function installedNote() {
     let ios = false;
     try { ios = navigator.standalone === true; } catch (_) { /* no such property */ }
-    return ios ? "This Home Screen app keeps its own sign-in, so it needs one pairing code: get one from the Devices panel on any device that is already paired." : "";
+    if (ios) return "This Home Screen app keeps its own sign-in, so it needs one pairing code: " + CODE_FROM;
+    return installedApp() ? "This installed app has no sign-in yet, so it needs one pairing code: " + CODE_FROM : "";
   }
 
   window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote,

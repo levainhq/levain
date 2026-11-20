@@ -4,7 +4,6 @@ CSS text for the layout claims, and glance.py for the doctor tile."""
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 
@@ -29,18 +28,6 @@ out.lev = lev.textContent; out.flow = flow.textContent;
 """ % (json.dumps(str(WEB / "sky.js")), json.dumps(LEV), json.dumps(FLOW)), tmp_path)
     assert "waiting on you" in out["lev"] and "Hover a mark for its time, kind and repo." in out["lev"]
     assert "waiting on you" not in out["flow"] and "review that failed" in out["flow"] and "decision made" in out["flow"]
-
-
-def test_i2_the_build_tab_mounts_the_sky_as_the_compact_strip_the_others_full(tmp_path: Path) -> None:
-    out = run_node(r"""
-const sizes = {};
-for (const m of ["morning", "board", "build", "memory"]) { globalThis.document.body.dataset.mode = m; sizes[m] = K.skySize(); }
-out.sizes = sizes;
-""", tmp_path)
-    assert out["sizes"] == {"morning": "compact", "board": "compact", "build": "strip", "memory": "compact"}
-    css = (WEB / "dashboard.css").read_text(encoding="utf-8")
-    assert 'body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }' in css      # no floor under the strip's plot: the mock's band is ~85 px
-    assert re.search(r"size: skySize\(\)", (WEB / "cockpit_view.js").read_text(encoding="utf-8"))
 
 
 def test_i3_the_events_line_never_says_zero_repos(tmp_path: Path) -> None:

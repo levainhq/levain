@@ -11,7 +11,6 @@ import pytest
 from levain import web_server
 from levain.cockpit import room as cockpit_room
 from tests.test_cockpit_room import TOKEN, _call, _serve_room
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401
 from tests.test_cockpit_room_wait import FAR, GET, _in_thread, _send, quick, w  # noqa: F401
 
 HUGE = "9" * 5000           # past int()'s 4300-digit limit: isdigit() holds, int() raises a plain ValueError

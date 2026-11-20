@@ -144,7 +144,7 @@ _LATCHED_LIVE = ("(SELECT kind FROM chat_launch_checks WHERE launch_id = NEW.lau
                  f"{_LAST_REENABLE})")
 
 # the one mapping of a reply's stored kind to its timeline kind (``col`` is the kind column's name in the query); the
-# chat_timeline view and timeline()'s "before" query both use it, and thread_view.js labels every kind it yields
+# chat_timeline view and timeline()'s "before" query both use it
 REPLY_KIND_CASE = ("CASE {col} WHEN 'drop_receipt' THEN 'reply_receipt' WHEN 'sign' THEN 'reply_sign' "
                    "WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' "
                    f"WHEN {SQL_KIND_DESK_REPLY} THEN {SQL_KIND_REPLY_DESK} END")

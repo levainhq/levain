@@ -228,8 +228,6 @@
     .panel, .panel.span2, .panel.k-brief, .panel.k-form, .panel.k-metric-grid, .panel.k-count-queue, .panel.k-reading { grid-column: 1 / -1; }
     .readout { margin-left: 0; }
   }
-  body[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
-  body[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
 
   .panel {
     background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg);
@@ -1129,14 +1127,9 @@
   .panel-hero .legendbar { padding-inline: var(--gutter); }
   .sky-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-5); flex-wrap: wrap; padding-bottom: var(--sp-5); }
   .sky-summary { font-size: var(--fs-meta); color: var(--meta); line-height: var(--lh-prose); min-width: 0; }
-  .sky-bar.sky-head { flex-wrap: nowrap; justify-content: flex-start; padding-bottom: var(--sp-3); }
-  .sky-head .sky-summary { display: flex; align-items: baseline; gap: var(--sp-4); flex: 1; }
-  .sky-head .sky-head-title { font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); letter-spacing: var(--track-tight); }
-  .sky-head .sky-head-win { margin-left: auto; font-size: var(--fs-micro); }
   .sky-summary b { color: var(--label); font-weight: var(--fw-semibold); }
   .sky-toggle { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; flex: none; }
   .sky-toggle:hover { color: var(--text); border-color: var(--hair-2); }
-  .sky-toggle-ghost { visibility: hidden; pointer-events: none; }
   .sky-legend { padding-top: var(--sp-3); font-size: var(--fs-meta); color: var(--label); }
   @media (max-width: 720px) { .sky { grid-template-columns: 1fr; } .when { border-right: 0; } }
 
@@ -1238,10 +1231,6 @@ body.ke .sky-hero { display: block; border: 0; }
 body.ke .sky-hero .plot { padding: 0; min-height: 200px; }
 body.ke .ck-sky .xbody { padding: 0; }
 body.ke .skycard .ck-legend { border-top: 1px solid var(--hair); }
-/* the Build tab's strip is the compact band the mock draws: its key is not part of it */
-body.ke[data-mode="build"] .skycard .ck-legend { display: none; }
-body.ke[data-mode="build"] #ck-sky { padding: 0 var(--sp-6) var(--sp-3); }
-body.ke[data-mode="build"] .sky-hero .plot { min-height: 0; }
 body.ke .skycard .ck-legend .legendbar { padding: var(--sp-3) var(--sp-6); }
 /* the header lens (the Activity slot): [Agents graph | Event graph | Work]. The Event graph is the sky as it was; the other two are the topology renderer
    drawn into #ck-hlens, whose bar carries the switch. The sky and its key are not shown while a topology lens is (their mounts stay, so a repaint is not lost). */
@@ -1327,9 +1316,7 @@ body.ke .ck-legend .legendbar { font-size: var(--fs-meta); color: var(--label); 
 body.ke .ck-secthead { display: flex; align-items: baseline; gap: var(--sp-4); margin-top: var(--sec); }
 body.ke .ck-secthead[hidden] { display: none; }
 /* a mode that hides every card in a region hides its header too (the cards' own mode rule is near the top) */
-body.ke[data-mode="morning"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="morning"]))),
 body.ke[data-mode="board"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="board"]))),
-body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))),
 body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="memory"]))) { display: none; }
 body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
@@ -1337,10 +1324,8 @@ body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
 /* the strip stands clear of the Needs-you cards above it, not 12px off their ring */
 body.ke .ck-needs ~ .ck-widgets { margin-top: var(--sp-6); }
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
-   is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
-body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
+   is display:flex); this one carries body.ke so a mode (Home, Memory) hides a card the manifest did not give that mode. */
 body.ke[data-mode="board"] [data-modes]:not([data-modes~="board"]),
-body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]),
 body.ke[data-mode="memory"] [data-modes]:not([data-modes~="memory"]) { display: none; }
 body.ke .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
 body.ke .zone-head .zone-title { margin: 0; }
@@ -1455,15 +1440,13 @@ body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .pexpan
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
 body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
-/* the freshness stamp rides right beside the always-visible fold chevron; the controls that only show on hover sit to ITS left, so the stamp
-   never floats mid-header and never moves when they appear. One spacer takes the free width (a single margin:auto, not two). */
+/* the freshness stamp rides right beside the always-visible fold chevron, so the stamp never floats mid-header. One spacer takes the free
+   width (a single margin:auto, not two). */
 body.ke .panel .phead:has(> .src.fresh)::after { content: ""; flex: 1 1 0; min-width: 0; }
 body.ke .panel .phead:has(> .src.fresh) > .ck-lay { display: contents; }
 body.ke .panel .phead:has(> .src.fresh) > .pexpand { order: 1; margin-left: 0; }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-up { order: 2; margin-left: calc(var(--sp-1) - var(--sp-3)); }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-down { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
-body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 4; margin-left: 0; }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 5; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 2; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
@@ -1790,11 +1773,11 @@ body.ke .needs-terminal .consent-cmd { margin-top: 0; }
 @media (max-width: 480px) { body.ke .consent-kv { grid-template-columns: minmax(0, 1fr); gap: 0; } body.ke .consent-kv dd { margin-bottom: var(--sp-2); } }
 /* the other tabs carry the header alone: one line saying how many wait */
 body.ke .needs-bar { display: none; }
-body.ke[data-mode="build"] .needs-answered, body.ke[data-mode="memory"] .needs-answered,
-body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
-body.ke[data-mode="build"] #ck-needs .needs-headline, body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
-body.ke[data-mode="build"] #ck-needs:not([data-waiting]), body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
-body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
+body.ke[data-mode="memory"] .needs-answered,
+body.ke[data-mode="memory"] .needs-grid,
+body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
+body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
+body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
   background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-lg); }
 body.ke .needs-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
 body.ke .needs-bar-title { font: var(--fw-bold) var(--fs-h)/1.2 var(--round); color: var(--text); }
@@ -1938,7 +1921,6 @@ body.ke .ck-widgets[data-shape="tiles"] .w .sub ~ .sub, body.ke .ck-widgets[data
 body.ke .ck-widgets[data-shape="tiles"] .w .row { flex-wrap: wrap; white-space: normal; }
 body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring);
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 8px 28px -12px color-mix(in oklch, var(--accent) calc(var(--glow-a) * 100%), transparent); }
-body.ke[data-mode="build"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="build"]),
 body.ke[data-mode="memory"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="memory"]) { display: none; }
 
 /* the cards size to what they hold (up to their size class, then they scroll) */
@@ -1950,9 +1932,7 @@ body.ke .ck-zgrid .panel { display: flex; flex-direction: column; }
 body.ke .zone-head { display: none; }
 body.ke[data-mode="board"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
 body.ke[data-mode="board"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
-body.ke[data-mode="morning"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="morning"])),
 body.ke[data-mode="board"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="board"])),
-body.ke[data-mode="build"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="build"])),
 body.ke[data-mode="memory"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="memory"])) { display: none; }
 
 /* two columns of cards on every tab; a card that stands for the whole row (Tray on Morning, a section, an empty line, a card alone in its
@@ -1963,7 +1943,6 @@ body.ke .ck-col { display: contents; }
 body.ke .ck-zgrid .panel[data-stretch], body.ke .ck-zgrid .panel.ck-fold, body.ke .ck-zgrid .panel.ck-dash { grid-column: 1 / -1; }
 body.ke .ck-zgrid .panel.ck-fold { order: 90; }
 body.ke .ck-zgrid .panel.ck-dash { order: 95; }
-body.ke[data-mode="morning"] .ck-zgrid .panel[data-ck-panel="tray"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel^="section:"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="wraps"] { align-self: start; }
 body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
@@ -1995,81 +1974,13 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now until a saved layout says otherwise) */
-
-/* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
-   Recent edits right. The headings are Build's own: the Work zone's heading is shown here only. */
-.k7-sess, .k7-zt, .k7-zg, .row > .k7-repo { display: none; }
-body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: var(--sec); }
-.k7-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
-.k7-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
-.k7-head span { font-size: var(--fs-meta); color: var(--meta); }
-.k7-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; min-width: 0; }
-.k7-card-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) var(--sp-6) var(--sp-4); }
-.k7-card-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
-.k7-card-h .ck-count { margin: 0; }
-.k7-sum, .k7-stats { font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
-.k7-sp { flex: 1 1 0; }
-.k7-card-h .k7-open { display: inline-flex; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-3); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
-.k7-card-h .k7-open:hover { background: var(--card-2); color: var(--text); }
+/* the repo chip a row carries (dashboard_core.js) is drawn only where a place shows it; the Results rows follow */
+.row > .k7-repo { display: none; }
 .k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
-.k7-card.k7-lone { display: flex; flex-direction: row; flex-wrap: wrap; align-items: baseline; text-align: left; border-style: dashed; border-color: var(--hair-2); background: none; }
-.k7-card.k7-lone .k7-card-h { padding: var(--sp-4) var(--sp-5); flex: none; }
-.k7-card.k7-lone .k7-none { padding: var(--sp-4) var(--sp-5) var(--sp-4) 0; flex: 1 1 240px; }
 .k7-none.err { color: var(--bad); }
-.k7-srow { display: grid; grid-template-columns: 14px minmax(170px, 1.1fr) minmax(220px, 1.6fr) minmax(190px, 1fr) minmax(96px, auto); align-items: center; gap: var(--sp-4) var(--sp-6);
-  padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--hair); }
-.k7-sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--meta); justify-self: center; }
-.k7-sdot.live { background: var(--ok); }
-.k7-who { min-width: 0; }
-.k7-who-t { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
-.k7-agent { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
 .k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
 .k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
-.k7-cwd { color: var(--meta); font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.k7-now { min-width: 0; color: var(--text); font-size: var(--fs-body); }
-.k7-srow.quiet .k7-now .k7-tool { color: var(--label); }
-.k7-tool { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.k7-limits { font-size: var(--fs-meta); color: var(--meta); }
-.k7-limits.amber { color: var(--warn); }
-.k7-limits.over { color: var(--bad); }
-.k7-meter { min-width: 0; }
-.k7-meter-h { display: flex; justify-content: space-between; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); letter-spacing: .08em; color: var(--label); }
-.k7-meter-v { letter-spacing: 0; font-variant-numeric: tabular-nums; }
-.k7-bar { height: 4px; border-radius: 2px; background: var(--hair); overflow: hidden; margin-top: var(--sp-1); }
-.k7-bar > i { display: block; height: 100%; background: var(--label); }
-.k7-meter.waiting .k7-bar > i { background: var(--accent); }
-.k7-meter.unread .k7-meter-v { color: var(--meta); }
-.k7-meter.over .k7-bar > i { background: var(--bad); }
-.k7-meter.over .k7-meter-v { color: var(--bad); }
-.k7-over { margin-left: auto; margin-right: var(--sp-2); padding: 0 var(--sp-2); border-radius: 3px; background: var(--bad); color: var(--bg, #fff); letter-spacing: .08em; }
-.k7-when { text-align: right; color: var(--label); font-size: var(--fs-meta); white-space: nowrap; }
-.k7-srow.waiting .k7-now .k7-tool { color: var(--text); }
-@media (max-width: 720px) {
-  .k7-srow { grid-template-columns: 14px minmax(0, 1fr); }
-  .k7-srow > .k7-now, .k7-srow > .k7-meter, .k7-srow > .k7-when { grid-column: 2; }
-  .k7-when { text-align: left; }
-}
-/* Results & edits */
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-title:not(.k7-zt),
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-gloss:not(.k7-zg) { display: none; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { display: block; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
-@media (min-width: 721px) {
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1; align-self: start; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
-}
-body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
-  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
-body.ke .ck-zgrid .panel.k7-results-none .phead { padding: 0; flex: none; }
-body.ke .ck-zgrid .panel.k7-results-none .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; color: var(--label); font-size: var(--fs-body); }
 body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
-@media (max-width: 720px) {
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
-}
 body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
@@ -2275,8 +2186,7 @@ body.ke[data-mode="memory"] .ck-widgets { display: none; }
 body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
 body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 
-/* K5: collapse and reorder. The controls sit at the end of a card's head, quiet until the card is hovered or holds focus; on touch they are
-   always shown. A folded card keeps its head (title and count) and hides everything under it. */
+/* K5: collapse. The fold button sits at the end of a card's head. A folded card keeps its head (title and count) and hides everything under it. */
 .ck-lay { display: inline-flex; gap: var(--sp-1); align-items: center; margin-left: auto; align-self: center; }
 .ck-lay-btn { border: 0; background: none; color: var(--label); width: 24px; height: 24px; border-radius: var(--r-sm); cursor: pointer; display: grid; place-items: center;
   font-size: var(--fs-meta); line-height: 1; padding: 0; }
@@ -2287,18 +2197,12 @@ body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 .panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
 .panel.ck-collapsed > :not(.phead) { display: none; }
 body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
-/* a card whose place CSS `order` pins would take a move as a no-op: the page marks its box (one set of keys in dashboard_core.js), no move buttons, collapse stays */
-.ck-lay.ck-nomove .ck-lay-up, .ck-lay.ck-nomove .ck-lay-down { display: none; }
-body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
-body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
-body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }
-@media (hover: none) { body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 1; } }
 .layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
   font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
 .layoutreset:hover { color: var(--text); }
 .ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
-/* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
-   Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
+/* F12b: the work view (topology_view.js) in the header lens. The topology panel is the feed, not a card of its own:
+   the lens draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
 .panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
 /* N1 the lens switch: a recessed track holding three keys; the chosen one is a raised, lit key (its top edge catches the light,
@@ -2327,9 +2231,6 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
   .hl-bar > .tv-seg { width: 100%; }
   .hl-bar > .tv-seg > .tv-seg-b { flex: 1 1 0; padding-inline: var(--sp-3); }
 }
-/* the Event graph's bar: its figures ride the lens bar like the other lenses', so the band's own title row is not drawn beside them */
-.skycard[data-hlens="events"] .sky-bar.sky-head { display: none; }
-.tv-evfig .tv-evwin { margin-left: auto; align-self: center; font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
 .tv-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); flex: 1 1 320px; min-width: 0; font-size: var(--fs-meta); color: var(--label); }
 .tv-metrics { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--sp-3) var(--sp-6); flex: 1 1 320px; min-width: 0; }
 .tv-m { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -2347,7 +2248,6 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-conf summary { cursor: pointer; }
 .tv-conf-row { padding: var(--sp-1) 0 0 var(--sp-5); color: var(--label); overflow-wrap: anywhere; }
 .tv-quiet { margin: var(--sp-5) 0 0; font-size: var(--fs-meta); color: var(--meta); overflow-wrap: anywhere; }
-.k7-card.k7-lone .tv-quiet { margin: 0; padding: 0 var(--sp-5) var(--sp-4); flex: 1 1 100%; }
 .tv-none { margin: 0; color: var(--meta); font-size: var(--fs-meta); }
 .tv-gloss { color: var(--meta); font-size: var(--fs-meta); font-weight: var(--fw-regular); }
 .tv-n { font: var(--fw-semibold) var(--fs-meta)/1 var(--round); color: var(--label); background: var(--card-2); border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); }
@@ -2411,7 +2311,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-legend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-5); margin-top: var(--sp-5); font-size: var(--fs-meta); color: var(--label); }
 .tv-leg { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .tv-legdef { color: var(--meta); }
-@container (min-width: 780px) {      /* the card shares the row with Lost if closed from 1440, so its body is ~830 px there */
+@container (min-width: 780px) {
   .tv-work { grid-template-columns: minmax(0, 1fr) minmax(200px, 280px); column-gap: var(--sp-8, 40px); row-gap: var(--sp-3); }
   .tv-work.tv-noouts { grid-template-columns: minmax(0, 1fr); }
   .tv-colh1 { grid-column: 1; grid-row: 1; }
@@ -2543,31 +2443,6 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-lg.stalled { border: 2px dashed var(--warn); }
 .tv-lg.running { border-color: var(--ok); }
 .tv-lit { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* F12c: Lost if closed, its own panel. Beside the Sessions card from 1440 px (360 px wide), under it below; phone: a stacked card. */
-.k7-sess-wrap > .panel { grid-column: auto; }      /* the page's generic panel span is for the board grid, not this wrap */
-.k7-sess-wrap { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-6); align-items: start; }
-@media (min-width: 1440px) { .k7-sess-wrap.k7-has-lost { grid-template-columns: minmax(0, 1fr) 360px; } }
-.lc { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: 0 var(--sp-6) var(--sp-5); min-width: 0; overflow: hidden; }
-.lc-h { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3) var(--sp-4); padding: var(--sp-5) 0 var(--sp-4); }
-.lc-h h2 { margin: 0; font: var(--fw-bold) var(--fs-lead)/1.2 var(--round); }
-.lc-h .ck-count { margin: 0; }
-.lc-sum { font-size: var(--fs-meta); color: var(--meta); }
-.lc-none { margin: 0; font-size: var(--fs-meta); color: var(--meta); overflow-wrap: anywhere; }
-.lc-none.err { color: var(--bad); }
-.lc-sess { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) 0; border-top: 1px solid var(--hair); min-width: 0; }
-.lc-h + .lc-sess { border-top: 0; padding-top: 0; }
-.lc-top { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
-.lc-top b { font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow-wrap: anywhere; min-width: 0; }
-.lc-chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
-.lc-chip { padding: var(--sp-1) var(--sp-3); border: 1px solid var(--warn); border-radius: var(--r-sm); color: var(--text); font: var(--fw-medium) var(--fs-meta)/1.3 var(--round); }
-.lc-chip.unk { border: 1px dashed var(--hair-2); color: var(--meta); }
-.lc-mono { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
-.lc-quiet { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) 0 0; border-top: 1px solid var(--hair); }
-.lc-line { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; font-size: var(--fs-meta); }
-.lc-name { color: var(--text); font-weight: var(--fw-medium); overflow-wrap: anywhere; min-width: 0; }
-.lc-ok, .lc-unread { margin-left: auto; white-space: nowrap; color: var(--ok); }
-.lc-unread { color: var(--meta); }
-.lc-foot { margin: var(--sp-4) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); font-size: var(--fs-micro); color: var(--meta); }
 @media (prefers-reduced-motion: no-preference) { .tv-task.waiting { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
@@ -2610,15 +2485,6 @@ body.ke[data-mode="board"] .ck-zgrid .panel[data-ck-panel="tray"] { max-height: 
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
-/* L3 a Tray with ONE group (flow's "Also pending") would fill the left column and leave the right one empty: the lone group takes
-   both columns and its rows run down two columns under one heading, so it reads like the two-group Tray beside it */
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { grid-column: 1 / -1; columns: 2; column-gap: var(--sp-8, 32px); }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .grp-head { column-span: all; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .row { break-inside: avoid; }
-@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
-  body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
 body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="intention_close"] { order: -1; }
 
 /* ═══════════════════════════ NARROW VIEW (1023+13): the cockpit at half a laptop screen ═══════════════════════════ */
@@ -2790,70 +2656,6 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="intenti
 body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {
   grid-column: 1 / -1; grid-row: 4; overflow: visible; text-overflow: clip; white-space: normal; min-height: 0; line-height: var(--lh-list); }
 
-/* CH-U1a: the Build tab's Threads zone (dashboard_boot.js) and the thread view's lines (thread_view.js, tv-*) */
-.th-zone { margin-top: var(--sec, var(--sp-7)); }
-.th-zone[hidden] { display: none; }
-body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled like the Build tab's other zones */
-.th-grid { display: grid; grid-template-columns: minmax(0, 1fr); }
-.th-body { padding: var(--sp-2) var(--sp-6) var(--sp-6); min-width: 0; }
-.th-body .tv-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-1) var(--sp-4); width: 100%; box-sizing: border-box; text-align: left;
-  padding: var(--sp-4) 0; background: none; color: var(--text); border: 0; border-bottom: 1px solid var(--hair); cursor: pointer; font: inherit; }
-.th-body .tv-row:last-of-type { border-bottom: 0; }
-.th-body .tv-row:hover .tv-id { text-decoration: underline; text-decoration-color: var(--faint); }
-.th-body .tv-id { font: var(--fw-semibold) var(--fs-meta)/1.3 var(--mono); color: var(--text); overflow-wrap: anywhere; }
-.th-body .tv-latest, .th-body .tv-at { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
-.th-body .tv-row .tv-at { grid-column: 2; text-align: right; }
-.th-body .tv-state { grid-column: 1; grid-row: 2; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
-.th-body .tv-note { margin: 0; padding: var(--sp-3) 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.th-body .tv-back { min-height: 38px; margin: var(--sp-2) 0 var(--sp-4); padding: var(--sp-2) var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans);
-  color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); cursor: pointer; }
-.th-body .tv-back:hover { border-color: var(--text); }
-.th-body .tv-title { margin: 0 0 var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1.3 var(--mono); color: var(--text); overflow-wrap: anywhere; }
-.th-body .tv-line { border-left: 3px solid var(--hair-2); padding: var(--sp-2) var(--sp-4); margin: 0 0 var(--sp-3); }
-.th-body .tv-message { border-left-color: var(--info); }
-.th-body .tv-vendor_approval_request { border-left-color: var(--warn); }
-.th-body .tv-vendor_error, .th-body .tv-vendor_gap { border-left-color: var(--bad); }
-.th-body .tv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-1) var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
-.th-body .tv-kind { font-weight: var(--fw-semibold); color: var(--text); }
-.th-body .tv-unverified { color: var(--warn); }
-.th-body .tv-tool-open { color: var(--ok); }
-.th-body .tv-head .tv-at { margin-left: auto; }
-.th-body .tv-body { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--text); }
-.th-body .tv-gap { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); border-radius: var(--r-sm); border: 1px solid var(--bad); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.th-body .tv-before { margin: 0 0 var(--sp-4); padding-bottom: var(--sp-2); border-bottom: 1px dashed var(--hair-2); }
-.th-body .tv-authority { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--info); border-radius: var(--r-sm); background: var(--card-2); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
-.th-body .tv-authority-none, .th-body .tv-authority-ended, .th-body .tv-authority-expired { border-left-color: var(--hair-2); color: var(--label); }
-.th-body .tv-authority-unreadable { border-left-color: var(--warn); }
-/* CH-U1 slice 3: collapsed tool lines, the model line, and the work thread's Stop dock. Every colour is a token the
-   page's light and dark themes already define, so both themes follow without a second block. */
-.th-body .tv-model { margin: calc(var(--sp-2) * -1) 0 var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
-.th-body .tv-fold { padding-block: var(--sp-1); }
-.th-body .tv-toggle { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-4); width: 100%; min-height: 32px; box-sizing: border-box; margin: 0; padding: var(--sp-1) 0;
-  background: none; border: 0; text-align: left; cursor: pointer; color: var(--label); }
-.th-body .tv-toggle::before { content: "\25B8"; flex: none; color: var(--meta); }
-.th-body .tv-toggle[aria-expanded="true"]::before { content: "\25BE"; }
-.th-body .tv-toggle:hover .tv-kind { text-decoration: underline; text-decoration-color: var(--faint); }
-.th-body .tv-toggle:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
-.th-body .tv-peek { flex: 1 1 100%; order: 5; padding-left: var(--sp-6); box-sizing: border-box; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label); }
-.th-body .tv-toggle .tv-who, .th-body .tv-toggle .tv-at { flex: none; }
-.th-body .tv-body[hidden] { display: none; }
-.tv-dock { margin-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
-.tv-dock:empty { display: none; }
-.tv-dock .tv-stop { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans);
-  background: none; color: var(--text); border: 1px solid var(--bad); }
-.tv-dock .tv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
-.tv-dock .tv-stop:disabled { opacity: .45; cursor: not-allowed; }
-.tv-dock .tv-stop:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
-.tv-dock .tv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
-@media (max-width: 640px) {
-  .th-body .tv-toggle { min-height: var(--hit-min, 44px); }
-  .th-body { padding-inline: var(--sp-5); }
-  .th-body .tv-back { min-height: var(--hit-min, 44px); }
-  .th-body .tv-row { min-height: var(--hit-min, 44px); grid-template-columns: minmax(0, 1fr); }   /* one column: the id keeps its width */
-  .th-body .tv-row .tv-at, .th-body .tv-state { grid-column: 1; grid-row: auto; text-align: left; }
-  .th-body .tv-head .tv-at { margin-left: 0; }
-}
-
 /* RM-F / 1106-51: the cockpit's one Claude room (room_view.js, rv-*), drawn as a whole-tab chat page the way the reference products draw
    one (chatgpt.com, gemini.google.com; measurements in project_memory/1106-16/design/DESIGN_RESEARCH_1106.md 4.1, 4.2, 7): a thin header
    (title, New), the conversation as the page's one scroller in a centered column, one pinned composer with Send and Stop in one slot. No
@@ -2966,22 +2768,22 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-md .md-code-b { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
 .rv .rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }          /* a bidi control in a seat's link text cannot reorder the words after it */
 .rv .rv-md .md-quote { color: var(--label); }
-/* The same draw in the chat panel's reply, the thread view's agent line and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
+/* The same draw in the chat panel's reply and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
    preserved, the blocks carry their own breaks, code is mono and wraps or scrolls inside the column. */
-.chat-text.rv-md, .th-body .tv-body.rv-md, .sess-text.rv-md { white-space: normal; }
-.chat-text.rv-md > :first-child, .tv-body.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
-.chat-text.rv-md > :last-child, .tv-body.rv-md > :last-child, .sess-text.rv-md > :last-child { margin-bottom: 0; }
+.chat-text.rv-md, .sess-text.rv-md { white-space: normal; }
+.chat-text.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
+.chat-text.rv-md > :last-child, .sess-text.rv-md > :last-child { margin-bottom: 0; }
 .chat-text.rv-md .md-p, .chat-text.rv-md .md-ul, .chat-text.rv-md .md-ol, .chat-text.rv-md .md-quote, .chat-text.rv-md .md-pre,
-.tv-body.rv-md .md-p, .sess-text.rv-md .md-p, .tv-body.rv-md .md-ul, .sess-text.rv-md .md-ul, .tv-body.rv-md .md-ol, .sess-text.rv-md .md-ol, .tv-body.rv-md .md-quote, .sess-text.rv-md .md-quote, .tv-body.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-bottom: var(--sp-3); }
-.chat-text.rv-md .md-h, .tv-body.rv-md .md-h, .sess-text.rv-md .md-h { margin: var(--sp-4) 0 var(--sp-2); color: var(--text); line-height: 1.35; text-transform: none; letter-spacing: normal; }
-.chat-text.rv-md .md-h1, .tv-body.rv-md .md-h1, .sess-text.rv-md .md-h1 { font-size: 1.3em; }
-.chat-text.rv-md .md-h2, .tv-body.rv-md .md-h2, .sess-text.rv-md .md-h2 { font-size: 1.15em; }
+.sess-text.rv-md .md-p, .sess-text.rv-md .md-ul, .sess-text.rv-md .md-ol, .sess-text.rv-md .md-quote, .sess-text.rv-md .md-pre { margin-bottom: var(--sp-3); }
+.chat-text.rv-md .md-h, .sess-text.rv-md .md-h { margin: var(--sp-4) 0 var(--sp-2); color: var(--text); line-height: 1.35; text-transform: none; letter-spacing: normal; }
+.chat-text.rv-md .md-h1, .sess-text.rv-md .md-h1 { font-size: 1.3em; }
+.chat-text.rv-md .md-h2, .sess-text.rv-md .md-h2 { font-size: 1.15em; }
 .chat-text.rv-md .md-h3, .chat-text.rv-md .md-h4, .chat-text.rv-md .md-h5, .chat-text.rv-md .md-h6,
-.tv-body.rv-md .md-h3, .sess-text.rv-md .md-h3, .tv-body.rv-md .md-h4, .sess-text.rv-md .md-h4, .tv-body.rv-md .md-h5, .sess-text.rv-md .md-h5, .tv-body.rv-md .md-h6, .sess-text.rv-md .md-h6 { font-size: 1em; }
-.chat-text.rv-md .md-code-i, .tv-body.rv-md .md-code-i, .sess-text.rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
-.chat-text.rv-md .md-pre, .tv-body.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
-.chat-text.rv-md .md-link, .tv-body.rv-md .md-link, .sess-text.rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }
-.chat-text.rv-md .md-quote, .tv-body.rv-md .md-quote, .sess-text.rv-md .md-quote { color: var(--label); }
+.sess-text.rv-md .md-h3, .sess-text.rv-md .md-h4, .sess-text.rv-md .md-h5, .sess-text.rv-md .md-h6 { font-size: 1em; }
+.chat-text.rv-md .md-code-i, .sess-text.rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.chat-text.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
+.chat-text.rv-md .md-link, .sess-text.rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }
+.chat-text.rv-md .md-quote, .sess-text.rv-md .md-quote { color: var(--label); }
 
 /* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
    is one fixed box of the visual viewport's height (room_view.js keeps --rv-vvh / --rv-vvt), so the page itself never scrolls and the
@@ -3134,10 +2936,6 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
     content: ""; position: absolute; top: 50%; left: 50%; width: 100%; height: 100%;
     min-width: var(--hit-min); min-height: var(--hit-min); transform: translate(-50%, -50%);
   }
-  /* the layout buttons sit in a row, so their areas would share ground: the gap between neighbours is what makes each centre the hit
-     minimum from the next, and the areas then meet without overlapping (the drawn size and the head's height stay as they are) */
-  body.ke .ck-lay { gap: calc(var(--hit-min) - var(--ctl-row)); }
-  body.ke .panel .phead:has(> .src.fresh) .ck-lay-up, body.ke .panel .phead:has(> .src.fresh) .ck-lay-down,
   body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { margin-left: calc(var(--hit-min) - var(--ctl-row) - var(--sp-3)); }
 }
 
@@ -3960,7 +3758,7 @@ body.ia[data-ia-place="home"] #ck-widgets { order: 61; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="agents"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { display: flex !important; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="notifications"], [data-ck-panel="episodes"], [data-ck-panel="topology"]) { display: none !important; }
 body.ia[data-ia-place="home"] #ck-h-widgets { display: none !important; }
-body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: grid !important; }
+body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; }
 /* the drop box is the desk's reply box: shown on Home in every width (Board mode was the only place it showed before) */
 body.ia[data-ia-place="home"] #ck-drop[hidden] { display: none; }
 
@@ -4010,8 +3808,8 @@ body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !
 body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
 
 /* ── the glance: the widgets small, between the Desk and Work ────────────────────────────────────────────────────────────────────── */
-body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
-body.ia[data-ia-place="home"] #ck-widgets > * { min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
+body.ia[data-ia-place="home"] #ck-widgets { flex-wrap: wrap; gap: var(--sp-4) !important; }
+body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - (var(--ck-n, 4) - 1) * var(--sp-4)) / var(--ck-n, 4) - 1px); min-width: 0; min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
 body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-size: var(--fs-h) !important; }
 
 /* ── the spans: laptop three across, tablet two, phone one ───────────────────────────────────────────────────────────── */
@@ -4043,7 +3841,6 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
      said "24 more", so it is taller than the other two on a phone */
   body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { height: 720px !important; }
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
-  body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
 }
 
 /* (after the phone block, whose 38 px it overrides) a finger is the pointer: the masthead's three actions and the places are the page's touch targets at any width, not only on a phone */
@@ -4101,7 +3898,6 @@ body.ia[data-ia-place="home"] .ck-mctl :is(.ia-graph-toggle, #calmbtn, .sky-togg
 body.ia[data-ia-place="home"] .ck-mctl .ia-graph-toggle { color: var(--text); }
 body.ia[data-ia-place="home"] .ck-mctl :is(.ia-graph-toggle, #calmbtn, .sky-toggle):hover { color: var(--text); border-color: var(--hair-2); }
 body.ia[data-ia-place="home"] .ck-mctl :is(#calmbtn, .sky-toggle)[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
-body.ia[data-ia-place="home"] .ck-mctl .sky-toggle-ghost { display: none; }
 body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox { margin-left: auto; display: flex; align-items: center; gap: var(--sp-3); color: var(--meta); font-size: var(--fs-meta); }
 body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox:empty { display: none; }
 @media (pointer: coarse) {
@@ -4119,12 +3915,11 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
   body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox { margin-left: 0; }
 }
 /* board row #144: at 1101-1180 the four-up Machine row and the five At a glance tiles left one panel / tile alone on a row.
-   Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row of three-up tiles that GROW, so whatever the last row holds fills it
-   (a tile the mode hides takes no place, which a counted grid cannot know). */
+   Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row whose tile basis is the column count fillGrids chose (--ck-n: its P1 rule
+   leaves no lone tile where a divisor fits) and whose tiles GROW, so whatever the last row holds fills it (a tile the mode hides takes no
+   place, which a counted grid cannot know). */
 @media (1100px < width <= 1180px) {
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 6 !important; }
-  body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; flex-wrap: wrap; }
-  body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - 2 * var(--sp-4)) / 3 - 1px); min-width: 0; }
 }
 
 /* ── levain#141 polish: header, now line, drop, Home order ── */

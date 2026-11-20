@@ -21,7 +21,6 @@ from levain.desk.room_launch import RoomLaunchError
 from levain.desk.room_serve import RoomServeError
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_desk_room_serve import scripted, wait
 
 
@@ -387,13 +386,12 @@ def test_the_rotate_route_answers_the_open_room_it_re_reads(tmp_path, qdir):
         assert _get(base)[1]["room_thread"] == got["room_thread"] != thread
 
 
-# --- f: the page mounts the room and the work-thread Stop -------------------------------------------------------------
+# --- f: the page mounts the room ------------------------------------------------------------------------------------
 
-def test_the_boot_script_mounts_the_room_view_and_passes_stop_to_the_thread_view():
+def test_the_boot_script_mounts_the_room_view():
     js = (cockpit_room.__file__ and __import__("pathlib").Path(cockpit_room.__file__).resolve().parents[1]
           / "templates" / "web" / "dashboard_boot.js").read_text()
     assert "LevainRoomView.mount(roomHost" in js
-    assert "LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}), stop: true })" in js
 
 
 def test_the_room_view_hides_the_expected_mode_report_and_shows_any_other():

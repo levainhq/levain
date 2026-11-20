@@ -1,6 +1,6 @@
-"""K7, the Build tab: Sessions as a large card (who is working, what each is doing, how much context it holds, what its limits
-say), the Q13 limits slot that draws only when `levain.consent.limits.panel` exists, Results beside Recent edits and Open
-loops, and a bare install that shows one line per empty section and no empty card."""
+"""K7, the providers behind the retired Build tab: what a Sessions row carries (the agent's tool, what it waits on, its context, its
+limits: the Q13 limits slot draws only when `levain.consent.limits.panel` exists) and what a finished job says (worded, ordered by its
+finish), and Home's outcome dots on them. The page painters for them went with the Modes bar (levain#163); the Sessions tile and the Machine panels still read these."""
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +9,6 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 
 from levain.cockpit.providers import build_default_cockpit
 from levain.consent.listing import read_listing
@@ -20,10 +19,7 @@ from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _
 from tests._h4 import h4_home
 
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
-BUILD = "#write_token=T&build"
-ROWS = "[...document.querySelectorAll('#k7-sessions .k7-srow')]"
-# F12b made the topology the default view of the Sessions card at 1440: these tests are about the list, so they choose it first
-LIST_VIEW = {"eval": "(() => { try { localStorage.setItem('levain_cockpit_topology_mode', 'list'); } catch (_) {} return 1; })()"}
+BUILD = "#write_token=T&build"   # a retired mode name in the address: the page lands on Home (tests/test_cockpit_places.py)
 
 
 def _stem(agent: str, sid: str) -> str:
@@ -241,25 +237,11 @@ def test_a_list_row_carries_its_age_as_the_integer_the_kernel_sends_not_the_badg
     assert "age_days: Number.isInteger(f.age_days)" in js             # the component receives the integer
 
 
-# --- the page ----------------------------------------------------------------------------------------
+# --- a bare install --------------------------------------------------------------------------------
 
 
 @needs_browser
-def test_the_no_results_placeholder_goes_when_a_jobs_panel_appears(tmp_path, monkeypatch):
-    """The placeholder is drawn while no jobs panel exists; the moment one is on the page (a job store that appears while the
-    page is open) the placeholder is removed, the same page, no reload."""
-    _root, src, _ids = _install(tmp_path)
-    count = "document.querySelectorAll('.k7-results-none').length"
-    add = ("(() => { const g = document.querySelector('.ck-zone[data-zone=operate] .ck-zgrid'); const p = document.createElement('div'); "
-           "p.className = 'panel'; p.dataset.ckPanel = 'jobs'; g.appendChild(p); return 1; })()")
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('.k7-results-none')"}, {"eval": count},
-                     {"eval": add}, {"eval": "new Promise(r => setTimeout(r, 2500))"}, {"eval": count}])["values"]
-    assert (out[-4], out[-1]) == (1, 0), out
-
-
-@needs_browser
-def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, monkeypatch):
+def test_home_draws_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, monkeypatch):
     from levain.jobs import JobRuntime, JobStore
 
     root, src, _ids = _install(tmp_path)
@@ -273,16 +255,13 @@ def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, 
     probe = ("JSON.stringify({title: document.querySelector('[data-ck-panel=jobs] h2').textContent, "
              "rows: [...document.querySelectorAll('[data-ck-panel=jobs] .row.k7-res')].map(r => [r.querySelector('.k7-rdot').className, r.querySelector('.clause').textContent, r.querySelector('.ext-meta').textContent])})")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", job_runtime=JobRuntime(store)) as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row.k7-res')"}, {"eval": probe}])["values"]
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row.k7-res')"}, {"eval": probe}])["values"]
     got = json.loads(out[-1])
     assert got["title"] == "Results", got
     rows = {r[1]: r for r in got["rows"]}
     assert rows["consult review finished"][0] == "k7-rdot ok" and rows["consult review finished"][2] == "8m ago", got
     assert rows["guard test failed"][0] == "k7-rdot bad", got
     assert not any("{" in r[1] for r in got["rows"]), got          # never the raw result body
-
-
-# --- a bare install --------------------------------------------------------------------------------
 
 
 def test_results_list_newest_finish_first_even_when_the_store_orders_by_filing(tmp_path, monkeypatch):
