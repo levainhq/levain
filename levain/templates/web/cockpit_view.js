@@ -2465,7 +2465,7 @@
     return squash(n.getAttribute("aria-label")) || JUMP_LABEL_OF[n.dataset.ckPanel] || "";
   }
   // The place a node is drawn in ("" when no place draws it): Settings, Desk and Room by their zone, then the tab list the node (or the
-  // zone's panels) carries; a widget card is drawn only on Home; the state line follows the place it is read from.
+  // zone's panels) carries; a widget card is a Home target; the state line follows the place it is read from.
   function jumpPlaceOf(n, here) {
     if (n.closest(".dev-zone, .ck-thiscockpit")) return "settings";
     if (n.closest(".dv-zone")) return "desk";
@@ -2688,7 +2688,7 @@
     input.focus();
   }
 
-  K.jumpLabel = jumpLabel;   // the one labeller: tests/test_cockpit_jump_coverage_browser.py reads its labels through it
+  K.jumpLabel = jumpLabel;   // the one labeller, exported so a test reads the same labels the list shows
   K.jumpTargets = jumpTargets;
 
   function install() {
