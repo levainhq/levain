@@ -570,3 +570,49 @@ def test_a_manifest_that_read_the_store_before_the_row_landed_is_not_served_unma
     other_done.set()
     t.join(10)
     assert out and (out[0]["count"] == 3 or out[0]["stale"] is True)
+
+
+# --- a requirement the loop never stamps heals on the panel's next derive ---------------------------------------------------
+def test_a_requirement_no_derive_stamps_is_answered_by_the_next_derive_that_began_after_the_write(
+        rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    rig.derive()
+    rig.forward = False                                          # the host accepted the call and never stamps it
+    rig.ck.invalidate_reads(["alpha"])
+    assert rig.ck.host_dirty_errors == 0
+    out = rig.ck.panel("alpha")
+    assert out["stale"] is True and out["pending"] is True
+    rig.clock.advance(31)                                        # the loop's own backstop derives it, stamped with no write
+    rig.loop.run_once(rig.clock.epoch())
+    assert rig.reader.read("alpha").write_gen == 0
+    out = rig.ck.panel("alpha")
+    assert out["stale"] is False and out["pending"] is False
+
+
+def test_a_read_is_not_held_for_a_row_a_derive_begun_after_the_write_already_is(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 1.5)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    rig.clock.advance(31)
+    rig.loop.run_once(rig.clock.epoch())
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    assert time.monotonic() - t0 < 1.0 and out["stale"] is False
+    assert rig.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}
+
+
+def test_a_panel_retired_and_registered_again_owes_nothing_for_a_write_that_named_its_earlier_life(
+        rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 1.5)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    rig.ck.unregister("alpha")
+    rig.ck.register(list_spec("alpha", rig.rec))
+    rig.loop.dirty(("alpha",), 0)
+    rig.loop.run_once(rig.clock.epoch())
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    assert time.monotonic() - t0 < 1.0 and out["stale"] is False and out["pending"] is False
+    assert rig.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}

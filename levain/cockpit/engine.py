@@ -1233,6 +1233,10 @@ class Cockpit:
             del self._replay_cache[k]
         self._specs = specs
         self._state = states
+        with self._rc_lock:      # a panel that is registered again starts with no write asked of it
+            self._write_required.pop(sid, None)
+            self._write_unsent.discard(sid)
+            self._write_lapsed.pop(sid, None)
 
     def _is_composed(self, panel_id: str, specs_map: dict[str, ProviderSpec] | None = None) -> bool:
         spec = (specs_map if specs_map is not None else self._specs).get(panel_id)
@@ -2976,28 +2980,31 @@ class Cockpit:
         with self._rc_lock:
             return {"waits": self._write_waits, "timeouts": self._write_wait_timeouts}
 
+    @staticmethod
+    def _answers_write(row: Any, req: "tuple[int, float]") -> bool:
+        """Whether ``row`` (None: no row) answers the write ``req`` = ``(generation, instant)`` stands for: it is stamped with
+        the write's generation, or a derive began after the write (it committed before the instant was taken, so that derive
+        read the post-write state whether or not the host was ever told of the write)."""
+        return row is not None and (row.write_gen >= req[0] or row.started_at > req[1])
+
     def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
         """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and
-        whether the host was never told of it. A row answers a write once it is stamped with the write's generation, or, for
-        a write the host was never told of, once a derive began after the write. The answer depends on the row handed in and
-        the panel's requirement alone: a reader holding an older row is told it is owed whoever has looked at a newer one."""
+        whether the host was never told of it. The answer depends on the row handed in and the panel's requirement alone:
+        a reader holding an older row is told it is owed whoever has looked at a newer one."""
         with self._rc_lock:
             req = self._write_required.get(panel_id)
-            if req is None:
+            if req is None or self._answers_write(row, req):
                 return False, False
-            unsent = panel_id in self._write_unsent
-            if row is not None and (row.write_gen >= req[0] or (unsent and row.started_at > req[1])):
-                return False, False
-            return True, unsent
+            return True, panel_id in self._write_unsent
 
     def _await_writes(self, panel_ids: list[str]) -> None:
         """Block, bounded by ``WRITE_WAIT_S`` from here (ONE bound for every panel named), until each of these panels has a
-        row stamped for the write that touched it. It returns early for a panel the host was never told of, one whose bound
+        row that answers the write that touched it (``_answers_write``). It returns early for a panel the host was never told of, one whose bound
         a read already ran out for this write, and a worker that is down; it holds no lock of this cockpit while it waits,
         and sleeps on the host's publish notice (``note_publish``), never on a timer it polls. A read that gives up leaves
         the panel's row as it is: the head says so (``_write_owed``)."""
         with self._rc_lock:
-            owed = {pid: req[0] for pid in panel_ids
+            owed = {pid: req for pid in panel_ids
                     if (req := self._write_required.get(pid)) is not None and pid not in self._write_unsent
                     and self._write_lapsed.get(pid, 0) < req[0]}
         if not owed:
@@ -3013,14 +3020,14 @@ class Cockpit:
         while True:
             with self._pub_cv:
                 ticket = self._pub_ticket          # taken before the rows are looked at: a publish after it is not missed
-            behind: dict[str, int] = {}
-            for pid, need in owed.items():
+            behind: dict[str, tuple[int, float]] = {}
+            for pid, req in owed.items():
                 try:
                     row = self._reader.read(pid)
                 except Exception:  # noqa: BLE001
                     return
-                if row is None or row.write_gen < need:
-                    behind[pid] = need
+                if not self._answers_write(row, req):
+                    behind[pid] = req
             if not behind:
                 return
             left = deadline - time.monotonic()
@@ -3030,8 +3037,8 @@ class Cockpit:
                     self._write_waits += 1
                 if left <= 0:
                     self._write_wait_timeouts += 1
-                    for pid, need in behind.items():
-                        self._write_lapsed[pid] = max(self._write_lapsed.get(pid, 0), need)
+                    for pid, req in behind.items():
+                        self._write_lapsed[pid] = max(self._write_lapsed.get(pid, 0), req[0])
                     return
             owed = behind
             with self._pub_cv:
