@@ -129,7 +129,7 @@ def _only_sockets_under(monkeypatch, top: Path, foreign: Path | None = None) -> 
         def views_then_vanish(*a, **k):
             out = real_views(*a, **k)
             import shutil
-            shutil.rmtree(foreign.parent)
+            shutil.rmtree(foreign.parent, ignore_errors=True)
             return out
         monkeypatch.setattr(conf, "_gnupg_home_views", views_then_vanish)
 
@@ -145,13 +145,13 @@ def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path,
     root = top / "a" / "xdg"
     s = _listen(root / "gnupg" / "S.gpg-agent")
     foreign = None
-    if foreign_worker:
-        foreign = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvhm")) / ".docker" / "gh" / "S.dirmngr"
-        foreign.parent.mkdir(parents=True, mode=0o700)
-        foreign.write_text("")
-    _only_sockets_under(monkeypatch, top, foreign)
-    monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
     try:
+        if foreign_worker:
+            foreign = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvhm")) / ".docker" / "gh" / "S.dirmngr"
+            foreign.parent.mkdir(parents=True, mode=0o700)
+            foreign.write_text("")
+        _only_sockets_under(monkeypatch, top, foreign)
+        monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
         root = root.resolve()
         argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True,
                                         allow_container_sockets=True))
@@ -161,6 +161,7 @@ def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path,
         for anc in (root.parent, root.parent.parent):
             pins = [i for i, op, a in ops if op == "--bind" and a == [str(anc), str(anc)]]
             assert pins and max(pins) < view[0], anc
+        assert foreign is None or not foreign.parent.exists(), "the foreign home's vanish never fired"
     finally:
         s.close()
         import shutil

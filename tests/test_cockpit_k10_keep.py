@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from anneal_memory.spores import IntentionStore
-from tests._cockpit_reread import REREAD, REREAD_CALL
+from tests._cockpit_reread import REREAD, REREAD_SETTLED
 from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_k4a_needs import DESKTOP
@@ -36,13 +36,15 @@ def _open_and_scroll(during_wait: str = "") -> str:
     """Open the tall row, scroll its body, and read the scroll back from the body node as it is AFTER the wait: a draw
     inside the wait (a store write seen through the change stream, every 1.5 s in the writer test) replaces the node, and
     the old node reads 0 for good (CI land run 44667712965, 2026-11-19). The scroll is set again on the fresh node until it holds.
-    ``during_wait``: JS run right after the scroll is set, standing for a draw landing in the wait."""
+    ``during_wait``: JS run right after the scroll is set, standing for a draw landing in the wait; ``replaced`` says whether
+    the first attempt's body node was replaced by then (the retries could otherwise hide a draw that never came)."""
     return ("(async () => { const sleep = (ms) => new Promise(r => setTimeout(r, ms));"
             f" const g = {GIANT_ROW}; g.querySelector(':scope > .clause-toggle').click(); await sleep(500);"
-            " let scrolled = 0;"
+            " let scrolled = 0, replaced = false;"
             " for (let i = 0; i < 5 && scrolled <= 100; i++) {"
-            f"  {BODY}.scrollTop = 500; {during_wait} await sleep(300); scrolled = Math.round({BODY}.scrollTop); }}"
-            f" return {{scrolled, state: ({STATE})}}; }})()")
+            f"  const before = {BODY}; before.scrollTop = 500; {during_wait}; await sleep(300);"
+            f"  const now = {BODY}; if (i === 0) replaced = now !== before; scrolled = Math.round(now.scrollTop); }}"
+            f" return {{scrolled, replaced, state: ({STATE})}}; }})()")
 
 
 OPEN_AND_SCROLL = _open_and_scroll()
@@ -138,9 +140,11 @@ def test_a_draw_inside_the_scroll_wait_does_not_read_as_never_scrolled(tmp_path:
             DESKTOP,
             {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
             BOARD_SETTLED,
-            {"eval": _open_and_scroll(REREAD_CALL)},
+            {"eval": _open_and_scroll("await " + REREAD_SETTLED)},
         ])
-    assert out["values"][-1]["scrolled"] > 100, f"the body was never scrolled: {out['values'][-1]}"
+    got = out["values"][-1]
+    assert got["replaced"], f"no draw landed inside the wait, the test proves nothing: {got}"
+    assert got["scrolled"] > 100, f"the body was never scrolled: {got}"
 
 
 AFFORD = (f"(() => {{ const b = {BODY}; return {{tab: b.getAttribute('tabindex'), role: b.getAttribute('role'),"
