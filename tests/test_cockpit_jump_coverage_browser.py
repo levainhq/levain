@@ -342,6 +342,34 @@ def test_a_choice_that_draws_late_does_not_take_focus_from_a_reopened_jump(tmp_p
     assert got["open"] and got["input"], got
 
 
+LATE_INJECT = ("(() => { const p = document.createElement('div'); p.className = 'panel'; p.dataset.ckPanel = 'zz-late'; p.style.display = 'none';"
+               " const h = document.createElement('h2'); h.textContent = 'Zz late panel'; p.appendChild(h); document.body.appendChild(p);"
+               " const o = document.createElement('input'); o.id = 'zz-other'; document.body.appendChild(o);"
+               " document.addEventListener('keydown', function f(e) { if (e.key !== 'Enter') return; document.removeEventListener('keydown', f, true);"
+               "   let k = 0; const t = () => { if (++k < 18) requestAnimationFrame(t); else p.style.display = ''; }; requestAnimationFrame(t); }, true);"
+               " document.getElementById('jumpbtn').click(); return 1; })()")
+LATE_AT = ("(() => { const a = document.activeElement, p = document.querySelector('[data-ck-panel=zz-late]');"
+           " return JSON.stringify({probe: 'late', other: a === document.getElementById('zz-other'), body: a === document.body,"
+           " inPanel: !!p && !!a && p.contains(a)}); })()")
+
+
+@needs_browser
+def test_a_late_landing_does_not_take_focus_from_a_control_the_reader_chose_meanwhile(tmp_path: Path) -> None:
+    refocus = {"eval": "document.getElementById('zz-other').focus(); 1"}                  # as a click on another control would
+    steps = [{"eval": LATE_INJECT}, _until("document.querySelectorAll('.palette-list li').length"), _pick("panel", "Zz late panel"), ENTER,
+             refocus, _wait(900), {"eval": LATE_AT}]
+    (got,) = _vals(_run(tmp_path, steps), "late")
+    assert got["other"] and not got["inPanel"], got
+
+
+@needs_browser
+def test_a_late_landing_with_focus_still_on_the_body_lands_on_the_target(tmp_path: Path) -> None:
+    steps = [{"eval": LATE_INJECT}, _until("document.querySelectorAll('.palette-list li').length"), _pick("panel", "Zz late panel"), ENTER,
+             _wait(900), {"eval": LATE_AT}]
+    (got,) = _vals(_run(tmp_path, steps), "late")
+    assert got["inPanel"] and not got["other"], got
+
+
 @needs_browser
 def test_escape_gives_focus_back_to_the_rebuilt_opener_and_never_to_the_body(tmp_path: Path) -> None:
     focus_panel = {"eval": "(() => { const p = document.querySelector('#board .panel[data-ck-panel=work_board]'); p.tabIndex = -1; p.focus(); return document.activeElement === p ? 1 : 0; })()"}

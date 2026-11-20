@@ -2668,7 +2668,9 @@
     const choose = (it) => {
       close();
       const gen = ++jumpGen;
-      const live = () => gen === jumpGen && !palette;
+      // a delayed landing completes only while focus is still where choosing left it (nothing focused); a reader who has since put focus
+      // on another control has answered where it belongs, and the landing gives up without moving it
+      const live = () => { const a = document.activeElement; return gen === jumpGen && !palette && (!a || a === document.body); };
       // the palette is already closed, so a target that never comes up gives focus back to the opener, else `prefer`, else the Jump button
       const giveUp = (prefer) => { const a = document.activeElement; if (live() && (!a || a === document.body)) settleFocus(back, prefer); };
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
