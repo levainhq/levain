@@ -34,14 +34,16 @@ MEASURE = """((id, mark) => { const p = document.querySelector('.ck-zgrid .panel
     .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top)[0]; window.__below[id] = n ? key(n) : null; }
   const below = window.__below[id] && document.querySelector(window.__below[id]);
   const pill = document.querySelector('[data-layout-reset]'); const row = pill && pill.parentElement.getClientRects().length ? pill.parentElement.getBoundingClientRect() : null;
-  let g = pill && pill.parentElement; while (g && !getComputedStyle(g).display.includes('grid')) g = g.parentElement;   // the grid the Reset row is an item of
+  let g = pill && pill.parentElement && pill.parentElement.parentElement; while (g && !getComputedStyle(g).display.includes('grid')) g = g.parentElement;   // the grid the Reset row is an item of
+  const gap = g ? parseFloat(getComputedStyle(g).rowGap) : 0;   // NaN when row-gap is `normal`
   return JSON.stringify({ m: id, h: r.height, head: head, collapsed: p.classList.contains('ck-collapsed'), belowSel: window.__below[id],
-    belowTop: below ? below.getBoundingClientRect().top : null, resetH: row ? row.height + parseFloat(getComputedStyle(g).rowGap) : 0, resetTop: row ? row.top : null }); })"""
+    belowTop: below ? below.getBoundingClientRect().top : null, resetH: row ? row.height + (Number.isFinite(gap) ? gap : 0) : 0, resetTop: row ? row.top : null }); })"""
 # a wait on the condition: the card is in the wanted fold state and neither it, the card below nor the Reset row moved since the last poll
 SETTLED = """((id, want) => { const p = document.querySelector('.ck-zgrid .panel[data-ck-panel="' + id + '"]'); if (!p) return null;
   const s = window.__below && window.__below[id]; const b = s && document.querySelector(s); const pill = document.querySelector('[data-layout-reset]');
-  const sig = [p.getBoundingClientRect().height, b && b.getBoundingClientRect().top, pill && pill.parentElement.getBoundingClientRect().height].join('/');
-  const ok = p.classList.contains('ck-collapsed') === want && window.__sig === sig; window.__sig = sig; return ok && 1; })"""
+  const sig = [id, want, p.getBoundingClientRect().height, b && b.getBoundingClientRect().top, pill && pill.parentElement.getBoundingClientRect().height].join('/');
+  const drawn = !want || (pill && pill.getClientRects().length);   // a saved fold draws the Reset row; do not settle before it is there
+  const ok = p.classList.contains('ck-collapsed') === want && drawn && window.__sig === sig; window.__sig = sig; return ok && 1; })"""
 
 
 def _wait(cid: str, want: bool) -> dict:
@@ -68,7 +70,7 @@ def test_a_folded_home_card_is_its_header_tall_and_what_is_below_moves_up(tmp_pa
     for cid, (before, folded, after) in _run(tmp_path, width).items():
         assert not before["collapsed"] and folded["collapsed"] and not after["collapsed"], (width, cid)
         assert before["h"] > before["head"] + 40, (width, cid, "the card has no body to fold on the fixture", before)
-        assert folded["h"] <= folded["head"] + HEIGHT_SLACK, (width, cid, "the folded card is not its header's height (a blank panel)", before, folded)
+        assert folded["head"] > 0 and abs(folded["h"] - folded["head"]) <= HEIGHT_SLACK, (width, cid, "the folded card is hidden or not its header's height (a blank panel)", before, folded)
         assert before["belowTop"] is not None and folded["belowTop"] is not None, (width, cid, "nothing below the card to move up", before, folded)
         freed = before["h"] - folded["head"]   # what a header-tall card frees; NOT before-minus-folded height, which is 0 for a card that did not shrink
         # the Reset row is drawn once a fold is saved; when it sits above the card below it pushes that card down by its own height
@@ -81,6 +83,7 @@ def test_a_folded_home_card_is_its_header_tall_and_what_is_below_moves_up(tmp_pa
 # A folded EMPTY card keeps `.ck-fold`'s `align-self: stretch`, so with `height: auto` it is stretched to the tallest card of its row. The fixture draws
 # no such row-mate, so a scratch pair is put in the Home grid: the first one starts a fresh row, both take the span the Home grid gives their id.
 PAIRS = (("scheduled_jobs", "jobs"), ("inbox", "edits"))   # (the taller unfolded row-mate, the slim empty card that is folded)
+# the scratch cards reuse the real cards' data-ck-panel ids on purpose: the Home rules that key on the id (heights, spans) must apply to them; the reads go by data-scratch
 PAIR = """((ids) => { const grid = document.querySelector('.ck-zgrid'); const mk = (id, cls, order) => { const p = document.createElement('section');
   p.className = 'panel ' + cls; p.dataset.ckPanel = id; p.dataset.scratch = id; p.style.order = String(order);
   p.innerHTML = '<div class="phead"><h2>' + id + '</h2></div><div class="pbody"><p class="empty">nothing here</p></div>'; grid.appendChild(p); return p; };
@@ -116,5 +119,5 @@ def test_a_folded_empty_card_beside_a_taller_one_is_its_header_tall_not_the_rows
     assert abs(before[mate]["top"] - before[slim]["top"]) <= SAME_ROW, (width, "the scratch pair is not in one row", before)
     assert before[mate]["h"] > before[slim]["h"] + 40, (width, "the row-mate is not taller than the card, so nothing could stretch it", before)
     assert folded[slim]["collapsed"] and not folded[mate]["collapsed"], (width, folded)
-    assert folded[slim]["h"] <= folded[slim]["head"] + HEIGHT_SLACK, (width, "the folded empty card is stretched to its row (a blank panel)", before, folded)
+    assert folded[slim]["head"] > 0 and abs(folded[slim]["h"] - folded[slim]["head"]) <= HEIGHT_SLACK, (width, "the folded empty card is hidden or stretched to its row (a blank panel)", before, folded)
     assert abs(folded[mate]["h"] - before[mate]["h"]) <= RESTORE_SLACK, (width, "the row-mate changed height", before, folded)

@@ -19,9 +19,11 @@ FOLD = {"eval": "document.querySelector('.ck-zgrid .panel[data-ck-panel=\"work_b
 # the pill is drawn and has not moved since the last poll (the fold has reflowed the deck)
 PILL_SETTLED = """(() => { const b = document.querySelector('[data-layout-reset]'); if (!b || !b.getClientRects().length) return null; const q = b.getBoundingClientRect();
   const sig = [q.left, q.top, q.width, q.height].join('/'); const ok = window.__pillSig === sig; window.__pillSig = sig; return ok && 1; })()"""
-MEASURE = """(() => { const b = document.querySelector('[data-layout-reset]'); const q = b.getBoundingClientRect();
-  return JSON.stringify({ vw: document.documentElement.clientWidth, text: b.textContent.trim(), pill: { left: q.left, right: q.right }, scroll: [b.scrollWidth, b.clientWidth] }); })()"""
-WIDTHS = (320, 360, 390, 430, 820, 1440)
+MEASURE = """(() => { const b = document.querySelector('[data-layout-reset]'); if (!b) return JSON.stringify({ missing: true }); const q = b.getBoundingClientRect();
+  const w = document.querySelector('.ia-head[data-ia-head="work"]'); const wq = w && w.getBoundingClientRect();
+  return JSON.stringify({ vw: document.documentElement.clientWidth, text: b.textContent.trim(), pill: { left: q.left, right: q.right, top: q.top, bottom: q.bottom },
+    work: wq && { top: wq.top, bottom: wq.bottom }, scroll: [b.scrollWidth, b.clientWidth] }); })()"""
+WIDTHS = (320, 360, 390, 430, 600, 720, 721, 820, 1440)
 
 
 def pill(tmp_path: Path, width: int) -> dict:
@@ -40,3 +42,9 @@ def test_the_reset_layout_pill_is_whole_and_inside_the_viewport(tmp_path: Path, 
     assert row["text"] == "Reset layout", row
     assert p["left"] >= 0 and p["right"] <= row["vw"], (width, "the pill is outside the viewport", row)
     assert row["scroll"][0] <= row["scroll"][1], (width, "the pill's label is wider than the pill", row)
+    assert row["work"] is not None, (width, "no Work head to place the pill against", row)
+    if width >= 721:   # in the Work head's row: the pill's vertical centre is inside the head
+        mid = (p["top"] + p["bottom"]) / 2
+        assert row["work"]["top"] <= mid <= row["work"]["bottom"], (width, "the pill is not in the Work head's row", row)
+    elif width <= 430:   # a row of its own: its top is at or below the head's bottom
+        assert p["top"] >= row["work"]["bottom"] - 1, (width, "the pill does not have a row of its own", row)
