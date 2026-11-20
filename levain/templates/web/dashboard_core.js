@@ -2846,6 +2846,7 @@
     });
     // a phone keyboard rises over the lower half: bring the box to the middle of what is left
     input.addEventListener("focus", () => {
+      if (restoringField) return;   // the page's own refocus after a draw is not the reader's: the page stays where they left it
       setTimeout(() => { try { box.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* a convenience only */ } }, 300);
     });
     go.addEventListener("click", submit);
@@ -10331,13 +10332,15 @@
     } catch (e) { fieldWarn(e); return null; }
   }
   // Focus, selection and scroll only: the value is never put back (a write that cleared the field must stay cleared).
+  let restoringField = false;   // true only while restoreField gives the keyboard back (a focus listener reads it)
   function restoreField(f) {
     try {
       if (!f || document.activeElement === f.el && f.el.isConnected) return;
       let t = null;
       try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
       if (!t || !isTextField(t)) return;
-      t.focus({ preventScroll: true });
+      restoringField = true;
+      try { t.focus({ preventScroll: true }); } finally { restoringField = false; }
       try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
       if (f.st) t.scrollTop = f.st;
     } catch (e) { fieldWarn(e); }
