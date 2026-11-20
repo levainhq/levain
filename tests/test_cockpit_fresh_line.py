@@ -378,7 +378,7 @@ def test_the_phone_keeps_the_age_number_and_the_words_at_390(tmp_path: Path) -> 
 
 
 # levain#159 round 6: on a phone the line's words were cut with an ellipsis exactly when they mattered ("Work board unavaila..."), and a phone has
-# no hover for the title. A state that names a panel takes its own row after the buttons' row, whole; the live state keeps the shared row.
+# no hover for the title. A state that names a panel takes its own row after the buttons' row, whole; the live state keeps the shared row (a live read that says "updating" wraps to its own row at the narrowest phone widths).
 # Names and ages are the page's real ones. Measured at the true device width (mobile + touch), the presence chip shown and hidden.
 PHONE = r"""((presence) => { const F = window.LevainFreshLine.seam, el = document.getElementById('freshline'), m = document.querySelector('.masthead');
   const pb = document.getElementById('presencebtn'); pb.hidden = !presence; pb.querySelector('.pr-chip-t').textContent = 'Follow here';
@@ -392,7 +392,8 @@ PHONE = r"""((presence) => { const F = window.LevainFreshLine.seam, el = documen
     down: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 60000 }, stream: { state: 'down', lastChunk: now - 40000, faults: [], everLive: true } }),
     failed: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 125000, failed: 'HTTP 502', failedAt: now - 1000 } }),
     refused: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, refused: true } }),
-    updating: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, inflight: true, inflightAt: now - 3000 } }) };
+    updating: Object.assign({}, base, { boot: { wholeDrawn: true, lastWholeAt: now - 5000, inflight: true, inflightAt: now - 3000 } }),
+    connecting: Object.assign({}, base, { boot: { wholeDrawn: false, lastWholeAt: 0 } }) };
   const rows = [];
   for (const k of Object.keys(states)) { F.setInputs(() => states[k]); F.reset(); F.recompute();
     const st = el.querySelector('.fl-state'), ag = el.querySelector('.fl-age'), l = R(el);
@@ -400,6 +401,7 @@ PHONE = r"""((presence) => { const F = window.LevainFreshLine.seam, el = documen
     rows.push({ k, w: innerWidth, state: el.dataset.state, h: Math.round(R(m).height * 10) / 10, words: st.textContent, age: ag.textContent,
       stCut: st.scrollWidth > st.clientWidth, ageCut: !ag.hidden && ag.scrollWidth > ag.clientWidth, ageShown: !ag.hidden && ag.getClientRects().length > 0,
       ownRow: l.top >= rowBottom - 0.5, sharesRow: l.top < rowBottom - 0.5, left: Math.round(l.left), brandLeft: Math.round(R(m.querySelector('.brand')).left), right: Math.round(l.right), top: Math.round(l.top), bottom: Math.round(l.bottom),
+      ageRight: Math.round(R(ag).right * 10) / 10, lineRight: Math.round(l.right * 10) / 10, vw: document.documentElement.clientWidth,
       docOver: document.documentElement.scrollWidth > document.documentElement.clientWidth, mastOver: m.scrollWidth > m.clientWidth,
       presenceBelow: !presence || R(pb).top >= l.bottom - 0.5 }); }
   F.setInputs(null);
@@ -431,14 +433,15 @@ def test_a_panel_trouble_state_is_whole_on_its_own_row_on_a_phone(tmp_path: Path
             assert r["left"] <= r["brandLeft"] + 1, where                           # left-aligned: it starts where the brand does, not at the right edge
             assert r["ageShown"] == (k != "refused"), where                         # "not signed in" carries no age; every other trouble state does
         assert rows["unavailable2"]["words"] == "Work board unavailable +1" and rows["stale2"]["words"] == "Work board stale +1", rows
-        for k in ("live", "updating"):                                              # live (and a live read that says "updating") keeps the buttons' row
+        for k in ("live", "updating"):                                              # live keeps the buttons' row, and so does "updating" except at the narrowest widths
             r = rows[k]
-            assert r["sharesRow"] and not r["stCut"] and not r["docOver"] and not r["mastOver"], (r["w"], g["presence"], r)
+            # the one exception (levain#169): at the narrowest phone width the "updating" cue does not fit beside the buttons, and an age is never cut, so it wraps to its own row
+            assert r["sharesRow"] == (not (k == "updating" and r["w"] == 320)) and not r["stCut"] and not r["docOver"] and not r["mastOver"], (r["w"], g["presence"], r)
 
 
 @needs_browser
 def test_the_live_line_keeps_the_buttons_row_and_the_phone_masthead_height_at_390(tmp_path: Path) -> None:
-    """The accepted look, as the tip had it: live (and "updating") shares the buttons' row and leaves the masthead 185 px (presence chip shown)."""
+    """The accepted look at 390, as the tip had it: live (and "updating", which fits here) shares the buttons' row and leaves the masthead 185 px (presence chip shown)."""
     g = [g for g in _phone(tmp_path, (390,)) if g["presence"]][0]
     rows = {r["k"]: r for r in g["rows"]}
     assert rows["live"]["sharesRow"] and rows["live"]["h"] == 185, rows["live"]
@@ -462,3 +465,21 @@ def test_a_trouble_state_moves_nothing_at_768_and_1440(tmp_path: Path) -> None:
         for g in _phone(tmp_path, widths, touch):
             heights = {r["k"]: r["h"] for r in g["rows"]}
             assert max(heights.values()) - min(heights.values()) <= 1, (g["rows"][0]["w"], g["presence"], heights)
+
+
+@needs_browser
+def test_the_live_and_updating_line_shows_its_age_whole_on_a_phone_at_every_width(tmp_path: Path) -> None:
+    """levain#169: at 320 the "live . updating" line was cut to "live . up..." (the age's ellipsis); the age is the cue, so it is never cut: the line
+    wraps to its own row where the buttons' row has no room for it, and a live line with nothing to say still shares the row."""
+    for g in _phone(tmp_path, (390, 360, 320)):
+        rows = {x["k"]: x for x in g["rows"]}
+        for k in ("live", "updating"):
+            r = rows[k]
+            where = (r["w"], g["presence"], r)
+            assert not r["ageCut"], where                                            # the age's text is not cut (scrollWidth within clientWidth)
+            assert r["ageRight"] <= r["lineRight"] + 0.5 and r["ageRight"] <= r["vw"], where   # inside its container and the screen
+            assert not r["docOver"] and not r["mastOver"], where                     # no sideways scroll
+            assert r["ageShown"] == (k == "updating"), where
+        # the first "connecting" has no age to protect, so it shares the buttons' row as it always did (no jump when the page then goes live)
+        c = rows["connecting"]
+        assert c["state"] == "connecting" and c["sharesRow"] and not c["docOver"] and not c["mastOver"], (c["w"], g["presence"], c)
