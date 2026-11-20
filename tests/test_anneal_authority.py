@@ -217,9 +217,71 @@ def test_doctor_falls_back_to_the_module_when_the_script_cannot_run(tmp_path, mo
     broken.write_text("#!/nonexistent/python\n", encoding="utf-8")
     broken.chmod(0o755)
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(broken))
+    # This test is about the fallback, not the range: no requirement to read, so the installed
+    # (possibly stale) levain metadata cannot decide it.
+    monkeypatch.setattr(importlib.metadata, "requires", lambda name: None)
 
     results = doctor._check_runtime(tmp_path)
 
     anneal = [r for r in results if r.name.startswith("anneal-memory")]
     assert len(anneal) == 1 and anneal[0].ok, anneal
     assert str(broken) in anneal[0].detail
+
+
+# levain#194 part B: the module check judges the importable anneal against the range levain's
+# own metadata declares (a stale guest-VM image carried 1.0.2 and `levain serve` died on import).
+_DECLARED = "anneal-memory<2.1,>=2.0.1"
+
+
+def _module_check(tmp_path, monkeypatch, version_out, requires):
+    from levain import doctor
+
+    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(tmp_path / "no-such-script"))
+    monkeypatch.setattr(
+        doctor, "_probe",
+        lambda cmd, timeout=5.0: (True, version_out) if "anneal_memory" in cmd else (False, ""),
+    )
+
+    def fake_requires(name):
+        assert name == "levain"
+        if isinstance(requires, Exception):
+            raise requires
+        return requires
+
+    monkeypatch.setattr(importlib.metadata, "requires", fake_requires)
+    results = doctor._check_runtime(tmp_path)
+    anneal = [r for r in results if r.name.startswith("anneal-memory")]
+    assert len(anneal) == 1, anneal
+    return anneal[0]
+
+
+@pytest.mark.parametrize("version", ["1.0.2", "2.1.0"])
+def test_doctor_fails_an_importable_anneal_outside_levains_range(tmp_path, monkeypatch, version):
+    r = _module_check(tmp_path, monkeypatch, f"anneal-memory {version}\n",
+                      ["markdown-it-py<5,>=4", _DECLARED, 'mcp>=1.27; extra == "app"'])
+
+    assert r.name == "anneal-memory module" and r.ok is False
+    assert version in r.detail and _DECLARED in r.detail
+    assert r.hint == f"{sys.executable} -m pip install -U '{_DECLARED}'"
+
+
+def test_doctor_passes_an_importable_anneal_inside_levains_range(tmp_path, monkeypatch):
+    r = _module_check(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
+
+    assert r.ok is True and "importable via" in r.detail and "(anneal-memory 2.0.1)" in r.detail
+    assert "not checked" not in r.detail and not r.hint
+
+
+@pytest.mark.parametrize("requires", [None, [], ["markdown-it-py>=4"], RuntimeError("no metadata"),
+                                      ["anneal-memory~=2.0"], ['anneal-memory>=3; extra == "dev"']])
+def test_doctor_does_not_judge_when_the_requirement_is_unreadable(tmp_path, monkeypatch, requires):
+    r = _module_check(tmp_path, monkeypatch, "anneal-memory 1.0.2\n", requires)
+
+    assert r.ok is True and "not checked" in r.detail
+
+
+@pytest.mark.parametrize("out", ["anneal-memory 2.0.1rc1\n", "anneal-memory dev\n", "present\n", ""])
+def test_doctor_does_not_judge_when_the_version_is_unparseable(tmp_path, monkeypatch, out):
+    r = _module_check(tmp_path, monkeypatch, out, [_DECLARED])
+
+    assert r.ok is True and "not checked" in r.detail
