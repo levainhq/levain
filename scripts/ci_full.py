@@ -34,7 +34,11 @@ ROOT = str(Path(__file__).resolve().parent.parent)  # git is asked about the che
 
 
 def _run(argv):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+    """subprocess.run that never raises: a timeout or a missing binary reads as a failed call (returncode 127)."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess(argv, 127, "", f"{type(e).__name__}: {e}")
 
 
 def parse_time(value):
@@ -48,11 +52,14 @@ def parse_time(value):
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
-def pick_run(runs, branch, sha, not_before):
-    """The newest workflow_dispatch run of `branch` at `sha` created at or after `not_before` (aware datetime), else None."""
+def pick_run(runs, branch, sha, not_before, exclude=()):
+    """The newest workflow_dispatch run of `branch` at `sha` created at or after `not_before` (aware datetime) whose id is
+    not in `exclude` (the runs that already existed before this dispatch), else None."""
     best = None
     for r in runs:
         if r.get("event") != "workflow_dispatch" or r.get("head_branch") != branch or r.get("head_sha") != sha:
+            continue
+        if r.get("id") in exclude:
             continue
         created = parse_time(r.get("created_at"))
         if created is None or created < not_before:
@@ -66,6 +73,22 @@ def wall_seconds(run):
     """Seconds from the run's start to its last update, or None when either time is missing."""
     start, end = parse_time(run.get("run_started_at") or run.get("created_at")), parse_time(run.get("updated_at"))
     return None if start is None or end is None else max(0.0, (end - start).total_seconds())
+
+
+def hold_and_run_seconds(jobs):
+    """(seconds the `hold for land runs` job waited, seconds from the first other job's start to the last one's end), either
+    None when the jobs do not show it. The hold is a wait for a landing, not the suite's cost."""
+    hold, rest = None, []
+    for j in jobs:
+        a, b = parse_time(j.get("started_at")), parse_time(j.get("completed_at"))
+        if a is None or b is None:
+            continue
+        if str(j.get("name", "")).startswith("hold for land runs"):
+            hold = (b - a).total_seconds()
+        elif j.get("conclusion") != "skipped":
+            rest.append((a, b))
+    run = (max(b for _, b in rest) - min(a for a, _ in rest)).total_seconds() if rest else None
+    return hold, run
 
 
 def not_passed(jobs):
@@ -117,6 +140,10 @@ def main(argv):
         print(f"ci_full: origin/{branch} is at {remote_sha[:10]}, local {branch} at {sha[:10]}: push first, CI tests what origin holds", file=sys.stderr)
         return 2
 
+    try:
+        before = {r.get("id") for r in _api(repo, f"actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch&branch={branch}&per_page=20")["workflow_runs"]}
+    except (RuntimeError, KeyError, ValueError):
+        before = set()
     t0 = datetime.now(timezone.utc)
     p = _run(["gh", "workflow", "run", WORKFLOW, "--repo", repo, "--ref", branch])
     if p.returncode != 0:
@@ -134,7 +161,7 @@ def main(argv):
         except (RuntimeError, KeyError, ValueError) as e:
             print(f"ci_full: {e}", file=sys.stderr)
             continue
-        run = pick_run(runs, branch, sha, not_before)
+        run = pick_run(runs, branch, sha, not_before, before)
     if run is None:
         print("ci_full: dispatched, but no run for this branch and sha appeared; read the run list by hand", file=sys.stderr)
         return 2
@@ -156,10 +183,20 @@ def main(argv):
             time.sleep(POLL_S)
             continue
         if cur.get("status") == "completed":
-            jobs = _api(repo, f"actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
-            wall = wall_seconds(cur)
             ok = cur.get("conclusion") == "success"
-            print(f"{'PASS' if ok else 'FAIL'}: {cur.get('conclusion')} in {wall / 60:.1f} min wall ({url})" if wall is not None else f"{'PASS' if ok else 'FAIL'}: {cur.get('conclusion')} ({url})")
+            verdict = "PASS" if ok else "FAIL"
+            wall = wall_seconds(cur)
+            line = f"{verdict}: {cur.get('conclusion')} in {wall / 60:.1f} min wall ({url})" if wall is not None else f"{verdict}: {cur.get('conclusion')} ({url})"
+            try:
+                jobs = _api(repo, f"actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
+            except (RuntimeError, ValueError) as e:
+                print(line)
+                print(f"  (the job list could not be read: {e})")
+                return 0 if ok else 1
+            hold, ran = hold_and_run_seconds(jobs)
+            if hold is not None and ran is not None:
+                line += f" = held {hold / 60:.1f} min for land runs + {ran / 60:.1f} min of jobs"
+            print(line)
             for name in not_passed(jobs):
                 print(f"  did not pass: {name}")
             return 0 if ok else 1

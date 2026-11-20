@@ -39,8 +39,9 @@ env:
   # History: the 3.12 job outgrew its cap unsharded (so it was split), then two shards outgrew the cap at 4 shards (11-03,
   # because the weight was a count of `def test_` lines and new files held few, slow tests). 11-20 (np-b454f2f6): a full run
   # took ~17 min wall at 6 shards while the laptop's cores carried the seats' own suites; a public repo's Linux minutes
-  # cost nothing and the plan runs far more concurrent jobs than a run holds, so the count was raised so CI, not the
-  # laptop, runs the full suite fast. Re-cut the count and the static list below together; rebalance from the per-shard
+  # cost nothing, so the count was raised so CI, not the laptop, runs the full suite fast. The org's plan allows 60
+  # concurrent jobs (Team; docs.github.com/actions/reference/limits, read 11-20): one full run fits, two overlapping runs
+  # queue in creation order, and the `hold` job below keeps only a seat dispatch from overlapping a land/** run. Re-cut the count and the static list below together; rebalance from the per-shard
   # durations in a run's job list (tests/ci/shard.py `weights`), and read a new run's wall time before moving it again.
   TEST_SHARDS: "14"
 

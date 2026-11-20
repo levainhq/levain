@@ -40,3 +40,19 @@ def test_not_passed_names_failures_cancellations_and_timeouts_only():
     assert ci_full.not_passed(jobs) == ["c", "d"]
     run = {"run_started_at": "2026-11-20T16:00:00Z", "updated_at": "2026-11-20T16:07:30Z"}
     assert ci_full.wall_seconds(run) == 450.0
+
+
+def test_pick_run_skips_a_run_that_existed_before_the_dispatch():
+    runs = [_run(7, "2026-11-20T16:00:40Z"), _run(8, "2026-11-20T16:00:50Z")]
+    assert ci_full.pick_run(runs, "seat/x", "abc", T0, exclude={8})["id"] == 7
+
+
+def test_hold_and_run_seconds_split_the_wait_from_the_jobs():
+    jobs = [
+        {"name": "hold for land runs", "started_at": "2026-11-20T16:00:00Z", "completed_at": "2026-11-20T16:17:00Z", "conclusion": "success"},
+        {"name": "pytest (Python 3.12, shard 0)", "started_at": "2026-11-20T16:17:05Z", "completed_at": "2026-11-20T16:24:05Z", "conclusion": "success"},
+        {"name": "pytest (Python 3.12, shard 1)", "started_at": "2026-11-20T16:17:05Z", "completed_at": "2026-11-20T16:28:05Z", "conclusion": "success"},
+        {"name": "verified on x run y", "started_at": "2026-11-20T16:00:00Z", "completed_at": "2026-11-20T16:00:00Z", "conclusion": "skipped"},
+    ]
+    assert ci_full.hold_and_run_seconds(jobs) == (1020.0, 660.0)
+    assert ci_full.hold_and_run_seconds([]) == (None, None)

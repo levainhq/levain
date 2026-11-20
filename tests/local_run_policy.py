@@ -13,15 +13,21 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 LOCAL_WORKERS_MAX = 4
 _PRIO_DARWIN_PROCESS = 4
 _PRIO_DARWIN_BG = 0x1000
 
 
+def _truthy(value):
+    return str(value or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def on_ci(env=None):
+    """CI is told by the variables a runner sets; `CI=false` or `CI=0` (a shell exporting the name off) is not CI."""
     env = os.environ if env is None else env
-    return bool(env.get("CI") or env.get("GITHUB_ACTIONS"))
+    return _truthy(env.get("CI")) or _truthy(env.get("GITHUB_ACTIONS"))
 
 
 def worker_cap(env=None):
@@ -33,9 +39,30 @@ def worker_cap(env=None):
     return n if n >= 1 else LOCAL_WORKERS_MAX
 
 
-def is_bare_full(positional, keyword, markexpr, collect_only, last_failed=False):
-    """True when nothing narrows the run: no path or node id, no -k, no -m, no --collect-only, no --lf."""
-    return not (positional or keyword or markexpr or collect_only or last_failed)
+def names_whole_tree(positional, invocation_dir, root_dir):
+    """True when a positional argument is the whole suite: the tests directory, the rootdir, or a directory above them
+    (a node id, a file, or a directory below tests/ narrows the run; `pytest tests/` does not)."""
+    tests = (root_dir / "tests").resolve()
+    for arg in positional:
+        path = Path(str(arg).split("::", 1)[0])
+        if not path.is_absolute():
+            path = Path(invocation_dir) / path
+        path = path.resolve()
+        if path == tests or path in tests.parents:
+            return True
+    return False
+
+
+def is_bare_full(positional, keyword, markexpr, collect_only, last_failed=False, whole_tree=False):
+    """True when nothing narrows the run: no path or node id below tests/, no -k, no -m, no --collect-only, no --lf."""
+    if keyword or markexpr or collect_only or last_failed:
+        return False
+    return whole_tree or not positional
+
+
+def _is_info_run(ns):
+    """--help, --version, --markers and --fixtures collect nothing."""
+    return any(getattr(ns, name, False) for name in ("help", "version", "markers", "showfixtures", "fixtures"))
 
 
 REFUSAL = (
@@ -52,12 +79,17 @@ def refuse_bare_full(config, env=None):
     if on_ci(env) or env.get("LEVAIN_LOCAL_FULL") == "1" or hasattr(config, "workerinput"):
         return None
     ns = config.known_args_namespace
+    if _is_info_run(ns):
+        return None
+    positional = list(getattr(ns, "file_or_dir", None) or [])
+    whole = names_whole_tree(positional, config.invocation_params.dir, config.rootpath)
     if is_bare_full(
-        list(getattr(ns, "file_or_dir", None) or []),
+        positional,
         getattr(ns, "keyword", ""),
         getattr(ns, "markexpr", ""),
         bool(getattr(ns, "collectonly", False)),
         bool(getattr(ns, "lf", False)),
+        whole,
     ):
         return REFUSAL
     return None

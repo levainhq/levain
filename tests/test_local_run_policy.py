@@ -3,21 +3,25 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tests import local_run_policy as p
 
+ROOT = Path(__file__).resolve().parent.parent
 NO_ENV = {}
 CI_ENV = {"GITHUB_ACTIONS": "true"}
 
 
-def _config(file_or_dir=(), keyword="", markexpr="", collectonly=False, lf=False, maxprocesses=0, worker=False):
+def _config(file_or_dir=(), keyword="", markexpr="", collectonly=False, lf=False, maxprocesses=0, worker=False, info=None, cwd=ROOT):
     cfg = SimpleNamespace(
         known_args_namespace=SimpleNamespace(
-            file_or_dir=list(file_or_dir), keyword=keyword, markexpr=markexpr, collectonly=collectonly, lf=lf),
+            file_or_dir=list(file_or_dir), keyword=keyword, markexpr=markexpr, collectonly=collectonly, lf=lf, **({info: True} if info else {})),
         option=SimpleNamespace(maxprocesses=maxprocesses),
+        invocation_params=SimpleNamespace(dir=cwd),
+        rootpath=ROOT,
     )
     if worker:
         cfg.workerinput = {}
@@ -32,6 +36,15 @@ def test_a_bare_full_run_is_refused_and_a_targeted_one_is_not():
         assert p.refuse_bare_full(narrowed, NO_ENV) is None
 
 
+def test_the_whole_tests_directory_is_a_full_run_and_an_info_flag_is_not():
+    for whole in (["tests"], ["tests/"], ["."], [str(ROOT)], [str(ROOT / "tests")], ["tests", "tests/test_x.py"]):
+        assert p.refuse_bare_full(_config(whole), NO_ENV) == p.REFUSAL, whole
+    assert p.refuse_bare_full(_config(["."], cwd=ROOT / "tests"), NO_ENV) == p.REFUSAL   # `.` from inside tests/
+    assert p.refuse_bare_full(_config(["tests/ci"]), NO_ENV) is None                     # a directory below tests/ narrows
+    for flag in ("help", "version", "markers", "showfixtures"):
+        assert p.refuse_bare_full(_config(info=flag), NO_ENV) is None, flag
+
+
 def test_local_full_one_overrides_the_refusal_and_nothing_else_does():
     assert p.refuse_bare_full(_config(), {"LEVAIN_LOCAL_FULL": "1"}) is None
     assert p.refuse_bare_full(_config(), {"LEVAIN_LOCAL_FULL": "yes"}) == p.REFUSAL
@@ -40,6 +53,7 @@ def test_local_full_one_overrides_the_refusal_and_nothing_else_does():
 
 def test_ci_environment_bypasses_the_refusal_the_cap_and_the_qos():
     assert p.on_ci(CI_ENV) and p.on_ci({"CI": "true"}) and not p.on_ci(NO_ENV)
+    assert not p.on_ci({"CI": "false"}) and not p.on_ci({"CI": "0"}) and not p.on_ci({"GITHUB_ACTIONS": "false"})
     assert p.refuse_bare_full(_config(), CI_ENV) is None
     cfg = _config(maxprocesses=64)
     p.cap_workers(cfg, CI_ENV)
