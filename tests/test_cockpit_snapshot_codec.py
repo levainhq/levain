@@ -11,6 +11,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import statistics
 import time
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -133,7 +134,7 @@ def _round_trip(s: _Snap) -> tuple[float, _Snap]:
 
 
 _SMALL_ROWS, _BIG_ROWS = 250, 5000  # the step between the two timed sizes
-_PAIRS = 5  # small and big attempts, interleaved
+_PAIRS = 5  # small and big attempts, interleaved; odd so the median is one measured pair
 _GROWTH_ALLOWANCE = 3  # the time ratio may reach this multiple of the size ratio
 
 
@@ -142,13 +143,18 @@ def test_a_large_rows_list_round_trips_in_linear_time() -> None:
 
     A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
     times the same round trip at a small row count and at a much larger one (_SMALL_ROWS, _BIG_ROWS), in the same test
-    on the same box. The attempts alternate small, big, small, big so a load burst lands on both halves of a pair, the
-    time ratio is taken per pair, and the lowest pair ratio is kept. The test fails when that ratio reaches
-    _GROWTH_ALLOWANCE times the size ratio. That catches growth well past linear, such as a size-quadratic blowup in
-    the encode or the decode, whose ratio nears the square of the size ratio. It does not catch a constant-factor
-    slowdown, nor a mild superlinear one that stays under the bound. The big round trip must also decode back to the
-    same change-detection text as the original."""
+    on the same box. One untimed round trip of the small size runs first, so the first timed small run does not pay
+    cold-start costs. The _PAIRS attempts then alternate small, big, small, big, the time ratio is taken per pair, and
+    the MEDIAN pair ratio is gated. The test fails when that median reaches _GROWTH_ALLOWANCE times the size ratio. The
+    median is robust both ways: a stall that lands on one small run (which would collapse that pair's ratio) or on one
+    big run (which would inflate it) moves one pair, and one pair cannot decide the verdict, so a noisy box neither
+    hides a regression nor fails a clean codec. That catches growth well past linear, such as a size-quadratic blowup
+    in the encode or the decode, whose ratio nears the square of the size ratio, provided it shows in most pairs. It
+    misses a regression that appears in fewer than half the pairs, a constant-factor slowdown, and a mild superlinear
+    one that stays under the bound. The big round trip must also decode back to the same change-detection text as the
+    original."""
     small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
+    _round_trip(small)  # warm-up, untimed
     ratios: list[float] = []
     last_back: _Snap | None = None
     for _ in range(_PAIRS):
@@ -156,7 +162,7 @@ def test_a_large_rows_list_round_trips_in_linear_time() -> None:
         big_took, last_back = _round_trip(big)
         ratios.append(big_took / small_took)
     bound = _GROWTH_ALLOWANCE * (_BIG_ROWS / _SMALL_ROWS)
-    assert min(ratios) < bound, (ratios, bound)
+    assert statistics.median(ratios) < bound, (ratios, bound)
     assert last_back is not None and _frags(last_back) == _frags(big)
 
 
