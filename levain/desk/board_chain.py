@@ -1,6 +1,6 @@
 """levain.desk.board_chain — the one chain checker for ``items.jsonl`` and ``repos.jsonl`` (design 7.4, P1).
 
-Stdlib only and no levain import, so both pure folds (:mod:`levain.desk.board_state`, :mod:`levain.desk.repos_fold`) and the
+Stdlib only and no levain import (it also holds the tier shape, :func:`is_tier`, which the writer and the fold share), so both pure folds (:mod:`levain.desk.board_state`, :mod:`levain.desk.repos_fold`) and the
 writer (:mod:`levain.desk.board_store`) call the SAME functions over the SAME lines. It reads nothing and writes nothing.
 
 The rules, per file (the two files are two chains; nothing chains across them):

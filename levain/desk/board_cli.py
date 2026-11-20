@@ -194,8 +194,9 @@ def register(subparsers: Any) -> None:
     u.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
     u.add_argument("--tiers", dest="tiers", action="append", default=[], metavar="REPO=T1,T2",
-                   help="The tiers REPO may use (repeatable; none declared means any well-shaped tier); saved in the board config, "
-                        "written exactly from the flags like --producer.")
+                   help="The tiers REPO may use (repeatable; none declared means any well-shaped tier); saved in the board config. "
+                        "Unlike --producer, a re-run keeps every declaration it does not name: --tiers REPO=a,b replaces that "
+                        "repo's list and --tiers REPO= clears it.")
     author_args(u)
     u.set_defaults(func=run_use)
     # the desk's door opens these, each where it is defined (install.DESK_BOARD_VERBS is the same list, for its allow rules)
@@ -511,14 +512,30 @@ def run_decide(args: argparse.Namespace) -> int:
 
 
 def _tiers_flags(specs: Sequence[str]) -> dict[str, list[str]]:
-    """``--tiers REPO=a,b`` (repeatable) as ``{repo: [a, b]}``; the same repo named twice adds to its list."""
+    """``--tiers REPO=a,b`` (repeatable) as ``{repo: [a, b]}``; the same repo named twice adds to its list, and ``REPO=`` is an
+    empty list (the repo's declaration is cleared)."""
     out: dict[str, list[str]] = {}
     for spec in specs:
         repo, eq, names = spec.partition("=")
         if not eq or not repo:
-            raise bs.BoardError(f"--tiers {spec!r} must read REPO=tier,tier")
-        out.setdefault(repo, []).extend(n.strip() for n in names.split(","))
+            raise bs.BoardError(f"--tiers {spec!r} must read REPO=tier,tier (REPO= alone clears that repo's declaration)")
+        out.setdefault(repo, []).extend([n.strip() for n in names.split(",")] if names.strip() else [])
     return out
+
+
+def _merged_tiers(store_dir: Path | str, flags: dict[str, list[str]]) -> dict[str, list[str]]:
+    """The declared tiers ``use`` writes: the ones already saved, with each repo named by ``--tiers`` replaced (an empty list
+    removes it). A saved config that cannot be read keeps nothing, as the rest of it is replaced by the default."""
+    try:
+        kept = {r: list(v) for r, v in bs.read_config(store_dir)["tiers"].items()}
+    except bs.BoardError:
+        kept = {}
+    for repo, names in flags.items():
+        if names:
+            kept[repo] = names
+        else:
+            kept.pop(repo, None)
+    return kept
 
 
 def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
@@ -528,7 +545,7 @@ def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
     def write(store_dir: Path) -> bool:
         if not (args.producers or args.no_land_waiter or args.tiers or (Path(store_dir) / bs.CONFIG_NAME).exists()):
             return False
-        return bs.write_config(store_dir, args.producers, args.no_land_waiter, _tiers_flags(args.tiers))
+        return bs.write_config(store_dir, args.producers, args.no_land_waiter, _merged_tiers(store_dir, _tiers_flags(args.tiers)))
     return write
 
 

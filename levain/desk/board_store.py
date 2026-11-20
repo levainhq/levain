@@ -1,7 +1,7 @@
 """levain.desk.board_store — the board's item store: where it lives, the one lock over it, and the writer.
 
 The writer is a port of flow's ``scripts/board.py``: flow's records (compact separators, ASCII only) plus three keys of
-its own, ``author``, ``grade`` and ``prev`` (see :func:`build_record`, :func:`chain_prev`), the same refusals, the same id
+its own, ``author``, ``grade`` and ``prev`` (see :func:`build_record`, :func:`chain_prev`), the same id
 allocation under the lock. Item STATE is never stored; this module writes
 records and reads ids only. The fold and every state rule live in :mod:`levain.desk.board_state`, which this module does
 not import.
@@ -1161,7 +1161,12 @@ def tier_vocabulary(target: Target, repo: str) -> tuple[str, ...] | None:
     Only a real store has a config: a standalone ``--items`` file is read as having none."""
     if not is_store(target):
         return None
-    return read_config(target.store_dir)["tiers"].get(repo)
+    declared, bad = _tiers_state(target.store_dir)
+    problem = bad.get(repo) or bad.get(None)
+    if problem:
+        raise BoardError(f"the board config {Path(target.store_dir) / CONFIG_NAME} declares tiers that cannot be used: {problem}; "
+                         f"fix it with `levain board use --tiers`")
+    return declared.get(repo)
 
 
 def check_tier(target: Target, repo: str, tier: Any) -> None:
@@ -1206,15 +1211,32 @@ def _config_doc(producers: Any, no_land_waiter: Any, tiers: Any = None) -> dict[
     return doc
 
 
-def read_config(store_dir: Path | str) -> dict[str, Any]:
-    """The board config ``levain board use --producer/--no-land-waiter`` wrote in the store dir: ``{producers: [..],
-    no_land_waiter: bool}``. No file is the default (no external producer named, a land waiter assumed). A file that cannot be
-    read or is not this shape raises ``BoardError``: a config that cannot be read is never silently the default."""
+def _tiers_lenient(raw: Any) -> tuple[dict[str, tuple[str, ...]], dict[str | None, str]]:
+    """A config's ``tiers`` as READ: the repos whose list is well-formed, and the problem of each that is not (the key None: the
+    whole value is not a mapping). A bad value is never a refusal on a read: it declares nothing."""
+    if not raw:
+        return {}, {}
+    if not isinstance(raw, Mapping):
+        return {}, {None: "tiers must map a repo name to its list of tiers"}
+    good: dict[str, tuple[str, ...]] = {}
+    bad: dict[str | None, str] = {}
+    for repo, names in raw.items():
+        try:
+            clean = _tiers_doc({repo: names})
+        except BoardError as exc:
+            bad[repo if isinstance(repo, str) else None] = str(exc)
+            continue
+        good.update({r: tuple(v) for r, v in clean.items()})
+    return good, bad
+
+
+def _config_file(store_dir: Path | str) -> dict[str, Any] | None:
+    """The parsed board config, or None when there is no file; refuses a file that cannot be read or is not a v1 config."""
     path = Path(store_dir) / CONFIG_NAME
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return {"producers": [], "no_land_waiter": False, "tiers": {}}
+        return None
     except OSError as exc:
         raise BoardError(f"the board config {path} cannot be read: {exc}") from None
     try:
@@ -1224,12 +1246,26 @@ def read_config(store_dir: Path | str) -> dict[str, Any]:
     if (not isinstance(doc, dict) or doc.get("config_v") != 1 or not isinstance(doc.get("producers"), list)
             or not isinstance(doc.get("no_land_waiter"), bool)):
         raise BoardError(f"the board config {path} is not a v1 config (config_v, producers, no_land_waiter)")
+    return doc
+
+
+def _tiers_state(store_dir: Path | str) -> tuple[dict[str, tuple[str, ...]], dict[str | None, str]]:
+    doc = _config_file(store_dir)
+    return _tiers_lenient(None if doc is None else doc.get("tiers"))
+
+
+def read_config(store_dir: Path | str) -> dict[str, Any]:
+    """The board config ``levain board use --producer/--no-land-waiter`` wrote in the store dir: ``{producers: [..],
+    no_land_waiter: bool, tiers: {repo: (..)}}`` (a ``tiers`` value that cannot be used reads as none declared, never a refusal). No file is the default (no external producer named, a land waiter assumed). A file that cannot be
+    read or is not this shape raises ``BoardError``: a config that cannot be read is never silently the default."""
+    doc = _config_file(store_dir)
+    if doc is None:
+        return {"producers": [], "no_land_waiter": False, "tiers": {}}
     try:
-        clean = _config_doc(doc["producers"], doc["no_land_waiter"], doc.get("tiers"))
+        clean = _config_doc(doc["producers"], doc["no_land_waiter"])
     except BoardError as exc:
-        raise BoardError(f"the board config {path} cannot be used: {exc}") from None
-    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"],
-            "tiers": {r: tuple(v) for r, v in clean.get("tiers", {}).items()}}
+        raise BoardError(f"the board config {Path(store_dir) / CONFIG_NAME} cannot be used: {exc}") from None
+    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"], "tiers": _tiers_lenient(doc.get("tiers"))[0]}
 
 
 def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any, tiers: Any = None) -> bool:

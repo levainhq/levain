@@ -1119,5 +1119,27 @@ def test_a_declared_vocabulary_refuses_a_tier_outside_it_naming_the_list(home, t
     assert _add(capsys, "x", repo="other")[0] == 0 and _add(capsys, "y", repo="other")[0] == 2
     rc, _, err = run(capsys, "use", str(tmp_path / "store"), "--tiers", "levain=Bad")
     assert rc == 2 and "well-shaped" in err
-    assert run(capsys, "use", str(tmp_path / "store"))[0] == 0      # a flagless re-run clears the declaration, as for the other flags
+
+
+def test_use_keeps_a_declaration_it_does_not_name_replaces_and_clears(home, tmp_path, capsys):
+    d = tmp_path / "store"
+    run(capsys, "use", str(d), "--tiers", "levain=light,heavy", "--tiers", "other=x")
+    assert run(capsys, "use", str(d))[0] == 0                       # flagless: both declarations stay
+    assert bs.read_config(d)["tiers"] == {"levain": ("light", "heavy"), "other": ("x",)}
+    run(capsys, "use", str(d), "--tiers", "levain=mid")             # replaces that repo's list only
+    assert bs.read_config(d)["tiers"] == {"levain": ("mid",), "other": ("x",)}
+    run(capsys, "use", str(d), "--tiers", "other=")                 # an empty list clears that repo
+    assert bs.read_config(d)["tiers"] == {"levain": ("mid",)}
+    assert _add(capsys, "sonnet")[0] == 2 and _add(capsys, "mid")[0] == 0
+
+
+@pytest.mark.parametrize("bad", ["light", {"levain": "light"}, {"levain": ["Bad Tier"]}, {"levain": []}])
+def test_a_malformed_tiers_value_reads_as_none_declared_and_refuses_only_a_tier_write(home, tmp_path, capsys, bad):
+    d = use(capsys, tmp_path / "store")
     assert _add(capsys, "sonnet")[0] == 0
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": bad}))
+    assert bs.read_config(d)["tiers"] == {}                         # a read never refuses over it
+    assert run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b")[0] == 0
+    rc, _, err = _add(capsys, "light")
+    assert rc == 2 and bs.CONFIG_NAME in err and "cannot be used" in err
+    assert _add(capsys, "light", repo="other")[0] == (2 if not isinstance(bad, dict) else 0)
