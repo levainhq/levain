@@ -602,17 +602,17 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
-            # waits for the focus to come back (up to 10 s) instead of a fixed 400 ms: a loaded CI runner failed this twice on 11-20
-            {"eval": "document.querySelector('#levain-modal .modal-close').click(); "
-                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            # a board draw may land between the click and this read and replace the control: its successor takes the focus when it is drawn, so the read is a bounded poll that ends at the first success
+            {"eval": f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
-    wide = json.loads(out["values"][-6])
+    wide = json.loads(out["values"][-7])
     assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
     assert wide["label"] and "desk owes 2" in wide["label"] and "open the full list" in wide["label"], wide
     assert wide["tags"] == [True], wide                                            # the carried row is tagged desk-owed, as the footer tags it
-    heads = json.loads(out["values"][-3])
+    heads = json.loads(out["values"][-4])
     assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
     assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
     assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view
@@ -639,6 +639,35 @@ def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
     assert out["values"][-1] is True, out["values"]
+
+
+@needs_browser
+def test_listpanel_a_board_redraw_after_the_full_list_closed_keeps_focus_on_the_cards_control(tmp_path: Path, monkeypatch: Any) -> None:
+    # the view has closed and given the focus back; the board is then drawn again (a poll does this) and replaces the control that holds it
+    src = _carried_install(tmp_path, monkeypatch)
+    ctl = "document.querySelector('[data-ck-panel=tray] [data-list-more]')"
+    focus_is_control = f"document.activeElement && document.activeElement === {ctl}"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            # the close hands the focus to the control (waited for, bounded), which is then kept to show the redraw replaced it; the successor is looked for on a timer
+            # (a hidden tab pauses animation frames), so the read is made as soon as the page gives it the focus and the deadline is checked on every tick and is past the ask's window
+            {"eval": "(() => { document.querySelector('#levain-modal .modal-close').click(); "
+                     f"const wait = (done, ms) => new Promise(r => {{ const t0 = Date.now(); const tick = () => (done() || Date.now() - t0 > ms) ? r(1) : setTimeout(tick, 16); tick(); }}); "
+                     f"return wait(() => {focus_is_control}, 5000).then(() => {{ "
+                     f"const old = {ctl}; const heldBefore = !!old && document.activeElement === old; window.LevainDashboard.redraw(); const replaced = !!old && !old.isConnected; "
+                     f"return wait(() => {focus_is_control}, 3500).then(() => JSON.stringify({{heldBefore, replaced, successor: {ctl} !== old, "
+                     f"focus: ({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing') + ' ctl=' + !!{ctl}}})); }}); }})()"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got["heldBefore"] is True, got      # the control held the focus when the redraw ran
+    assert got["replaced"] is True and got["successor"] is True, got      # the redraw took that control out and drew another
+    assert got["focus"] is True, got
 
 
 @needs_browser

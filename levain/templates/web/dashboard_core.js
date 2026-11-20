@@ -323,7 +323,9 @@
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
     { const ae = document.activeElement;   // a focused open tile is replaced by this draw: its successor takes the focus
-      if (ae && ae !== document.body && ae.dataset && ae.dataset.ckPanel && ae.classList.contains("w-open")) askTileFocus(ae.dataset.ckPanel); }
+      if (ae && ae !== document.body && ae.dataset && ae.dataset.ckPanel && ae.classList.contains("w-open")) askTileFocus(ae.dataset.ckPanel);
+      // the List card's control that holds the focus is replaced by this draw as well: the control drawn next is given it (listMore)
+      else if (ae && ae.dataset && ae.dataset.listMore && ae.closest('[data-ck-panel="tray"]')) askTileFocus("tray"); }
     buildKept = kept;                  // a typed panel filled during this draw may owe the reader a later repaint of it
     board.replaceChildren();
 
