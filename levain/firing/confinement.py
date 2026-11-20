@@ -3953,8 +3953,9 @@ def hands_claude_argv(*args: str, settings: dict | None = None) -> list[str]:
     """``claude --settings <compact sorted JSON> <args...>``: the ONE place a hands Claude argv is built, and the one place
     the flag sits (right after the program). NOT YET RUN on a real guest: whether Claude Code parses ``--settings`` ahead of
     the ``auth`` and ``mcp`` subcommands is a fresh-VM measurement; if it does not, moving the pair after the subcommand
-    is a change to this return value alone. ``settings`` is merged over :data:`HANDS_CLAUDE_BASE_SETTINGS`."""
-    merged = {**HANDS_CLAUDE_BASE_SETTINGS, **(settings or {})}
+    is a change to this return value alone. ``settings`` is merged UNDER :data:`HANDS_CLAUDE_BASE_SETTINGS`: the base
+    keys always win, so a caller's key cannot turn the connectors-off layer back on."""
+    merged = {**(settings or {}), **HANDS_CLAUDE_BASE_SETTINGS}
     return ["claude", "--settings", json.dumps(merged, sort_keys=True, separators=(",", ":")), *args]
 
 

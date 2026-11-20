@@ -128,3 +128,10 @@ def test_the_codex_argvs_take_no_settings_flag(monkeypatch):
     for argv in (hands_login.login_argv(h, "codex"), hands_login.status_argv(h, "codex"),
                  hands_mcp_login.codex_chat_argv(h)):
         assert "--settings" not in argv
+
+
+def test_a_callers_settings_key_cannot_turn_the_connectors_layer_back_on():
+    import json
+    argv = confinement.hands_claude_argv("auth", "status", settings={"disableClaudeAiConnectors": False, "other": 1})
+    got = json.loads(argv[argv.index("--settings") + 1])
+    assert got["disableClaudeAiConnectors"] is True and got["other"] == 1
