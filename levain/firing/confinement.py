@@ -3928,8 +3928,9 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
                          tuple(cfg.hands_egress_ports))
 
 
-#: The hands account signs in as the operator, and a Claude Code start WITHOUT ``--strict-mcp-config`` (``claude mcp list``, a
-#: status or login probe) adds that account's claude.ai connectors (its mail, drive and calendar connectors). Measured on a
+#: The hands account signs in as the operator, and a Claude Code start WITHOUT ``--strict-mcp-config`` adds that account's
+#: claude.ai connectors (its mail, drive and calendar connectors). Measured only for ``claude mcp list`` (the status and login
+#: probes are non-strict too and presumed alike, not measured), on a
 #: fresh macOS 15.7.7 hands account 11-20 (levain#139, leg 6): ``claude mcp list`` showed five connected claude.ai connectors;
 #: with this variable it said "No MCP servers configured" (project_memory/1118-vm/leg6_fresh_evidence/chat_mcplist.txt and
 #: chat_mcplist_off.txt). The chat's strict start did NOT show them (levain-leg6 2's 14:30 correction in the desk log), so this
