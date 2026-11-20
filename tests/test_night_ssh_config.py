@@ -63,11 +63,18 @@ def test_an_address_with_a_host_key_alias_renders_both_lines(tmp_path):
 
 def test_no_alias_renders_no_host_key_alias_line(tmp_path):
     assert "HostKeyAlias" not in night_ssh.render_config(ADDR, tmp_path)
-    assert night_ssh.render_config(ADDR, tmp_path, host_key_alias=None) == night_ssh.render_config(ADDR, tmp_path)
+
+
+def test_the_alias_line_is_the_only_difference_from_the_no_alias_render(tmp_path):
+    base = night_ssh.render_config(ADDR, tmp_path).splitlines()
+    with_alias = night_ssh.render_config(ADDR, tmp_path, host_key_alias="taoserv.example.net").splitlines()
+    assert [ln for ln in with_alias if ln not in base] == ["    HostKeyAlias taoserv.example.net"]
+    assert [ln for ln in with_alias if ln != "    HostKeyAlias taoserv.example.net"] == base
 
 
 @pytest.mark.parametrize("bad", ["", "a b", "a\nHost evil", "a\tb", "a/b", "-oProxyCommand=x", "-a.example", "é.example",
-                                 "a;b", "x" * 300, "REPLACE-WITH-TAOSERV-ADDRESS", "replace-with-taoserv-address"])
+                                 "a;b", "x" * 300, "a." * 127 + "a", "a.example\n", "a.example.", "a..b",
+                                 "REPLACE-WITH-TAOSERV-ADDRESS", "replace-with-taoserv-address"])
 def test_a_host_key_alias_that_is_not_a_plain_name_is_refused(tmp_path, bad):
     with pytest.raises(ValueError):
         night_ssh.render_config(ADDR, tmp_path, host_key_alias=bad)
