@@ -69,3 +69,32 @@ def test_statement_ledger_gives_signs_and_clean_run(tmp_path, capsys):
         "2026-11-20  signs=1 empty_failures=1 failed_signs=2 other_failures=1",
         "clean_run=1",
     ]
+
+
+def test_bad_ledger_lines_are_skipped_and_counted(tmp_path, capsys):
+    _dir(tmp_path)
+    ledger = tmp_path / "statements.jsonl"
+    line = lambda ts: '{"event": "statement", "signed": {"sig": "x"}, "ts": %s}' % ts
+    ledger.write_text("\n".join([line("1e20"), line('"1795000000"'), line("true"), line("NaN"), line("Infinity"),
+                                 line("1795000000")]) + "\n")      # the last is a 2026-11-18 sign
+    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "2026-11-18  signs=1 empty_failures=0 failed_signs=0 other_failures=0" in out
+    assert "note: 5 unreadable record(s) skipped" in out
+    assert out[-1] == "clean_run=0"       # that good sign is before the latest empty failure
+
+
+def test_non_utf8_ledger_is_refused(tmp_path, capsys):
+    _dir(tmp_path)
+    ledger = tmp_path / "statements.jsonl"
+    ledger.write_bytes(b"\xff\xfe\x00bad\n")
+    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 1
+    assert "sign-stretch: cannot read" in capsys.readouterr().err
+
+
+def test_missing_dir_is_refused_but_no_subdirectory_is_clean(tmp_path, capsys):
+    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "nope")]) == 1
+    assert "sign-stretch: no such directory" in capsys.readouterr().err
+    (tmp_path / "keys").mkdir()
+    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys")]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "no sign-failure records"

@@ -9,6 +9,7 @@ stretch of signs is long enough is the person's to judge from the numbers; nothi
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -49,7 +50,9 @@ def _day(epoch: float) -> str:
 
 
 def _read_statements(path: Path) -> tuple[list[float], int]:
-    """``(ts of each good-sign line, unreadable lines)``; a line that is not a JSON object is counted unreadable."""
+    """``(ts of each good-sign line, unreadable lines)``. A line that is not a JSON object, or whose ts is not a finite
+    number a UTC day can be made from (a bool, a string, NaN, infinity, one too large), is counted unreadable. A ledger
+    that is not UTF-8 raises UnicodeDecodeError (a ValueError); the caller reports it."""
     times: list[float] = []
     bad = 0
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -58,8 +61,12 @@ def _read_statements(path: Path) -> tuple[list[float], int]:
         try:
             rec = json.loads(line)
             if rec.get("event") == "statement" and rec.get("signed"):
-                times.append(float(rec["ts"]))
-        except (ValueError, AttributeError, KeyError, TypeError):
+                ts = rec["ts"]
+                if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
+                    raise ValueError("ts")
+                _day(ts)
+                times.append(float(ts))
+        except (ValueError, AttributeError, KeyError, TypeError, OverflowError, OSError):
             bad += 1
     return times, bad
 

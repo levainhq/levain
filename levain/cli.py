@@ -583,7 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
             "other_failures; then clean_run=K, the good signs since the latest empty failure (the good signs and the "
             "empty-failure records merged by time; K counts the good ones after the last empty one). That directory "
             "holds failures only, so signs and clean_run print as unavailable (no success ledger) unless --statements "
-            "names the good signs. Reads only; never touches a key."
+            "names the good signs. clean_run counts good signs strictly after the latest empty failure. Days are UTC. "
+            "The evidence directory is capped, so the failure counts of old days are lower bounds. "
+            "Reads only; never touches a key."
         ),
     )
     ck_stretch.add_argument("--statements", type=Path, default=None, metavar="PATH",
@@ -591,7 +593,8 @@ def build_parser() -> argparse.ArgumentParser:
                                  "\"event\": \"statement\", a non-empty \"signed\" object and \"ts\" in epoch seconds; "
                                  "other lines are ignored. Days are UTC.")
     ck_stretch.add_argument("--dir", type=Path, default=None,
-                            help="The key directory (default: <levain home>/keys, i.e. $LEVAIN_HOME/keys or ~/.levain/keys).")
+                            help="The directory where the key and its sign-failures subdirectory live (default: "
+                                 "<levain home>/keys, i.e. $LEVAIN_HOME/keys or ~/.levain/keys); it must exist.")
     ck_stretch.set_defaults(func=_cmd_cockpit_sign_stretch)
     ck_ledger = ck_sub.add_parser("ledger", help="The authority log itself.")
     ck_ledger_sub = ck_ledger.add_subparsers(dest="ledger_cmd", required=True)
@@ -4417,14 +4420,17 @@ def _cmd_cockpit_sign_stretch(args: argparse.Namespace) -> int:
     from levain import sign_stretch
 
     if args.dir is not None:
-        key_dir = args.dir
+        key_dir = args.dir.expanduser()
+        if not key_dir.is_dir():
+            print(f"sign-stretch: no such directory: {key_dir}", file=sys.stderr)
+            return 1
     else:
-        from levain.consent.queue import default_queue_dir
+        from levain.cockpit.custody import default_key_dir
 
-        key_dir = default_queue_dir().parent / "keys"
+        key_dir = default_key_dir()      # where `cockpit key create` puts a key
     try:
         report = sign_stretch.read(key_dir / "sign-failures", args.statements)
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         print(f"sign-stretch: cannot read {args.statements}: {exc}", file=sys.stderr)
         return 1
     print(sign_stretch.render(report))
