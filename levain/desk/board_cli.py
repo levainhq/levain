@@ -55,10 +55,11 @@ from levain.desk import board_evidence as be
 from levain.desk import board_registry as br
 from levain.desk import board_store as bs
 from levain.desk import board_producers as bp
-from levain.desk.board_state import (EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, Evidence, FlatBlock, derive_all,
+from levain.desk.board_state import (COLUMNS, EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, STATE_COLUMN, STATE_KIND, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "only_repo", "read_board", "register", "run_state", "state_doc", "table_lines"]
+__all__ = ["CLOSED_COLUMNS", "EXTRA_KEYS", "ITEMS_ENV", "OPEN_STATES", "READ_BY_CLI", "only_repo", "open_lines", "open_view", "read_board", "register", "run_open",
+           "run_state", "state_doc", "table_lines"]
 
 ITEMS_ENV = bs.ITEMS_ENV
 #: Read when ``--launch-key`` is not given. Nothing in Levain's launch path exports it yet; the flag is the sure way.
@@ -74,17 +75,8 @@ EXIT_LOCKED = 4
 STATE_LOCK_WAIT = 2.0           # seconds, in all, `board state` waits for a writer's store lock before it refuses: a hold is milliseconds
 
 
-def register(subparsers: Any) -> None:
-    # Hidden, as ``levain upgrade`` and ``levain session`` are (no ``help=``: ``levain --help`` and the README's "All
-    # commands" table, which tests/test_readme_commands.py holds to the listed verbs, leave it out); ``levain board state
-    # --help`` still works. Give it a ``help=`` and a README row together when it is made public.
-    board = subparsers.add_parser("board", description="The work board. Item state is never stored; it is derived on every read.")
-    sub = board.add_subparsers(dest="board_cmd", required=True)
-    p = sub.add_parser(
-        "state", help="Print the board's derived state (READY_SCHEMA v3).",
-        description=("Fold the item store, read git, and print the derived state of every item. Reads only. Exit 0 when the "
-                     "audit is empty, 3 when it is not, 2 when the items file or an explicit option is unusable."))
-    p.add_argument("--json", action="store_true", help="Print the Board as JSON (the contract flow's readers consume).")
+def _read_args(p: Any) -> None:
+    """The options that say what a board read reads: ``board state`` and ``board open`` take them alike, so one verb's read is the other's."""
     p.add_argument("--items", type=str, metavar="PATH",
                    help=f"The store directory, or its items.jsonl. Default: ${ITEMS_ENV}; one of the two is required.")
     p.add_argument("--evidence-extra", dest="evidence_extra", type=Path, metavar="PATH",
@@ -98,6 +90,24 @@ def register(subparsers: Any) -> None:
                    help="--no-land-waiter: this install runs no land waiter, so Levain declares waiters absent; --land-waiter: it "
                         "does, so waiters are unknown until a producer that runs them supplies them. Either one, given, overrides "
                         "the store's board config; left off, the config's value stands.")
+    p.add_argument("--since", default=be.BOARD_EPOCH, metavar="ISO",
+                   help=f"Commits and branches older than this are out of the attribution scan (default {be.BOARD_EPOCH}).")
+    p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
+    ba.add_resolver_args(p)
+
+
+def register(subparsers: Any) -> None:
+    # Hidden, as ``levain upgrade`` and ``levain session`` are (no ``help=``: ``levain --help`` and the README's "All
+    # commands" table, which tests/test_readme_commands.py holds to the listed verbs, leave it out); ``levain board state
+    # --help`` still works. Give it a ``help=`` and a README row together when it is made public.
+    board = subparsers.add_parser("board", description="The work board. Item state is never stored; it is derived on every read.")
+    sub = board.add_subparsers(dest="board_cmd", required=True)
+    p = sub.add_parser(
+        "state", help="Print the board's derived state (READY_SCHEMA v3).",
+        description=("Fold the item store, read git, and print the derived state of every item. Reads only. Exit 0 when the "
+                     "audit is empty, 3 when it is not, 2 when the items file or an explicit option is unusable."))
+    p.add_argument("--json", action="store_true", help="Print the Board as JSON (the contract flow's readers consume).")
+    _read_args(p)
     p.add_argument("--repo", type=Path, default=None, metavar="PATH",
                    help=("The repository to read. Without it, a store with a registry reads every tracked repo (each as its own "
                          "--also-repo NAME=PATH); a store without one reads the repository here."))
@@ -109,11 +119,18 @@ def register(subparsers: Any) -> None:
                          "The repo's name is its directory's name unless NAME=PATH says it (a worktree or a clone under another "
                          "directory name needs NAME=PATH, e.g. levain=/tmp/levain-review). --evidence-extra's documents apply "
                          "to the primary --repo only. Given alone, it reads these repos and not every tracked one."))
-    p.add_argument("--since", default=be.BOARD_EPOCH, metavar="ISO",
-                   help=f"Commits and branches older than this are out of the attribution scan (default {be.BOARD_EPOCH}).")
-    p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
-    ba.add_resolver_args(p)
     p.set_defaults(func=run_state)
+    o = sub.add_parser(
+        "open", help="Print the board's open items (a read of the same derived state).",
+        description=("The items the board reads as still open: every state outside the off and done columns, unknown first. A pure "
+                     "read of the derived board (the same read as `board state`, never stored), so it cannot drift from it. Exit "
+                     "codes are `board state`'s: 0 when the audit is empty, 3 when it is not, 2 or 4 when the board cannot be read. "
+                     "An untracked repo keeps its own file: the board holds no items for it."))
+    o.add_argument("--json", action="store_true", help="Print the open selection as JSON: the document's own item dicts, no new fields.")
+    o.add_argument("--repo", default=None, metavar="NAME",
+                   help="Only the items of this repo (the NAME in item ids NAME#N). The whole board is still read.")
+    _read_args(o)
+    o.set_defaults(func=run_open)
 
     def source_args(parser: Any) -> None:
         parser.add_argument("--source", default=None, metavar="Q-ID",
@@ -828,6 +845,97 @@ def table_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
 def _print_table(doc: dict[str, Any]) -> None:
     for line in table_lines(doc):
         print(line)
+
+
+# ------------------------------------------------------------------------------------------------ the open view
+#: The columns whose items are not open (cut, parked and out of 1.0 sit in ``off``; finished work in ``done``). Open is every state
+#: OUTSIDE them, taken from :data:`STATE_COLUMN`: a state added to the board reaches the view by its column, and a state this reader
+#: does not know is open too (an item the board cannot read is never "not open").
+CLOSED_COLUMNS = ("off", "done")
+OPEN_STATES = tuple(s for s, c in STATE_COLUMN.items() if c not in CLOSED_COLUMNS)
+#: Open states in the order the view draws them: ``unknown`` first, then the board's own column order, and within a column the
+#: order :data:`STATE_COLUMN` lists them.
+_OPEN_ORDER = tuple(sorted(OPEN_STATES, key=lambda s: ["unknown", *COLUMNS].index(STATE_COLUMN[s])))
+
+
+def _is_open(item: dict[str, Any]) -> bool:
+    return STATE_COLUMN.get(item.get("state")) not in CLOSED_COLUMNS
+
+
+def _rank(item: dict[str, Any]) -> tuple[int, str]:
+    state = item.get("state")
+    return (_OPEN_ORDER.index(state) if state in _OPEN_ORDER else 0), str(state)    # a state not known here is drawn with ``unknown``
+
+
+def _one_line(value: Any) -> str:
+    """``value`` as one printable line: runs of whitespace collapse, any other control character shows as ``?``."""
+    return "".join(c if c.isprintable() else "?" for c in " ".join(str(value).split()))
+
+
+def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, Any]:
+    """The open items of ``doc`` (what :func:`state_doc` returns), as the document's own item dicts in drawing order, with the
+    audit, ``problems`` and ``reader`` it carries (:func:`only_repo` for ``repo_name``). A pure function of ``doc``: nothing is
+    stored, and no key the document does not hold is added."""
+    kept = only_repo(doc, repo_name)
+    items = sorted((i for i in kept["items"] if _is_open(i)), key=_rank)
+    out = {"schema": kept.get("schema"), "as_of": kept.get("as_of"), "items": items, "audit": kept.get("audit", []),
+           "problems": kept.get("problems", []), "reader": kept.get("reader", {})}
+    out.update({k: kept[k] for k in ("repo_filter", "reader_scope") if k in kept})
+    return out
+
+
+def _heading(state: Any, count: int) -> str:
+    column, kind = STATE_COLUMN.get(state), STATE_KIND.get(state)
+    name = str(state) if column in (None, state) else f"{column} / {state}"
+    return f"{_one_line(name)}{f' ({kind})' if kind else ''}: {count}"
+
+
+def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
+    """The lines ``levain board open`` prints for ``doc``. A repo the board holds no item of is ONE line; a board that read no item
+    and says why (``problems``) is ``unreadable``, never an empty list."""
+    whole = only_repo(doc, repo_name)
+    total = len(whole["items"])
+    view = open_view(doc, repo_name)
+    problems = problem_lines(view)
+    if not doc["items"] and problems:
+        lines = ["open: unreadable: no item of the board could be read"]
+    elif total == 0 and repo_name is not None:
+        return [f"{repo_name}: the board holds no items for it"]
+    else:
+        lines = [f"open: {len(view['items'])} of {total} items, as of {view['as_of'] or 'unknown'}"
+                 + (f" ({repo_name})" if repo_name is not None else "")]
+        group = object()
+        for s in view["items"]:
+            if s.get("state") != group:
+                group = s.get("state")
+                lines.append(_heading(group, sum(1 for i in view["items"] if i.get("state") == group)))
+            lines.append(f"  {_one_line(s['id'])}  {_one_line(s.get('title', ''))} -- {_one_line(s['reason'])}")
+    scoped = view.get("reader_scope") == "board"
+    for a in sorted(view["audit"], key=lambda a: a["kind"] != "landed_not_closed"):
+        tag = "(whole board) " if scoped and a["id"] is None else ""
+        hint = " (close it or name what remains)" if a["kind"] == "landed_not_closed" else ""
+        lines.append(f"  audit {tag}{a['kind']}: {a['id'] or '-'}: {_one_line(a['why'])}{hint}")
+    lines += problems
+    label = "reader (whole board): " if scoped else ""
+    for name in view["reader"].get("diverged", []):
+        lines.append(f"  {label}diverged: {name}: the local head and origin's copy each hold commits the other lacks (ahead is the union)")
+    return lines
+
+
+def run_open(args: argparse.Namespace) -> int:
+    said: list[str] = []
+    read = argparse.Namespace(**{**vars(args), "repo": None, "repo_name": None, "also_repo": []})     # --repo here is a NAME filter
+    rc, doc = state_doc(read, said.append)
+    if doc is None:
+        why = "\n".join(said).strip() or "the board could not be read"
+        print(json.dumps({"unreadable": why}, indent=2) if args.json else f"open: unreadable: {_one_line(why)}")
+        return rc
+    if args.json:
+        print(json.dumps(open_view(doc, args.repo), indent=2, sort_keys=False))
+    else:
+        for line in open_lines(doc, args.repo):
+            print(line)
+    return rc
 
 
 def read_board(items: str | None = None, *, consent_dir: Path | str | None = None) -> tuple[int, dict[str, Any] | None, str]:
