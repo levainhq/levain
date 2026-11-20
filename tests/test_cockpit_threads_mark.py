@@ -14,11 +14,9 @@ from levain.cockpit.consent import utc_stamp
 from levain.desk.chat import ChatStore, next_gseq
 from levain.desk.driver import ScriptedSession
 from levain.desk.envelopes import NOT_IN_FORCE, EnvelopeStore
-from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
-from tests.test_cockpit_threads_send import _PAGE, _call
+from tests.test_cockpit_threads_send import _call
 from levain.desk import envelope as env
 from levain.desk.store import Part
 from tests.test_desk_chat_send import T0, _world, ready, send
@@ -166,25 +164,3 @@ def test_a_drop_effect_naming_no_held_effect_changes_nothing(amb, qdir):
     _attenuate(qdir, "drop_effect", env.effect_identity("pushes", {"repo": "/elsewhere"}))
     assert "effects named: 1 land, 0 push, 0 publish" in _header(qdir, world["thread"])["line"]
 
-
-_BOOT = ('window.__tv = LevainThreadView.mount(document.getElementById("host"),'
-         ' {pollMs: 0, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
-
-
-@needs_browser
-def test_the_page_draws_the_authority_line_and_no_reconcile_buttons(tmp_path, amb, qdir):
-    svc, cs, world, _store, message = amb
-    _bind(qdir, world["thread"], stop_at=utc_stamp(datetime.now(timezone.utc) + timedelta(days=1)))   # the page reads the wall clock
-    _root, src, _ids = _install(tmp_path)
-    extra = {"/tvc.html": ("text/html; charset=utf-8", _PAGE.encode()),
-             "/tvc.js": ("text/javascript; charset=utf-8", _BOOT.encode())}
-    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=extra) as (base, _h):
-        out = _drive(tmp_path, base + "/tvc.html", [
-            {"until": "document.querySelector('.tv-row')"},
-            {"eval": "document.querySelector('.tv-row').click(); 1"},
-            {"until": "document.querySelector('.tv-authority')"},
-            {"eval": "document.querySelector('.tv-authority').textContent"},
-            {"eval": "document.querySelectorAll('.tv-mark, .tv-mark-yes, .tv-mark-no').length"},
-        ])
-    assert out["values"][3].startswith("Standing authority: envelope ev-aaaaaaaa") and "Not in force yet" in out["values"][3]
-    assert out["values"][4] == 0                    # reconciling an ambiguous send is the room's, not a work thread's

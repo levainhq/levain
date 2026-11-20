@@ -182,7 +182,7 @@
   // real fix at Lane 1.
   const WRITE_TOKEN_KEY = "levain_write_token";
   // `storage` never fires in the document that changed the token, so every same-page set or remove announces it here
-  // for the zones that follow the token (the Threads zone); other tabs still arrive through `storage`.
+  // for the zones that follow the token (the Room and Desk views); other tabs still arrive through `storage`.
   const TOKEN_CHANGE_EVENT = "levain:write-token-change";
   function announceTokenChange() { forgetLanded(); try { window.dispatchEvent(new Event(TOKEN_CHANGE_EVENT)); } catch (_) { /* no events */ } }
   // The panels that landed for a cold board no whole draw has yet replaced: a later read of it (a foreground that superseded a stuck read, a
@@ -1209,31 +1209,14 @@
 
 
   let heldNext = null;
-  // the server offers no Threads zone (make_server(threads=False)): the zone's boot reads this. Both data sources call it.
-  function markThreadsOff() {
-    if (document.body.dataset.threads === "off") return;
-    document.body.dataset.threads = "off";
-    window.dispatchEvent(new Event("levain:threads-off"));
-  }
-
-  // the zone stays hidden until a read says threads are on (no flash before the manifest lands): both data sources call it
-  function markThreadsRead() {
-    if (document.body.dataset.threadsRead === "1") return;
-    document.body.dataset.threadsRead = "1";
-    window.dispatchEvent(new Event("levain:threads-off"));   // the zone's sync listens on this one event
-  }
-
   // `isCurrent()`: this read is still the page's current one (a superseded read's late answers write nothing the board keeps)
   async function loadManifestView(passive, onPartial, isCurrent) {
     const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
     let manifest;
-    try { manifest = await authedReadJson("/cockpit/manifest.json"); }   // settles the token: panels do not re-prompt
-    catch (e) { markThreadsRead(); throw e; }     // a failed read does not say threads are off: only an explicit threads:false hides the zone
+    manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
     // would draw every action refused. Ask for the token now, then read again as that credential.
     const cred = manifest && manifest.credential;
-    if (manifest && manifest.transport && manifest.transport.threads === false) markThreadsOff();
-    else markThreadsRead();     // a transport-less manifest is no "off" either (the server 404s every thread write when threads are off)
     if (manifest && manifest.transport && typeof manifest.transport.owner_key === "boolean") tokenAuth = manifest.transport.owner_key ? "owner" : "pair";
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
@@ -1441,7 +1424,6 @@
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
-      if (view.threads === false) markThreadsOff(); else markThreadsRead();
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
@@ -1509,15 +1491,12 @@
   load().finally(function () { if (storeEl) storeEl.removeAttribute("data-cold"); });
 })();
 
-// CH-U1a: the Build tab's Threads zone. The desk's threads and one thread's stream, read-only, drawn by
-// thread_view.js (LevainThreadView) over GET /cockpit/threads.json and /cockpit/thread/<id>.json. Those routes need the
-// page's write token on every bind, so the zone stays hidden on a page holding none. It polls only while the Build tab
-// is shown and the page is visible; leaving stops the poll, and coming back starts again at the thread list.
+// The Room and Desk full-tab views (room_view.js, desk_tab_view.js): each owns the whole tab while its body class is on, mounts only with
+// a write token, and leaves on any other places tab. (The Build tab's Threads zone that once shared this boot went with the Modes bar.)
 (function () {
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
-  let section = null, host = null, view = null;
-  let roomSection = null, roomHost = null, roomView = null;     // RM-G2: the cockpit's one Claude room, beside the threads
+  let roomSection = null, roomHost = null, roomView = null;     // RM-G2: the cockpit's one Claude room
   let deskSection = null, deskHost = null, deskView = null;     // the Desk view (levain 33), a second full tab beside the Room
 
   function el(tag, cls, text) {
@@ -1529,26 +1508,7 @@
   function token() { try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; } }
 
   function build() {
-    section = el("section", "ck-zone th-zone");
-    section.dataset.zone = "threads";
-    section.dataset.modes = "build";
-    section.hidden = true;
-    const head = el("div", "zone-head");
-    head.appendChild(el("div", "zone-title", "Threads"));
-    head.appendChild(el("span", "zone-gloss", "what each desk thread said, in the order it happened"));
-    section.appendChild(head);
-    const grid = el("div", "ck-zgrid th-grid");
-    const panel = el("div", "panel k-list th-panel");
-    panel.dataset.modes = "build";   // dashboard.css hides a zone whose panel names no tab for the current mode
-    const ph = el("div", "phead");
-    ph.appendChild(el("h2", null, "Desk threads"));
-    panel.appendChild(ph);
-    host = el("div", "pbody th-body");
-    panel.appendChild(host);
-    grid.appendChild(panel);
-    section.appendChild(grid);
     const main = document.querySelector("main.frame");
-    if (main) main.appendChild(section); else document.body.appendChild(section);
     buildRoom(main);
     buildDesk(main);
   }
@@ -1603,18 +1563,6 @@
   }
 
   function sync() {
-    const off = document.body.dataset.threads === "off";
-    const read = document.body.dataset.threadsRead === "1";
-    const want = !off && read && !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
-    section.hidden = off || !read || !token();
-    if (want && !view) {
-      host.replaceChildren();
-      const T = window.LevainCockpitTransport;
-      view = window.LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}), stop: true });
-    } else if (!want && view) {
-      view.stop();
-      view = null;
-    }
     if (roomSection && roomOn() && !token()) { setRoom(false); return; }   // the token went: the protected conversation leaves the page with it
     if (deskSection && deskOn() && !token()) { setDesk(false); return; }   // the token went: the protected view leaves the page with it
     const wantRoom = !!roomSection && !!token() && roomOn() && document.visibilityState !== "hidden";
@@ -1644,7 +1592,7 @@
   }
 
   function start() {
-    if (!window.LevainThreadView || !document.querySelector("main.frame")) return;
+    if (!document.querySelector("main.frame")) return;
     build();
     let lastMode = document.body.dataset.mode;
     new MutationObserver(() => { if (document.body.dataset.mode !== lastMode) { lastMode = document.body.dataset.mode; setRoom(false); setDesk(false); } sync(); }).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
@@ -1677,7 +1625,6 @@
     }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
-    window.addEventListener("levain:threads-off", sync);
     window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)
     sync();
   }

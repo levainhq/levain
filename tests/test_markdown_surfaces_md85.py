@@ -1,6 +1,6 @@
 """levain#85: every cockpit surface that shows an agent's reply draws it as markdown through the one shared renderer.
 
-Driven in headless Chrome over the REAL cockpit page (its own dashboard_core.js, room_view.js, desk_tab_view.js, thread_view.js,
+Driven in headless Chrome over the REAL cockpit page (its own dashboard_core.js, room_view.js, desk_tab_view.js,
 dashboard_chat.js and dashboard.css). One reply holds the four constructs a person writes (a heading, a list, a code fence, a link)
 and each surface must show them as ELEMENTS, with no marker character left in the text. The Room and the notification detail are
 held by tests/test_room_markdown_1112.py and tests/test_notify_center_markdown.py.
@@ -88,32 +88,6 @@ def test_the_desk_reply_the_voice_reads_is_the_plain_words_not_the_drawn_nodes(t
             {"eval": "JSON.stringify({said: window.__said})"}])
     said = json.loads(out["values"][-1])["said"]
     assert said and said[-1] == REPLY, said          # the words handed to the voice are the reply as written
-
-
-# --- the thread view's agent line -----------------------------------------------------------------------------------
-
-_THREAD = """(() => { const host = document.createElement('div'); host.id = 'md85-thread'; document.body.appendChild(host);
-  const TV = window.LevainThreadView;
-  const body = {thread_id: 't1', launch_id: 'L1', stream: [
-    {gseq: 1, kind: 'vendor_agent_text', source: 'vendor', ref: 'a:1', launch_id: 'L1', body: %s, at: ''},
-    {gseq: 2, kind: 'message', source: 'operator', ref: 'm:2', launch_id: 'L1', status: 'accepted', body: '**mine** stays text', at: ''}]};
-  TV.renderThread(document, host, TV.threadModel(body), {open: {}});
-  const mine = [...host.querySelectorAll('.tv-message .tv-body')][0];
-  host.id = 'md85-thread-done'; document.body.classList.add('md85-thread-ready');
-  return JSON.stringify({ok: 1, mineEls: mine ? mine.querySelectorAll('strong').length : -1}); })()""" % json.dumps(REPLY)
-
-
-@needs_browser
-def test_the_thread_view_draws_the_agents_line_as_markdown_elements_and_leaves_the_rest_plain(tmp_path):
-    sel = "#md85-thread-done .tv-vendor_agent_text .tv-body"
-    with desk_page(tmp_path) as (stub, base):
-        out = _drive(tmp_path, base + "/", [{"until": "window.LevainThreadView && window.LevainMD"},
-                                           {"eval": _THREAD}, {"eval": _LOOK % json.dumps(sel)}])
-    g = _look(out, sel)
-    _elements(g)
-    assert g["tag"] == "DIV" and "rv-md" in g["cls"], g
-    first = json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith('{"ok"')))
-    assert first["mineEls"] == 0, first             # a line that is not the agent's is not drawn as markdown
 
 
 # --- the chat panel's reply -------------------------------------------------------------------------------------------

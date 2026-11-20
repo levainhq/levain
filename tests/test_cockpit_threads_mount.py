@@ -63,17 +63,9 @@ def test_no_dispatch_store_is_an_empty_list_and_nothing_is_created(tmp_path, qdi
     assert not (qdir / "dispatch.db").exists()
 
 
-def test_the_view_script_is_app_shell_and_the_routes_are_reserved(tmp_path):
+def test_the_thread_routes_are_reserved(tmp_path):
     _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN) as (base, _h):
-        with urllib.request.urlopen(base + "/thread_view.js", timeout=10) as r:  # noqa: S310 - loopback, token-free
-            assert r.status == 200 and r.headers["Content-Type"].startswith("text/javascript")
-            view = r.read()
-            assert b"LevainThreadView" in view
-        import hashlib   # the page names the script by the digest of the bytes served (1105-17)
-        with urllib.request.urlopen(base + "/", timeout=10) as r:  # noqa: S310 - loopback
-            assert b'<script src="/thread_view.js?v=%s"></script>' % hashlib.sha256(view).hexdigest()[:12].encode() in r.read()
-    for path in (threads.THREADS_LIST_PATH, "/cockpit/thread/x.json", "/thread_view.js", "/cockpit/note/9.json"):
+    for path in (threads.THREADS_LIST_PATH, "/cockpit/thread/x.json", "/cockpit/note/9.json"):
         with pytest.raises(ValueError):
             make_server(src, port=0, extra_json={path: lambda: {}})
 
@@ -92,11 +84,4 @@ def test_a_busy_server_answers_503_not_a_dead_connection(tmp_path, seeded):
         finally:
             for _ in range(taken):
                 httpd.request_gate.release()
-
-
-# the thread reads the page has made, from resource timing (thread_view.js binds fetch at mount, so a wrapper installed
-# later would never see them)
-_READS = "performance.getEntriesByType('resource').filter(e => e.name.indexOf('/cockpit/thread') > 0).length"
-_COUNT = f"performance.setResourceTimingBufferSize(10000); window.__th = () => {_READS}; 1"
-_WAIT = "new Promise(r => setTimeout(() => r(window.__th()), 2600))"
 
