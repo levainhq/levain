@@ -148,7 +148,7 @@ def test_each_open_desk_basis_is_drawn_as_the_host_said_it(tmp_path):
                                    {"state": "none", "open_desk": False}, {"state": "unknown", "open_desk": True},
                                    {"state": "held", "holder": "desk 40", "age_s": 60, "open_desk": "true"}])
     assert [g["openCount"] for g in shown] == [1, 1, 0, 0, 0, 0], shown
-    assert "The host says a new desk can open now." in shown[1]["bar"] and "The host says" not in shown[2]["bar"], shown   # a held lease beside the button says why
+    assert ", renewed" in shown[1]["bar"] and ". The host says a new desk can open now." in shown[1]["bar"] and "The host says" not in shown[2]["bar"], shown   # a held lease beside the button says why
 
 
 @needs_browser
@@ -163,4 +163,4 @@ def test_the_desk_page_source_holds_no_rotate_path_and_no_clock_rule():
     desk = (WEB / "desk_tab_view.js").read_text()
     for gone in ("Rotate Desk", "ROTATE_", "STALL_AGE_S", "ROTATE_WAIT_MS", "/rotate", "Take over", "Start desk", "\"dv-start\""):
         assert gone not in desk, gone
-    assert desk.count("lease.open_desk") == 2          # the two reads of the host's field, in leaseModel; no other place decides
+    assert desk.count("lease.open_desk") == 3          # the reads of the host's field, all in leaseModel (held, its hint, none); draw() reads only the model
