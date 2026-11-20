@@ -620,7 +620,7 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
 
 @needs_browser
 def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives_focus_to_it_when_the_page_draws_it_again(tmp_path: Path, monkeypatch: Any) -> None:
-    # the card is mid-redraw (drawn without its control) at the moment the view closes: the control the page draws next takes the focus
+    # the card is mid-redraw (drawn without its control) at the moment the view closes: the control the page draws next is given the focus (the ask acts only while focus is on the body; if .pexpand holds it, it stays there)
     src = _carried_install(tmp_path, monkeypatch)
     ctl = "document.querySelector('[data-ck-panel=tray] [data-list-more]')"
     focus_is_control = f"document.activeElement && document.activeElement === {ctl}"
