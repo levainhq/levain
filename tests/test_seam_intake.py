@@ -398,6 +398,8 @@ def test_plan_says_cannot_derive_for_a_board_it_cannot_read_never_zero_open(tmp_
     assert seam_plan.close_plan(w.store, w.q, now, "levain")[3].startswith("board: cannot-derive (RuntimeError: the board read no item")
     fake_board(monkeypatch, board_doc(("levain#1", "ready"), problems=["line 9: not json"]))
     assert "+1 problem line(s)" in seam_plan.close_plan(w.store, w.q, now, "levain")[3]
+    fake_board(monkeypatch, board_doc(("levain#1", "done"), ("levain#2", "cut"), problems=["line 9: not json"]))      # closed items, a torn line
+    assert seam_plan.close_plan(w.store, w.q, now, "levain")[3] == "board: 0 open items (+1 problem line(s) in the read)"
 
 
 def test_plan_reads_cannot_derive_for_a_queue_directory_it_cannot_read(tmp_path, capsys):

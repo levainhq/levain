@@ -133,9 +133,9 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             last = conn.execute("SELECT body FROM seam_handoffs ORDER BY handoff_id DESC LIMIT 1").fetchone() if has_handoffs else None
             drift = board_cli.in_flight_drift(json.loads(last[0]), doc) if last else []
             stale = "".join(f"; the last handoff's {d}" for d in drift)
+            unread = f" (+{len(problems)} problem line(s) in the read)" if problems else ""       # a zero over a read that had problems says so
             if not items:
-                return "board: 0 open items" + stale
-            unread = f" (+{len(problems)} problem line(s) in the read)" if problems else ""
+                return "board: 0 open items" + unread + stale
             return (f"board: {len(items)} open ({_ids([str(i['id']) for i in items])}){unread}: read them with `{lv} board open`; "
                     "do not copy them into in_flight: in_flight names only live work the board does not hold, with its owner and why"
                     + stale)
