@@ -305,3 +305,123 @@ def test_a_desk_wake_reply_that_asks_is_refused_and_one_that_does_not_is_not(tmp
     assert out["decision"] == "block" and "levain ask" in out["reason"]
     rig.ups(rig.wake)
     assert rig.stop("split drop d1 into 2 threads") == ""
+
+
+def ask_row(store, what="Can you approve deploy X?"):
+    return store.file(agent="claude_code", agent_session_id="sess-other", what=what, options=OPTS, rec="exp",
+                      blocks="the deploy", cwd="/tmp/proj")
+
+
+def test_a_row_answered_between_the_prompt_and_the_stop_does_not_refuse_the_reprinted_block(qdir, store, monkeypatch):
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    row = ask_row(store)
+    band = deliver("s1", e)
+    assert "Can you approve deploy X?" in band
+    store.answer(row.id, option="exp", channel="cli")                       # answered from another surface
+    assert stop("s1", f"Done, tests pass.\n\n{band}", e) is None
+
+
+def test_a_turn_whose_view_was_never_committed_is_not_checked_against_an_older_view(qdir, store, monkeypatch):
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    ask_row(store, "Which retry policy do we keep?")
+    deliver("s1", e)                                                        # turn 1: its view is committed
+    ask_row(store, "Can you approve deploy Y?")
+    text, _commit = band_view.hook_prompt({"session_id": "s1", "prompt": "next"}, e)
+    assert "Can you approve deploy Y?" in text                              # turn 2 showed it; the commit never ran
+    assert "levain ask" not in (stop("s1", f"Done, tests pass.\n\n{text}", e) or "")
+
+
+def test_a_desk_view_with_items_and_no_staged_record_is_unknown_and_an_empty_one_is_none(qdir, store, monkeypatch):
+    fact = band_view.TurnFact("operator", band_view.DESK_VIEWER, True, True)
+    wake = band_view.TurnFact(band_view.FACT_DESK_WAKE, band_view.DESK_VIEWER, True, True)
+    view = band_view.View(3, (1,), None)
+    monkeypatch.setattr(band_view, "_view_row", lambda *_a: (view, 1, "band@3 · NEEDS YOU · 1 open"))
+    assert band_view._shown_lines(qdir, fact, "s1") is None
+    assert band_view._shown_lines(qdir, wake, "s1") == []                   # a wake showed nothing
+    monkeypatch.setattr(band_view, "_view_row", lambda *_a: (band_view.View(3, (), None), 1, None))
+    assert band_view._shown_lines(qdir, fact, "s1") == []
+    monkeypatch.setattr(band_view, "_view_row", lambda *_a: None)
+    assert band_view._shown_lines(qdir, fact, "s1") == []
+
+
+def claims(qdir):
+    d = qdir / "band_stop"
+    return sorted(p.name for p in d.iterdir() if not p.name.startswith("s-")) if d.exists() else []
+
+
+def test_the_ask_claim_goes_with_its_turn(qdir, store, monkeypatch):
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    other_row(store)
+    band = deliver("s1", e)
+    reply = f"{PRICE}\n\n{band}"
+    assert stop("s1", reply, e) and len(claims(qdir)) == 1
+    assert stop("s1", reply, e, stop_hook_active=True) is None              # the continuation ends the turn
+    assert claims(qdir) == []
+    band = deliver("s1", e)
+    assert stop("s1", f"{PRICE}\n\n{band}", e) and len(claims(qdir)) == 1
+    deliver("s1", e)                                                        # a new prompt: the old turn is over
+    assert claims(qdir) == []
+
+
+def test_a_reason_for_a_desk_commit_that_also_asks_starts_with_the_reason(tmp_path):
+    from tests.test_desk_wake_silent import Rig, block_of
+
+    rig = Rig(tmp_path, "claude_code")
+    rig.ask("Pick a DB")
+    shown = block_of(rig.ups("hello desk"), rig)
+    out = json.loads(rig.stop(f"{PRICE}\n\n{shown}"))
+    assert out["reason"].startswith("[Levain")
+
+
+def test_filing_the_same_question_again_is_a_new_row_so_a_turn_that_files_is_counted(qdir, store):
+    first = ask_row(store, "Which DB?")
+    again = ask_row(store, "Which DB?")
+    assert first.id != again.id
+    assert store.filed_since("claude_code", "sess-other", "2000-01-01T00:00:00.000000Z") == 2
+
+
+def test_the_prose_check_reads_the_store_inside_the_hook_bound(qdir, store, monkeypatch):
+    from levain.consent import questions
+
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    other_row(store)
+    band = deliver("s1", e)
+    seen = []
+    real_view, real_filed = band_view._view_row, QuestionStore.filed_since
+    monkeypatch.setattr(band_view, "_view_row", lambda *a: seen.append(questions.current_read_deadline()) or real_view(*a))
+    monkeypatch.setattr(QuestionStore, "filed_since",
+                        lambda self, *a: seen.append(questions.current_read_deadline()) or real_filed(self, *a))
+    assert stop("s1", f"{PRICE}\n\n{band}", e)
+    assert len(seen) >= 3 and all(d is not None for d in seen)
+
+
+@pytest.mark.parametrize("text", [
+    "I changed the prompt to: Please approve the request.",
+    "The UI now displays Please confirm your email before continuing.",
+    "The page says: Please pick a plan.",
+    "The dialog reads: Reply with a or b.",
+    "Please approve the request.",
+])
+def test_reported_interface_text_and_a_bare_request_with_no_question_is_no_ask(text):
+    assert operator_ask.detect(text) is None
+
+
+def test_a_direct_request_that_stands_as_its_own_clause_is_still_an_ask():
+    assert shapes("Ok. Please confirm you want me to ship it?") == "operator"
+    assert shapes("Please confirm: ship it?") == "unclear"
+
+
+def test_a_description_of_a_message_sent_does_not_hide_the_real_question(qdir, store, monkeypatch):
+    text = "I sent the report to Codex: it passed. Should I deploy now? (a) yes (b) no"
+    assert shapes(text) == "operator"
+    assert shapes("Message to flow 54: can we ship the retry change?") == "agent"
+    assert shapes("To codex: can we ship the retry change? It passed.") == "agent"
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    other_row(store)
+    band = deliver("s1", e)
+    assert stop("s1", f"{text}\n\n{band}", e)

@@ -48,12 +48,15 @@ _CITE_ROW = re.compile(r"\b(?:rows?|items?|questions?)\s+#?(\d+)\b|(?<![\w&])#(\
 _CITE_ID = re.compile(r"\b(?:q|np)-[0-9a-f]{6,}\b")
 _ITEM_NUMBER = re.compile(r"^(\d+)\. ")
 
-# a sentence that opens a message to another agent: it and the sentences after it that do not name the operator
+# a sentence that opens a message to another agent: it and the sentences after it that do not name the operator.
+# "to <seat>:" opens one only as the start of the sentence (optionally after a verb that sends), never in the middle
+# of a sentence that reports having sent something
 _SEAT = r"(?:levain|flow|argus|desk|fan-?in|heads?|lanes?|seats?|codex|claude|nemo|cognitive)"
 _MESSAGE_CUES = (
     re.compile(r"(?m)^\W*ROUTE\b"),
     re.compile(r"\bROUTE to \S"),
-    re.compile(r"\bto\s+" + _SEAT + r"\b(?:\s+[\w-]{1,12})?\s*:", re.I),
+    re.compile(r"^\W*(?:(?:send(?:ing)?|message|msg|note|ask(?:ing)?|reply|replying|forward(?:ing)?|hand-?off|re)\s+)?to\s+"
+               + _SEAT + r"\b(?:\s+[\w-]{1,12})?\s*:", re.I),
 )
 # a cue that holds only for its own sentence
 _ASIDE_CUES = (
@@ -72,10 +75,13 @@ _PICK_Q = re.compile(r"\b(?:your call|up to you|you(?:'d| would)? (?:decide|pick
 _AMOUNT = re.compile(r"[$£€¥]\s?\d|\b\d[\d,]*(?:\.\d+)?\s?(?:k\b|usd\b|eur\b|gbp\b|dollars?\b|bucks\b|"
                      r"/\s?(?:hr|hour|mo|month|yr|year)\b|per (?:hour|month|year)\b)", re.I)
 _CONFIRM_Q = re.compile(r"\b(?:confirm|pick|approve|sign off|go ahead|proceed|ship it|merge)\b", re.I)
-_CONFIRM_ANY = re.compile(r"\bplease (?:confirm|pick|choose|approve)\b", re.I)
 
 # an imperative that asks him for a word or a pick, at the start of a clause or a line
 _LEAD = r"(?:^|[.:;!?\-—(]\s*|\n[ \t]*)"
+_CONFIRM_ANY = re.compile(_LEAD + r"please (?:confirm|pick|choose|approve)\b", re.I)
+# text a sentence reports (what a prompt, a label or a page says) follows one of these and a colon: it is not asked
+_REPORTED = re.compile(r"\b(?:to|says?|said|saying|reads?|reading|displays?|shows?|titled|labell?ed|prompt|message|text|"
+                       r"copy|banner|title|label|header|caption|output|error|warning)\s*:.*", re.I | re.S)
 _IMPERATIVE = re.compile(
     _LEAD + r"(?:say\b(?!\s+(?:nothing|that|this|what)\b)|tell me\b|let me know\b|pick (?:one|a|the)\b|"
     r"give me (?:a|the) (?:go|word|price|number)\b|name (?:the|a) (?:price|number|time|day)\b|"
@@ -108,6 +114,11 @@ def _spans(text: str) -> list[tuple[int, int]]:
     if start < len(text):
         out.append((start, len(text)))
     return [(a, b) for a, b in out if text[a:b].strip()]
+
+
+def _asked(sentence: str) -> str:
+    """``sentence`` without the text it reports after a cue and a colon (``changed the prompt to: ...``)."""
+    return _REPORTED.sub("", sentence)
 
 
 def _is_question(sentence: str) -> bool:
@@ -178,7 +189,7 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
     found: list[str] = []
     questions = [s for s in sentences if _is_question(s)]
     to_him = [q for q in questions if _ADDRESS.search(q) or _PERMISSION.search(q) or _CONFIRM_FORM.search(q)]
-    told = any(_IMPERATIVE.search(s) for s in sentences)
+    told = any(_IMPERATIVE.search(_asked(s)) for s in sentences)
     letters = {m.group(1).lower() for rx in (_LETTER_PAREN, _LETTER_LINE, _LETTER_OPTION) for m in rx.finditer(text)}
     if {"a", "b"} <= letters and (questions or told):
         found.append("lettered_options")
@@ -189,7 +200,7 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
         found.append("say_and_ill")
     if any(_PERMISSION.search(q) or _CONFIRM_FORM.search(q) or _PICK_Q.search(q) for q in questions):
         found.append("which_do_you")
-    if _CONFIRM_ANY.search(text) or any(_AMOUNT.search(q) or (q in to_him and _CONFIRM_Q.search(q)) for q in questions):
+    if any(_CONFIRM_ANY.search(_asked(s)) for s in sentences) or any(_AMOUNT.search(q) or (q in to_him and _CONFIRM_Q.search(q)) for q in questions):
         found.append("confirm_pick")
     if any(_ADDRESS.search(q) for q in questions):
         found.append("q_to_you")
@@ -245,7 +256,8 @@ def detect(text: str, *, drop_lines: Iterable[str] = ()) -> Verdict | None:
         shapes = _shapes_of(body, op_sents)
         if shapes:
             asks = bool(set(shapes) - {"confirm_pick", "q_to_you"}) or bool(_YOU.search(" ".join(op_sents)))
-            return _verdict(shapes, body, op_sents, "operator" if asks else "unclear")
+            if asks or any(_is_question(s) for s in op_sents):      # an unclear addressee needs a question to be read
+                return _verdict(shapes, body, op_sents, "operator" if asks else "unclear")
         side = "\n\n".join(side_texts)
         shapes = _shapes_of(side, side_sents)
         return _verdict(shapes, side, side_sents, "agent") if shapes else None

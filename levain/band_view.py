@@ -3529,6 +3529,9 @@ def _write_turn(directory: Path | str, session: str, fact: TurnFact, prompt: Any
     (:func:`_gc_turns`). Never raises."""
     try:
         f = _session_file(directory, session, "turn.rec")
+        before = _read_turn(directory, session)
+        if before is not None:
+            _drop_ask_claim(directory, before[0]["viewer"], before[0])      # that turn is over
         _replace(f, json.dumps({"kind": fact.kind, "viewer": fact.viewer, "coord": fact.coord, "band": fact.band,
                                 "session": session, "at": time.time_ns(), "sha": _prompt_sha(prompt)}))
         _gc_turns(f)
@@ -3735,13 +3738,14 @@ def _hook_stop(payload: Any, environ: Mapping[str, str] | None, agent: str, dead
         else:
             rec = raw = None
             fact = _turn_fact(session, None, directory, env, agent, max(0.0, deadline - time.monotonic()))
-        shown = _shown_lines(directory, fact, session)       # a desk's staged block is cleared by its commit
+        shown = _shown_lines(directory, fact, session, rec)  # a desk's staged block is cleared by its commit
         out = _stop_turn(directory, fact, rec, payload, message, deadline)
         ask = _ask_reason(directory, fact, rec, payload, message, shown, agent)
         if ask is not None:
-            return ask if out is None else f"{out}\n\n{ask}"
+            return ask if not out else f"{out}\n\n{ask}"
         if out is None and raw is not None:
             _remove_if(_session_file(directory, session, "turn.rec"), raw)    # the turn ended: its record is spent
+            _drop_ask_claim(directory, fact.viewer, rec)
         return out
     except Exception:
         return None
@@ -3753,25 +3757,44 @@ ASK_NOTE = ("The row takes 2-6 options (keys lowercase a-z, 0-9, _ or -); when t
             "file it with --open and no options and no --rec, and the operator answers in words.")
 
 
-def _shown_lines(directory: Path | str, fact: TurnFact, session: str) -> list[str] | None:
+def _shown_lines(directory: Path | str, fact: TurnFact, session: str, rec: dict | None = None) -> list[str] | None:
     """The lines of the block this turn's prompt hook showed the seat (what every reply reprints), read before the
-    Stop commit that can clear them; ``[]`` when there is none, ``None`` when the lines are unknown (a view with items
-    kept no block, a staged record that exists and cannot be read, or a read that failed)."""
+    Stop commit that can clear them; ``[]`` when the view is known to be empty (or a wake showed nothing), ``None``
+    when the lines are unknown: a view with items kept no block, a staged record that exists and cannot be read or is
+    absent while the view has items, a view older than the turn record ``rec`` (this turn's view was never committed),
+    or a read that failed."""
     try:
         if not fact.band:
             return []
+        store = QuestionStore(directory)
         if fact.coord:
             got = _read_staged(directory, session)
-            if got is None:
-                return None if _session_file(directory, session, "staged").exists() else []
-            return got[0]["block"].splitlines()
-        row = _view_row(QuestionStore(directory), fact.viewer)
-        if row is None:
+            if got is not None:
+                return got[0]["block"].splitlines()
+            if _session_file(directory, session, "staged").exists():
+                return None
+            if fact.kind == FACT_DESK_WAKE:
+                return []
+            row = _view_row(store, fact.viewer)
+            return [] if row is None or not row[0].open_list else None
+        row = _view_row(store, fact.viewer)
+        if row is None or not row[0].open_list:
             return []
-        view, _gen, block = row
-        return None if block is None and view.open_list else (block or "").splitlines()
+        view, gen, block = row
+        if block is None or (rec is not None and gen < rec["at"]):
+            return None
+        return block.splitlines()
     except Exception:
         return None
+
+
+def _drop_ask_claim(directory: Path | str, viewer: str, rec: dict | None) -> None:
+    """Remove the prose-ask claim (:func:`_ask_reason`) of the turn ``rec`` names. Never raises."""
+    try:
+        if rec is not None:
+            _claim_path(directory, "opq:" + viewer, rec["at"]).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _ask_reason(directory: Path | str, fact: TurnFact, rec: dict | None, payload: dict, message: str,
