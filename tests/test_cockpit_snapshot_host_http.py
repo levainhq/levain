@@ -107,13 +107,6 @@ def _derive_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name.startswith(DERIVE_THREAD_PREFIX)]
 
 
-def _settle(resp: Any, quiet_s: float = 1.0, timeout: float = 60.0) -> None:
-    """Read the stream until it has been quiet for ``quiet_s``: the host's first derives of every panel are announced."""
-    deadline = time.monotonic() + timeout
-    while _events_for(resp, quiet_s):
-        assert time.monotonic() < deadline, "the stream never went quiet"
-
-
 def _collect(resp: Any, done: Callable[[list], bool], timeout: float = 30.0) -> "list[tuple[str, Any]]":
     """The (event, panel id) pairs read until ``done`` accepts them, or ``timeout``."""
     got: list[tuple[str, Any]] = []
@@ -127,13 +120,26 @@ def _every_plan_has_a_row(host: SnapshotHost) -> bool:
     return all(host.reader.read(p.id) is not None for p in host._plans())
 
 
+def _token_taken(host: SnapshotHost) -> bool:
+    """Every plan's last derive was made at the watch token as it stands now. A first derive that touches a store the token
+    names moves the token under its own wave, and the loop's next poll derives every on-token panel again: a host that is
+    idle between the two waves is not at rest. (A host with no token has none to take.)"""
+    loop = host.loop
+    token = loop._token_fn() if loop._token_fn is not None else None
+    if token is None:
+        return True
+    with loop._lock:
+        return all(st.token == token for st in loop._states.values())
+
+
 def _derived_and_idle(host: SnapshotHost) -> bool:
-    """Every plan has a row, discovery has added the panels it will, and no derive is queued or running."""
+    """Every plan has a row, discovery has added the panels it will, no derive is queued or running, and none is owed to a
+    token that moved while the first ones ran."""
     plans = {p.id for p in host._plans()}
-    if not _every_plan_has_a_row(host) or host.loop.deriving():
+    if not _every_plan_has_a_row(host) or host.loop.deriving() or not _token_taken(host):
         return False
     time.sleep(0.3)
-    return {p.id for p in host._plans()} == plans and not host.loop.deriving()
+    return {p.id for p in host._plans()} == plans and not host.loop.deriving() and _token_taken(host)
 
 
 def _provider_reads_during(reads: Reads, run: Callable[[], None], tries: int = 5) -> list[str]:
@@ -306,12 +312,11 @@ class TestStream:
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
             assert _get(port, "/cockpit/manifest.json")[0] == 200
             host = httpd._snapshot_host
-            _until(lambda: _every_plan_has_a_row(host))
+            _until(lambda: _derived_and_idle(host))     # the stream's baseline is then taken with every first derive already made
             httpd.stream_watcher.token_s = 0.05
             c, r = _open(port)
             try:
                 _read_frame(r)
-                _settle(r)
                 reads.rows = [_row(1), _row(2)]         # the source changed; the next derive of "od" publishes it
                 host.loop.dirty(["od"], 1)
                 got = _await_events(r)
@@ -343,12 +348,11 @@ class TestStream:
         with _serving(src, cockpit=ck, watch_paths=[watched]) as (port, httpd):
             host = httpd._snapshot_host
             assert host is not None
-            _until(lambda: _every_plan_has_a_row(host))
+            _until(lambda: _derived_and_idle(host))
             httpd.stream_watcher.token_s = 0.05
             c, r = _open(port)
             try:
                 _read_frame(r)
-                _settle(r)
                 store["rows"] = [_row(1), _row(2)]
                 before = [(e[0], e[2].get("id")) for e in _events_for(r, 0.8)]
                 assert ("panel-changed", "mine") not in before, before   # the store moved but nothing the serve watches did
@@ -370,13 +374,16 @@ class TestStream:
                 name, _eid, _data = _parse_first(r)
                 assert name == "hello"
                 assert httpd._snapshot_host is not None and httpd.get_cockpit().attached
-                _until(lambda: _every_plan_has_a_row(httpd._snapshot_host))
+                host = httpd._snapshot_host
+                _until(lambda: _derived_and_idle(host))
                 httpd.stream_watcher.token_s = 0.05
-                _settle(r)
                 reads.rows = [_row(1), _row(2)]
-                httpd._snapshot_host.loop.dirty(["od"], 1)
-                got = _collect(r, lambda evs: ("panel-changed", "od") in evs)
-                assert ("panel-changed", "od") in got, got
+                host.loop.dirty(["od"], 1)
+                _until(lambda: len(_get(port, "/cockpit/panel/od.json")[1]["rows"]) == 2 and not host.loop.deriving())
+                etag = _get(port, "/cockpit/manifest.json")[1]["panels"]["od"]["etag"]
+                got: list = []      # the first derives were announced to this stream: the one that counts carries the new rows' etag
+                _until(lambda: got.extend(_events_for(r, 0.25)) or any(e[0] == "panel-changed" and e[2].get("etag") == etag for e in got))
+                assert [e[2].get("id") for e in got if e[2].get("etag") == etag] == ["od"], got
             finally:
                 c.close()
 
