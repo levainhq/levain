@@ -17,6 +17,7 @@ stdlib only; every external call is a `gh` or `git` argv list, so no branch name
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -29,6 +30,7 @@ DEFAULT_TIMEOUT_S = 90 * 60  # the hold job may wait on a landing, then the matr
 FIND_TIMEOUT_S = 120
 CLOCK_SKEW_S = 90
 CALL_TIMEOUT_S = 60
+ROOT = str(Path(__file__).resolve().parent.parent)  # git is asked about the checkout this script lives in, whatever the caller's cwd
 
 
 def _run(argv):
@@ -96,7 +98,7 @@ def main(argv):
     if args:
         branch = args[0]
     else:
-        p = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        p = _run(["git", "-C", ROOT, "rev-parse", "--abbrev-ref", "HEAD"])
         branch = p.stdout.strip()
         if p.returncode != 0 or not branch or branch == "HEAD":
             print("ci_full: not on a branch; name one", file=sys.stderr)
@@ -105,8 +107,8 @@ def main(argv):
         print("ci_full: main and land/** run through the landing chain, not a dispatch", file=sys.stderr)
         return 2
 
-    local = _run(["git", "rev-parse", branch])
-    remote = _run(["git", "ls-remote", "origin", f"refs/heads/{branch}"])
+    local = _run(["git", "-C", ROOT, "rev-parse", branch])
+    remote = _run(["git", "-C", ROOT, "ls-remote", "origin", f"refs/heads/{branch}"])
     if local.returncode != 0 or remote.returncode != 0 or not remote.stdout.strip():
         print(f"ci_full: branch {branch} is not pushed to origin (or not local): push it first", file=sys.stderr)
         return 2
