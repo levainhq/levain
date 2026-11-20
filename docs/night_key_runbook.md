@@ -6,7 +6,10 @@ upgrade; a `sudo -l` read first": steps 0 and 1 are that read.
 
 **RUN ON TAOSERV 11-15 (levain 6, the desk's go, signed np-dedaa950 (a)):** steps 0 to 3 and probes 1 to 16 were executed
 from the laptop with `soupcan@transalliesohio.org` as the admin path (proved before and after); `systemctl start
-logrotate.service` was not run (it would rotate and reload every due stanza), probe 17 and step 5 were not. Two measured
+logrotate.service` was not run (it would rotate and reload every due stanza), and step 5 was not. Probe 17 ran 11-20 at 16:17
+(desk 49, on his word, fan-in log note ND-8 PROBE 17): every pass clause of its row was met (exit 0, the site back at 200
+within 3 s, `accepted` then `ok` with the same sha256, the rate file holding one apache2 entry, the journal showing the stop and
+start). Two measured
 corrections are in the text: the logrotate stanza needs `su root root` (`/var/log` is group-writable, so logrotate
 refused it without), and probe 9 exited 255 after `PTY allocation request failed` rather than 2 (no PTY was granted).
 The seat's machine address in the probes is the IP with `-o HostKeyAlias=transalliesohio.org`: the name is behind
@@ -235,6 +238,9 @@ Define once in that shell:
 ```
 nk() { SSH_AUTH_SOCK= ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.levain/night/known_hosts -i ~/.levain/night/taoserv_night "$@"; }
 ```
+The name `TAOSERV` in the probe commands below does not resolve under `-F /dev/null` (the name is behind Cloudflare, which does not
+carry SSH). The form that ran on 11-20 was `nk -o HostKeyAlias=transalliesohio.org nightkey@172.233.220.105 <words>`: the address
+in place of `nightkey@TAOSERV`, plus the alias, which mirrors the pin in the laptop's `~/.ssh/config`. Read every `nightkey@TAOSERV` below that way.
 `BatchMode` will not prompt for an unknown host key, so first put TAOSERV's host key in `~/.levain/night/known_hosts`
 (`ssh-keyscan -t ed25519 TAOSERV > ~/.levain/night/known_hosts`, then compare `ssh-keygen -lf ~/.levain/night/known_hosts`
 with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on TAOSERV: the fingerprints must be identical).
