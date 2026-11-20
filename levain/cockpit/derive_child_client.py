@@ -29,7 +29,9 @@ Kill. The child is its own session leader (``start_new_session=True``), so its p
 to the group, a short grace, then SIGKILL to the group BEFORE the leader is reaped, always (a leader that is a zombie still holds
 the group id, so the group cannot belong to anyone else and a helper that ignored SIGTERM, or outlived a leader that exited by
 itself, does not survive), then the reap and the pipes closed. Only the thread that holds the turn reaps and closes pipes;
-``close()`` from another thread signals the group and leaves the rest to the holder. The environment is the parent's own copy,
+``close()`` from another thread signals the group and leaves the rest to the holder, who ends a closed client's child before
+it lets go of the turn, whatever way its own call ended. A leader still unreaped after SIGKILL and the reap bound is handed to a
+reaper thread that keeps the Popen until it has been collected. The environment is the parent's own copy,
 with the directory this package is imported from put first on ``PYTHONPATH``, so the child reads the same install the parent runs.
 """
 
@@ -112,8 +114,13 @@ def _lost_answer(kind: str, text: str, hung: bool = False) -> ChildAnswer:
 
 
 def _valid_timeout(timeout_s: Any) -> bool:
-    return (isinstance(timeout_s, (int, float)) and not isinstance(timeout_s, bool)
-            and math.isfinite(timeout_s) and timeout_s > 0)
+    """A positive number that is finite as a float (an int too big for a float is not: ``OverflowError`` is a no)."""
+    if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool):
+        return False
+    try:
+        return math.isfinite(float(timeout_s)) and timeout_s > 0
+    except (OverflowError, ValueError):
+        return False
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -181,7 +188,9 @@ class DeriveChild:
 
     def start(self, timeout_s: float) -> bool:
         """Bring the child up and wait at most ``timeout_s`` for it to be ready. True when it is. Never raises; a failure that
-        costs a child is counted like any other (the backoff applies)."""
+        costs a child is counted like any other (the backoff applies). A ``timeout_s`` that is the client's ``ready_timeout_s``
+        or more (what ``warm`` asks) waits through the child's own ready bound: a child still not ready at that bound is killed
+        and backed off, as it is for any ask. A shorter one is a wait only: a child still building is left to build."""
         if not _valid_timeout(timeout_s):
             return False
         acquired = False
@@ -191,7 +200,7 @@ class DeriveChild:
             if not acquired:
                 return False
             try:
-                self._ensure_ready(deadline)
+                self._ensure_ready(deadline, through_ready=timeout_s >= self._ready_s)
                 return True
             except _Lost as lost:
                 if lost.costly:
@@ -204,7 +213,7 @@ class DeriveChild:
             return False
         finally:
             if acquired:
-                self._turn.release()
+                self._release_turn()
 
     def warm(self) -> None:
         """Start the child in the background (a thread) so ``knows`` can answer; returns at once, and does nothing when a
@@ -225,8 +234,12 @@ class DeriveChild:
     # ---- the ask
 
     def derive(self, panel_id: str, timeout_s: float) -> ChildAnswer:
-        """Ask the child to derive ``panel_id``; the whole call, from this moment, takes at most ``timeout_s`` (a positive
-        finite number: anything else is ``refused`` and touches nothing). Never raises."""
+        """Ask the child to derive ``panel_id``. ``timeout_s`` (a positive finite number: anything else, an integer too big
+        for a float included, is ``refused`` and touches nothing) bounds the wait for the turn, the start and the answer
+        together, counted from this moment. The call returns by then, except that a failure that ENDS the child takes the
+        ending too: SIGTERM, up to ``term_grace_s`` for a child that will not leave, then SIGKILL and the reap. So the real
+        worst case is ``timeout_s`` plus ``term_grace_s`` (a leader that ignores SIGTERM costs the whole grace; one that is
+        stuck in the kernel after SIGKILL is left to a reaper and does not hold the call). Never raises."""
         if not _valid_timeout(timeout_s):
             return _lost_answer("refused", f"timeout_s must be a finite number over 0, not {timeout_s!r}")
         acquired = False
@@ -248,7 +261,7 @@ class DeriveChild:
             return _lost_answer("died", f"{type(exc).__name__}: {exc}")
         finally:
             if acquired:
-                self._turn.release()
+                self._release_turn()
 
     def _ask(self, panel_id: str, deadline: float, timeout_s: float) -> ChildAnswer:
         proc = self._ensure_ready(deadline)
@@ -288,9 +301,10 @@ class DeriveChild:
 
     # ---- the child's life
 
-    def _ensure_ready(self, deadline: float) -> "subprocess.Popen[bytes]":
+    def _ensure_ready(self, deadline: float, through_ready: bool = False) -> "subprocess.Popen[bytes]":
         """The held child once it is ready, starting one if there is none. The caller holds the turn. ``_Lost`` when it cannot
-        be had by ``deadline`` (``costly`` says whether the child is lost with it)."""
+        be had by ``deadline`` (``costly`` says whether the child is lost with it). ``through_ready``: wait for the child's
+        own ready bound whatever ``deadline`` says, and a child not ready by then is a costly failure."""
         if self._closed:
             raise _Lost("refused", "the child is closed", costly=False)
         proc = self._proc
@@ -306,7 +320,7 @@ class DeriveChild:
                 self._kill()
                 raise _Lost("refused", "the child is closed", costly=False)
         if not self._ready:
-            self._await_ready(proc, deadline)
+            self._await_ready(proc, deadline, through_ready)
         return proc
 
     def _spawn(self) -> "subprocess.Popen[bytes]":
@@ -319,12 +333,13 @@ class DeriveChild:
         self._proc, self._buf, self._ready, self._spawned_at = proc, b"", False, self._clock()
         return proc
 
-    def _await_ready(self, proc: "subprocess.Popen[bytes]", deadline: float) -> None:
+    def _await_ready(self, proc: "subprocess.Popen[bytes]", deadline: float, through_ready: bool = False) -> None:
         """Read the ready frame. The call's ``deadline`` ends the WAIT but not the child: one still building is left to build
-        (the next ask waits for it); the child's own ready bound ends it for good."""
+        (the next ask waits for it); the child's own ready bound ends it for good, and a ``through_ready`` call waits to it."""
         ready_deadline = self._spawned_at + self._ready_s
         try:
-            frame = self._frame(min(deadline, ready_deadline), f"the child was not ready in {self._ready_s:g}s")
+            frame = self._frame(ready_deadline if through_ready else min(deadline, ready_deadline),
+                                f"the child was not ready in {self._ready_s:g}s")
         except _Lost as lost:
             if lost.kind == "timeout" and self._clock() < ready_deadline:
                 raise _Lost("timeout", "the child is still starting", costly=False) from None
@@ -396,6 +411,27 @@ class DeriveChild:
         proc, self._proc, self._buf, self._ready = self._proc, None, b"", False
         if proc is not None:
             _terminate(proc, self._grace_s)
+
+    def _release_turn(self) -> None:
+        """Let go of the turn. A ``close`` that could not take the turn killed the group and left the reaping to the holder; a
+        holder that ended normally (it had read its answer, or timed out at no cost) would never reap, so a closed client's
+        child is ended here, before the turn is let go. A ``close`` that set ``_closed`` just after that check and gave up on the
+        turn just before the release is caught by the second look."""
+        try:
+            if self._closed and self._proc is not None:
+                self._kill()
+        except Exception:  # noqa: BLE001 - letting go of the turn must not raise past a derive's promise
+            pass
+        finally:
+            self._turn.release()
+        if self._closed and self._proc is not None and self._turn.acquire(blocking=False):
+            try:
+                if self._closed and self._proc is not None:
+                    self._kill()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                self._turn.release()
 
     # ---- the end
 
@@ -470,6 +506,46 @@ def _reap(proc: "subprocess.Popen[bytes]", timeout_s: float) -> "int | None":
         time.sleep(0.005)
 
 
+_REAPER_LOCK = threading.Lock()
+_REAPER_QUEUE: "list[subprocess.Popen[bytes]]" = []
+_REAPER_RUNNING = False
+# How often the reaper looks at the leaders it still owes a wait (seconds).
+_REAPER_TICK_S = 0.25
+
+
+def _reap_later(proc: "subprocess.Popen[bytes]") -> None:
+    """Hand a SIGKILLed leader the bounded reap could not collect to the one reaper thread, which owns it until it is reaped
+    (it holds the Popen, so the leader is never dropped as a zombie). The thread starts on demand and ends when none is left."""
+    global _REAPER_RUNNING
+    with _REAPER_LOCK:
+        _REAPER_QUEUE.append(proc)
+        if _REAPER_RUNNING:
+            return
+        _REAPER_RUNNING = True
+    threading.Thread(target=_reaper_loop, name="derive-child-reaper", daemon=True).start()
+
+
+def _reaper_loop() -> None:
+    global _REAPER_RUNNING
+    while True:
+        with _REAPER_LOCK:
+            pending = list(_REAPER_QUEUE)
+            if not pending:
+                _REAPER_RUNNING = False
+                return
+        for proc in pending:
+            try:
+                with _SIG_LOCK:
+                    done = proc.poll() is not None
+            except Exception:  # noqa: BLE001 - a Popen that cannot be polled is not coming back
+                done = True
+            if done:
+                with _REAPER_LOCK:
+                    if proc in _REAPER_QUEUE:
+                        _REAPER_QUEUE.remove(proc)
+        time.sleep(_REAPER_TICK_S)
+
+
 def _terminate(proc: "subprocess.Popen[bytes]", grace_s: float) -> None:
     """End ``proc`` and its process group, reap it, and close its pipes: SIGTERM to the group, the grace, SIGKILL to the group
     while the leader is still unreaped (whatever the leader did meanwhile), the reap. Only the thread that holds the child's
@@ -478,7 +554,8 @@ def _terminate(proc: "subprocess.Popen[bytes]", grace_s: float) -> None:
         _signal_group(proc, signal.SIGTERM)
         _wait_exit_unreaped(proc, grace_s)
         _signal_group(proc, signal.SIGKILL)
-        _reap(proc, _REAP_BOUND_S)
+        if _reap(proc, _REAP_BOUND_S) is None:
+            _reap_later(proc)        # SIGKILLed but still in the kernel (an uninterruptible wait): somebody must still wait for it
     finally:
         for pipe in (proc.stdin, proc.stdout):
             try:

@@ -31,7 +31,8 @@ parent-death signal, so a watchdog thread also compares ``os.getppid()`` with th
 parent names itself with ``--parent-pid``, since the child could be started after its parent already died), every
 ``PARENT_TICK_S``. The watchdog is the first thing started, before the factory is imported or called, and it runs while a
 derive runs too: an orphan stuck in a factory or in a hung derive is the case that matters. An orphan ends its whole process
-group (it is the group's leader) before it exits, so a provider's subprocess does not outlive it.
+group (it is the group's leader) before it exits, so a provider's subprocess does not outlive it. A broken pipe on an answer
+or on the factory-failure frame is the same signal: with the parent gone, the group ends then too, not at the watchdog's tick.
 """
 
 from __future__ import annotations
@@ -225,13 +226,18 @@ def main(argv: "list[str] | None" = None) -> int:
         try:
             _send(out, {"op": "fatal", "error": f"{type(exc).__name__}: {exc}"})
         except OSError:
-            pass
+            if _parent_gone(parent, ORPHAN_SETTLE_S):
+                _exit_orphan()      # a helper the factory started must not outlive this exit
         return EXIT_FACTORY
     try:
         _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL, "panels": panels})
         return serve(cockpit, in_fd, out, parent)
     except (BrokenPipeError, ConnectionResetError):
-        return 0      # the parent is gone: nobody is left to answer
+        # the pipe to the parent is broken: if the parent is gone nobody is left to answer, and the process group (a provider's
+        # helper that ignores SIGTERM included) ends with this child, the same as on stdin EOF, without waiting for the watchdog
+        if _parent_gone(parent, ORPHAN_SETTLE_S):
+            _exit_orphan()
+        return 0
     finally:
         _stop_cockpit(cockpit)
 

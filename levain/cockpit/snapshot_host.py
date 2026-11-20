@@ -549,7 +549,9 @@ class SnapshotHost:
                 else:
                     res = self._result_of(ans)
                     if res is not None:
-                        return res, (ans.duration_ms if res.status in ("ok", "partial") else None)
+                        # every healthy answer is a measure (an ``empty`` one too: a promoted panel that now answers fast and
+                        # empty must be able to go back); an error or a timeout the derive ended in says nothing of the panel's weight
+                        return res, (None if res.status in ("error", "timeout") else ans.duration_ms)
             elif failure == "timeout":
                 if ans.hung:
                     self._mark(self._hung, pid, True)

@@ -327,6 +327,21 @@ def test_a_promoted_panel_returns_after_three_fast_derives_and_not_before(make_h
     assert not host._routed("count")
 
 
+def test_a_promoted_panel_that_now_answers_fast_and_empty_is_demoted(make_host):
+    """A healthy ``empty`` answer is a measured derive like an ``ok`` one: ``ms`` came back None for it, so a promoted panel that
+    began answering fast-and-empty (nothing to show) stayed in the child for good."""
+    empty = lambda pid, t: ChildAnswer("empty", dict(MARK, panel=pid), None, 5)     # noqa: E731
+    host, child = _light(make_host, [300, 300, 300])
+    for _ in range(3):
+        host._derive("count")
+    assert host._routed("count")
+    child.answer = empty
+    for _ in range(3):
+        res = host._derive("count")
+        assert res.status == "empty"
+    assert not host._routed("count")
+
+
 def test_between_the_two_bounds_a_panel_stays_where_it_is(make_host):
     """200 ms is under the promotion bound and over the demotion bound: it neither promotes a panel here nor sends a routed
     one back, which is what keeps the list from flapping."""

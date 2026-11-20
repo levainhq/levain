@@ -527,7 +527,8 @@ def test_a_request_that_is_json_but_not_an_object_is_answered_not_fatal(rig: Rig
     assert proc.poll() is None and rig.ask(c, "fast").failure is None
 
 
-@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -1.0, 0.0, "5", None, True], ids=repr)
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -1.0, 0.0, "5", None, True, 10**1000, -(10**1000)],
+                         ids=lambda v: repr(v)[:24])
 def test_a_timeout_that_is_not_a_positive_finite_number_is_refused_and_touches_nothing(rig: Rig, bad):
     """``derive(p, inf)`` raised out of the lock; ``derive(p, 0)`` killed a healthy child and set a backoff. Neither may
     happen: a typed ``refused``, the same child, and the very next valid ask is answered at once."""
@@ -663,3 +664,204 @@ def test_a_request_is_written_whole_whatever_the_os_returns_for_one_write(rig: R
     got = c.derive("fast", 10.0)
     monkeypatch.undo()
     assert got.failure is None and got.status == "ok" and len(calls) > 3
+
+
+# ------------------------------------------------------------------------------------------------ L3 round 2: the fixes
+
+
+def test_a_holder_that_ends_normally_after_a_contended_close_reaps_the_child(rig: Rig):
+    """``close`` cannot take the turn from a holder, kills the group and leaves the reap to it. A holder that goes on to end
+    normally (it had read its answer, or timed out without cost) never killed anything, so the child stayed an unreaped zombie
+    with pipes nobody owned. The holder now ends a child a closed client still holds before it lets go of the turn."""
+    c = rig.client(term_grace_s=0.3)
+    assert rig.ask(c, "fast").failure is None
+    proc = c._proc
+    assert proc is not None
+    pid = proc.pid
+    entered, go = threading.Event(), threading.Event()
+
+    def held(panel_id: str, deadline: float, timeout_s: float) -> ChildAnswer:
+        entered.set()
+        go.wait(30)
+        return ChildAnswer("ok", {"v": 1}, None, 1)         # the holder had its answer: it ends normally, never through _kill
+
+    c._ask = held                                           # type: ignore[method-assign]
+    out: list[ChildAnswer] = []
+    t = threading.Thread(target=lambda: out.append(c.derive("fast", 30.0)))
+    t.start()
+    assert entered.wait(10)
+    c.close()                                               # contended: the group is killed, the rest is the holder's
+    go.set()
+    t.join(timeout=20)
+    assert out and out[0].failure is None
+    assert c._proc is None, "the holder let go of a child nobody owns any more"
+    assert proc.returncode is not None, "and the child was reaped, not left a zombie"
+    assert not _alive(pid)
+
+
+class _StuckProc:
+    """A ``Popen`` whose leader cannot be reaped until ``release`` is set (a SIGKILLed process in an uninterruptible wait)."""
+
+    def __init__(self) -> None:
+        self.pid = 2 ** 22 + 12345                          # never signalled: the test replaces the signalling
+        self.returncode: "int | None" = None
+        self.stdin = self.stdout = None
+        self.release = threading.Event()
+        self.reaped = threading.Event()
+
+    def poll(self) -> "int | None":
+        if self.returncode is None and self.release.is_set():
+            self.returncode = -9
+            self.reaped.set()
+        return self.returncode
+
+    def wait(self, timeout: "float | None" = None) -> int:
+        end = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if end is not None and time.monotonic() >= end:
+                import subprocess
+                raise subprocess.TimeoutExpired("stuck", timeout)
+            time.sleep(0.01)
+        return self.returncode                              # type: ignore[return-value]
+
+
+def test_a_leader_the_reap_gave_up_on_is_still_waited_for(monkeypatch):
+    """``_reap`` gives up after its cap and ``_kill`` dropped the Popen, so a SIGKILLed leader that was slow to leave was
+    never waited for and became a zombie. The Popen now goes to a reaper that waits for it however long that takes."""
+    from levain.cockpit import derive_child_client as cc
+
+    monkeypatch.setattr(cc, "_REAP_BOUND_S", 0.05)
+    monkeypatch.setattr(cc, "_signal_group", lambda proc, sig: None)
+    monkeypatch.setattr(cc, "_wait_exit_unreaped", lambda proc, grace: None)
+    stuck = _StuckProc()
+    c = DeriveChild("x:y", term_grace_s=0.0)
+    c._proc = stuck                                         # type: ignore[assignment]
+    t0 = time.monotonic()
+    c._kill()
+    assert time.monotonic() - t0 < 5 and c._proc is None, "the call itself still returns at its cap"
+    assert not stuck.reaped.is_set()
+    stuck.release.set()                                     # the leader finally leaves the kernel's wait
+    assert stuck.reaped.wait(10), "somebody must still wait for it"
+
+
+def test_a_start_that_hangs_in_the_factory_is_killed_at_the_ready_bound_and_backed_off(rig: Rig):
+    """``start(ready_timeout_s)`` (what ``warm`` runs) took its deadline before the spawn and measured the ready bound from after
+    it, so it gave up a moment BEFORE the bound and called that a cost-free wait: the hung child lived on and no backoff was set."""
+    c = rig.client("test_derive_child_stub:slow_factory", ready_timeout_s=1.0, term_grace_s=0.5, backoff_base_s=30.0)
+    c._env["DERIVE_CHILD_STUB_FACTORY_SLEEP"] = "600"
+    assert c.start(1.0) is False
+    assert c._proc is None, "the child that never said ready is killed"
+    assert c._failures == 1 and c._not_before > time.monotonic(), "and the next one waits out a backoff"
+    assert c.derive("fast", 5.0).failure == "refused"
+
+
+def test_warm_kills_a_child_that_hangs_in_the_factory_and_sets_the_backoff(rig: Rig):
+    c = rig.client("test_derive_child_stub:slow_factory", ready_timeout_s=1.0, term_grace_s=0.5, backoff_base_s=30.0)
+    c._env["DERIVE_CHILD_STUB_FACTORY_SLEEP"] = "600"
+    c.warm()
+    end = time.monotonic() + 20
+    while (c._warming or c._failures == 0) and time.monotonic() < end:
+        time.sleep(0.05)
+    assert c._proc is None and c._failures == 1 and c._not_before > time.monotonic()
+    assert not c.knows("fast")
+
+
+def test_a_short_start_that_is_not_the_ready_bound_is_still_a_wait_and_not_a_kill(rig: Rig):
+    """The short deadline of a derive (or of a ``start`` that asks for less than the ready bound) leaves a still-building child to build."""
+    c = rig.client("test_derive_child_stub:slow_factory", ready_timeout_s=60.0, backoff_base_s=30.0)
+    c._env["DERIVE_CHILD_STUB_FACTORY_SLEEP"] = "3"
+    assert c.start(0.5) is False
+    assert c._proc is not None and c._proc.poll() is None and c._failures == 0
+    assert c.start(30.0) is True and c.knows("fast")
+
+
+# ---- the child's own exit when its parent is gone and the pipe says so
+
+
+def _child_main(monkeypatch, *, factory, parent_gone: bool, break_out_after_ready: bool):
+    """Run ``derive_child.main`` in this process over pipes (no watchdog, no stdio claim), with the parent said to be gone or not;
+    returns ``(exit code, how often the orphan exit ran)``."""
+    from levain.cockpit import derive_child as dc
+
+    in_r, in_w = os.pipe()
+    out_r, out_w = os.pipe()
+    orphans: list[int] = []
+    monkeypatch.setattr(dc, "_claim_stdio", lambda: (out_w, in_r))
+    monkeypatch.setattr(dc, "_watch_parent", lambda parent, tick: None)
+    monkeypatch.setattr(dc, "_load_factory", lambda spec: factory)
+    monkeypatch.setattr(dc, "_parent_gone", lambda parent, settle: parent_gone)
+    monkeypatch.setattr(dc, "_exit_orphan", lambda: orphans.append(1))
+    if break_out_after_ready:
+        def parent() -> None:
+            with os.fdopen(out_r, "rb") as r:
+                r.readline()                                # the ready frame
+            os.write(in_w, b'{"id":1,"op":"derive","panel":"fast"}\n')     # the child's answer now has no reader
+        threading.Thread(target=parent, daemon=True).start()
+    else:
+        os.close(out_r)                                     # nobody reads the child's first frame at all
+    try:
+        code = dc.main(["--factory", "x:y", "--parent-pid", str(os.getppid())])
+    finally:
+        for fd in (in_r, in_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return code, len(orphans)
+
+
+def test_a_child_answering_a_dead_parent_runs_the_orphan_exit(monkeypatch):
+    """The broken pipe on an answer ended ``main`` normally and skipped the group cleanup, so a SIGTERM-proof helper outlived a
+    child that left before its watchdog's next tick."""
+    from tests import test_derive_child_stub as stub
+
+    code, orphans = _child_main(monkeypatch, factory=stub.factory, parent_gone=True, break_out_after_ready=True)
+    assert code == 0 and orphans == 1
+
+
+def test_a_child_whose_factory_failed_to_a_dead_parent_runs_the_orphan_exit(monkeypatch):
+    def failing():
+        raise RuntimeError("cannot build")
+
+    code, orphans = _child_main(monkeypatch, factory=failing, parent_gone=True, break_out_after_ready=False)
+    assert orphans == 1
+
+
+def test_a_broken_pipe_with_the_parent_still_there_is_no_orphan_exit(monkeypatch):
+    from tests import test_derive_child_stub as stub
+
+    code, orphans = _child_main(monkeypatch, factory=stub.factory, parent_gone=False, break_out_after_ready=True)
+    assert code == 0 and orphans == 0, "the orphan exit kills the process group: it is for a parent that is gone"
+
+
+def test_a_parent_killed_while_the_child_answers_leaves_no_process(rig: Rig):
+    """The whole path in real processes: the parent dies while the child's derive runs, and neither the child nor its helper
+    survives. (The watchdog covers this one as well; the unit tests above pin the pipe path alone.)"""
+    import subprocess
+    import sys
+
+    root = str(Path(engine.__file__).resolve().parents[2])
+    script = rig.tmp / "scratch_parent2.py"
+    script.write_text(
+        "import os, sys, threading, time\n"
+        "from levain.cockpit.derive_child_client import DeriveChild\n"
+        f"c = DeriveChild({FACTORY!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=60)\n"
+        "assert c.derive('grandchild', 30).failure is None\n"
+        "threading.Thread(target=lambda: c.derive('slow5', 60), daemon=True).start()\n"
+        "print(c._proc.pid, flush=True)\n"
+        "time.sleep(600)\n")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([root, TESTS_DIR]), DERIVE_CHILD_STUB_DIR=str(rig.tmp),
+               DERIVE_CHILD_STUB_HELPERS="1", DERIVE_CHILD_STUB_SLOW_S="1.5")
+    parent = subprocess.Popen([sys.executable, "-P", str(script)], stdout=subprocess.PIPE, env=env)
+    try:
+        assert parent.stdout is not None
+        child_pid = int(parent.stdout.readline())
+        rig.pids.add(child_pid)
+        helper = _grandchild_pid(rig.tmp)
+        time.sleep(0.5)                                     # the child is inside the slow derive now
+        parent.kill()
+        parent.wait(timeout=10)
+        assert _gone(child_pid) and _gone(helper)
+    finally:
+        parent.kill()
+        parent.wait(timeout=10)
