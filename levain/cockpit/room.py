@@ -3,7 +3,7 @@ routes into it, as JSON. The desk half is landed code this module only calls (``
 ``room_launch``, ``chat``); no authority, consent or containment rule lives here.
 
 Reads (``GET /cockpit/room.json``) open ``<directory>/dispatch.db`` ``mode=ro`` and write nothing: the open room thread,
-its newest room launch's composer, its stream in ``gseq`` order (the thread view's own item shape), and the drop proposals
+its newest room launch's composer, its stream in ``gseq`` order, and the drop proposals
 its session made, each with the state the RECORD holds (``open`` / ``committed`` / ``dismissed`` / ``expired``). A card's
 state comes from ``proposal_events``, never from anything the room said.
 

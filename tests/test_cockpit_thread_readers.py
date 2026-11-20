@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -87,3 +89,30 @@ def test_a_model_that_is_absent_unreadable_or_not_a_string_is_none(model):
 
 def test_without_a_service_or_a_launch_there_is_no_model():
     assert threads.model_in_use(None, "ln-1") is None and threads.model_in_use(_Svc("m"), None) is None
+
+
+def test_event_facts_gap_is_true_for_a_stream_gap_event_or_a_cursor_that_could_not_catch_up(tmp_path):
+    # the gap flag the room's read still carries (levain#177 deleted its only other pin, the thread catch-up test)
+    db = sqlite3.connect(tmp_path / "dispatch.db")
+    db.execute("CREATE TABLE chat_cursors (launch_id TEXT, seq INTEGER, gap INTEGER)")
+    db.executemany("INSERT INTO chat_cursors VALUES (?, ?, ?)", [("L-A", 1, 1), ("L-A", 2, 0), ("L-B", 1, 0), ("L-B", 2, 1)])
+    db.commit(); db.close()
+    conn = threads._open(tmp_path)
+    try:
+        assert threads._event_facts(conn, {"L-A"})[1] is False       # the LATEST cursor row decides: L-A caught up
+        assert threads._event_facts(conn, {"L-B"})[1] is True        # L-B's latest says it could not
+        assert threads._event_facts(conn, {"L-A", "L-B"})[1] is True
+    finally:
+        conn.close()
+
+
+def test_the_deleted_thread_routes_answer_the_generic_404_past_the_write_token(tmp_path):
+    # levain#177: the Threads zone's routes are gone; a client that still asks gets an unknown route, never a 500 or a read
+    from tests.test_cockpit_k2a import TOKEN, _install, _serve
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        for path in ("/cockpit/threads.json", "/cockpit/thread/th-" + "0" * 32 + ".json"):
+            req = urllib.request.Request(base + path, headers={"Authorization": "Bearer " + TOKEN})
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(req, timeout=10)
+            assert err.value.code == 404, (path, err.value.code)
