@@ -602,9 +602,8 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
-            # waits for the focus to come back (up to 10 s) instead of a fixed 400 ms: a loaded CI runner failed this twice on 11-20
-            {"eval": "document.querySelector('#levain-modal .modal-close').click(); "
-                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            # closing returns the focus in the same task as the click: it is read at once, with no wait
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
@@ -637,6 +636,27 @@ def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives
             {"eval": "window.LevainDashboard.redraw(); "
                      f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 3000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
+        ])
+    assert out["values"][-1] is True, out["values"]
+
+
+@needs_browser
+def test_listpanel_a_board_redraw_after_the_full_list_closed_keeps_focus_on_the_cards_control(tmp_path: Path, monkeypatch: Any) -> None:
+    # the view has closed and given the focus back; the board is then drawn again (a poll does this) and replaces the control that holds it
+    src = _carried_install(tmp_path, monkeypatch)
+    ctl = "document.querySelector('[data-ck-panel=tray] [data-list-more]')"
+    focus_is_control = f"document.activeElement && document.activeElement === {ctl}"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); window.LevainDashboard.redraw(); "
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 3000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing') + ' ctl=' + !!{ctl})"},
         ])
     assert out["values"][-1] is True, out["values"]
 
