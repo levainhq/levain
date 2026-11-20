@@ -31,8 +31,8 @@ the group id, so the group cannot belong to anyone else and a helper that ignore
 itself, does not survive), then the reap and the pipes closed. Only the thread that holds the turn reaps and closes pipes;
 ``close()`` from another thread signals the group and leaves the rest to the holder, who ends a closed client's child before
 it lets go of the turn, whatever way its own call ended. A leader still unreaped after SIGKILL and the reap bound is handed to a
-reaper thread that keeps the Popen until it has been collected. The environment is the parent's own copy,
-with the directory this package is imported from put first on ``PYTHONPATH``, so the child reads the same install the parent runs.
+reaper thread that keeps the Popen until it has been collected. The environment is ``levain.launch.child_env()``
+(an explicit ``env`` is used as given), with the directory this package is imported from put first on ``PYTHONPATH``, so the child reads the same install the parent runs.
 """
 
 from __future__ import annotations
@@ -50,6 +50,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+from levain.launch import child_env
 
 CHILD_MODULE = "levain.cockpit.derive_child"
 # The protocol the child and this client speak; the child's ``ready`` frame names it and a client talks to no other.
@@ -151,7 +153,9 @@ class DeriveChild:
         self._argv = [python or sys.executable, "-P", "-m", CHILD_MODULE, "--factory", factory, "--parent-pid", str(os.getpid())]
         for d in syspath:
             self._argv += ["--syspath", str(d)]
-        base = dict(os.environ if env is None else env)
+        # The child reads nothing from the environment beyond what every levain child is given (the allowlist: PATH, HOME,
+        # the locale, PYTHON*, LEVAIN_*), so no names are carried on top. An ``env`` a caller passes is used as given.
+        base = child_env() if env is None else dict(env)
         base["PYTHONPATH"] = os.pathsep.join([_LEVAIN_ROOT] + ([base["PYTHONPATH"]] if base.get("PYTHONPATH") else []))
         self._env = base
         self._stderr = stderr           # None: the child's stderr is this process's own (the serve's log)

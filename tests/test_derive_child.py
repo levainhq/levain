@@ -452,7 +452,9 @@ def _scratch_parent(rig: Rig, factory_sleep: str) -> "tuple[Any, int]":
     script.write_text(
         "import os, sys, threading, time\n"
         "from levain.cockpit.derive_child_client import DeriveChild\n"
-        f"c = DeriveChild({FACTORY.replace('factory', 'slow_factory')!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=600)\n"
+        "from levain.launch import child_env\n"
+        f"c = DeriveChild({FACTORY.replace('factory', 'slow_factory')!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=600, "
+        "env=child_env(prefixes=('DERIVE_CHILD_STUB_',)))\n"
         "threading.Thread(target=lambda: c.derive('fast', 600), daemon=True).start()\n"
         "while c._proc is None:\n"
         "    time.sleep(0.05)\n"
@@ -845,7 +847,9 @@ def test_a_parent_killed_while_the_child_answers_leaves_no_process(rig: Rig):
     script.write_text(
         "import os, sys, threading, time\n"
         "from levain.cockpit.derive_child_client import DeriveChild\n"
-        f"c = DeriveChild({FACTORY!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=60)\n"
+        "from levain.launch import child_env\n"
+        f"c = DeriveChild({FACTORY!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=60, "
+        "env=child_env(prefixes=('DERIVE_CHILD_STUB_',)))\n"
         "assert c.derive('grandchild', 30).failure is None\n"
         "threading.Thread(target=lambda: c.derive('slow5', 60), daemon=True).start()\n"
         "print(c._proc.pid, flush=True)\n"
