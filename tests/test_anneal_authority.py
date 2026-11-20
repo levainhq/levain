@@ -484,14 +484,14 @@ def test_a_missing_or_empty_version_is_guarded(tmp_path, monkeypatch):
 
 
 # --- levain#194 L3 r1 fixes -------------------------------------------------------------------
-def _both(tmp_path, monkeypatch, script_out, module_out, requires=None, *, module_ok=True):
+def _both(tmp_path, monkeypatch, script_out, module_out, requires=None, *, module_ok=True, script_text=""):
     """A script that runs (under ITS shebang interpreter) and the module under sys.executable."""
     from levain import doctor
 
     _declared(monkeypatch, requires if requires is not None else [_DECLARED])
     script = tmp_path / "bin" / "anneal-memory"
     script.parent.mkdir(exist_ok=True)
-    script.write_text("", encoding="utf-8")
+    script.write_text(script_text, encoding="utf-8")
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(script))
 
     def probe(cmd, timeout=5.0):
@@ -540,12 +540,55 @@ def test_in_range_but_different_versions_are_reported_as_disagreeing(tmp_path, m
     assert all("disagree" in r.detail.lower() for r in rows.values())
 
 
-def test_a_script_that_runs_with_no_importable_module_is_a_warning(tmp_path, monkeypatch):
+def test_a_script_that_runs_with_no_importable_module_fails(tmp_path, monkeypatch):
+    """L3 r2 MED (complement + deepseek): `levain` imports anneal_memory under sys.executable and it is
+    a hard dependency, so a module absent there is a FAILURE whatever the script says."""
     rows = _both(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", "boom", module_ok=False)
 
     assert rows["anneal-memory CLI"].ok is True
-    mod = rows["anneal-memory module"]
-    assert mod.ok is True and mod.warn is True and sys.executable in mod.detail
+    mod = rows["anneal-memory"]
+    assert mod.ok is False and not mod.warn
+    assert mod.detail == f"not installed for levain's interpreter ({sys.executable})"
+    assert mod.hint == f"Install with: {manifest.pip_invocation()} install anneal-memory"
+    assert not all(r.ok for r in rows.values())
+
+
+def test_the_absent_module_hint_quotes_an_interpreter_path_with_a_space(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", "/opt/my venv/bin/python")
+    rows = _both(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", "boom", module_ok=False)
+
+    assert rows["anneal-memory"].hint == "Install with: '/opt/my venv/bin/python' -m pip install anneal-memory"
+
+
+_STALE = "#!/old/venv/bin/python3\nimport sys\n"
+
+
+@pytest.mark.parametrize("script_out, requires", [
+    ("anneal-memory 1.0.2\n", [_DECLARED]),       # a FAIL row
+    ("anneal-memory 2.0.1rc1\n", [_DECLARED]),    # a WARN row (version not modelled)
+    ("anneal-memory 2.0.1\n", ['anneal-memory>=3.0; extra == "app"']),  # a WARN row (marker entry)
+])
+def test_a_script_row_remedy_never_names_a_pip_command_for_sys_executable(tmp_path, monkeypatch, script_out, requires):
+    """L3 r2 MED/LOW (codex, deepseek): the script runs under its OWN interpreter, so a pip command aimed
+    at sys.executable (or a bare `python`) can send the operator to an environment that is already fine."""
+    rows = _both(tmp_path, monkeypatch, script_out, script_out, requires, script_text=_STALE)
+    cli = rows["anneal-memory CLI"]
+    script = str(tmp_path / "bin" / "anneal-memory")
+
+    assert not cli.ok or cli.warn
+    assert sys.executable not in cli.hint and "pip" not in cli.hint and "python -m" not in cli.hint
+    assert f"environment of the script {script}" in cli.hint
+    assert "/old/venv/bin/python3" in cli.hint
+
+
+@pytest.mark.parametrize("script_text", ["", "\x80\x81 not a shebang\n", "print(1)\n"])
+def test_a_script_row_remedy_without_a_readable_shebang_names_only_the_script(tmp_path, monkeypatch, script_text):
+    rows = _both(tmp_path, monkeypatch, "anneal-memory 1.0.2\n", "anneal-memory 2.0.1\n", script_text=script_text)
+    cli = rows["anneal-memory CLI"]
+    script = str(tmp_path / "bin" / "anneal-memory")
+
+    assert cli.ok is False and f"environment of the script {script}" in cli.hint
+    assert "shebang" not in cli.hint and "pip" not in cli.hint and sys.executable not in cli.hint
 
 
 _EXTRA = 'anneal-memory>=3.0; extra == "app"'
