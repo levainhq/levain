@@ -3990,24 +3990,25 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
    where the chip used to sit between them and push Jump onto a row of its own */
 @media (max-width: 720px) {
   body.ia .masthead .indicators > .ia-actions, body.ia .masthead #jumpbtn { order: 3; }
-  /* a zero basis keeps it on the buttons' row whatever it says (it takes the row's remaining room and cuts with an ellipsis), and right-aligned */
+  /* a zero basis keeps it on the buttons' row (it takes the row's remaining room and cuts with an ellipsis), and right-aligned; the live state
+     is the one exception, where its age would be cut (the rule further down) */
   body.ia .masthead #freshline { order: 4; flex: 1 1 0; min-width: 7ch; max-width: none; justify-content: flex-end; }
   /* the state words keep their room and the age takes what is left of the row (an ellipsis on the age first, then on the words) */
   body.ia .masthead #freshline .fl-age { flex: 1 1 0; }
   /* a trouble state is read whole: on the shared row the cut hit the panel's name ("Work board unavaila...") and the age, the very words that say
      what is wrong, and a phone has no hover to read the title. So it takes its own row after the buttons' (the presence chip, a full row, follows it),
-     left-aligned, the words wrapping rather than cutting and the age after them. The live state (and a live read that says "updating", and the
-     first "connecting") keeps the shared row above. The row comes when a trouble state speaks (a worse state waits its hold first, so a flap
+     left-aligned, the words wrapping rather than cutting and the age after them. The live state and the first "connecting" keep the shared row
+     above (a live read that says "updating" does too, unless its age would not fit; see the rule below). The row comes when a trouble state speaks (a worse state waits its hold first, so a flap
      does not move the page) and goes when the page is live again; the masthead is not pinned here. 721 px and up is untouched: its footprint
      is fixed on purpose (the block below). */
   body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) { flex: 1 1 100%; justify-content: flex-start; }
   body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) :is(.fl-state, .fl-age) {
     flex: 0 1 auto; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
-  /* the "updating" cue is the age, and an age is never cut (levain#169: at 320 the shared row left 72 px and it read "live · up..."). The live
-     and connecting line is sized by its own text and never shrunk, so where the buttons' row has not the room for it the line wraps to its own
-     row (320 only, and only while a read says "updating"); a line with no age is a dot and a word and shares the row at every phone width. */
-  body.ia .masthead #freshline:is([data-state="live"], [data-state="connecting"]) { flex: 1 0 auto; min-width: 0; }
-  body.ia .masthead #freshline:is([data-state="live"], [data-state="connecting"]) .fl-age { flex: 0 0 auto; overflow: visible; text-overflow: clip; }
+  /* the "updating" cue is the age, and an age is never cut: the live line is sized by its own text and never shrunk, so at the narrowest phone
+     widths, where the buttons' row has not the room for it, it wraps to its own row while a read says "updating". A plain live line (a dot and a
+     word) shares the row as before. The first "connecting" has no age and keeps the shared row, so the masthead does not change height when the page goes live. */
+  body.ia .masthead #freshline[data-state="live"] { flex: 1 0 auto; min-width: 0; }
+  body.ia .masthead #freshline[data-state="live"] .fl-age { flex: 0 0 auto; overflow: visible; text-overflow: clip; }
   /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
   body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
   /* its own full row, cut with an ellipsis rather than past the edge: it now carries a read's failure and what to do about it */
