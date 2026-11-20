@@ -127,7 +127,7 @@ def test_a_page_read_waits_for_a_slot_and_is_served_with_no_refusal_counted(band
     finally:
         _release(httpd.page_gate, held)
         t.join(10)
-    assert stats.snapshot()["band"]["refused_503"] == 0
+    assert stats.snapshot().get("band", {}).get("refused_503", 0) == 0     # a served read records no refusal row at all
     assert httpd.page_waiters == 0
 
 
