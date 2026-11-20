@@ -13,7 +13,8 @@ Protocol (JSON lines, one object per line, UTF-8):
   parent -> child   {"id": N, "op": "derive", "panel": PANEL_ID}   -> one answer with the same id
                     {"op": "ping"}                                  -> {"op": "pong"}
                     {"op": "stop"}                                  -> the child exits 0 (so does stdin EOF)
-  child -> parent   {"op": "ready", "pid": P, "protocol": "levain-derive-child/1"}   once, when the factory has built
+  child -> parent   {"op": "ready", "pid": P, "protocol": PROTOCOL, "panels": [ID, ...]}   once, when the factory has built:
+                    the panels this child holds (a sorted list, at most READY_PANELS_MAX), so the parent routes only those
                     {"op": "fatal", "error": TEXT}                  once, then exit 2, when the factory could not build
                     {"id": N, "status": S, "body": B, "valid_until": U, "error": E, "duration_ms": D}
 
@@ -26,8 +27,11 @@ with it, so a provider's ``print`` (or a subprocess it starts) cannot write into
 null device for the same reason, so a provider's subprocess cannot read the parent's requests.
 
 Parent death. Stdin EOF is the primary signal (the parent's pipe closes when it dies, however it dies). macOS has no
-parent-death signal, so a watchdog thread also compares ``os.getppid()`` with the parent the child started under, every
-``PARENT_TICK_S``, and it runs while a derive is running too: a hung derive in an orphan is the case that matters.
+parent-death signal, so a watchdog thread also compares ``os.getppid()`` with the parent the child started under (the
+parent names itself with ``--parent-pid``, since the child could be started after its parent already died), every
+``PARENT_TICK_S``. The watchdog is the first thing started, before the factory is imported or called, and it runs while a
+derive runs too: an orphan stuck in a factory or in a hung derive is the case that matters. An orphan ends its whole process
+group (it is the group's leader) before it exits, so a provider's subprocess does not outlive it.
 """
 
 from __future__ import annotations
@@ -36,19 +40,24 @@ import argparse
 import importlib
 import json
 import os
-import select
+import signal
 import sys
 import threading
 import time
 from typing import Any, BinaryIO
 
+from levain.cockpit.derive_child_client import PROTOCOL, READY_PANELS_MAX
 from levain.cockpit.snapshot_host import PSEUDO_PREFIX, derive_panel_result
 
-PROTOCOL = "levain-derive-child/1"
 # How often the watchdog looks at the parent (seconds).
 PARENT_TICK_S = 1.0
 # What the child exits with when its factory cannot build.
 EXIT_FACTORY = 2
+# How long the child waits for the cockpit's own ``stop`` before it exits without it (seconds).
+COCKPIT_STOP_BOUND_S = 2.0
+# After stdin closes without a stop request, how long the child looks for its parent to be gone before deciding the close
+# was an orderly one (seconds): a dying parent's pipe closes a moment before the child is reparented.
+ORPHAN_SETTLE_S = 0.3
 
 
 def _claim_stdio() -> "tuple[int, int]":
@@ -80,19 +89,26 @@ def _frame(obj: "dict[str, Any]") -> bytes:
     return json.dumps(obj, allow_nan=False, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "surrogatepass") + b"\n"
 
 
+def _safe_id(rid: Any) -> "int | str | None":
+    """The request id as the frame may echo it: a plain integer or string, else None (a NaN, a float, a list cannot crash the writer)."""
+    if isinstance(rid, bool) or not isinstance(rid, (int, str)):
+        return None
+    return rid
+
+
 def _send(out: BinaryIO, obj: "dict[str, Any]") -> None:
     try:
         data = _frame(obj)
     except (TypeError, ValueError, RecursionError) as exc:
         # a result that is not JSON is an error answer, never a broken frame
-        data = _frame({"id": obj.get("id"), "status": "error", "body": None, "valid_until": None,
-                       "error": f"the answer is not JSON: {type(exc).__name__}: {exc}", "duration_ms": obj.get("duration_ms", 0)})
+        data = _frame({"id": _safe_id(obj.get("id")), "status": "error", "body": None, "valid_until": None,
+                       "error": f"the answer is not JSON: {type(exc).__name__}: {exc}", "duration_ms": 0})
     out.write(data)
     out.flush()
 
 
 def _derive(cockpit: Any, req: "dict[str, Any]") -> "dict[str, Any]":
-    rid, panel = req.get("id"), req.get("panel")
+    rid, panel = _safe_id(req.get("id")), req.get("panel")
     started = time.monotonic()
 
     def done(status: str, body: Any, until: Any, error: "str | None") -> "dict[str, Any]":
@@ -103,25 +119,48 @@ def _derive(cockpit: Any, req: "dict[str, Any]") -> "dict[str, Any]":
         return done("error", None, None, f"not a panel this child derives: {panel!r}")
     try:
         res = derive_panel_result(cockpit, panel, lambda pid: None)    # the one derivation the in-process loop runs
-    except Exception as exc:  # noqa: BLE001 - one bad derive must not end the child; the text is the loop's own error text
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - one bad derive (a provider's sys.exit included) must not end the child; the text is the loop's own error text
         return done("error", None, None, f"{type(exc).__name__}: {exc}")
     return done(res.status, res.body, res.valid_until, res.error)
 
 
+def _exit_orphan() -> None:
+    """Leave because the parent is gone: the process group first (this child leads it), so a provider's subprocess that
+    ignores a polite stop does not outlive the child; the kill reaches this process too, which is the exit."""
+    try:
+        if os.getpgrp() == os.getpid():
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        pass
+    os._exit(0)
+
+
 def _watch_parent(parent: int, tick_s: float) -> None:
     while True:
-        time.sleep(tick_s)
         if os.getppid() != parent:
-            os._exit(0)
+            _exit_orphan()
+        time.sleep(tick_s)
 
 
-def serve(cockpit: Any, in_fd: int, out: BinaryIO) -> int:
-    """Answer requests from ``in_fd`` until a stop request or EOF; the exit status."""
+def _parent_gone(parent: int, settle_s: float) -> bool:
+    end = time.monotonic() + settle_s
+    while True:
+        if os.getppid() != parent:
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+
+
+def serve(cockpit: Any, in_fd: int, out: BinaryIO, parent: "int | None" = None) -> int:
+    """Answer requests from ``in_fd`` until a stop request or EOF; the exit status. An EOF that comes with the parent gone
+    ends the process group as the watchdog does (``parent`` is the pid the child started under; None skips the check)."""
     buf = b""
     while True:
-        select.select([in_fd], [], [])
         chunk = os.read(in_fd, 65536)
         if not chunk:
+            if parent is not None and _parent_gone(parent, ORPHAN_SETTLE_S):
+                _exit_orphan()
             return 0
         buf += chunk
         while b"\n" in buf:
@@ -130,11 +169,13 @@ def serve(cockpit: Any, in_fd: int, out: BinaryIO) -> int:
                 continue
             try:
                 req = json.loads(line)
-                op = req.get("op") if isinstance(req, dict) else None
             except ValueError:
+                req = None
+            if not isinstance(req, dict):
                 _send(out, {"id": None, "status": "error", "body": None, "valid_until": None,
-                            "error": "a request that is not a JSON line", "duration_ms": 0})
+                            "error": "a request that is not a JSON object", "duration_ms": 0})
                 continue
+            op = req.get("op")
             if op == "stop":
                 return 0
             if op == "ping":
@@ -142,39 +183,57 @@ def serve(cockpit: Any, in_fd: int, out: BinaryIO) -> int:
             elif op == "derive":
                 _send(out, _derive(cockpit, req))
             else:
-                _send(out, {"id": req.get("id"), "status": "error", "body": None, "valid_until": None,
+                _send(out, {"id": _safe_id(req.get("id")), "status": "error", "body": None, "valid_until": None,
                             "error": f"unknown op {op!r}", "duration_ms": 0})
+
+
+def _panels_of(cockpit: Any) -> "list[str]":
+    """The panel ids this child holds, as the ready frame states them: sorted, strings only, at most READY_PANELS_MAX."""
+    return sorted(p for p in cockpit.panel_ids if isinstance(p, str))[:READY_PANELS_MAX]
+
+
+def _stop_cockpit(cockpit: Any) -> None:
+    """The cockpit's own ``stop``, bounded: a stop that waits on a provider thread must not hold the exit."""
+    def run() -> None:
+        try:
+            cockpit.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    t = threading.Thread(target=run, name="derive-child-cockpit-stop", daemon=True)
+    t.start()
+    t.join(COCKPIT_STOP_BOUND_S)
 
 
 def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(prog="python -P -m levain.cockpit.derive_child", description=__doc__.split("\n")[0])
     ap.add_argument("--factory", required=True, help="MODULE:CALLABLE returning an unstarted Cockpit")
     ap.add_argument("--syspath", action="append", default=[], metavar="DIR", help="a directory put on sys.path before the factory imports")
+    ap.add_argument("--parent-pid", type=int, default=None, metavar="PID", help="the parent to watch (default: the process that started this one)")
     args = ap.parse_args(argv)
-    parent = os.getppid()
+    parent = args.parent_pid if args.parent_pid is not None else os.getppid()
     out_fd, in_fd = _claim_stdio()
+    # first, before anything that can take long or hang: a parent that dies from here on cannot leave this child running
+    threading.Thread(target=_watch_parent, args=(parent, PARENT_TICK_S), name="derive-child-parent-watch", daemon=True).start()
     out = os.fdopen(out_fd, "wb")        # buffered: a large answer is written whole, never as a partial pipe write
     for i, d in enumerate(args.syspath):
         sys.path.insert(i, d)
     try:
         cockpit = _load_factory(args.factory)()
+        panels = _panels_of(cockpit)
     except BaseException as exc:  # noqa: BLE001 - whatever stopped the build is said to the parent, once
         try:
             _send(out, {"op": "fatal", "error": f"{type(exc).__name__}: {exc}"})
         except OSError:
             pass
         return EXIT_FACTORY
-    threading.Thread(target=_watch_parent, args=(parent, PARENT_TICK_S), name="derive-child-parent-watch", daemon=True).start()
     try:
-        _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL})
-        return serve(cockpit, in_fd, out)
+        _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL, "panels": panels})
+        return serve(cockpit, in_fd, out, parent)
     except (BrokenPipeError, ConnectionResetError):
         return 0      # the parent is gone: nobody is left to answer
     finally:
-        try:
-            cockpit.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        _stop_cockpit(cockpit)
 
 
 if __name__ == "__main__":

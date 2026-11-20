@@ -79,13 +79,22 @@ def rig(tmp_path: Path):
             except Exception:  # noqa: BLE001
                 pass
             if c._proc is not None:             # a child close() could not end: never leave one running
-                os.killpg(c._proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(c._proc.pid, signal.SIGKILL)
+                except ProcessLookupError:      # it died uncollected: the teardown must not mask the test's own failure
+                    pass
         for pid in r.pids:
             if _alive(pid):
                 try:
                     os.killpg(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        gpid = (tmp_path / "grandchild.pid")
+        if gpid.exists():                       # a SIGTERM-proof helper a test started: never leave one running
+            try:
+                os.kill(int(gpid.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
         r.err.close()
 
 
@@ -381,3 +390,276 @@ def test_a_caller_waiting_its_turn_is_bounded(rig: Rig):
     (rig.tmp / "hang.flag").unlink()
     t.join(timeout=30)
     assert first and first[0].failure is None and _rows(first[0]) == ["released"], "the wait must not kill the child"
+
+
+# ------------------------------------------------------------------------------------------------ L3 round 1: the fixes
+
+
+def _gone(pid: int, within_s: float = 8.0) -> bool:
+    end = time.monotonic() + within_s
+    while time.monotonic() < end:
+        if not _alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+def _grandchild_pid(tmp: Path) -> int:
+    return int((tmp / "grandchild.pid").read_text())
+
+
+def test_a_helper_that_ignores_sigterm_is_gone_after_close(rig: Rig):
+    """A provider's subprocess that ignores SIGTERM, left behind when ``close`` reaped the leader that had exited on its own
+    (before: the group was never signalled once the leader was gone, so the helper outlived the child)."""
+    c = rig.client()
+    assert rig.ask(c, "grandchild").failure is None
+    helper = _grandchild_pid(rig.tmp)
+    assert _alive(helper)
+    c.close()
+    assert _gone(helper), "the whole process group must end with the child"
+
+
+def test_a_helper_that_ignores_sigterm_is_gone_after_a_timeout_kill(rig: Rig):
+    """The leader dies on SIGTERM at once, so the escalation to SIGKILL used to be skipped and the helper survived."""
+    c = rig.client()
+    rig.hang_flag()
+    assert rig.ask(c, "grandchild").failure is None
+    helper = _grandchild_pid(rig.tmp)
+    assert rig.ask(c, "hang", timeout_s=1.0).failure == "timeout"
+    assert _gone(helper)
+
+
+def test_a_helper_is_gone_when_the_leader_exited_by_itself(rig: Rig):
+    """The leader leaves on a stop request (no signal from the client); the next ask finds it gone and must end the group too."""
+    c = rig.client()
+    assert rig.ask(c, "grandchild").failure is None
+    helper = _grandchild_pid(rig.tmp)
+    proc = c._proc
+    assert proc is not None
+    os.write(proc.stdin.fileno(), b'{"op":"stop"}\n')        # type: ignore[union-attr]
+    time.sleep(1.0)                                         # the leader is a zombie: nobody has reaped it
+    assert rig.ask(c, "fast").failure is None
+    assert _gone(helper)
+
+
+def _scratch_parent(rig: Rig, factory_sleep: str) -> "tuple[Any, int]":
+    """A parent process that starts a child whose factory is slow, and prints the child's pid; ``(parent, child_pid)``."""
+    import subprocess
+    import sys
+
+    root = str(Path(engine.__file__).resolve().parents[2])
+    script = rig.tmp / "scratch_parent.py"
+    script.write_text(
+        "import os, sys, threading, time\n"
+        "from levain.cockpit.derive_child_client import DeriveChild\n"
+        f"c = DeriveChild({FACTORY.replace('factory', 'slow_factory')!r}, syspath=[{TESTS_DIR!r}], ready_timeout_s=600)\n"
+        "threading.Thread(target=lambda: c.derive('fast', 600), daemon=True).start()\n"
+        "while c._proc is None:\n"
+        "    time.sleep(0.05)\n"
+        "print(c._proc.pid, flush=True)\n"
+        "time.sleep(600)\n")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([root, TESTS_DIR]), DERIVE_CHILD_STUB_DIR=str(rig.tmp),
+               DERIVE_CHILD_STUB_FACTORY_SLEEP=factory_sleep)
+    parent = subprocess.Popen([sys.executable, "-P", str(script)], stdout=subprocess.PIPE, env=env)
+    assert parent.stdout is not None
+    child_pid = int(parent.stdout.readline())
+    rig.pids.add(child_pid)
+    return parent, child_pid
+
+
+def test_a_child_whose_parent_dies_during_a_slow_factory_leaves_no_process(rig: Rig):
+    """The parent is killed while the factory is still building. The watchdog used to start only after the factory returned,
+    so a factory that took long (or never returned) kept an orphan, and its helper, for as long as it ran."""
+    parent, child_pid = _scratch_parent(rig, "600")
+    try:
+        end = time.monotonic() + 20
+        while not (rig.tmp / "grandchild.pid").exists() and time.monotonic() < end:
+            time.sleep(0.05)                                # the factory is running now, and hung
+        helper = _grandchild_pid(rig.tmp)
+        assert _alive(child_pid) and _alive(helper)
+        parent.kill()
+        parent.wait(timeout=10)
+        assert _gone(child_pid), "the orphan must exit while its factory is still running"
+        assert _gone(helper), "and take its process group with it"
+    finally:
+        parent.kill()
+        parent.wait(timeout=10)
+
+
+def test_a_ready_frame_of_another_protocol_is_died(rig: Rig, monkeypatch):
+    """A child of another protocol version (a package updated on disk under a running parent) is refused at the ready frame,
+    not talked to."""
+    from levain.cockpit import derive_child_client as cc
+
+    monkeypatch.setattr(cc, "PROTOCOL", "levain-derive-child/0")
+    got = rig.ask(rig.client(), "fast")
+    assert got.failure == "died" and "protocol" in (got.error or "")
+
+
+def test_the_ready_frame_lists_the_panels_the_child_holds_and_knows_says_so(rig: Rig):
+    c = rig.client()
+    assert c.knows("fast") is False, "nothing is known of a child that has not started"
+    assert rig.ask(c, "fast").failure is None
+    assert c.knows("fast") and c.knows("count") and not c.knows("nothing_registered") and not c.knows("_entity")
+    assert c.knows(5) is False                              # type: ignore[arg-type]
+
+
+def test_the_ready_frames_panel_list_is_bounded(rig: Rig):
+    from levain.cockpit import derive_child_client as cc
+
+    c = rig.client("test_derive_child_stub:many_factory")
+    c._env["DERIVE_CHILD_STUB_MANY"] = str(cc.READY_PANELS_MAX + 7)
+    assert c.start(30.0)
+    assert len(c._panels) == cc.READY_PANELS_MAX and c.knows("m00000") and not c.knows(f"m{cc.READY_PANELS_MAX + 6:05d}")
+
+
+def test_a_request_that_is_json_but_not_an_object_is_answered_not_fatal(rig: Rig):
+    """``null``, a list, a number and a non-finite id each get an error answer and the child lives on (before: an
+    AttributeError, or a ValueError in the frame writer, ended it)."""
+    c = rig.client()
+    assert rig.ask(c, "fast").failure is None
+    proc = c._proc
+    assert proc is not None and proc.stdin is not None
+    os.write(proc.stdin.fileno(), b'null\n[1,2]\n42\n{"id": NaN, "op": "nope"}\n{"id": Infinity, "op": "derive", "panel": "fast"}\n')
+    seen = [c._frame(time.monotonic() + 10, "an answer") for _ in range(5)]
+    assert all(f["status"] == "error" for f in seen[:4]) and seen[4]["status"] == "ok", seen
+    assert all(f["id"] is None for f in seen), "an id that is not a plain integer or string is not echoed"
+    assert proc.poll() is None and rig.ask(c, "fast").failure is None
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -1.0, 0.0, "5", None, True], ids=repr)
+def test_a_timeout_that_is_not_a_positive_finite_number_is_refused_and_touches_nothing(rig: Rig, bad):
+    """``derive(p, inf)`` raised out of the lock; ``derive(p, 0)`` killed a healthy child and set a backoff. Neither may
+    happen: a typed ``refused``, the same child, and the very next valid ask is answered at once."""
+    c = rig.client(backoff_base_s=30.0)
+    assert rig.ask(c, "count").failure is None
+    pid = c.pid
+    got = c.derive("count", bad)                            # type: ignore[arg-type]
+    assert got.failure == "refused" and "timeout_s" in (got.error or "")
+    assert c.pid == pid
+    assert _rows(rig.ask(c, "count")) == ["call 2"], "the child is the warm one, with no backoff set"
+
+
+def test_one_deadline_covers_the_spawn_and_a_cold_start_is_not_killed_by_a_short_call(rig: Rig):
+    """A one-second ask of a child whose factory takes three seconds comes back near one second (before: the ready wait had its
+    own thirty and the answer its own one), and the child, which has done nothing wrong, is left starting for the next ask."""
+    c = rig.client(backoff_base_s=30.0)
+    c._env["DERIVE_CHILD_STUB_FACTORY_SLEEP"] = "3"
+    c._argv[c._argv.index("--factory") + 1] = "test_derive_child_stub:slow_factory"
+    t0 = time.monotonic()
+    got = c.derive("fast", 1.0)
+    took = time.monotonic() - t0
+    assert got.failure == "timeout" and took < 2.0, (got, took)
+    assert not got.hung, "a derive that never started is not a hung panel"
+    assert c._proc is not None and c._proc.poll() is None, "the cold start goes on"
+    ok = c.derive("fast", 20.0)
+    assert ok.failure is None and ok.status == "ok", ok
+
+
+def test_the_wait_for_the_turn_is_part_of_the_deadline(rig: Rig):
+    """B asks for a two-second deadline, waits about a second for A's turn, and its derive then runs five: it ends near two
+    seconds from its call (before: the answer wait began again at two, so near three)."""
+    c = rig.client()
+    rig.hang_flag()
+    assert rig.ask(c, "fast").failure is None
+    a = threading.Thread(target=lambda: c.derive("hang", 30.0))
+    a.start()
+    time.sleep(0.3)                                         # A holds the turn
+    threading.Timer(1.0, lambda: (rig.tmp / "hang.flag").unlink(missing_ok=True)).start()
+    t0 = time.monotonic()
+    got = c.derive("slow5", 2.0)
+    took = time.monotonic() - t0
+    a.join(timeout=30)
+    assert got.failure == "timeout" and got.hung, got
+    assert 1.8 <= took < 2.7, f"one deadline for the wait and the answer together: {took:.2f}s"
+
+
+def test_close_while_a_derive_runs_cuts_it_short_and_leaves_no_child(rig: Rig):
+    """``close`` from another thread while a derive holds the turn: the derive answers ``died`` (its pipe is not closed under
+    it), the child is gone, and the holder's own reap leaves no zombie."""
+    c = rig.client(term_grace_s=0.5)
+    rig.hang_flag()
+    assert rig.ask(c, "fast").failure is None
+    pid = c.pid
+    assert pid is not None
+    out: list[ChildAnswer] = []
+    t = threading.Thread(target=lambda: out.append(c.derive("hang", 30.0)))
+    t.start()
+    time.sleep(0.5)
+    c.close()
+    t.join(timeout=20)
+    assert out and out[0].failure in ("died", "refused") and _gone(pid)
+    assert c._proc is None
+
+
+def test_close_during_a_cold_start_leaves_no_child(rig: Rig):
+    """``close`` while a derive is still waiting for the factory: nothing is left running when both have returned."""
+    c = rig.client(term_grace_s=0.5)
+    c._env["DERIVE_CHILD_STUB_FACTORY_SLEEP"] = "30"
+    c._argv[c._argv.index("--factory") + 1] = "test_derive_child_stub:slow_factory"
+    out: list[ChildAnswer] = []
+    t = threading.Thread(target=lambda: out.append(c.derive("fast", 60.0)))
+    t.start()
+    time.sleep(1.0)
+    proc = c._proc
+    assert proc is not None
+    pid = proc.pid
+    rig.pids.add(pid)
+    c.close()
+    t.join(timeout=20)
+    assert out and out[0].failure in ("died", "refused") and _gone(pid)
+    assert c._proc is None
+
+
+def test_a_child_is_not_asked_through_a_descriptor_past_the_select_limit(rig: Rig):
+    """The parent has more than 1024 descriptors open (a busy serve does): ``select.select`` raised ValueError on the child's
+    pipe and every ask was ``died``. A poll-based wait has no such limit."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 1400
+    if hard != resource.RLIM_INFINITY and hard < want:
+        pytest.skip("the hard descriptor limit is too low to open 1100 descriptors")
+    if soft != resource.RLIM_INFINITY and soft < want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    held = [os.open(os.devnull, os.O_RDONLY) for _ in range(1100)]
+    try:
+        c = rig.client()
+        got = rig.ask(c, "fast")
+        assert got.failure is None and got.status == "ok", got
+        assert c._proc is not None and c._proc.stdout.fileno() > 1024      # type: ignore[union-attr]
+    finally:
+        for fd in held:
+            os.close(fd)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_close_tolerates_a_stdin_the_caller_closed(rig: Rig):
+    """The caller closed the child's stdin (a test, a bug): ``close`` raised ValueError out of ``with`` and left the child."""
+    c = rig.client()
+    assert rig.ask(c, "fast").failure is None
+    pid = c.pid
+    assert pid is not None and c._proc is not None
+    c._proc.stdin.close()                                   # type: ignore[union-attr]
+    c.close()
+    assert _gone(pid)
+
+
+def test_a_request_is_written_whole_whatever_the_os_returns_for_one_write(rig: Rig, monkeypatch):
+    """A short ``os.write`` once left half a request on the pipe, and the child waited for the newline until the deadline."""
+    from levain.cockpit import derive_child_client as cc
+
+    real = os.write
+    calls = []
+
+    def one_byte(fd: int, data: Any) -> int:
+        calls.append(len(data))
+        return real(fd, bytes(data)[:1])
+
+    c = rig.client()
+    assert rig.ask(c, "fast").failure is None
+    monkeypatch.setattr(cc.os, "write", one_byte)
+    got = c.derive("fast", 10.0)
+    monkeypatch.undo()
+    assert got.failure is None and got.status == "ok" and len(calls) > 3

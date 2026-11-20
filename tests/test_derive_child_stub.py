@@ -10,11 +10,17 @@ The panels and what each is for:
   explode  a panel whose ``derive_panel`` itself raises (an exception out of the derive, which no provider can make)
   chatty   a provider that writes to stdout (``print`` and a raw write to fd 1) while it reads
   pid      the child's pid and the engine file it imported, as a row
+  grandchild  starts a subprocess that ignores SIGTERM (its pid is written to ``grandchild.pid`` under the stub dir) and returns
+  slow5    reads for five seconds whatever the flags say (a derive that takes longer than a short deadline, never forever)
+
+Other factories: ``slow_factory`` (starts the same SIGTERM-proof subprocess, then takes ``$DERIVE_CHILD_STUB_FACTORY_SLEEP``
+seconds to build), ``many_factory`` (more panels than the ready frame may list) and ``failing_factory``.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -74,6 +80,23 @@ def _pid(ctx):
     return Read(rows=(_row(1, f"{os.getpid()} {engine.__file__}"),))
 
 
+def _grandchild_start() -> int:
+    # a subprocess in the child's own process group that ignores SIGTERM (a provider's helper that will not stop politely)
+    proc = subprocess.Popen(["/bin/sh", "-c", 'trap "" TERM; while :; do sleep 1; done'], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (Path(os.environ["DERIVE_CHILD_STUB_DIR"]) / "grandchild.pid").write_text(str(proc.pid))
+    return proc.pid
+
+
+def _grandchild(ctx):
+    return Read(rows=(_row(1, f"grandchild {_grandchild_start()}"),))
+
+
+def _slow5(ctx):
+    time.sleep(5.0)
+    return Read(rows=(_row(1, "slow"),))
+
+
 def factory() -> Cockpit:
     ck = StubCockpit()
     ck.register(_spec("fast", lambda ctx: Read(rows=(_row(1), _row(2), _row(3)), valid_until=VALID_UNTIL)))
@@ -85,8 +108,24 @@ def factory() -> Cockpit:
     ck.register(_spec("explode", lambda ctx: Read(rows=())))
     ck.register(_spec("chatty", _chatty))
     ck.register(_spec("pid", _pid))
+    ck.register(_spec("grandchild", _grandchild))
+    ck.register(_spec("slow5", _slow5, timeout_s=120.0))
     return ck
 
 
 def failing_factory() -> Cockpit:
     raise RuntimeError("the stub factory cannot build")
+
+
+def slow_factory() -> Cockpit:
+    """A factory that has started a SIGTERM-proof subprocess and is still building: the child a dying parent leaves behind."""
+    _grandchild_start()
+    time.sleep(float(os.environ.get("DERIVE_CHILD_STUB_FACTORY_SLEEP", "600")))
+    return factory()
+
+
+def many_factory() -> Cockpit:
+    ck = StubCockpit()
+    for n in range(int(os.environ["DERIVE_CHILD_STUB_MANY"])):
+        ck.register(_spec(f"m{n:05d}", lambda ctx: Read(rows=())))
+    return ck
