@@ -1751,7 +1751,19 @@
       s.body.replaceChildren(el("p", "err", "unavailable — the board could not be drawn"));
     }
   }
+  // A read that failed on a panel that already shows rows keeps them (s.stale says why); only a panel that never had rows is drawn as
+  // unavailable (s.fault). A quiet line under the rows says the refresh failed; a tile (widget) has no room for a line, so it shows none (levain#173).
+  const STALE_SAY = "could not refresh just now: showing the last read";
   function paintBody(s) {
+    paintRows(s);
+    const old = s.body && s.body.querySelector ? s.body.querySelector(".stale-note") : null;
+    if (old) old.remove();
+    if (!s.stale || s.fault || s.ctx.widget) return;
+    const note = el("p", "xnote stale-note", STALE_SAY);
+    note.title = String(s.stale);
+    s.body.appendChild(note);
+  }
+  function paintRows(s) {
     const d = s.data, sr = d.search || {};
     if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
     dropSky(s);
@@ -1942,6 +1954,8 @@
       heads[pid] = Object.assign({}, heads[pid], nx);
     }
   }
+  // a failed read of a panel that is drawn with rows keeps the rows (stale); one drawn as unavailable stays unavailable (fault)
+  function failRead(s, why) { if (s.fault) s.fault = why; else s.stale = why; }
   function noteFault(pid, why) {
     const heldMap = root.LevainCockpitHeld;
     if (heldMap && heldMap[pid]) heldMap[pid] = Object.assign({}, heldMap[pid], { err: String(why || "read failed") });
@@ -1989,7 +2003,7 @@
     if (boardEpoch !== epoch) return false;
     const live = liveOf(pid);
     if (!live.length) return false;
-    if (fault) { for (const s of live) { s.fault = fault; paint(s); } noteFault(pid, fault); return "fault"; }
+    if (fault) { for (const s of live) { failRead(s, fault); paint(s); } noteFault(pid, fault); return "fault"; }
     const core = root.LevainDashboard;
     if (!lastManifest || !core) return false;
     let view, entry, data;
@@ -1999,7 +2013,7 @@
       data = view.extra_panels[pid];
     } catch (e) {
       const why = "could not be mapped (" + (e && e.message ? e.message : e) + ")";
-      for (const s of live) { s.fault = why; paint(s); }
+      for (const s of live) { failRead(s, why); paint(s); }
       noteFault(pid, why);
       return "fault";
     }
@@ -2009,6 +2023,7 @@
     for (const s of live) {
       s.data = data;
       s.fault = "";
+      s.stale = "";
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
