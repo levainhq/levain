@@ -779,11 +779,41 @@ def claude_launch_path(hands: HandsIdentity) -> str:
     return f"{hl.config_home(hands, VENDOR)}/{CLAUDE_LAUNCH_FILE}"
 
 
+#: The settings object every hands Claude CHAT is started with, as ``--settings <compact JSON>`` (:func:`claude_chat_argv`);
+#: the one place it is written. It sits here, beside the argv that passes it, rather than in ``confinement`` (which
+#: holds the environment every hands start gets): it is an argument of one command, not of every start.
+#: What it says: do not sync the operator's claude.ai account skills (``syncClaudeAiSkills``) or plugins
+#: (``syncClaudeAiPlugins``) into the hands home, keep the claude.ai connectors off (``disableClaudeAiConnectors``, the
+#: settings twin of the connectors-off variable in ``confinement``), and keep the built-in plugins off
+#: (``enabledPlugins``; ``cc-plugin-easel@builtin`` runs an in-process loopback tool server that ``--strict-mcp-config``
+#: does not govern).
+#: Why a flag and not the hands ``~/.claude/settings.json``: that file is the account's own, and
+#: :func:`levain.firing.hands_chat.claude_user_layer` already refuses an ``enabledPlugins`` key in it; a ``--settings``
+#: value is a layer the account cannot edit from its home. ``syncClaudeAiSkills: false`` there also hides skills an
+#: earlier chat already synced for this start, without moving them.
+#: MEASURED: Claude Code 2.1.329, fresh macOS VM, 11-20: the first chat wrote ``skills/synced`` and ``plugins/synced`` into
+#: the hands home and its ``/mcp`` listed ``easel`` (project_memory/1118-vm/leg6_fresh_evidence/, easel_probe2.txt,
+#: step14_run.txt, easel_listener.txt). READ FROM THE BINARY and the settings reference, not run: the key names, that only
+#: ``false`` is honoured for the sync keys, and that ``enabledPlugins`` is read from a ``--settings`` layer
+#: (project_memory/1120-61_lanes/sync_research_return.md, sections 2 and 3, reasoned prescriptions).
+#: NOT yet run on a hands account: the VM acceptance is the second chat on the same home (levain#139).
+#: A default the chat is started with, not a claim that the account cannot reach plugins another way: a non-strict start, a
+#: codex chat and the account's own shell are separate starts this does not cover.
+HANDS_CLAUDE_FLAG_SETTINGS: dict[str, Any] = {
+    "syncClaudeAiSkills": False,
+    "syncClaudeAiPlugins": False,
+    "disableClaudeAiConnectors": True,
+    "enabledPlugins": {"cc-plugin-easel@builtin": False, "claude-platform@builtin": False},
+}
+
+
 def claude_chat_argv(hands: HandsIdentity, *extra: str) -> list[str]:
     """The hands account's Claude chat: the hands prefix with its config home, then ``claude`` reading ONLY the
-    registry's servers from the launch file (``--strict-mcp-config``)."""
+    registry's servers from the launch file (``--strict-mcp-config``) and started with
+    :data:`HANDS_CLAUDE_FLAG_SETTINGS` (``--settings``, serialised the same way every time)."""
+    settings = json.dumps(HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
     return [*hl._launch_prefix(hands, VENDOR), "claude", "--strict-mcp-config", "--mcp-config",
-            claude_launch_path(hands), *extra]
+            claude_launch_path(hands), "--settings", settings, *extra]
 
 
 #: Codex features switched off for every hands chat (L3 r3 G4, codex HIGH): an installed or remote plugin can carry an

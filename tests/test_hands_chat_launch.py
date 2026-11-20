@@ -25,6 +25,7 @@ from tests.test_hands_mcp_verbs import McpRig
 
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
+_FLAG_SETTINGS_JSON = json.dumps(hml.HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
 _REAL_HOST_REFUSAL = getattr(hc, "host_refusal", None)
 _REAL_VENDOR_MISSING = getattr(hc, "vendor_missing", None)
 
@@ -116,7 +117,8 @@ def test_a_server_revoked_after_an_earlier_prepare_is_absent_from_both_files_at_
     [seen] = fake.started
     assert set(seen["claude"]) == {"beta"} and set(seen["codex"]) == {"beta"}
     if vendor == "claude":
-        assert seen["argv"][-4:] == ["claude", "--strict-mcp-config", "--mcp-config", hml.claude_launch_path(rig.h)]
+        assert seen["argv"][-6:] == ["claude", "--strict-mcp-config", "--mcp-config", hml.claude_launch_path(rig.h),
+                                     "--settings", _FLAG_SETTINGS_JSON]
     else:
         assert seen["argv"][-11:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin", "--disable", "apps", "--disable", "skill_mcp_dependency_install", "--disable", "hooks"]
         assert f"CODEX_HOME={rig.hands_home}/.codex" in seen["argv"]

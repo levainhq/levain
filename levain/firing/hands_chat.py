@@ -200,6 +200,11 @@ def project_layer(workspace: Path, vendor: str) -> Path | None:
 #: list`` but was not started by a ``-p`` or a TUI chat even with no flag on this host, so what strict does to it is
 #: unmeasured; a user agent's ``mcpServers`` start only when that agent runs, which needs a model (unmeasured). The
 #: unmeasured ones are refused, not left to strict. A plain claude run makes ``plugins/store`` only, so that is not one.
+#:
+#: ``plugins/marketplaces`` is what Claude Code's official-marketplace autoinstall writes. The chat's environment now asks
+#: Claude Code not to run that autoinstall (:data:`levain.firing.confinement.HANDS_NO_MARKETPLACE_AUTOINSTALL`), so this
+#: refusal is the second line, not the first; a home an earlier build's chat already wrote still holds the tree, is still
+#: refused by name, and needs the operator to remove it.
 CLAUDE_USER_LAYER = ("agents", "plugins/installed_plugins.json", "plugins/marketplaces")
 _CLAUDE_SETTINGS_KEYS = ("enabledPlugins", "extraKnownMarketplaces", "mcpServers")
 
