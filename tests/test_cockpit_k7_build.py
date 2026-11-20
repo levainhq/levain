@@ -1,6 +1,6 @@
 """K7, the providers behind the retired Build tab: what a Sessions row carries (the agent's tool, what it waits on, its context, its
 limits: the Q13 limits slot draws only when `levain.consent.limits.panel` exists) and what a finished job says (worded, ordered by its
-finish). The page painters for them went with the Modes bar (levain#163); the Sessions tile and the Machine panels still read these."""
+finish), and Home's outcome dots on them. The page painters for them went with the Modes bar (levain#163); the Sessions tile and the Machine panels still read these."""
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +13,8 @@ from pathlib import Path
 from levain.cockpit.providers import build_default_cockpit
 from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
-from tests.test_cockpit_k2a import _install
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_sessions import CWD_CC, CWD_CX, SID_CC, SID_CX, SID_Q, _fixture, _put, _stamp
 from tests._h4 import h4_home
 
@@ -236,8 +237,31 @@ def test_a_list_row_carries_its_age_as_the_integer_the_kernel_sends_not_the_badg
     assert "age_days: Number.isInteger(f.age_days)" in js             # the component receives the integer
 
 
-
 # --- a bare install --------------------------------------------------------------------------------
+
+
+@needs_browser
+def test_home_draws_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, monkeypatch):
+    from levain.jobs import JobRuntime, JobStore
+
+    root, src, _ids = _install(tmp_path)
+    store = JobStore(root / ".levain" / "jobs.json")
+    now = datetime.now(timezone.utc)
+    for jid, verb, ok, mins in (("j1", "consult review", True, 8), ("j2", "guard test", False, 190)):
+        t = (now - timedelta(minutes=mins)).isoformat()
+        store.create(jid, verb, t)
+        store.claim_running(jid, t)
+        store.finish(jid, "done" if ok else "failed", {"ok": True} if ok else None, None if ok else "assert failed", t)
+    probe = ("JSON.stringify({title: document.querySelector('[data-ck-panel=jobs] h2').textContent, "
+             "rows: [...document.querySelectorAll('[data-ck-panel=jobs] .row.k7-res')].map(r => [r.querySelector('.k7-rdot').className, r.querySelector('.clause').textContent, r.querySelector('.ext-meta').textContent])})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", job_runtime=JobRuntime(store)) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row.k7-res')"}, {"eval": probe}])["values"]
+    got = json.loads(out[-1])
+    assert got["title"] == "Results", got
+    rows = {r[1]: r for r in got["rows"]}
+    assert rows["consult review finished"][0] == "k7-rdot ok" and rows["consult review finished"][2] == "8m ago", got
+    assert rows["guard test failed"][0] == "k7-rdot bad", got
+    assert not any("{" in r[1] for r in got["rows"]), got          # never the raw result body
 
 
 def test_results_list_newest_finish_first_even_when_the_store_orders_by_filing(tmp_path, monkeypatch):
