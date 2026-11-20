@@ -62,7 +62,7 @@ from levain import hands_live
 from levain.consent import notes as notes_mod
 from levain.firing import hands_login as hl
 from levain.firing import hands_mcp_login as hml
-from levain.firing.confinement import HandsIdentity
+from levain.firing.confinement import ConfinementError, HandsIdentity
 from levain.firing.ws_git import WsGitError, hold_hands_session, hold_session_lock
 from levain.launch import child_env
 
@@ -142,8 +142,8 @@ def vendor_missing(vendor: str) -> str | None:
     a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one installed only in the
     operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare ``env: claude: No
     such file or directory`` after the locks, the sweep and the prepare. Looked up as the operator, on that PATH and
-    nothing else: a binary the operator cannot see there the hands account cannot either. That rules a vendor out and
-    never in (a link into the operator's own home passes it): :func:`hands_cannot_run` asks the hands uid."""
+    nothing else. It decides nothing (a link into a directory only the hands account can enter is invisible here): it
+    only words a refusal the hands uid already gave (:func:`hands_cannot_run`)."""
     import shutil
     from levain.firing import confinement
     if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
@@ -154,9 +154,12 @@ def vendor_missing(vendor: str) -> str | None:
 
 
 def hands_cannot_run(vendor: str, entity_dir: Path | str) -> str | None:
-    """Why the hands uid cannot run ``vendor``, or None, asked of that uid by a read-only run and before any lock
-    (:func:`levain.firing.hands_login.vendor_refusal`, shared with ``hands login``)."""
-    return hl.vendor_refusal(hl.load_hands_identity(entity_dir), vendor, entity_dir=entity_dir)
+    """Why the hands uid cannot run ``vendor``, or None, asked of that uid before any lock
+    (:func:`levain.firing.hands_login.vendor_refusal`, shared with ``hands login``). The hands uid's answer decides;
+    when it says no and the operator's lookup cannot see the vendor either, :func:`vendor_missing`'s narrower words
+    are used."""
+    why = hl.vendor_refusal(hl.load_hands_identity(entity_dir), vendor, entity_dir=entity_dir)
+    return None if why is None else (vendor_missing(vendor) or why)
 
 
 def project_layer(workspace: Path, vendor: str) -> Path | None:
@@ -761,9 +764,9 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
         raise HandsChatRefused(f"{refusal}; no chat was started")
     if vendor not in VENDORS:
         raise HandsChatRefused(f"unknown vendor {vendor!r}; one of {', '.join(VENDORS)}")
-    try:        # lock-free, and before any lock: the hands uid is asked whether it can run the vendor
-        missing = vendor_missing(vendor) or hands_cannot_run(vendor, entity_dir)
-    except hl.HandsLoginError as exc:
+    try:        # before the launch's locks: the hands uid is asked whether it can run the vendor
+        missing = hands_cannot_run(vendor, entity_dir)
+    except (hl.HandsLoginError, ConfinementError, OSError) as exc:
         raise HandsChatRefused(f"{exc}; no chat was started") from None
     if missing is not None:
         raise HandsChatRefused(f"{missing}; no chat was started")

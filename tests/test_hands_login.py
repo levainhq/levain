@@ -33,6 +33,10 @@ _REAL_SECURITY = hands_login.SECURITY
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
 CLAUDE_SHIM = """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  if [ -n "$SHIM_VERSION_HANG" ]; then sleep 8 & echo $! > "$SHIM_PIDS"; wait; fi
+  echo "2.1.329 (Claude Code)"; exit 0
+fi
 if [ "$1" = "--settings" ]; then echo "$2" >> "$SHIM_LOG.settings"; shift 2; fi
 echo "$HOME|$CLAUDE_CONFIG_DIR|$PATH|$*" >> "$SHIM_LOG"
 CRED="$CLAUDE_CONFIG_DIR/.credentials.json"
@@ -63,6 +67,7 @@ exit 2
 """
 
 CODEX_SHIM = """#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.162.1"; exit 0; fi
 echo "$HOME|$CODEX_HOME|$PATH|$*" >> "$SHIM_LOG"
 case "$1 $2" in
   "login --device-auth")
@@ -1023,8 +1028,53 @@ def test_the_default_probe_is_a_read_only_run_as_hands_that_follows_links(rig, t
     assert len(seen) == 2
     for argv in seen:
         assert argv[:2] == ["/usr/bin/env", "-i"] and "/bin/sh" in argv and " -x " in " ".join(argv)
+        assert '"$p" --version' in " ".join(argv)                  # the vendor is exec'd, not only tested with -x
         assert not any(w in argv for w in ("rm", "/bin/rm", "mkdir", "/bin/mkdir", "chmod", "/bin/chmod"))
+        # L3 r1 (deepseek 4): HANDS_PATH is read when the probe is built, so the patched value is the one it runs on
+        assert [a for a in argv if a.startswith("PATH=")] == [f"PATH={rig.bindir}:/usr/bin:/bin"]
     assert not any(ln.startswith("SWEEP") for ln in rig.log.read_text().splitlines()) if rig.log.exists() else True
+    assert not any("--version" in c for c in rig.calls())        # the shims answer --version without logging a verb
+
+
+@pytest.mark.parametrize("shebang", ["#!/nonexistent-interpreter/node", "#!/usr/bin/env levain-no-such-interpreter"])
+def test_an_executable_vendor_that_cannot_exec_is_refused_by_name(rig, monkeypatch, capsys, shebang):
+    # L3 r1 (codex MED): an npm-installed vendor whose interpreter sits in the operator's 0700 home passes ``test -x``
+    # and dies after the locks; the probe execs the vendor (``--version``), which fails here as it would at the start
+    (rig.bindir / "claude").write_text(f"{shebang}\n")
+    assert hands_login.vendor_probe(rig.h, "claude", entity_dir=rig.entity) is False
+    assert hands_login.cmd_hands_login(rig.entity, "claude") == 1
+    out = capsys.readouterr().out
+    assert "claude" in out and "the hands account cannot run it" in out and out.rstrip().endswith("the login was not started")
+    assert rig.calls() == []
+
+
+def test_a_probe_that_succeeds_takes_no_lock(rig, monkeypatch):
+    # L3 r1 (deepseek 2): ``held`` names who holds the lock for a sweep; it never makes the run take one
+    taken: list[object] = []
+    real = hands_live.take_exclusive
+    monkeypatch.setattr(hands_live, "take_exclusive", lambda e: taken.append(e) or real(e))
+    assert hands_login.vendor_probe(rig.h, "claude", entity_dir=rig.entity) is True
+    assert taken == []
+
+
+def test_a_probe_that_runs_out_is_a_refusal_swept_under_the_hands_lock(rig, monkeypatch):
+    # L3 r1 (codex MED, deepseek 3): the probe now runs the vendor, which can hang; what it started is stopped by the
+    # established sweep, taken under the hands lock when no session holds it, and the timeout is a HandsLoginError
+    monkeypatch.setattr(hands_login, "STEP_TIMEOUT", 1.0)
+    rig.knobs["SHIM_VERSION_HANG"] = "1"
+    with pytest.raises(hands_login.HandsRefused, match="timed out after 1 seconds.*the login was not started"):
+        _login(rig, "claude")
+    sweeps = [ln for ln in rig.log.read_text().splitlines() if ln.startswith("SWEEP")]
+    assert sweeps == [f"SWEEP levain-hands {os.getuid()} lock-held=True"]
+    fd = hands_live.take_exclusive(rig.entity)
+    assert fd is not None                            # released after the sweep
+    os.close(fd)
+
+
+def test_a_probe_whose_runner_cannot_start_is_a_login_error(rig, monkeypatch):
+    monkeypatch.setattr(hands_login, "_launch_prefix", lambda hands, vendor: ["/nonexistent/levain-sudo"])
+    with pytest.raises(HandsLoginError, match="the claude check did not finish"):
+        hands_login.vendor_probe(rig.h, "claude", entity_dir=rig.entity)
 
 
 def test_a_probe_that_cannot_run_is_a_refusal_not_a_pass(rig):

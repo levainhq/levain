@@ -30,6 +30,9 @@ SHIM = r'''#!%(py)s
 import json, os, sys, urllib.request
 cfgdir = os.environ["CLAUDE_CONFIG_DIR"]
 argv = sys.argv[1:]
+if argv == ["--version"]:             # the vendor preflight's exec, before any verb
+    print("2.1.329 (Claude Code)")
+    sys.exit(0)
 if argv[:1] == ["--settings"]:        # the connectors-off pair every hands Claude command leads with (the argv tests pin it)
     argv = argv[2:]
 with open(os.environ["SHIM_LOG"], "a") as f:

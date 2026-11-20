@@ -286,7 +286,9 @@ def run_as_hands_bounded(hands: HandsIdentity, argv: list[str], *, entity_dir: P
     (:func:`_sweep_after`), since the program sudo started runs as the hands uid and can outlive the killed sudo. An
     ``Exception`` comes back as :class:`HandsLoginError` naming ``what`` and the sweep's result; an interrupt passes
     through after the sweep. ``sweep=False`` is for a read-only caller (the doctor row): the killed child is all that
-    is stopped, the hands account's other processes are never touched, and the error says so (L3 r1, levain 23)."""
+    is stopped, the hands account's other processes are never touched, and the error says so (L3 r1, levain 23).
+    ``held`` says whether the CALLER holds the hands lock; it only decides how the sweep gets the lock. The run itself
+    never takes it."""
     t = STEP_TIMEOUT if timeout is None else timeout
     try:
         return hands_live.run_bounded(argv, env=child_env(), timeout=t, stdin=stdin)
@@ -307,17 +309,27 @@ def _as_hands_argv(hands: HandsIdentity, vendor: str, *argv: str) -> list[str]:
 #: The one exit code the vendor probe's script uses for "the hands uid cannot run it"; any other non-zero exit is the
 #: probe itself failing (the sudo rule, the launcher), which is never read as an answer.
 _PROBE_NO = 42
-#: Run as the hands user under the hands PATH: the lookup and the execute test both happen as that uid, so a link into a
-#: directory only the operator can enter fails here as it will at the start. Writes nothing.
-_PROBE_SH = f'p=$(command -v "$1") || exit {_PROBE_NO}; [ -f "$p" ] && [ -x "$p" ] || exit {_PROBE_NO}'
+#: Run as the hands user under the hands PATH: the lookup, the execute test and the exec all happen as that uid, so a link
+#: into a directory only the operator can enter fails here as it will at the start, and so does a script whose
+#: interpreter only the operator can reach (an npm install's ``#!/usr/bin/env node`` with node under the operator's
+#: home): the shell's own 126 (cannot execute) or 127 (not found, from it or from ``env``) is read as "cannot run".
+#: ``--version`` reads no credential and its output is discarded; any other non-zero exit is the check failing. Not
+#: write-free for codex: like any codex start it makes its scratch helper directory under an existing ``CODEX_HOME``
+#: (codex-cli 0.162.1, measured on a scratch home); claude 2.1.329's wrote nothing there.
+_PROBE_SH = (f'p=$(command -v "$1") || exit {_PROBE_NO}; [ -f "$p" ] && [ -x "$p" ] || exit {_PROBE_NO}; '
+             f'"$p" --version </dev/null >/dev/null 2>&1; rc=$?; '
+             f'case $rc in 126|127) exit {_PROBE_NO};; *) exit $rc;; esac')
 
 
 def vendor_probe(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> bool:
-    """Whether the HANDS uid finds ``vendor`` on its PATH and can execute it, asked of that uid by a read-only run (no
-    lock, no sweep: nothing it starts outlives it). Tests replace this function; no second account is needed to
-    exercise the refusal. A probe that cannot run raises :class:`HandsLoginError`, never answers False."""
+    """Whether the HANDS uid finds ``vendor`` on its PATH and can exec it (``vendor --version``), asked of that uid
+    without taking the hands lock: the probe is the start's own first step, run early. Bounded by
+    :data:`STEP_TIMEOUT`; one that runs out, or fails to start, is stopped by :func:`run_as_hands_bounded`'s sweep
+    (under the hands lock when no session holds it; the error names what was left otherwise) and raises
+    :class:`HandsLoginError`, never answers False. Tests replace this function; no second account is needed to
+    exercise the refusal."""
     r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, "/bin/sh", "-c", _PROBE_SH, "sh", vendor),
-                             entity_dir=entity_dir, held=False, sweep=False, what=f"the {vendor} check")
+                             entity_dir=entity_dir, held=False, what=f"the {vendor} check")
     if r.returncode == 0:
         return True
     if r.returncode == _PROBE_NO:
@@ -333,7 +345,7 @@ def vendor_refusal(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str)
         return None
     from levain.firing import confinement
     return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}) or the hands account cannot run it "
-            f"(a link into the operator's home, say); install {vendor} where the hands account can run it, under "
+            f"(a link or an interpreter in the operator's home, say); install {vendor} where the hands account can run it, under "
             "/usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors puts claude and codex there)")
 
 

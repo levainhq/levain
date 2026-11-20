@@ -313,12 +313,16 @@ def test_a_vendor_not_on_the_hands_path_is_refused_by_name_before_any_lock(rig, 
     empty.mkdir()
     monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
     monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    asked = []
+    monkeypatch.setattr(hands_login, "vendor_probe", lambda hands, v, **kw: asked.append(v) or False)
     rig.register("alpha", callback_port=49601)
     fake = FakeVendor(rig)
     with pytest.raises(hc.HandsChatRefused) as info:
         launch(rig, vendor, spawn=fake)
     msg = str(info.value)
-    assert f"{vendor} is not on the hands account's PATH" in msg and "/usr/local/bin or /opt/homebrew/bin" in msg
+    assert f"{vendor} is not on the hands account's PATH ({empty})" in msg and "/usr/local/bin or /opt/homebrew/bin" in msg
+    assert "cannot run it" not in msg                       # the operator's lookup sharpened the hands uid's answer
+    assert asked == [vendor]                                # the hands uid decided; the operator lookup only worded it
     assert msg.endswith("no chat was started")
     assert fake.started == [] and rig.events == []          # no sweep, no prepare: refused before the locks
     assert_released(rig)
@@ -906,4 +910,40 @@ def test_a_vendor_link_into_a_closed_home_is_refused_by_name_before_any_lock(rig
     assert vendor in msg and "the hands account cannot run it" in msg and msg.endswith("no chat was started")
     assert asked == [("levain-hands", vendor)]
     assert fake.started == [] and rig.events == []          # no sweep, no prepare: refused before the locks
+    assert_released(rig)
+
+
+def test_a_vendor_only_the_hands_uid_can_see_still_launches(rig, monkeypatch, tmp_path):
+    """L3 r1 (codex LOW): a vendor link into a 0700 directory the hands account owns is invisible to the operator's
+    lookup; the hands uid's answer decides, so the launch proceeds."""
+    from levain.firing import confinement
+    empty = tmp_path / "operator-sees-nothing"
+    empty.mkdir()
+    monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
+    monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    assert _REAL_VENDOR_MISSING("claude") is not None
+    monkeypatch.setattr(hands_login, "vendor_probe", lambda hands, v, **kw: True)
+    rig.register("alpha", callback_port=49601)
+    fake = FakeVendor(rig)
+    assert launch(rig, "claude", spawn=fake) == 0
+    assert len(fake.started) == 1
+    assert_released(rig)
+
+
+@pytest.mark.parametrize("exc", [OSError("confinement.json: permission denied"),
+                                 "confinement-error"])
+def test_an_identity_that_cannot_be_read_before_the_lock_is_a_refusal(rig, monkeypatch, exc):
+    """L3 r1 (complement 4, deepseek 6): the pre-lock probe reads the hands identity; a failure there is a refusal
+    that names it, never a traceback."""
+    from levain.firing.confinement import ConfinementError
+    err = ConfinementError("the hands user is gone") if exc == "confinement-error" else exc
+
+    def boom(entity_dir, cfg=None):
+        raise err
+    monkeypatch.setattr(hands_login, "load_hands_identity", boom)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused) as info:
+        launch(rig, "claude", spawn=fake)
+    assert str(err) in str(info.value) and str(info.value).endswith("no chat was started")
+    assert fake.started == [] and rig.events == []
     assert_released(rig)
