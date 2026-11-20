@@ -14,7 +14,8 @@ The panels and what each is for:
            only when ``$DERIVE_CHILD_STUB_HELPERS`` is 1, which a test sets in the env of the client it starts
   slow5    reads for ``$DERIVE_CHILD_STUB_SLOW_S`` seconds (a derive that takes longer than a short deadline, never forever)
 
-Other factories: ``slow_factory`` (starts the same SIGTERM-proof subprocess, then takes ``$DERIVE_CHILD_STUB_FACTORY_SLEEP``
+Other factories: ``attach_factory`` (the same panels, with the readers named in ``$DERIVE_CHILD_STUB_ATTACH`` attached),
+``slow_factory`` (starts the same SIGTERM-proof subprocess, then takes ``$DERIVE_CHILD_STUB_FACTORY_SLEEP``
 seconds to build), ``many_factory`` (more panels than the ready frame may list) and ``failing_factory``.
 """
 
@@ -115,6 +116,20 @@ def factory() -> Cockpit:
     ck.register(_spec("pid", _pid))
     ck.register(_spec("grandchild", _grandchild))
     ck.register(_spec("slow5", _slow5, timeout_s=120.0))
+    return ck
+
+
+def attach_factory() -> Cockpit:
+    """The stub cockpit with stub readers attached after construction, the way a serve attaches them: the ones named in
+    ``$DERIVE_CHILD_STUB_ATTACH`` (a comma list drawn from consent, questions, notes; unset or empty attaches none)."""
+    ck = factory()
+    names = {n for n in os.environ.get("DERIVE_CHILD_STUB_ATTACH", "").split(",") if n}
+    if "consent" in names:
+        ck.attach_consent_rows(lambda now: None)
+    if "questions" in names:
+        ck.attach_question_rows(object())
+    if "notes" in names:
+        ck.attach_note_rows(object())
     return ck
 
 

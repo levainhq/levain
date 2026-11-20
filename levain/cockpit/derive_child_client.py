@@ -20,6 +20,8 @@ answers ``timeout`` and the child is left starting (its own ``ready_timeout_s`` 
 
 What the child holds. The ``ready`` frame lists the panels the child's factory built; ``knows(panel_id)`` says whether a panel
 is one of them. A host routes only panels the child knows, and ``start()`` / ``warm()`` bring the child up so the list is known.
+The frame also says which of ``snapshot_host.ATTACHMENTS`` the child's cockpit holds (``attached``): a panel derived in a cockpit that lacks a
+reader the host's own cockpit has would read short or blind, so the host asks for that too before it routes.
 
 Supervision. The child starts on first use, not at construction. After any failure that cost a child, the next child is not
 started until a backoff has passed: ``backoff_base_s`` doubling on each consecutive failure up to ``BACKOFF_CAP_S``; a call
@@ -56,6 +58,9 @@ CHILD_MODULE = "levain.cockpit.derive_child"
 PROTOCOL = "levain-derive-child/1"
 # The most panel ids a ready frame lists (the child truncates its sorted list there; a longer list is a bad frame).
 READY_PANELS_MAX = 4096
+# The most names a ready frame's ``attached`` list may carry; a longer one is a bad frame. Well above the attachments there are
+# (``snapshot_host.ATTACHMENTS``), so a newer child that names one this client does not know still reads as well formed.
+READY_ATTACHED_MAX = 16
 # Every ``ChildAnswer.failure`` a caller can see.
 FAILURES = ("timeout", "died", "refused", "bad_reply")
 # How long a child may take to say it is ready: the factory builds the whole cockpit first (seconds).
@@ -166,6 +171,7 @@ class DeriveChild:
         self._ready = False             # the held child has sent its ready frame
         self._spawned_at = 0.0          # the clock reading its build began at
         self._panels: "frozenset[str] | None" = None    # what the last ready frame listed; None until a child has been ready
+        self._attached: "frozenset[str] | None" = None  # the attachments that frame said the child holds; None until one has been ready
         self._ids = itertools.count(1)
         self._failures = 0              # consecutive failures that cost a child
         self._not_before = 0.0          # the earliest clock reading the next child may start
@@ -185,6 +191,12 @@ class DeriveChild:
         """Whether the child's factory built ``panel_id`` (the last ready frame's list). False until a child has been ready."""
         panels = self._panels
         return panels is not None and isinstance(panel_id, str) and panel_id in panels
+
+    @property
+    def attached(self) -> "frozenset[str] | None":
+        """Which of ``snapshot_host.ATTACHMENTS`` the child's cockpit held when it was last ready, or None until a child has been ready. A
+        ready frame with no ``attached`` key (a child that predates it) is an EMPTY set: not knowing is never read as holding all."""
+        return self._attached
 
     def start(self, timeout_s: float) -> bool:
         """Bring the child up and wait at most ``timeout_s`` for it to be ready. True when it is. Never raises; a failure that
@@ -359,7 +371,11 @@ class DeriveChild:
             raise _Lost("died", f"the child's ready frame names pid {frame.get('pid')!r}, not {proc.pid}")
         if not isinstance(panels, list) or len(panels) > READY_PANELS_MAX or not all(isinstance(p, str) for p in panels):
             raise _Lost("bad_reply", "the child's ready frame lists its panels badly")
+        attached = frame.get("attached", [])
+        if not isinstance(attached, list) or len(attached) > READY_ATTACHED_MAX or not all(isinstance(a, str) for a in attached):
+            raise _Lost("bad_reply", "the child's ready frame lists its attachments badly")
         self._panels = frozenset(panels)
+        self._attached = frozenset(attached)
         self._ready = True
 
     def _gone(self, proc: "subprocess.Popen[bytes]") -> bool:

@@ -13,8 +13,10 @@ Protocol (JSON lines, one object per line, UTF-8):
   parent -> child   {"id": N, "op": "derive", "panel": PANEL_ID}   -> one answer with the same id
                     {"op": "ping"}                                  -> {"op": "pong"}
                     {"op": "stop"}                                  -> the child exits 0 (so does stdin EOF)
-  child -> parent   {"op": "ready", "pid": P, "protocol": PROTOCOL, "panels": [ID, ...]}   once, when the factory has built:
-                    the panels this child holds (a sorted list, at most READY_PANELS_MAX), so the parent routes only those
+  child -> parent   {"op": "ready", "pid": P, "protocol": PROTOCOL, "panels": [ID, ...], "attached": [NAME, ...]}   once, when
+                    the factory has built: the panels this child holds (a sorted list, at most READY_PANELS_MAX), so the parent
+                    routes only those, and which of consent, questions and notes its cockpit holds (a sorted list), so the
+                    parent routes only while the child holds every one its own cockpit holds
                     {"op": "fatal", "error": TEXT}                  once, then exit 2, when the factory could not build
                     {"id": N, "status": S, "body": B, "valid_until": U, "error": E, "duration_ms": D}
 
@@ -48,7 +50,7 @@ import time
 from typing import Any, BinaryIO
 
 from levain.cockpit.derive_child_client import PROTOCOL, READY_PANELS_MAX
-from levain.cockpit.snapshot_host import PSEUDO_PREFIX, derive_panel_result
+from levain.cockpit.snapshot_host import PSEUDO_PREFIX, attached_of, derive_panel_result
 
 # How often the watchdog looks at the parent (seconds).
 PARENT_TICK_S = 1.0
@@ -193,6 +195,11 @@ def _panels_of(cockpit: Any) -> "list[str]":
     return sorted(p for p in cockpit.panel_ids if isinstance(p, str))[:READY_PANELS_MAX]
 
 
+def _attached_of(cockpit: Any) -> "list[str]":
+    """Which of the cockpit's attachments this child holds, as the ready frame states them: sorted names from ``snapshot_host.ATTACHMENTS``."""
+    return sorted(attached_of(cockpit))
+
+
 def _stop_cockpit(cockpit: Any) -> None:
     """The cockpit's own ``stop``, bounded: a stop that waits on a provider thread must not hold the exit."""
     def run() -> None:
@@ -222,6 +229,7 @@ def main(argv: "list[str] | None" = None) -> int:
     try:
         cockpit = _load_factory(args.factory)()
         panels = _panels_of(cockpit)
+        attached = _attached_of(cockpit)
     except BaseException as exc:  # noqa: BLE001 - whatever stopped the build is said to the parent, once
         try:
             _send(out, {"op": "fatal", "error": f"{type(exc).__name__}: {exc}"})
@@ -230,7 +238,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 _exit_orphan()      # a helper the factory started must not outlive this exit
         return EXIT_FACTORY
     try:
-        _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL, "panels": panels})
+        _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL, "panels": panels, "attached": attached})
         return serve(cockpit, in_fd, out, parent)
     except (BrokenPipeError, ConnectionResetError):
         # the pipe to the parent is broken: if the parent is gone nobody is left to answer, and the process group (a provider's

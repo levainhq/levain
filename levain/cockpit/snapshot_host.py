@@ -38,6 +38,10 @@ promoted. If the child says it does not hold a panel anyway, that is no verdict 
 is dropped from the routed set, and the loop is never told to retire it on the child's word. A panel that just hung in the
 child is not run in this process while the child is in its backoff: it gets the timeout row again.
 
+The child is also used only while its cockpit holds every attachment (consent reader, question store, note store) the serve's
+cockpit holds, which its ready frame states: a gap sends every panel here, is named by ``child_attach_gap``, and ends the moment
+the two match. See ``_note_attach_gap`` for what that check does and does not promise.
+
 ``ServerProbe`` is what the change stream watches in a served cockpit: the engine probe's counter folded with the
 serve's own watch token, since the panels the serve composes itself read stores no derive publishes.
 """
@@ -46,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 import time
@@ -61,6 +66,8 @@ from levain.cockpit.snapshots import DB_FILENAME, KNOWN_STATUSES, SnapshotReader
 if TYPE_CHECKING:
     from levain.cockpit.derive_child_client import ChildAnswer, DeriveChild
     from levain.cockpit.engine import Cockpit, _Snap
+
+_log = logging.getLogger(__name__)
 
 # The body schema's major version. A body carrying any other value is refused by ``decode_snap``.
 BODY_VERSION = 1
@@ -293,6 +300,18 @@ DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
 FIRST_DISCOVERY_BOUND_S = 3.0
 
 
+# The attachments a cockpit gets after it is built that a derive can read, each named by the cockpit property that holds it: the
+# consent reader, the question store and the note store. The child's ready frame lists the ones its cockpit holds.
+ATTACHMENTS = ("consent", "questions", "notes")
+
+
+def attached_of(cockpit: "Cockpit") -> "frozenset[str]":
+    """Which of ``ATTACHMENTS`` ``cockpit`` holds now. The one reading of that question: the child states its answer in the
+    ready frame with it and the host reads its own cockpit with it, so the two sides cannot mean different things by a name."""
+    held = {"consent": cockpit.consent_reader, "questions": cockpit.question_store, "notes": cockpit.note_store}
+    return frozenset(name for name in ATTACHMENTS if held[name] is not None)
+
+
 def _one_line(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())
 
@@ -375,6 +394,7 @@ class SnapshotHost:
         self._child_lacks: set[str] = set()             # panels the child said it does not hold: not routed again
         self._hung: set[str] = set()                    # panels whose last child derive hung (the child was killed for it)
         self._child_fallbacks = 0
+        self._attach_gap: "tuple[str, ...]" = ()        # the last decision's gap (the host logs a change, not each derive)
         self._child_closed = False
         self._lock = threading.Lock()
         self._started = False
@@ -484,7 +504,46 @@ class SnapshotHost:
         with self._route_lock:
             if pid in self._child_lacks:
                 return False
-        return bool(self._child is not None and self._child.knows(pid))
+        if self._child is None or not self._child.knows(pid):
+            return False
+        return not self._note_attach_gap()
+
+    def _note_attach_gap(self) -> "tuple[str, ...]":
+        """The attachments this host's cockpit holds now that the child's does not (sorted), recorded and logged when the set
+        differs from the last decision's. This is PRESENCE, not EQUIVALENCE: it asks only whether the child's cockpit holds a
+        consent reader, a question store and a note store wherever the serve's does. A child whose reader was built differently
+        (a serve may wrap its consent reader in a class that names no directory, while a factory attaches a plain one) passes,
+        and so does one whose store reads another place. Making the two the same reader is the factory's
+        to do; the host can only decline a child that holds nothing where the serve holds something, so that no factory makes a
+        panel derive blind unseen. The serve's side is read here, at each decision, because it attaches after this host is built
+        and whatever wraps a reader later does so after the host started. A child that has not been ready has told nothing yet, which is no gap
+        to name (``knows`` keeps it out of the routing until it has), and a ready frame with no list was read as an empty one by
+        the client. A gap is not a failure of the child: nothing here touches the fallback count, the backoff or the process."""
+        child = self._child
+        held = getattr(child, "attached", None) if child is not None else None
+        gap: "tuple[str, ...]" = ()
+        if held is not None:
+            try:
+                gap = tuple(sorted(attached_of(self._cockpit) - held))
+            except Exception:  # noqa: BLE001 - a cockpit that cannot say what it holds is no reason to lose a derive
+                gap = ()
+        with self._route_lock:
+            changed = gap != self._attach_gap
+            before, self._attach_gap = self._attach_gap, gap
+        if changed:
+            if gap:
+                _log.warning("derive child not used: its cockpit lacks %s that the serve's cockpit holds; every panel derives "
+                             "in this process until the child holds them", ", ".join(gap))
+            else:
+                _log.info("derive child used again: its cockpit holds every attachment the serve's does (the gap was %s)",
+                          ", ".join(before))
+        return gap
+
+    @property
+    def child_attach_gap(self) -> "tuple[str, ...]":
+        """The attachments the serve's cockpit holds that the child's does not, sorted; empty when there is no gap (or no
+        child, or none that has been ready). While it is not empty no panel is routed to the child."""
+        return self._note_attach_gap()
 
     def _routed(self, pid: str) -> bool:
         """Whether ``pid`` derives in the child now: it is in the heavy set or was promoted, AND the child holds it. A heavy
