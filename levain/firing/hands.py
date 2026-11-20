@@ -123,7 +123,7 @@ class HandsSetupError(RuntimeError):
 
 class GitProbeError(HandsSetupError):
     """The git ownership probe could not be carried out. The text is what ran and what came back
-    (the command, its exit code, the first line of its error output) or the step of preparing the
+    (the command, its exit code, the line of its output that :func:`_probe_failure` picks) or the step of preparing the
     scratch repository that the system refused and its own text; it says nothing about what git
     does in a repository whose git directory belongs to another user."""
 
@@ -1413,7 +1413,8 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
     True: ``git status`` exited non-zero and its output says "dubious ownership". False: it exited
     0 (git worked in that repository). Any other non-zero exit, and a ``git init`` or ``git status``
     that could not be started or failed, measured nothing about the refusal: it raises
-    :class:`GitProbeError` with the command, the exit code and the first line of what it printed.
+    :class:`GitProbeError` with the command, the exit code and the line of what it printed that
+    :func:`_probe_failure` picks (its docstring says which).
     So does a step of preparing the scratch repository that the system refused (no ``nobody`` or
     operator account, no scratch directory, a chmod or chown that failed): the error carries the
     exception's own text."""
