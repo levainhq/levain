@@ -735,8 +735,13 @@ def test_an_unknown_voice_refuses_with_the_fixed_sentence(world, voice):
     assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_VOICE and not rig.sent
 
 
+class _SlyDraft(fx.Draft):
+    """A Draft by inheritance only: the voice check takes the exact type, so a subclass cannot carry its own voice logic."""
+
+
 @pytest.mark.parametrize("drafted", [GOOD_DRAFT, {"text": GOOD_DRAFT, "voice": "stand_in"},
-                                     (GOOD_DRAFT, "stand_in"), 0, ""])
+                                     (GOOD_DRAFT, "stand_in"), 0, "",
+                                     pytest.param(_SlyDraft(GOOD_DRAFT, "stand_in"), id="draft-subclass")])
 def test_a_draft_with_no_voice_refuses(world, drafted):
     g = signed(world)
     rig = Rig(world)
@@ -751,17 +756,6 @@ def test_a_drafter_with_no_draft_refuses_as_no_draft_not_as_a_voice(world):
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects(drafter=lambda event_id: None).send_ack(g["id"], EVT, expect_sha256=D(g))
     assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_DRAFT and not rig.sent
-
-
-def test_a_draft_subclass_cannot_carry_its_own_voice_logic(world):
-    class Sly(fx.Draft):
-        pass
-
-    g = signed(world)
-    rig = Rig(world)
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects(drafter=lambda e: Sly(GOOD_DRAFT, "stand_in")).send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) == fx.R_VOICE and not rig.sent
 
 
 def test_a_voice_the_order_does_not_name_refuses(world):
