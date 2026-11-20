@@ -102,7 +102,7 @@ def test_a_write_tells_the_host_the_panels_it_touched_under_a_generation_that_on
     rig.forward = False
     rig.ck.invalidate_reads(["alpha"])
     rig.ck.invalidate_reads(["alpha", "beta"])
-    rig.ck.invalidate_reads(["beta"], refresh=False)
+    rig.ck.invalidate_reads(["beta"])
     assert rig.dirty_calls == [(("alpha",), 1), (("alpha", "beta"), 2), (("beta",), 3)]
 
 
@@ -280,10 +280,19 @@ def test_a_down_worker_is_not_waited_for(tmp_path: Path, monkeypatch) -> None:
 
 
 # --- the double call ------------------------------------------------------------------------------------------------------
-def test_the_second_call_of_one_write_is_answered_by_a_derive_begun_after_it(rig: WriteRig, monkeypatch) -> None:
-    """The server calls ``invalidate_reads`` before the response and again after it. Each call's ``dirty`` is answered by a
-    derive that began after it, so the read behind the second call is satisfied and never waits for a generation no derive
-    stamps, including when a derive began between the two calls and stamped only the first."""
+def test_the_repeat_call_of_one_write_tells_the_host_nothing_and_takes_no_generation(rig: WriteRig) -> None:
+    """The server calls ``invalidate_reads`` for a write it admitted, and again after the response with ``refresh=False``: the
+    first call is the write's, the second is its repeat. One write is one ``dirty`` and one generation."""
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    rig.ck.invalidate_reads(["alpha"], refresh=False)
+    assert rig.dirty_calls == [(("alpha",), 1)]
+    rig.ck.invalidate_reads(["alpha"])                          # the next write is the second generation, not the third
+    assert rig.dirty_calls == [(("alpha",), 1), (("alpha",), 2)]
+
+
+def test_the_repeat_call_leaves_the_requirement_of_the_first_and_what_a_derive_between_the_calls_stamped(
+        rig: WriteRig, monkeypatch) -> None:
     monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
     rig.derive()
     rig.host_runs()
@@ -295,22 +304,28 @@ def test_the_second_call_of_one_write_is_answered_by_a_derive_begun_after_it(rig
     out = rig.ck.panel("alpha")
     assert time.monotonic() - t0 < 10.0
     assert rows_of(out) == ["alpha:a", "alpha:z"] and out["stale"] is False and out["pending"] is False
-    assert rig.dirty_calls == [(("alpha",), 1), (("alpha",), 2)]
-    assert rig.reader.read("alpha").write_gen == 2
+    assert rig.dirty_calls == [(("alpha",), 1)]
+    assert rig.reader.read("alpha").write_gen == 1
+    assert rig.ck.write_wait_counts()["timeouts"] == 0
 
 
-def test_two_calls_with_no_derive_between_are_answered_by_one(rig: WriteRig, monkeypatch) -> None:
+def test_a_repeat_call_alone_records_no_requirement_and_holds_no_read(rig: WriteRig, monkeypatch) -> None:
     monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
     rig.derive()
-    rig.rec.rows["alpha"] = ["a", "z"]
-    rig.ck.invalidate_reads(["alpha"])
+    rig.forward = False
     rig.ck.invalidate_reads(["alpha"], refresh=False)
-    before = rig.rec.count("alpha")
-    rig.host_runs()
+    t0 = time.monotonic()
     out = rig.ck.panel("alpha")
-    assert out["stale"] is False and rows_of(out) == ["alpha:a", "alpha:z"]
-    assert rig.reader.read("alpha").write_gen == 2
-    assert rig.rec.count("alpha") - before in (1, 2)           # the loop may take the second call as a derive of its own, never more
+    assert time.monotonic() - t0 < 5.0 and out["stale"] is False and out["pending"] is False
+    assert rig.dirty_calls == [] and rig.ck.write_wait_counts()["waits"] == 0
+
+
+def test_the_repeat_call_still_clears_the_caches_and_advances_the_epoch(rig: WriteRig) -> None:
+    rig.derive()
+    rig.forward = False
+    epoch = rig.ck._state["alpha"].epoch
+    rig.ck.invalidate_reads(["alpha"], refresh=False)
+    assert rig.ck._state["alpha"].epoch == epoch + 1
 
 
 # --- the manifest: one deadline -------------------------------------------------------------------------------------------

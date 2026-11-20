@@ -2904,6 +2904,12 @@ class Cockpit:
         every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
         caller's; ``refresh=False`` skips that.
 
+        ``refresh`` also says, for an attached cockpit, whether the call is a write's own or its repeat. The server passes
+        ``refresh=True`` on its first call for a write it admitted, made after the write committed, and ``refresh=False`` on
+        the second: a named call with ``refresh=True`` takes a write generation, asks the host to derive the panels and
+        makes their reads wait for that row; one with ``refresh=False`` does everything else above and none of that, so a
+        write told once is told once.
+
         Either way the named panels' write epoch advances: a provider read begun before this call is never joined by a
         reader arriving after it (``_single_flight`` waits it out and reads afresh), so what the older read saw cannot
         be handed to, or stored for, a reader of the new generation. The manifest's own entity and discovery reads keep
@@ -2933,7 +2939,7 @@ class Cockpit:
         if refresh:
             for pid in ids:
                 self._refresh_in_background(pid)
-        self._note_write(ids)
+            self._note_write(ids)
 
     def _note_write(self, panel_ids: "list[str]") -> None:
         """D7, attached mode only (a bare cockpit returns at once: it has no host to tell). Every call advances the write
