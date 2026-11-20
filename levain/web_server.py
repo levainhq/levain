@@ -2773,6 +2773,26 @@ class _Handler(GuardedHandler):
             if got:
                 self._write_touched = got
 
+    def _note_signed(self, answer: Any) -> None:
+        """The twin of :meth:`_note_fired` for a verb a signature let through (a T2 or T3 fire answers WAITING at the verb's own
+        route, so ``_note_fired`` never sees its effect): when the answer says the signed pending was decided and applied (or is
+        being), the panels the verb changed are kept for the invalidation ``send_response`` makes. For an attached cockpit
+        only, whose host is told those panels and holds the reads for their rows; a bare cockpit's invalidation of every
+        read is left as it was. A replayed answer, a refusal, and a verb the registry does not know leave the set unset."""
+        cockpit = getattr(self.server, "cockpit", None)
+        registry = getattr(self.server, "verb_registry", None)
+        if cockpit is None or registry is None or not cockpit.attached or not isinstance(answer, dict):
+            return
+        if answer.get("replay") is True or answer.get("state") not in _SIGNED_APPLIED_STATES:
+            return
+        verb, panel = answer.get("verb"), answer.get("panel_id")
+        spec = registry.get(verb) if isinstance(verb, str) else None
+        if spec is None or not isinstance(panel, str):
+            return
+        touched = frozenset(registry.touched(cockpit, spec, panel))
+        if touched:
+            self._write_touched = touched
+
     def _log_write_time(self) -> None:
         """One stderr line for a cockpit verb POST that reached dispatch: ``cockpit write <verb> <ms> ms``, the time from
         do_POST's start to the response written, and a ``slow cockpit write`` warning past the slow-read threshold."""
@@ -5681,7 +5701,9 @@ class _Handler(GuardedHandler):
             raise EditError("needs_broker", 403, "this server has no cockpit broker")
         try:
             if action == "signature":
-                return broker.submit(pending_id, req.get("signature"))
+                answer = broker.submit(pending_id, req.get("signature"))
+                self._note_signed(answer)
+                return answer
             return broker.cancel(pending_id, credential=credential, intent=req.get("intent"),
                                  idempotency_key=req.get("idempotency_key"))
         except BrokerError as exc:
@@ -6209,6 +6231,10 @@ class _Handler(GuardedHandler):
         finally:
             srv.request_gate.release()
 
+
+# the ``Broker.result`` states of a signed pending whose effects landed or are being applied: a write that may have
+# changed what the verb's panels show
+_SIGNED_APPLIED_STATES = frozenset({"COMMITTED", "COMMITTED_INCOMPLETE", "applying"})
 
 _PENDING_KEYS = {"signature": frozenset({"signature"}),
                  "cancel": frozenset({"intent", "idempotency_key"})}
