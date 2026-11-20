@@ -121,7 +121,7 @@ def test_a_tracking_repo_and_an_untracked_repo_holding_items_are_not_read_and_sa
     track_ready(capsys, tmp_path, store, c, "gamma")                                          # begin-track, item, charter: no `track` yet
     _, did = track_ready(capsys, tmp_path, store, d, "delta")
     ok(capsys, "track", "delta", "--words", "go", *A)
-    ok(capsys, "decide", "--id", did, "--decision", "out-of-1.0", "--words", "later", *A)
+    ok(capsys, "decide", "--id", did, "--decision", "out-of-horizon", "--horizon", "1.0", "--words", "later", *A)
     ok(capsys, "untrack", "delta", "--words", "bye", *A)                                      # untracked, and its item is still in the store
     rc, doc, err = _state(capsys)
     assert rc == 3, err

@@ -38,8 +38,9 @@ MAX_PRINTED = 50          # problems and warnings printed as text; --json carrie
 SECTIONS = ("Purpose", "Criteria", "Constraints", "Plan")
 EXPORTS = ("repo", "memory", "off")
 WARN_PREFIX = "levain: warning (charter not yet enforced): "
-#: Decisions that take an item out of the plan-in-step warning.
-OUT_OF_PLAN = ("cut", "parked", "out-of-1.0")
+#: Decisions that take an item out of the plan-in-step warning (the fold's normalised word: a stored legacy ``out-of-1.0`` is
+#: already ``out-of-horizon`` there).
+OUT_OF_PLAN = ("cut", "parked", "out-of-horizon")
 
 _TITLE = re.compile(r"^# Charter: (\S+)$")
 _CRITERION = re.compile(r"^- (C\d+): (.+)$")
@@ -651,7 +652,7 @@ def register(subparsers: Any) -> None:
     q.add_argument("--repo", type=Path, default=None, metavar="PATH", help="The repository (default: the git top-level of here).")
     q.add_argument("--export", choices=EXPORTS, default="memory", help="The Export value (default memory).")
     q.add_argument("--items", type=Path, metavar="PATH",
-                   help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out-of-1.0; "
+                   help="The board items store; the Plan is prefilled from NAME's items not cut, parked or out of their horizon; "
                         "for a repo in `tracking`, from its ceremony's adopted items and the items added under its key.")
     q.add_argument("--stdout", action="store_true", help="Print the skeleton instead of writing it.")
     q.set_defaults(func=run_init)

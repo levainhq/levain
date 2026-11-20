@@ -1,6 +1,6 @@
 """The conformance fixtures of the board-state function and the runner that applies one case to it.
 
-A case is ``{name, items_lines, evidence, now, expect: {id: {state, column, reason_contains}}}`` plus the optional
+A case is ``{name, items_lines, evidence, now, expect: {id: {state, column, reason_contains[, horizon]}}}`` plus the optional
 ``audit`` (the exact [kind, id] list) and ``problems_contain``; the runner takes the module as an argument so the same
 file can be pointed at another installed copy of the function."""
 from __future__ import annotations
@@ -40,6 +40,8 @@ def case_problems(bs: ModuleType, case: dict[str, Any]) -> list[str]:
             bad.append(f"{iid}: state {s.state!r} != {want['state']!r} ({s.reason})")
         if s.column != want["column"]:
             bad.append(f"{iid}: column {s.column!r} != {want['column']!r}")
+        if "horizon" in want and getattr(s, "horizon", None) != want["horizon"]:
+            bad.append(f"{iid}: horizon {getattr(s, 'horizon', None)!r} != {want['horizon']!r}")
         if want["reason_contains"] not in s.reason:
             bad.append(f"{iid}: reason {s.reason!r} lacks {want['reason_contains']!r}")
     if "audit" in case and [[a.kind, a.id] for a in board.audit] != case["audit"]:

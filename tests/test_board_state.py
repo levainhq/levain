@@ -165,7 +165,7 @@ def test_the_board_serialises_with_the_schema_word():
     board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"], now=None), now=NOW)
     d = json.loads(json.dumps(board.to_dict()))
     assert d["schema"] == "ready-v3" and set(d) == {"schema", "as_of", "items", "audit", "unattributed", "problems"}
-    assert set(d["items"][0]) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"}
+    assert set(d["items"][0]) == {"id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind", "horizon"}
 
 
 def _chain_world(n: int, low_waits_on_high: bool):
@@ -284,7 +284,8 @@ def _random_world(rng: random.Random):
                                  "depends_on": deps}))
         if rng.random() < 0.2:
             lines.append(json.dumps({"v": 1, "op": "decide", "id": iid, "at": "t", "by": "b",
-                                     "decision": rng.choice(["cut", "parked", "out-of-1.0", "reopen"]), "words": "w", "date": "d"}))
+                                     "decision": rng.choice(["cut", "parked", "out-of-horizon", "out-of-1.0", "reopen"]),
+                                     "horizon": rng.choice(["launch", "", None, 7]), "words": "w", "date": "d"}))
         if rng.random() < 0.05:
             lines.append(rng.choice(["{", "", "[]", json.dumps({"v": 9})]))
     pick = lambda: rng.sample(pool, rng.randint(0, min(3, len(pool))))                          # noqa: E731
@@ -569,13 +570,18 @@ def test_each_audited_item_id_appears_in_the_audit_exactly_once_per_world():
     assert sorted(ids) == ["levain#1", "levain#2", "levain#3"], board.audit
 
 
-def _dep_world(dep, *, orphan: bool = False, cut: bool = False):
-    """levain#133 has commits on main and no close; levain#140 is open and ready (cut when ``cut``). ``dep`` is what #133 depends on
-    (one link or a list of them)."""
+CUT = {"decision": "cut"}
+OUT_OF_HORIZON = {"decision": "out-of-horizon", "horizon": "launch"}
+LEGACY_OUT_OF = {"decision": "out-of-1.0"}
+
+
+def _dep_world(dep, *, orphan: bool = False, cut: bool = False, ruling: dict | None = None):
+    """levain#133 has commits on main and no close; levain#140 is open and ready (ruled ``ruling`` when given, cut when ``cut``).
+    ``dep`` is what #133 depends on (one link or a list of them)."""
     deps = dep if isinstance(dep, list) else [dep]
     lines = [_line(iid="levain#133", done="d", tier="sonnet", depends_on=deps), _line(iid="levain#140", done="d", tier="sonnet")]
-    if cut:
-        lines.append(_line("decide", iid="levain#140", decision="cut", words="no", date="2026-11-12"))
+    if cut or ruling:
+        lines.append(_line("decide", iid="levain#140", words="no", date="2026-11-12", **(ruling or CUT)))
     branches = [{"name": "seat/x", "tip": "b" * 40, "date": None, "ahead": 2, "items": ["levain#133"]}] if orphan else []
     ev = bs.Evidence.from_dict(_ev_dict(
         main=[{"sha": "a" * 40, "date": "2026-11-11T00:00:00Z", "items": ["levain#133"], "closes": []}], branches=branches,
@@ -609,8 +615,9 @@ _ITEM = {"kind": "item", "ref": "levain#140"}
 _PAST_GATE = {"kind": "gate", "words": "a judgement", "recheck": "2026-11-01"}
 
 
-def test_np_5023a20a_a_cut_dependency_says_resolve_or_remove_not_close_once_it_clears():
-    s, audit = _dep_world(_ITEM, cut=True)
+@pytest.mark.parametrize("ruling", [CUT, OUT_OF_HORIZON, LEGACY_OUT_OF], ids=["cut", "out_of_horizon", "legacy_out_of_1_0"])
+def test_np_5023a20a_a_cut_or_out_of_horizon_dependency_says_resolve_or_remove_not_close_once_it_clears(ruling):
+    s, audit = _dep_world(_ITEM, ruling=ruling)
     assert s.state == "blocked" and "dependency cut: decide" in s.reason, s.reason
     assert "resolve or remove the dependency before closing" in s.reason and "once the dependency clears" not in s.reason, s.reason
     assert audit == []
@@ -628,8 +635,9 @@ def test_np_5023a20a_landed_work_behind_an_unmet_item_and_an_expired_gate_keeps_
     assert s.state == "unknown" and "past its recheck" in s.reason and "commit" not in s.reason, s.reason
     assert [a.kind for a in audit] == ["gate_expired"]
     assert "close it once the dependency clears" in audit[0].why and "close it or name what remains" not in audit[0].why, audit[0].why
-    s, audit = _dep_world([_ITEM, _PAST_GATE], cut=True)
-    assert "resolve or remove the dependency before closing" in audit[0].why, audit[0].why
+    for ruling in (CUT, OUT_OF_HORIZON, LEGACY_OUT_OF):
+        s, audit = _dep_world([_ITEM, _PAST_GATE], ruling=ruling)
+        assert "resolve or remove the dependency before closing" in audit[0].why, audit[0].why
     s, audit = _dep_world([_ITEM, _PAST_GATE], orphan=True)       # an orphan branch keeps its own wording
     assert "close it or name what remains" in audit[0].why
 

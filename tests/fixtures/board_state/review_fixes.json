@@ -1118,8 +1118,9 @@
    "expect": {
     "levain#1": {
      "column": "off",
+     "horizon": "1.0",
      "reason_contains": "",
-     "state": "out_of_1_0"
+     "state": "out_of_horizon"
     },
     "levain#2": {
      "column": "backlog",
@@ -1132,7 +1133,47 @@
     "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"out-of-1.0\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}",
     "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
    ],
-   "name": "blocked: a dependency that is out_of_1_0 is never met",
+   "name": "blocked: a dependency that is out_of_horizon (a stored legacy out-of-1.0 record) is never met",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "horizon": "launch",
+     "reason_contains": "",
+     "state": "out_of_horizon"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: dependency cut: decide (",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"out-of-horizon\", \"horizon\": \"launch\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "blocked: a dependency that is out_of_horizon (the horizon word, horizon launch) is never met",
    "now": "2026-11-12T20:00:00Z"
   },
   {

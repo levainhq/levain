@@ -37,7 +37,8 @@ from levain.desk import board_chain
 
 __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
-    "EVIDENCE_V", "FLAT_EVIDENCE_V", "FLAT_PRODUCER", "FUTURE_SKEW_S", "FlatBlock", "Folded", "GRADE_ORDER", "Item", "Link",
+    "EVIDENCE_V", "FLAT_EVIDENCE_V", "FLAT_PRODUCER", "FUTURE_SKEW_S", "FlatBlock", "Folded", "GRADE_ORDER", "HORIZON_MAX", "HORIZON_RE",
+    "Item", "LEGACY_HORIZON", "LEGACY_OUT_OF", "Link",
     "MAX_EVIDENCE_AGE_S", "PRODUCER_FUTURE_SKEW_S", "PRODUCER_MAX_AGE_S", "PRODUCER_SOURCES", "SCHEMA", "BandRow", "STATES",
     "STATE_COLUMN", "STATE_KIND", "State", "TIERS", "derive_all", "derive_state", "fold", "parse_timestamp",
 ]
@@ -69,7 +70,15 @@ MAX_EVIDENCE_AGE_S = 21600
 FUTURE_SKEW_S = 300
 TIERS = ("sonnet", "opus", "haiku")
 DONE_KINDS = ("merged", "document", "band", "run")
-DECISIONS = ("cut", "parked", "out-of-1.0")
+DECISIONS = ("cut", "parked", "out-of-horizon")
+#: The decision word the first records carried, before a ruling named its horizon. It is READ, never written: :func:`_apply`
+#: turns it into ``out-of-horizon`` with horizon :data:`LEGACY_HORIZON`, so no other site sees the old spelling.
+LEGACY_OUT_OF = "out-of-1.0"
+LEGACY_HORIZON = "1.0"
+#: What an ``out-of-horizon`` record's ``horizon`` must be: a letter or a digit first, then letters, digits, ``.``, ``_``, ``-``
+#: and inner spaces, ending on a non-space, at most :data:`HORIZON_MAX` characters. The writer (board_store) imports this rule, it does not restate it.
+HORIZON_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._ -]*[A-Za-z0-9._-])?")
+HORIZON_MAX = 40
 _OPS = ("add", "amend", "decide")
 _LINK_KINDS = ("item", "band", "link", "gate")
 _AMEND_FIELDS = ("title", "words", "done", "done_kind", "tier", "depends_on")
@@ -77,7 +86,7 @@ _AMEND_FIELDS = ("title", "words", "done", "done_kind", "tier", "depends_on")
 #: Every state a read can show and the board column it sits in. ``unknown`` is outside the six-column set on purpose:
 #: the board shows it in a band of its own at the top and the gates fail closed on it.
 STATE_COLUMN: dict[str, str] = {
-    "cut": "off", "parked": "off", "out_of_1_0": "off",
+    "cut": "off", "parked": "off", "out_of_horizon": "off",
     "done": "done",
     "needs_you": "needs_you",
     "landing": "waiting",
@@ -97,7 +106,10 @@ STATES = tuple(STATE_COLUMN)
 #: The columns in board order (the order readers draw them); a test holds this set to the values of :data:`STATE_COLUMN`.
 COLUMNS = ("off", "done", "needs_you", "waiting", "running", "backlog", "ready", "unknown")
 AUDIT_KINDS = ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer")
-_DECISION_STATE = {"cut": "cut", "parked": "parked", "out-of-1.0": "out_of_1_0"}
+_DECISION_STATE = {"cut": "cut", "parked": "parked", "out-of-horizon": "out_of_horizon"}
+#: The states a gate's expiry is never audited on: closed, or ruled out by a decision record. The registry's ``untrack`` reads the
+#: same set as "settled" (one definition, so the next state rename edits one place).
+_SETTLED = ("done", "cut", "parked", "out_of_horizon")
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
@@ -155,11 +167,14 @@ class Link:
 
 @dataclass(frozen=True)
 class Decision:
+    """A ruling. ``decision`` is the normalised word (a legacy ``out-of-1.0`` record is already ``out-of-horizon`` here) and
+    ``horizon`` the name an ``out-of-horizon`` ruling carries, None for every other word."""
     decision: str
     words: str
     date: str
     at: str
     by: str
+    horizon: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +304,17 @@ def _common(rec: Mapping[str, Any]) -> tuple[str, str, str, str]:
     return op, iid, _req_str(rec, "at"), _req_str(rec, "by")
 
 
+def _horizon(value: Any) -> str:
+    """The horizon an ``out-of-horizon`` record names, or the record is bad: a string that is :data:`HORIZON_RE` and at most
+    :data:`HORIZON_MAX` long."""
+    if not isinstance(value, str) or not value:
+        raise _Bad("out-of-horizon needs a horizon: a non-empty string")
+    if len(value) > HORIZON_MAX or not HORIZON_RE.fullmatch(value):
+        raise _Bad(f"horizon {value[:HORIZON_MAX + 1]!r} is not a horizon name (at most {HORIZON_MAX} characters, a letter or a digit "
+                   f"first, then letters, digits, `.` `_` `-` and inner spaces)")
+    return value
+
+
 def _apply(rec: Mapping[str, Any], items: dict[str, Item]) -> None:
     op, iid, at, by = _common(rec)
     if op == "add":
@@ -320,13 +346,20 @@ def _apply(rec: Mapping[str, Any], items: dict[str, Item]) -> None:
         items[iid] = replace(old, **values, amendments=old.amendments + (Amendment(at, by, tuple(sorted(values)), why),))
         return
     decision = rec.get("decision")
-    if decision not in (*DECISIONS, "reopen"):
-        raise _Bad(f"decision {decision!r} is not one of {(*DECISIONS, 'reopen')}")
+    readable = (*DECISIONS, LEGACY_OUT_OF, "reopen")
+    if decision not in readable:
+        raise _Bad(f"decision {decision!r} is not one of {readable}")
     words, when = _req_str(rec, "words"), _calendar_date(_req_str(rec, "date"), "decision date")
     _utc_stamp(at, "decide at")                         # a ruling carries WHEN it was made: a stamp that is not one tears the file
+    horizon = None
+    if decision == LEGACY_OUT_OF:                       # the one place the legacy word is read: every later site sees the new spelling;
+                                                        # a ``horizon`` key on a legacy record is IGNORED (the horizon is always 1.0)
+        decision, horizon = "out-of-horizon", LEGACY_HORIZON
+    elif decision == "out-of-horizon":
+        horizon = _horizon(rec.get("horizon"))
     if iid not in items:
         raise _Soft(f"{iid}: decided but never added")
-    items[iid] = replace(items[iid], decision=None if decision == "reopen" else Decision(decision, words, when, at, by))
+    items[iid] = replace(items[iid], decision=None if decision == "reopen" else Decision(decision, words, when, at, by, horizon))
 
 
 def fold(lines: Iterable[str]) -> Folded:
@@ -952,11 +985,12 @@ class State:
     refs: tuple[str, ...]
     as_of: str | None
     kind: str | None = None
+    horizon: str | None = None          # the horizon an ``out_of_horizon`` state names; None for every other state
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "repo": self.repo, "title": self.title, "tier": self.tier, "state": self.state,
                 "column": self.column, "reason": self.reason, "refs": list(self.refs), "as_of": self.as_of,
-                "kind": self.kind}
+                "kind": self.kind, "horizon": self.horizon}
 
 
 @dataclass(frozen=True)
@@ -1012,9 +1046,9 @@ class _Ctx:
         self.notes: dict[str, list[str]] = {}     # item id -> the checks that were skipped for it, each with its reason
         self._cycles: dict[str, tuple[str, ...] | None] = {}
 
-    def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
+    def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = (), horizon: str | None = None) -> State:
         return State(item.id, item.repo, item.title, item.tier if item.tier in TIERS else None, state,
-                     STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at, STATE_KIND[state])
+                     STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at, STATE_KIND[state], horizon)
 
     def state_of(self, iid: str) -> State:
         if iid not in self.memo:
@@ -1246,7 +1280,7 @@ _CHECKS_FOR_DECIDED = ("torn",)
 # --- the rule table (design 3.2): first rule that fires wins
 def _rule_decision(ctx: _Ctx, item: Item) -> State | None:
     d = item.decision
-    return ctx.make(item, _DECISION_STATE[d.decision], f"{d.words} ({d.date})") if d else None
+    return ctx.make(item, _DECISION_STATE[d.decision], f"{d.words} ({d.date})", horizon=d.horizon) if d else None
 
 
 def _rule_done(ctx: _Ctx, item: Item) -> State | None:
@@ -1341,7 +1375,7 @@ _CUT_WHY = "dependency cut: decide"
 
 
 def _landed_while_blocked(ctx: _Ctx, item: Item, landed: tuple[int, MainCommit]) -> str:
-    """The landed-work wording for an item that waits on an unmet ``item:``/``band:`` dependency. A cut or out-of-1.0 dependency can
+    """The landed-work wording for an item that waits on an unmet ``item:``/``band:`` dependency. A cut or out-of-horizon dependency can
     never clear, so the tail says to resolve or remove it instead of waiting for it."""
     count, last = landed
     cut = any(w.startswith(_CUT_WHY) for _, _, w in _unmet(ctx, item, ("item", "band")))
@@ -1363,7 +1397,7 @@ def _unmet(ctx: _Ctx, item: Item, kinds: tuple[str, ...] | None = None) -> list[
             s = ctx.state_of(dep.id)
             if s.state != "done":
                 # a ruling that the work will not happen: the wait can never end, a human decides the dependent
-                shown = _CUT_WHY if s.state in ("cut", "out_of_1_0") else s.state
+                shown = _CUT_WHY if s.state in ("cut", "out_of_horizon") else s.state
                 out.append((dep.id, l.label, f"{shown} ({s.reason})" if s.reason else shown))
         elif l.kind == "band":
             if l.ref in ctx.ev.band_open or l.ref not in ctx.ev.band_resolved:
@@ -1604,7 +1638,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
                 why = f"{why}; " + (_landed_while_blocked(ctx, folded.items[s.id], gone) if standing == "waiting" else _landed_why(*gone))
             audit.append(AuditEntry(kind, s.id, why))
             continue
-        old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
+        old = [] if s.state in _SETTLED else _expired_gates(folded.items[s.id], now.date())
         ctx.focus(folded.items[s.id])
         landed, standing = _landed_standing(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else (None, "none")
         if standing != "orphan":        # only an orphan branch ruled rule 6 out for the audit; a "waiting" row (np-5023a20a) has nothing closable now: no entry

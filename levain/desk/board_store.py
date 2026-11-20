@@ -3,8 +3,9 @@
 The writer is a port of flow's ``scripts/board.py``: flow's records (compact separators, ASCII only) plus three keys of
 its own, ``author``, ``grade`` and ``prev`` (see :func:`build_record`, :func:`chain_prev`), the same refusals, the same id
 allocation under the lock. Item STATE is never stored; this module writes
-records and reads ids only. The fold and every state rule live in :mod:`levain.desk.board_state`, which this module does
-not import.
+records and reads ids only. The fold and every state rule live in :mod:`levain.desk.board_state`; this module imports the
+decision words and the horizon rule from it, so each is defined once (board_state imports neither this module nor work_attach:
+no cycle).
 
 Where the store is (one pointer, one identity):
 
@@ -44,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from levain.desk import board_chain, work_attach
+from levain.desk.board_state import DECISIONS as _FOLD_DECISIONS, HORIZON_MAX, HORIZON_RE, LEGACY_OUT_OF
 
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
@@ -64,7 +66,15 @@ OPEN_RETRIES = 5
 
 DONE_KINDS = ("merged", "document", "band", "run")
 TIERS = ("sonnet", "opus", "haiku")
-DECISIONS = ("cut", "parked", "out-of-1.0", "reopen")
+#: The words a NEW decide may write: the fold's own set (board_state.DECISIONS) and ``reopen``. HAZARD: a levain that does not fold
+#: ``out-of-horizon`` reads it as an unknown decision word and tears the whole store, so the first one is written only once every
+#: levain that reads the store has the fold.
+DECISIONS = (*_FOLD_DECISIONS, "reopen")
+#: ``LEGACY_OUT_OF`` (imported above) is the word records carried before a ruling named its horizon: the fold still reads it, the
+#: writer refuses it.
+LEGACY_REFUSED = f"decision {LEGACY_OUT_OF!r} is not written any more: use out-of-horizon --horizon 1.0"
+#: What ``--horizon`` may be is the fold's rule, ``HORIZON_RE`` and ``HORIZON_MAX`` imported from board_state above (a letter or a
+#: digit first, then letters, digits, ``.``, ``_``, ``-`` and inner spaces, ending on a non-space, at most 40 characters).
 CLEARABLE = ("done", "tier", "depends")
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*#[1-9][0-9]*")      # no leading zero: `#007` and `#7` must never be two ids
 REPO_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")                # lowercase only: `flow` and `Flow` must never be two counters
@@ -1074,19 +1084,38 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
     return _append(target, build, seal=seal)[0]["id"]
 
 
+def _check_horizon(decision, horizon) -> None:
+    """``out-of-horizon`` names the horizon the item is out of, and no other word carries one."""
+    if decision != "out-of-horizon":
+        if horizon is not None:
+            raise BoardError(f"--horizon belongs to out-of-horizon only, not {decision!r}")
+        return
+    if not isinstance(horizon, str) or not horizon.strip():
+        raise BoardError("out-of-horizon needs a horizon: --horizon NAME (the horizon the item is out of, for example `1.1`)")
+    if len(horizon) > HORIZON_MAX or not HORIZON_RE.fullmatch(horizon):
+        raise BoardError(f"horizon {horizon!r} is not a horizon name: at most {HORIZON_MAX} characters, a letter or a digit first, "
+                         f"then letters, digits, `.` `_` `-` and inner spaces")
+
+
 def decide(target: Target, item_id, decision, words, by, when=None, now=None, *, author, cause=None, seal=None,
-           authority=None, relay=None, cause_band=None) -> str:
+           authority=None, relay=None, cause_band=None, horizon=None) -> str:
     """Append a ``decide``. ``cause`` (a sha256) is the hash of the registry record this decision derives from (an
     ``abandon-track``'s cuts carry it); it is written after ``date`` only when given. A cut's cause (P2-d) is checked against
     ``authority``, an authority SOURCE read under the lock (``board_sign.resolve_authority``); a sealed decide checks it
-    against the seal's source instead. A cause that is a RELAYED abandon-track is re-read through ``cause_band``."""
-    _relay_or_sign(relay, seal)
+    against the seal's source instead. A cause that is a RELAYED abandon-track is re-read through ``cause_band``.
+    ``horizon`` is required with ``out-of-horizon`` and refused with every other word; it is written after ``date``."""
+    if decision == LEGACY_OUT_OF:
+        raise BoardError(LEGACY_REFUSED)
     if decision not in DECISIONS:
         raise BoardError(f"decision {decision!r} is not one of {DECISIONS}")
+    _check_horizon(decision, horizon)
+    _relay_or_sign(relay, seal)
     words, by = _one_line(words, "words", verbatim=True), _one_line(by, "by")
     author = _author_for(author, by)
     when = _real_date(when or (now or _utc_now())[:10], "date")
     body = {"decision": decision, "words": words, "date": when}
+    if horizon is not None:
+        body["horizon"] = horizon
     if cause is not None:
         if not isinstance(cause, str) or not HASH_RE.fullmatch(cause):
             raise BoardError(f"cause {cause!r} is not a lowercase sha256 hex digest")

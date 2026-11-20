@@ -81,7 +81,7 @@ def test_an_ordinary_word_and_a_judged_date_pass():
 
 
 def test_the_store_checks_run_only_when_the_store_is_given():
-    store = {"levain#7": ("levain", None), "levain#99": ("levain", None), "levain#98": ("levain", "out-of-1.0"),
+    store = {"levain#7": ("levain", None), "levain#99": ("levain", None), "levain#98": ("levain", "out-of-horizon"),
              "flow#1": ("flow", None)}
     problems, warnings = charter.check_text(REAL, repo_name="levain", items=store)
     assert {p.text for p in problems if p.rule == "store"} >= {"levain#8 is not in the board store"}
@@ -309,7 +309,8 @@ def _store_file(path, rows):
                                  "tier": "sonnet", "depends_on": []}))
         if decision:
             lines.append(json.dumps({"v": 1, "op": "decide", "id": iid, "at": "2026-11-13T12:06:09Z", "by": "desk 21",
-                                     "decision": decision, "words": "w", "date": "2026-11-13"}))
+                                     "decision": decision, "words": "w", "date": "2026-11-13",
+                                     **({"horizon": "launch"} if decision == "out-of-horizon" else {})}))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
@@ -363,7 +364,7 @@ def test_init_refuses_an_oversize_skeleton_before_writing_and_says_when_the_stor
 def test_init_writes_the_skeleton_with_the_plan_prefilled_in_id_order(tmp_path, capsys):
     repo = _git_repo(tmp_path / "levain")
     store = _store_file(tmp_path / "items.jsonl", [("levain#10", None), ("levain#2", None), ("levain#3", "cut"),
-                                                   ("levain#4", "parked"), ("levain#5", "out-of-1.0"), ("flow#1", None)])
+                                                   ("levain#4", "parked"), ("levain#5", "out-of-1.0"), ("levain#6", "out-of-horizon"), ("flow#1", None)])
     assert main(["charter", "init", "levain", "--repo", str(repo), "--items", str(store)]) == 0
     text = (repo / "CHARTER.md").read_text(encoding="utf-8")
     assert text.startswith("# Charter: levain\nCharter-Version: 1\nExport: memory\n\n## Purpose\n<")

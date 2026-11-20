@@ -10,7 +10,7 @@ import pytest
 
 from levain.cli import main
 from tests.test_board_registry import (  # noqa: F401  (fixtures and helpers of the registry tests)
-    A, CHARTER, HASH_A, bare_store, decision_seal, git, home, item_lines, land, migration_of, mkrepo, ok, reg_lines, run, store)
+    A, CHARTER, HASH_A, append_legacy_decide, bare_store, decision_seal, git, home, item_lines, land, migration_of, mkrepo, ok, reg_lines, run, store)
 
 
 def seeded(capsys, bare_store, repo_names, per=3):
@@ -176,14 +176,25 @@ def test_k1_an_adopted_item_keyed_to_this_ceremony_is_refused_so_abort_never_cut
     assert [r["id"] for r in item_lines(bare_store) if r.get("op") == "decide"] == [keyed]
 
 
-@pytest.mark.parametrize("decision", ["parked", "out-of-1.0", "cut"])
-def test_k2_begin_track_refuses_an_adopted_item_that_is_parked_or_out_of_1_0(decision_seal, bare_store, tmp_path, mkrepo, capsys, decision):
+@pytest.mark.parametrize("decision", ["parked", "out-of-horizon", "cut"])
+def test_k2_begin_track_refuses_an_adopted_item_that_is_parked_or_out_of_horizon(decision_seal, bare_store, tmp_path, mkrepo, capsys, decision):
     a = mkrepo("alpha")
     ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
-    ok(capsys, "decide", "--id", ids[1], "--decision", decision, "--words", "w", *A)
+    ok(capsys, "decide", "--id", ids[1], "--decision", decision, *(["--horizon", "launch"] if decision == "out-of-horizon" else []), "--words", "w", *A)
     ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
     rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, adopt_items=[ids[0], ids[1]])), "--words", "y", *A)
     assert rc == 2 and ids[1] in err and decision in err and ids[0] not in err
+    assert [r for r in reg_lines(bare_store) if r["op"] == "begin-track"] == []
+
+
+def test_k2_begin_track_refuses_an_adopted_item_a_record_stored_with_the_legacy_word_put_out_of_horizon(decision_seal, bare_store, tmp_path, mkrepo, capsys):
+    """The writer refuses ``out-of-1.0`` now, so the raw line is written by hand: the registry must read it as ``out-of-horizon``."""
+    a = mkrepo("alpha")
+    ids = seeded(capsys, bare_store, ["alpha"])["alpha"]
+    append_legacy_decide(bare_store, ids[1])
+    ok(capsys, "register", "alpha", "--path", str(a), "--words", "w", *A)
+    rc, _, err = run(capsys, "begin-track", "alpha", "--manifest", str(man(tmp_path, adopt_items=[ids[0], ids[1]])), "--words", "y", *A)
+    assert rc == 2 and ids[1] in err and "out-of-horizon" in err and "out-of-1.0" not in err and ids[0] not in err
     assert [r for r in reg_lines(bare_store) if r["op"] == "begin-track"] == []
 
 

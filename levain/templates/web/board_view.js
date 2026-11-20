@@ -39,7 +39,7 @@
       // provider's board is the desk's own work and says nothing, which reads as true
       dropHere: body.drop_here !== false,
       unreadable: Array.isArray(body.unreadable) ? body.unreadable.map(String) : [],
-      // what the board has set aside (cut, parked, out of 1.0): a count, not a column of cards
+      // what the board has set aside (cut, parked, out of horizon): a count, not a column of cards
       off: typeof body.off_count === "number" && body.off_count > 0 ? Math.floor(body.off_count) : 0,
       columns: ORDER.filter(function (name) { return name !== "unknown" || (cols.unknown && visibleCards(cols.unknown.cards).length); }).map(function (name) {
         var c = cols[name] || { cards: [] };
@@ -166,7 +166,7 @@
     if (model.queue === "unreadable") note.push("The queue could not be read; this is not an empty queue.");
     model.unreadable.forEach(function (u) { note.push("Could not read: " + u + "."); });
     if (model.note && model.queue !== "none") note.push(model.note);
-    if (model.off) note.push(model.off + " off the board (cut, parked or out of 1.0).");
+    if (model.off) note.push(model.off + " off the board (cut, parked or out of horizon).");
     if (note.length) host.appendChild(el(doc, "p", "bd-note", note.join(" ")));
   }
 

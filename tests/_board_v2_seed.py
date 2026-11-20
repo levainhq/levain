@@ -1,7 +1,7 @@
 """A scratch board store for the cockpit board tests and the look: two tracked repos (alpha, beta, each a real scratch git
 repository with a bare origin), one registered but untracked (gamma), and items in every state a repository's own git can
 produce: done, ready, ready with a start, landed not closed, blocked, needs grooming, unknown (a link that names nothing)
-and off (cut, parked, out of 1.0). Running, waiting and needs-you take a live seat, a waiter or a band row: ``seed`` does
+and off (cut, parked, out of horizon). Running, waiting and needs-you take a live seat, a waiter or a band row: ``seed`` does
 not make those (the tests that need one feed ``board._v2`` a derived document instead).
 
 Used as ``seed(root)`` under a ``LEVAIN_HOME`` the caller has set; it uses only ``levain board`` and ``git``."""
@@ -132,5 +132,5 @@ def seed(root: Path, monkeypatch) -> dict[str, str]:
     git(b, "fetch", "-q")
     ids["beta_ready"] = _item("beta", "A fresh piece of beta work")
     ids["out"] = _item("beta", "Not for 1.0")
-    board("decide", "--id", ids["out"], "--decision", "out-of-1.0", "--words", "later", *A)
+    board("decide", "--id", ids["out"], "--decision", "out-of-horizon", "--horizon", "1.0", "--words", "later", *A)
     return ids

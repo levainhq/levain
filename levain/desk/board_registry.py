@@ -505,7 +505,7 @@ def begin_track(target: bs.Target, name: str, manifest_file: str | Path, words: 
 def _check_adopt(manifest: Mapping[str, Any], name: str, migration: str, adds: Mapping[str, dict],
                  decision: Mapping[str, str | None]) -> None:
     """Design rev 8 and its corrections, rule 1: each ``adopt_items`` entry must be an item that exists, is X's own, is not cut,
-    is not parked or out-of-1.0 (``charter.OUT_OF_PLAN``) and is not keyed to this ceremony (``migration:<k>``: abort cuts
+    is not parked or out of its horizon (``charter.OUT_OF_PLAN``) and is not keyed to this ceremony (``migration:<k>``: abort cuts
     keyed items, so an adopted one must never carry such a key). A repeat is refused by the manifest's own shape check. EVERY
     bad entry is reported in the one refusal. The caller holds the registry lock and has read the items."""
     from levain.desk import charter
@@ -519,7 +519,7 @@ def _check_adopt(manifest: Mapping[str, Any], name: str, migration: str, adds: M
         elif decision.get(iid) == "cut":
             bad.append(f"{iid} is cut: a cut item is not adopted")
         elif decision.get(iid) in charter.OUT_OF_PLAN:
-            bad.append(f"{iid} is {decision.get(iid)}: a parked or out-of-1.0 item is not adopted (reopen it first)")
+            bad.append(f"{iid} is {decision.get(iid)}: a parked or out-of-horizon item is not adopted (reopen it first)")
         elif isinstance(rec.get("key"), str) and rec["key"].startswith(migration + ":"):
             bad.append(f"{iid} is keyed {rec['key']} to this ceremony: abort cuts keyed items, so it cannot also be adopted")
     if bad:
@@ -925,12 +925,12 @@ def abandon_done(target: bs.Target, name: str, words: str, by: str, *, author: M
 
 
 def _unsettled_items(target: bs.Target, cur: rf.Repo) -> tuple[list[str], str]:
-    """``(ids, digest)``: the ids of the repo's items that are neither done nor decided (cut, parked, out of 1.0), and the
+    """``(ids, digest)``: the ids of the repo's items that are neither done nor decided (cut, parked, out of horizon), and the
     sha256 of the items file's bytes they were judged from (``untrack`` compares it again under the exclusive lock). The
     board's own derive is asked, with the repo's git evidence. A torn item store refuses, whether or not any item reads as the
     repo's; evidence that cannot be read refuses."""
     from levain.desk import board_evidence as be
-    from levain.desk.board_state import Evidence, derive_all
+    from levain.desk.board_state import _SETTLED, Evidence, derive_all
 
     with bs.store_lock(target.store_dir, exclusive=False):
         raw = _items_raw(target.store_dir)
@@ -947,12 +947,12 @@ def _unsettled_items(target: bs.Target, cur: rf.Repo) -> tuple[list[str], str]:
                            repo_evidence={cur.name: Evidence.from_dict(ev, now=now)}, primary_repo=cur.name)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise BoardError(f"untrack {cur.name} refused: the repo's evidence cannot be read ({type(exc).__name__}: {exc})") from None
-    return sorted(s.id for s in board.items if s.repo == cur.name and s.state not in ("done", "cut", "parked", "out_of_1_0")), digest
+    return sorted(s.id for s in board.items if s.repo == cur.name and s.state not in _SETTLED), digest
 
 
 def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mapping[str, Any],
             now: str | None = None, seal: Any = None) -> tuple[rf.Repo | None, bool]:
-    """Leave tracked mode (a forward act). Refuses while the repo has an item that is not done, cut, parked or out of 1.0."""
+    """Leave tracked mode (a forward act). Refuses while the repo has an item that is not done, cut, parked or out of horizon."""
     name, words, by = _name(name), _words(words), bs._one_line(by, "by")
     view = read_registry(target)
     cur = _need_repo(view.fold, name)
@@ -962,7 +962,7 @@ def untrack(target: bs.Target, name: str, words: str, by: str, *, author: Mappin
         raise BoardError(f"{name} is {cur.mode}: untrack needs a tracked repo")
     open_ids, digest = _unsettled_items(target, cur)
     if open_ids:
-        raise BoardError(f"untrack {name} refused: items not done, cut, parked or out of 1.0: {', '.join(open_ids[:20])}"
+        raise BoardError(f"untrack {name} refused: items not done, cut, parked or out of horizon: {', '.join(open_ids[:20])}"
                          f"{' ...' if len(open_ids) > 20 else ''}; decide each one first")
 
     def build(fold, sid, raw):
@@ -1718,7 +1718,7 @@ def register_cli(sub: Any, author_args: Callable[[Any], None], author_of: Callab
 
     door_ok_author(p)
 
-    p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut, parked or out of 1.0.")
+    p = sub.add_parser("untrack", description="Leave tracked mode. Refuses while an item is not done, cut, parked or out of horizon.")
     common(p)
     p.set_defaults(func=run(lambda a, t: said(a, *untrack(t, a.name, a.words, a.by, author=author_of(a), seal=seal(a)), "untracked", "already untracked")))
     door_ok_author(p)

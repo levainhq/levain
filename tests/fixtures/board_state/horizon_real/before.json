@@ -1,0 +1,26 @@
+[
+[
+"app#11",
+"out_of_1_0",
+"off",
+"sample ruling C: confirmed, the budget change follows the first release (2026-03-04)"
+],
+[
+"app#12",
+"out_of_1_0",
+"off",
+"sample ruling B: the exporter rewrite waits for the next release (2026-03-03)"
+],
+[
+"app#13",
+"out_of_1_0",
+"off",
+"sample ruling D: undo ships in the follow-up (a sample reason) (2026-03-05)"
+],
+[
+"app#14",
+"blocked",
+"backlog",
+"waits on app#12: dependency cut: decide (sample ruling B: the exporter rewrite waits for the next release (2026-03-03))"
+]
+]

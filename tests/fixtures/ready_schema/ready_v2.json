@@ -7,7 +7,7 @@
  "states": [
   {"state": "cut", "column": "off"},
   {"state": "parked", "column": "off"},
-  {"state": "out_of_1_0", "column": "off"},
+  {"state": "out_of_horizon", "column": "off"},
   {"state": "done", "column": "done"},
   {"state": "needs_you", "column": "needs_you"},
   {"state": "landing", "column": "waiting"},
@@ -23,7 +23,7 @@
  "audit_kinds": ["unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer"],
  "precedence": ["decision", "done", "needs_you", "landing", "in_flight", "landed_not_closed", "blocked", "ready_with_start", "needs_grooming", "ready"],
  "board_keys": ["schema", "as_of", "items", "audit", "unattributed", "problems"],
- "state_keys": ["id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind"],
+ "state_keys": ["id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of", "kind", "horizon"],
  "kinds": {"landed_not_closed": "close", "ready_with_start": "start", "ready": "work"},
  "audit_entry_keys": ["kind", "id", "why"]
 }

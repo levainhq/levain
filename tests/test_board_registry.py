@@ -147,6 +147,15 @@ def reg_lines(store):
     return [json.loads(ln) for ln in (store / "repos.jsonl").read_text("utf-8").splitlines()]
 
 
+def append_legacy_decide(store, iid):
+    """Write by hand (the writer refuses it now) a chained ``decide`` that carries the legacy word ``out-of-1.0``."""
+    path = store / "items.jsonl"
+    rec = {"v": 1, "op": "decide", "id": iid, "at": "2026-11-12T10:00:00Z", "prev": bs.chain_prev(path.read_bytes()), "by": "desk 1",
+           "decision": "out-of-1.0", "words": "stored before the horizon word", "date": "2026-11-12"}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
 def item_lines(store):
     return [json.loads(ln) for ln in (store / "items.jsonl").read_text("utf-8").splitlines()]
 
@@ -679,10 +688,21 @@ def test_untrack_refuses_while_an_item_is_not_done_cut_or_parked(decision_seal, 
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
     rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
-    assert rc == 2 and f"items not done, cut, parked or out of 1.0: {iid}" in err
-    ok(capsys, "decide", "--id", iid, "--decision", "out-of-1.0", "--words", "later", *A)
+    assert rc == 2 and f"items not done, cut, parked or out of horizon: {iid}" in err
+    ok(capsys, "decide", "--id", iid, "--decision", "out-of-horizon", "--horizon", "1.0", "--words", "later", *A)
     assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "untracked alpha"
     assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "already untracked alpha"
+
+
+def test_untrack_counts_an_item_stored_with_the_legacy_out_of_1_0_word_as_settled(decision_seal, store, tmp_path, mkrepo, capsys):
+    """The writer refuses ``out-of-1.0`` now, so the raw line is written by hand: untrack must read it as out of horizon."""
+    a = mkrepo("alpha")
+    m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
+    assert rc == 2 and iid in err
+    append_legacy_decide(store, iid)
+    assert ok(capsys, "untrack", "alpha", "--words", "bye", *A) == "untracked alpha"
 
 
 def test_untrack_refuses_a_repo_that_is_not_tracked(decision_seal, store, tmp_path, mkrepo, capsys):
@@ -1314,7 +1334,7 @@ def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_mi
     a = mkrepo("alpha")
     m, iid = track_ready(capsys, tmp_path, store, a, "alpha")
     ok(capsys, "track", "alpha", "--words", "go", *A)
-    ok(capsys, "decide", "--id", iid, "--decision", "out-of-1.0", "--words", "later", *A)
+    ok(capsys, "decide", "--id", iid, "--decision", "out-of-horizon", "--horizon", "1.0", "--words", "later", *A)
     real = br._unsettled_items
 
     def derive_then_a_concurrent_add(*args, **kw):
@@ -1328,7 +1348,7 @@ def test_f4_untrack_rechecks_the_items_under_the_lock_a_concurrent_add_is_not_mi
     assert rc == 2 and "changed under the check" in err and len(reg_lines(store)) == n
     monkeypatch.setattr(br, "_unsettled_items", real)
     rc, _, err = run(capsys, "untrack", "alpha", "--words", "bye", *A)
-    assert rc == 2 and "items not done, cut, parked or out of 1.0" in err                  # run again: now it sees the add
+    assert rc == 2 and "items not done, cut, parked or out of horizon" in err                  # run again: now it sees the add
 
 
 def test_f4_abandon_done_rechecks_every_item_reads_cut_under_the_lock(decision_seal, store, tmp_path, mkrepo, capsys, monkeypatch):

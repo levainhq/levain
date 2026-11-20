@@ -56,7 +56,7 @@ def test_every_tracked_repo_is_read_and_the_untracked_one_is_not(store):
 
 def test_off_is_a_count_and_never_a_column_of_cards(store):
     v = board.build(None, None)
-    assert v["off_count"] == 3                                                              # cut, parked, out of 1.0
+    assert v["off_count"] == 3                                                              # cut, parked, out of horizon
     assert "off" not in [c["category"] for c in v["columns"]]
     shown = {i for c in v["columns"] for i in (k["id"] for k in c["cards"])}
     assert not shown & {store["cut"], store["parked"], store["out"]}
@@ -128,7 +128,7 @@ def test_the_page_draws_the_unknown_column_while_it_holds_a_card_and_the_off_cou
                          capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
     got = json.loads(res.stdout)
-    assert got["with"]["heads"][:2] == ["unknown 1", "backlog 0"] and "ready 1" in got["with"]["heads"] and "3 off the board (cut, parked or out of 1.0)." in got["with"]["notes"][0]
+    assert got["with"]["heads"][:2] == ["unknown 1", "backlog 0"] and "ready 1" in got["with"]["heads"] and "3 off the board (cut, parked or out of horizon)." in got["with"]["notes"][0]
     assert got["with"]["held"] == ["held: item:a#9 is not in the store"]
     assert "unknown" not in " ".join(got["without"]["heads"]) and "ready 1" in got["without"]["heads"] and got["without"]["notes"] == []
 

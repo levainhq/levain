@@ -74,6 +74,13 @@ EXIT_LOCKED = 4
 STATE_LOCK_WAIT = 2.0           # seconds, in all, `board state` waits for a writer's store lock before it refuses: a hold is milliseconds
 
 
+def _decision_word(word: str) -> str:
+    """``--decision``'s type: the legacy word is refused here with its pointer (argparse would only name the valid words)."""
+    if word == bs.LEGACY_OUT_OF:
+        raise argparse.ArgumentTypeError(bs.LEGACY_REFUSED)
+    return word
+
+
 def register(subparsers: Any) -> None:
     # Hidden, as ``levain upgrade`` and ``levain session`` are (no ``help=``: ``levain --help`` and the README's "All
     # commands" table, which tests/test_readme_commands.py holds to the listed verbs, leave it out); ``levain board state
@@ -168,7 +175,11 @@ def register(subparsers: Any) -> None:
     m.set_defaults(func=run_amend)
     d = sub.add_parser("decide", description="Record a ruling on an item.")
     d.add_argument("--id", required=True)
-    d.add_argument("--decision", required=True, choices=bs.DECISIONS)
+    d.add_argument("--decision", required=True, choices=bs.DECISIONS, type=_decision_word,
+                   help="out-of-horizon takes --horizon; the legacy word out-of-1.0 is refused for a new write")
+    d.add_argument("--horizon", default=None, metavar="NAME",
+                   help="With out-of-horizon (required) and no other decision: the horizon the item is out of, one line of at most "
+                        f"{bs.HORIZON_MAX} characters (a letter or a digit first, then letters, digits, . _ - and inner spaces), for example 1.1")
     d.add_argument("--words", required=True)
     d.add_argument("--by", required=True)
     author_args(d)
@@ -499,7 +510,7 @@ def run_decide(args: argparse.Namespace) -> int:
         target = bs.resolve_store(args.items)
         print("decided", bs.decide(target, args.id, args.decision, args.words, args.by, when=args.date, author=author,
                                    cause=args.cause, seal=seal, authority=_cause_authority(args, seal), relay=relay,
-                                   cause_band=_cause_band(args, seal)))
+                                   cause_band=_cause_band(args, seal), horizon=args.horizon))
     except bs.BoardError as exc:
         return _refused(exc)
     return 0

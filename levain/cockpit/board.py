@@ -4,7 +4,7 @@ writes, stores a column, or keeps a second needs-you list.
 Two sources, one value. When this install has a board store (T3, READY_SCHEMA v3: items stored, state derived on every read,
 every tracked repo of the registry read from one snapshot) the cards are that board's items, read through
 :func:`levain.desk.board_cli.state_doc`; the columns are the v2 ``STATE_COLUMN`` set: ``unknown`` is its own column, first, and
-never folded into another; ``off`` (cut, parked, out of 1.0) is a COUNT (``off_count``), never a column of cards. An install
+never folded into another; ``off`` (cut, parked, out of horizon) is a COUNT (``off_count``), never a column of cards. An install
 with no board store yet reads the desk's dispatch queue as before (C13's ``list(all=True)`` items, each with its last journal
 record), and its ``unknown`` column is empty. The needs-you column IS the Q17-ALL band's open items, read through
 ``levain.band_view``'s own read-only snapshot and its allocated numbers (a number not yet allocated reads ``None``: a look
@@ -369,7 +369,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], off_count, unreadable, band_hint,
     note, journal_as_of_read, as_of}``: ``generated`` is the time of this build, ``as_of`` the OLDEST fetch time of the repos read
     (null when a repo has none, or there is no board store). With a board store (``board_items``, else ``$LEVAIN_BOARD_ITEMS``, the pointer, the levain
-    home's own) the cards are the v2 board's, ``off_count`` counts what is cut, parked or out of 1.0 and ``store_dir`` (the
+    home's own) the cards are the v2 board's, ``off_count`` counts what is cut, parked or out of horizon and ``store_dir`` (the
     dispatch queue) is not read; the producers and the land waiter are the store's board config, read by the same code as
     ``levain board state``. Without a board store this is the dispatch queue as it was and ``off_count`` is 0: its items, the
     journal and the live-seat projections (``running`` cards, no journal line) come from ONE read transaction (:func:`levain.desk.ready.snapshot`), so a card's journal line is never newer than its column;

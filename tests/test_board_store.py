@@ -1090,3 +1090,64 @@ def test_an_empty_launch_key_means_no_launch_key_whatever_the_environment_says(h
     assert "launch_key" not in json.loads(lines(store)[0])["author"]
     assert run(capsys, *ADD)[0] == 0
     assert json.loads(lines(store)[1])["author"]["launch_key"] == "envkey"
+
+
+# ------------------------------------------------------------------------------------------------ levain#188: the horizon
+def _decide_args(*more):
+    return ("decide", "--id", "levain#1", "--words", "later", "--by", "b", "--date", "2026-11-20", *SIGNED, *more)
+
+
+def test_out_of_horizon_with_a_horizon_writes_a_record_carrying_it_and_the_fold_reads_it(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "store")
+    assert run(capsys, *ADD)[0] == 0
+    rc, out, err = run(capsys, *_decide_args("--decision", "out-of-horizon", "--horizon", "launch"))
+    assert rc == 0, err
+    rec = json.loads(lines(store)[-1])
+    assert (rec["decision"], rec["horizon"]) == ("out-of-horizon", "launch")
+    assert list(rec)[list(rec).index("decision"):list(rec).index("horizon") + 1] == ["decision", "words", "date", "horizon"]
+    folded = fold(lines(store))
+    assert not folded.torn and (folded.items["levain#1"].decision.decision, folded.items["levain#1"].decision.horizon) == ("out-of-horizon", "launch")
+
+
+def test_out_of_horizon_needs_a_horizon_and_only_it_takes_one(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "store")
+    assert run(capsys, *ADD)[0] == 0
+    before = lines(store)
+    rc, _, err = run(capsys, *_decide_args("--decision", "out-of-horizon"))
+    assert rc == 2 and "needs a horizon" in err
+    rc, _, err = run(capsys, *_decide_args("--decision", "cut", "--horizon", "launch"))
+    assert rc == 2 and "--horizon belongs to out-of-horizon only" in err
+    rc, _, err = run(capsys, *_decide_args("--decision", "reopen", "--horizon", "launch"))
+    assert rc == 2 and "--horizon belongs to out-of-horizon only" in err
+    assert lines(store) == before
+
+
+@pytest.mark.parametrize("horizon", ["", "  ", "two\nlines", "x" * 41, "-lead", " lead", "trail ", "a/b", "café"])
+def test_a_bad_horizon_is_refused_before_anything_is_written(home, tmp_path, capsys, horizon):
+    store = use(capsys, tmp_path / "store")
+    assert run(capsys, *ADD)[0] == 0
+    before = lines(store)
+    rc, _, err = run(capsys, *_decide_args("--decision", "out-of-horizon", f"--horizon={horizon}"))
+    assert rc == 2 and "horizon" in err
+    assert lines(store) == before
+
+
+def test_the_legacy_word_is_refused_for_a_new_write_with_a_pointer(home, tmp_path, capsys):
+    store = use(capsys, tmp_path / "store")
+    assert run(capsys, *ADD)[0] == 0
+    before = lines(store)
+    with pytest.raises(SystemExit) as stop:                 # argparse's own refusal of a value: the usage line and the pointer on stderr
+        run(capsys, *_decide_args("--decision", "out-of-1.0"))
+    assert stop.value.code == 2 and "use out-of-horizon --horizon 1.0" in capsys.readouterr().err
+    assert lines(store) == before
+    t = bs.resolve_store(None)
+    with pytest.raises(bs.BoardError, match="use out-of-horizon --horizon 1.0"):
+        bs.decide(t, "levain#1", "out-of-1.0", "later", "b", author=None)
+    assert lines(store) == before
+
+
+def test_the_writer_set_and_the_horizon_rule_are_the_folds(home):
+    from levain.desk import board_state
+    assert bs.DECISIONS == (*board_state.DECISIONS, "reopen")
+    assert bs.HORIZON_MAX is board_state.HORIZON_MAX and bs.HORIZON_RE is board_state.HORIZON_RE     # imported, not restated
+    assert bs.LEGACY_OUT_OF is board_state.LEGACY_OUT_OF and bs.LEGACY_OUT_OF not in bs.DECISIONS
