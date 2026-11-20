@@ -3914,7 +3914,7 @@ def _valid_until_iso(raw: Any) -> str | None:
         dt = datetime.fromisoformat(raw)
         # a naive time is read as local time, Python's own rule for a naive datetime, not as UTC the way ``_parse_iso`` does
         return (dt.astimezone() if dt.tzinfo is None else dt).isoformat()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):    # astimezone() on an out-of-range naive time
         return None
 
 
