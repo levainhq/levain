@@ -32,6 +32,11 @@ live Ollama, the Linux image, a real Chrome (the `needs_browser` tests), Node wi
 tests). CI runs several of these in their own jobs, and one more job runs root-run code on Python 3.9; plain `pytest`
 runs none of those jobs for you. A skip is not a pass, so read the skip count in the output.
 
+On your own machine, run one file or one test (`pytest tests/test_x.py`). A bare or whole-`tests/` run is refused off CI
+(it ran the machine out of cores), runs at most four xdist workers, and runs at background priority on macOS; to run the
+full suite in CI on a branch you have pushed, use `python3 scripts/ci_full.py`, and set `LEVAIN_LOCAL_FULL=1` only when
+you need the full suite on your own machine. The policy is `tests/local_run_policy.py`.
+
 ## Changes
 
 - A change a user would notice gets an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md), in the format of
