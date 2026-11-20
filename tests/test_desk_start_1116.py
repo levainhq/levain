@@ -35,8 +35,8 @@ def _shot(name: str) -> list[dict]:
 # what the page draws in the lease bar and what the Start control did; the sheet's opener is stubbed only where a test names it
 _LOOK = """(() => { const z = document.querySelector('.dv-zone'), q = s => z.querySelector(s), r = n => { const b = n.getBoundingClientRect(); return {l: b.left, t: b.top, w: b.width, h: b.height, r: b.right}; };
   const s = q('.dv-open'), bar = q('.dv-state'), sheet = document.getElementById('levain-sign-sheet');
-  return JSON.stringify({ start: !!s, openText: s && s.textContent, startBox: s && r(s), bar: bar ? bar.innerText : null, barCls: bar ? bar.className : null,
-    startCount: z.querySelectorAll('.dv-open').length, openCount: z.querySelectorAll('.dv-open').length, buttons: [...z.querySelectorAll('.dv-state button')].map(b => b.textContent), roomDesk: document.querySelectorAll('.rv-desk').length, drops: window.__drops || null,
+  return JSON.stringify({ start: !!s, openText: s && s.textContent, openBox: s && r(s), bar: bar ? bar.innerText : null, barCls: bar ? bar.className : null,
+    openCount: z.querySelectorAll('.dv-open').length, buttons: [...z.querySelectorAll('.dv-state button')].map(b => b.textContent), roomDesk: document.querySelectorAll('.rv-desk').length, drops: window.__drops || null,
     note: q('.dv-startnote') ? q('.dv-startnote').textContent : null, sheet: !!sheet, frame: sheet && sheet.querySelector('iframe') ? sheet.querySelector('iframe').getAttribute('src') : null,
     pageX: document.documentElement.scrollWidth > innerWidth + 1, vw: innerWidth }); })()"""
 LOOK = {"eval": _LOOK}
@@ -44,7 +44,7 @@ _STUB = "(() => { window.__drops = []; const S = window.LevainSignSheet; S.openD
 
 
 def looks(out) -> list[dict]:
-    return [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"startCount"' in v]
+    return [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"openCount"' in v]
 
 
 def _drive_desk(tmp_path, emulate, steps):
@@ -61,8 +61,8 @@ def test_the_desk_view_offers_open_a_desk_only_where_the_lease_read_says_open_de
         put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"), LOOK,
         put(get={"status": 200, "json": wired(lease={"state": "unknown"})}), until("document.querySelector('.dv-lease-unknown')"), LOOK])
     none, held, unknown = looks(out)
-    assert none["start"] and none["openText"] == "Open a Desk" and none["startCount"] == 1, none
-    assert none["startBox"]["w"] >= 44 and none["startBox"]["h"] >= 44 and none["startBox"]["r"] <= none["vw"] + 0.5 and not none["pageX"], none
+    assert none["start"] and none["openText"] == "Open a Desk" and none["openCount"] == 1, none
+    assert none["openBox"]["w"] >= 44 and none["openBox"]["h"] >= 44 and none["openBox"]["r"] <= none["vw"] + 0.5 and not none["pageX"], none
     assert not held["start"] and not unknown["start"], (held, unknown)       # a desk is live, or the lease cannot be told: nothing to open
 
 
@@ -98,7 +98,7 @@ def test_a_refused_open_says_no_desk_was_started(tmp_path):
 
 
 @needs_browser
-def test_the_start_note_goes_when_a_desk_takes_the_lease(tmp_path):
+def test_the_open_note_goes_when_a_desk_takes_the_lease(tmp_path):
     out = _drive_desk(tmp_path, DESKTOP, [
         put(get={"status": 200, "json": wired(lease=NONE)}), until("document.querySelector('.dv-open')"),
         {"eval": _STUB % "{}"}, {"tap": "document.querySelector('.dv-zone .dv-open')"}, {"eval": "new Promise(r => setTimeout(r, 200)).then(() => 1)"}, LOOK,
@@ -148,6 +148,7 @@ def test_each_open_desk_basis_is_drawn_as_the_host_said_it(tmp_path):
                                    {"state": "none", "open_desk": False}, {"state": "unknown", "open_desk": True},
                                    {"state": "held", "holder": "desk 40", "age_s": 60, "open_desk": "true"}])
     assert [g["openCount"] for g in shown] == [1, 1, 0, 0, 0, 0], shown
+    assert "The host says a new desk can open now." in shown[1]["bar"] and "The host says" not in shown[2]["bar"], shown   # a held lease beside the button says why
 
 
 @needs_browser

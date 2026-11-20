@@ -79,7 +79,7 @@
     var st = lease && typeof lease === "object" && own(LEASE_STATES, lease.state) ? lease.state : "unknown";
     if (st === "held") {
       var who = str(lease.holder), age = ageWords(lease.age_s);
-      return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false, openDesk: lease.open_desk === true };
+      return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false, openDesk: lease.open_desk === true, startHint: " The host says a new desk can open now." };
     }
     if (st === "none") {
       return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk.", startHint: " To start one, use Open a Desk below.", drop: true, openDesk: lease.open_desk === true };
