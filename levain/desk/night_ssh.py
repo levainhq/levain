@@ -50,15 +50,27 @@ def config_path(home: Path | str) -> Path:
     return _night_dir(home) / "ssh_config"
 
 
-def render_config(hostname: str, home: Path | str) -> str:
+def _checked_host(value: object, what: str) -> str:
+    """``value`` if it is a plain DNS name or IPv4 address (the placeholder refused); else ValueError naming ``what``."""
+    if (type(value) is not str or len(value) > _HOSTNAME_MAX or value.upper() == _PLACEHOLDER
+            or _HOSTNAME.fullmatch(value) is None):
+        raise ValueError(f"{what} must be a plain DNS name or IPv4 address")
+    return value
+
+
+def render_config(hostname: str, home: Path | str, *, host_key_alias: str | None = None) -> str:
     """The runbook's ``taoserv-night`` block with absolute, quoted key and known-hosts paths under ``home``, and the
-    compiled-in global known-hosts files turned off (only the pinned file can vouch for the server)."""
-    if (type(hostname) is not str or len(hostname) > _HOSTNAME_MAX or hostname.upper() == _PLACEHOLDER
-            or _HOSTNAME.fullmatch(hostname) is None):
-        raise ValueError("hostname must be a plain DNS name or IPv4 address")
+    compiled-in global known-hosts files turned off (only the pinned file can vouch for the server). With
+    ``host_key_alias`` the block adds a ``HostKeyAlias`` line right after ``HostName``; the alias is checked as the
+    hostname is."""
+    _checked_host(hostname, "hostname")
+    alias_line = ""
+    if host_key_alias is not None:
+        alias_line = f"    HostKeyAlias {_checked_host(host_key_alias, 'host_key_alias')}\n"
     nd = _night_dir(home)
     return (f"Host {NIGHT_ALIAS['taoserv']}\n"
             f"    HostName {hostname}\n"
+            f"{alias_line}"
             "    User nightkey\n"
             f'    IdentityFile "{nd}/taoserv_night"\n'
             "    IdentitiesOnly yes\n"
@@ -70,11 +82,11 @@ def render_config(hostname: str, home: Path | str) -> str:
             "    ForwardAgent no\n")
 
 
-def write_config(hostname: str, home: Path | str) -> Path:
+def write_config(hostname: str, home: Path | str, *, host_key_alias: str | None = None) -> Path:
     """Write the config (mode 0600, its directory 0700) through a unique temp file in the same directory and replace;
     return its path. A symlink at ``.levain``, ``.levain/night`` or the target is refused, not followed; a failed write
     removes only its own temp file."""
-    text = render_config(hostname, home)
+    text = render_config(hostname, home, host_key_alias=host_key_alias)
     target = config_path(home)
     levain_dir, nd = target.parent.parent, target.parent
     for d in (levain_dir, nd):

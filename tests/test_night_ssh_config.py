@@ -53,6 +53,42 @@ def test_a_non_str_hostname_is_refused(tmp_path):
             night_ssh.render_config(bad, tmp_path)
 
 
+def test_an_address_with_a_host_key_alias_renders_both_lines(tmp_path):
+    text = night_ssh.render_config("172.233.220.105", tmp_path, host_key_alias="taoserv.example.net")
+    lines = text.splitlines()
+    assert "    HostName 172.233.220.105" in lines and "    HostKeyAlias taoserv.example.net" in lines
+    assert lines.index("    HostKeyAlias taoserv.example.net") == lines.index("    HostName 172.233.220.105") + 1
+    assert text.count("HostKeyAlias") == 1
+
+
+def test_no_alias_renders_no_host_key_alias_line(tmp_path):
+    assert "HostKeyAlias" not in night_ssh.render_config(ADDR, tmp_path)
+    assert night_ssh.render_config(ADDR, tmp_path, host_key_alias=None) == night_ssh.render_config(ADDR, tmp_path)
+
+
+@pytest.mark.parametrize("bad", ["", "a b", "a\nHost evil", "a\tb", "a/b", "-oProxyCommand=x", "-a.example", "é.example",
+                                 "a;b", "x" * 300, "REPLACE-WITH-TAOSERV-ADDRESS", "replace-with-taoserv-address"])
+def test_a_host_key_alias_that_is_not_a_plain_name_is_refused(tmp_path, bad):
+    with pytest.raises(ValueError):
+        night_ssh.render_config(ADDR, tmp_path, host_key_alias=bad)
+    with pytest.raises(ValueError):
+        night_ssh.write_config(ADDR, tmp_path, host_key_alias=bad)
+    assert not (tmp_path / ".levain").exists()                                   # refused before anything is written
+
+
+def test_a_non_str_host_key_alias_is_refused(tmp_path):
+    for bad in (b"a.example", 5):
+        with pytest.raises(ValueError):
+            night_ssh.render_config(ADDR, tmp_path, host_key_alias=bad)
+
+
+def test_write_config_writes_the_alias_and_ssh_G_reads_it(tmp_path):
+    cfg = night_ssh.write_config("172.233.220.105", tmp_path, host_key_alias="taoserv.example.net")
+    assert cfg.read_text() == night_ssh.render_config("172.233.220.105", tmp_path, host_key_alias="taoserv.example.net")
+    eff = _ssh_G(cfg)
+    assert eff["hostname"] == "172.233.220.105" and eff["hostkeyalias"] == "taoserv.example.net"
+
+
 def test_write_config_writes_under_the_injected_home_only(tmp_path):
     path = night_ssh.write_config(ADDR, tmp_path)
     assert path == tmp_path / ".levain" / "night" / "ssh_config" == night_ssh.config_path(tmp_path)
