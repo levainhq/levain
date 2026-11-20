@@ -11,6 +11,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -217,9 +218,9 @@ def test_doctor_falls_back_to_the_module_when_the_script_cannot_run(tmp_path, mo
     broken.write_text("#!/nonexistent/python\n", encoding="utf-8")
     broken.chmod(0o755)
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(broken))
-    # This test is about the fallback, not the range: no requirement to read, so the installed
-    # (possibly stale) levain metadata cannot decide it.
-    monkeypatch.setattr(importlib.metadata, "requires", lambda name: None)
+    # This test is about the fallback, not the range: no requirement to read, so no range
+    # can decide it.
+    monkeypatch.setattr(manifest, "_levain_requires", lambda: [])
 
     results = doctor._check_runtime(tmp_path)
 
@@ -228,12 +229,202 @@ def test_doctor_falls_back_to_the_module_when_the_script_cannot_run(tmp_path, mo
     assert str(broken) in anneal[0].detail
 
 
-# levain#194 part B: the module check judges the importable anneal against the range levain's
-# own metadata declares (a stale guest-VM image carried 1.0.2 and `levain serve` died on import).
+
+
+# levain#194 part B: the anneal checks judge the runnable anneal against the range levain declares
+# (a stale guest-VM image carried 1.0.2 and `levain serve` died on import). The range is read through
+# manifest's `_levain_requires` (repo pyproject first), the same source the pip-pin row uses.
 _DECLARED = "anneal-memory<2.1,>=2.0.1"
+_PIP = f"{shlex.quote(sys.executable)} -m pip"
+
+
+def _declared(monkeypatch, requires):
+    monkeypatch.setattr(manifest, "_levain_requires", lambda: requires)
 
 
 def _module_check(tmp_path, monkeypatch, version_out, requires):
+    from levain import doctor
+
+    _declared(monkeypatch, requires)
+    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(tmp_path / "no-such-script"))
+    monkeypatch.setattr(
+        doctor, "_probe",
+        lambda cmd, timeout=5.0: (True, version_out) if "anneal_memory" in cmd else (False, ""),
+    )
+    results = doctor._check_runtime(tmp_path)
+    anneal = [r for r in results if r.name.startswith("anneal-memory")]
+    assert len(anneal) == 1, anneal
+    return anneal[0]
+
+
+def _script_check(tmp_path, monkeypatch, version_out, requires):
+    """The CLI-script branch: a script file exists and its faked `--version` runs."""
+    from levain import doctor
+
+    _declared(monkeypatch, requires)
+    script = tmp_path / "bin" / "anneal-memory"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(script))
+    monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, version_out))
+    results = doctor._check_runtime(tmp_path)
+    anneal = [r for r in results if r.name.startswith("anneal-memory")]
+    assert len(anneal) == 1, anneal
+    return anneal[0], script
+
+
+_BRANCHES = pytest.mark.parametrize("branch", ["module", "script"])
+
+
+def _check(branch, tmp_path, monkeypatch, version_out, requires):
+    if branch == "module":
+        return _module_check(tmp_path, monkeypatch, version_out, requires)
+    return _script_check(tmp_path, monkeypatch, version_out, requires)[0]
+
+
+@_BRANCHES
+@pytest.mark.parametrize("version", ["1.0.2", "2.0.0", "2.0", "2.1.0", "2.1", "3.0.0"])
+def test_doctor_fails_a_runnable_anneal_outside_levains_range(tmp_path, monkeypatch, branch, version):
+    r = _check(branch, tmp_path, monkeypatch, f"anneal-memory {version}\n",
+               ["markdown-it-py<5,>=4", _DECLARED, 'mcp>=1.27; extra == "app"'])
+
+    assert r.ok is False and not r.warn
+    assert r.name == ("anneal-memory module" if branch == "module" else "anneal-memory CLI")
+    assert f"anneal-memory {version})" in r.detail and _DECLARED in r.detail
+    assert r.hint == f"{_PIP} install -U {shlex.quote(_DECLARED)}"
+
+
+@_BRANCHES
+@pytest.mark.parametrize("line", ["anneal-memory 2.0.1\n", "anneal-memory v2.0.1\n", "2.0.1\n", "anneal-memory 2.0.9\n"])
+def test_doctor_passes_a_runnable_anneal_inside_levains_range(tmp_path, monkeypatch, branch, line):
+    r = _check(branch, tmp_path, monkeypatch, line, [_DECLARED])
+
+    assert r.ok is True and not r.warn and not r.hint
+    assert "not checked" not in r.detail.lower() and f"({line.strip()})" in r.detail
+
+
+def test_doctor_names_where_the_module_and_the_script_were_judged(tmp_path, monkeypatch):
+    module = _module_check(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
+    (tmp_path / "s").mkdir()
+    script_check, script = _script_check(tmp_path / "s", monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
+
+    assert f"importable via {sys.executable}" in module.detail
+    assert script_check.detail == f"{script} (anneal-memory 2.0.1)"
+
+
+@_BRANCHES
+def test_a_fail_says_which_interpreter_it_was_judged_for(tmp_path, monkeypatch, branch):
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 1.0.2\n", [_DECLARED])
+
+    assert f"Judged for the interpreter doctor runs under ({sys.executable})" in r.detail
+    assert "another venv is not judged" in r.detail
+
+
+@_BRANCHES
+@pytest.mark.parametrize("version", ["2.0.1.post1", "2.0.1+local", "1!2.0.1", "2.0.1rc1", "2.0.2.dev0", "dev", "present"])
+def test_doctor_warns_it_did_not_check_a_version_it_cannot_model(tmp_path, monkeypatch, branch, version):
+    r = _check(branch, tmp_path, monkeypatch, f"anneal-memory {version}\n", [_DECLARED])
+
+    # A warning: ok (never a fail on a possibly good install) but not a green pass.
+    assert r.ok is True and r.warn is True
+    assert "NOT checked" in r.detail and r.hint and _DECLARED in r.hint
+
+
+@_BRANCHES
+@pytest.mark.parametrize("version_out", ["", "anneal-memory 2.0.1 schema 2\n", "anneal-memory 2.0.1 python 3.12\n"])
+def test_doctor_does_not_guess_a_version_out_of_a_longer_line(tmp_path, monkeypatch, branch, version_out):
+    """The version is the one token right after the name, never the last release-looking token."""
+    r = _check(branch, tmp_path, monkeypatch, version_out, [_DECLARED])
+
+    assert r.ok is True and r.warn is True and "NOT checked" in r.detail
+
+
+@_BRANCHES
+@pytest.mark.parametrize("requires", [None, [], ["markdown-it-py>=4"], ["anneal-memory"],
+                                      ["anneal-memory~=2.0"], ["anneal-memory==2.0.*"],
+                                      ['anneal-memory>=3; extra == "dev"'],
+                                      ['anneal-memory>=3; python_version >= "3.10"']])
+def test_doctor_warns_when_the_requirement_cannot_be_judged(tmp_path, monkeypatch, branch, requires):
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 1.0.2\n", requires or [])
+
+    assert r.ok is True and r.warn is True and "NOT checked" in r.detail
+
+
+@_BRANCHES
+def test_an_unmodelled_clause_does_not_hide_an_earlier_definite_failure(tmp_path, monkeypatch, branch):
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 1.0.2\n", ["anneal-memory>=2.0.1,~=2.0"])
+    assert r.ok is False and "anneal-memory>=2.0.1,~=2.0" in r.detail
+
+    # ...and the clause that is not modelled, ahead of the definite one, hides nothing either
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 1.0.2\n", ["anneal-memory~=2.0,>=2.0.1"])
+    assert r.ok is False
+
+
+@_BRANCHES
+def test_an_unmodelled_clause_with_no_failure_is_not_a_pass(tmp_path, monkeypatch, branch):
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 2.0.1\n", ["anneal-memory>=2.0.1,~=2.0"])
+
+    assert r.ok is True and r.warn is True and "NOT checked" in r.detail
+
+
+@_BRANCHES
+@pytest.mark.parametrize("version, ok", [("2.1.0", False), ("2.0.1", False), ("1.5.0", False), ("2.0.5", True)])
+def test_every_anneal_entry_must_hold(tmp_path, monkeypatch, branch, version, ok):
+    """Two entries for the package are ANDed: the second (`<2.1`) is not forgotten behind the first."""
+    r = _check(branch, tmp_path, monkeypatch, f"anneal-memory {version}\n",
+               ["anneal-memory>=2.0.5", "anneal-memory<2.1"])
+
+    assert r.ok is ok
+    if not ok:
+        assert "anneal-memory>=2.0.5,<2.1" in r.detail
+
+
+def _pyproject(tmp_path, dependency):
+    path = tmp_path / "repo" / "pyproject.toml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        f'[project]\nname = "levain"\nversion = "0"\ndependencies = ["{dependency}"]\n', encoding="utf-8"
+    )
+    return path
+
+
+@_BRANCHES
+def test_the_repo_requirement_wins_over_stale_installed_metadata(tmp_path, monkeypatch, branch):
+    """An editable install's dist metadata is not regenerated when pyproject moves: a good 2.0.1
+    must pass on the repo's range, and the hint must never send an operator to the stale one."""
+    from levain import doctor
+
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", _pyproject(tmp_path, "anneal-memory>=2.0.1,<2.1"))
+    monkeypatch.setattr(importlib.metadata, "requires", lambda name: ["anneal-memory<1.1,>=1.0.7"])
+    # _levain_requires is NOT patched here: the real repo-first read runs.
+    if branch == "module":
+        monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(tmp_path / "no-such-script"))
+        monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, "anneal-memory 2.0.1\n"))
+    else:
+        script = tmp_path / "bin" / "anneal-memory"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("", encoding="utf-8")
+        monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(script))
+        monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, "anneal-memory 2.0.1\n"))
+
+    [good] = [r for r in doctor._check_runtime(tmp_path) if r.name.startswith("anneal-memory")]
+    assert good.ok is True and not good.warn and not good.hint
+
+    monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, "anneal-memory 1.0.9\n"))
+    [bad] = [r for r in doctor._check_runtime(tmp_path) if r.name.startswith("anneal-memory")]
+    assert bad.ok is False and "anneal-memory>=2.0.1,<2.1" in bad.hint and "1.0.7" not in bad.hint
+
+
+def test_installed_metadata_is_used_when_there_is_no_source_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", tmp_path / "absent" / "pyproject.toml")
+    monkeypatch.setattr(importlib.metadata, "requires", lambda name: [_DECLARED])
+
+    r = _module_check_unpatched(tmp_path, monkeypatch, "anneal-memory 1.0.2\n")
+
+    assert r.ok is False and _DECLARED in r.detail
+
+
+def _module_check_unpatched(tmp_path, monkeypatch, version_out):
     from levain import doctor
 
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(tmp_path / "no-such-script"))
@@ -241,88 +432,37 @@ def _module_check(tmp_path, monkeypatch, version_out, requires):
         doctor, "_probe",
         lambda cmd, timeout=5.0: (True, version_out) if "anneal_memory" in cmd else (False, ""),
     )
-
-    def fake_requires(name):
-        assert name == "levain"
-        if isinstance(requires, Exception):
-            raise requires
-        return requires
-
-    monkeypatch.setattr(importlib.metadata, "requires", fake_requires)
-    results = doctor._check_runtime(tmp_path)
-    anneal = [r for r in results if r.name.startswith("anneal-memory")]
-    assert len(anneal) == 1, anneal
-    return anneal[0]
+    [r] = [r for r in doctor._check_runtime(tmp_path) if r.name.startswith("anneal-memory")]
+    return r
 
 
-@pytest.mark.parametrize("version", ["1.0.2", "2.1.0"])
-def test_doctor_fails_an_importable_anneal_outside_levains_range(tmp_path, monkeypatch, version):
-    r = _module_check(tmp_path, monkeypatch, f"anneal-memory {version}\n",
-                      ["markdown-it-py<5,>=4", _DECLARED, 'mcp>=1.27; extra == "app"'])
+@_BRANCHES
+def test_the_pip_hint_quotes_an_interpreter_path_with_a_space(tmp_path, monkeypatch, branch):
+    monkeypatch.setattr(sys, "executable", "/opt/my venv/bin/python")
 
-    assert r.name == "anneal-memory module" and r.ok is False
-    assert version in r.detail and _DECLARED in r.detail
-    assert r.hint == f"{sys.executable} -m pip install -U '{_DECLARED}'"
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 1.0.2\n", [_DECLARED])
 
-
-def test_doctor_passes_an_importable_anneal_inside_levains_range(tmp_path, monkeypatch):
-    r = _module_check(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
-
-    assert r.ok is True and "importable via" in r.detail and "(anneal-memory 2.0.1)" in r.detail
-    assert "not checked" not in r.detail and not r.hint
+    assert r.hint == "'/opt/my venv/bin/python' -m pip install -U 'anneal-memory<2.1,>=2.0.1'"
+    assert r.hint.startswith(manifest.pip_invocation())
 
 
-@pytest.mark.parametrize("requires", [None, [], ["markdown-it-py>=4"], RuntimeError("no metadata"),
-                                      ["anneal-memory~=2.0"], ['anneal-memory>=3; extra == "dev"']])
-def test_doctor_does_not_judge_when_the_requirement_is_unreadable(tmp_path, monkeypatch, requires):
-    r = _module_check(tmp_path, monkeypatch, "anneal-memory 1.0.2\n", requires)
-
-    assert r.ok is True and "not checked" in r.detail
-
-
-@pytest.mark.parametrize("out", ["anneal-memory 2.0.1rc1\n", "anneal-memory dev\n", "present\n", ""])
-def test_doctor_does_not_judge_when_the_version_is_unparseable(tmp_path, monkeypatch, out):
-    r = _module_check(tmp_path, monkeypatch, out, [_DECLARED])
-
-    assert r.ok is True and "not checked" in r.detail
-
-
-def _script_check(tmp_path, monkeypatch, version_out, requires):
-    """The CLI-script branch: a script file exists and its faked `--version` runs."""
+@_BRANCHES
+def test_the_not_checked_warning_renders_as_a_warning_not_a_pass(tmp_path, monkeypatch, branch, capsys):
     from levain import doctor
 
-    script = tmp_path / "bin" / "anneal-memory"
-    script.parent.mkdir()
-    script.write_text("", encoding="utf-8")
-    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(script))
-    monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, version_out))
-    monkeypatch.setattr(importlib.metadata, "requires", lambda name: requires)
-    results = doctor._check_runtime(tmp_path)
-    anneal = [r for r in results if r.name.startswith("anneal-memory")]
-    assert len(anneal) == 1, anneal
-    return anneal[0], script
+    r = _check(branch, tmp_path, monkeypatch, "anneal-memory 2.0.1rc1\n", [_DECLARED])
+    doctor._emit(r)
+
+    out = capsys.readouterr().out
+    assert doctor._WARN in out and doctor._OK not in out
+    assert r.hint in out
 
 
-@pytest.mark.parametrize("version", ["1.0.2", "2.1.0"])
-def test_doctor_fails_a_working_anneal_script_outside_levains_range(tmp_path, monkeypatch, version):
-    r, script = _script_check(tmp_path, monkeypatch, f"anneal-memory {version}\n", [_DECLARED])
+def test_a_missing_or_empty_version_is_guarded(tmp_path, monkeypatch):
+    from levain import doctor
 
-    assert r.name == "anneal-memory CLI" and r.ok is False
-    assert str(script) in r.detail and version in r.detail and _DECLARED in r.detail
-    assert r.hint == f"{sys.executable} -m pip install -U '{_DECLARED}'"
-
-
-def test_doctor_passes_a_working_anneal_script_inside_levains_range(tmp_path, monkeypatch):
-    r, script = _script_check(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
-
-    assert r.name == "anneal-memory CLI" and r.ok is True and not r.hint
-    assert r.detail == f"{script} (anneal-memory 2.0.1)"
-
-
-@pytest.mark.parametrize("requires, out", [(None, "anneal-memory 1.0.2\n"),
-                                           ([_DECLARED], "anneal-memory 2.0.1rc1\n")])
-def test_doctor_does_not_judge_the_anneal_script_when_the_range_cannot_be_checked(
-        tmp_path, monkeypatch, requires, out):
-    r, _ = _script_check(tmp_path, monkeypatch, out, requires)
-
-    assert r.name == "anneal-memory CLI" and r.ok is True and "not checked" in r.detail
+    _declared(monkeypatch, [_DECLARED])
+    for version in (None, ""):
+        r = doctor._anneal_version_result("anneal-memory CLI", "/x/anneal-memory", version)
+        assert r.ok is True and r.warn is True and "NOT checked" in r.detail
+    assert doctor._anneal_range_verdict(None)[0] is None

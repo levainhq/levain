@@ -3415,87 +3415,101 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     return results
 
 
-def _anneal_version_result(name: str, where: str, version: str, tail: str = "") -> CheckResult:
+def _anneal_version_result(name: str, where: str, version: str | None, tail: str = "") -> CheckResult:
     """The ONE judgement of a runnable anneal's version, shared by the script and module branches.
 
     In range: ok, the plain "<where> (<version>)" detail. Out of range: not ok, with the declared
-    requirement and a pip hint. Unknown (see `_anneal_range_verdict`): ok, noted as not checked.
+    requirement, the scope it was judged for and a pip hint. Not checked (see
+    `_anneal_range_verdict`): ok WITH `warn`, so the badge is `[WARN]` and the hint prints; it is
+    neither a pass nor a fail, and the run's last line still says "All checks passed." with the
+    "(N warning(s) above.)" count.
     """
-    verdict, requirement = _anneal_range_verdict(version)
+    from levain.manifest import pip_invocation
+
+    version = version or "present"
+
+    verdict, requirement, why = _anneal_range_verdict(version)
     if verdict is False:
         return CheckResult(
             name,
             False,
-            f"{where} ({version}), but levain requires {requirement}{tail}",
-            f"{sys.executable} -m pip install -U '{requirement}'",
+            f"{where} ({version}), but levain requires {requirement}{tail}. Judged for the interpreter "
+            f"doctor runs under ({sys.executable}); a `levain serve` under another venv is not judged here.",
+            f"{pip_invocation()} install -U {shlex.quote(requirement)}",
         )
-    unchecked = (
-        "" if verdict else "; levain's required range was not checked (it could not be read or compared)"
-    )
-    return CheckResult(name, True, f"{where} ({version}){tail}{unchecked}")
+    if verdict is None:
+        fix = f"; or install the declared range: {pip_invocation()} install -U {shlex.quote(requirement)}"
+        return CheckResult(
+            name,
+            True,
+            f"{where} ({version}){tail}; levain's anneal-memory range was NOT checked ({why})",
+            "Compare the version above with levain's anneal-memory requirement by hand" + (fix if requirement else ""),
+            warn=True,
+        )
+    return CheckResult(name, True, f"{where} ({version}){tail}")
 
 
-_SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)$")
+# One comparison clause against a plain release. `~=`, `===` and a wildcard are not modelled.
+_CLAUSE_RE = re.compile(r"(==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)")
+_PLAIN_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+# `anneal-memory 2.0.1` (what `anneal-memory --version` prints) or `anneal-memory v2.0.1`; the
+# WHOLE line must fit, so a line with more after the version is unknown, never a guessed token.
+_VERSION_LINE_RE = re.compile(r"(?:anneal[-_]memory\s+)?[vV]?(\S+)")
 
 
-def _release_tuple(text: str) -> tuple[int, ...] | None:
-    """A plain release (`2.0.1`) as a tuple, else None. A pre/post/dev/local suffix is None."""
-    if not re.fullmatch(r"\d+(?:\.\d+)*", text):
-        return None
-    return tuple(int(part) for part in text.split("."))
+def _anneal_range_verdict(version_line: str | None) -> tuple[bool | None, str, str]:
+    """(True in range | False out of range | None not checked, the requirement, why not checked).
 
-
-def _anneal_requirement() -> str | None:
-    """The anneal-memory requirement levain's own installed metadata declares, as declared.
-
-    None when there is no `levain` distribution (a bare source checkout), no unconditional
-    anneal-memory entry, or the metadata cannot be read. `packaging` is not a levain
-    dependency, so the caller compares release tuples itself.
+    The range is judged with manifest's own machinery (`_levain_requires`: repo pyproject first,
+    installed metadata only when there is no source tree; `_anneal_spec_clauses`; `version_tuple`),
+    so doctor's pip-pin row and this row read ONE source. EVERY anneal-memory entry must hold. A
+    definite failure on a modelled clause wins over a clause that is not modelled; with no
+    failure, any clause, marker entry or version this helper cannot model is None.
     """
-    import importlib.metadata as metadata
+    from levain import manifest
 
     try:
-        declared = metadata.requires("levain") or []
-    except Exception:  # noqa: BLE001 - metadata trouble is an unknown, not a failure
-        return None
-    for entry in declared:
-        if not isinstance(entry, str) or ";" in entry:
-            continue  # an extra/marker entry is not the base requirement
-        if re.split(r"[\s<>=!~(\[]", entry.strip(), maxsplit=1)[0].lower().replace("_", "-") == "anneal-memory":
-            return entry.strip()
-    return None
+        entries = [e for e in manifest._levain_requires() if isinstance(e, str)]
+    except Exception:  # noqa: BLE001 - trouble reading the requirement is an unknown
+        entries = []
+    clauses: list[str] = []
+    conditional = False  # an anneal entry behind a marker we do not evaluate
+    for entry in entries:
+        found = manifest._anneal_spec_clauses(entry)
+        if ";" in entry and found and "extra" not in entry.split(";", 1)[1]:
+            conditional = True
+        if ";" not in entry:
+            clauses.extend(found)
+    requirement = "anneal-memory" + ",".join(clauses) if clauses else ""
 
+    line = (version_line or "").strip().splitlines()[0:1]
+    match = _VERSION_LINE_RE.fullmatch(line[0]) if line else None
+    token = match.group(1) if match else ""
+    have = manifest.version_tuple(token) if _PLAIN_RELEASE_RE.fullmatch(token) else None
 
-def _anneal_range_verdict(version_line: str) -> tuple[bool | None, str]:
-    """(True in range | False out of range | None unknown, the requirement as declared).
-
-    An unknown is never a pass or a fail: no requirement, a specifier this helper does not
-    model (`~=`, `===`, a wildcard), or a version that is not a plain release.
-    """
-    requirement = _anneal_requirement()
-    if requirement is None:
-        return None, ""
-    tokens = version_line.split()
-    installed = next((t for t in reversed(tokens) if _release_tuple(t.lstrip("vV"))), None)
-    have = _release_tuple(installed.lstrip("vV")) if installed else None
-    spec_text = re.sub(r"^[A-Za-z0-9_.-]+\s*", "", requirement).strip().strip("()")
-    if have is None or not spec_text:
-        return None, requirement
-    verdict = True
-    for clause in spec_text.split(","):
-        match = _SPEC_RE.match(clause.strip())
-        want = _release_tuple(match.group(2)) if match else None
-        if match is None or want is None or match.group(1) in ("===", "~="):
-            return None, requirement
+    failed = False
+    unmodelled = conditional
+    for clause in clauses:
+        parsed = _CLAUSE_RE.fullmatch(clause)
+        if parsed is None or not _PLAIN_RELEASE_RE.fullmatch(parsed.group(2)):
+            unmodelled = True
+            continue
+        if have is None:
+            continue
+        want = manifest.version_tuple(parsed.group(2))
         width = max(len(have), len(want))
-        a = have + (0,) * (width - len(have))
-        b = want + (0,) * (width - len(want))
-        op = match.group(1)
-        holds = {
-            ">=": a >= b, ">": a > b, "<=": a <= b, "<": a < b, "==": a == b, "!=": a != b,
-        }[op]
-        verdict = verdict and holds
-    return verdict, requirement
+        a, b = have + (0,) * (width - len(have)), want + (0,) * (width - len(want))
+        holds = {">=": a >= b, ">": a > b, "<=": a <= b, "<": a < b, "==": a == b, "!=": a != b}[parsed.group(1)]
+        failed = failed or not holds
+    if failed:
+        return False, requirement, ""
+    if not clauses:
+        return None, requirement, "levain's anneal-memory requirement could not be read"
+    if have is None:
+        return None, requirement, "the installed version is not a plain release, e.g. a pre, post, local or epoch form"
+    if unmodelled:
+        return None, requirement, "part of the requirement uses a form this check does not model"
+    return True, requirement, ""
 
 
 def _anneal_invocation(*args: str) -> str:
