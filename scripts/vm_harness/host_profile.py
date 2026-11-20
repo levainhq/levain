@@ -46,8 +46,10 @@ class HostProfile:
         return ("sudo", "-n", self.python, "-I", f"{self.tools_dir}/guest_ops.py")
 
     def dispatch_argv(self) -> tuple[str, ...]:
-        """The dispatch-user guest_dispatch invocation prefix."""
-        return ("sudo", "-n", "-u", self.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={self.store}/dispatch",
+        """The dispatch-user guest_dispatch invocation prefix. ``env -C`` sets the working directory to the dispatch dir: sudo
+        keeps the caller's cwd, which the dispatch account cannot read on a fresh image (the admin home is 0700), so
+        ``os.getcwd()`` raised PermissionError (levain#133 leg 6)."""
+        return ("sudo", "-n", "-u", self.dispatch_user, "/usr/bin/env", "-C", f"{self.store}/dispatch", "PATH=/usr/bin:/bin", f"HOME={self.store}/dispatch",
                 self.python, "-I", f"{self.tools_dir}/guest_dispatch.py")
 
     def ps_argv(self) -> list[str]:

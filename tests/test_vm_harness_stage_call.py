@@ -59,6 +59,8 @@ def test_run_pins_cwd_to_root_and_the_dispatch_argv_sets_home(tmp_path, monkeypa
     a = _args(tmp_path)
     for argv in (SC.as_dispatch(a, ["x"]), SC.as_dispatch_script(a, [])):
         assert f"HOME={a.dispatch_dir}" in argv      # the recorded failure: ~/.levain/consent/... unreadable under admin's HOME
+        i = argv.index("/usr/bin/env")
+        assert argv[i + 1:i + 3] == ["-C", a.dispatch_dir]   # the recorded failure: getcwd() PermissionError under admin's 0700 home
 
 
 # ---- J: provider_policy read: [] refused every contract ----------------------------------------------------------------------

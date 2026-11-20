@@ -307,11 +307,13 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
 
     def dispatch_argv(verb: Sequence[str]) -> tuple[str, ...]:
         """A levain verb as the STOPGAP runs it (np-667d731c (b)): as the dispatch account, against ``L/dispatch``, verified
-        against the run server's authority replica. ``file``, ``sign`` and ``authorise`` also name the data root."""
+        against the run server's authority replica. ``file``, ``sign`` and ``authorise`` also name the data root. ``env -C`` sets the
+        cwd to the dispatch dir: sudo keeps the caller's cwd (the admin home, 0700 on a fresh image), which the dispatch account
+        cannot read, so ``os.getcwd()`` raised PermissionError."""
         extra = ("--dispatch-dir", dispatch_dir(cfg))
         if verb[:2] in (("dispatch", "file"), ("dispatch", "sign"), ("dispatch", "authorise")):
             extra += ("--data-root", authority_root(cfg))
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", f"HOME={dispatch_dir(cfg)}", *levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "-C", dispatch_dir(cfg), f"HOME={dispatch_dir(cfg)}",*levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
 
     def operator(*verb: str, stdin: str | None = None, timeout: float = 300) -> tuple[str, int]:
         """A levain verb as the stopgap runs it: (merged output, exit code). A refusal (exit 2) is data, not an error."""
@@ -358,7 +360,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
             sleep(cfg.poll_s)
 
     def dispatch_user_argv() -> tuple[str, ...]:
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={dispatch_dir(cfg)}", cfg.profile.python, "-I", "-")
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "-C", dispatch_dir(cfg), "PATH=/usr/bin:/bin", f"HOME={dispatch_dir(cfg)}", cfg.profile.python, "-I", "-")
 
     def tickets(job: str) -> list[dict]:
         sock = f"{cfg.profile.run_dir}/control/control.sock"
