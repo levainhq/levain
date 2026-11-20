@@ -805,6 +805,9 @@ WORKER_LIVE_FACTOR = 3          # a heartbeat no older than this many cadences i
 WORKER_DOWN_AFTER_S = 30.0      # a heartbeat older than this (or none at all) is a worker that is down; between, stale
 STALE_CADENCE_FACTOR = 2        # a row older than this many of its panel's cadences is stale though the worker lives
 ATTACHED_SNAP_CACHE_MAX = 256   # decoded snapshots kept, one per (panel, generation)
+# how long a read of a panel a write touched waits for the row that answers the write (D7), counted from the start of the read
+# (a manifest takes one bound for all its panels); then it serves the older row, marked stale and pending
+WRITE_WAIT_S = 2.0
 # the head layer's caches (attached mode): composed panel heads are small and many (one per panel and request class); whole
 # panel payloads carry rows, so fewer are kept
 HEAD_CACHE_MAX = 256
@@ -854,12 +857,17 @@ class _ChangeProbe:
         self._cockpit = cockpit
 
     def change_seq(self) -> int:
-        # the publish counter: a heartbeat is no panel change, so the file's own change token (which a heartbeat moves) is not used
+        # the store's publish counter, which moves when a panel's body or status did, plus the count of publishes the host
+        # told the cockpit of (``note_publish``): a row that lands with the body it had still flips a panel from stale and
+        # pending to current, and moves only the second. A heartbeat is no panel change, so the file's own change token
+        # (which a heartbeat moves) is not used. Both only grow
         meta = self._cockpit._reader.meta()
         try:
-            return int(meta.get("publish_seq", 0))
+            seq = int(meta.get("publish_seq", 0))
         except (TypeError, ValueError):
-            return 0
+            seq = 0
+        with self._cockpit._pub_cv:
+            return seq + self._cockpit._pub_ticket
 
     def snapshot(self) -> "tuple[dict[str, str], str]":
         return self._cockpit._probe_snapshot()
@@ -929,6 +937,23 @@ class Cockpit:
         self._host_pending: Callable[[str], bool] | None = None
         self._host_dirty: Callable[[Iterable[str], int], None] | None = None
         self._host_state: Callable[[], Mapping[str, Any]] | None = None
+        # D7 (attached mode only), all under ``_rc_lock``: the serve's write generation, which only grows; per panel, the
+        # generation its row must be stamped with at least and the instant of the write that asked for it; per panel, the
+        # latest generation whose ``dirty`` call raised (``_unsent_for``); how many raised and the last one; per panel, the generation a read has waited out the
+        # bound for (it is not waited for again); how many reads blocked for a row and how many of those gave up
+        self._write_gen = 0
+        self._write_stamps_unknown = False      # attached over a store whose stamps could not be read: no stamp answers a write
+        self._write_required: dict[str, tuple[int, float]] = {}
+        self._write_unsent: dict[str, int] = {}
+        self.host_dirty_errors = 0
+        self.last_host_dirty_error: BaseException | None = None
+        self._write_lapsed: dict[str, int] = {}
+        self._write_waits = 0
+        self._write_wait_timeouts = 0
+        # what a blocked read sleeps on: ``_pub_ticket`` moves, and the condition is notified, whenever the host says it
+        # published (``note_publish``). Its lock guards the ticket and nothing else
+        self._pub_cv = threading.Condition(threading.Lock())
+        self._pub_ticket = 0
         self._heartbeat_cadence_s: float | None = None      # how often the attached host beats, when it is not the default
         self._serve_composed: frozenset[str] = SERVE_COMPOSED_IDS
         # what the host cycle last read for the manifest: the entity (with its faults) and the discovery faults. Each is one
@@ -1219,6 +1244,10 @@ class Cockpit:
             del self._replay_cache[k]
         self._specs = specs
         self._state = states
+        with self._rc_lock:      # a panel that is registered again starts with no write asked of it
+            self._write_required.pop(sid, None)
+            self._write_unsent.pop(sid, None)
+            self._write_lapsed.pop(sid, None)
 
     def _is_composed(self, panel_id: str, specs_map: dict[str, ProviderSpec] | None = None) -> bool:
         spec = (specs_map if specs_map is not None else self._specs).get(panel_id)
@@ -1489,11 +1518,19 @@ class Cockpit:
         ``start()``: an attached cockpit starts no refresher threads, and one already running keeps running.
 
         ``deriving()`` and ``pending(panel_id)`` are the host's busy accessors; ``dirty(panel_ids, write_gen)`` is the
-        host's write hook, kept for the write path and not called here; ``host_state()`` answers ``{"worker": "live" |
+        host's write hook, called by ``invalidate_reads`` for the panels a write touched; ``host_state()`` answers ``{"worker": "live" |
         "stale" | "down", "heartbeat_age_s": float | None}`` for a host that knows its own health better than the
         file's heartbeat does. ``heartbeat_cadence_s`` is how often the host beats when that is not the default
         (``HEARTBEAT_CADENCE_S``): the file's heartbeat is read as live within ``WORKER_LIVE_FACTOR`` of those. All
         optional. Once only: a second reader is refused (the same reader again is a no-op)."""
+        # the rows may be stamped by an earlier life of this serve, whose generations this one's would otherwise start below,
+        # and a row stamped with one of those would pass for the answer to a write it never saw: start above them. The read
+        # is made, and the generation seeded, before the reader and the host's hook are visible to a write
+        stamps_known = True
+        try:
+            held = max((r.write_gen for r in reader.read_manifest()[1].values()), default=0)
+        except Exception:  # noqa: BLE001 - a store that cannot be read says nothing of the stamps it holds
+            held, stamps_known = 0, False
         with self._lock:
             if self._reader is not None:
                 if self._reader is reader:
@@ -1506,6 +1543,9 @@ class Cockpit:
                         or not math.isfinite(heartbeat_cadence_s) or heartbeat_cadence_s <= 0):
                     raise ValueError("a heartbeat cadence is a finite positive number of seconds")
                 cadence = float(heartbeat_cadence_s)
+            with self._rc_lock:
+                self._write_gen = max(self._write_gen, held)
+                self._write_stamps_unknown = not stamps_known
             self._host_deriving, self._host_pending = deriving, pending
             self._host_dirty, self._host_state = dirty, host_state
             if cadence is not None:
@@ -1677,6 +1717,11 @@ class Cockpit:
         if row is None:
             return self._attached_error(spec, NOT_DERIVED_YET, None, _Fresh(None, None, True, pending), hint=True)
         fresh = self._fresh_of(spec, row, meta, _epoch(ctx.now))
+        owed, unsent = self._write_owed(spec.id, row)
+        if owed:
+            # a write asked for a row this one is not: it is the older row, and says so. A derive is owed for it, unless the
+            # host was never told of the write
+            fresh = dataclasses.replace(fresh, stale=True, pending=fresh.pending or not unsent)
         as_of = fresh.derived_at
         if row.status in ("error", "timeout"):
             return self._attached_error(spec, row.error or ("the derive timed out" if row.status == "timeout"
@@ -2630,7 +2675,10 @@ class Cockpit:
         """Every listed panel's head in one pass over ONE read of the store (``read_manifest``: the meta and every row in
         one transaction), and that read's meta. A panel that is not serve-composed is composed from its row with no further
         read of the store; a serve-composed one reads its own stores under the request, in the manifest pool, as a bare
-        cockpit reads every panel, and is told it is fresh (it is read now)."""
+        cockpit reads every panel, and is told it is fresh (it is read now).
+
+        It does not wait for a write's row: ``_manifest_compute`` does, before it takes the request's clock. A panel a write
+        asked a row of that this read's row is not is stale and pending (``_write_owed``)."""
         try:
             stored: Any = self._reader.read_manifest()
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
@@ -2857,13 +2905,21 @@ class Cockpit:
         once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it).
 
         No argument: every cached read and every in-flight one is stale from here. A read started before this call is
-        never stored for, nor joined by, a request arriving after it (the generation is part of the key).
+        never stored for, nor joined by, a request arriving after it (the generation is part of the key). An attached
+        cockpit tells its host nothing of a write that named no panels and holds no read for it: it reaches the panels by
+        their stores' own change detection, as every write did before the write generation.
 
         ``panel_ids`` (a write that knows what it changed): only those panels' entries go cold, with the same rule per
         panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
         A read is scoped by its key: a panel read by its panel id, everything else (the manifest) by one shared scope that
         every keyed write advances. A refresher panel named here is refreshed once on a background thread, never on the
         caller's; ``refresh=False`` skips that.
+
+        ``refresh`` also says, for an attached cockpit, whether the call is a write's own or its repeat. The server passes
+        ``refresh=True`` on its first call for a write it admitted, made after the write committed, and ``refresh=False`` on
+        the second: a named call with ``refresh=True`` takes a write generation, asks the host to derive the panels and
+        makes their reads wait for that row; one with ``refresh=False`` does everything else above and none of that, so a
+        write told once is told once.
 
         Either way the named panels' write epoch advances: a provider read begun before this call is never joined by a
         reader arriving after it (``_single_flight`` waits it out and reads afresh), so what the older read saw cannot
@@ -2894,6 +2950,133 @@ class Cockpit:
         if refresh:
             for pid in ids:
                 self._refresh_in_background(pid)
+            self._note_write(ids)
+
+    def _note_write(self, panel_ids: "list[str]") -> None:
+        """D7, attached mode only (a bare cockpit returns at once: it has no host to tell). Every call advances the write
+        generation, and the ids named that are registered and served from a row are told to the host with it, outside every
+        lock of this cockpit; each such panel's row is from then on
+        required to answer the write (``_write_owed``, ``_await_writes``). A host whose hook raises does not fail the
+        write: the failure is counted and kept (``host_dirty_errors``, ``last_host_dirty_error``) and those panels are
+        remembered as unsent until a later call reaches the host."""
+        if self._reader is None:
+            return
+        specs = self._specs
+        ids = [pid for pid in panel_ids if pid in specs and not self.serve_composed(pid)]
+        dirty = self._host_dirty
+        with self._rc_lock:
+            self._write_gen += 1
+            write_gen = self._write_gen
+            at = _epoch(self._clock())       # with the generation, so a later generation never carries an earlier instant
+            if dirty is not None:      # with no host to tell, no row will ever answer the write, so none is asked for
+                for pid in ids:
+                    self._write_required[pid] = (write_gen, at)
+        if dirty is None or not ids:
+            return
+        try:
+            dirty(tuple(ids), write_gen)
+        except Exception as exc:  # noqa: BLE001 - a host that cannot be told is no fault of the write that is being answered
+            with self._rc_lock:
+                for pid in ids:
+                    self._write_unsent[pid] = max(self._write_unsent.get(pid, 0), write_gen)
+                self.host_dirty_errors += 1
+                self.last_host_dirty_error = exc
+            self._wake_waiters()      # a read already blocked for this write's row is not going to get it
+        else:
+            with self._rc_lock:
+                for pid in ids:
+                    if self._write_unsent.get(pid, 0) <= write_gen:
+                        self._write_unsent.pop(pid, None)
+
+    def note_publish(self, panel_id: str, gen: int, write_gen: int) -> None:
+        """The host's word that it published a row (the shape of a derive loop's ``on_publish``): wakes every read blocked
+        for a row. The arguments are not trusted to say whether the row answers a write: a woken read looks at the row."""
+        self._wake_waiters()
+
+    def _wake_waiters(self) -> None:
+        with self._pub_cv:
+            self._pub_ticket += 1
+            self._pub_cv.notify_all()
+
+    def write_wait_counts(self) -> dict[str, int]:
+        """How many reads of a panel a write touched had to block for its row (``waits``), and how many of those gave up at
+        the bound (``timeouts``) and served the older row."""
+        with self._rc_lock:
+            return {"waits": self._write_waits, "timeouts": self._write_wait_timeouts}
+
+    def _answers_write(self, row: Any, req: "tuple[int, float]") -> bool:
+        """Whether ``row`` (None: no row) answers the write ``req`` = ``(generation, instant)`` stands for: it is stamped with
+        the write's generation, or a derive began after the write (the write had committed before the instant was taken, so
+        that derive read the post-write state whether or not the host was ever told of the write). Over a store whose stamps
+        could not be read at attach, the stamps are not trusted and only the second counts."""
+        if row is None:
+            return False
+        return row.started_at > req[1] or (row.write_gen >= req[0] and not self._write_stamps_unknown)
+
+    def _unsent_for(self, panel_id: str, req: "tuple[int, float]") -> bool:
+        """Whether the host was never told of the write ``req`` stands for: the last call that failed for this panel carried
+        that write's generation or a later one, and no call that carried a generation at least as late has gone through
+        since. Called under ``_rc_lock``."""
+        return self._write_unsent.get(panel_id, 0) >= req[0]
+
+    def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
+        """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and
+        whether the host was never told of it. The answer depends on the row handed in and the panel's requirement alone:
+        a reader holding an older row is told it is owed whoever has looked at a newer one."""
+        with self._rc_lock:
+            req = self._write_required.get(panel_id)
+            if req is None or self._answers_write(row, req):
+                return False, False
+            return True, self._unsent_for(panel_id, req)
+
+    def _await_writes(self, panel_ids: list[str]) -> None:
+        """Block, bounded by ``WRITE_WAIT_S`` from here (ONE bound for every panel named), until each of these panels has a
+        row that answers the write that touched it (``_answers_write``). It returns early for a panel the host was never told of, one whose bound
+        a read already ran out for this write, and a worker that is down; it holds no lock of this cockpit while it waits,
+        and sleeps on the host's publish notice (``note_publish``), never on a timer it polls. A read that gives up leaves
+        the panel's row as it is: the head says so (``_write_owed``)."""
+        with self._rc_lock:
+            owed = {pid: req for pid in panel_ids
+                    if (req := self._write_required.get(pid)) is not None and not self._unsent_for(pid, req)
+                    and self._write_lapsed.get(pid, 0) < req[0]}
+        if not owed:
+            return
+        try:
+            meta = self._reader.meta()
+        except Exception:  # noqa: BLE001 - a store that cannot be read is an answer the read itself gives
+            return
+        if self._worker_health(meta, _epoch(self._clock()))[0] == "down":
+            return
+        deadline = time.monotonic() + WRITE_WAIT_S
+        blocked = False
+        while True:
+            with self._pub_cv:
+                ticket = self._pub_ticket          # taken before the rows are looked at: a publish after it is not missed
+            behind: dict[str, tuple[int, float]] = {}
+            for pid, req in owed.items():
+                try:
+                    row = self._reader.read(pid)
+                except Exception:  # noqa: BLE001
+                    return
+                if not self._answers_write(row, req):
+                    behind[pid] = req
+            with self._rc_lock:      # a host that failed to be told of the write while this read waited answers no one
+                behind = {pid: req for pid, req in behind.items() if not self._unsent_for(pid, req)}
+            if not behind:
+                return
+            left = deadline - time.monotonic()
+            with self._rc_lock:
+                if not blocked:
+                    blocked = True
+                    self._write_waits += 1
+                if left <= 0:
+                    self._write_wait_timeouts += 1
+                    for pid, req in behind.items():
+                        self._write_lapsed[pid] = max(self._write_lapsed.get(pid, 0), req[0])
+                    return
+            owed = behind
+            with self._pub_cv:
+                self._pub_cv.wait_for(lambda: self._pub_ticket != ticket, timeout=left)
 
     def _drop_scopes(self, scopes: list) -> None:
         """Advance these read scopes' generation and delete their entries, in-flight ones included."""
@@ -3011,8 +3194,10 @@ class Cockpit:
         is shared: read-only for every caller.
 
         Attached: no read cache, no ``_obs_gen``: the manifest is composed from the heads the head layer keeps (one read
-        of the store per call), so there is no provider read to share or to order after. ``read_after`` reaches only the
-        serve-composed panels, whose reads are the bare ones."""
+        of the store per call, after the wait for the rows of the panels a write touched, which reads the store again
+        while it waits), so there is no provider read to share or to order after. ``read_after`` reaches only the
+        serve-composed panels, whose reads are the bare ones, and it also turns that wait off: a read that must see its
+        own writes passes none."""
         if self._reader is not None:
             return self._manifest_compute(credential, install_class=install_class, transport=transport,
                                           read_after=read_after)
@@ -3042,6 +3227,10 @@ class Cockpit:
         """``transport`` is the serving transport's write capability (``writable``,
         ``write_token_required``), which only the server knows; it is published when given. ``read_after``: see
         :meth:`manifest`."""
+        if self._reader is not None and read_after is None:
+            # one bound for every panel; ``read_after`` marks an observation (the change stream's): it waits for nothing and
+            # sees a panel a write asked a row of as stale and pending until the row lands. The clock is taken after the wait
+            self._await_writes([sid for sid in self._specs if not self.serve_composed(sid)])
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         if self._reader is not None:
@@ -3232,6 +3421,8 @@ class Cockpit:
                 raise QueryError("at is a read of the whole panel: it takes no q, row or limit")
             return self._panel_at(panel_id, at, profile=profile, credential_class=credential_class)
         q, limit = check_query(q, limit)
+        if self._reader is not None and not self.serve_composed(panel_id):
+            self._await_writes([panel_id])       # before the request's clock is taken
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs

@@ -1555,6 +1555,10 @@ class Broker:
                                "verb": read_recorded_verb(view.record.get("verb")), "tier": view.record.get("tier"),
                                "intent": view.record.get("intent"), "decision_kind": view.decision_kind,
                                "replay": replay}
+        target = view.record.get("target")
+        panel = target.get("panel_id") if isinstance(target, dict) else None
+        if isinstance(panel, str) and panel:
+            out["panel_id"] = panel          # the panel the verb was fired on
         if view.decision_kind is not None:
             out["label"] = label_class(view.decision_kind, self.install_class)
         if state == "WAITING":
