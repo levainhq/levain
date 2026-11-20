@@ -937,6 +937,7 @@ class Cockpit:
         # last ``dirty`` call raised; how many raised and the last one; per panel, the generation a read has waited out the
         # bound for (it is not waited for again); how many reads blocked for a row and how many of those gave up
         self._write_gen = 0
+        self._write_stamps_unknown = False      # attached over a store whose stamps could not be read: no stamp answers a write
         self._write_required: dict[str, tuple[int, float]] = {}
         self._write_unsent: set[str] = set()
         self.host_dirty_errors = 0
@@ -1517,6 +1518,14 @@ class Cockpit:
         file's heartbeat does. ``heartbeat_cadence_s`` is how often the host beats when that is not the default
         (``HEARTBEAT_CADENCE_S``): the file's heartbeat is read as live within ``WORKER_LIVE_FACTOR`` of those. All
         optional. Once only: a second reader is refused (the same reader again is a no-op)."""
+        # the rows may be stamped by an earlier life of this serve, whose generations this one's would otherwise start below,
+        # and a row stamped with one of those would pass for the answer to a write it never saw: start above them. The read
+        # is made, and the generation seeded, before the reader and the host's hook are visible to a write
+        stamps_known = True
+        try:
+            held = max((r.write_gen for r in reader.read_manifest()[1].values()), default=0)
+        except Exception:  # noqa: BLE001 - a store that cannot be read says nothing of the stamps it holds
+            held, stamps_known = 0, False
         with self._lock:
             if self._reader is not None:
                 if self._reader is reader:
@@ -1529,19 +1538,14 @@ class Cockpit:
                         or not math.isfinite(heartbeat_cadence_s) or heartbeat_cadence_s <= 0):
                     raise ValueError("a heartbeat cadence is a finite positive number of seconds")
                 cadence = float(heartbeat_cadence_s)
+            with self._rc_lock:
+                self._write_gen = max(self._write_gen, held)
+                self._write_stamps_unknown = not stamps_known
             self._host_deriving, self._host_pending = deriving, pending
             self._host_dirty, self._host_state = dirty, host_state
             if cadence is not None:
                 self._heartbeat_cadence_s = cadence
             self._reader = reader
-        # the rows may be stamped by an earlier life of this serve, whose generations this one's would otherwise start below,
-        # and a row stamped with one of those would pass for the answer to a write it never saw: start above them
-        try:
-            held = max((r.write_gen for r in reader.read_manifest()[1].values()), default=0)
-        except Exception:  # noqa: BLE001 - a store that cannot be read yet has no stamps to start above
-            held = 0
-        with self._rc_lock:
-            self._write_gen = max(self._write_gen, held)
 
     @property
     def attached(self) -> bool:
@@ -2991,12 +2995,14 @@ class Cockpit:
         with self._rc_lock:
             return {"waits": self._write_waits, "timeouts": self._write_wait_timeouts}
 
-    @staticmethod
-    def _answers_write(row: Any, req: "tuple[int, float]") -> bool:
+    def _answers_write(self, row: Any, req: "tuple[int, float]") -> bool:
         """Whether ``row`` (None: no row) answers the write ``req`` = ``(generation, instant)`` stands for: it is stamped with
-        the write's generation, or a derive began after the write (it committed before the instant was taken, so that derive
-        read the post-write state whether or not the host was ever told of the write)."""
-        return row is not None and (row.write_gen >= req[0] or row.started_at > req[1])
+        the write's generation, or a derive began after the write (the write had committed before the instant was taken, so
+        that derive read the post-write state whether or not the host was ever told of the write). Over a store whose stamps
+        could not be read at attach, the stamps are not trusted and only the second counts."""
+        if row is None:
+            return False
+        return row.started_at > req[1] or (row.write_gen >= req[0] and not self._write_stamps_unknown)
 
     def _write_owed(self, panel_id: str, row: Any) -> "tuple[bool, bool]":
         """``(owed, unsent)``: whether a write has asked for a row of this panel that ``row`` (None: no row) is not yet, and

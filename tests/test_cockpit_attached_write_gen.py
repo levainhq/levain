@@ -641,3 +641,82 @@ def test_a_panel_retired_and_registered_again_owes_nothing_for_a_write_that_name
     out = rig.ck.panel("alpha")
     assert time.monotonic() - t0 < 1.0 and out["stale"] is False and out["pending"] is False
     assert rig.ck.write_wait_counts() == {"waits": 0, "timeouts": 0}
+
+
+# --- attaching over rows an earlier life stamped ----------------------------------------------------------------------------
+class AttachProbeReader:
+    """The rig's reader, with a hook run inside the first ``read_manifest`` (the read an attach makes for the stamps)."""
+
+    def __init__(self, inner: Any, during_first_read: Any) -> None:
+        self._inner = inner
+        self._hook = during_first_read
+        self.reads = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def read_manifest(self) -> Any:
+        self.reads += 1
+        if self.reads == 1:
+            self._hook()
+        return self._inner.read_manifest()
+
+
+def earlier_life(tmp_path: Path) -> tuple[Rig, Cockpit, list[Any]]:
+    """Rows stamped 50 by an earlier life of the serve, and a fresh cockpit that has not attached to them yet."""
+    r = Rig(tmp_path, attach=False)
+    r.derive()
+    r.loop.dirty(("alpha",), 50)
+    r.loop.run_once(r.clock.epoch())
+    assert r.reader.read("alpha").write_gen == 50
+    ck = Cockpit(clock=r.clock)
+    ck.register(list_spec("alpha", r.rec))
+    return r, ck, []
+
+
+def test_a_write_made_while_the_stamps_are_being_read_at_attach_is_no_attached_write(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    r, ck, told = earlier_life(tmp_path)
+    try:
+        wrapped = AttachProbeReader(r.reader, lambda: ck.invalidate_reads(["alpha"]))
+        ck.attach_snapshots(wrapped, dirty=lambda ids, w: told.append((tuple(ids), w)), host_state=lambda: LIVE)
+        assert told == []                                       # nothing was told under a generation an old stamp passes
+        ck.invalidate_reads(["alpha"])
+        assert told == [(("alpha",), 51)]
+        out = ck.panel("alpha")
+        assert out["stale"] is True and out["pending"] is True
+    finally:
+        r.close()
+
+
+class FailingFirstRead(AttachProbeReader):
+    def __init__(self, inner: Any) -> None:
+        super().__init__(inner, self._fail)
+
+    @staticmethod
+    def _fail() -> None:
+        raise RuntimeError("the store cannot be read yet")
+
+    def read_manifest(self) -> Any:
+        self.reads += 1
+        if self.reads == 1:
+            self._fail()
+        return self._inner.read_manifest()
+
+
+def test_a_store_that_cannot_be_read_at_attach_leaves_an_earlier_lifes_stamps_no_answer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.2)
+    r, ck, told = earlier_life(tmp_path)
+    try:
+        ck.attach_snapshots(FailingFirstRead(r.reader), dirty=lambda ids, w: told.append((tuple(ids), w)),
+                            host_state=lambda: LIVE)
+        ck.invalidate_reads(["alpha"])
+        assert told == [(("alpha",), 1)]
+        out = ck.panel("alpha")                                  # the row is stamped 50: a stamp this life's generations pass
+        assert out["stale"] is True and out["pending"] is True
+        r.clock.advance(31)                                      # a derive that began after the write is the answer
+        r.loop.run_once(r.clock.epoch())
+        out = ck.panel("alpha")
+        assert out["stale"] is False and out["pending"] is False
+    finally:
+        r.close()
