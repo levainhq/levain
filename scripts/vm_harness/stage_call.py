@@ -397,8 +397,10 @@ def mode_stage(a) -> int:
     except Exception as e:                                                   # noqa: BLE001
         die("key", f"{type(e).__name__}: {e}")
     bodies = build_bodies(a)
-    if a.sudo_askpass and not a.dry_submit and not os.access(a.sudo_askpass, os.X_OK):
-        die("sudo-askpass", f"--sudo-askpass {a.sudo_askpass} is not an executable file on this guest (the host stages it before this call)")
+    if a.sudo_askpass:
+        a.sudo_askpass = os.path.abspath(a.sudo_askpass)      # sudo runs from cwd "/": a relative path would not resolve there
+        if not a.dry_submit and not (os.path.isfile(a.sudo_askpass) and os.access(a.sudo_askpass, os.X_OK)):
+            die("sudo-askpass", f"--sudo-askpass {a.sudo_askpass} is not an executable file on this guest (the host stages it before this call)")
     if a.dry_submit:
         # HOST TEST ONLY: `levain dispatch config` refuses any process with a claude/codex ancestor (cli._refuse_an_agent), so the
         # store steps run through the same product API the CLI calls (ControlStore.init / .accept, item_bytes, ssh_signer)
@@ -417,7 +419,7 @@ def mode_stage(a) -> int:
         req = canonical_bytes({"format": dcli.ROUTES_TRUST_REQUEST, "store_id": init["store_id"], "fingerprint": fp, "public_key": pub})
         helper = routes_trust_via_askpass(a.sudo_askpass) if a.sudo_askpass else dcli.ROUTES_TRUST_HELPER
         prc, pout, perr = helper(req)
-        ans = json_in(pout)
+        ans = json_in(pout) if pout.strip() else None         # a refused sudo (wrong password) answers nothing on stdout
         if not (isinstance(ans, dict) and ans.get("ok") is True):
             die("routes-trust", f"rc={prc} {(pout + perr).strip()[-300:]}")
         print("routes-trust pinned")

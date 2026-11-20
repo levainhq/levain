@@ -34,7 +34,10 @@ def test_staging_sends_the_password_on_stdin_only_and_makes_the_file_private():
     SA.stage(lambda argv, text, timeout=60: calls.append((list(argv), text)) or "", DARWIN, PATH)
     (argv, text), = calls
     assert text == SA.askpass_text(DARWIN.ssh_password) and DARWIN.ssh_password not in argv
-    assert PATH in argv and "umask 077" in argv[argv.index("-c") + 1] and "chmod 700" in argv[argv.index("-c") + 1]
+    script = argv[argv.index("-c") + 1]
+    assert PATH in argv and "umask 077" in script and "chmod 700" in script
+    # an existing inode or symlink is never written through: removed first, then noclobber refuses a path that reappeared
+    assert script.index('rm -f -- "$1"') < script.index("set -C") < script.index("umask 077") < script.index("cat >")
     assert "sudo" not in argv          # the file is the operator's own, so sudo -A run by the operator can exec it
 
 
@@ -177,3 +180,126 @@ def test_wave3_stages_the_askpass_before_the_stage_call_names_it_and_removes_it(
 def test_wave3_without_the_flag_runs_as_before(tmp_path):
     w, _ev, (status, _s, _p) = T.go(tmp_path)
     assert status == "PASS" and not any(PATH in " ".join(a) for a in w.argvs)
+
+
+# ---- round 1 fixes -----------------------------------------------------------------------------------------------------
+
+def test_staging_does_not_write_through_a_preexisting_file_or_symlink(tmp_path):
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    link = tmp_path / "ask.sh"
+    link.symlink_to(target)
+    done = subprocess.run(list(SA.stage_argv(str(link))), input="secret\n", capture_output=True, text=True)
+    assert done.returncode == 0 and target.read_text() == "keep"
+    assert not link.is_symlink() and link.read_text() == "secret\n" and (link.stat().st_mode & 0o777) == 0o700
+
+
+def _askpass_world(order, *, stage_call_raises=False):
+    """A World whose askpass stage/removal and stage call are logged in ``order`` (everything else is the World's)."""
+    w = T.World()
+    og, os_ = w.guest, w.stdin_run
+
+    def guest(argv, timeout=60):
+        if list(argv[4:6]) == ["stage", "it"]:
+            order.append("stage-call")
+            if stage_call_raises:
+                raise OSError("ssh dropped")
+            return "staged gen=4\n" + f"{T.RB.RC_MARK} 0\n"
+        order.append("guest")
+        return og(argv, timeout)
+
+    def stdin_run(argv, text, timeout=60):
+        if PATH in argv and "umask 077" in " ".join(argv):
+            order.append("askpass-staged")
+            return ""
+        if list(argv) == ["/bin/rm", "-f", PATH]:
+            order.append("askpass-removed")
+            return ""
+        return os_(argv, text, timeout)
+
+    w.guest, w.stdin_run = guest, stdin_run
+    return w
+
+
+def test_a_bad_askpass_path_fails_before_any_key_install(tmp_path):
+    w = T.World()
+    _w, _ev, (status, _steps, path) = T.go(tmp_path, w, sudo_askpass="/tmp/bad path")
+    assert status != "PASS" and path.exists()
+    assert w.files == {} and not any(a[:4] == ["sudo", "-n", "/bin/sh", "-c"] and a[4] == T.T3.INSTALL_SCRIPT for a in w.argvs)
+
+
+def test_the_helper_is_removed_right_after_the_stage_call_not_at_the_end(tmp_path):
+    order = []
+    T.go(tmp_path, _askpass_world(order), sudo_askpass=PATH)
+    assert order.index("askpass-removed") == order.index("stage-call") + 1 and order.count("askpass-removed") == 1
+
+
+def test_the_helper_is_removed_when_the_stage_call_raises(tmp_path):
+    order = []
+    T.go(tmp_path, _askpass_world(order, stage_call_raises=True), sudo_askpass=PATH)
+    assert order.index("askpass-removed") == order.index("stage-call") + 1
+
+
+def test_a_raising_askpass_removal_still_runs_the_credential_cleanup(tmp_path, monkeypatch):
+    w = _askpass_world([])
+    monkeypatch.setattr(W.sudo_askpass, "remove", lambda *a, **k: (_ for _ in ()).throw(ValueError("odd path")))
+    _w, _ev, (status, _s, path) = T.go(tmp_path, w, sudo_askpass=PATH)
+    assert status != "PASS" and path.exists() and "odd path" in path.read_text()
+    assert w.files == {}                      # the credential was removed though the helper's removal raised
+
+
+# ---- stage_call: the askpass argument and a failed sudo ------------------------------------------------------------------
+
+def _stage_env(monkeypatch):
+    monkeypatch.setattr("levain.cockpit.keys.signing_public_key", lambda p: "ecdsa-sha2-nistp256 AAAA")
+    monkeypatch.setattr("levain.cockpit.keys.fingerprint_of", lambda pub: "SHA256:x")
+
+
+def _init_answer(argv, **k):
+    return 0, json.dumps({"store_id": "s1", "route_trust": {"pinned": False}}) + "\n", ""
+
+
+def _executable(tmp_path):
+    ask = tmp_path / "ask.sh"
+    ask.write_text("#!/bin/sh\n")
+    ask.chmod(0o700)
+    return ask
+
+
+def test_a_directory_is_not_an_askpass(monkeypatch, tmp_path, capsys):
+    _stage_env(monkeypatch)
+    d = tmp_path / "d"
+    d.mkdir()
+    monkeypatch.setattr(SC, "run", lambda *x, **k: pytest.fail("a store step ran"))
+    with pytest.raises(SystemExit):
+        SC.mode_stage(T_args(tmp_path, sudo_askpass=str(d)))
+    assert "sudo-askpass" in capsys.readouterr().out
+
+
+def test_a_relative_askpass_is_made_absolute_before_sudo(monkeypatch, tmp_path):
+    _stage_env(monkeypatch)
+    ask = _executable(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    via = []
+    monkeypatch.setattr(SC, "routes_trust_via_askpass", lambda path, **k: via.append(path) or (lambda data, **kw: (0, '{"ok":true}\n', "")))
+
+    def fake_run(argv, **k):
+        if "init" in argv:
+            return _init_answer(argv)
+        raise StopAfterPin
+
+    monkeypatch.setattr(SC, "run", fake_run)
+    with pytest.raises(StopAfterPin):
+        SC.mode_stage(T_args(tmp_path, sudo_askpass="ask.sh"))
+    assert via == [str(ask)]
+
+
+@pytest.mark.parametrize("answer", [(1, "", "sudo: 3 incorrect password attempts\n"), (0, "", ""), (0, "not json\n", "")])
+def test_a_failed_sudo_is_the_promised_routes_trust_result_not_a_traceback(monkeypatch, tmp_path, capsys, answer):
+    _stage_env(monkeypatch)
+    ask = _executable(tmp_path)
+    monkeypatch.setattr(SC, "routes_trust_via_askpass", lambda path, **k: (lambda data, **kw: answer))
+    monkeypatch.setattr(SC, "run", _init_answer)
+    with pytest.raises(SystemExit):
+        SC.mode_stage(T_args(tmp_path, sudo_askpass=str(ask)))
+    assert capsys.readouterr().out.splitlines()[-1].startswith("stage-failed routes-trust: ")

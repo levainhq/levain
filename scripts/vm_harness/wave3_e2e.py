@@ -428,17 +428,21 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
     askpass = {"staged": False}
 
     def cleanup() -> list[str]:
-        """The staged askpass helper goes first (it holds the guest login), then the credential's removal."""
+        """A backstop for the askpass helper (W1 removes it itself), then the credential's removal, which runs whatever the
+        helper's removal raised."""
         problems: list[str] = []
-        if askpass["staged"]:
-            try:
-                sudo_askpass.remove(stdin_run, cfg.sudo_askpass)
-                askpass["staged"] = False
-            except (GuestError, OSError, subprocess.SubprocessError) as e:
-                problems.append(f"the sudo askpass helper {cfg.sudo_askpass} NOT confirmed removed ({type(e).__name__}: {e}); remove it by hand")
-        for p in problems:
-            ev.log(scrub("cleanup: " + p))
-        return problems + cred_cleanup()
+        try:
+            if askpass["staged"]:
+                try:
+                    sudo_askpass.remove(stdin_run, cfg.sudo_askpass)
+                    askpass["staged"] = False
+                except (GuestError, OSError, subprocess.SubprocessError, ValueError) as e:
+                    problems.append(f"the sudo askpass helper {cfg.sudo_askpass} NOT confirmed removed ({type(e).__name__}: {e}); remove it by hand")
+            for p in problems:
+                ev.log(scrub("cleanup: " + p))
+        finally:
+            cred_problems = cred_cleanup()
+        return problems + cred_problems
 
     def cred_cleanup() -> list[str]:
         if cred["state"] == "none":
@@ -476,13 +480,27 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
         if not cfg.stage_call:
             raise StepFail("no --stage-call: the guest command that stages the route map, template and verifier is the sitting's to name",
                            status="UNBOUND")
+        if cfg.sudo_askpass:
+            try:                           # before the key goes in: a bad path must not leave the provider key installed
+                sudo_askpass._check_path(cfg.sudo_askpass)
+            except ValueError as e:
+                raise StepFail(f"--sudo-askpass: {e}", status="UNBOUND") from None
         install_key()
         stage_call = cfg.stage_call
-        if cfg.sudo_askpass:
-            askpass["staged"] = True       # set first: a half-written helper is still removed
-            sudo_askpass.stage(stdin_run, cfg.profile, cfg.sudo_askpass)
+        if not cfg.sudo_askpass:
+            lines, rc = capture(guest, stage_call, 600)
+        else:
             stage_call = stage_call + ("--sudo-askpass", cfg.sudo_askpass)
-        lines, rc = capture(guest, stage_call, 600)
+            try:
+                askpass["staged"] = True   # set first: a half-written helper is still removed
+                sudo_askpass.stage(stdin_run, cfg.profile, cfg.sudo_askpass)
+                lines, rc = capture(guest, stage_call, 600)
+            finally:                       # the helper holds the guest login and only this call uses it
+                try:
+                    sudo_askpass.remove(stdin_run, cfg.sudo_askpass)
+                    askpass["staged"] = False
+                except (GuestError, OSError, subprocess.SubprocessError, ValueError):
+                    pass                   # still marked staged: the end-of-run cleanup retries and reports it
         line = next((ln.strip() for ln in lines if ln.startswith("staged gen=")), "")
         m = re.fullmatch(r"staged gen=([0-9]+)", line)
         if rc != 0 or not m or int(m.group(1)) < 1:

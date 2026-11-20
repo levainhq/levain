@@ -37,9 +37,11 @@ def askpass_text(password: str) -> str:
 
 
 def stage_argv(path: str) -> tuple[str, ...]:
-    """Make the helper file private before any byte of it is written (umask), then pin the mode. The path is a positional
-    argument, never interpolated into the script."""
-    return ("/bin/sh", "-c", 'umask 077 && cat >"$1" && chmod 700 "$1"', "sh", _check_path(path))
+    """Never write the password through an existing inode or symlink: remove the path, then noclobber makes the redirect
+    refuse one that reappeared; the file is created private (umask) and its mode pinned. The path is a positional argument,
+    never interpolated into the script."""
+    script = 'rm -f -- "$1" && set -C && umask 077 && cat >"$1" && chmod 700 "$1"'
+    return ("/bin/sh", "-c", script, "sh", _check_path(path))
 
 
 def stage(stdin_run: StdinRunner, profile, path: str, timeout: float = 60) -> None:
