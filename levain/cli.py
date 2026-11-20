@@ -574,6 +574,20 @@ def build_parser() -> argparse.ArgumentParser:
                          help="The running server (default: http://127.0.0.1:7420); loopback only.")
     _ck_common(ck_sign)
     ck_sign.set_defaults(func=_cmd_cockpit_sign)
+    ck_stretch = ck_sub.add_parser(
+        "sign-stretch",
+        help="Count the terminal key's sign failures per day (read-only).",
+        description=(
+            "Read <key dir>/sign-failures and print one line per UTC day: signs, empty_failures (attempts whose "
+            "key answer carried no signature), failed_signs (distinct signing processes that left a record) and "
+            "other_failures; then clean_run=K, the number of the most recent signs in a row with no empty failure. "
+            "That directory holds failures only, so signs and clean_run print as unavailable (no success ledger) "
+            "until the good signatures are counted from a ledger levain reads. Reads only; never touches a key."
+        ),
+    )
+    ck_stretch.add_argument("--dir", type=Path, default=None,
+                            help="The key directory (default: <levain home>/keys, i.e. $LEVAIN_HOME/keys or ~/.levain/keys).")
+    ck_stretch.set_defaults(func=_cmd_cockpit_sign_stretch)
     ck_ledger = ck_sub.add_parser("ledger", help="The authority log itself.")
     ck_ledger_sub = ck_ledger.add_subparsers(dest="ledger_cmd", required=True)
     ck_init = ck_ledger_sub.add_parser(
@@ -4391,6 +4405,20 @@ def _cmd_cockpit_sign(args: argparse.Namespace) -> int:
         print(_term_safe(f"sign unconfirmed: the server answered COMMITTED but {view.pending_id} is {after.state} "
                          f"in {db.path}: the server at {url} does not hold this journal"), file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_cockpit_sign_stretch(args: argparse.Namespace) -> int:
+    from levain import sign_stretch
+
+    if args.dir is not None:
+        key_dir = args.dir
+    else:
+        from levain.consent.queue import default_queue_dir
+
+        key_dir = default_queue_dir().parent / "keys"
+    days, unreadable = sign_stretch.read_days(key_dir / "sign-failures")
+    print(sign_stretch.render(days, unreadable))
     return 0
 
 
