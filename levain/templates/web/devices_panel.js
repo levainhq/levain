@@ -368,6 +368,10 @@
     const boxes = el("div", "nf-checks");
     const l = el("label", "nf-check");
     nfUrgent = el("input", "nf-urgent"); nfUrgent.type = "checkbox"; nfUrgent.checked = false;
+    nfUrgent.addEventListener("change", () => {
+      if (nfNote.textContent !== NF_CAP_NEEDS_URGENT) return;
+      nfUrgentCap.removeAttribute("aria-invalid"); nfSay("");
+    });
     l.appendChild(nfUrgent); l.appendChild(document.createTextNode(" urgent: this token can wake you through sleep"));
     boxes.appendChild(l);
     const capLab = el("label", "nf-check nf-cap");
@@ -395,6 +399,8 @@
     return nfPanel;
   }
   function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
+  // the one line the Urgent box owns: ticking the box makes it untrue, so ticking clears it (and the mark it set), and no other note
+  const NF_CAP_NEEDS_URGENT = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
   function nfSay(msg) { nfNote.textContent = msg; nfNote.hidden = !msg; }
   function paintNotify(tokens) {
     nfList.replaceChildren();
@@ -437,16 +443,17 @@
     return null;
   }
   async function createNotify() {
+    if (nfBusy) return;     // a second mint would replace the first one's only shown secret; a dropped submit leaves the note and the field mark as they were
     nfSay("");
+    nfUrgentCap.removeAttribute("aria-invalid");
     const name = nfName.value.trim();
     if (!name) { nfSay("Give the notify token a name."); return; }
     // the cap rides along only on an urgent token; a value in the field with Urgent unticked is refused, never dropped, and what was typed stays;
     // a whole number the page can hold exactly is sent, and what the server allows beyond that stays the server's to say
     let cap = null;
-    nfUrgentCap.removeAttribute("aria-invalid");
     if (nfUrgentCap.value !== "" || nfUrgentCap.validity.badInput) {
       let refusal = "";
-      if (!nfUrgent.checked) refusal = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
+      if (!nfUrgent.checked) refusal = NF_CAP_NEEDS_URGENT;
       else {
         const n = /^[0-9]+$/.test(nfUrgentCap.value) ? Number(nfUrgentCap.value) : NaN;
         if (Number.isSafeInteger(n) && n >= 1) cap = n;
@@ -454,7 +461,6 @@
       }
       if (refusal) { nfSay(refusal); nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.focus(); return; }
     }
-    if (nfBusy) return;     // a second mint would replace the first one's only shown secret
     nfBusy = true; nfGen++;
     try {
       const body = { name: name };

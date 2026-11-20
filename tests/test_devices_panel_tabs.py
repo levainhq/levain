@@ -335,3 +335,54 @@ def test_a_cap_above_what_the_server_allows_reaches_the_error_line_in_the_server
     assert refused["mints"] == [{"name": "too-high", "urgent": True, "urgent_per_hour": 100001}], refused   # the card left the bound to the server
     assert "whole number from 1 to 100000" in refused["note"] and refused["cap"] == "100001", refused      # the server's words, and the typed value kept
     assert stored == {}, stored
+
+
+NF_NAME_NOTE = "Give the notify token a name."
+NF_CLICK_URGENT = {"eval": "(() => { document.querySelector('.nf-urgent').click(); return 1; })()"}
+NF_SUBMIT_NAMELESS = {"eval": "(() => { document.querySelector('.nf-name').value = ''; document.querySelector('.nf-form').requestSubmit(); return 1; })()"}
+
+
+@needs_browser
+def test_ticking_urgent_clears_the_tick_urgent_refusal_and_the_field_mark_but_never_another_note(tmp_path, monkeypatch) -> None:
+    steps = _nf_mint("forgot-tick", urgent=False, cap="20") + [_nf_settle("forgot-tick"), {"eval": NF_STATE}]       # 0: refused, the field marked
+    # a nameless submit while the field is marked: the new note replaces the refusal, and the mark goes with the cap check that is no longer the news
+    steps += [NF_SUBMIT_NAMELESS, {"eval": NF_STATE}]                                                                 # 1: the name note, no mark
+    steps += [_nf_fill("forgot-tick", urgent=False, cap="20"), NF_SUBMIT, _nf_settle("forgot-tick"), {"eval": NF_STATE}]   # 2: refused again
+    steps += [NF_CLICK_URGENT, {"eval": NF_STATE}]                                                                    # 3: the box ticked: the refusal is no longer true
+    # another note on the same line is not the box's to clear, whichever way the box goes
+    steps += [NF_SUBMIT_NAMELESS, NF_CLICK_URGENT, {"eval": NF_STATE}, NF_CLICK_URGENT, {"eval": NF_STATE}]          # 4, 5: the name note stays
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 6, seen
+    refused, nameless, again, ticked, unticked, reticked = seen
+    assert NF_TICK in refused["note"] and refused["aria"] == "true", refused
+    assert nameless["note"] == NF_NAME_NOTE and nameless["aria"] is None, nameless
+    assert NF_TICK in again["note"] and again["aria"] == "true", again
+    assert ticked["note"] == "" and ticked["aria"] is None and ticked["cap"] == "20" and ticked["box"] is True and ticked["mints"] == [], ticked
+    for kept in (unticked, reticked):
+        assert kept["note"] == NF_NAME_NOTE and kept["mints"] == [], kept
+    assert unticked["box"] is False and reticked["box"] is True, (unticked, reticked)
+    assert stored == {}, stored
+
+
+NF_HOLD = ("(() => { const g = window.fetch.bind(window); window.__posts = 0; window.__releases = [];"
+           " window.fetch = (u, o) => { if (!(String(u).endsWith('/webpush/notify/tokens') && o && o.method === 'POST')) return g(u, o);"
+           " window.__posts++; return new Promise((r) => window.__releases.push(() => r(g(u, o)))); };"
+           " window.__release = () => { window.__releases.splice(0).forEach((f) => f()); return 1; }; return 1; })()")
+NF_HELD_STATE = ("JSON.stringify({posts: window.__posts, note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+                 " aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
+
+
+@needs_browser
+def test_a_second_submit_while_a_mint_is_in_flight_leaves_the_note_and_the_field_mark_untouched(tmp_path, monkeypatch) -> None:
+    steps = [{"eval": NF_HOLD}, _nf_fill("first", urgent=True, cap=""), NF_SUBMIT, {"until": "window.__posts === 1", "ms": 10000}, {"eval": NF_HELD_STATE}]   # 0: the mint is held open
+    steps += [NF_SUBMIT_NAMELESS, {"eval": NF_HELD_STATE}]                                                            # 1: a nameless second submit
+    steps += [_nf_fill("second", urgent=True, cap="1.5"), NF_SUBMIT, {"eval": NF_HELD_STATE}]                         # 2: a second submit with a cap the card would refuse
+    steps += [{"eval": "window.__release()"}, _nf_settle("first"), {"eval": NF_STATE}]                                # 3: the first mint let through and settled
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 4, seen
+    held, nameless, capped, done = seen
+    assert held == {"posts": 1, "note": "", "aria": None}, held
+    assert nameless == held and capped == held, (held, nameless, capped)       # a dropped second submit leaves no trace
+    assert done["mints"] == [{"name": "first", "urgent": True}], done
+    assert done["note"] == "" and done["aria"] is None, done
+    assert list(stored) == ["first"], stored
