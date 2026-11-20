@@ -1356,15 +1356,19 @@ _PROBE_LINE_MAX = 200
 
 def _probe_failure(argv: list[str], returncode: int, stderr: str | bytes | None, stdout: str | bytes | None) -> GitProbeError:
     """A :class:`GitProbeError` for ``argv`` that exited with ``returncode``: the command, the code
-    and the first non-empty line of its error output (of its standard output when the error output
-    is empty), cut to :data:`_PROBE_LINE_MAX` characters."""
-    first = "no output"
+    and one line of what it printed, cut to :data:`_PROBE_LINE_MAX` characters. The line is the first
+    one, across the error output and then the standard output, that starts with git's own ``fatal:``
+    or ``error:``; with none, the first non-empty line. The first line alone can be a warning that
+    ``sudo`` printed ahead of git (an unresolvable host name, for one), which would hide the line that
+    says why git failed."""
+    lines: list[str] = []
     for stream in (stderr, stdout):
         text = stream.decode("utf-8", "replace") if isinstance(stream, bytes) else (stream or "")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if lines:
-            first = lines[0] if len(lines[0]) <= _PROBE_LINE_MAX else lines[0][:_PROBE_LINE_MAX] + "..."
-            break
+        lines.extend(ln.strip() for ln in text.splitlines() if ln.strip())
+    first = "no output"
+    if lines:
+        chosen = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))), lines[0])
+        first = chosen if len(chosen) <= _PROBE_LINE_MAX else chosen[:_PROBE_LINE_MAX] + "..."
     return GitProbeError(f"`{shlex.join(argv)}` exited {returncode}: {first}")
 
 

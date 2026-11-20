@@ -1369,7 +1369,7 @@ _FALSE_CLAIM = "works in a repository whose git directory belongs to another use
 
 def _probe_rig(monkeypatch, *, init_fails=None, status):
     """The probe without root: the account lookups and chowns are stubbed, ``git init`` runs for real
-    unless ``init_fails=(rc, stderr_bytes)``, and the operator's ``git status`` (the sudo command) is
+    unless ``init_fails=(rc, stderr_bytes)`` (or an exception to raise from the init call), and the operator's ``git status`` (the sudo command) is
     ``status``: a (rc, stdout, stderr) tuple, or an exception to raise."""
     me = hands.pwd.getpwuid(os.getuid())
     monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me)
@@ -1385,6 +1385,8 @@ def _probe_rig(monkeypatch, *, init_fails=None, status):
                 raise status
             return subprocess.CompletedProcess(argv, status[0], status[1], status[2])
         if init_fails is not None and "init" in argv:
+            if isinstance(init_fails, BaseException):
+                raise init_fails
             return subprocess.CompletedProcess(argv, init_fails[0], b"", init_fails[1])
         return real_run(argv, **kw)
 
@@ -1434,6 +1436,29 @@ def test_a_git_that_cannot_be_started_is_a_probe_failure(monkeypatch) -> None:
     with pytest.raises(hands.GitProbeError) as err:
         hands.git_refuses_foreign_gitdir("someone")
     assert "could not be started" in str(err.value) and "No such file or directory" in str(err.value)
+
+
+def test_a_sudo_warning_ahead_of_git_does_not_hide_gits_fatal_line(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(128, "", "sudo: unable to resolve host vm\n" + _NOT_A_REPO))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "fatal: not a git repository" in str(err.value) and "unable to resolve host" not in str(err.value)
+
+
+def test_the_probe_failure_quotes_standard_output_when_the_error_output_is_empty(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(3, "something only on stdout\nsecond\n", ""))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "exited 3: something only on stdout" in str(err.value) and "no output" not in str(err.value)
+
+
+def test_a_git_init_that_cannot_be_started_is_a_probe_failure_naming_it(monkeypatch) -> None:
+    seen = _probe_rig(monkeypatch, init_fails=PermissionError(errno.EACCES, "Permission denied", "/usr/bin/git"),
+                      status=(128, "", _DUBIOUS))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "init" in str(err.value) and "could not be started" in str(err.value) and "Permission denied" in str(err.value)
+    assert not any(a[0] == SUDO for a in seen)
 
 
 def test_a_long_first_line_is_cut_and_a_silent_failure_says_so(monkeypatch) -> None:
