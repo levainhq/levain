@@ -9,7 +9,6 @@ is the Python implementation of it. Stdlib only.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -171,6 +170,8 @@ class SnapshotWriter:
     """
 
     def __init__(self, path: str | os.PathLike, *, pid: int | None = None, now: float | None = None) -> None:
+        import fcntl  # at use, not at module top: tests/test_cockpit_sign_facet.py::test_the_sign_facet_validator_needs_no_fcntl
+
         self.path = os.fspath(path)
         fd = os.open(self.path + LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o644)
         try:

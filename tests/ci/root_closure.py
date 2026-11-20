@@ -394,6 +394,8 @@ LAZY_SITES = {
     'levain/cockpit/engine.py::_consent_rows_in::from levain.consent.listing import egress_state_of': 'operator',
     'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
     'levain/cockpit/engine.py::_board_visible::from levain.cockpit import board': 'operator',
+    'levain/cockpit/engine.py::Cockpit._stamp_band_age::from levain.cockpit.list_panel import _age_text': 'operator',
+    'levain/cockpit/snapshot_host.py::_engine::from levain.cockpit import engine': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: the same function as the row below (``Cockpit._compose_decisions`` only)
