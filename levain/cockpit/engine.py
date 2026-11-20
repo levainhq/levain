@@ -328,6 +328,9 @@ class ProviderSpec:
     # input types are derive.py's). Empty: the host keeps the panel on its clock. Carried by ``replaced`` and
     # ``with_verbs`` like every field.
     inputs: "tuple[File | Dir | Sqlite | GitRefs | Poll, ...]" = ()
+    # this panel's derive backstop in seconds, in place of the host loop's default; None keeps the default. Last, so no
+    # positional caller's arguments shift.
+    backstop_s: float | None = None
 
     def __post_init__(self) -> None:
         # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
@@ -477,6 +480,10 @@ class _Snap:
     # the row this snapshot was decoded from, ``(gen, body_sha)``; None when no row stands behind it. The attached head's etag
     # and its caches are keyed on it, so no serialisation of the content is needed to tell one snapshot from another
     row_key: "tuple[int, str] | None" = field(default=None, compare=False)
+    # the instant the provider declared this content goes out of date (``Read.valid_until``, ISO). Advisory (R13): outside
+    # equality and the stored body, so a derive that moves only this does not move the row's generation. Last, so no
+    # positional caller shifts
+    valid_until: str | None = field(default=None, compare=False)
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
@@ -1357,6 +1364,15 @@ class Cockpit:
                     f"{sid}: stale_after_s ({spec.stale_after_s}) must be <= 2 x refresh_every_s "
                     f"({spec.refresh_every_s})"
                 )
+        if spec.backstop_s is not None and not (
+                isinstance(spec.backstop_s, (int, float)) and not isinstance(spec.backstop_s, bool)
+                and math.isfinite(spec.backstop_s) and spec.backstop_s > 0):
+            raise CockpitRegistrationError(f"{sid}: backstop_s must be a positive finite number")
+        if spec.backstop_s is not None and spec.backstop_s > spec.stale_after_s:
+            # a panel no input moves re-derives only at its backstop; past stale_after_s it would show stale while correct
+            raise CockpitRegistrationError(
+                f"{sid}: backstop_s ({spec.backstop_s}) must be <= stale_after_s ({spec.stale_after_s})"
+            )
         if type(spec.inputs) is not tuple or not all(isinstance(i, (File, Dir, Sqlite, GitRefs, Poll)) for i in spec.inputs):
             # a derive host hashes and fingerprints these: anything else would be found on its poll thread, not here
             raise CockpitRegistrationError(
@@ -2315,7 +2331,8 @@ class Cockpit:
                      label_keys, value_key,
                      [{"count": c, "reason": r} for c, r in res.hidden_skipped if c],
                      res.hidden_note if isinstance(res.hidden_note, str) else "",
-                     source_as_of=res.as_of if isinstance(res.as_of, str) and res.as_of else None)
+                     source_as_of=res.as_of if isinstance(res.as_of, str) and res.as_of else None,
+                     valid_until=_valid_until_iso(res.valid_until))
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
@@ -3888,6 +3905,26 @@ def _set_once(fut: Future, value: Any) -> None:
 def _parse_iso(s: str) -> datetime:
     dt = datetime.fromisoformat(s)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _valid_until_iso(raw: Any) -> str | None:
+    """``Read.valid_until`` (an ISO string or a datetime) as an ISO instant with its zone, or None: it is advisory, so a
+    value that is not a readable instant, or one whose UTC or epoch form is out of range, is no bound rather than a
+    fault of the read."""
+    try:
+        dt = datetime.fromisoformat(raw) if isinstance(raw, str) and raw else raw
+        if not isinstance(dt, datetime):
+            return None
+        # a naive time is read as local time, Python's own rule for a naive datetime, not as UTC the way ``_parse_iso`` does
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        # the reader's ISO and epoch conversions must never meet an out-of-range instant
+        if not 1970 <= dt.astimezone(timezone.utc).year <= 9998:
+            return None
+        dt.timestamp()
+        return dt.isoformat()
+    except (ValueError, OverflowError, OSError):    # an out-of-range time in astimezone() or timestamp()
+        return None
 
 
 def _field_text(row: dict[str, Any], field_name: str) -> str:

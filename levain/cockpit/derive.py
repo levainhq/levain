@@ -353,7 +353,7 @@ def due_panels(
     now: float,
     backstop_s: float,
 ) -> list[tuple[str, str]]:
-    """[(panel_id, reason)] of the due panels: dirty first, then the oldest derived_at (never derived first)."""
+    """[(panel_id, reason)] of the due panels, in ``queue_order``."""
     due = []
     for pid, plan in plans.items():
         st = states[pid]
@@ -361,12 +361,14 @@ def due_panels(
         if reason is not None:
             due.append((pid, reason))
 
-    def key(item: tuple[str, str]) -> tuple[int, float, str]:
-        st = states[item[0]]
-        return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, item[0])
-
-    due.sort(key=key)
+    due.sort(key=lambda item: queue_order(item[0], states[item[0]]))
     return due
+
+
+def queue_order(pid: str, st: PanelState) -> tuple[int, float, str]:
+    """The one order panels are derived in: dirty first (a write's reader is waiting), then the oldest derived_at (never
+    derived first), then the id. It is fair because a panel just derived has the newest derived_at, so it sorts last."""
+    return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, pid)
 
 
 @dataclass
@@ -812,8 +814,7 @@ class DeriveLoop:
             self._run_job(job, self._clock())
 
     def _queue_key(self, pid: str) -> tuple[int, float, str]:
-        st = self._states[pid]
-        return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, pid)
+        return queue_order(pid, self._states[pid])
 
     # ---- one derive
 
@@ -835,6 +836,7 @@ class DeriveLoop:
             st.running_since, st.run_fp, st.run_write_gen, st.timed_out = started, job.fp, write_gen, False
         body: bytes | None = None
         status, error, valid_until = "error", None, None
+        state_valid_until: float | None = None
         finished: float | None = None
         published = False
         notice: tuple[str, int, int] | None = None
@@ -856,9 +858,11 @@ class DeriveLoop:
                     fatal = exc
             finished = self._clock()
             duration_ms = max(0, int(round((finished - started) * 1000)))
-            # A valid_until at or before the finish would re-derive on every poll: treat it as no expiry, also in the store.
-            if valid_until is not None and valid_until <= finished:
-                valid_until = None
+            # A valid_until at or before the finish would re-derive on every poll, so the state does not keep it
+            # (state_valid_until is None); the store keeps the bound as declared, so a reader marks the row stale.
+            state_valid_until = valid_until
+            if state_valid_until is not None and state_valid_until <= finished:
+                state_valid_until = None
             with self._write_lock:
                 # the failure is recorded under the write lock too, as _publish_timeouts does: a retire that takes the
                 # lock next then clears it, so a retired panel's error never outlives it
@@ -898,7 +902,7 @@ class DeriveLoop:
                     st.derived_at = finished
                     st.inputs_fp = job.fp
                     st.token = job.token
-                    st.valid_until = valid_until
+                    st.valid_until = state_valid_until
                 st.busy = False
                 if st.detached:  # a retired panel's derive has ended: its id may be derived again
                     st.detached = False
