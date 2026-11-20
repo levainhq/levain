@@ -27,7 +27,7 @@ from levain.consent import band
 from levain.consent.queue import default_queue_dir
 from levain.consent.questions import QuestionStore
 from levain.writes import KEEP_EPISODE_SOURCE, apply_edit
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_list_page_browser import _FOCUS, _FOCUS_ROWS, TRAY, _open_focus, _posts, _reload, _seed_more
 
@@ -1000,6 +1000,7 @@ def test_each_shape_the_new_codes_can_arrive_in_reads_one_fixed_line_and_a_moved
         {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
         *_reload(),
         {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+        BOARD_SETTLED,                # a fresh install's first hello may draw the board again, which would replace the row the steps hold
         _day_words_step(far),
         {"eval": f"{btn}.click(); 1"},
         {"until": f"{_day_input(row)} && 1"},

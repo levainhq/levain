@@ -6930,6 +6930,14 @@ def run_web_server(
         _open_browser(url, unlocked)
 
     watcher = None
+    stall_watch = None
+
+    def stall_say(line: str) -> None:    # until stall_watch's own safe say imports; a closed stderr must not raise either
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
     try:
         if write:
             # C10 S1: a writable serve supervises the desk, over the directory its Desk panel reads
@@ -6937,6 +6945,16 @@ def run_web_server(
             from levain.desk.supervise import Watcher, default_store
 
             watcher = Watcher(lambda: default_store(_dispatch_dir(getattr(httpd, "consent_reader", None)))).start()
+        if getattr(httpd, "broker", None) is not None:
+            # levain#157: a stall watch beside the serve, dumping under the broker's data root; never fatal to the serve.
+            # Only the path goes in: the watch thread makes the directory itself, so no disk work runs before serve_forever
+            try:
+                from levain.cockpit.stall_watch import StallWatch, say as stall_say
+
+                stall_watch = StallWatch(httpd.broker.data_root / "stalls")
+                stall_watch.start()
+            except Exception as exc:
+                stall_say(f"cockpit stall watch not started: {exc}")
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
@@ -6946,8 +6964,15 @@ def run_web_server(
             if chat_host is not None:
                 chat_host.shutdown()
         finally:
-            if watcher is not None:      # stopped last, and whatever the closes above raised
-                watcher.stop()
+            try:
+                if stall_watch is not None:
+                    try:
+                        stall_watch.stop()
+                    except Exception as exc:
+                        stall_say(f"cockpit stall watch not stopped: {exc}")
+            finally:                     # a Ctrl-C inside the stall watch's stop does not skip the desk watcher's
+                if watcher is not None:      # stopped last, and whatever the closes above raised
+                    watcher.stop()
     return 0
 
 
