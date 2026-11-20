@@ -38,6 +38,7 @@ def pill(tmp_path: Path, width: int) -> dict:
 @pytest.mark.parametrize("width", WIDTHS)
 def test_the_reset_layout_pill_is_whole_and_inside_the_viewport(tmp_path: Path, width: int) -> None:
     row = pill(tmp_path, width)
+    assert not row.get("missing"), (width, "no Reset pill drawn")
     p = row["pill"]
     assert row["text"] == "Reset layout", row
     assert p["left"] >= 0 and p["right"] <= row["vw"], (width, "the pill is outside the viewport", row)
@@ -46,5 +47,5 @@ def test_the_reset_layout_pill_is_whole_and_inside_the_viewport(tmp_path: Path, 
     if width >= 721:   # in the Work head's row: the pill's vertical centre is inside the head
         mid = (p["top"] + p["bottom"]) / 2
         assert row["work"]["top"] <= mid <= row["work"]["bottom"], (width, "the pill is not in the Work head's row", row)
-    elif width <= 430:   # a row of its own: its top is at or below the head's bottom
+    else:   # below 721 a row of its own: its top is at or below the head's bottom
         assert p["top"] >= row["work"]["bottom"] - 1, (width, "the pill does not have a row of its own", row)
