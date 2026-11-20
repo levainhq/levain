@@ -104,9 +104,9 @@ case "$1" in
       if [ -n "$SEC_SET_FAIL" ]; then echo "security: SecKeychainSetDomainDefault: $SEC_SET_FAIL" >&2; exit 1; fi
       [ -n "$SEC_SET_NOOP" ] || printf '%s' "$5" > "$D"; exit 0
     fi
-    if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDefault: $SEC_READ_FAIL" >&2; exit 1; fi
+    if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDomainDefault user: $SEC_READ_FAIL" >&2; exit 1; fi
     if [ -f "$D" ]; then printf '    "%s"\\n' "$(cat "$D")"; exit 0; fi
-    echo "security: SecKeychainCopyDomainDefault user: ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
+    echo "security: ${SEC_NONE_PREFIX:-SecKeychainCopyDomainDefault user:} ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
   list-keychains)
     if [ "$4" = "-s" ]; then
       if [ -n "$SEC_LIST_FAIL" ]; then echo "security: SecKeychainSetDomainSearchList: $SEC_LIST_FAIL" >&2; exit 1; fi
@@ -803,9 +803,29 @@ def test_the_no_default_line_matches_the_measured_shape_and_its_older_form(line)
     "security: SecKeychainCopyDomainDefault bogus: A default keychain could not be found.",
     "security: SecKeychainCopyDomainDefault user : A default keychain could not be found.",
     "security: SecKeychainSetDomainDefault user: A default keychain could not be found.",
+    # a domain this module never queries (-d user): another domain's "no default" is not an absent user default
+    "security: SecKeychainCopyDomainDefault system: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault common: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault dynamic: A default keychain could not be found.",
+    # a domain word belongs to the Domain call only
+    "security: SecKeychainCopyDefault user: A default keychain could not be found.",
 ])
-def test_a_domain_word_outside_the_known_set_or_another_call_is_not_no_default(line):
+def test_only_the_queried_domain_on_the_domain_call_is_no_default(line):
     assert not hands_login._NO_DEFAULT.fullmatch(line)
+
+
+@pytest.mark.parametrize("prefix", ["SecKeychainCopyDefault:", "SecKeychainCopyDomainDefault user:"])
+def test_both_printed_forms_of_no_default_make_the_keychain_through_the_rig(rig, prefix):
+    rig.knobs["SEC_NONE_PREFIX"] = prefix
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in and _kc(rig).is_file()
+
+
+def test_a_system_domain_no_default_line_is_an_error_not_an_absent_default(rig):
+    rig.knobs["SEC_NONE_PREFIX"] = "SecKeychainCopyDomainDefault system:"
+    with pytest.raises(hands_login.HandsRefused, match="could not read .*default keychain"):
+        _login(rig, "claude")
+    assert not _kc(rig).exists() and rig.calls() == []
 
 
 @pytest.mark.parametrize("text", ["The specified item could not be found in the keychain.",

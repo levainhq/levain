@@ -614,7 +614,9 @@ HANDS_KEYCHAIN = "levain-hands.keychain-db"
 #: line from SecKeychainCopy(Domain)Default naming errSecNoDefaultKeychain (its text, or its OSStatus -25307). The domain
 #: form names the domain before the colon: measured on a fresh macOS 15.7.7 hands account 11-20 (levain#139, line in
 #: project_memory/1118-vm/leg6_fresh_evidence/l139_defkc.txt): ``SecKeychainCopyDomainDefault user: A default keychain ...``.
-_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Domain)?Default(?: (?:user|system|common|dynamic))?: "
+#: Only the domain this module queries (``-d user``) is accepted, and only with the ``Domain`` call that names it: another
+#: domain's "no default" says nothing about the user domain, so it is an error here, never an absent default.
+_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Default|DomainDefault user): "
                          r"(?:A default keychain could not be found\.?|.*\(-25307\)\.?)")
 
 
