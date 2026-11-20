@@ -132,25 +132,32 @@ def _round_trip(s: _Snap) -> tuple[float, _Snap]:
     return time.perf_counter() - t0, back
 
 
+_SMALL_ROWS, _BIG_ROWS = 250, 5000  # the step between the two timed sizes
+_PAIRS = 5  # small and big attempts, interleaved
+_GROWTH_ALLOWANCE = 3  # the time ratio may reach this multiple of the size ratio
+
+
 def test_a_large_rows_list_round_trips_in_linear_time() -> None:
-    """The round trip of a big rows list must cost time in proportion to the rows, not the square of them.
+    """The round trip of a big rows list must not cost far more than its size ratio over a small one.
 
     A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
-    times the same round trip at a small row count and at a much larger one, in the same test on the same box, and
-    asserts the time grows by a small multiple of the size ratio, far short of the square of it. A slow or loaded box
-    slows both runs together and leaves the ratio alone, and each size is timed several times with the fastest kept so
-    a stall that hits one run is not read as growth. Linear growth gives a time ratio near the size ratio; a quadratic
-    step in the encode or the decode gives one near its square, well past the bound. The bound leaves a multiple of
-    the size ratio as room for allocation and collection noise. The big round trip must also decode back to the same
-    change-detection text as the original."""
-    small_n, big_n, attempts = 500, 5000, 5
-    small, big = _big_snap(small_n), _big_snap(big_n)
-    small_took = min(_round_trip(small)[0] for _ in range(attempts))
-    timed = [_round_trip(big) for _ in range(attempts)]
-    big_took = min(t for t, _ in timed)
-    ratio = big_took / small_took
-    assert ratio < 3 * (big_n / small_n), (small_took, big_took, ratio)
-    assert _frags(timed[-1][1]) == _frags(big)
+    times the same round trip at a small row count and at a much larger one (_SMALL_ROWS, _BIG_ROWS), in the same test
+    on the same box. The attempts alternate small, big, small, big so a load burst lands on both halves of a pair, the
+    time ratio is taken per pair, and the lowest pair ratio is kept. The test fails when that ratio reaches
+    _GROWTH_ALLOWANCE times the size ratio. That catches growth well past linear, such as a size-quadratic blowup in
+    the encode or the decode, whose ratio nears the square of the size ratio. It does not catch a constant-factor
+    slowdown, nor a mild superlinear one that stays under the bound. The big round trip must also decode back to the
+    same change-detection text as the original."""
+    small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
+    ratios: list[float] = []
+    last_back: _Snap | None = None
+    for _ in range(_PAIRS):
+        small_took, _discard = _round_trip(small)
+        big_took, last_back = _round_trip(big)
+        ratios.append(big_took / small_took)
+    bound = _GROWTH_ALLOWANCE * (_BIG_ROWS / _SMALL_ROWS)
+    assert min(ratios) < bound, (ratios, bound)
+    assert last_back is not None and _frags(last_back) == _frags(big)
 
 
 # --- rule 1: as_of is never in the body --------------------------------------------------------------------------------
