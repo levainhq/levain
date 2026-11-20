@@ -103,7 +103,7 @@ function makeEnv(verbAnswer, refetchAnswer, opts) {
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
     LevainDashboard: { render: (view, o) => renders.push({ view, opts: o }), hasUnsavedEdit: () => env.editing, jobsActive: () => env.jobs }, dispatchEvent() {} };
   env.stampEl = { textContent: "" };    // the page's status line (#stamp), where a failed board read says so
-  const doc = { getElementById: (id) => (id === "stamp" ? env.stampEl : null), addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelector: () => null, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
+  const doc = { getElementById: (id) => (id === "stamp" ? env.stampEl : null), addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); }, querySelector: (sel) => { if (sel === "main.frame") return null; throw new Error("unmodeled querySelector: " + sel); }, querySelectorAll: (sel) => (sel === "[data-row-key]" ? [rowEl] : []),
                 createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   env.V = V;
   // a board read already out: the manifest GET is held until released; the page's resume handler asks a passive load

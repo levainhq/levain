@@ -99,7 +99,7 @@ function makeEnv(over) {
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: over.prompt ? () => over.prompt(env) : () => "",
     LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false }, dispatchEvent() {} };
   env.listeners = {};
-  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelector: () => null, querySelectorAll: (q) => (env.rows && q === "[data-row-key]" ? env.rows : []), createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
+  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelector: (sel) => { if (sel === "main.frame") return null; throw new Error("unmodeled querySelector: " + sel); }, querySelectorAll: (q) => (env.rows && q === "[data-row-key]" ? env.rows : []), createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
     await new Promise((r) => setTimeout(r, 30));
