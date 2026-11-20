@@ -137,10 +137,13 @@ def render(report: Report) -> str:
         lines.append(f"note: {report.bad_failures} unreadable failure record(s) skipped")
     if report.clean_run is None:
         lines.append(f"clean_run={NO_SUCCESS_LEDGER}")
-    elif report.bad_failures:
-        lines.append(f"clean_run={report.clean_run} (unverified: {report.bad_failures} unreadable failure records)")
-    elif report.at_cap:
-        lines.append(f"clean_run={report.clean_run} (at most: the evidence directory is at its cap)")
+    elif report.bad_failures or report.at_cap:
+        why = []
+        if report.at_cap:
+            why.append("at most: the evidence directory is at its cap")
+        if report.bad_failures:
+            why.append(f"unverified: {report.bad_failures} unreadable failure records")
+        lines.append(f"clean_run={report.clean_run} ({'; '.join(why)})")
     else:
         lines.append(f"clean_run={report.clean_run}")
     return "\n".join(lines)

@@ -4423,15 +4423,17 @@ def _cmd_cockpit_sign_stretch(args: argparse.Namespace) -> int:
     if args.dir is not None:
         key_dir = args.dir.expanduser()
         if not key_dir.is_dir():
-            print(f"sign-stretch: no such directory: {key_dir}", file=sys.stderr)
+            print(f"sign-stretch: {'not a directory' if os.path.lexists(key_dir) else 'no such directory'}: {key_dir}",
+                  file=sys.stderr)
             return 1
     else:
         from levain.cockpit.custody import default_key_dir
 
         key_dir = default_key_dir()      # where `cockpit key create` puts a key
         if not key_dir.is_dir():
-            print(f"sign-stretch: no such directory: {key_dir} (the default key directory; no key has been made here, "
-                  "or pass --dir)", file=sys.stderr)
+            what = "not a directory" if os.path.lexists(key_dir) else "no such directory"
+            print(f"sign-stretch: {what}: {key_dir} (the default key directory; "
+                  "no key has been made here, or pass --dir)", file=sys.stderr)
             return 1
     try:
         report = sign_stretch.read(key_dir / "sign-failures", args.statements)

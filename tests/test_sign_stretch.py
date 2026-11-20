@@ -160,3 +160,21 @@ def test_missing_default_key_dir_is_refused(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(custody, "default_key_dir", lambda: tmp_path / "fresh" / "keys")
     assert cli.main(["cockpit", "sign-stretch"]) == 1
     assert "sign-stretch: no such directory" in capsys.readouterr().err
+
+
+def test_unverified_and_at_cap_are_both_said(tmp_path, capsys, monkeypatch):
+    import levain.cockpit.keys as keys
+    d = _dir(tmp_path)
+    (d / "sigfail-20261120T120000000000-0000000002-1.json").write_text("{not json")
+    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", 1)
+    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "clean_run=1 (at most: the evidence directory is at its cap; unverified: 1 unreadable failure records)")
+
+
+def test_default_key_dir_that_is_a_file_is_not_a_directory(tmp_path, capsys, monkeypatch):
+    import levain.cockpit.custody as custody
+    (tmp_path / "keys").write_text("in the way")
+    monkeypatch.setattr(custody, "default_key_dir", lambda: tmp_path / "keys")
+    assert cli.main(["cockpit", "sign-stretch"]) == 1
+    assert f"sign-stretch: not a directory: {tmp_path / 'keys'}" in capsys.readouterr().err
