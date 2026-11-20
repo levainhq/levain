@@ -1308,7 +1308,7 @@ def test_the_foreign_gitdir_probe_fixture_does_not_inherit_a_private_umask(tmp_p
     env = {"PATH": hands.SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
     old = os.umask(0o077)
     try:
-        assert hands._make_gitcheck_repo(scratch, repo, env)
+        hands._make_gitcheck_repo(scratch, repo, env)
     finally:
         os.umask(old)
     other_can_enter_and_read = stat.S_IROTH | stat.S_IXOTH
@@ -1345,10 +1345,150 @@ def test_the_gitcheck_repo_helper_widens_only_what_it_is_told_and_not_through_a_
            "GIT_TEMPLATE_DIR": str(template)}
     old = os.umask(0o077)
     try:
-        assert hands._make_gitcheck_repo(scratch, other / "r", env)
+        hands._make_gitcheck_repo(scratch, other / "r", env)
     finally:
         os.umask(old)
     assert stat.S_IMODE(other.stat().st_mode) == 0o700
     assert stat.S_IMODE(scratch.stat().st_mode) == 0o755
     assert (other / "r" / ".git" / "link").is_symlink()
     assert stat.S_IMODE(outside.stat().st_mode) == 0o600
+
+
+# --- the probe says why it could not measure (board levain#197) ----------------------------------
+# Failure texts below: "sudo: a password is required" (rc 1) and "fatal: detected dubious ownership
+# ..." (rc 128) are from project_memory/1118-vm/leg6_fresh_evidence/ (w_dry_sudo2.txt, gitprobe2.txt).
+# "fatal: cannot mkdir ...: File exists" (rc 128) is what git printed here for `git init` under a plain file.
+# "fatal: not a git repository ..." is git's own wording for the case l193 found; no captured copy.
+
+_DUBIOUS = ("fatal: detected dubious ownership in repository at '/private/tmp/levain-gitcheck-87wt7qla/r'\n"
+            "To add an exception for this directory, call:\n\n"
+            "\tgit config --global --add safe.directory /private/tmp/levain-gitcheck-87wt7qla/r\n")
+_NOT_A_REPO = "fatal: not a git repository (or any of the parent directories): .git\n"
+_FALSE_CLAIM = "works in a repository whose git directory belongs to another user"
+
+
+def _probe_rig(monkeypatch, *, init_fails=None, status):
+    """The probe without root: the account lookups and chowns are stubbed, ``git init`` runs for real
+    unless ``init_fails=(rc, stderr_bytes)``, and the operator's ``git status`` (the sudo command) is
+    ``status``: a (rc, stdout, stderr) tuple, or an exception to raise."""
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me)
+    monkeypatch.setattr(hands.os, "lchown", lambda *a, **kw: None)
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+    real_run = subprocess.run
+    seen: list = []
+
+    def fake_run(argv, **kw):
+        seen.append(list(argv))
+        if argv[0] == SUDO:
+            if isinstance(status, BaseException):
+                raise status
+            return subprocess.CompletedProcess(argv, status[0], status[1], status[2])
+        if init_fails is not None and "init" in argv:
+            return subprocess.CompletedProcess(argv, init_fails[0], b"", init_fails[1])
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(hands.subprocess, "run", fake_run)
+    return seen
+
+
+def test_the_probe_passes_when_git_refuses_the_foreign_gitdir(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(128, "", _DUBIOUS))
+    assert hands.git_refuses_foreign_gitdir("someone") is True
+
+
+def test_the_probe_says_false_only_when_git_worked_in_the_foreign_gitdir(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(0, "On branch main\n", ""))
+    assert hands.git_refuses_foreign_gitdir("someone") is False
+
+
+def test_a_sudo_error_is_a_probe_failure_that_names_it_not_a_git_that_works(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(1, "", "sudo: a password is required\n"))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    text = str(err.value)
+    assert "exited 1" in text and "sudo: a password is required" in text and "status" in text
+    assert _FALSE_CLAIM not in text
+
+
+def test_not_a_git_repository_is_a_probe_failure_that_names_it(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(128, "", _NOT_A_REPO))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "exited 128" in str(err.value) and "not a git repository" in str(err.value)
+
+
+def test_a_failed_git_init_is_a_probe_failure_with_its_code_and_first_line(monkeypatch) -> None:
+    seen = _probe_rig(monkeypatch, init_fails=(128, b"fatal: cannot mkdir /tmp/l197_x/blocker/r: File exists\nhint: more\n"),
+                      status=(128, "", _DUBIOUS))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    text = str(err.value)
+    assert "init" in text and "exited 128" in text and "fatal: cannot mkdir /tmp/l197_x/blocker/r: File exists" in text
+    assert "hint: more" not in text and _FALSE_CLAIM not in text
+    assert not any(a[0] == SUDO for a in seen), "git status must not run after a failed init"
+
+
+def test_a_git_that_cannot_be_started_is_a_probe_failure(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=FileNotFoundError(errno.ENOENT, "No such file or directory", "/usr/bin/sudo"))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "could not be started" in str(err.value) and "No such file or directory" in str(err.value)
+
+
+def test_a_long_first_line_is_cut_and_a_silent_failure_says_so(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(1, "", "x" * 900 + "\nsecond line\n"))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "x" * hands._PROBE_LINE_MAX in str(err.value) and "x" * (hands._PROBE_LINE_MAX + 1) not in str(err.value)
+    assert "second line" not in str(err.value)
+    _probe_rig(monkeypatch, status=(2, "", ""))
+    with pytest.raises(hands.GitProbeError) as err2:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "exited 2: no output" in str(err2.value)
+
+
+def test_the_probe_removes_its_scratch_directory_when_it_fails(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(hands.tempfile, "tempdir", str(tmp_path))
+    _probe_rig(monkeypatch, status=(1, "", "sudo: a password is required\n"))
+    with pytest.raises(hands.GitProbeError):
+        hands.git_refuses_foreign_gitdir("someone")
+    assert list(tmp_path.glob("levain-gitcheck-*")) == []
+
+
+def test_the_gitcheck_repo_helper_raises_the_real_failure_of_git_init(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")  # git init cannot make blocker/r
+    env = {"PATH": hands.SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    with pytest.raises(hands.GitProbeError) as err:
+        hands._make_gitcheck_repo(tmp_path, blocker / "r", env)
+    assert "init" in str(err.value) and "exited" in str(err.value) and "fatal:" in str(err.value)
+
+
+def _setup_rig_up_to_the_probe(tmp_path: Path, monkeypatch):
+    ed, _ = _linux_repair_rig(tmp_path, monkeypatch)
+    (ed / ".levain" / "confinement.json").write_text("{}")
+    monkeypatch.setattr(hands, "_user_exists", lambda n: False)
+    monkeypatch.setattr(hands, "shared_root_problem", lambda h: None)
+    return ed
+
+
+def test_setup_isolation_names_the_probe_failure_and_not_the_false_claim(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed = _setup_rig_up_to_the_probe(tmp_path, monkeypatch)
+
+    def probe(operator):
+        raise hands.GitProbeError("`sudo -u someone git -C /tmp/r status` exited 1: sudo: a password is required")
+
+    monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", probe)
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    out = capsys.readouterr().out
+    assert "exited 1: sudo: a password is required" in out and "could not be carried out" in out
+    assert _FALSE_CLAIM not in out and "Upgrade git" not in out
+
+
+def test_setup_isolation_still_says_the_git_works_when_the_probe_measured_that(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed = _setup_rig_up_to_the_probe(tmp_path, monkeypatch)
+    monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", lambda o: False)
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    out = capsys.readouterr().out
+    assert _FALSE_CLAIM in out and "Upgrade git (2.37.1 or later" in out
