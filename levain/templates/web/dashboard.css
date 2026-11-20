@@ -1445,15 +1445,13 @@ body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .pexpan
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
 body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
-/* the freshness stamp rides right beside the always-visible fold chevron; the controls that only show on hover sit to ITS left, so the stamp
-   never floats mid-header and never moves when they appear. One spacer takes the free width (a single margin:auto, not two). */
+/* the freshness stamp rides right beside the always-visible fold chevron, so the stamp never floats mid-header. One spacer takes the free
+   width (a single margin:auto, not two). */
 body.ke .panel .phead:has(> .src.fresh)::after { content: ""; flex: 1 1 0; min-width: 0; }
 body.ke .panel .phead:has(> .src.fresh) > .ck-lay { display: contents; }
 body.ke .panel .phead:has(> .src.fresh) > .pexpand { order: 1; margin-left: 0; }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-up { order: 2; margin-left: calc(var(--sp-1) - var(--sp-3)); }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-down { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
-body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 4; margin-left: 0; }
-body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 5; margin-left: calc(var(--sp-1) - var(--sp-3)); }
+body.ke .panel .phead:has(> .src.fresh) > .src.fresh { order: 2; margin-left: 0; }
+body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { order: 3; margin-left: calc(var(--sp-1) - var(--sp-3)); }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
@@ -2193,8 +2191,7 @@ body.ke[data-mode="memory"] .ck-widgets { display: none; }
 body.ke .ck-zgrid .ck-mem-row > .panel.ck-fold, body.ke .ck-zgrid .ck-mem-row > .panel.ck-is-empty { grid-column: auto; order: 0; align-self: start; }
 body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 
-/* K5: collapse and reorder. The controls sit at the end of a card's head, quiet until the card is hovered or holds focus; on touch they are
-   always shown. A folded card keeps its head (title and count) and hides everything under it. */
+/* K5: collapse. The fold button sits at the end of a card's head. A folded card keeps its head (title and count) and hides everything under it. */
 .ck-lay { display: inline-flex; gap: var(--sp-1); align-items: center; margin-left: auto; align-self: center; }
 .ck-lay-btn { border: 0; background: none; color: var(--label); width: 24px; height: 24px; border-radius: var(--r-sm); cursor: pointer; display: grid; place-items: center;
   font-size: var(--fs-meta); line-height: 1; padding: 0; }
@@ -2205,12 +2202,6 @@ body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 .panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
 .panel.ck-collapsed > :not(.phead) { display: none; }
 body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
-/* a card whose place CSS `order` pins would take a move as a no-op: the page marks its box (one set of keys in dashboard_core.js), no move buttons, collapse stays */
-.ck-lay.ck-nomove .ck-lay-up, .ck-lay.ck-nomove .ck-lay-down { display: none; }
-body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
-body.ke .panel:hover .phead .ck-lay-up, body.ke .panel:hover .phead .ck-lay-down,
-body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phead .ck-lay-down { opacity: 1; }
-@media (hover: none) { body.ke .panel .phead .ck-lay-up, body.ke .panel .phead .ck-lay-down { opacity: 1; } }
 .layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
   font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
 .layoutreset:hover { color: var(--text); }
@@ -2953,10 +2944,6 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
     content: ""; position: absolute; top: 50%; left: 50%; width: 100%; height: 100%;
     min-width: var(--hit-min); min-height: var(--hit-min); transform: translate(-50%, -50%);
   }
-  /* the layout buttons sit in a row, so their areas would share ground: the gap between neighbours is what makes each centre the hit
-     minimum from the next, and the areas then meet without overlapping (the drawn size and the head's height stay as they are) */
-  body.ke .ck-lay { gap: calc(var(--hit-min) - var(--ctl-row)); }
-  body.ke .panel .phead:has(> .src.fresh) .ck-lay-up, body.ke .panel .phead:has(> .src.fresh) .ck-lay-down,
   body.ke .panel .phead:has(> .src.fresh) .ck-lay-fold { margin-left: calc(var(--hit-min) - var(--ctl-row) - var(--sp-3)); }
 }
 
