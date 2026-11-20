@@ -2894,7 +2894,9 @@ class Cockpit:
         once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it).
 
         No argument: every cached read and every in-flight one is stale from here. A read started before this call is
-        never stored for, nor joined by, a request arriving after it (the generation is part of the key).
+        never stored for, nor joined by, a request arriving after it (the generation is part of the key). An attached
+        cockpit tells its host nothing of a write that named no panels and holds no read for it: it reaches the panels by
+        their stores' own change detection, as every write did before the write generation.
 
         ``panel_ids`` (a write that knows what it changed): only those panels' entries go cold, with the same rule per
         panel, and the manifest's entries too (it carries every panel's head). Every other panel keeps its cached read.
@@ -2919,7 +2921,6 @@ class Cockpit:
             with self._rc_lock:
                 self._rc_gen += 1
                 self._rc.clear()
-            self._note_write(None)
             return
         ids = [p for p in dict.fromkeys(panel_ids) if isinstance(p, str)]
         for pid in ids:
@@ -2934,18 +2935,17 @@ class Cockpit:
                 self._refresh_in_background(pid)
         self._note_write(ids)
 
-    def _note_write(self, panel_ids: "list[str] | None") -> None:
+    def _note_write(self, panel_ids: "list[str]") -> None:
         """D7, attached mode only (a bare cockpit returns at once: it has no host to tell). Every call advances the write
-        generation, and the panels the write touched (the ids named, or every panel served from a row when none were) that are
-        registered are told to the host with it, outside every lock of this cockpit; each such panel's row is from then on
+        generation, and the ids named that are registered and served from a row are told to the host with it, outside every
+        lock of this cockpit; each such panel's row is from then on
         required to answer the write (``_write_owed``, ``_await_writes``). A host whose hook raises does not fail the
         write: the failure is counted and kept (``host_dirty_errors``, ``last_host_dirty_error``) and those panels are
         remembered as unsent until a later call reaches the host."""
         if self._reader is None:
             return
         specs = self._specs
-        ids = [pid for pid in (specs if panel_ids is None else panel_ids)
-               if pid in specs and not self.serve_composed(pid)]
+        ids = [pid for pid in panel_ids if pid in specs and not self.serve_composed(pid)]
         dirty = self._host_dirty
         at = _epoch(self._clock())
         with self._rc_lock:

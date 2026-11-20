@@ -106,15 +106,23 @@ def test_a_write_tells_the_host_the_panels_it_touched_under_a_generation_that_on
     assert rig.dirty_calls == [(("alpha",), 1), (("alpha", "beta"), 2), (("beta",), 3)]
 
 
-def test_a_write_naming_no_panels_touches_every_attached_panel_but_the_serve_composed_ones(tmp_path: Path) -> None:
-    r = WriteRig(tmp_path, ("alpha", "beta", "gamma"))
-    try:
-        r.ck.mark_serve_composed(["gamma"])
-        r.forward = False
-        r.ck.invalidate_reads()
-        assert r.dirty_calls == [(("alpha", "beta"), 1)]
-    finally:
-        r.close()
+def test_a_write_naming_no_panels_asks_nothing_of_the_host_and_holds_no_read(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)           # a read that entered the wait would show as time
+    rig.derive()
+    rig.forward = False
+    waits = rig.ck.write_wait_counts()
+    rig.ck.invalidate_reads()
+    rig.ck.invalidate_reads(refresh=False)
+    assert rig.dirty_calls == []
+    t0 = time.monotonic()
+    out = rig.ck.panel("alpha")
+    heads = rig.ck.manifest(CRED)["panels"]
+    assert time.monotonic() - t0 < 5.0
+    assert out["stale"] is False and out["pending"] is False
+    assert all(h["stale"] is False and h["pending"] is False for h in heads.values())
+    assert rig.ck.write_wait_counts() == waits
+    rig.ck.invalidate_reads(["alpha"])                           # a write that names a panel still takes the path
+    assert rig.dirty_calls == [(("alpha",), 1)]
 
 
 def test_a_write_names_only_panels_that_are_registered_and_served_from_rows(tmp_path: Path) -> None:
@@ -134,7 +142,7 @@ def test_a_write_names_only_panels_that_are_registered_and_served_from_rows(tmp_
 def test_the_host_is_told_outside_every_cockpit_lock(rig: WriteRig) -> None:
     rig.forward = False
     rig.ck.invalidate_reads(["alpha"])
-    rig.ck.invalidate_reads()
+    rig.ck.invalidate_reads(["alpha", "beta"])
     assert rig.locks_free_in_dirty == [True, True]
 
 
@@ -310,7 +318,7 @@ def test_a_manifest_takes_one_shared_deadline_for_every_touched_panel(rig: Write
     monkeypatch.setattr(engine, "WRITE_WAIT_S", 0.4)
     rig.derive()
     rig.forward = False
-    rig.ck.invalidate_reads()                                  # both panels
+    rig.ck.invalidate_reads(["alpha", "beta"])
     t0 = time.monotonic()
     heads = rig.ck.manifest(CRED)["panels"]
     took = time.monotonic() - t0
@@ -366,7 +374,7 @@ def test_a_serve_composed_panel_is_never_waited_for(tmp_path: Path, monkeypatch)
         r.derive()
         r.forward = False
         r.ck.invalidate_reads(["gamma"])
-        r.ck.invalidate_reads()
+        r.ck.invalidate_reads(["alpha", "gamma"])
         t0 = time.monotonic()
         r.ck.panel("gamma")
         assert time.monotonic() - t0 < 5.0 and r.ck.write_wait_counts()["waits"] == 0
@@ -407,7 +415,7 @@ def test_a_host_that_raises_does_not_fail_the_write_and_its_panel_reads_stale_at
     rig.derive()
     rig.fail = RuntimeError("the host is gone")
     rig.ck.invalidate_reads(["alpha"])                           # does not raise
-    rig.ck.invalidate_reads()
+    rig.ck.invalidate_reads(["alpha", "beta"])
     assert rig.ck.host_dirty_errors == 2 and rig.ck.last_host_dirty_error is rig.fail
     t0 = time.monotonic()
     head = rig.ck.manifest(CRED)["panels"]["alpha"]
