@@ -49,14 +49,14 @@ _CITE_ID = re.compile(r"\b(?:q|np)-[0-9a-f]{6,}\b")
 _ITEM_NUMBER = re.compile(r"^(\d+)\. ")
 
 # a sentence that opens a message to another agent: it and the sentences after it that do not name the operator.
-# "to <seat>:" opens one only as the start of the sentence (optionally after a verb that sends), never in the middle
+# "to <seat>:" opens one only as the start of a line (optionally after a verb that sends), never in the middle
 # of a sentence that reports having sent something
 _SEAT = r"(?:levain|flow|argus|desk|fan-?in|heads?|lanes?|seats?|codex|claude|nemo|cognitive)"
 _MESSAGE_CUES = (
     re.compile(r"(?m)^\W*ROUTE\b"),
     re.compile(r"\bROUTE to \S"),
     re.compile(r"^\W*(?:(?:send(?:ing)?|message|msg|note|ask(?:ing)?|reply|replying|forward(?:ing)?|hand-?off|re)\s+)?to\s+"
-               + _SEAT + r"\b(?:\s+[\w-]{1,12})?\s*:", re.I),
+               + _SEAT + r"\b(?:\s+[\w-]{1,12})?\s*:", re.I | re.M),
 )
 # a cue that holds only for its own sentence
 _ASIDE_CUES = (
@@ -188,7 +188,10 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
     """The shapes of :data:`SHAPES` that ``text`` (its lines) and its ``sentences`` show, in that order."""
     found: list[str] = []
     questions = [s for s in sentences if _is_question(s)]
-    to_him = [q for q in questions if _ADDRESS.search(q) or _PERMISSION.search(q) or _CONFIRM_FORM.search(q)]
+    # what a question reports after a cue and a colon is not its own: the permission and confirmation forms are read
+    # from the rest
+    own = {q: _asked(q) for q in questions}
+    to_him = [q for q in questions if _ADDRESS.search(q) or _PERMISSION.search(own[q]) or _CONFIRM_FORM.search(own[q])]
     told = any(_IMPERATIVE.search(_asked(s)) for s in sentences)
     letters = {m.group(1).lower() for rx in (_LETTER_PAREN, _LETTER_LINE, _LETTER_OPTION) for m in rx.finditer(text)}
     if {"a", "b"} <= letters and (questions or told):
@@ -198,9 +201,9 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
         found.append("numbered_options")
     if told:
         found.append("say_and_ill")
-    if any(_PERMISSION.search(q) or _CONFIRM_FORM.search(q) or _PICK_Q.search(q) for q in questions):
+    if any(_PERMISSION.search(own[q]) or _CONFIRM_FORM.search(own[q]) or _PICK_Q.search(own[q]) for q in questions):
         found.append("which_do_you")
-    if any(_CONFIRM_ANY.search(_asked(s)) for s in sentences) or any(_AMOUNT.search(q) or (q in to_him and _CONFIRM_Q.search(q)) for q in questions):
+    if any(_CONFIRM_ANY.search(_asked(s)) for s in sentences) or any(_AMOUNT.search(own[q]) or (q in to_him and _CONFIRM_Q.search(own[q])) for q in questions):
         found.append("confirm_pick")
     if any(_ADDRESS.search(q) for q in questions):
         found.append("q_to_you")

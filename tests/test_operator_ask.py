@@ -333,7 +333,7 @@ def test_a_turn_whose_view_was_never_committed_is_not_checked_against_an_older_v
     assert "levain ask" not in (stop("s1", f"Done, tests pass.\n\n{text}", e) or "")
 
 
-def test_a_desk_view_with_items_and_no_staged_record_is_unknown_and_an_empty_one_is_none(qdir, store, monkeypatch):
+def test_a_desk_turn_with_no_staged_record_is_unknown_whatever_the_committed_view_says(qdir, store, monkeypatch):
     fact = band_view.TurnFact("operator", band_view.DESK_VIEWER, True, True)
     wake = band_view.TurnFact(band_view.FACT_DESK_WAKE, band_view.DESK_VIEWER, True, True)
     view = band_view.View(3, (1,), None)
@@ -341,9 +341,10 @@ def test_a_desk_view_with_items_and_no_staged_record_is_unknown_and_an_empty_one
     assert band_view._shown_lines(qdir, fact, "s1") is None
     assert band_view._shown_lines(qdir, wake, "s1") == []                   # a wake showed nothing
     monkeypatch.setattr(band_view, "_view_row", lambda *_a: (band_view.View(3, (), None), 1, None))
-    assert band_view._shown_lines(qdir, fact, "s1") == []
+    assert band_view._shown_lines(qdir, fact, "s1") is None
     monkeypatch.setattr(band_view, "_view_row", lambda *_a: None)
-    assert band_view._shown_lines(qdir, fact, "s1") == []
+    assert band_view._shown_lines(qdir, fact, "s1") is None
+    assert band_view._shown_lines(qdir, wake, "s1") == []
 
 
 def claims(qdir):
@@ -425,3 +426,60 @@ def test_a_description_of_a_message_sent_does_not_hide_the_real_question(qdir, s
     other_row(store)
     band = deliver("s1", e)
     assert stop("s1", f"{text}\n\n{band}", e)
+
+
+def test_a_first_desk_prompt_whose_staging_failed_is_not_refused_for_the_reprinted_question(tmp_path):
+    from tests.test_desk_wake_silent import Rig, block_of
+
+    rig = Rig(tmp_path, "claude_code")
+    rig.ask("Can you approve deploy X?")
+    shown = block_of(rig.ups("hello desk"), rig)
+    staged = list((rig.qdir / "band_stop").glob("s-*.staged"))
+    assert staged
+    for f in staged:
+        f.unlink()                                                          # staging failed; no view was ever committed
+    assert rig.stop(f"Done, the build is green.\n\n{shown}") == ""
+
+
+def test_a_failed_turn_record_replace_leaves_the_old_record_with_its_claim(qdir, store, monkeypatch):
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    other_row(store)
+    band = deliver("s1", e)
+    assert stop("s1", f"{PRICE}\n\n{band}", e) and len(claims(qdir)) == 1
+    real = band_view._replace
+
+    def flaky(f, data):
+        if f.name.endswith("turn.rec"):
+            raise OSError("disk full")
+        return real(f, data)
+
+    monkeypatch.setattr(band_view, "_replace", flaky)
+    again = deliver("s1", e)                                                # the replace fails: the old turn stays
+    assert len(claims(qdir)) == 1
+    monkeypatch.setattr(band_view, "_replace", real)
+    assert stop("s1", f"{PRICE}\n\n{again}", e) is None                    # and its claim still holds
+
+
+def test_a_band_view_with_nothing_open_still_drops_the_closed_notices_it_carries(qdir, store, monkeypatch):
+    no_desk_launch(monkeypatch)
+    e = env(qdir)
+    other_row(store)
+    band = deliver("s1", e)
+    notice = "band@4 · 1 closed\nCan you approve deploy X?"
+    monkeypatch.setattr(band_view, "_view_row", lambda *_a: (band_view.View(4, (), None), 1, notice))
+    assert band_view._shown_lines(qdir, band_view.TurnFact("operator", "v1", False, True), "s1") == notice.splitlines()
+    assert stop("s1", f"Done, tests pass.\n\n{notice}", e) is None
+    monkeypatch.setattr(band_view, "_view_row", lambda *_a: None)
+    assert band_view._shown_lines(qdir, band_view.TurnFact("operator", "v1", False, True), "s1") == []
+
+
+def test_a_reported_confirmation_question_is_no_ask():
+    assert operator_ask.detect("The UI now displays: Should I deploy now?") is None
+    assert operator_ask.detect("The dialog says: Is $150 OK?") is None
+    assert shapes("Should I deploy now?") == "operator"
+
+
+def test_a_seat_address_that_begins_a_later_line_is_an_agent_message():
+    assert shapes("Update:\nTo Codex: should I deploy?") == "agent"
+    assert shapes("I sent the report to Codex: it passed. Should I deploy now?") == "operator"
