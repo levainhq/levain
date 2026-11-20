@@ -4,10 +4,9 @@ Run as ``python -P -m levain.cockpit.derive_child --factory MODULE:CALLABLE [--s
 cockpit once (an UNSTARTED one: no refresher threads, no server), and the child then answers one request at a time, so a
 provider's in-memory state stays warm between derives.
 
-One derivation, two hosts. The child does not know how a panel is derived: it calls ``SnapshotHost._derive``, the same
-function the in-process loop calls, so the status, the body and the ``valid_until`` it answers are the ones the loop would
-have made for that panel. Only the host's own bookkeeping is stubbed (``retire`` has nothing to retire here: the parent's
-plan set is the parent's).
+One derivation, two hosts. The child does not know how a panel is derived: it calls ``derive_panel_result``, the
+one function the parent's own derive calls too, so the status, the body and the ``valid_until`` it answers are the ones the
+loop would have made for that panel. Only the loop's ``retire`` is a no-op here: the parent's plan set is the parent's.
 
 Protocol (JSON lines, one object per line, UTF-8):
 
@@ -43,29 +42,13 @@ import threading
 import time
 from typing import Any, BinaryIO
 
-from levain.cockpit.snapshot_host import PSEUDO_PREFIX, SnapshotHost
+from levain.cockpit.snapshot_host import PSEUDO_PREFIX, derive_panel_result
 
 PROTOCOL = "levain-derive-child/1"
 # How often the watchdog looks at the parent (seconds).
 PARENT_TICK_S = 1.0
 # What the child exits with when its factory cannot build.
 EXIT_FACTORY = 2
-
-
-class _NoLoop:
-    """The part of a host's loop ``SnapshotHost._derive`` may call: a panel that is no longer registered is retired from the
-    plan set, and this child holds none (the parent's loop sees the error answer and retires it itself)."""
-
-    def retire(self, pid: str) -> None:
-        return None
-
-
-class _DeriveHost:
-    """Stands in for ``self`` of ``SnapshotHost._derive``: the cockpit, and the loop's one call."""
-
-    def __init__(self, cockpit: Any) -> None:
-        self._cockpit = cockpit
-        self._loop = _NoLoop()
 
 
 def _claim_stdio() -> "tuple[int, int]":
@@ -108,7 +91,7 @@ def _send(out: BinaryIO, obj: "dict[str, Any]") -> None:
     out.flush()
 
 
-def _derive(host: _DeriveHost, req: "dict[str, Any]") -> "dict[str, Any]":
+def _derive(cockpit: Any, req: "dict[str, Any]") -> "dict[str, Any]":
     rid, panel = req.get("id"), req.get("panel")
     started = time.monotonic()
 
@@ -119,7 +102,7 @@ def _derive(host: _DeriveHost, req: "dict[str, Any]") -> "dict[str, Any]":
     if not isinstance(panel, str) or panel.startswith(PSEUDO_PREFIX):
         return done("error", None, None, f"not a panel this child derives: {panel!r}")
     try:
-        res = SnapshotHost._derive(host, panel)    # type: ignore[arg-type]  # the one derivation the in-process loop runs
+        res = derive_panel_result(cockpit, panel, lambda pid: None)    # the one derivation the in-process loop runs
     except Exception as exc:  # noqa: BLE001 - one bad derive must not end the child; the text is the loop's own error text
         return done("error", None, None, f"{type(exc).__name__}: {exc}")
     return done(res.status, res.body, res.valid_until, res.error)
@@ -132,7 +115,7 @@ def _watch_parent(parent: int, tick_s: float) -> None:
             os._exit(0)
 
 
-def serve(host: _DeriveHost, in_fd: int, out: BinaryIO) -> int:
+def serve(cockpit: Any, in_fd: int, out: BinaryIO) -> int:
     """Answer requests from ``in_fd`` until a stop request or EOF; the exit status."""
     buf = b""
     while True:
@@ -157,7 +140,7 @@ def serve(host: _DeriveHost, in_fd: int, out: BinaryIO) -> int:
             if op == "ping":
                 _send(out, {"op": "pong"})
             elif op == "derive":
-                _send(out, _derive(host, req))
+                _send(out, _derive(cockpit, req))
             else:
                 _send(out, {"id": req.get("id"), "status": "error", "body": None, "valid_until": None,
                             "error": f"unknown op {op!r}", "duration_ms": 0})
@@ -184,7 +167,7 @@ def main(argv: "list[str] | None" = None) -> int:
     threading.Thread(target=_watch_parent, args=(parent, PARENT_TICK_S), name="derive-child-parent-watch", daemon=True).start()
     try:
         _send(out, {"op": "ready", "pid": os.getpid(), "protocol": PROTOCOL})
-        return serve(_DeriveHost(cockpit), in_fd, out)
+        return serve(cockpit, in_fd, out)
     except (BrokenPipeError, ConnectionResetError):
         return 0      # the parent is gone: nobody is left to answer
     finally:

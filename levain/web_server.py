@@ -1123,6 +1123,11 @@ COCKPIT_READ_CACHE_TTL_S = 1.5
 # Attached mode (the cockpit's panels read from snapshots a derive host publishes) is on only when this variable is "1".
 # It is read once, when a server is constructed. Off by default until a write shows in the snapshots it reads.
 COCKPIT_SNAPSHOTS_ENV = "LEVAIN_COCKPIT_SNAPSHOTS"
+# The warm derive child attached mode runs its heavy panels in (``MODULE:CALLABLE``, a factory returning an unstarted
+# cockpit), and the directories (``os.pathsep``-separated) put on its ``sys.path`` before the factory imports. The
+# ``derive_factory`` / ``derive_syspath`` arguments of ``make_server`` win; with neither there is no child.
+COCKPIT_DERIVE_FACTORY_ENV = "LEVAIN_COCKPIT_DERIVE_FACTORY"
+COCKPIT_DERIVE_SYSPATH_ENV = "LEVAIN_COCKPIT_DERIVE_SYSPATH"
 # How long ``server_close`` waits for the snapshot host's derive threads: a little past a provider read's own deadline.
 SNAPSHOT_HOST_STOP_S = 15.0
 
@@ -2293,6 +2298,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
 
     snapshots_on = False                # attached mode asked for (COCKPIT_SNAPSHOTS_ENV), read at construction
+    derive_factory: "str | None" = None         # the child's factory (make_server sets it); None: no child
+    derive_syspath: "tuple[str, ...]" = ()
     _snapshot_host: "SnapshotHost | None" = None
 
     def _engine_change_probe(self) -> Any:
@@ -2325,7 +2332,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         except OSError as exc:
             host, reason = None, f"{type(exc).__name__}: {exc}"
         else:
-            host, reason = SnapshotHost.try_open(cockpit, broker.data_root, token_fn=self._watch_token)
+            child = None
+            if self.derive_factory:
+                # imported only here: a serve with no factory never loads the child's client
+                from levain.cockpit.derive_child_client import DeriveChild
+                child = DeriveChild(self.derive_factory, syspath=self.derive_syspath)
+            host, reason = SnapshotHost.try_open(cockpit, broker.data_root, token_fn=self._watch_token, derive_child=child)
+            if host is None and child is not None:
+                child.close()       # the host that would have owned it was not opened
         if host is None:
             print(f"cockpit: snapshots not attached ({reason}); serving from the providers", file=sys.stderr, flush=True)
             return
@@ -6232,6 +6246,8 @@ def make_server(
     premium_stt: "bool | None" = None,
     watch_paths: "Iterable[str | Path] | None" = None,
     host_grants: "HostGrantSurface | None" = None,
+    derive_factory: "str | None" = None,
+    derive_syspath: "tuple[str, ...]" = (),
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -6247,6 +6263,11 @@ def make_server(
     list ``stt``, so a key added or revoked takes effect on the next request with no restart. An embedder that never
     wants dictation passes ``False``. An AUTO server whose authority log cannot be replayed refuses in the
     ``authority_unreadable`` words.
+
+    ``derive_factory`` (``MODULE:CALLABLE``, a factory returning an unstarted cockpit) and ``derive_syspath`` (directories
+    put on the child's ``sys.path`` first) name the warm child process that attached mode (``LEVAIN_COCKPIT_SNAPSHOTS=1``)
+    derives its heavy panels in. ``None`` takes ``LEVAIN_COCKPIT_DERIVE_FACTORY`` (and ``LEVAIN_COCKPIT_DERIVE_SYSPATH``,
+    ``os.pathsep``-separated); with no factory no child exists and every panel derives in this process.
 
     ``extra_assets`` / ``extra_json`` are the READ-ONLY extension point a downstream
     control plane uses to register additional GET views that ride this server's
@@ -6673,6 +6694,11 @@ def make_server(
     # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
+    # Attached mode's warm derive child (levain.cockpit.derive_child): the argument, else the environment, else none. It
+    # only matters when attached mode is on (COCKPIT_SNAPSHOTS_ENV); a server with no factory runs no child.
+    httpd.derive_factory = derive_factory or os.environ.get(COCKPIT_DERIVE_FACTORY_ENV) or None
+    httpd.derive_syspath = tuple(derive_syspath) or tuple(
+        d for d in os.environ.get(COCKPIT_DERIVE_SYSPATH_ENV, "").split(os.pathsep) if d)
     httpd.work_board = work_board
     httpd.chat_service = chat_service
     httpd.room_host = room_host
