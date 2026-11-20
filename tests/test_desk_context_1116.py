@@ -436,7 +436,7 @@ def test_the_lease_line_points_to_start_desk_only_when_the_button_is_drawn(tmp_p
             {"eval": "JSON.stringify({w: " + words + ", marker: 'lw'})"},
             put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"),
             {"eval": "(() => { window.LevainSignSheet.openDrop = null; return 1; })()"},
-            put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"),
+            put(get={"status": 200, "json": wired(lease={"state": "none", "open_desk": True})}), until("document.querySelector('.dv-lease-none')"),
             {"eval": "JSON.stringify({w: " + words + ", start: !!document.querySelector('.dv-zone .dv-open'), marker: 'lw'})"}])
     with_btn, without = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"marker":"lw"' in v]
     assert with_btn["w"].endswith("To start one, use Open a Desk below."), with_btn

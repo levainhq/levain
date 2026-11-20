@@ -414,6 +414,7 @@ def test_lease_reads_the_allowlisted_fields_only(rig):
     ({"state": "held"}, LeaseView("held")),
     ({"state": "HELD", "holder": "x"}, LeaseView("unknown")),
     ({"state": "held", "holder": 25, "age_s": 3}, LeaseView("unknown")),
+    ({"state": "held", "holder": 25, "open_desk": True}, LeaseView("unknown")),     # a bad holder with the host saying open is unknown, never open
     ({"state": "held", "holder": "d", "age_s": -1}, LeaseView("unknown")),
     ({"state": "held", "holder": "d", "age_s": True}, LeaseView("unknown")),
     ({"state": "held", "holder": "d", "age_s": "3"}, LeaseView("unknown")),

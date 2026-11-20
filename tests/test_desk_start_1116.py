@@ -132,11 +132,22 @@ def test_the_room_page_has_no_start_desk_button_in_a_real_page(tmp_path, qdir):
 
 # --- the show/hide rule: the page holds no copy of it; each answer of the host's relay is drawn as given ------------------------------
 
+def _drawn(lease: dict) -> str:
+    """The wait that says THIS lease was drawn: the bar carries its state class and, for a held lease, its holder. Every pair of
+    consecutive leases a caller passes differs in one of those two, so a bar still holding the previous lease never satisfies it
+    (the bar element itself persists across draws, so waiting on it alone returned at once)."""
+    cond = "!!document.querySelector('.dv-zone .dv-state.dv-lease-%s')" % lease["state"]
+    if lease["state"] == "held":
+        cond += " && document.querySelector('.dv-zone .dv-state').innerText.includes(%s)" % json.dumps(lease["holder"])
+    return cond
+
+
 def _open_looks(tmp_path, leases):
+    for a, b in zip(leases, leases[1:]):
+        assert (a["state"], a.get("holder")) != (b["state"], b.get("holder")), "two consecutive leases the wait cannot tell apart"
     steps = []
     for lease in leases:
-        steps += [put(get={"status": 200, "json": wired(lease=lease)}), until("document.querySelector('.dv-state')"),
-                  {"eval": "new Promise(r => setTimeout(r, 250)).then(() => 1)"}, LOOK]
+        steps += [put(get={"status": 200, "json": wired(lease=lease)}), until(_drawn(lease)), LOOK]
     return looks(_drive_desk(tmp_path, DESKTOP, steps))
 
 
@@ -147,6 +158,7 @@ def test_each_open_desk_basis_is_drawn_as_the_host_said_it(tmp_path):
     shown = _open_looks(tmp_path, [NONE, STALLED, {"state": "held", "holder": "desk 40", "age_s": 60, "open_desk": False},
                                    {"state": "none", "open_desk": False}, {"state": "unknown", "open_desk": True},
                                    {"state": "held", "holder": "desk 40", "age_s": 60, "open_desk": "true"}])
+    assert [g["barCls"].rsplit("dv-lease-", 1)[-1] for g in shown] == ["none", "held", "held", "none", "unknown", "held"], shown   # each lease was drawn
     assert [g["openCount"] for g in shown] == [1, 1, 0, 0, 0, 0], shown
     assert ", renewed" in shown[1]["bar"] and ". The host says a new desk can open now." in shown[1]["bar"] and "The host says" not in shown[2]["bar"], shown   # a held lease beside the button says why
 
