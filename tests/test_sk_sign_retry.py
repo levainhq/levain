@@ -747,6 +747,7 @@ def test_an_unbroken_run_of_empty_answers_makes_exactly_two_signing_calls_then_r
     assert "nothing was signed" in text and "phone" in text
 
 
-def test_the_wait_table_holds_one_wait_per_retry_the_cap_allows():
-    """The import-time assert's own proof: a cap raised without its wait would be an IndexError in the middle of a sign."""
-    assert len(keys._EMPTY_RETRY_WAITS_S) == keys._SK_EMPTY_ATTEMPTS - 1
+def test_the_attempt_cap_is_derived_from_the_wait_table():
+    """One wait per retry: the cap is the table's length plus one, so a cap can never run past its waits (an IndexError
+    in the middle of a sign), and the stopgap's cap is two attempts."""
+    assert keys._SK_EMPTY_ATTEMPTS == 1 + len(keys._EMPTY_RETRY_WAITS_S) == 2

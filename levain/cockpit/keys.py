@@ -872,9 +872,8 @@ def signing_public_key(key_path: Path) -> str:
 # attempt 2; that is inferred from a single evidence file (a cancel or timeout at attempt 2 leaves one too), not recorded in the
 # files, and the 00:19Z sign's outcome is unknown. Small sample: attempt 3 cost a third touch and rescued none of two. Each file
 # carries its attempt's own timing (elapsed_s).
-_SK_EMPTY_ATTEMPTS = 2
 _EMPTY_RETRY_WAITS_S = (1.0,)             # one wait per retry, indexed by attempt number - 1
-assert len(_EMPTY_RETRY_WAITS_S) == _SK_EMPTY_ATTEMPTS - 1,     "_EMPTY_RETRY_WAITS_S needs one wait per retry: _SK_EMPTY_ATTEMPTS - 1 entries (an import-time check, not a mid-sign IndexError)"
+_SK_EMPTY_ATTEMPTS = 1 + len(_EMPTY_RETRY_WAITS_S)   # derived from the table: the cap and the waits cannot disagree
 _SK_RETRIES = 1                # a security-key answer that does not verify is asked for once more, never twice (levain#125)
 # a second touch is asked for only while at least this much of the ONE sign bound is left: the sheet comes up at once and a
 # touch takes a second or two, so 5 s is a real chance; any less and the person would be shown a sheet that closes under them
