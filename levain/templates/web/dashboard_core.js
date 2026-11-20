@@ -506,11 +506,12 @@
       modalReturnFocus = more;      // closing the focus view lands back on the control he pressed (its successor is found by closeModal)
     });
     panel.appendChild(more);
+    if (more.isConnected) giveTileFocus(more, "tray");   // a closed full list left no control to return to: the one drawn now takes the focus (only if the ask is still live; a fold on a panel not yet in the page leaves the ask for the next)
     return hidden > 0;
   }
   function foldRowsAt(body, panel) {
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
-    const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) old.remove();   // the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
+    const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) { const held = document.activeElement === old; old.remove(); if (held) askTileFocus("tray"); }   // a fold that replaces the control the reader (or the ask) just put focus on gives it to the new one; the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
     const apartNow = listApart(panel);
     if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
@@ -10161,7 +10162,10 @@
     }
     // the List card's control is rebuilt by every fold: its successor is the card's control now
     if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.listMore) {
-      rf = document.querySelector('[data-ck-panel="tray"] [data-list-more]') || document.querySelector('[data-ck-panel="tray"] .pexpand');
+      rf = document.querySelector('[data-ck-panel="tray"] [data-list-more]');
+      // no control yet (the card is mid-redraw): the card's own expand button holds the focus for now, and the control takes it when it is drawn
+      // (the ask only acts while focus is on the body, so it waits if that button is replaced and ignores it if the reader has moved on)
+      if (!rf) { rf = document.querySelector('[data-ck-panel="tray"] .pexpand'); askTileFocus("tray"); }
     }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
