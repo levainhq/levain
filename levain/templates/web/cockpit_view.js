@@ -2087,57 +2087,39 @@
     if (html && html.dataset && t) html.dataset.theme = t;
     if (html && html.classList && storedCalm()) html.classList.add("calm");
   })();
-  // ---- the layout (K5): the order of a zone's cards and which panels are folded, kept per browser under one key, the way the theme is.
-  // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
-  // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
+  // ---- the layout (K5): which cards are folded, kept per browser under one key, the way the theme is.
+  // {"v":1,"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
+  // Reordering was retired (levain#172): a stored `zones` from an older browser is read past and never used, and the next collapse write sheds it.
+  // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws every card unfolded.
   const LAYOUT_KEY = "levain_cockpit_layout_v1";
-  // Panel ids that no longer exist: a layout saved before their removal never reorders or folds a future card that takes the id.
+  // Panel ids that no longer exist: a layout saved before their removal never folds a future card that takes the id.
   const RETIRED_PANEL_IDS = ["now"];
   const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s && RETIRED_PANEL_IDS.indexOf(s) < 0) : []);
   // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
   let memLayout = null, memStale = false;
-  const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
+  const copyLayout = (l) => ({ collapsed: l.collapsed.slice() });
   function readLayout() {
     if (memStale && memLayout) return copyLayout(memLayout);
-    const out = { zones: Object.create(null), collapsed: [] };
+    const out = { collapsed: [] };
     let v = null;
     try { v = JSON.parse(root.localStorage.getItem(LAYOUT_KEY)); } catch (_) { return out; }
     if (!v || typeof v !== "object" || v.v !== 1) return out;
-    if (v.zones && typeof v.zones === "object") {
-      for (const z of Object.keys(v.zones)) {
-        const o = v.zones[z];
-        if (o && typeof o === "object" && Array.isArray(o.order)) {
-          const kept = strings(o.order);
-          if (kept.length || !o.order.some((s) => RETIRED_PANEL_IDS.indexOf(s) >= 0)) out.zones[z] = kept;   // an order that was only retired ids is no saved order
-        }
-      }
-    }
     out.collapsed = strings(v.collapsed);
     return out;
   }
   function writeLayout(l) {
-    const zones = {};
-    for (const z of Object.keys(l.zones)) zones[z] = { order: l.zones[z] };
     memLayout = copyLayout(l);
-    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, zones, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
+    try { root.localStorage.setItem(LAYOUT_KEY, JSON.stringify({ v: 1, collapsed: l.collapsed })); memStale = false; } catch (_) { memStale = true; }
   }
   // A store that refuses the removal still holds the old copy: the page then keeps an EMPTY layout in memory (the stored one is never read
   // back) and drops it only after a removal that worked.
   function resetLayout() {
     try { root.localStorage.removeItem(LAYOUT_KEY); memLayout = null; memStale = false; }
-    catch (_) { memLayout = { zones: Object.create(null), collapsed: [] }; memStale = true; }
-  }
-  // the stored names first, in their stored order; every key the page has and the store does not name follows in the order it came
-  function layoutOrder(zoneId, keys) {
-    const stored = readLayout().zones[zoneId] || [];
-    const have = new Set(keys), seen = new Set(), head = [];
-    for (const k of stored) if (have.has(k) && !seen.has(k)) { seen.add(k); head.push(k); }
-    return head.concat(keys.filter((k) => !seen.has(k)));
+    catch (_) { memLayout = { collapsed: [] }; memStale = true; }
   }
   const layoutCollapsed = () => new Set(readLayout().collapsed);
-  // true when anything is saved (a stored order or a collapsed panel): the one condition under which a Reset layout control is drawn
-  function hasLayout() { const l = readLayout(); return l.collapsed.length > 0 || Object.keys(l.zones).length > 0; }
-  function setLayoutOrder(zoneId, order) { const l = readLayout(); l.zones[zoneId] = order; writeLayout(l); }
+  // true only while a card is folded: the one condition under which a Reset layout (unfold all) control is drawn
+  function hasLayout() { return readLayout().collapsed.length > 0; }
   function setLayoutCollapsed(panelId, on) {
     const l = readLayout(), s = new Set(l.collapsed);
     if (on) s.add(panelId); else s.delete(panelId);
@@ -2654,7 +2636,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutCollapsed, hasLayout, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
