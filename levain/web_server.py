@@ -1125,8 +1125,8 @@ class _RouteStats:
     never a raw path: at most ``_ROUTE_PANEL_IDS_MAX`` panel ids plus a fixed handful of other keys. Holds counts and
     times only, no request content. ``snapshot()`` is the read-only shape; there is no network route for it (no new
     surface). ``clock`` times the refusal log's one-line-per-second bound, injectable so a test drives it. It counts
-    REFUSALS by design: only the question and panel/manifest reads are also timed (count, total, max); a served band,
-    board, threads, consent, note or session read, and every page-gate read, adds no row time."""
+    REFUSALS by design: only the question and panel/manifest reads are also timed (count, total, max); a served read
+    of any other route adds no row time."""
 
     _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other", "notify", "verb",
               "band", "board", "threads", "room", "sign", "consent/<id>", "consent/standing", "note/<n>",
