@@ -368,10 +368,7 @@
     const boxes = el("div", "nf-checks");
     const l = el("label", "nf-check");
     nfUrgent = el("input", "nf-urgent"); nfUrgent.type = "checkbox"; nfUrgent.checked = false;
-    nfUrgent.addEventListener("change", () => {
-      if (nfNote.textContent !== NF_CAP_NEEDS_URGENT) return;
-      nfUrgentCap.removeAttribute("aria-invalid"); nfSay("");
-    });
+    nfUrgent.addEventListener("change", () => { if (nfNote.textContent === NF_CAP_NEEDS_URGENT) nfClearCapRefusal(); });
     l.appendChild(nfUrgent); l.appendChild(document.createTextNode(" urgent: this token can wake you through sleep"));
     boxes.appendChild(l);
     const capLab = el("label", "nf-check nf-cap");
@@ -379,7 +376,7 @@
     nfUrgentCap = el("input", "dev-label nf-urgent-cap");
     nfUrgentCap.type = "number"; nfUrgentCap.min = "1"; nfUrgentCap.step = "1"; nfUrgentCap.inputMode = "numeric";
     nfUrgentCap.placeholder = "optional";
-    nfUrgentCap.addEventListener("input", () => nfUrgentCap.removeAttribute("aria-invalid"));
+    nfUrgentCap.addEventListener("input", () => nfClearCapRefusal());
     capLab.appendChild(nfUrgentCap);
     boxes.appendChild(capLab);
     form.appendChild(boxes);
@@ -399,9 +396,15 @@
     return nfPanel;
   }
   function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
-  // the one line the Urgent box owns: ticking the box makes it untrue, so ticking clears it (and the mark it set), and no other note
+  // the two lines the cap field owns, each set together with the mark on the field: the tick-Urgent line is made untrue by ticking the box,
+  // and either is stale once the value is edited, so the mark and the line go together, and no other note on the shared line is touched
   const NF_CAP_NEEDS_URGENT = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
+  const NF_CAP_WHOLE = "Urgent per hour must be a whole number above zero, or left empty.";
   function nfSay(msg) { nfNote.textContent = msg; nfNote.hidden = !msg; }
+  function nfClearCapRefusal() {
+    nfUrgentCap.removeAttribute("aria-invalid");
+    if (nfNote.textContent === NF_CAP_NEEDS_URGENT || nfNote.textContent === NF_CAP_WHOLE) nfSay("");
+  }
   function paintNotify(tokens) {
     nfList.replaceChildren();
     if (!tokens.length) { nfList.appendChild(el("p", "dev-none", "No notify tokens yet.")); return; }
@@ -457,7 +460,7 @@
       else {
         const n = /^[0-9]+$/.test(nfUrgentCap.value) ? Number(nfUrgentCap.value) : NaN;
         if (Number.isSafeInteger(n) && n >= 1) cap = n;
-        else refusal = "Urgent per hour must be a whole number above zero, or left empty.";
+        else refusal = NF_CAP_WHOLE;
       }
       if (refusal) { nfSay(refusal); nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.focus(); return; }
     }

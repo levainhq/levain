@@ -386,3 +386,33 @@ def test_a_second_submit_while_a_mint_is_in_flight_leaves_the_note_and_the_field
     assert done["mints"] == [{"name": "first", "urgent": True}], done
     assert done["note"] == "" and done["aria"] is None, done
     assert list(stored) == ["first"], stored
+
+
+NF_RETYPE = ("(() => { const c = document.querySelector('.nf-urgent-cap'); c.focus(); c.select();"
+             " return document.execCommand('insertText', false, %s) ? 1 : 0; })()")
+
+
+@needs_browser
+def test_editing_the_cap_field_leaves_the_mark_and_the_cap_note_agreeing_and_never_clears_another_note(tmp_path, monkeypatch) -> None:
+    # a refused cap edited to another cap the card would refuse: assistive technology is read the mark, the sighted reader the note,
+    # so the two are both there or both gone (levain#192); the edit is a real one, through the engine's own input event
+    retype = lambda text: {"eval": NF_RETYPE % json.dumps(text)}
+    steps = [_nf_fill("whole", urgent=True, cap=None), retype("1.5"), NF_SUBMIT, _nf_settle("whole"), {"eval": NF_STATE}]    # 0: refused, marked
+    steps += [retype("2.5"), {"eval": NF_STATE}]                                                                          # 1: another invalid value
+    steps += [NF_SUBMIT, _nf_settle("whole"), {"eval": NF_STATE}]                                                         # 2: refused again, marked
+    steps += [_nf_fill("tick", urgent=False, cap="20"), NF_SUBMIT, _nf_settle("tick"), {"eval": NF_STATE}]                # 3: the unticked box, refused, marked
+    steps += [retype("21"), {"eval": NF_STATE}]                                                                           # 4: edited, the box still unticked
+    steps += [NF_SUBMIT_NAMELESS, {"eval": NF_STATE}, retype("22"), {"eval": NF_STATE}]                                   # 5, 6: the name note is not the field's to clear
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 7, seen
+    for state in seen:
+        assert state["mints"] == [], state
+    refused, edited, again, tick_refused, tick_edited, nameless, kept = seen
+    assert NF_WHOLE in refused["note"] and refused["aria"] == "true", refused
+    assert edited["cap"] == "2.5" and (edited["aria"] == "true") == (NF_WHOLE in edited["note"]), edited           # the mark and the note agree
+    assert NF_WHOLE in again["note"] and again["aria"] == "true", again
+    assert NF_TICK in tick_refused["note"] and tick_refused["aria"] == "true", tick_refused
+    assert tick_edited["cap"] == "21" and (tick_edited["aria"] == "true") == (NF_TICK in tick_edited["note"]), tick_edited
+    assert nameless["note"] == NF_NAME_NOTE and nameless["aria"] is None, nameless
+    assert kept["cap"] == "22" and kept["note"] == NF_NAME_NOTE and kept["aria"] is None, kept                    # another note stays through an edit
+    assert stored == {}, stored
