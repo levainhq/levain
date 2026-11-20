@@ -119,16 +119,38 @@ def test_a_snapshot_with_no_odd_values_decodes_to_an_equal_snapshot_field_for_fi
             assert getattr(back, f.name) == getattr(s, f.name), f.name
 
 
-def test_a_large_rows_list_round_trips_fast() -> None:
-    rows = [_row(i, band_age="5m", repo=f"repo{i % 9}", alpha=[i, i + 1], mid={"b": i, "a": 2}) for i in range(5000)]
-    s = _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
+def _big_snap(n: int) -> _Snap:
+    rows = [_row(i, band_age="5m", repo=f"repo{i % 9}", alpha=[i, i + 1], mid={"b": i, "a": 2}) for i in range(n)]
+    return _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
+
+
+def _round_trip(s: _Snap) -> tuple[float, _Snap]:
     t0 = time.perf_counter()
     status, body = sh.encode_snap(s)
     raw = snapshots.encode_body(body)
     back = sh.decode_snap(status, json.loads(raw), as_of=s.as_of)
-    took = time.perf_counter() - t0
-    assert took < 1.0, took
-    assert _frags(back) == _frags(s)
+    return time.perf_counter() - t0, back
+
+
+def test_a_large_rows_list_round_trips_in_linear_time() -> None:
+    """The round trip of a big rows list must cost time in proportion to the rows, not the square of them.
+
+    A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
+    times the same round trip at a small row count and at a much larger one, in the same test on the same box, and
+    asserts the time grows by a small multiple of the size ratio, far short of the square of it. A slow or loaded box
+    slows both runs together and leaves the ratio alone, and each size is timed several times with the fastest kept so
+    a stall that hits one run is not read as growth. Linear growth gives a time ratio near the size ratio; a quadratic
+    step in the encode or the decode gives one near its square, well past the bound. The bound leaves a multiple of
+    the size ratio as room for allocation and collection noise. The big round trip must also decode back to the same
+    change-detection text as the original."""
+    small_n, big_n, attempts = 500, 5000, 5
+    small, big = _big_snap(small_n), _big_snap(big_n)
+    small_took = min(_round_trip(small)[0] for _ in range(attempts))
+    timed = [_round_trip(big) for _ in range(attempts)]
+    big_took = min(t for t, _ in timed)
+    ratio = big_took / small_took
+    assert ratio < 3 * (big_n / small_n), (small_took, big_took, ratio)
+    assert _frags(timed[-1][1]) == _frags(big)
 
 
 # --- rule 1: as_of is never in the body --------------------------------------------------------------------------------
