@@ -43,7 +43,6 @@ def test_a_signed_verb_that_landed_keys_the_write_by_the_panels_the_registry_say
     assert "tray" in want
     assert _note(rig, _answer()) == want
     assert _note(rig, _answer(state="COMMITTED_INCOMPLETE")) == want      # some effect applied: the panels may have moved
-    assert _note(rig, _answer(state="applying")) == want                   # decided, settling: the same write
 
 
 def test_a_bare_cockpit_keeps_dropping_every_read_for_a_signed_verb(rig) -> None:
@@ -55,6 +54,7 @@ def test_a_bare_cockpit_keeps_dropping_every_read_for_a_signed_verb(rig) -> None
     _answer(state="WAITING"),
     _answer(state="REFUSED"),
     _answer(state="EXPIRED"),
+    _answer(state="applying"),                  # decided, not committed: a derive begun now could read the older state
 ])
 def test_an_answer_that_applied_nothing_leaves_the_write_unkeyed(rig, answer) -> None:
     assert _note(rig, answer) is None
@@ -65,3 +65,17 @@ def test_a_verb_the_registry_does_not_know_or_an_answer_without_a_panel_leaves_t
     assert _note(rig, _answer(verb=None)) is None
     assert _note(rig, {k: v for k, v in _answer().items() if k != "panel_id"}) is None
     assert _note(rig, "not a dict") is None
+
+
+def test_a_registry_that_raises_after_the_signature_was_spent_leaves_the_write_unkeyed_and_fails_nothing(rig) -> None:
+    real = rig.reg
+
+    class Raising:
+        def get(self, name: str) -> Any:
+            return real.get(name)
+
+        def touched(self, *a: Any) -> Any:
+            raise RuntimeError("the registry cannot say")
+
+    rig.reg = Raising()
+    assert _note(rig, _answer()) is None

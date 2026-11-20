@@ -2775,10 +2775,12 @@ class _Handler(GuardedHandler):
 
     def _note_signed(self, answer: Any) -> None:
         """The twin of :meth:`_note_fired` for a verb a signature let through (a T2 or T3 fire answers WAITING at the verb's own
-        route, so ``_note_fired`` never sees its effect): when the answer says the signed pending was decided and applied (or is
-        being), the panels the verb changed are kept for the invalidation ``send_response`` makes. For an attached cockpit
-        only, whose host is told those panels and holds the reads for their rows; a bare cockpit's invalidation of every
-        read is left as it was. A replayed answer, a refusal, and a verb the registry does not know leave the set unset."""
+        route, so ``_note_fired`` never sees its effect): when the answer says the signed pending's effects committed, the
+        panels the verb changed are kept for the invalidation ``send_response`` makes. For an attached cockpit only, whose
+        host is told those panels and holds the reads for their rows; a bare cockpit's invalidation of every read is left
+        as it was. A replayed answer, a refusal, a decided pending still settling (its effect has not committed: a derive
+        begun now could read the older state and be taken as the answer), and a verb the registry does not know leave the set
+        unset. It never fails the answer: the signature is spent by the time it runs."""
         cockpit = getattr(self.server, "cockpit", None)
         registry = getattr(self.server, "verb_registry", None)
         if cockpit is None or registry is None or not cockpit.attached or not isinstance(answer, dict):
@@ -2789,7 +2791,10 @@ class _Handler(GuardedHandler):
         spec = registry.get(verb) if isinstance(verb, str) else None
         if spec is None or not isinstance(panel, str):
             return
-        touched = frozenset(registry.touched(cockpit, spec, panel))
+        try:
+            touched = frozenset(registry.touched(cockpit, spec, panel))
+        except Exception:  # noqa: BLE001 - a registry that cannot say leaves the write unkeyed, as if the verb were unknown
+            return
         if touched:
             self._write_touched = touched
 
@@ -6232,9 +6237,9 @@ class _Handler(GuardedHandler):
             srv.request_gate.release()
 
 
-# the ``Broker.result`` states of a signed pending whose effects landed or are being applied: a write that may have
-# changed what the verb's panels show
-_SIGNED_APPLIED_STATES = frozenset({"COMMITTED", "COMMITTED_INCOMPLETE", "applying"})
+# the ``Broker.result`` states of a signed pending whose effects have committed (every one, or those the store took): a write
+# that changed what the verb's panels show. A decided pending still settling is not among them
+_SIGNED_APPLIED_STATES = frozenset({"COMMITTED", "COMMITTED_INCOMPLETE"})
 
 _PENDING_KEYS = {"signature": frozenset({"signature"}),
                  "cancel": frozenset({"intent", "idempotency_key"})}
