@@ -180,9 +180,11 @@ def vendor_missing(vendor: str) -> str | None:
     the hands prefix runs it as a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one
     installed only in the operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare
     ``env: claude: No such file or directory`` (exit 127) after the locks, the sweep and the prepare. Looked up as the
-    operator, on that PATH and nothing else: a binary the operator cannot see there the hands account cannot either. KNOWN
-    EDGE (L3 r2, codex MED, kept): the converse does not hold, so a binary the operator can run but the hands uid cannot
-    (a ``/usr/local/bin`` link into the operator's 0700 home) passes here and ends in the vendor launch's own error."""
+    operator, on that PATH and nothing else, because the product's rule is a vendor the operator installed under
+    ``/usr/local/bin`` or ``/opt/homebrew/bin`` where the hands account can run it. KNOWN EDGES (L3 r2 and r3, kept, board
+    row): ownership oddities are not judged in either direction. A binary the operator can run but the hands uid cannot
+    (a ``/usr/local/bin`` link into the operator's 0700 home) passes here and ends in the vendor launch's own error; one
+    only the hands uid can run (not a path the product makes) is refused."""
     import shutil
     from levain.firing import confinement
     if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
