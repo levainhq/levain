@@ -106,7 +106,7 @@ case "$1" in
     fi
     if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDefault: $SEC_READ_FAIL" >&2; exit 1; fi
     if [ -f "$D" ]; then printf '    "%s"\\n' "$(cat "$D")"; exit 0; fi
-    echo "security: SecKeychainCopyDefault: ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
+    echo "security: SecKeychainCopyDomainDefault user: ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
   list-keychains)
     if [ "$4" = "-s" ]; then
       if [ -n "$SEC_LIST_FAIL" ]; then echo "security: SecKeychainSetDomainSearchList: $SEC_LIST_FAIL" >&2; exit 1; fi
@@ -787,6 +787,25 @@ def test_the_no_default_answer_is_matched_on_its_structure(rig, text):
     rig.knobs["SEC_NONE_TEXT"] = text
     res, st = _login(rig, "claude")
     assert res.returncode == 0 and st.logged_in and _kc(rig).is_file()
+
+
+@pytest.mark.parametrize("line", [
+    # the line measured on a fresh macOS 15.7.7 hands account (levain#139, l139_defkc.txt), verbatim
+    "security: SecKeychainCopyDomainDefault user: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault user: Unknown error: (-25307)",
+    "security: SecKeychainCopyDefault: A default keychain could not be found.",       # the form the code first assumed
+])
+def test_the_no_default_line_matches_the_measured_shape_and_its_older_form(line):
+    assert hands_login._NO_DEFAULT.fullmatch(line)
+
+
+@pytest.mark.parametrize("line", [
+    "security: SecKeychainCopyDomainDefault bogus: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault user : A default keychain could not be found.",
+    "security: SecKeychainSetDomainDefault user: A default keychain could not be found.",
+])
+def test_a_domain_word_outside_the_known_set_or_another_call_is_not_no_default(line):
+    assert not hands_login._NO_DEFAULT.fullmatch(line)
 
 
 @pytest.mark.parametrize("text", ["The specified item could not be found in the keychain.",

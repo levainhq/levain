@@ -611,8 +611,10 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
 SECURITY = "/usr/bin/security"
 HANDS_KEYCHAIN = "levain-hands.keychain-db"
 #: ``security``'s answer when the user domain has no default, run with LC_ALL=C: exit 1, nothing on stdout, one stderr
-#: line from SecKeychainCopy(Domain)Default naming errSecNoDefaultKeychain (its text, or its OSStatus -25307).
-_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Domain)?Default: "
+#: line from SecKeychainCopy(Domain)Default naming errSecNoDefaultKeychain (its text, or its OSStatus -25307). The domain
+#: form names the domain before the colon: measured on a fresh macOS 15.7.7 hands account 11-20 (levain#139, line in
+#: project_memory/1118-vm/leg6_fresh_evidence/l139_defkc.txt): ``SecKeychainCopyDomainDefault user: A default keychain ...``.
+_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Domain)?Default(?: (?:user|system|common|dynamic))?: "
                          r"(?:A default keychain could not be found\.?|.*\(-25307\)\.?)")
 
 
