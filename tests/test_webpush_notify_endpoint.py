@@ -68,7 +68,7 @@ def _raw(port, head: str, body: bytes = b"", wait: float = 5.0):
     """Hand-written request bytes; the answer's status, parsed body and headers. Times out (raises) if the server waits."""
     s = socket.create_connection(("127.0.0.1", port), timeout=wait)
     try:
-        s.sendall(head.encode("ascii") + body)
+        s.sendall(head.encode("latin-1") + body)       # latin-1: a header byte above 0x7f (a non-ASCII digit) goes as sent
         buf = b""
         while b"\r\n\r\n" not in buf:
             chunk = s.recv(65536)
@@ -300,7 +300,7 @@ def test_a_title_and_body_at_their_character_maxima_in_4_byte_characters_are_tak
     assert n["title"] == title and n["body"] == body
 
 
-@pytest.mark.parametrize("clen", [None, "abc", "-1", "1 2"])
+@pytest.mark.parametrize("clen", [None, "abc", "-1", "1 2", pytest.param("²", id="non-ascii-digit")])
 def test_a_missing_or_malformed_content_length_is_411(rig, clen):
     src, q = rig
     tok = _mint(q)
@@ -311,19 +311,6 @@ def test_a_missing_or_malformed_content_length_is_411(rig, clen):
         st, got, _ = _raw(port, head)
     assert st == 411 and got["error"] == "length_required"
     assert PushStore(q).notices() == []
-
-
-def test_a_non_ascii_digit_content_length_is_411(rig):
-    src, q = rig
-    tok = _mint(q)
-    with _signed(src, q) as (port, _):
-        s = socket.create_connection(("127.0.0.1", port), timeout=5)
-        try:
-            s.sendall((f"POST {URL} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n"
-                       f"{nt.HEADER}: {tok}\r\nContent-Length: ²\r\nConnection: close\r\n\r\n").encode("latin-1"))
-            assert b" 411 " in s.recv(4096).split(b"\r\n")[0]
-        finally:
-            s.close()
 
 
 @pytest.mark.parametrize("ctype", ["text/plain", "application/x-www-form-urlencoded", "application/jsonx", None])
