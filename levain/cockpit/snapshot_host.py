@@ -37,6 +37,7 @@ import json
 import math
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -352,7 +353,7 @@ class SnapshotHost:
             plans.append(PanelPlan(
                 id=pid, inputs=tuple(spec.inputs), every_s=spec.refresh_every_s,
                 on_token=(not spec.inputs and spec.refresh_every_s is None),
-                heavy=pid in self._heavy, timeout_s=spec.timeout_s,
+                heavy=pid in self._heavy, timeout_s=spec.timeout_s, backstop_s=spec.backstop_s,
             ))
         plans.append(PanelPlan(id=DISCOVER_ID, on_token=True))
         plans.append(PanelPlan(id=ENTITY_ID, on_token=True))
@@ -375,7 +376,9 @@ class SnapshotHost:
             return DeriveResult("error", None, error="the panel is no longer registered")
         status, body = encode_snap(snap)
         # a failed derive's row carries its message on the row (the store keeps no body for it)
-        return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None)
+        until = datetime.fromisoformat(snap.valid_until).timestamp() if snap.valid_until else None
+        return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None,
+                            valid_until=until)
 
     def _derive_discovery(self) -> DeriveResult:
         try:

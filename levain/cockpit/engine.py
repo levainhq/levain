@@ -267,6 +267,8 @@ class ProviderSpec:
     region: str = "operate"           # "hero", "brief", "widgets", a zone id, or the legacy "header"
     rank: int = 0
     refresh_every_s: float | None = None
+    # this panel's derive backstop in seconds, in place of the host loop's default; None keeps the default
+    backstop_s: float | None = None
     stale_after_s: float = 900.0
     optional: bool = False
     # a source the substrate only creates on first use (the intention store): absent before it was ever seen is an EMPTY panel,
@@ -474,6 +476,9 @@ class _Snap:
     # the freshness facts of a snapshot an attached cockpit read from its row; None on a snapshot a provider read made. An
     # init field so ``dataclasses.replace`` carries it; it is no part of what the snapshot says, so it never takes part in equality
     fresh_info: "_Fresh | None" = field(default=None, compare=False)
+    # the instant the provider declared this content goes out of date (``Read.valid_until``, ISO). Advisory (R13): outside
+    # equality and the stored body, so a derive that moves only this does not move the row's generation
+    valid_until: str | None = field(default=None, compare=False)
     # the row this snapshot was decoded from, ``(gen, body_sha)``; None when no row stands behind it. The attached head's etag
     # and its caches are keyed on it, so no serialisation of the content is needed to tell one snapshot from another
     row_key: "tuple[int, str] | None" = field(default=None, compare=False)
@@ -1357,6 +1362,10 @@ class Cockpit:
                     f"{sid}: stale_after_s ({spec.stale_after_s}) must be <= 2 x refresh_every_s "
                     f"({spec.refresh_every_s})"
                 )
+        if spec.backstop_s is not None and not (
+                isinstance(spec.backstop_s, (int, float)) and not isinstance(spec.backstop_s, bool)
+                and math.isfinite(spec.backstop_s) and spec.backstop_s > 0):
+            raise CockpitRegistrationError(f"{sid}: backstop_s must be a positive finite number")
         if type(spec.inputs) is not tuple or not all(isinstance(i, (File, Dir, Sqlite, GitRefs, Poll)) for i in spec.inputs):
             # a derive host hashes and fingerprints these: anything else would be found on its poll thread, not here
             raise CockpitRegistrationError(
@@ -2315,7 +2324,8 @@ class Cockpit:
                      label_keys, value_key,
                      [{"count": c, "reason": r} for c, r in res.hidden_skipped if c],
                      res.hidden_note if isinstance(res.hidden_note, str) else "",
-                     source_as_of=res.as_of if isinstance(res.as_of, str) and res.as_of else None)
+                     source_as_of=res.as_of if isinstance(res.as_of, str) and res.as_of else None,
+                     valid_until=_valid_until_iso(res.valid_until))
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
@@ -3888,6 +3898,17 @@ def _set_once(fut: Future, value: Any) -> None:
 def _parse_iso(s: str) -> datetime:
     dt = datetime.fromisoformat(s)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _valid_until_iso(raw: Any) -> str | None:
+    """``Read.valid_until`` as an ISO instant with its zone, or None: it is advisory, so a value that is not a readable
+    ISO string is no bound rather than a fault of the read."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return _parse_iso(raw).isoformat()
+    except ValueError:
+        return None
 
 
 def _field_text(row: dict[str, Any], field_name: str) -> str:

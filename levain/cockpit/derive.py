@@ -811,9 +811,13 @@ class DeriveLoop:
                 job = self._queue.pop(pid)
             self._run_job(job, self._clock())
 
-    def _queue_key(self, pid: str) -> tuple[int, float, str]:
+    def _queue_key(self, pid: str) -> tuple[int, int, float, str]:
         st = self._states[pid]
-        return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, pid)
+        # dirty first (a write's reader is waiting), then light before heavy so a slow derive does not hold a quick one
+        # behind it; a dirty heavy panel still beats a clean light one
+        plan = self._plans.get(pid)
+        return (0 if st.dirty_gen is not None else 1, 1 if plan is not None and plan.heavy else 0,
+                st.derived_at if st.derived_at is not None else -1.0, pid)
 
     # ---- one derive
 

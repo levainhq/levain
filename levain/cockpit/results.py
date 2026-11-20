@@ -43,6 +43,10 @@ class Read:
     filtered: tuple[tuple[int, str], ...] = ()
     stale: bool = False
     as_of: str | None = None
+    # the instant the provider knows this content goes out of date (its next due, an expiry, a day rollover), an ISO string
+    # like ``as_of``. Advisory: an attached host re-derives the panel at it and serves it in the head; it is never part of
+    # the content, so a derive that moves only this changes nothing a client holds. A bare cockpit ignores it.
+    valid_until: str | None = None
     note: str | None = None      # this read's own note line; None keeps the registration's ``note``
     empty: str | None = None     # this read's own sentence for status empty; None keeps the registration's
     # the STORED record a line or prose value's ``value_version`` hashes, when what is displayed is a
