@@ -982,7 +982,7 @@ class TestHandlerFaultPath:
         a 500 / dead connection."""
         import levain.web_server as ws
 
-        def boom(_paths, _extra_panels=None, *, write_token_required=False, extra_verbs=None, threads=True):
+        def boom(_paths, _extra_panels=None, *, write_token_required=False, extra_verbs=None):
             # mirror build_substrate_json's real signature (gained extra_panels, then the
             # keyword-only write_token_required for intention-129, then extra_verbs for the
             # action-seam) so the stub is CALLED, not TypeError'd on an unexpected kwarg —

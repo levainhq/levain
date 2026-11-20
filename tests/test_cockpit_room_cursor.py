@@ -5,7 +5,6 @@ import pytest
 
 from levain.cockpit import room as cockpit_room
 from tests.test_cockpit_room import World, _call, _serve_room
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 
 GET = cockpit_room.ROOM_PATH
 

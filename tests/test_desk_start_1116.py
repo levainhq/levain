@@ -14,7 +14,6 @@ from pathlib import Path
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _serve
 from tests.test_cockpit_room_join import _rig
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_room_fulltab_1106 import _ENTER
 from tests.test_desk_pane_page import _OPEN, _TAP_DESK, _TOKENED, WEB, desk_page, put, until, wired
 

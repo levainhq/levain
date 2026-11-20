@@ -112,7 +112,7 @@ def test_a_repo_less_review_is_left_out_of_the_auto_single_repo_view():
     assert m["single"] == "only" and m["counts"]["review"] == 0 and m["counts"]["failed"] == 0
 
 
-# ── the Levain marks: lanes, tracks, strip, empty window, tooltips; and flow's feed unchanged ──
+# ── the Levain marks: lanes, tracks, empty window, tooltips; and flow's feed unchanged ──
 
 _NOW = "2026-10-19T19:13:00Z"
 _LEV_JS = ("const {buildModel,normalise,eventTip}=require(process.argv[1]);const i=JSON.parse(require('fs').readFileSync(0,'utf8'));"
@@ -181,16 +181,6 @@ def test_a_flow_shaped_feed_keeps_flow_rows_and_a_decision_outcome_ok_is_not_a_l
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_the_strip_merges_the_repos_and_drops_lanes_nothing_landed_on():
-    m = _lev(_LEVAIN_FEED, {"size": "strip"})
-    assert m["rows"] == ["commit", "sessions", "memory", "decisions"]
-    assert m["where"]["commit@14:00"] == m["where"]["commit@15:00"] == "commit"
-    assert m["where"]["question@17:00"] == m["where"]["decision@16:00"] == "decisions"   # the question shares the decisions lane
-    only = _lev([_e("commit", "15:00", "a")], {"size": "strip"})
-    assert only["rows"] == ["commit"]
-
-
-@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_an_empty_window_is_flagged_so_the_page_can_say_so_and_keeps_its_lanes():
     m = _lev([])
     assert m["empty"] is True and m["rows"] == ["memory", "decisions"]   # flow's bare frame, as before
@@ -219,7 +209,7 @@ def test_tooltips_name_kind_repo_and_time_and_use_the_label_when_there_is_one():
     assert flow.startswith("review · a · codex · failed · ")   # flow's own tooltip is unchanged
 
 
-# ── the fix round: a fake canvas runs sky.js whole (flow draws as before, strip, aria, theme, rest state) ──
+# ── the fix round: a fake canvas runs sky.js whole (flow draws as before, aria, theme, rest state) ──
 
 _FAKE = r"""
 const fs = require('fs'), cp = require('child_process');
@@ -313,14 +303,6 @@ def test_a_flow_feed_draws_exactly_what_cockpit_ks_sky_drew(tmp_path: Path, opts
 def test_destroy_leaves_no_frame_pending_after_a_meteor_launched(tmp_path: Path) -> None:
     r = _fake(tmp_path, SKY, [_LEVAIN_FEED, _LEVAIN_FEED + [_e("commit", "19:10", "tally")]])
     assert r["pendingBefore"] == 1 and r["pendingAfter"] == 0
-
-
-@pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_the_strip_builds_no_summary_hides_the_bar_inline_and_says_nothing_yet_when_empty(tmp_path: Path) -> None:
-    r = _fake(tmp_path, SKY, [_LEVAIN_FEED], opts={"size": "strip"})
-    assert r["barDisplay"] == "none" and r["summary"] == ""
-    e = _fake(tmp_path, SKY, [[]], opts={"size": "strip"})
-    assert e["fillText"] == ["Nothing yet"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

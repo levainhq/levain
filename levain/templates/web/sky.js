@@ -5,10 +5,7 @@
        value  {events: [{kind, at, repo, agent, outcome, end?, label?}], legend}   (the `ambient` kind's contract)
        opts   windowHours (14)   topRows (5)   pinnedRows ([])   single (a repo name, or auto)
               ambient (true)     now (() => ms; a replay supplies its own clock)
-              size ('compact' | 'large' | 'strip'; default and 'compact' are today's size, 'large' is the tall chart,
-                    'strip' is the phone's and the Build tab's: merged lanes, no gutter, no tooltip, no summary)
-              head (true: a strip carries its own header row, "Activity  N commits · ...  last 14 h", as the Build tab draws it)
-              onHead (fn(parts, hours): called with each [count, label] pair every time the head row is rebuilt, so a host can draw the figures in its own bar)
+              size ('compact' | 'large'; default and 'compact' are today's size, 'large' is the tall chart)
      LevainSky.legendNode() -> a DOM key for the Levain marks (the host may place it, as the hero does with its own).
 
    A feed is Levain-shaped when it carries a session or question, a decision with an outcome of allowed / denied / waiting
@@ -139,7 +136,7 @@
 
   // Which rows, and which row each event lands on. Pure: no DOM, so it is testable under node.
   function buildModel(events, opts, nowMs) {
-    var start = nowMs - opts.windowHours * 3600000, strip = opts.size === 'strip';
+    var start = nowMs - opts.windowHours * 3600000;
     var inWin = events.filter(function (e) {
       if (e.kind === 'session') return e.t <= nowMs && sessEnd(e, nowMs) >= start;
       return e.t >= start && e.t <= nowMs;
@@ -149,15 +146,9 @@
     var repos = Object.create(null);
     inWin.forEach(function (e) { if (e.repo && (e.kind === 'commit' || e.kind === 'review')) repos[e.repo] = (repos[e.repo] || 0) + 1; });
     var names = Object.keys(repos);
-    var single = lev || strip ? '' : opts.single || (names.length <= 1 && !opts.pinnedRows.length ? (names[0] || '') : '');
+    var single = lev ? '' : opts.single || (names.length <= 1 && !opts.pinnedRows.length ? (names[0] || '') : '');
     var rows, rowOf, folded = [], noRepo = 0;
-    if (strip) {
-      // the phone's strip: one lane per kind of thing, the repos merged
-      rows = [{ id: 'commit', label: 'commits' }, { id: 'sessions', label: 'sessions' }, { id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' }];
-      rowOf = function (e) {
-        return e.kind === 'commit' || e.kind === 'review' ? 'commit' : e.kind === 'session' ? 'sessions' : e.kind === 'decision' || e.kind === 'question' ? 'decisions' : 'memory';
-      };
-    } else if (single) {
+    if (single) {
       rows = [{ id: 'commit', label: 'commits' }, { id: 'review', label: 'reviews' }, { id: 'memory', label: 'memory' }, { id: 'decisions', label: 'decisions' }];
       rowOf = function (e) { return e.kind === 'commit' ? 'commit' : e.kind === 'review' ? 'review' : e.kind === 'decision' ? 'decisions' : 'memory'; };
     } else {
@@ -183,14 +174,14 @@
         return e.repo && mainSet[e.repo] ? 'r:' + e.repo : 'other';
       };
     }
-    // a phone (compact) or the strip keeps only the rows an event landed on, and compact shortens the names of memory and
-    // decisions; if nothing landed anywhere the rows stay, so the plot is never a bare frame
-    if (opts.compact || strip) {
+    // a phone (compact) keeps only the rows an event landed on and shortens the names of memory and decisions;
+    // if nothing landed anywhere the rows stay, so the plot is never a bare frame
+    if (opts.compact) {
       var used = Object.create(null);
       inWin.forEach(function (e) { if (!offView(e, single)) used[rowOf(e)] = 1; });
       var kept = rows.filter(function (r) { return used[r.id]; });
       if (kept.length) rows = kept;
-      if (opts.compact) rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
+      rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
     }
     var waiting = [];
     var counts = { commit: 0, review: 0, failed: 0, memory: 0, sessions: 0, decisions: 0, questions: 0, waiting: 0 };
@@ -221,7 +212,7 @@
       });
       sharedWith.set(b, sharedWith.get(b) || 0);
     });
-    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, strip: strip, empty: !inWin.some(function (e) { return !offView(e, single); }), tracks: ends.length,
+    return { rows: rows, rowOf: rowOf, single: single, counts: counts, start: start, lev: lev, empty: !inWin.some(function (e) { return !offView(e, single); }), tracks: ends.length,
       trackOf: trackOf, overflow: overflow, sharedWith: sharedWith, waiting: waiting,
       hasDecisions: inWin.some(function (e) { return e.kind === 'decision'; }) };
   }
@@ -266,10 +257,10 @@
 
   function mount(host, value, userOpts) {
     var o = userOpts || {};
-    var size = o.size === 'large' || o.size === 'strip' ? o.size : 'compact';
-    var strip = size === 'strip', sc = size === 'large' ? 1.4 : strip ? 0.8 : 1;   // mark scale
-    var padT = strip ? 6 : PAD_T, padB = strip ? 4 : PAD_B, padR = strip ? 4 : PAD_R;
-    var trackH = size === 'large' ? 11 : strip ? 5 : 7, trackGap = size === 'large' ? 4 : 3;
+    var size = o.size === 'large' ? o.size : 'compact';
+    var sc = size === 'large' ? 1.4 : 1;   // mark scale
+    var padT = PAD_T, padB = PAD_B, padR = PAD_R;
+    var trackH = size === 'large' ? 11 : 7, trackGap = size === 'large' ? 4 : 3;
     var opts = { windowHours: o.windowHours || 14, topRows: o.topRows || 5, pinnedRows: o.pinnedRows || [], single: o.single || '', size: size, dialect: dialectOf(value) };
     var clock = o.now || function () { return Date.now(); };
     var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
@@ -277,7 +268,7 @@
     var reduceOn = function () { return !!(reduce && reduce.matches); };
     // ambientOn is the user's Ambient preference; neither Calm nor the OS reduced-motion setting writes it. The motion that
     // runs is the preference AND not reduced motion AND not Calm.
-    var ambientOn = o.ambient !== false && !strip;
+    var ambientOn = o.ambient !== false;
     var motionOn = function () { return ambientOn && !reduceOn() && !calmOn(); };
 
     var root = el('div', { class: 'sky-panel' });
@@ -285,36 +276,25 @@
     var bar = el('div', { class: 'sky-bar' });
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
-    // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
-    var head = strip && !!o.head;   // the Build tab's strip: a one-row header, no toggle
-    if (strip && !head) bar.style.display = 'none';   // the phone's strip is a glance: no summary line, no toggle (inline: .sky-bar's display would beat `hidden`)
-    if (head) {
-      bar.classList.add('sky-head'); bar.append(summary);
-      // the strip has no Ambient key, but the masthead's row must not move when it is absent: an invisible twin holds the key's place
-      if (o.toggleHost) {
-        Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); });
-        toggle.classList.add('sky-toggle-ghost'); toggle.textContent = 'Ambient'; toggle.tabIndex = -1; toggle.disabled = true; toggle.setAttribute('aria-hidden', 'true');
-        o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null);
-      }
-    }
-    else if (o.toggleHost && !strip) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
+    // a host that owns a control row (the hero's control row) takes the toggle there, so the row is one row
+    if (o.toggleHost) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
     var cv = el('canvas', { class: 'sky-canvas', role: 'img' });
     cv.style.display = 'block'; cv.style.width = '100%'; cv.style.height = '320px';
     var axis = el('div', { class: 'sky-axis' });
-    axis.style.position = 'relative'; axis.style.height = strip ? '18px' : '24px';
+    axis.style.position = 'relative'; axis.style.height = '24px';
     var tip = el('div', { class: 'sky-tip', role: 'status' });
     tip.style.cssText = 'position:absolute;pointer-events:none;display:none;z-index:2;white-space:nowrap;padding:6px 10px;border-radius:10px;font-size:12px;border:1px solid var(--hair-2,#28324a);background:var(--base,#060912);color:var(--contrast,var(--text,#f3f5f9))';
-    var showLegend = o.legend !== false && !strip;    // a host that draws its own legend passes legend:false
+    var showLegend = o.legend !== false;    // a host that draws its own legend passes legend:false
     var legend = el('div', { class: 'sky-legend' });
-    legend.hidden = !showLegend;   // the host's own legend stands in; an empty strip would still take its padding
+    legend.hidden = !showLegend;   // the host's own legend stands in; an empty legend would still take its padding
     plot.append(cv, axis, tip);
     root.append(bar, plot, legend);
     host.appendChild(root);
 
     var g = cv.getContext('2d');
-    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = strip ? 6 : GUTTER_MIN, rowBase = ROW_H_MIN, sumW = 1, wOf = Object.create(null), cumOf = Object.create(null), nowAt = NOW_AT;
+    var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = GUTTER_MIN, rowBase = ROW_H_MIN, sumW = 1, wOf = Object.create(null), cumOf = Object.create(null), nowAt = NOW_AT;
     var events = [], model = null, meteors = [], feed = { seen: {}, loaded: false }, raf = 0, timer = 0, ro = null, dead = false, hits = [];
     var themeObs = null, scheme = null;
 
@@ -353,7 +333,6 @@
     var rowPx = function (id) { return (H - padT - padB) * wOf[id] / sumW; };
 
     function measureGutter() {
-      if (strip) { gutter = 6; return; }   // the strip's lanes are told apart by their marks, not labelled
       g.font = FONT_MONO;
       var w = GUTTER_MIN;
       model.rows.forEach(function (r) { w = Math.max(w, g.measureText(r.label).width + GUTTER_PAD * 2); });
@@ -376,39 +355,28 @@
 
     function rebuild() {
       var now = clock();
-      var hw = host.getBoundingClientRect().width, narrow = !strip && hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
+      var hw = host.getBoundingClientRect().width, narrow = hw > 0 && hw < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
       opts.compact = narrow;
       model = buildModel(events, opts, now);
       if (model.lev) opts.lev = true;   // latch: once the lanes are Levain's they stay so, however the window ages
-      nowAt = model.lev || strip ? NOW_AT_LEV : NOW_AT;
-      rowBase = size === 'large' ? 44 : strip ? 18 : narrow ? 48 : ROW_H_MIN;
+      nowAt = model.lev ? NOW_AT_LEV : NOW_AT;
+      rowBase = size === 'large' ? 44 : narrow ? 48 : ROW_H_MIN;
       sumW = 0; wOf = Object.create(null); cumOf = Object.create(null);
       model.rows.forEach(function (r) {
         var w = 1;
-        if (r.id === 'sessions' && model.tracks) w = Math.max(1, (model.tracks * (trackH + trackGap) + (strip ? 4 : size === 'large' ? 16 : 10)) / rowBase);
+        if (r.id === 'sessions' && model.tracks) w = Math.max(1, (model.tracks * (trackH + trackGap) + (size === 'large' ? 16 : 10)) / rowBase);
         wOf[r.id] = w; cumOf[r.id] = sumW; sumW += w;
       });
       if (!sumW) sumW = 1;
-      var rowsH = Math.max(size === 'large' ? 240 : strip ? 60 : narrow ? 200 : 160, padT + padB + sumW * rowBase);
+      var rowsH = Math.max(size === 'large' ? 240 : narrow ? 200 : 160, padT + padB + sumW * rowBase);
       cv.style.height = rowsH + 'px';
       var c = model.counts, lev = model.lev;
       var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + (lev ? c.sessions + ' sessions, ' + c.decisions + ' decisions, ' + c.memory + ' memory writes, ' + c.questions + ' questions, ' + c.waiting + ' waiting on you'
         : c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes');
-      if (head) {
-        var parts = lev ? [[c.commit, 'commits'], [c.sessions, 'sessions'], [c.decisions, 'decisions'], [c.memory, 'memory writes'], [c.questions, 'questions']]
-          : [[c.commit, 'commits'], [c.review, 'reviews'], [c.memory, 'memory writes']];
-        var hb = document.createElement('b'); hb.className = 'sky-head-title'; hb.textContent = 'Activity';
-        var hc = document.createElement('span'); hc.className = 'sky-head-counts';
-        hc.textContent = parts.map(function (x) { return x[0] + ' ' + x[1]; }).join(' · ');
-        var hw2 = document.createElement('span'); hw2.className = 'sky-head-win'; hw2.textContent = 'last ' + opts.windowHours + ' h';
-        summary.replaceChildren(hb, hc, hw2);
-        if (typeof o.onHead === 'function') { try { o.onHead(parts, opts.windowHours); } catch (e) { /* the host's figures are its own; a throw there must not stop the chart */ } }
-      } else if (!strip) {   // the phone's strip has no summary bar, so none is built
-        var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
-        var txt = function (x) { return document.createTextNode(x); };
-        if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));
-        else summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
-      }
+      var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
+      var txt = function (x) { return document.createTextNode(x); };
+      if (lev) summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.sessions), txt(' sessions · '), bold(c.decisions), txt(' decisions · '), bold(c.memory), txt(' memory writes · '), bold(c.questions), txt(' questions · '), bold(c.waiting), txt(' waiting on you'));
+      else summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
       // the canvas is the only place the marks live, so its label names what is waiting on the reader
       var wl = model.waiting.slice().sort(function (a, b) { return a.t - b.t; }), more = '';
       if (wl.length) {
@@ -446,9 +414,9 @@
         var y = rowY(r.id);
         g.globalAlpha = 1; g.fillStyle = P.hair; g.fillRect(gutter, y, W - padR - gutter, 1);
         g.fillStyle = P.meta;
-        var shown = strip ? '' : fit(r.label, gutter - GUTTER_PAD * 2 + 8);
-        if (!strip) g.fillText(shown, gutter - GUTTER_PAD, y + 4);
-        var sw = !strip && P.hues && r.id.indexOf('r:') === 0 ? P.hues[hueKey(r.id.slice(2))] : '';
+        var shown = fit(r.label, gutter - GUTTER_PAD * 2 + 8);
+        g.fillText(shown, gutter - GUTTER_PAD, y + 4);
+        var sw = P.hues && r.id.indexOf('r:') === 0 ? P.hues[hueKey(r.id.slice(2))] : '';
         if (sw) { g.fillStyle = sw; g.beginPath(); g.arc(gutter - GUTTER_PAD - g.measureText(shown).width - 8, y, 3, 0, 7); g.fill(); g.fillStyle = P.meta; }
         hits.push({ label: true, row: r, x0: 0, x1: gutter, y: y });
       });
@@ -479,7 +447,7 @@
           if (!('sessions' in wOf) || e.t > now) return;
           var sEnd = sessEnd(e, now); if (sEnd < model.start) return;
           var x1 = Math.max(gutter, xOf(Math.max(e.t, model.start), now)), x2 = Math.max(x1 + 3, xOf(sEnd, now));
-          var top = rowY('sessions') - rowPx('sessions') / 2 + (strip ? 2 : size === 'large' ? 8 : 5), yy = top + (model.trackOf.get(e) || 0) * (trackH + trackGap);
+          var top = rowY('sessions') - rowPx('sessions') / 2 + (size === 'large' ? 8 : 5), yy = top + (model.trackOf.get(e) || 0) * (trackH + trackGap);
           g.globalAlpha = e.out === 'live' ? 0.85 : 0.5; g.fillStyle = e.out === 'live' ? P.ok : P.label;
           pill(x1, yy, x2 - x1, trackH); g.fill(); g.globalAlpha = 1;
           hits.push({ e: e, x: x1, x2: x2, y: yy + trackH / 2 });
@@ -487,7 +455,7 @@
         }
         if (e.t < model.start || e.t > now) return;
         if (offView(e, model.single)) return;
-        var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (lev || strip ? 0 : (hash01(e.t + e.kind.length) - 0.5) * 12);
+        var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (lev ? 0 : (hash01(e.t + e.kind.length) - 0.5) * 12);
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
         var hue = !P.hues || (lev && e.kind !== 'commit') ? '' : P.hues[hueKey(e.repo)];   // a levain feed hues its commits by repo; its own marks keep their kind colours
         if (lev && e.out === 'failed' && e.kind !== 'review') {   // a failure is a red ring, whatever failed
@@ -517,7 +485,7 @@
           else { g.globalAlpha = 1; g.fillStyle = P.violet; g.beginPath(); g.arc(x, y, R * 0.95, 0, 7); g.fill(); }
         }
         else if (lev) {   // a memory write: a blue tick
-          var th = (strip ? 10 : size === 'large' ? 18 : 12);
+          var th = (size === 'large' ? 18 : 12);
           g.globalAlpha = 1; g.fillStyle = P.info; g.fillRect(x - 1, y - th / 2, 2.2, th);
         }
         else { g.globalAlpha = a * 0.55; g.fillStyle = P.contrast; g.fillRect(x, y, 1.4, 1.4); }
@@ -525,9 +493,9 @@
         hits.push({ e: e, x: x, y: y });
       });
       if (late.length) { late.forEach(function (f) { f(); }); g.globalAlpha = 1; }
-      if (!model.lev && !strip && !model.empty && !model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
+      if (!model.lev && !model.empty && !model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
       if (model.empty) {   // the lanes stay (a bare frame reads as broken) and one line says why they are bare
-        var msg = strip ? 'Nothing yet' : 'No activity in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
+        var msg = 'No activity in the last ' + opts.windowHours + ' h', mx = gutter + (W - gutter - padR) / 2, my = padT + (H - padT - padB) / 2;
         g.font = FONT_MONO; g.textAlign = 'center';
         g.globalAlpha = 1; g.fillStyle = P.label; g.fillText(msg, mx, my + 4);   // text only: no box over the grid
       }
@@ -550,13 +518,12 @@
       var perHour = xOf(now, now) - xOf(now - 3600000, now), step = 12;
       [2, 3, 4, 6, 12].some(function (n) { if (perHour * n >= 56) { step = n; return true; } return false; });
       for (var t = h0; t < now; t += 3600000) {
-        var x = xOf(t, now); if (x < gutter || x > W - padR - 20 || Math.abs(x - nowX) < (strip ? 12 : 34)) continue;
+        var x = xOf(t, now); if (x < gutter || x > W - padR - 20 || Math.abs(x - nowX) < 34) continue;
         var hr = new Date(t).getHours(); if (hr % step) continue;
         var s = el('span', null, pad2(hr) + ':00');
         s.style.cssText = 'position:absolute;top:6px;transform:translateX(-50%);font:11px ui-monospace,"SF Mono",Menlo,monospace;color:var(--meta,#7d889c);left:' + x + 'px';
         axis.appendChild(s);
       }
-      if (strip) return;
       var n = el('span', null, 'now');
       n.style.cssText = 'position:absolute;top:6px;transform:translateX(-50%);font:11px ui-monospace,"SF Mono",Menlo,monospace;color:var(--accent,#ff8a3d);left:' + nowX + 'px';
       axis.appendChild(n);
@@ -596,7 +563,6 @@
       return t;
     }
     cv.addEventListener('mousemove', function (ev) {
-      if (strip) return;   // the strip is a glance: no tooltip
       var b = cv.getBoundingClientRect(), x = ev.clientX - b.left, y = ev.clientY - b.top, best = null, bd = 100;
       for (var i = 0; i < hits.length; i++) {
         var h = hits[i];

@@ -26,7 +26,6 @@ from levain.desk.desk_port import (DESKCMD_ENV, DeskCaps, DeskCommandError, Desk
 from levain.desk.room_host import HostCommands
 from levain.web_server import _Handler, _build_desk_serve, make_server, run_web_server
 from tests.test_cockpit_k2a import TOKEN, _install
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 
 SEND = "/cockpit/desk/send"
 READ = "/cockpit/desk.json"

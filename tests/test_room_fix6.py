@@ -23,7 +23,6 @@ from levain.desk.room_default import GUARD_PATH
 from levain.desk.room_launch import RoomLaunchError
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_room import World
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_room_host_launch import launcher, mode, spawns, world  # noqa: F401  (world is a fixture)
 from tests.test_room_mode_noise_1112 import _hidden, _row, _service
 from tests.test_room_profile import profile, recorded_init, script  # noqa: F401  (script is a fixture)

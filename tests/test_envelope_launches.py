@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from levain.cockpit import threads as cockpit_threads
 from levain.cockpit.consent import utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
 from levain.desk import cli as ccli
@@ -426,23 +425,6 @@ def test_no_grant_means_no_launches_line_and_a_changed_one_is_marked_against_its
     assert "- removed: " in gone and "up to 2 seats" in gone
     added = "\n".join(ccli._describe(new, None, old=_body(), now=AT))
     assert "+ added: " in added
-
-
-def test_the_cockpit_authority_line_names_the_launch_grant_only_when_there_is_one():
-    assert cockpit_threads._effects_words(_body()) == "effects named: 0 land, 0 push, 0 publish"
-    words = cockpit_threads._effects_words(_body(launches=_grant(2)), STOP)
-    assert words.endswith(f"; may launch up to 2 seats in {REPO} until 2026-10-20 14:00 UTC")
-
-
-@pytest.mark.parametrize("launches", [[{"repo": REPO}], [{"count": 2}], [None], [{"repo": 7, "count": 2}],
-                                      [{"repo": REPO, "count": 0}], [{"repo": REPO, "count": env.LAUNCH_MAX + 1}],
-                                      [{"repo": REPO, "count": True}], [{"repo": REPO, "count": 2, "x": 1}]])
-def test_the_cockpit_authority_line_refuses_a_launch_entry_it_cannot_read(launches):
-    """L3 r1 #8: each entry goes through the same _bad() refusal as the effect lists (fail closed upstream)."""
-    with pytest.raises(ValueError, match="an effect list is a list"):
-        cockpit_threads._effects_words(_body(launches=launches), STOP)
-    # every entry dropped by a narrowing leaves an empty list behind there: no words, not a refusal
-    assert cockpit_threads._effects_words(_body(launches=[]), STOP) == "effects named: 0 land, 0 push, 0 publish"
 
 
 # 9 -- who may set it -------------------------------------------------------------------------------------------------

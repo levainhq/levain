@@ -8,7 +8,6 @@ import pytest
 from levain.cockpit import room as cockpit_room
 from levain.desk import room_live
 from tests.test_cockpit_room import TOKEN, _call, _serve_room
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401
 from tests.test_cockpit_room_wait import (FAR, GET, _dcall, _dserve, _in_thread, _pair, _revoke, quick,  # noqa: F401
                                           w)
 

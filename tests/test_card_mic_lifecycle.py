@@ -14,7 +14,6 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_room import _serve_room, w  # noqa: F401  (fixture)
 from tests.test_cockpit_sign_card import DESKTOP, QRID, TOK, _Rig, needs_ssh
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_mic_page import _fake
 
 MIC_JS = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "mic.js"
