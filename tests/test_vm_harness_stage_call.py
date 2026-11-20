@@ -73,8 +73,8 @@ def test_the_two_copies_of_the_cd_words_are_equal_and_really_change_directory(tm
     assert SC.cd_run(str(d)) == host_profile.cd_run(str(d))
     r = subprocess.run([*host_profile.cd_run(str(d)), "/bin/pwd", "-P"], cwd="/", capture_output=True, text=True, timeout=30)
     assert r.returncode == 0 and r.stdout.strip() == os.path.realpath(d)     # the directory was a positional argument
-    bad = subprocess.run([*host_profile.cd_run(str(tmp_path / "missing")), "/usr/bin/true"], capture_output=True, text=True, timeout=30)
-    assert bad.returncode != 0 and "/usr/bin/true" not in bad.stdout          # a missing dir never runs the command
+    bad = subprocess.run([*host_profile.cd_run(str(tmp_path / "missing")), "/bin/echo", "RAN"], capture_output=True, text=True, timeout=30)
+    assert bad.returncode != 0 and "RAN" not in bad.stdout                    # a missing dir never runs the command
 
 
 # ---- J: provider_policy read: [] refused every contract ----------------------------------------------------------------------

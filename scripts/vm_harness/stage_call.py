@@ -75,7 +75,8 @@ def die(step: str, why: str, code: int = 1) -> "None":
 
 def run(argv, *, stdin=None, env=None, timeout=300):
     # cwd="/" : a command run as _levain_dispatch inherits admin's home as its cwd, which that account cannot read, and
-    # pathlib's cwd() then raises PermissionError (measured in the 11-18 guest sitting: stage-failed config-init).
+    # pathlib's cwd() then raises PermissionError (measured in the 11-18 guest sitting: stage-failed config-init). The
+    # dispatch-account argv builders below also run their command from the dispatch dir (cd_run), whatever cwd this gives.
     p = subprocess.run(list(argv), input=None if stdin is None else stdin.encode(), capture_output=True, env=env, timeout=timeout, cwd="/")
     return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
