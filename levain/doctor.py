@@ -184,6 +184,8 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_guarded("slot alarms", _check_slot_alarms))
     core.extend(_check_slot_keys())
     core.extend(_guarded(_BROKERED, lambda: _check_brokered_launcher(install)))
+    core.extend(_guarded("dispatch ceiling", _check_dispatch_ceiling))
+    core.extend(_guarded("TLS trust store", _check_tls_trust))
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
     core.extend(_guarded("queue answers", _check_queue_answers))
@@ -2036,6 +2038,93 @@ def _check_brokered_launcher(install: Path, *, host: str | None = None) -> list[
     return brokered_launcher_rows(
         setting, lambda: _api_key_links(install),
         lambda: T.read_ceiling(layout.policy_dispatch_ceiling_path(host)).max_reserved_microdollars_per_run)
+
+
+# --- the TLS trust store and the dispatch ceiling: two first-run facts a fresh install leaves unsaid (#198, #199) ---
+
+#: A python.org framework build's prefix; its installer ships no CA bundle until ``Install Certificates.command`` runs.
+_PYTHON_ORG_FRAMEWORK = "/Library/Frameworks/Python.framework/Versions/"
+
+
+def _tls_store_probe() -> dict:
+    """What the broker's own TLS context (``ssl.create_default_context()``) would trust: the CA certificates loaded now
+    and whether the default cafile or capath is readable (capath certificates load lazily, so a readable capath is a
+    store the count cannot show)."""
+    import ssl
+
+    stats = ssl.create_default_context().cert_store_stats()
+    paths = ssl.get_default_verify_paths()
+    capath = paths.capath
+    return {"x509_ca": int(stats.get("x509_ca", 0)),
+            "cafile_readable": bool(paths.cafile) and os.access(paths.cafile, os.R_OK),
+            "capath_readable": bool(capath) and os.path.isdir(capath) and os.access(capath, os.R_OK)
+                               and any(True for _ in os.scandir(capath))}
+
+
+def _check_tls_trust(*, probe: Any = None, version: tuple | None = None, prefix: str | None = None,
+                     platform: str | None = None) -> list[CheckResult]:
+    """The ``TLS trust store`` row: a Python whose default context trusts no CA cannot verify any server, so the
+    broker's HTTPS to a provider fails CERTIFICATE_VERIFY_FAILED. FAIL when the store is empty and no default cafile or
+    capath is readable; no row otherwise. The remedy names python.org's ``Install Certificates.command``, derived from
+    the running version, only for a python.org framework build (the one that ships it); any other Python gets words.
+    Verification itself is not touched. ``probe``/``version``/``prefix``/``platform``: a test's seams."""
+    name = "TLS trust store"
+    try:
+        got = (probe or _tls_store_probe)()
+        empty = got["x509_ca"] == 0 and not got["cafile_readable"] and not got["capath_readable"]
+    except Exception as exc:  # noqa: BLE001 - cannot tell is a warning, never a pass
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", warn=True)]
+    if not empty:
+        return []
+    major, minor = (version or sys.version_info[:2])[:2]
+    prefix = sys.base_prefix if prefix is None else prefix
+    detail = ("this Python trusts no certificate authority (no CA certificates loaded, no readable default cafile or "
+              "capath): the broker cannot verify any provider and its HTTPS fails CERTIFICATE_VERIFY_FAILED")
+    if (platform or sys.platform) == "darwin" and prefix.startswith(_PYTHON_ORG_FRAMEWORK):
+        hint = (f"Run \"/Applications/Python {major}.{minor}/Install Certificates.command\" once (python.org's "
+                "installer ships no CA bundle until it runs), then run doctor again.")
+    else:
+        hint = ("Install a CA bundle this Python can read (its default cafile or capath), or point SSL_CERT_FILE at "
+                "one, then run doctor again.")
+    return [CheckResult(name, False, detail, hint)]
+
+
+def _dispatch_ceiling_hint(host: str) -> str:
+    from levain.slot import layout
+    from levain.slot import tickets as T
+
+    doc = (f'{{"format":"{T.CEILING_FORMAT}","max_reserved_microdollars_per_run":1000000,'
+           '"max_open_tickets":4,"max_runs_per_day":50}')
+    return (f"The operator sets it, once, with the install helper; nothing writes it for you. Edit the three numbers "
+            f"(the per-run figure is in micro-dollars) and run: echo '{doc}' | sudo "
+            f"{layout.install_helper_path(host)} set-ceiling")   # type: ignore[arg-type]
+
+
+def _check_dispatch_ceiling(*, host: str | None = None, store: Path | None = None, owner: int = 0) -> list[CheckResult]:
+    """The ``dispatch ceiling`` row: ``L/policy/dispatch_ceiling`` is the operator's bound on dispatch and has no
+    default, so while it is absent or unusable every mint refuses ``ticket-ceiling:file``. A WARN (the install works,
+    nothing can dispatch yet) naming the ``set-ceiling`` invocation with a minimal document, whether or not any API-key
+    agent link stands: the refusal does not depend on one. Never writes the file. No row before the isolation install
+    or when the ceiling reads; the read is the ticket store's own (:func:`levain.slot.tickets.read_ceiling`), so the
+    row and mint cannot disagree. ``owner``: a test's seam (root in production)."""
+    from levain.slot import Refused, layout
+    from levain.slot import tickets as T
+
+    name = "dispatch ceiling"
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "policy").is_dir():
+        return []
+    path = store / "policy" / layout.policy_dispatch_ceiling_path(host).name
+    try:
+        T.read_ceiling(path, owner)
+    except Refused as exc:
+        return [CheckResult(name, True, f"{path} is absent or unusable ({exc.detail}): every mint refuses "
+                            "ticket-ceiling:file until it is set", _dispatch_ceiling_hint(host), warn=True)]
+    except OSError as exc:
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", warn=True)]
+    return []
 
 
 def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,
