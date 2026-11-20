@@ -45,8 +45,8 @@ class Rig:
     def client(self, factory: str = FACTORY, **kw: Any) -> DeriveChild:
         kw.setdefault("backoff_base_s", 0.3)
         kw.setdefault("term_grace_s", 2.0)
-        c = DeriveChild(factory, syspath=[TESTS_DIR], env=dict(os.environ, DERIVE_CHILD_STUB_DIR=str(self.tmp)),
-                        stderr=self.err, **kw)
+        c = DeriveChild(factory, syspath=[TESTS_DIR], stderr=self.err, **kw, env=dict(
+            os.environ, DERIVE_CHILD_STUB_DIR=str(self.tmp), DERIVE_CHILD_STUB_HELPERS="1", DERIVE_CHILD_STUB_SLOW_S="5"))
         self.clients.append(c)
         return c
 

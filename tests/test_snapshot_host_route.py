@@ -1,7 +1,7 @@
 """Routing heavy panels to the warm derive child (levain#157 S4b): which panels go, what a failure of the child becomes, when a
 panel is promoted and demoted by its measured duration, and the wiring (a factory, the child closed with the host).
 
-Most tests use ``FakeChild``, an object with the client's two methods that spawns nothing and records what it was asked.
+Most tests use ``FakeChild``, an object with the client's surface that spawns nothing and records what it was asked.
 The tests that need a process use the S4a stub factory (``test_derive_child_stub``) and nothing else; each cleans its
 processes up in a ``finally``."""
 
@@ -49,16 +49,25 @@ def ok_answer(pid: str, timeout_s: float) -> ChildAnswer:
 
 
 class FakeChild:
-    """The client's surface (``derive``, ``close``) with no process behind it. ``answer`` makes each reply."""
+    """The client's surface (``derive``, ``knows``, ``warm``, ``close``) with no process behind it. ``answer`` makes each
+    reply; ``known`` is the set of panels its (imagined) factory built, None meaning every panel."""
 
-    def __init__(self, answer: "Callable[[str, float], ChildAnswer] | None" = None) -> None:
+    def __init__(self, answer: "Callable[[str, float], ChildAnswer] | None" = None, known: "set[str] | None" = None) -> None:
         self.answer = answer or ok_answer
+        self.known = known
         self.calls: list[tuple[str, float]] = []
         self.closed = 0
+        self.warmed = 0
 
     def derive(self, panel_id: str, timeout_s: float) -> ChildAnswer:
         self.calls.append((panel_id, timeout_s))
         return self.answer(panel_id, timeout_s)
+
+    def knows(self, panel_id: str) -> bool:
+        return self.known is None or panel_id in self.known
+
+    def warm(self) -> None:
+        self.warmed += 1
 
     def close(self) -> None:
         self.closed += 1
@@ -67,8 +76,14 @@ class FakeChild:
         return [p for p, _ in self.calls]
 
 
-def lost(kind: str) -> ChildAnswer:
-    return ChildAnswer(None, None, None, None, kind, f"the child {kind}")
+def lost(kind: str, hung: bool = False) -> ChildAnswer:
+    return ChildAnswer(None, None, None, None, kind, f"the child {kind}", hung)
+
+
+def timed(ms: "list[int]") -> "Callable[[str, float], ChildAnswer]":
+    """Answers that each say the derive took the next number of milliseconds (the last one repeats)."""
+    left = list(ms)
+    return lambda pid, t: ChildAnswer("ok", dict(MARK, panel=pid), None, left.pop(0) if len(left) > 1 else left[0])
 
 
 class Timer:
@@ -268,8 +283,9 @@ def test_a_failure_after_stop_is_an_error_row_not_a_derive_here(make_host):
 # ------------------------------------------------------------------------------------------------ the promotion rule
 
 
-def _light(make_host, ms: "list[float]") -> "tuple[SnapshotHost, FakeChild]":
-    child = FakeChild()
+def _light(make_host, ms: "list[float]", child_ms: "list[int] | None" = None) -> "tuple[SnapshotHost, FakeChild]":
+    """A host whose in-process derives take ``ms`` (its timer) and whose child says its derives take ``child_ms``."""
+    child = FakeChild(timed(child_ms) if child_ms else None)
     return make_host(derive_child=child, timer=Timer(ms)), child
 
 
@@ -300,7 +316,7 @@ def test_a_promotion_needs_every_one_of_the_last_three_over_the_bound(make_host)
 
 
 def test_a_promoted_panel_returns_after_three_fast_derives_and_not_before(make_host):
-    host, _ = _light(make_host, [300, 300, 300, 100, 100, 100, 100])
+    host, _ = _light(make_host, [300, 300, 300], child_ms=[100])
     for _ in range(3):
         host._derive("count")
     assert host._routed("count")
@@ -318,7 +334,7 @@ def test_between_the_two_bounds_a_panel_stays_where_it_is(make_host):
     for _ in range(6):
         here._derive("count")
     assert not here._routed("count")
-    routed, _ = _light(make_host, [300, 300, 300] + [200] * 6)
+    routed, _ = _light(make_host, [300, 300, 300], child_ms=[200])
     for _ in range(9):
         routed._derive("count")
     assert routed._routed("count")
@@ -326,10 +342,14 @@ def test_between_the_two_bounds_a_panel_stays_where_it_is(make_host):
 
 def test_the_named_heavy_panels_stay_routed_however_fast_they_are(make_host):
     child = FakeChild()
-    host = make_host(heavy={"fast"}, derive_child=child, timer=Timer([5.0] * 6))
+    host = make_host(heavy={"fast"}, derive_child=FakeChild(timed([5])), timer=Timer([5.0] * 6))
     for _ in range(6):
         host._derive("fast")
-    assert host._routed("fast") and child.asked() == ["fast"] * 6
+    assert host._routed("fast") and host._windows == {}, "a named heavy panel is routed always and is not even measured"
+    host2 = make_host(heavy={"fast"}, derive_child=child)
+    for _ in range(6):
+        host2._derive("fast")
+    assert child.asked() == ["fast"] * 6
 
 
 def test_a_host_with_no_child_keeps_no_durations_and_promotes_nothing(make_host):
@@ -414,7 +434,10 @@ class Procs:
             except Exception:  # noqa: BLE001
                 pass
             if c._proc is not None:
-                os.killpg(c._proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(c._proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         for pid in self.pids:
             if _alive(pid):
                 try:
@@ -444,6 +467,7 @@ def test_a_row_made_by_the_child_is_the_row_the_in_process_host_makes(make_host,
     in-process host's, byte for byte, over an ok, a partial and an error status."""
     heavy = {"fast", "partial", "explode"}
     c = procs.client()
+    assert c.start(30.0)
     routed = make_host(heavy=heavy, derive_child=c)
     here = make_host()
     routed.run_once()
@@ -458,6 +482,7 @@ def test_a_row_made_by_the_child_is_the_row_the_in_process_host_makes(make_host,
 
 def test_a_routed_panel_really_runs_in_another_process_and_a_light_one_in_this(make_host, procs):
     c = procs.client()
+    assert c.start(30.0)
     host = make_host(heavy={"pid"}, derive_child=c)
     host.run_once()
     procs.note(c)
@@ -469,6 +494,7 @@ def test_a_routed_panel_really_runs_in_another_process_and_a_light_one_in_this(m
 
 def test_a_hung_heavy_derive_is_killed_at_its_deadline_the_loop_publishes_its_timeout_row_and_the_next_derive_gets_a_fresh_child(make_host, procs):
     c = procs.client()
+    assert c.start(30.0)
     ck = stub.factory()
     real_spec = ck.spec
     ck.spec = lambda pid, **kw: (dataclasses.replace(real_spec(pid), timeout_s=1.0) if pid == "hang" else real_spec(pid, **kw))  # type: ignore[method-assign]
@@ -488,6 +514,13 @@ def test_a_hung_heavy_derive_is_killed_at_its_deadline_the_loop_publishes_its_ti
         assert 0.9 <= took < 20.0, f"killed at the deadline, not long after: {took:.2f}s"
         assert not _alive(old), "the child that held the hung derive is gone"
         assert host.child_fallbacks == 0, "a timeout is not run again in this process"
+        ran: list[str] = []
+        real = host._cockpit.derive_panel
+        host._cockpit.derive_panel = lambda pid: (ran.append(pid), real(pid))[1]       # type: ignore[method-assign]
+        again = host._derive("hang")            # inside the client's backoff: refused, and still not run here
+        assert again.status == "timeout" and "still running after 1 s" in (again.error or "")
+        assert ran == [] and host.child_fallbacks == 0, "the hung panel's provider never ran in this process"
+        host._cockpit.derive_panel = real       # type: ignore[method-assign]
         procs.skip_backoff()               # the client's backoff, on its injected clock
         flag.unlink()
         assert host._derive("count").body["rows"][0]["title"] == "call 1", "a fresh child counts from one"
@@ -499,19 +532,22 @@ def test_a_hung_heavy_derive_is_killed_at_its_deadline_the_loop_publishes_its_ti
         flag.unlink(missing_ok=True)
 
 
-def test_a_child_that_cannot_start_leaves_every_derive_to_run_here_and_each_is_counted(make_host, procs):
+def test_a_child_that_cannot_start_leaves_every_derive_to_run_here(make_host, procs):
     """A child that is dead (its factory cannot build), and then refused inside its backoff, never makes the serve worse
-    than the thread host: the panel still derives, here."""
+    than the thread host: the panel still derives, here. The child never held the panel, so it is never routed (no fallback
+    is counted: nothing was asked)."""
     c = procs.client(factory="test_derive_child_stub:failing_factory")
+    assert c.start(30.0) is False
     host = make_host(heavy={"fast"}, derive_child=c)
     first = host._derive("fast")
-    assert first.status == "ok" and host.child_fallbacks == 1
-    second = host._derive("fast")                           # inside the backoff: refused, nothing is started
-    assert second == first and host.child_fallbacks == 2 and c.pid is None
+    assert first.status == "ok" and host.child_fallbacks == 0
+    second = host._derive("fast")                           # inside the backoff: nothing is started
+    assert second == first and c.pid is None
 
 
 def test_a_child_killed_between_derives_is_replaced_without_a_fallback(make_host, procs):
     c = procs.client()
+    assert c.start(30.0)
     host = make_host(heavy={"count"}, derive_child=c)
     host._derive("count")
     old = procs.note(c)
@@ -525,6 +561,7 @@ def test_a_child_killed_between_derives_is_replaced_without_a_fallback(make_host
 
 def test_stopping_the_host_leaves_no_child_process(make_host, procs):
     c = procs.client()
+    assert c.start(30.0)
     host = make_host(heavy={"count"}, derive_child=c)
     host._derive("count")
     pid = procs.note(c)
@@ -570,7 +607,8 @@ def test_a_server_with_a_factory_opens_a_host_that_owns_a_child_and_closing_it_l
         httpd._open_snapshot_host(stub.factory())
         host = httpd._snapshot_host
         assert host is not None and isinstance(host._child, DeriveChild)
-        assert host._child.pid is None, "the child starts on the first heavy derive, not when the host opens"
+        assert host._child.start(30.0), "the host warmed its child when it started: the panels it holds are known"
+        assert host._child.knows("pid")
         ans = host._child.derive("pid", 30.0)
         assert ans.failure is None
         pid = host._child.pid
@@ -629,3 +667,155 @@ def test_a_store_another_writer_holds_closes_the_child_made_for_the_host_that_di
     finally:
         holder.close()
         httpd.server_close()
+
+
+# ------------------------------------------------------------------------------------------------ L3 round 1: the fixes
+
+
+def test_a_panel_the_child_does_not_hold_is_never_routed_or_promoted(make_host):
+    """The child serves only what its factory built. A heavy panel, or a slow one, that the child's ready frame does not list
+    derives here every time and is never promoted (before: it was routed, the child answered "no longer registered" and that was
+    published as the panel's row)."""
+    child = FakeChild(known={"fast"})
+    host = make_host(heavy={"fast", "partial"}, derive_child=child, timer=Timer([900.0] * 9))
+    assert [host._routed(p) for p in ("fast", "partial")] == [True, False]
+    assert host._derive("partial").status == "partial"
+    for _ in range(3):
+        host._derive("count")                       # slow, and not held by the child
+    assert not host._routed("count") and "count" not in host.routed_panels() and host._windows == {}
+    assert child.asked() == [] and child.warmed >= 1, "an unknown panel starts the child's warm-up and runs here meanwhile"
+
+
+def test_a_child_that_says_it_lacks_a_panel_is_no_verdict_on_the_panel(make_host):
+    """If the child answers "the panel is no longer registered" for a panel the parent has, that is a failed ask: this derive
+    runs here (counted), the panel is not routed again, and the loop is never told to retire it."""
+    child = FakeChild(lambda p, t: ChildAnswer("error", None, None, 1, None, sh.UNREGISTERED_TEXT))
+    host = make_host(heavy={"fast"}, derive_child=child)
+    res = host._derive("fast")
+    assert res.status == "ok" and [r["title"] for r in res.body["rows"]] == ["row 1", "row 2", "row 3"]
+    assert host.child_fallbacks == 1 and not host._routed("fast") and host._cockpit.spec("fast") is not None
+    assert "fast" in {p.id for p in host._plans()} and "fast" in host.loop._plans, "the loop still derives it"
+    host._derive("fast")
+    assert child.asked() == ["fast"], "asked once, then never again"
+
+
+def test_a_hung_panel_is_not_run_here_while_the_child_backs_off(make_host):
+    """After a timeout that killed the child, the panel's next derives are refused by the client; they answer the timeout row
+    and never run the provider in this process. A refusal for a panel that did not hang, or any other failure, still falls back."""
+    seq = iter([lost("timeout", hung=True), lost("refused"), lost("refused"), lost("died"), lost("refused")])
+    child = FakeChild(lambda p, t: next(seq))
+    host = make_host(heavy={"fast"}, derive_child=child)
+    ran: list[str] = []
+    real = host._cockpit.derive_panel
+    host._cockpit.derive_panel = lambda pid: (ran.append(pid), real(pid))[1]       # type: ignore[method-assign]
+    for _ in range(3):
+        res = host._derive("fast")
+        assert res.status == "timeout" and "still running after" in (res.error or "")
+    assert ran == [] and host.child_fallbacks == 0
+    assert host._derive("fast").status == "ok" and ran == ["fast"] and host.child_fallbacks == 1      # died: a crash falls back
+    assert host._derive("fast").status == "ok" and host.child_fallbacks == 2, "the hang is forgotten once the child answered otherwise"
+
+
+def test_a_timeout_that_was_only_a_wait_is_not_a_hang(make_host):
+    """A turn wait or a cold start that ran out (``hung`` False) kills nothing, so a later refusal falls back as usual."""
+    seq = iter([lost("timeout"), lost("refused")])
+    host = make_host(heavy={"fast"}, derive_child=FakeChild(lambda p, t: next(seq)))
+    assert host._derive("fast").status == "timeout"
+    assert host._derive("fast").status == "ok" and host.child_fallbacks == 1
+
+
+def test_stop_racing_a_routed_derive_leaves_the_last_good_row(make_host):
+    """``stop`` closes the child under a derive that is waiting on it; the synthetic "host is stopping" result is not stored
+    over the panel's last good row (before: the loop published it as the panel's error)."""
+    import threading
+
+    from levain.cockpit.snapshots import SnapshotReader
+
+    entered, release = threading.Event(), threading.Event()
+    mode = {"hold": False}
+
+    def answer(pid: str, t: float) -> ChildAnswer:
+        if mode["hold"] and pid == "fast":
+            entered.set()
+            release.wait(20)
+            return lost("died")
+        return ChildAnswer("ok", {"v": 1, "marker": "child"}, None, 5)
+
+    child = FakeChild(answer)
+    child.close = lambda: (child.__setattr__("closed", child.closed + 1), release.set())[1]       # type: ignore[method-assign]
+    host = make_host(heavy={"fast"}, derive_child=child)
+    host.run_once()
+    good = host.reader.read("fast")
+    assert good is not None and good.status == "ok"
+    mode["hold"] = True
+    host.loop.dirty(["fast"], 1)
+    host.start()
+    assert entered.wait(20), "the routed derive is waiting on the child"
+    assert host.stop(timeout=20) == []
+    after = SnapshotReader(host._writer.path).read("fast")
+    assert after is not None and after.status == "ok" and after.error is None and after.body_sha == good.body_sha
+    assert "stopping" not in (after.error or ""), after
+
+
+def test_only_servable_ids_are_remembered_and_they_are_dropped_when_they_leave_the_plan_set(make_host):
+    """2,000 ids that a retiring discoverer comes and goes with, each slow, are neither measured nor promoted; and a panel
+    that was promoted is forgotten when it leaves the plan set (so an id reused later starts clean)."""
+    ck = Cockpit()
+    ck.register(_simple("plain"))
+    ids = [0]
+
+    def discoverer(ctx):
+        ids[0] += 1
+        return [_simple(f"d{ids[0] * 1000 + n}") for n in range(50)]
+
+    ck.discover(discoverer, retire=True)
+    child = FakeChild()
+    host = make_host(ck, derive_child=child, timer=Timer([900.0] * 3000))
+    seen = set()
+    for _ in range(50):
+        host._derive_discovery()
+        for pid in list(ck.panel_ids):
+            if pid.startswith("d"):
+                seen.add(pid)
+                host._derive(pid)
+    assert len(seen) >= 2000
+    assert host._windows == {} and host._promoted == set() and host._child_lacks == set() and host._hung == set()
+    # a servable panel IS measured and promoted, then forgotten when it leaves the plan set
+    for _ in range(3):
+        host._derive("plain")
+    assert "plain" in host._promoted and "plain" in host._windows
+    ck.unregister("plain")
+    host._derive_discovery()
+    assert "plain" not in host._promoted and "plain" not in host._windows
+
+
+def test_the_childs_ready_list_gates_a_real_child_too(make_host, procs):
+    """With a real child: a panel its factory built is routed; one the parent registered on its own (the factory never saw
+    it) is not, however slow, and the heavy name does not change that."""
+    c = procs.client()
+    assert c.start(30.0)
+    ck = stub.factory()
+    ck.register(_simple("only_here"))
+    host = make_host(ck, heavy={"fast", "only_here"}, derive_child=c)
+    assert host._routed("fast") and not host._routed("only_here")
+    res = host._derive("only_here")
+    assert res.status in ("ok", "empty") and "marker" not in (res.body or {}) and host.child_fallbacks == 0
+
+
+# ------------------------------------------------------------------------------------------------ make_server: the environment never overrides an argument
+
+
+def test_an_explicit_empty_argument_is_not_overridden_by_the_environment(tmp_path: Path, monkeypatch):
+    from levain.web_server import _resolve_derive_child
+
+    env = {COCKPIT_DERIVE_FACTORY_ENV: "m:envf", COCKPIT_DERIVE_SYSPATH_ENV: "/x"}
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert _resolve_derive_child(None, None) == ("m:envf", ("/x",))
+    assert _resolve_derive_child("", None) == (None, ()), "an empty factory is an explicit none"
+    assert _resolve_derive_child("m:arg", None) == ("m:arg", ()), "the environment's directories belong to the environment's factory"
+    assert _resolve_derive_child("m:arg", ()) == ("m:arg", ())
+    assert _resolve_derive_child("m:arg", ["/q", ""]) == ("m:arg", ("/q",))
+    assert _resolve_derive_child(None, ("/own",)) == ("m:envf", ("/own",))
+    monkeypatch.setenv(COCKPIT_DERIVE_FACTORY_ENV, "   ")
+    assert _resolve_derive_child(None, None) == (None, ()), "a blank factory in the environment is no factory"

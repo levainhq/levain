@@ -6217,6 +6217,22 @@ def _stat_sig(path: Any) -> "tuple[int, int] | None":
     return st.st_mtime_ns, st.st_size
 
 
+def _resolve_derive_child(factory: "str | None", syspath: "Iterable[str] | None") -> "tuple[str | None, tuple[str, ...]]":
+    """``(factory, syspath)`` for the warm derive child: an argument that was passed (even an empty one) wins over the
+    environment, a factory with no text is no factory, and the environment's directories go only with the environment's factory."""
+    from_env = factory is None
+    if from_env:
+        factory = os.environ.get(COCKPIT_DERIVE_FACTORY_ENV)
+    factory = factory.strip() if isinstance(factory, str) else None
+    if not factory:
+        return None, ()
+    if syspath is not None:
+        return factory, tuple(str(d) for d in syspath if d)
+    if from_env:
+        return factory, tuple(d for d in os.environ.get(COCKPIT_DERIVE_SYSPATH_ENV, "").split(os.pathsep) if d)
+    return factory, ()
+
+
 def make_server(
     source: SubstrateSource,
     *,
@@ -6247,7 +6263,7 @@ def make_server(
     watch_paths: "Iterable[str | Path] | None" = None,
     host_grants: "HostGrantSurface | None" = None,
     derive_factory: "str | None" = None,
-    derive_syspath: "tuple[str, ...]" = (),
+    derive_syspath: "Iterable[str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -6266,8 +6282,10 @@ def make_server(
 
     ``derive_factory`` (``MODULE:CALLABLE``, a factory returning an unstarted cockpit) and ``derive_syspath`` (directories
     put on the child's ``sys.path`` first) name the warm child process that attached mode (``LEVAIN_COCKPIT_SNAPSHOTS=1``)
-    derives its heavy panels in. ``None`` takes ``LEVAIN_COCKPIT_DERIVE_FACTORY`` (and ``LEVAIN_COCKPIT_DERIVE_SYSPATH``,
-    ``os.pathsep``-separated); with no factory no child exists and every panel derives in this process.
+    derives its heavy panels in. ``None`` (the default) takes ``LEVAIN_COCKPIT_DERIVE_FACTORY`` (and, only when the factory
+    too came from there, ``LEVAIN_COCKPIT_DERIVE_SYSPATH``, ``os.pathsep``-separated: the directories belong to the factory
+    they name); an empty string or an empty ``derive_syspath`` is an explicit "none" that the environment does not override.
+    With no factory no child exists and every panel derives in this process.
 
     ``extra_assets`` / ``extra_json`` are the READ-ONLY extension point a downstream
     control plane uses to register additional GET views that ride this server's
@@ -6696,9 +6714,7 @@ def make_server(
     httpd.cockpit = cockpit
     # Attached mode's warm derive child (levain.cockpit.derive_child): the argument, else the environment, else none. It
     # only matters when attached mode is on (COCKPIT_SNAPSHOTS_ENV); a server with no factory runs no child.
-    httpd.derive_factory = derive_factory or os.environ.get(COCKPIT_DERIVE_FACTORY_ENV) or None
-    httpd.derive_syspath = tuple(derive_syspath) or tuple(
-        d for d in os.environ.get(COCKPIT_DERIVE_SYSPATH_ENV, "").split(os.pathsep) if d)
+    httpd.derive_factory, httpd.derive_syspath = _resolve_derive_child(derive_factory, derive_syspath)
     httpd.work_board = work_board
     httpd.chat_service = chat_service
     httpd.room_host = room_host

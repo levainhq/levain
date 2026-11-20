@@ -10,8 +10,9 @@ The panels and what each is for:
   explode  a panel whose ``derive_panel`` itself raises (an exception out of the derive, which no provider can make)
   chatty   a provider that writes to stdout (``print`` and a raw write to fd 1) while it reads
   pid      the child's pid and the engine file it imported, as a row
-  grandchild  starts a subprocess that ignores SIGTERM (its pid is written to ``grandchild.pid`` under the stub dir) and returns
-  slow5    reads for five seconds whatever the flags say (a derive that takes longer than a short deadline, never forever)
+  grandchild  starts a subprocess that ignores SIGTERM (its pid is written to ``grandchild.pid`` under the stub dir) and returns;
+           only when ``$DERIVE_CHILD_STUB_HELPERS`` is 1, which a test sets in the env of the client it starts
+  slow5    reads for ``$DERIVE_CHILD_STUB_SLOW_S`` seconds (a derive that takes longer than a short deadline, never forever)
 
 Other factories: ``slow_factory`` (starts the same SIGTERM-proof subprocess, then takes ``$DERIVE_CHILD_STUB_FACTORY_SLEEP``
 seconds to build), ``many_factory`` (more panels than the ready frame may list) and ``failing_factory``.
@@ -89,11 +90,15 @@ def _grandchild_start() -> int:
 
 
 def _grandchild(ctx):
+    # only a child a test started for the purpose (its client sets the variable) makes a helper: an in-process host that
+    # derives every panel must not leave one running
+    if os.environ.get("DERIVE_CHILD_STUB_HELPERS") != "1":
+        return Read(rows=(_row(1, "no helper"),))
     return Read(rows=(_row(1, f"grandchild {_grandchild_start()}"),))
 
 
 def _slow5(ctx):
-    time.sleep(5.0)
+    time.sleep(float(os.environ.get("DERIVE_CHILD_STUB_SLOW_S", "0")))
     return Read(rows=(_row(1, "slow"),))
 
 
