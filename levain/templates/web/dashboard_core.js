@@ -2787,6 +2787,10 @@
     const hit = names.find((n) => String(n).toLowerCase() === w);
     return hit === undefined ? "" : String(hit);
   }
+  // The field the page itself last gave the keyboard back to after a draw (restoreField sets it). A window without system focus
+  // takes focus() at once but raises the focus event only when it gains focus, so the listener below cannot tell a restore from a
+  // reader's tap by when the event arrives: it asks which element it is. The reader's next press, key or blur on that field ends it.
+  let restoredEl = null;
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");
     const row = el("div", "list-intake-row");
@@ -2842,12 +2846,18 @@
     };
     input.addEventListener("input", () => { intakeKept.draft = input.value; });
     input.addEventListener("keydown", (ev) => {
+      if (restoredEl === input) restoredEl = null;
       if (ev.key === "Enter" && !ev.isComposing && !ev.shiftKey) { ev.preventDefault(); submit(); }
     });
+    input.addEventListener("pointerdown", () => { if (restoredEl === input) restoredEl = null; });
+    input.addEventListener("blur", () => { if (restoredEl === input) restoredEl = null; });
     // a phone keyboard rises over the lower half: bring the box to the middle of what is left
-    input.addEventListener("focus", () => {
-      if (restoringField) return;   // the page's own refocus after a draw is not the reader's: the page stays where they left it
-      setTimeout(() => { try { box.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* a convenience only */ } }, 300);
+    input.addEventListener("focus", (ev) => {
+      if (ev.target === restoredEl) return;   // the page's own refocus after a draw is not the reader's: the page stays where they left it
+      setTimeout(() => {
+        if (!box.isConnected || document.activeElement !== input) return;   // a draw or a move on since: nothing left to bring to the middle
+        try { box.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* a convenience only */ }
+      }, 300);
     });
     go.addEventListener("click", submit);
     // a rebuilt box carries the last receipt and the unsent line
@@ -10332,15 +10342,14 @@
     } catch (e) { fieldWarn(e); return null; }
   }
   // Focus, selection and scroll only: the value is never put back (a write that cleared the field must stay cleared).
-  let restoringField = false;   // true only while restoreField gives the keyboard back (a focus listener reads it)
   function restoreField(f) {
     try {
       if (!f || document.activeElement === f.el && f.el.isConnected) return;
       let t = null;
       try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
       if (!t || !isTextField(t)) return;
-      restoringField = true;
-      try { t.focus({ preventScroll: true }); } finally { restoringField = false; }
+      restoredEl = t;
+      t.focus({ preventScroll: true });
       try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
       if (f.st) t.scrollTop = f.st;
     } catch (e) { fieldWarn(e); }

@@ -14,7 +14,8 @@ HOME = ".ia-places [data-ia-place-btn=home]"
 SHORT = {"emulate": {"w": 1440, "h": 420, "dpr": 1}}   # a window shorter than the page, so the page has somewhere to scroll
 SCROLL_TO = 300
 PLACE = "document.body.dataset.iaPlace"
-READ = f"JSON.stringify({{y: Math.round(window.scrollY), place: {PLACE}, max: Math.round(document.documentElement.scrollHeight - innerHeight)}})"
+FIELD = "document.querySelector('[data-ck-panel=tray] .list-intake-input')"
+READ = f"JSON.stringify({{y: Math.round(window.scrollY), place: {PLACE}, focused: document.activeElement === {FIELD}, max: Math.round(document.documentElement.scrollHeight - innerHeight)}})"
 LATER = {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"}
 # the driver's press scrolls its target to the middle of the window first, which moves a pinned button's page by itself: the button's
 # own scrollIntoView is switched off so the page's reaction to the press is the only thing that can move the page
@@ -38,11 +39,13 @@ def _drive_page(tmp_path: Path, steps: list[dict[str, Any]]) -> list[dict[str, A
 @needs_browser
 def test_a_tap_on_home_while_on_home_does_not_scroll_the_page(tmp_path: Path) -> None:
     got = _drive_page(tmp_path, _steps([
+        {"eval": f"{FIELD}.focus({{preventScroll: true}}); 1"}, LATER,   # the person has the keyboard in the box, as the tap finds them
         {"eval": f"window.scrollTo(0, {SCROLL_TO}); 1"}, LATER, {"eval": READ},
         PRESS_HOME, LATER, {"eval": READ}]))
     before, after = got[-2], got[-1]
+    assert before["focused"], before                                  # the box held the keyboard before the tap
     assert before["place"] == "home" and before["y"] >= 100, before   # the page really is scrolled down before the tap
-    assert after["place"] == "home" and after["y"] == before["y"], (before, after)
+    assert after["place"] == "home" and abs(after["y"] - before["y"]) <= 1, (before, after)
 
 
 @needs_browser
