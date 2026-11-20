@@ -1981,7 +1981,6 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now until a saved layout says otherwise) */
-/* the repo chip a row carries (dashboard_core.js) is hidden in a row unless a place draws it (the Tray, the List); the Results rows' outcome dot follows */
 /* the repo chip a row carries (dashboard_core.js) is drawn only where a place shows it; the Results rows and the Work zone heading follow */
 .row > .k7-repo { display: none; }
 .k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
@@ -2789,19 +2788,19 @@ body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.
 /* The same draw in the chat panel's reply, the thread view's agent line and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
    preserved, the blocks carry their own breaks, code is mono and wraps or scrolls inside the column. */
 .chat-text.rv-md, .sess-text.rv-md { white-space: normal; }
-.chat-text.rv-md > :first-child, .tv-body.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
-.chat-text.rv-md > :last-child, .tv-body.rv-md > :last-child, .sess-text.rv-md > :last-child { margin-bottom: 0; }
+.chat-text.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
+.chat-text.rv-md > :last-child, .sess-text.rv-md > :last-child { margin-bottom: 0; }
 .chat-text.rv-md .md-p, .chat-text.rv-md .md-ul, .chat-text.rv-md .md-ol, .chat-text.rv-md .md-quote, .chat-text.rv-md .md-pre,
-.tv-body.rv-md .md-p, .sess-text.rv-md .md-p, .tv-body.rv-md .md-ul, .sess-text.rv-md .md-ul, .tv-body.rv-md .md-ol, .sess-text.rv-md .md-ol, .tv-body.rv-md .md-quote, .sess-text.rv-md .md-quote, .tv-body.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-bottom: var(--sp-3); }
-.chat-text.rv-md .md-h, .tv-body.rv-md .md-h, .sess-text.rv-md .md-h { margin: var(--sp-4) 0 var(--sp-2); color: var(--text); line-height: 1.35; text-transform: none; letter-spacing: normal; }
-.chat-text.rv-md .md-h1, .tv-body.rv-md .md-h1, .sess-text.rv-md .md-h1 { font-size: 1.3em; }
-.chat-text.rv-md .md-h2, .tv-body.rv-md .md-h2, .sess-text.rv-md .md-h2 { font-size: 1.15em; }
+.sess-text.rv-md .md-p, .sess-text.rv-md .md-ul, .sess-text.rv-md .md-ol, .sess-text.rv-md .md-quote, .sess-text.rv-md .md-pre { margin-bottom: var(--sp-3); }
+.chat-text.rv-md .md-h, .sess-text.rv-md .md-h { margin: var(--sp-4) 0 var(--sp-2); color: var(--text); line-height: 1.35; text-transform: none; letter-spacing: normal; }
+.chat-text.rv-md .md-h1, .sess-text.rv-md .md-h1 { font-size: 1.3em; }
+.chat-text.rv-md .md-h2, .sess-text.rv-md .md-h2 { font-size: 1.15em; }
 .chat-text.rv-md .md-h3, .chat-text.rv-md .md-h4, .chat-text.rv-md .md-h5, .chat-text.rv-md .md-h6,
-.tv-body.rv-md .md-h3, .sess-text.rv-md .md-h3, .tv-body.rv-md .md-h4, .sess-text.rv-md .md-h4, .tv-body.rv-md .md-h5, .sess-text.rv-md .md-h5, .tv-body.rv-md .md-h6, .sess-text.rv-md .md-h6 { font-size: 1em; }
-.chat-text.rv-md .md-code-i, .tv-body.rv-md .md-code-i, .sess-text.rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
-.chat-text.rv-md .md-pre, .tv-body.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
-.chat-text.rv-md .md-link, .tv-body.rv-md .md-link, .sess-text.rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }
-.chat-text.rv-md .md-quote, .tv-body.rv-md .md-quote, .sess-text.rv-md .md-quote { color: var(--label); }
+.sess-text.rv-md .md-h3, .sess-text.rv-md .md-h4, .sess-text.rv-md .md-h5, .sess-text.rv-md .md-h6 { font-size: 1em; }
+.chat-text.rv-md .md-code-i, .sess-text.rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.chat-text.rv-md .md-pre, .sess-text.rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
+.chat-text.rv-md .md-link, .sess-text.rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }
+.chat-text.rv-md .md-quote, .sess-text.rv-md .md-quote { color: var(--label); }
 
 /* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
    is one fixed box of the visual viewport's height (room_view.js keeps --rv-vvh / --rv-vvt), so the page itself never scrolls and the
