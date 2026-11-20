@@ -190,7 +190,9 @@ class DeriveChild:
         """Bring the child up and wait at most ``timeout_s`` for it to be ready. True when it is. Never raises; a failure that
         costs a child is counted like any other (the backoff applies). A ``timeout_s`` that is the client's ``ready_timeout_s``
         or more (what ``warm`` asks) waits through the child's own ready bound: a child still not ready at that bound is killed
-        and backed off, as it is for any ask. A shorter one is a wait only: a child still building is left to build."""
+        and backed off, as it is for any ask. That call is bounded by ``timeout_s`` for the turn, then the ready bound counted
+        from the spawn, then the ending of a child that failed (see ``derive``): not by ``timeout_s`` alone. A shorter
+        ``timeout_s`` is a wait only: a child still building is left to build."""
         if not _valid_timeout(timeout_s):
             return False
         acquired = False
@@ -237,9 +239,10 @@ class DeriveChild:
         """Ask the child to derive ``panel_id``. ``timeout_s`` (a positive finite number: anything else, an integer too big
         for a float included, is ``refused`` and touches nothing) bounds the wait for the turn, the start and the answer
         together, counted from this moment. The call returns by then, except that a failure that ENDS the child takes the
-        ending too: SIGTERM, up to ``term_grace_s`` for a child that will not leave, then SIGKILL and the reap. So the real
-        worst case is ``timeout_s`` plus ``term_grace_s`` (a leader that ignores SIGTERM costs the whole grace; one that is
-        stuck in the kernel after SIGKILL is left to a reaper and does not hold the call). Never raises."""
+        ending too: SIGTERM, up to ``term_grace_s`` for a child that will not leave, then SIGKILL and the reap, which waits at
+        most ``_REAP_BOUND_S`` before the leader is left to a reaper thread. So the real worst case is ``timeout_s`` plus
+        ``term_grace_s`` plus ``_REAP_BOUND_S`` (a leader that ignores SIGTERM costs the whole grace; one stuck in the kernel
+        after SIGKILL costs the reap bound and then does not hold the call). Never raises."""
         if not _valid_timeout(timeout_s):
             return _lost_answer("refused", f"timeout_s must be a finite number over 0, not {timeout_s!r}")
         acquired = False
@@ -341,7 +344,8 @@ class DeriveChild:
             frame = self._frame(ready_deadline if through_ready else min(deadline, ready_deadline),
                                 f"the child was not ready in {self._ready_s:g}s")
         except _Lost as lost:
-            if lost.kind == "timeout" and self._clock() < ready_deadline:
+            # a ``through_ready`` wait ends at the ready bound by construction, so its timeout is that bound whatever the clock reads
+            if not through_ready and lost.kind == "timeout" and self._clock() < ready_deadline:
                 raise _Lost("timeout", "the child is still starting", costly=False) from None
             raise
         if not isinstance(frame, dict) or frame.get("op") not in ("ready", "fatal"):
