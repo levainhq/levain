@@ -92,6 +92,8 @@ REFUSALS = {
     "unknown-launcher": lambda w: ["--cockpit-root", str(w[1]), "--launcher", "no-such-launcher"],
     "unwired-is-not-a-launcher": lambda w: ["--cockpit-root", str(w[1]), "--launcher", "unwired"],
     "blank-launcher": lambda w: ["--cockpit-root", str(w[1]), "--launcher", " "],
+    "empty-launcher": lambda w: ["--cockpit-root", str(w[1]), "--launcher", ""],
+    "values-nested-too-deep": lambda w: ["--cockpit-root", str(w[1]), "--values", '{"a":' * 20000],
     "relative-episodic": lambda w: ["--cockpit-root", str(w[1]), "--episodic-path", "rel/episodes.db"],
     "episodic-is-a-directory": lambda w: ["--cockpit-root", str(w[1]), "--episodic-path", str(w[2])],
     "values-not-json": lambda w: ["--cockpit-root", str(w[1]), "--values", "{nope"],
@@ -227,3 +229,97 @@ def test_an_install_with_no_episodic_path_still_says_so_in_show_json(world, caps
     assert _run(store, capsys, "--cockpit-root", str(cockpit), "--launcher", "stub")[0] == 0
     _, doc = _show(store, capsys, "job_push_check")
     assert doc["episodes"] is None and "names no episodic_path" in doc["episodes_note"]
+
+
+# --- the dream install's cockpit root, the replaced root (P10b R1 review round) ----------------------------------------
+
+def _dream_install(store, root: Path) -> None:
+    from levain.dream import agent as DA
+    (root / "m.db").write_text("")
+    (store.directory / DA.INSTALL_FILE).write_text(json.dumps(
+        {"schema": DA.INSTALL_SCHEMA, "zone": "UTC", "cockpit_root": str(root), "coord_dir": str(root),
+         "store_path": str(root / "m.db")}))
+    assert DA.read_install(store.directory).cockpit_root == root
+
+
+def test_a_cockpit_root_other_than_the_dream_installs_is_refused_naming_both(world, capsys):
+    store, cockpit, tmp_path = world
+    other = tmp_path / "other"
+    other.mkdir()
+    _dream_install(store, other)
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit), "--launcher", "stub")
+    assert code == 1 and out == "" and err.startswith("levain agents session-install: ")
+    assert str(cockpit) in err and str(other) in err and "nothing written" in err
+    assert not _file(store).exists()
+
+
+def test_a_cockpit_root_other_than_the_dream_installs_leaves_the_previous_file(world, capsys):
+    store, cockpit, tmp_path = world
+    before, litter = _good(world, capsys)
+    _dream_install(store, cockpit)
+    other = tmp_path / "other"
+    other.mkdir()
+    code, _, err = _run(store, capsys, "--cockpit-root", str(other))
+    assert code == 1 and str(other) in err and str(cockpit) in err
+    assert _file(store).read_bytes() == before and _litter(store) == sorted(litter + ["dream_install.json"])
+
+
+def test_the_dream_installs_cockpit_root_is_written(world, capsys):
+    store, cockpit, tmp_path = world
+    _dream_install(store, cockpit)
+    assert _run(store, capsys, "--cockpit-root", str(cockpit), "--launcher", "stub")[0] == 0
+    link = tmp_path / "link"
+    link.symlink_to(cockpit)
+    code, _, err = _run(store, capsys, "--cockpit-root", str(link), "--launcher", "stub")
+    assert code == 0, err
+    assert W.read_install(store.directory).cockpit_root == link
+
+
+def test_an_unreadable_dream_install_does_not_bar_the_write(world, capsys):
+    from levain.dream import agent as DA
+    store, cockpit, _ = world
+    (store.directory / DA.INSTALL_FILE).write_text("{not json")
+    code, _, err = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert code == 0, err
+    assert W.read_install(store.directory).cockpit_root == cockpit
+
+
+def test_no_dream_install_writes(world, capsys):
+    store, cockpit, _ = world
+    code, _, err = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert code == 0 and err == "" and W.read_install(store.directory).cockpit_root == cockpit
+
+
+def test_a_changed_cockpit_root_is_named_as_replaced(world, capsys):
+    store, cockpit, tmp_path = world
+    other = tmp_path / "other"
+    other.mkdir()
+    assert _run(store, capsys, "--cockpit-root", str(cockpit))[0] == 0
+    code, out, _ = _run(store, capsys, "--cockpit-root", str(other))
+    assert code == 0 and f"replaced cockpit_root {cockpit} -> {other}" in out.splitlines()
+
+
+def test_the_same_cockpit_root_or_a_first_write_names_no_replacement(world, capsys):
+    store, cockpit, _ = world
+    _, first, _ = _run(store, capsys, "--cockpit-root", str(cockpit))
+    _, second, _ = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert "replaced" not in first and "replaced" not in second
+
+
+def test_an_unreadable_previous_install_names_no_replacement(world, capsys):
+    store, cockpit, _ = world
+    _file(store).write_text("{not json")
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert code == 0, err
+    assert "replaced" not in out and W.read_install(store.directory).cockpit_root == cockpit
+
+
+def test_a_too_deep_values_is_said_not_raised(world, capsys):
+    code, out, err = _run(world[0], capsys, "--cockpit-root", str(world[1]), "--values", '{"a":' * 20000)
+    assert code == 1 and out == "" and "recursion" in err and "nothing written" in err
+    assert not _file(world[0]).exists()
+
+
+def test_an_unknown_launcher_error_reads_as_a_list(world, capsys):
+    _, _, err = _run(world[0], capsys, "--cockpit-root", str(world[1]), "--launcher", "nope")
+    assert "registered launchers: stub" in err and " are " not in err

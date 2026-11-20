@@ -672,7 +672,8 @@ def _add_session_install_parsers(verbs: argparse._SubParsersAction) -> None:
         description="Write <store dir>/session_install.json, the one source of the launcher and the paths a session "
                     "agent may use, through session_wire.write_install. The file is replaced whole by what "
                     "these flags give; a call that is refused writes nothing and leaves the old file as it was. "
-                    "--launcher must name a registered launcher. Prints what it wrote. Give --store-dir before "
+                    "--launcher must name a registered launcher; --cockpit-root must be the one the store's "
+                    "dream install names, when it has one. Prints what it wrote. Give --store-dir before "
                     "`session-install`.")
     si.add_argument("--cockpit-root", dest="cockpit_root", type=Path, required=True,
                     help="The cockpit's data root (an absolute path to an existing directory).")
@@ -699,6 +700,18 @@ def _install_workspaces(entries) -> dict[str, dict[str, str]]:
     return out
 
 
+def _dream_cockpit_root(store_dir) -> Path | None:
+    """The cockpit root ``levain.dream.agent.read_install`` reads from the store's dream install, or None when that
+    file is absent or that reader refuses it."""
+    from levain.dream import agent as dream_agent
+    if not (Path(store_dir) / dream_agent.INSTALL_FILE).exists():
+        return None
+    try:
+        return dream_agent.read_install(store_dir).cockpit_root
+    except ValueError:
+        return None
+
+
 def run_session_install(args: argparse.Namespace) -> int:
     from levain.agents import session_wire
 
@@ -707,14 +720,23 @@ def run_session_install(args: argparse.Namespace) -> int:
         if values is not None and not isinstance(values, dict):
             raise ValueError("--values is not a JSON object")
         workspaces = _install_workspaces(args.workspace)
-    except ValueError as exc:      # json.JSONDecodeError is one
+    except (ValueError, RecursionError) as exc:      # json.JSONDecodeError is a ValueError
         return _fail("session-install", f"{exc} (nothing written)")
     if args.launcher is not None and args.launcher not in session_wire.LAUNCHERS:
-        return _fail("session-install", f"launcher {args.launcher!r} is not registered: "
-                                        f"{', '.join(sorted(session_wire.LAUNCHERS)) or 'none'} are (nothing written)")
+        return _fail("session-install", f"launcher {args.launcher!r} is not registered (registered launchers: "
+                                        f"{', '.join(sorted(session_wire.LAUNCHERS)) or 'none'}; nothing written)")
     store = _open(args)
     if store is None:
         return 1
+    dream_root = _dream_cockpit_root(store.directory)
+    if (dream_root is not None and args.cockpit_root.is_absolute()
+            and dream_root.resolve() != args.cockpit_root.resolve()):
+        return _fail("session-install", f"--cockpit-root {args.cockpit_root} is not the cockpit root the dream "
+                                        f"install names ({dream_root}): one store has one cockpit (nothing written)")
+    try:
+        previous_root = session_wire.read_install(store.directory).cockpit_root
+    except ValueError:      # no previous root to name as replaced
+        previous_root = None
     try:
         path = session_wire.write_install(store.directory, cockpit_root=args.cockpit_root, launcher=args.launcher,
                                           episodic_path=args.episodic_path, values=values, workspaces=workspaces)
@@ -727,6 +749,8 @@ def run_session_install(args: argparse.Namespace) -> int:
     except session_wire.InstallRefused as exc:
         return _fail("session-install", f"wrote {path} but cannot read it back: {exc}")
     print(f"wrote {path}")
+    if previous_root is not None and previous_root.resolve() != install.cockpit_root.resolve():
+        print(f"replaced cockpit_root {previous_root} -> {install.cockpit_root}")
     print(f"cockpit_root: {install.cockpit_root}")
     print(f"launcher: {install.launcher if install.launcher is not None else '(none)'}")
     print(f"episodic_path: {install.episodic_path if install.episodic_path is not None else '(none)'}")
