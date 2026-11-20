@@ -20,7 +20,7 @@ from anneal_memory.spores import IntentionStore
 from levain.consent.queue import default_queue_dir
 from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 
 TRAY = "document.querySelector('[data-ck-panel=tray]')"
@@ -681,6 +681,7 @@ def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_lay
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            BOARD_SETTLED,        # a fresh install's first hello may draw the board again: "idle" is counted from the settled board
             {"eval": f"window.__m = {TRAY}.querySelector('[data-list-more]'); window.__n = 0; "
                      f"new MutationObserver((r) => {{ window.__n += r.length; }}).observe({TRAY}, {{childList: true}}); 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"},

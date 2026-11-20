@@ -104,6 +104,34 @@ def landed_tap(target: str, until: str | None = None, **step: Any) -> list[dict[
              "ms": 30000, **step}]
 
 
+# A page that has just drawn its board is not yet at rest. On a freshly installed cockpit the change stream's first hello is compared
+# with the server's manifest, and a panel head that has moved since the page's boot read (its own band read numbers the rows, the
+# stream's first build is a new generation) makes the page draw the whole board once more a moment later, replacing every node a test
+# had already taken hold of. A test that clicks, scrolls or counts changes on the first draw must start from the settled board:
+# BOARD_SETTLED waits for the stream's live chip (the hello has been taken), then for a stretch with no board panel added or removed,
+# longer than the page's own pause before such a redraw. It is a positive wait: the chip says live, then the board sits still. A page
+# that never reaches that state in the time allowed fails the drive with the step's own words (what the chip said, when the board
+# was last drawn), never a later assertion on a node that was replaced under the test. One step, one collected value (1).
+BOARD_SETTLED = {"eval": """(async () => {
+  const QUIET_MS = 1500, DEADLINE_MS = 25000, sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const t0 = performance.now(); let lastDraw = null, liveAt = 0, state = 'no chip';
+  const drawn = (n) => n.nodeType === 1 && (n.hasAttribute('data-ck-panel') || !!n.querySelector('[data-ck-panel]'));
+  const seen = new MutationObserver((rs) => { for (const r of rs) for (const n of [...r.addedNodes, ...r.removedNodes]) if (drawn(n)) lastDraw = performance.now(); });
+  seen.observe(document, { subtree: true, childList: true });
+  try {
+    while (performance.now() - t0 < DEADLINE_MS) {
+      const chip = document.querySelector('.livechip'), now = performance.now();
+      state = chip ? String(chip.dataset.state) : 'no chip';
+      if (state !== 'live') liveAt = 0; else if (!liveAt) liveAt = now;
+      if (liveAt && now - Math.max(liveAt, lastDraw === null ? 0 : lastDraw) >= QUIET_MS) return 1;
+      await sleep(50);
+    }
+  } finally { seen.disconnect(); }
+  throw new Error('the board never settled: the live chip said ' + JSON.stringify(state) + ' and the board was last drawn '
+    + (lastDraw === null ? 'not at all since this step began' : Math.round(performance.now() - lastDraw) + ' ms ago') + ' (a settled board is live and undrawn for ' + QUIET_MS + ' ms)');
+})()"""}
+
+
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
     sent, injected = _with_diag(steps)
