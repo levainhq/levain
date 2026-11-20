@@ -36,7 +36,7 @@
     // the flag is only ever true on the board page with no view up: anything else that changed the page's own state ends it
     if (settingsOn() && (roomOn() || deskOn() || mode() !== "board")) document.body.classList.remove(SETTINGS_ON);
     var p = place();
-    if (document.body.dataset.iaPlace !== p) { document.body.dataset.iaPlace = p; if (remeasure) remeasure(); }
+    if (document.body.dataset.iaPlace !== p) { document.body.dataset.iaPlace = p; if (remeasure) remeasure(); queueHeads(); }
     // scoped to the places bar: other controls carry aria-current of their own
     var bar = document.querySelectorAll(".ia-places [data-ia-place-btn]");
     for (var i = 0; i < bar.length; i++) {
@@ -162,6 +162,38 @@
     });
   }
 
+  // levain#164: a Home section head is shown only while a block it owns is drawn. A bare install (no desk, no flow-desk panel, no Machine
+  // panels) would otherwise show "Desk" and "Machine" over nothing. dashboard.css orders each block under its head by the same selectors
+  // (the `order` rules for the drop box, the flow-desk, board, tray, inbox, roster and so on); this map is the page's copy of that ownership.
+  var HEAD_OWNS = {
+    desk: ["#ck-drop", '.panel[data-ck-panel="flow-desk"]'],
+    work: ['.panel[data-ck-panel="tray"]', '.panel[data-ck-panel="board"]', '.panel[data-ck-panel="inbox"]'],
+    machine: ["#ck-skycol", '.panel[data-ck-panel="roster"]', '.panel[data-ck-panel="agents"]', '.panel[data-ck-panel="agent_calls"]',
+      '.panel[data-ck-panel="stream"]', '.panel[data-ck-panel="scheduled_jobs"]', '.panel[data-ck-panel="jobs"]', '.panel[data-ck-panel="edits"]'],
+    glance: ["#ck-widgets"]
+  };
+  function drawn(el) { return !!(el && el.getClientRects && el.getClientRects().length); }
+  // only on Home: elsewhere the heads are not displayed and the blocks under them are not either, so nothing there can be measured
+  function syncHeads() {
+    if (document.body.dataset.iaPlace !== "home") return;
+    var heads = document.querySelectorAll(".deck .ia-head");
+    for (var i = 0; i < heads.length; i++) {
+      var sels = HEAD_OWNS[heads[i].dataset.iaHead] || [], any = false;
+      for (var j = 0; j < sels.length && !any; j++) {
+        var els = document.querySelectorAll(sels[j]);
+        for (var k = 0; k < els.length && !any; k++) any = drawn(els[k]);
+      }
+      if (any) heads[i].removeAttribute("data-ia-empty"); else heads[i].setAttribute("data-ia-empty", "1");
+    }
+  }
+  var headsQueued = false;
+  function queueHeads() {
+    if (headsQueued) return;
+    headsQueued = true;
+    var run = function () { headsQueued = false; syncHeads(); };
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run); else window.setTimeout(run, 0);
+  }
+
   // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, on a screen at least
   // PIN_MIN_W wide AND PIN_MIN_H tall (a landscape phone is 932 x 430: the bars would take 40% of it). These two numbers are the ONE
   // source: dashboard.css mirrors them in its `(min-width: 721px) and (min-height: 600px)` pinned blocks (test_cockpit_polish_fix4
@@ -221,7 +253,12 @@
     addGraphToggle();
     watchNotifyLabel();
     new MutationObserver(paint).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
+    // a block drawn, removed or shown later (the board's panels arrive after the first paint) re-asks which heads have something under them;
+    // the heads' own attribute is outside the filter, so this cannot feed itself
+    var deck = document.querySelector(".deck");
+    if (deck) new MutationObserver(queueHeads).observe(deck, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "class", "style"] });
     paint();
+    queueHeads();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();

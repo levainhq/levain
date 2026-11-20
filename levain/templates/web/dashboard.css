@@ -3932,6 +3932,8 @@ body.ia[data-ia-place="home"] #ck-band { order: -4; }
 body.ia[data-ia-place="home"] #ck-needs { order: 10; }
 body.ia[data-ia-place="home"] #ck-notes { order: 11; }
 body.ia[data-ia-place="home"] .ia-head { display: flex; align-items: baseline; gap: var(--sp-4); margin-top: var(--sp-5); }
+/* a head with nothing drawn under it is not shown (levain#164; dashboard_places.js syncHeads sets the attribute) */
+body.ia[data-ia-place="home"] .ia-head[data-ia-empty="1"] { display: none; }
 body.ia[data-ia-place="home"] .ia-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); color: var(--text); }
 body.ia[data-ia-place="home"] .ia-head span { font: var(--fw-regular) var(--fs-meta) var(--round); color: var(--label); }
 body.ia[data-ia-place="home"] .ia-head[data-ia-head="desk"] { order: 20; }

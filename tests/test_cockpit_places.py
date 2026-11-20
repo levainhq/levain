@@ -565,3 +565,47 @@ def test_the_collapsed_graph_strip_hides_the_event_graph_too(tmp_path: Path) -> 
     assert not shut["sky"]["shown"] and not shut["legend"]["shown"], shut              # collapsed: it is not drawn
     assert opened["sky"]["shown"] and opened["sky"]["h"] > 0, opened                   # the toggle opens it
     assert shut["toggle"]["h"] > 0 and shut["toggle"]["y"] + shut["toggle"]["h"] <= shut["card"]["y"] + 1, shut   # the toggle sits in the Machine control row above the card (levain#141 polish: it no longer floats over the card)
+
+
+# levain#164: the blocks each Home head owns (the page's own copy lives in dashboard_places.js HEAD_OWNS; this is the test's, so a block
+# added to one and not the other shows as a disagreement here)
+HEAD_BLOCKS = {
+    "desk": ["#ck-drop", '.panel[data-ck-panel="flow-desk"]'],
+    "work": ['.panel[data-ck-panel="tray"]', '.panel[data-ck-panel="board"]', '.panel[data-ck-panel="inbox"]'],
+    "machine": ["#ck-skycol", '.panel[data-ck-panel="roster"]', '.panel[data-ck-panel="agents"]', '.panel[data-ck-panel="agent_calls"]',
+                '.panel[data-ck-panel="stream"]', '.panel[data-ck-panel="scheduled_jobs"]', '.panel[data-ck-panel="jobs"]', '.panel[data-ck-panel="edits"]'],
+    "glance": ["#ck-widgets"],
+}
+HEADS_NOW = ("JSON.stringify([...document.querySelectorAll('.deck .ia-head')].map((h) => { const own = %s[h.dataset.iaHead] || [];"
+             " return { head: h.dataset.iaHead, shown: getComputedStyle(h).display !== 'none',"
+             " owned: own.reduce((n, s) => n + [...document.querySelectorAll(s)].filter((e) => e.getClientRects().length > 0).length, 0) }; }))") % json.dumps(HEAD_BLOCKS)
+
+
+@needs_browser
+def test_a_home_head_is_shown_only_over_a_block_that_is_drawn(tmp_path: Path) -> None:
+    """A bare install has no desk and no machine panels: its Home must not draw 'Desk' or 'Machine' over nothing, at a phone and a laptop width."""
+    drop_blocks = json.dumps(HEAD_BLOCKS["desk"] + HEAD_BLOCKS["machine"])
+    strip = f"{drop_blocks}.forEach((s) => document.querySelectorAll(s).forEach((e) => e.remove())); 1"
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
+            READY, SETTLE, SETTLE,
+            {"eval": HEADS_NOW},                                   # 0: the page as served
+            {"eval": strip}, SETTLE, SETTLE,                       # the desk and machine blocks are gone: a bare Home
+            {"eval": HEADS_NOW},                                   # 1: laptop width
+            {"emulate": {"w": 390, "h": 800, "dpr": 3, "mobile": True}}, SETTLE,
+            {"eval": HEADS_NOW},                                   # 2: phone width
+        ])
+    sets = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("[{")]
+    assert len(sets) == 3, out["values"]
+    for heads in sets:
+        assert sorted(h["head"] for h in heads) == ["desk", "glance", "machine", "work"], heads
+        for h in heads:
+            assert h["shown"] == (h["owned"] > 0), heads          # shown exactly when something it owns is drawn
+    served, bare_laptop, bare_phone = sets
+    assert all(h["shown"] for h in served), served                  # as served, every head has its blocks
+    for heads in (bare_laptop, bare_phone):
+        by = {h["head"]: h["shown"] for h in heads}
+        assert by["desk"] is False and by["machine"] is False, heads   # nothing under Desk or Machine: no heading over an empty section
+        assert by["work"] is True and by["glance"] is True, heads      # the heads that still have blocks stay
