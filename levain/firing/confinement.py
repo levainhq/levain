@@ -3944,13 +3944,22 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 #: row levain#202), because ``claude --settings ... <subcommand>`` is unmeasured on the VM.
 HANDS_NO_CLAUDEAI_CONNECTORS = ("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
 
-#: Stops Claude Code's official-marketplace autoinstall, which on the hands account's first interactive start cloned the
-#: marketplace into ``~/.claude/plugins/marketplaces`` (a path :data:`levain.firing.hands_chat.CLAUDE_USER_LAYER` refuses,
-#: so the next chat was refused). MEASURED: Claude Code 2.1.329 on a fresh macOS VM, 11-20, hands account signed in with the
-#: operator's claude.ai login: after the first chat that directory existed (project_memory/1118-vm/leg6_fresh_evidence/,
-#: step14_run.txt). READ FROM THE BINARY and the environment-variable reference, not run: with this variable set the
-#: autoinstall writes only a flag into ``.claude.json`` and nothing under ``plugins/``, and the gate applies to the
-#: interactive session only (project_memory/1120-61_lanes/sync_research_return.md, section 1, a reasoned prescription).
+#: Stops Claude Code's official-marketplace autoinstall, which is read to be what put the marketplace into
+#: ``~/.claude/plugins/marketplaces`` (a path :data:`levain.firing.hands_chat.CLAUDE_USER_LAYER` refuses, so the next chat
+#: was refused). MEASURED: Claude Code 2.1.329 on a fresh macOS VM, 11-20, hands account signed in with the operator's
+#: claude.ai login: ``plugins/marketplaces``, ``plugins/synced``, ``plugins/known_marketplaces.json`` and ``skills/synced``
+#: were found in the home after the first chat (project_memory/1118-vm/leg6_fresh_evidence/, easel_probe2.txt and
+#: easel_probe.txt). READ FROM THE BINARY and the environment-variable reference, not run: with this variable set the
+#: autoinstall writes only a flag into ``.claude.json`` and nothing under ``plugins/``
+#: (project_memory/1120-61_lanes/sync_research_return.md, section 1, a reasoned prescription). That the gate applies to the
+#: interactive session only is from the environment-variable documentation ("stops interactive terminal sessions from
+#: auto-registering"), NOT from the code gate: the research's reading of an ``On()`` predicate in the binary as
+#: "non-interactive" was wrong (it is a remote-workspace test).
+#: A home an earlier chat already wrote is a separate case this variable does not touch: it also holds
+#: ``plugins/known_marketplaces.json`` and autoinstall state in ``.claude.json``, an already-registered marketplace is not
+#: removed by this variable, and whether a start re-creates ``plugins/marketplaces`` from ``known_marketplaces.json`` is NOT
+#: measured. Acceptance on such a home needs its own run (see the comment above
+#: :data:`levain.firing.hands_chat.CLAUDE_USER_LAYER`).
 #: NOT yet run on a hands account: the VM acceptance is the second chat on the same home (levain#139). Like the connectors
 #: variable it is a default the hands start carries, not a boundary: the account's own ``settings.json`` ``env`` block or its
 #: shell can set it differently.

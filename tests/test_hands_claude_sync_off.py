@@ -1,10 +1,14 @@
 """The hands Claude chat does not sync account skills or plugins and does not start built-in plugins (levain#139 family).
 
-Measured on Claude Code 2.1.329 (fresh macOS VM, 11-20): the first hands chat wrote ``plugins/marketplaces``,
-``plugins/synced`` and ``skills/synced`` into the hands home, after which ``claude_user_layer`` refused every later chat,
-and the chat's ``/mcp`` listed the built-in ``cc-plugin-easel@builtin`` tool server. The names used to stop that are
-read from the binary and the vendor's references, NOT yet run on a hands account (the acceptance is the second chat on
-the same home); these tests pin that the names are carried, once, by the one start that is meant to carry them.
+Evidence (Claude Code 2.1.329, fresh macOS VM, 11-20; project_memory/1118-vm/leg6_fresh_evidence/): ``plugins/marketplaces``,
+``plugins/synced``, ``plugins/known_marketplaces.json`` and ``skills/synced`` were found in the hands home after the first
+chat (easel_probe2.txt and easel_probe.txt), after which ``claude_user_layer`` refused every later chat; the two built-in ids
+``cc-plugin-easel@builtin`` and ``claude-platform@builtin`` are in the hands ``.claude.json`` (easel_probe5.txt); a loopback
+socket was listening, owned by the ``claude`` process only (easel_listener.txt). That the chat's ``/mcp`` listed ``easel``
+was reported in the leg 6 route (levain-leg6 2, fanin log 14:30, read by Phill from the chat's ``/mcp``), not in the
+evidence files. The names used to stop that are read from the binary and the vendor's references, NOT yet run on a hands
+account (the acceptance is the second chat on the same home); these tests pin that the names are carried, once, by the one
+start that is meant to carry them.
 
 - the environment line rides the hands environment (``confinement._hands_env``), the one dict every hands start takes;
 - the settings object is one constant and the chat argv passes it as ``--settings <compact JSON>``;

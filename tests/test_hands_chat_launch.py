@@ -842,3 +842,34 @@ def test_a_ctrl_c_before_the_start_is_a_line_and_exit_130_with_the_locks_release
     assert rc == 130 and fake.started == []
     assert out == "hands chat: interrupted (Ctrl-C) before the start; no chat was started\n"
     assert_released(rig)
+
+
+CLAUSE = "; remove it and `plugins/known_marketplaces.json` beside it (whether leaving that file brings the tree back is not measured)"
+
+
+def test_a_marketplaces_refusal_names_the_known_marketplaces_file_beside_it_and_says_it_is_not_measured(rig):
+    """levain#139 fix r1: a home an earlier chat poisoned also holds plugins/known_marketplaces.json; whether leaving it
+    brings the tree back is not measured, and the refusal says both."""
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    named = _user_marketplace(home)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+        launch(rig, "claude", spawn=fake)
+    text = str(info.value)
+    assert named in text and CLAUSE in text and hc.MARKETPLACES_REMOVE_CLAUSE == CLAUSE
+    assert text.endswith("no chat was started") and fake.started == []
+    assert_released(rig)
+
+
+@pytest.mark.parametrize("plant", [_user_agent, _user_plugin, _user_settings])
+def test_the_other_refused_paths_keep_the_refusal_text_without_the_marketplaces_clause(rig, plant):
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    plant(home)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+        launch(rig, "claude", spawn=fake)
+    text = str(info.value)
+    assert "known_marketplaces" not in text and text.endswith("hold; remove it; no chat was started"), text
+    assert_released(rig)
