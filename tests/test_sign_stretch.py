@@ -4,6 +4,7 @@ Nothing here touches ~/.levain: the directory is tmp_path."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from levain import cli
@@ -28,13 +29,14 @@ def _dir(tmp_path: Path) -> Path:
 def test_table_from_real_records_and_a_good_signature(tmp_path, capsys):
     d = _dir(tmp_path)
     before = sorted((p.name, p.stat().st_mtime_ns) for p in d.iterdir())
-    days, bad = sign_stretch.read_days(d)
-    assert bad == 0
+    rep = sign_stretch.read(d)
+    days = rep.days
+    assert rep.unreadable == 0
     assert [(x.day, x.empty_failures, x.failed_signs, x.other_failures) for x in days] == [
         ("2026-11-19", 2, 1, 0),      # one sign, empty at attempts 1 and 2
         ("2026-11-20", 1, 2, 1),      # the 00:19Z empty one, and the good-signature record
     ]
-    out = sign_stretch.render(days)
+    out = sign_stretch.render(rep)
     na = sign_stretch.NO_SUCCESS_LEDGER
     assert out.splitlines() == [
         f"2026-11-19  signs={na} empty_failures=2 failed_signs=1 other_failures=0",
@@ -47,5 +49,23 @@ def test_table_from_real_records_and_a_good_signature(tmp_path, capsys):
 
 
 def test_missing_directory_is_no_days(tmp_path):
-    assert sign_stretch.render(*sign_stretch.read_days(tmp_path / "none")).splitlines() == [
+    assert sign_stretch.render(sign_stretch.read(tmp_path / "none")).splitlines() == [
         "no sign-failure records", f"clean_run={sign_stretch.NO_SUCCESS_LEDGER}"]
+
+
+def test_statement_ledger_gives_signs_and_clean_run(tmp_path, capsys):
+    _dir(tmp_path)
+    ts = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
+    ledger = tmp_path / "statements.jsonl"
+    good = lambda t: json.dumps({"event": "statement", "ts": ts(t), "signed": {"sig": "x"}})
+    ledger.write_text("\n".join([
+        good("2026-11-19T16:30:00"),                                 # before the last empty failure
+        good("2026-11-20T00:30:00"),                                 # after it (00:19Z)
+        json.dumps({"event": "countersign", "ts": ts("2026-11-20T01:00:00")}),   # not a statement: ignored
+    ]) + "\n")
+    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "2026-11-19  signs=1 empty_failures=2 failed_signs=1 other_failures=0",
+        "2026-11-20  signs=1 empty_failures=1 failed_signs=2 other_failures=1",
+        "clean_run=1",
+    ]

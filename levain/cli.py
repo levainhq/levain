@@ -580,11 +580,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Read <key dir>/sign-failures and print one line per UTC day: signs, empty_failures (attempts whose "
             "key answer carried no signature), failed_signs (distinct signing processes that left a record) and "
-            "other_failures; then clean_run=K, the number of the most recent signs in a row with no empty failure. "
-            "That directory holds failures only, so signs and clean_run print as unavailable (no success ledger) "
-            "until the good signatures are counted from a ledger levain reads. Reads only; never touches a key."
+            "other_failures; then clean_run=K, the good signs since the latest empty failure (the good signs and the "
+            "empty-failure records merged by time; K counts the good ones after the last empty one). That directory "
+            "holds failures only, so signs and clean_run print as unavailable (no success ledger) unless --statements "
+            "names the good signs. Reads only; never touches a key."
         ),
     )
+    ck_stretch.add_argument("--statements", type=Path, default=None, metavar="PATH",
+                            help="A JSONL ledger of good signs: one JSON object per line, a good sign being a line with "
+                                 "\"event\": \"statement\", a non-empty \"signed\" object and \"ts\" in epoch seconds; "
+                                 "other lines are ignored. Days are UTC.")
     ck_stretch.add_argument("--dir", type=Path, default=None,
                             help="The key directory (default: <levain home>/keys, i.e. $LEVAIN_HOME/keys or ~/.levain/keys).")
     ck_stretch.set_defaults(func=_cmd_cockpit_sign_stretch)
@@ -4417,8 +4422,12 @@ def _cmd_cockpit_sign_stretch(args: argparse.Namespace) -> int:
         from levain.consent.queue import default_queue_dir
 
         key_dir = default_queue_dir().parent / "keys"
-    days, unreadable = sign_stretch.read_days(key_dir / "sign-failures")
-    print(sign_stretch.render(days, unreadable))
+    try:
+        report = sign_stretch.read(key_dir / "sign-failures", args.statements)
+    except OSError as exc:
+        print(f"sign-stretch: cannot read {args.statements}: {exc}", file=sys.stderr)
+        return 1
+    print(sign_stretch.render(report))
     return 0
 
 
