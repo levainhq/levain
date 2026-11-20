@@ -2778,7 +2778,7 @@ DESK_VERBS = ("coord", "drops", "thread")
 # defined (door.door_ok_author); tests/test_door_census.py holds the two equal. Authority on a
 # board write is enforced in the writer (a decision needs a signature or a relayed answer), never by this door.
 DESK_BOARD_VERBS = (
-    "board state", "board repos", "board context", "board use", "board register", "board add", "board amend",
+    "board state", "board open", "board repos", "board context", "board use", "board register", "board add", "board amend",
     "board decide", "board begin-track", "board track", "board abandon-track", "board abandon-done", "board untrack",
     "charter init", "charter check",
 )

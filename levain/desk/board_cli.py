@@ -213,7 +213,7 @@ def register(subparsers: Any) -> None:
     # the desk's door opens these, each where it is defined (install.DESK_BOARD_VERBS is the same list, for its allow rules)
     from levain.desk.door import door_ok_author
 
-    door_ok_author(p, a, m, d, u)
+    door_ok_author(p, o, a, m, d, u)
     br.register_cli(sub, author_args, _author, items_help, _seal, source_args, _relay)
     from levain.desk import board_context       # imported here: board_context reads this module's helpers
     board_context.register(sub)
