@@ -23,7 +23,8 @@ FACTS = """(() => {
   const calm = document.querySelector('#calmbtn');
   const mast = [...document.querySelectorAll('header.masthead button, header.masthead a[href]')].filter(vis).map((n) => ({ id: n.id || n.className, ...box(n) }));
   const tiles = [...document.querySelectorAll('#ck-widgets > .ck-card.w')].filter(vis).map(box);
-  return JSON.stringify({ facts: true, w: innerWidth, docW: document.documentElement.scrollWidth, calm: vis(calm) ? box(calm) : null, mast, tiles });
+  const wrap = document.querySelector('#ck-widgets'); const wr = wrap ? wrap.getBoundingClientRect() : null;
+  return JSON.stringify({ facts: true, w: innerWidth, docW: document.documentElement.scrollWidth, calm: vis(calm) ? box(calm) : null, mast, tiles, ckN: wrap ? Number(wrap.style.getPropertyValue('--ck-n')) : 0, wrapL: wr ? Math.round(wr.left) : 0, wrapR: wr ? Math.round(wr.right) : 0 });
 })()"""
 
 
@@ -44,10 +45,15 @@ def test_home_has_no_sideways_scroll_and_draws_its_controls_inside_the_viewport_
         for m in r["mast"]:
             assert 0 <= m["left"] and m["right"] <= w, (w, "a masthead control leaves the viewport", m)
         assert r["calm"] is not None, (w, "the Calm control is not drawn on Home")
-        assert 0 <= r["calm"]["left"] and r["calm"]["right"] <= w and r["calm"]["h"] > 0, (w, r["calm"])
-        if len(r["tiles"]) > 1:                                                     # At a glance: every row fills the row above it, so no tile sits beside empty space
-            rows_by_top: dict[int, list[dict]] = {}
-            for t in r["tiles"]:
-                rows_by_top.setdefault(t["top"], []).append(t)
-            spans = {(min(t["left"] for t in row), max(t["right"] for t in row)) for row in rows_by_top.values()}
-            assert max(s[0] for s in spans) - min(s[0] for s in spans) <= 4 and max(s[1] for s in spans) - min(s[1] for s in spans) <= 4, (w, "a row does not fill the width of the others", sorted(spans), r["tiles"])
+        assert 0 <= r["calm"]["left"] and r["calm"]["right"] - r["calm"]["left"] > 0 and r["calm"]["right"] <= w and r["calm"]["h"] > 0, (w, r["calm"])
+        assert len(r["tiles"]) >= 2, (w, "At a glance draws fewer than two tiles on the fixture, so its row check would prove nothing", r["tiles"])
+        rows_by_top: list[list[dict]] = []                                          # rows by top within 4 px
+        for t in sorted(r["tiles"], key=lambda t: t["top"]):
+            if rows_by_top and t["top"] - rows_by_top[-1][0]["top"] <= 4:
+                rows_by_top[-1].append(t)
+            else:
+                rows_by_top.append([t])
+        for row in rows_by_top:                                                    # every row fills the container: no tile sits beside empty space
+            assert abs(min(t["left"] for t in row) - r["wrapL"]) <= 4 and abs(max(t["right"] for t in row) - r["wrapR"]) <= 4, (w, "a row does not fill the tiles container", r["wrapL"], r["wrapR"], rows_by_top)
+        assert max(len(row) for row in rows_by_top) <= r["ckN"], (w, "a row holds more tiles than the column count fillGrids chose", r["ckN"], rows_by_top)
+        assert len(rows_by_top[-1]) > 1 or len(r["tiles"]) == 1, (w, "the last row is a lone tile", r["ckN"], rows_by_top)   # P1: no lone tile where a divisor fits
