@@ -29,8 +29,11 @@ pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason=
 SHIM = r'''#!%(py)s
 import json, os, sys, urllib.request
 cfgdir = os.environ["CLAUDE_CONFIG_DIR"]
+argv = sys.argv[1:]
+if argv[:1] == ["--settings"]:        # the connectors-off pair every hands Claude command leads with (the argv tests pin it)
+    argv = argv[2:]
 with open(os.environ["SHIM_LOG"], "a") as f:
-    f.write("%%s|%%s|%%s\n" %% (os.environ["HOME"], cfgdir, " ".join(sys.argv[1:])))
+    f.write("%%s|%%s|%%s\n" %% (os.environ["HOME"], cfgdir, " ".join(argv)))
 CFG = os.path.join(cfgdir, ".claude.json")
 CRED = os.path.join(cfgdir, ".credentials.json")
 env = os.environ
@@ -55,7 +58,7 @@ def missing(name):
     sys.exit(1)
 
 
-a = sys.argv[1:]
+a = argv
 if a[:1] != ["mcp"]:
     sys.exit(2)
 verb, rest = a[1], a[2:]
@@ -567,7 +570,8 @@ def test_the_vendor_argv_runs_as_hands_with_the_pinned_home_and_the_name_last(mo
                  hml.remove_argv(h, "linear"), hml.get_argv(h, "linear")):
         assert argv[:6] == [confinement.SUDO, "-n", "-u", "levain-hands", "/usr/bin/env", "-i"]
         assert "CLAUDE_CONFIG_DIR=/Users/levain-hands/.claude" in argv and "HOME=/Users/levain-hands" in argv
-        assert "claude" in argv and argv[argv.index("claude") + 1] == "mcp"
+        i = argv.index("claude")
+        assert argv[i + 1] == "--settings" and argv[i + 3] == "mcp"     # the connectors-off pair, then the subcommand
         assert all("/Users/phillipclapham" not in a for a in argv)
     assert hml.add_argv(h, e)[-9:] == ["add", "--scope", "user", "--transport", "http", "--callback-port", "49300",
                                        "linear", "https://mcp.linear.example/mcp"]

@@ -12,7 +12,9 @@ start that is meant to carry them.
 
 - the environment line rides the hands environment (``confinement._hands_env``), the one dict every hands start takes;
 - the settings object is one constant and the chat argv passes it as ``--settings <compact JSON>``;
-- no second builder passes ``--settings`` for the hands Claude chat (the codex chat is untouched).
+- one builder (``confinement.hands_claude_argv``) writes the flag for every hands Claude command; the chat's single JSON
+  is the connectors-off base merged with the sync-off object, and every other Claude start carries the base alone;
+- the codex chat is untouched.
 """
 from __future__ import annotations
 
@@ -83,7 +85,8 @@ def test_the_chat_argv_passes_the_constant_as_compact_sorted_json_before_any_ext
         assert json.loads(text) == hands_mcp_login.HANDS_CLAUDE_FLAG_SETTINGS
         assert text == json.dumps(hands_mcp_login.HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
         assert " " not in text
-        assert argv.index("--mcp-config") < i
+        assert argv[argv.index("claude") + 1] == "--settings"       # the pair sits right after the program
+        assert i < argv.index("--mcp-config")
     argv = hands_mcp_login.claude_chat_argv(_hands(), "-p")
     assert argv[-1] == "-p" and argv.index("--settings") < argv.index("-p")
 
@@ -103,20 +106,23 @@ def test_the_chat_argv_takes_none_of_the_modes_that_cost_the_login_or_the_mcp_di
 # (c) one source --------------------------------------------------------------------------------------------------
 
 def test_no_other_builder_under_firing_passes_settings_to_the_hands_claude():
-    """Source-level: ``"--settings"`` as a literal argument is written in ``hands_mcp_login.py`` only (the chat argv)."""
+    """Source-level: ``"--settings"`` as a literal argument is written in ``confinement.py`` only (the one Claude argv builder)."""
     firing = Path(confinement.__file__).parent
     named = sorted(p.name for p in firing.rglob("*.py") if '"--settings"' in p.read_text())
-    assert named == ["hands_mcp_login.py"], named
-    src = (firing / "hands_mcp_login.py").read_text()
-    assert src.count('"--settings"') == 1
+    assert named == ["confinement.py"], named
+    assert (firing / "confinement.py").read_text().count('"--settings"') == 1
 
 
-def test_the_other_hands_starts_take_no_settings_flag(monkeypatch):
+def test_the_other_hands_claude_starts_carry_the_connectors_base_alone_and_the_rest_none(monkeypatch):
+    """The sync-off keys ride the chat only; every other Claude start gets the base layer, and non-Claude starts get no flag."""
     monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
     for what, argv in _starts(_hands()).items():
         if what in ("claude chat", "claude chat through the chat module"):
             continue
-        assert "--settings" not in argv, what
+        if "claude" in argv and argv.count("--settings") == 1 and argv[argv.index("claude") + 1] == "--settings":
+            assert json.loads(argv[argv.index("--settings") + 1]) == confinement.HANDS_CLAUDE_BASE_SETTINGS, what
+        else:
+            assert "--settings" not in argv, what
 
 
 # (e) the refusal of an already-poisoned home stays (its own test is in test_hands_chat_launch)
