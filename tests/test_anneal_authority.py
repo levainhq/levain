@@ -285,3 +285,44 @@ def test_doctor_does_not_judge_when_the_version_is_unparseable(tmp_path, monkeyp
     r = _module_check(tmp_path, monkeypatch, out, [_DECLARED])
 
     assert r.ok is True and "not checked" in r.detail
+
+
+def _script_check(tmp_path, monkeypatch, version_out, requires):
+    """The CLI-script branch: a script file exists and its faked `--version` runs."""
+    from levain import doctor
+
+    script = tmp_path / "bin" / "anneal-memory"
+    script.parent.mkdir()
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(script))
+    monkeypatch.setattr(doctor, "_probe", lambda cmd, timeout=5.0: (True, version_out))
+    monkeypatch.setattr(importlib.metadata, "requires", lambda name: requires)
+    results = doctor._check_runtime(tmp_path)
+    anneal = [r for r in results if r.name.startswith("anneal-memory")]
+    assert len(anneal) == 1, anneal
+    return anneal[0], script
+
+
+@pytest.mark.parametrize("version", ["1.0.2", "2.1.0"])
+def test_doctor_fails_a_working_anneal_script_outside_levains_range(tmp_path, monkeypatch, version):
+    r, script = _script_check(tmp_path, monkeypatch, f"anneal-memory {version}\n", [_DECLARED])
+
+    assert r.name == "anneal-memory CLI" and r.ok is False
+    assert str(script) in r.detail and version in r.detail and _DECLARED in r.detail
+    assert r.hint == f"{sys.executable} -m pip install -U '{_DECLARED}'"
+
+
+def test_doctor_passes_a_working_anneal_script_inside_levains_range(tmp_path, monkeypatch):
+    r, script = _script_check(tmp_path, monkeypatch, "anneal-memory 2.0.1\n", [_DECLARED])
+
+    assert r.name == "anneal-memory CLI" and r.ok is True and not r.hint
+    assert r.detail == f"{script} (anneal-memory 2.0.1)"
+
+
+@pytest.mark.parametrize("requires, out", [(None, "anneal-memory 1.0.2\n"),
+                                           ([_DECLARED], "anneal-memory 2.0.1rc1\n")])
+def test_doctor_does_not_judge_the_anneal_script_when_the_range_cannot_be_checked(
+        tmp_path, monkeypatch, requires, out):
+    r, _ = _script_check(tmp_path, monkeypatch, out, requires)
+
+    assert r.name == "anneal-memory CLI" and r.ok is True and "not checked" in r.detail
