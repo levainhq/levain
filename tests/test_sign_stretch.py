@@ -98,3 +98,65 @@ def test_missing_dir_is_refused_but_no_subdirectory_is_clean(tmp_path, capsys):
     (tmp_path / "keys").mkdir()
     assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys")]) == 0
     assert capsys.readouterr().out.splitlines()[0] == "no sign-failure records"
+
+
+def _ledger(tmp_path, *stamps):
+    ts = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
+    p = tmp_path / "statements.jsonl"
+    p.write_text("\n".join(json.dumps({"event": "statement", "ts": ts(t), "signed": {"sig": "x"}}) for t in stamps) + "\n")
+    return p
+
+
+def _run(tmp_path, *extra):
+    return cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), *extra])
+
+
+def test_unlistable_evidence_dir_is_refused(tmp_path, capsys):
+    (tmp_path / "keys").mkdir()
+    (tmp_path / "keys" / "sign-failures").write_text("a file, not a directory")
+    assert _run(tmp_path) == 1
+    err = capsys.readouterr().err
+    assert f"cannot read {tmp_path / 'keys' / 'sign-failures'}" in err and "None" not in err
+
+
+def test_unreadable_failure_record_makes_clean_run_unverified(tmp_path, capsys):
+    d = _dir(tmp_path)
+    (d / "sigfail-20261120T120000000000-0000000002-1.json").write_text("{not json")
+    (d / "sigfail-20261120T120100000000-0000000003-1.json").write_text(json.dumps({"time": "2026-11-20T12:01:00+00:00"}))
+    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
+    out = capsys.readouterr().out.splitlines()
+    assert out[-1] == "clean_run=1 (unverified: 2 unreadable failure records)"
+
+
+def test_directory_at_its_cap_makes_clean_run_an_upper_bound(tmp_path, capsys, monkeypatch):
+    import levain.cockpit.keys as keys
+    d = _dir(tmp_path)
+    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", len(list(d.glob("sigfail-*.json"))))
+    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
+    assert capsys.readouterr().out.splitlines()[-1] == "clean_run=1 (at most: the evidence directory is at its cap)"
+
+
+def test_naive_time_is_read_as_utc(tmp_path, capsys):
+    d = tmp_path / "keys" / "sign-failures"
+    d.mkdir(parents=True)
+    rec = json.loads(next((FIX / "sign_failures_1120").glob("*-1.json")).read_text())
+    rec["time"] = "2026-11-20T23:30:00"
+    (d / "sigfail-20261120T233000000000-0000000004-1.json").write_text(json.dumps(rec))
+    _run(tmp_path)
+    assert capsys.readouterr().out.splitlines()[0].startswith("2026-11-20  ")
+
+
+def test_signed_must_be_a_non_empty_object(tmp_path, capsys):
+    _dir(tmp_path)
+    p = tmp_path / "statements.jsonl"
+    p.write_text("\n".join(json.dumps({"event": "statement", "ts": 1795000000, "signed": s})
+                           for s in ("yes", [1], {}, None, {"sig": "x"})) + "\n")
+    _run(tmp_path, "--statements", str(p))
+    assert "2026-11-18  signs=1 empty_failures=0 failed_signs=0 other_failures=0" in capsys.readouterr().out
+
+
+def test_missing_default_key_dir_is_refused(tmp_path, capsys, monkeypatch):
+    import levain.cockpit.custody as custody
+    monkeypatch.setattr(custody, "default_key_dir", lambda: tmp_path / "fresh" / "keys")
+    assert cli.main(["cockpit", "sign-stretch"]) == 1
+    assert "sign-stretch: no such directory" in capsys.readouterr().err

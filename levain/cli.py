@@ -584,7 +584,8 @@ def build_parser() -> argparse.ArgumentParser:
             "empty-failure records merged by time; K counts the good ones after the last empty one). That directory "
             "holds failures only, so signs and clean_run print as unavailable (no success ledger) unless --statements "
             "names the good signs. clean_run counts good signs strictly after the latest empty failure. Days are UTC. "
-            "The evidence directory is capped, so the failure counts of old days are lower bounds. "
+            "The evidence directory is capped, so the failure counts of old days are lower bounds, and a directory "
+            "at its cap prints clean_run as `at most`; an unreadable failure record prints it as `unverified`. "
             "Reads only; never touches a key."
         ),
     )
@@ -4428,10 +4429,15 @@ def _cmd_cockpit_sign_stretch(args: argparse.Namespace) -> int:
         from levain.cockpit.custody import default_key_dir
 
         key_dir = default_key_dir()      # where `cockpit key create` puts a key
+        if not key_dir.is_dir():
+            print(f"sign-stretch: no such directory: {key_dir} (the default key directory; no key has been made here, "
+                  "or pass --dir)", file=sys.stderr)
+            return 1
     try:
         report = sign_stretch.read(key_dir / "sign-failures", args.statements)
     except (OSError, UnicodeDecodeError) as exc:
-        print(f"sign-stretch: cannot read {args.statements}: {exc}", file=sys.stderr)
+        where = getattr(exc, "filename", None) or args.statements or key_dir / "sign-failures"
+        print(f"sign-stretch: cannot read {where}: {exc}", file=sys.stderr)
         return 1
     print(sign_stretch.render(report))
     return 0
