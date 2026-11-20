@@ -93,9 +93,10 @@ def test_the_server_body_normalises_signed_and_reads_options_once() -> None:
     assert '"signed": None if signed is None else bool(signed)' in body
 
 
-def test_a_strip_of_only_answered_cards_takes_no_space_in_build_and_memory() -> None:
+def test_a_strip_of_only_answered_cards_takes_no_space_in_memory() -> None:
+    # levain#166 retired the Build mode (the page maps it to the board), so its half of the rule went with it
     css = (WEB / "dashboard.css").read_text()
-    for mode in ("build", "memory"):
+    for mode in ("memory",):
         assert f'body.ke[data-mode="{mode}"] #ck-needs:not([data-waiting])' in css
 
 
