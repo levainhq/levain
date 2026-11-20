@@ -33,6 +33,26 @@ def _at_the_laptop(monkeypatch):
     monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 5.0)
 
 
+def board_doc(*items, problems=()):
+    """A board document as ``board_cli.read_board`` returns it, one open item per ``(id, state)`` given."""
+    return {"schema": "ready-v3", "as_of": "2026-11-12T20:00:00Z", "audit": [], "unattributed": [], "problems": list(problems),
+            "reader": {"repo": "levain"}, "items": [{"id": i, "repo": "levain", "title": f"t {i}", "tier": None, "state": s,
+                                                    "column": s, "reason": "r", "refs": [], "as_of": None, "kind": None}
+                                                   for i, s in items]}
+
+
+def fake_board(monkeypatch, doc=None, code=0, err=""):
+    from levain.desk import board_cli
+
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (code, doc, err))
+
+
+@pytest.fixture(autouse=True)
+def _a_quiet_board(monkeypatch):
+    """The plan's board line reads the board (``levain board state``'s read), which these tests are not about: an empty one."""
+    fake_board(monkeypatch, board_doc())
+
+
 def sql(store, text, *args):
     conn = sqlite3.connect(store.path)
     try:
@@ -332,12 +352,13 @@ def test_plan_lists_each_kind_of_thing_the_walk_needs(tmp_path, capsys, monkeypa
          "cwd": "/x", "tier": "T2", "gap": "g", "undecided_at": "2026-11-03T01:00:00Z", "rule": "r"}])
     w.store.accept_drop("from the phone", surface="phone")
     v1_seed.add(w.store, w.token, "levain:s4", repo="levain", title="S4 polish", who="seat-9", why="running.", to="running")
+    fake_board(monkeypatch, board_doc(("levain#7", "in_flight")))
     plan = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc) + timedelta(minutes=30), "levain")
     assert len(plan) == 7
     assert plan[0].startswith("band: 1 open (#1)") or plan[0].startswith("band: 1 open (new)")
     assert plan[1].startswith("undecided SIGNs and crossed budgets: 1 undecided SIGN(s) (rq-1)")
     assert plan[2].startswith("drops with no reply: 1 (dr-") and "coord reply DROP_ID" in plan[2]
-    assert plan[3].startswith("board: running 1 (levain:s4)") and "in_flight" in plan[3]
+    assert plan[3].startswith("board: 1 open (levain#7)") and "levain board open" in plan[3] and "levain:s4" not in plan[3]
     assert plan[4] == "unacknowledged opens: 0"
     assert plan[5].startswith("away: off") and "coord away DROP_ID" in plan[5]
     assert plan[6].startswith("body: state_line, in_flight, next and contingencies") and "attested_walked" in plan[6]
@@ -350,7 +371,33 @@ def test_plan_on_an_empty_store_says_zero_for_every_section(tmp_path, capsys):
     assert [ln.split(":")[0] for ln in plan] == ["band", "undecided SIGNs and crossed budgets", "drops with no reply",
                                                  "board", "unacknowledged opens", "away", "body"]
     assert plan[0] == "band: 0 open" and plan[1].endswith(": 0") and plan[2].endswith(": 0")
-    assert "nothing running" in plan[3] and plan[4].endswith(": 0")
+    assert plan[3] == "board: 0 open items" and plan[4].endswith(": 0")
+
+
+def test_plan_names_the_boards_open_items_and_the_verb_and_never_says_to_copy_them_into_in_flight(tmp_path, capsys, monkeypatch):
+    """levain#179: the open items are the board's. The plan counts them from the board (not the retired v1 queue, which a seeded
+    running row would still fill), names the read verb, and its words no longer tell the desk to copy items into in_flight."""
+    w = World(tmp_path, capsys)
+    v1_seed.add(w.store, w.token, "levain:s4", repo="levain", title="S4 polish", who="seat-9", why="running.", to="running")
+    ids = [f"levain#{n}" for n in range(1, 9)]
+    fake_board(monkeypatch, board_doc(*[(i, "ready") for i in ids]))
+    line = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
+    assert line.startswith("board: 8 open (levain#1, levain#2") and f", +{8 - seam_plan.MAX_IDS} more)" in line
+    assert "read them with `levain board open`" in line and "do not copy them into in_flight" in line
+    assert "each goes into in_flight" not in line and "levain:s4" not in line
+    fake_board(monkeypatch, board_doc(("levain#1", "done"), ("levain#2", "cut")))
+    assert seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3] == "board: 0 open items"
+
+
+def test_plan_says_cannot_derive_for_a_board_it_cannot_read_never_zero_open(tmp_path, capsys, monkeypatch):
+    w = World(tmp_path, capsys)
+    now = datetime.now(timezone.utc)
+    fake_board(monkeypatch, None, 2, "levain board state: no items store")
+    assert seam_plan.close_plan(w.store, w.q, now, "levain")[3].startswith("board: cannot-derive (RuntimeError: levain board state: no items store")
+    fake_board(monkeypatch, board_doc(problems=["line 1: not json"]))
+    assert seam_plan.close_plan(w.store, w.q, now, "levain")[3].startswith("board: cannot-derive (RuntimeError: the board read no item")
+    fake_board(monkeypatch, board_doc(("levain#1", "ready"), problems=["line 9: not json"]))
+    assert "+1 problem line(s)" in seam_plan.close_plan(w.store, w.q, now, "levain")[3]
 
 
 def test_plan_reads_cannot_derive_for_a_queue_directory_it_cannot_read(tmp_path, capsys):

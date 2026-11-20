@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import utc_stamp
-from levain.desk import drop_reply, morning, ready, seam_open
+from levain.desk import drop_reply, morning, seam_open
 from levain.desk import lease as _leases
 from levain.desk.seam import _cap, _clean
 from levain.desk.seam_open import open_tables_present
@@ -117,17 +117,21 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             return "drops with no reply: " + "; ".join(parts if open_ else ["0 to answer", *parts])
 
         def board() -> str:
-            out = ready.list_ready(store, all=True, generated=read_at, conn=conn)
-            by: dict[str, list[str]] = {}
-            for it in out["items"]:
-                if it["status_category"] in ("running", "waiting", "needs-you"):
-                    by.setdefault(it["status_category"], []).append(str(it["id"]))
-            if out["unreadable"]:
-                raise RuntimeError("the board could not be read: " + ", ".join(map(str, out["unreadable"])))
-            if not by:
-                return "board: nothing running, waiting or needs-you"
-            parts = [f"{k} {len(by[k])} ({_ids(by[k])})" for k in ("running", "waiting", "needs-you") if k in by]
-            return "board: " + "; ".join(parts) + ": each goes into in_flight with its owner and why, or is done"
+            # The open items are the board's: read them there (``board_cli.read_board``), not from the v1 queue.
+            from levain.desk import board_cli
+
+            code, doc, err = board_cli.read_board(consent_dir=store.directory)
+            if doc is None:
+                raise RuntimeError(err or f"levain board state exited {code} with no board")
+            problems = board_cli.problem_lines(doc)
+            if problems and not doc["items"]:
+                raise RuntimeError("the board read no item: " + "; ".join(p.strip() for p in problems[:2]))
+            items = board_cli.open_view(doc)["items"]
+            if not items:
+                return "board: 0 open items"
+            unread = f" (+{len(problems)} problem line(s) in the read)" if problems else ""
+            return (f"board: {len(items)} open ({_ids([str(i['id']) for i in items])}){unread}: read them with `{lv} board open`; "
+                    "do not copy them into in_flight: in_flight names only live work the board does not hold, with its owner and why")
 
         def unacked() -> str:
             if not open_tables_present(conn):
