@@ -96,12 +96,18 @@ def test_event_facts_gap_is_true_for_a_stream_gap_event_or_a_cursor_that_could_n
     db = sqlite3.connect(tmp_path / "dispatch.db")
     db.execute("CREATE TABLE chat_cursors (launch_id TEXT, seq INTEGER, gap INTEGER)")
     db.executemany("INSERT INTO chat_cursors VALUES (?, ?, ?)", [("L-A", 1, 1), ("L-A", 2, 0), ("L-B", 1, 0), ("L-B", 2, 1)])
+    # the stream-gap half: a launch with no cursor row at all, told apart by its event rows alone
+    db.execute("CREATE TABLE chat_events (launch_id TEXT, vendor_event_key TEXT, call_id TEXT, truncated INTEGER, backfill INTEGER, kind TEXT)")
+    db.executemany("INSERT INTO chat_events VALUES (?, ?, ?, ?, ?, ?)",
+                   [("L-C", "k1", None, 0, 0, "gap"), ("L-D", "k2", None, 0, 0, "vendor_tool_call")])
     db.commit(); db.close()
     conn = threads._open(tmp_path)
     try:
         assert threads._event_facts(conn, {"L-A"})[1] is False       # the LATEST cursor row decides: L-A caught up
         assert threads._event_facts(conn, {"L-B"})[1] is True        # L-B's latest says it could not
         assert threads._event_facts(conn, {"L-A", "L-B"})[1] is True
+        assert threads._event_facts(conn, {"L-C"})[1] is True        # a stream gap event alone is a gap
+        assert threads._event_facts(conn, {"L-D"})[1] is False       # an ordinary event row is not
     finally:
         conn.close()
 
@@ -116,3 +122,9 @@ def test_the_deleted_thread_routes_answer_the_generic_404_past_the_write_token(t
             with pytest.raises(urllib.error.HTTPError) as err:
                 urllib.request.urlopen(req, timeout=10)
             assert err.value.code == 404, (path, err.value.code)
+        # the Stop route was a POST: it answers the same unknown route, not a handler's own error
+        post = urllib.request.Request(base + "/cockpit/thread/th-" + "0" * 32 + "/stop", data=b"{}", method="POST",
+                                      headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(post, timeout=10)
+        assert err.value.code == 404, err.value.code
