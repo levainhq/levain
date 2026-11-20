@@ -44,11 +44,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from levain.desk import board_chain, work_attach
+from levain.desk.board_chain import TIER_MAX, is_tier
 
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
     "TWO_STORES", "add", "amend", "build_record", "canonical_bytes", "chain_prev", "decide", "next_id", "read_item_lines", "read_pointer",
-    "resolve_store", "is_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config",
+    "resolve_store", "is_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config", "check_tier", "tier_vocabulary", "TIER_MAX", "is_tier",
 ]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
@@ -63,7 +64,6 @@ TWO_STORES = "two stores: --items names {a}, this install's store is {b} (levain
 OPEN_RETRIES = 5
 
 DONE_KINDS = ("merged", "document", "band", "run")
-TIERS = ("sonnet", "opus", "haiku")
 DECISIONS = ("cut", "parked", "out-of-1.0", "reopen")
 CLEARABLE = ("done", "tier", "depends")
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*#[1-9][0-9]*")      # no leading zero: `#007` and `#7` must never be two ids
@@ -961,8 +961,8 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         raise BoardError(f"repo {repo!r} must match {REPO_RE.pattern}")
     if done_kind not in DONE_KINDS:
         raise BoardError(f"done_kind {done_kind!r} is not one of {DONE_KINDS}")
-    if tier is not None and tier not in TIERS:
-        raise BoardError(f"tier {tier!r} is not one of {TIERS}")
+    if tier is not None:
+        check_tier(target, repo, tier)
     fields = {"title": _one_line(title, "title"), "words": str(words or ""), "origin": _one_line(origin, "origin"),
               "done": _one_line(done, "done", required=False) or None, "done_kind": done_kind, "tier": tier,
               "depends_on": [parse_link(d) for d in depends]}
@@ -1050,8 +1050,8 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
                 raise BoardError(f"done_kind {v!r} is not one of {DONE_KINDS}")
             out[k] = v
         elif k == "tier":
-            if v is not None and v not in TIERS:
-                raise BoardError(f"tier {v!r} is not one of {TIERS}")
+            if v is not None:
+                check_tier(target, str(item_id).partition("#")[0], v)
             out[k] = v
         else:
             if not isinstance(v, list) or not all(isinstance(d, str) for d in v):
@@ -1156,7 +1156,42 @@ def _write_pointer(home: Path, store_dir: Path) -> None:
     _fsync_dir_or_warn(home, "the store pointer")
 
 
-def _config_doc(producers: Any, no_land_waiter: Any) -> dict[str, Any]:
+def tier_vocabulary(target: Target, repo: str) -> tuple[str, ...] | None:
+    """The tiers the store's board config declares for ``repo``, or None when it declares none (any well-shaped tier then writes).
+    Only a real store has a config: a standalone ``--items`` file is read as having none."""
+    if not is_store(target):
+        return None
+    return read_config(target.store_dir)["tiers"].get(repo)
+
+
+def check_tier(target: Target, repo: str, tier: Any) -> None:
+    """Refuse a tier that is not a well-shaped token, or is outside the vocabulary the repo declared. Writes only: a stored tier
+    is never judged here."""
+    if not is_tier(tier):
+        raise BoardError(f"tier {tier!r} must be one short token: lowercase letters, digits, '.', '_' or '-', starting with a "
+                         f"letter or digit, at most {TIER_MAX} characters")
+    declared = tier_vocabulary(target, repo)
+    if declared is not None and tier not in declared:
+        raise BoardError(f"tier {tier!r} is not one of the tiers {repo!r} declares: {', '.join(declared)}")
+
+
+def _tiers_doc(tiers: Any) -> dict[str, list[str]]:
+    if not tiers:
+        return {}
+    if not isinstance(tiers, Mapping):
+        raise BoardError("the board config's tiers must map a repo name to its list of tiers")
+    out: dict[str, list[str]] = {}
+    for repo, names in tiers.items():
+        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+            raise BoardError(f"the board config's tiers name a repo {repo!r} that must match {REPO_RE.pattern}")
+        if not isinstance(names, list) or not names or not all(is_tier(n) for n in names):
+            raise BoardError(f"the board config's tiers for {repo!r} must be a non-empty list of well-shaped tier tokens "
+                             f"(lowercase letters, digits, '.', '_', '-', at most {TIER_MAX} characters)")
+        out[repo] = list(dict.fromkeys(names))
+    return out
+
+
+def _config_doc(producers: Any, no_land_waiter: Any, tiers: Any = None) -> dict[str, Any]:
     from levain.desk import board_producers as bp
 
     names = list(producers or ())
@@ -1164,7 +1199,11 @@ def _config_doc(producers: Any, no_land_waiter: Any) -> dict[str, Any]:
         raise BoardError("the board config's producers must be non-empty one-line names")
     if bp.NATIVE_PRODUCER in names:      # Levain's own producer is always read: naming it would fail every read of the board, at write and at read alike
         raise BoardError(f"the board config's producers name {bp.NATIVE_PRODUCER!r}, Levain's own producer, which is always read; name an external one")
-    return {"config_v": 1, "producers": list(dict.fromkeys(names)), "no_land_waiter": bool(no_land_waiter)}
+    doc: dict[str, Any] = {"config_v": 1, "producers": list(dict.fromkeys(names)), "no_land_waiter": bool(no_land_waiter)}
+    declared = _tiers_doc(tiers)
+    if declared:                       # absent when none is declared: a config without tiers is written byte for byte as before
+        doc["tiers"] = declared
+    return doc
 
 
 def read_config(store_dir: Path | str) -> dict[str, Any]:
@@ -1175,7 +1214,7 @@ def read_config(store_dir: Path | str) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return {"producers": [], "no_land_waiter": False}
+        return {"producers": [], "no_land_waiter": False, "tiers": {}}
     except OSError as exc:
         raise BoardError(f"the board config {path} cannot be read: {exc}") from None
     try:
@@ -1186,17 +1225,18 @@ def read_config(store_dir: Path | str) -> dict[str, Any]:
             or not isinstance(doc.get("no_land_waiter"), bool)):
         raise BoardError(f"the board config {path} is not a v1 config (config_v, producers, no_land_waiter)")
     try:
-        clean = _config_doc(doc["producers"], doc["no_land_waiter"])
+        clean = _config_doc(doc["producers"], doc["no_land_waiter"], doc.get("tiers"))
     except BoardError as exc:
         raise BoardError(f"the board config {path} cannot be used: {exc}") from None
-    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"]}
+    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"],
+            "tiers": {r: tuple(v) for r, v in clean.get("tiers", {}).items()}}
 
 
-def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any) -> bool:
+def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any, tiers: Any = None) -> bool:
     """Write the board config atomically (a temp file in the store dir, fsynced, renamed, directory fsynced). Returns whether the
     config changed. The store dir is locked while it is written."""
     store_dir = Path(store_dir)
-    doc = _config_doc(producers, no_land_waiter)
+    doc = _config_doc(producers, no_land_waiter, tiers)
     payload = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
     try:
         with store_lock(store_dir, exclusive=True, setup=True):

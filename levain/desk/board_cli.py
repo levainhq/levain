@@ -48,7 +48,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from levain.desk import board_author as ba
 from levain.desk import board_evidence as be
@@ -135,6 +135,8 @@ def register(subparsers: Any) -> None:
                             help=f"An agent's launch key (default: ${LAUNCH_KEY_ENV} when set). Refused for an operator.")
 
     items_help = f"An explicit store (its items file or its directory); it must be this install's store. Default: ${ITEMS_ENV}."
+    tier_help = ("A short token (lowercase letters, digits, '.', '_', '-'). If the repo declares its tiers "
+                 "(`board use --tiers REPO=a,b`), one of those.")
     a = sub.add_parser("add", description="Capture an item; prints its id.")
     a.add_argument("--repo", required=True)
     a.add_argument("--title", required=True)
@@ -142,7 +144,7 @@ def register(subparsers: Any) -> None:
     a.add_argument("--words", default="", help="the operator's words verbatim when they gave them")
     a.add_argument("--done", default=None)
     a.add_argument("--done-kind", dest="done_kind", default="merged", choices=bs.DONE_KINDS)
-    a.add_argument("--tier", default=None, choices=bs.TIERS)
+    a.add_argument("--tier", default=None, help=tier_help)
     a.add_argument("--depends", action="append", default=[], metavar="TYPED")
     a.add_argument("--by", required=True)
     author_args(a)
@@ -161,7 +163,7 @@ def register(subparsers: Any) -> None:
     m.add_argument("--words")
     m.add_argument("--done")
     m.add_argument("--done-kind", dest="done_kind", choices=bs.DONE_KINDS)
-    m.add_argument("--tier", choices=bs.TIERS)
+    m.add_argument("--tier", help=tier_help)
     m.add_argument("--depends", action="append", default=None, metavar="TYPED", help="replaces the item's depends_on")
     m.add_argument("--clear", action="append", default=[], choices=bs.CLEARABLE)
     m.add_argument("--items", type=str, metavar="PATH", help=items_help)
@@ -191,6 +193,9 @@ def register(subparsers: Any) -> None:
                         "the default, so `use` with none clears it.")
     u.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
+    u.add_argument("--tiers", dest="tiers", action="append", default=[], metavar="REPO=T1,T2",
+                   help="The tiers REPO may use (repeatable; none declared means any well-shaped tier); saved in the board config, "
+                        "written exactly from the flags like --producer.")
     author_args(u)
     u.set_defaults(func=run_use)
     # the desk's door opens these, each where it is defined (install.DESK_BOARD_VERBS is the same list, for its allow rules)
@@ -505,14 +510,25 @@ def run_decide(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tiers_flags(specs: Sequence[str]) -> dict[str, list[str]]:
+    """``--tiers REPO=a,b`` (repeatable) as ``{repo: [a, b]}``; the same repo named twice adds to its list."""
+    out: dict[str, list[str]] = {}
+    for spec in specs:
+        repo, eq, names = spec.partition("=")
+        if not eq or not repo:
+            raise bs.BoardError(f"--tiers {spec!r} must read REPO=tier,tier")
+        out.setdefault(repo, []).extend(n.strip() for n in names.split(","))
+    return out
+
+
 def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
     """The board config, written EXACTLY from the flags (a flag left off is the default), as the step ``use`` runs BEFORE it
     publishes the pointer or tombstones focus.json. With no flag and no config file there is nothing to write; with no flag and
     a file, the file is replaced by the default, which clears it (levain 29: ``use`` writes exactly its flags)."""
     def write(store_dir: Path) -> bool:
-        if not (args.producers or args.no_land_waiter or (Path(store_dir) / bs.CONFIG_NAME).exists()):
+        if not (args.producers or args.no_land_waiter or args.tiers or (Path(store_dir) / bs.CONFIG_NAME).exists()):
             return False
-        return bs.write_config(store_dir, args.producers, args.no_land_waiter)
+        return bs.write_config(store_dir, args.producers, args.no_land_waiter, _tiers_flags(args.tiers))
     return write
 
 
@@ -520,7 +536,8 @@ def _config_said(store_dir: Path) -> str:
     """What the board config in ``store_dir`` says, in the words ``use`` prints (so a flagless re-run that cleared it says so)."""
     conf = bs.read_config(store_dir)
     producers = ", ".join(conf["producers"]) if conf["producers"] else "none"
-    return f"config: producers {producers}; {'no land waiter' if conf['no_land_waiter'] else 'a land waiter assumed'}"
+    tiers = "".join(f"; tiers {r}: {', '.join(v)}" for r, v in conf["tiers"].items())
+    return f"config: producers {producers}; {'no land waiter' if conf['no_land_waiter'] else 'a land waiter assumed'}{tiers}"
 
 
 def run_use(args: argparse.Namespace) -> int:
@@ -648,7 +665,7 @@ def state_doc(args: argparse.Namespace, say: Any = None, read_evidence: Any = No
             return _sfail(say, "--repo-name names one repo: give --repo with it (a registry names its own repos)")
     try:       # before any git read: a config that cannot be read refuses at once. Only a real store has one: a legacy standalone
                # --items file (no store.id beside it) is the default, whatever board.json happens to sit next to it
-        config = bs.read_config(target.store_dir) if bs.is_store(target) else {"producers": [], "no_land_waiter": False}
+        config = bs.read_config(target.store_dir) if bs.is_store(target) else {"producers": [], "no_land_waiter": False, "tiers": {}}
     except bs.BoardError as exc:
         return _srefused(say, exc)
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)

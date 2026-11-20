@@ -984,9 +984,9 @@
     }
    },
    "items_lines": [
-    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#14\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"land\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#14\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"Land Word\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
    ],
-   "name": "needs_grooming: an unknown tier word reads as no tier",
+   "name": "needs_grooming: an ill-shaped tier reads as no tier",
    "now": "2026-11-12T20:00:00Z"
   },
   {

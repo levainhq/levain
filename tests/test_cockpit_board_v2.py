@@ -165,11 +165,11 @@ def test_use_writes_the_config_atomically_and_a_second_use_changes_nothing(tmp_p
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
     d = tmp_path / "s"
     assert seed.board("use", str(d), "--producer", "flow", "--producer", "ci", "--no-land-waiter").startswith("using")
-    assert board_store.read_config(d) == {"producers": ["flow", "ci"], "no_land_waiter": True}
+    assert board_store.read_config(d) == {"producers": ["flow", "ci"], "no_land_waiter": True, "tiers": {}}
     assert seed.board("use", str(d), "--producer", "flow", "--producer", "ci", "--no-land-waiter").startswith("already using")
     assert [p.name for p in d.iterdir() if p.name.startswith(".")] == []                  # no temp file left behind
     seed.board("use", str(d), "--producer", "flow")                                        # the config is EXACTLY the flags: no_land_waiter off
-    assert board_store.read_config(d) == {"producers": ["flow"], "no_land_waiter": False}
+    assert board_store.read_config(d) == {"producers": ["flow"], "no_land_waiter": False, "tiers": {}}
     seed.board("use", str(d))                                                              # no flag is the default: `use` clears the config
     assert board_store.read_config(d) == {"producers": [], "no_land_waiter": False}
     fresh = tmp_path / "fresh"
@@ -178,7 +178,7 @@ def test_use_writes_the_config_atomically_and_a_second_use_changes_nothing(tmp_p
 
 
 def test_a_store_with_no_config_reads_as_the_flagless_cli(tmp_path):
-    assert board_store.read_config(tmp_path) == {"producers": [], "no_land_waiter": False}
+    assert board_store.read_config(tmp_path) == {"producers": [], "no_land_waiter": False, "tiers": {}}
 
 
 def test_a_config_that_is_not_a_config_is_refused_not_defaulted(tmp_path):

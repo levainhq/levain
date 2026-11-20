@@ -41,8 +41,20 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-__all__ = ["ACK_OP", "Ack", "AckError", "Chain", "ChainBreak", "PREV_BAD", "UNCHAINED", "acked_lines", "check_chain", "honours",
-           "line_hash", "parse_ack", "prev_ill_formed", "record_of"]
+__all__ = ["ACK_OP", "Ack", "AckError", "Chain", "ChainBreak", "PREV_BAD", "TIER_MAX", "TIER_RE", "UNCHAINED", "acked_lines",
+           "check_chain", "honours", "is_tier", "line_hash", "parse_ack", "prev_ill_formed", "record_of"]
+
+#: The longest tier token a board row may carry.
+TIER_MAX = 32
+#: A tier is a short one-line token, read by SHAPE and never by a list of model names: lowercase letters, digits, dot, dash,
+#: underscore, starting with a letter or digit (so it can never read as a command-line flag). A repo may declare the
+#: vocabulary it uses (the board config, ``tiers``); this is the shape every tier, declared or not, has.
+TIER_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+def is_tier(value: Any) -> bool:
+    """True for a well-shaped tier token (at most ``TIER_MAX`` long). The one definition the writer and the fold share."""
+    return isinstance(value, str) and len(value) <= TIER_MAX and TIER_RE.fullmatch(value) is not None
 
 ACK_OP = "ack-torn"
 UNCHAINED = "unchained record after the cutover (an old writer?)"

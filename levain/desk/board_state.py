@@ -39,7 +39,7 @@ __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
     "EVIDENCE_V", "FLAT_EVIDENCE_V", "FLAT_PRODUCER", "FUTURE_SKEW_S", "FlatBlock", "Folded", "GRADE_ORDER", "Item", "Link",
     "MAX_EVIDENCE_AGE_S", "PRODUCER_FUTURE_SKEW_S", "PRODUCER_MAX_AGE_S", "PRODUCER_SOURCES", "SCHEMA", "BandRow", "STATES",
-    "STATE_COLUMN", "STATE_KIND", "State", "TIERS", "derive_all", "derive_state", "fold", "parse_timestamp",
+    "STATE_COLUMN", "STATE_KIND", "State", "derive_all", "derive_state", "fold", "parse_timestamp",
 ]
 
 SCHEMA = "ready-v3"
@@ -67,7 +67,6 @@ MAX_EVIDENCE_AGE_S = 21600
 #: Evidence fetched MORE than this far ahead of ``now`` reads unknown ("fetched_at is in the future"): a fetcher with a
 #: wrong clock must not keep every item fresh for ever. A smaller lead is ordinary clock skew between two machines.
 FUTURE_SKEW_S = 300
-TIERS = ("sonnet", "opus", "haiku")
 DONE_KINDS = ("merged", "document", "band", "run")
 DECISIONS = ("cut", "parked", "out-of-1.0")
 _OPS = ("add", "amend", "decide")
@@ -1013,7 +1012,7 @@ class _Ctx:
         self._cycles: dict[str, tuple[str, ...] | None] = {}
 
     def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
-        return State(item.id, item.repo, item.title, item.tier if item.tier in TIERS else None, state,
+        return State(item.id, item.repo, item.title, item.tier if board_chain.is_tier(item.tier) else None, state,
                      STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at, STATE_KIND[state])
 
     def state_of(self, iid: str) -> State:
@@ -1409,7 +1408,7 @@ def _rule_ready_with_start(ctx: _Ctx, item: Item) -> State | None:
 
 
 def _grooming_gap(item: Item) -> str | None:
-    no_done, no_tier = not item.done, item.tier not in TIERS
+    no_done, no_tier = not item.done, not board_chain.is_tier(item.tier)
     if no_done and no_tier:
         return "needs grooming: no DONE line or tier"
     return "needs grooming: no DONE line" if no_done else "needs grooming: no tier" if no_tier else None

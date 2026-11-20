@@ -658,3 +658,10 @@ def test_a_closing_trailer_on_main_reads_done_beside_an_orphan_branch_with_extra
 def test_no_closing_trailer_beside_an_orphan_branch_is_still_a_conflict():
     s = _orphan_world(closes=False)["levain#1"]
     assert s.state == "unknown" and s.reason.startswith("conflict: in chain queue/1114-land3/sr2 vs orphan branch seat/1114-44-storeresolver")
+
+
+def test_every_stored_tier_still_reads_and_an_ill_shaped_one_reads_as_no_tier():
+    lines = [_line(iid=f"levain#{i}", done="d", tier=t) for i, t in enumerate(("sonnet", "opus", "haiku", "light", "Bad Tier"), 1)]
+    items = bs.fold(lines).items
+    got = {i: bs._grooming_gap(it) for i, it in items.items()}
+    assert [got[f"levain#{i}"] for i in range(1, 6)] == [None, None, None, None, "needs grooming: no tier"]

@@ -1090,3 +1090,34 @@ def test_an_empty_launch_key_means_no_launch_key_whatever_the_environment_says(h
     assert "launch_key" not in json.loads(lines(store)[0])["author"]
     assert run(capsys, *ADD)[0] == 0
     assert json.loads(lines(store)[1])["author"]["launch_key"] == "envkey"
+
+
+# ------------------------------------------------------------------------------------------- the tier is a declared vocabulary
+def _add(capsys, tier, repo="levain"):
+    return run(capsys, "add", "--repo", repo, "--title", "t", "--origin", "o", "--by", "b", "--tier", tier)
+
+
+def test_a_tier_is_judged_by_shape_when_no_vocabulary_is_declared(home, tmp_path, capsys):
+    use(capsys, tmp_path / "store")
+    assert _add(capsys, "light")[0] == 0 and _add(capsys, "gpt-5.2_mini")[0] == 0 and _add(capsys, "sonnet")[0] == 0
+    for bad in ("Light", "two words", "x y", "x" * (bs.TIER_MAX + 1), "a/b"):
+        rc, out, err = _add(capsys, bad)
+        assert rc == 2 and out == "" and "must be one short token" in err, bad
+    rc, _, err = run(capsys, "amend", "--id", "levain#1", "--why", "w", "--by", "b", "--tier", "Heavy")
+    assert rc == 2 and "must be one short token" in err
+
+
+def test_a_declared_vocabulary_refuses_a_tier_outside_it_naming_the_list(home, tmp_path, capsys):
+    rc, out, err = run(capsys, "use", str(tmp_path / "store"), "--tiers", "levain=light,heavy", "--tiers", "other=x")
+    assert rc == 0 and "tiers levain: light, heavy" in out, err
+    assert _add(capsys, "light")[0] == 0
+    rc, _, err = _add(capsys, "sonnet")
+    assert rc == 2 and "light, heavy" in err
+    rc, _, err = run(capsys, "amend", "--id", "levain#1", "--why", "w", "--by", "b", "--tier", "opus")
+    assert rc == 2 and "light, heavy" in err
+    assert _add(capsys, "sonnet", repo="unlisted")[0] == 0          # a repo that declares nothing takes any well-shaped tier
+    assert _add(capsys, "x", repo="other")[0] == 0 and _add(capsys, "y", repo="other")[0] == 2
+    rc, _, err = run(capsys, "use", str(tmp_path / "store"), "--tiers", "levain=Bad")
+    assert rc == 2 and "well-shaped" in err
+    assert run(capsys, "use", str(tmp_path / "store"))[0] == 0      # a flagless re-run clears the declaration, as for the other flags
+    assert _add(capsys, "sonnet")[0] == 0
