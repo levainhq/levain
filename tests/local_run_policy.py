@@ -53,11 +53,29 @@ def names_whole_tree(positional, invocation_dir, root_dir):
     return False
 
 
-def is_bare_full(positional, keyword, markexpr, collect_only, last_failed=False, whole_tree=False):
-    """True when nothing narrows the run: no path or node id below tests/, no -k, no -m, no --collect-only, no --lf."""
+def has_last_failed(root_dir):
+    """True when pytest's cache holds failures to rerun: `--lf` on an empty cache runs everything, so only then it narrows."""
+    try:
+        return bool(Path(root_dir, ".pytest_cache", "v", "cache", "lastfailed").read_text(encoding="utf-8").strip("{} \n"))
+    except OSError:
+        return False
+
+
+def inside_tests_subdir(invocation_dir, root_dir):
+    """True when the run starts in a directory below tests/ with no path given: pytest then collects that directory only."""
+    tests = (root_dir / "tests").resolve()
+    here = Path(invocation_dir).resolve()
+    return here != tests and tests in here.parents
+
+
+def is_bare_full(positional, keyword, markexpr, collect_only, last_failed=False, whole_tree=False, in_subdir=False):
+    """True when nothing narrows the run: no path or node id below tests/, no -k, no -m, no --collect-only, no --lf with
+    failures to rerun, and not started from inside a tests/ subdirectory."""
     if keyword or markexpr or collect_only or last_failed:
         return False
-    return whole_tree or not positional
+    if not positional:
+        return not in_subdir
+    return whole_tree
 
 
 def _is_info_run(ns):
@@ -88,8 +106,9 @@ def refuse_bare_full(config, env=None):
         getattr(ns, "keyword", ""),
         getattr(ns, "markexpr", ""),
         bool(getattr(ns, "collectonly", False)),
-        bool(getattr(ns, "lf", False)),
+        bool(getattr(ns, "lf", False)) and has_last_failed(config.rootpath),
         whole,
+        inside_tests_subdir(config.invocation_params.dir, config.rootpath),
     ):
         return REFUSAL
     return None
@@ -113,7 +132,10 @@ def background_qos(env=None, platform=None):
     platform = sys.platform if platform is None else platform
     if on_ci(env) or platform != "darwin" or env.get("LEVAIN_TEST_QOS") == "normal":
         return False
-    import ctypes
+    try:
+        import ctypes
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    return libc.setpriority(_PRIO_DARWIN_PROCESS, 0, _PRIO_DARWIN_BG) == 0
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.setpriority(_PRIO_DARWIN_PROCESS, 0, _PRIO_DARWIN_BG) == 0
+    except (OSError, AttributeError):
+        return False     # a priority that cannot be set must never fail the run it was meant to quiet

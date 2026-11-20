@@ -32,7 +32,7 @@ def test_a_bare_full_run_is_refused_and_a_targeted_one_is_not():
     assert p.refuse_bare_full(_config(), NO_ENV) == p.REFUSAL
     assert "scripts/ci_full.py" in p.REFUSAL and "LEVAIN_LOCAL_FULL=1" in p.REFUSAL
     for narrowed in (_config(["tests/test_x.py"]), _config(["tests/test_x.py::test_y"]), _config(keyword="foo"),
-                     _config(markexpr="invariant"), _config(collectonly=True), _config(lf=True)):
+                     _config(markexpr="invariant"), _config(collectonly=True)):
         assert p.refuse_bare_full(narrowed, NO_ENV) is None
 
 
@@ -43,6 +43,21 @@ def test_the_whole_tests_directory_is_a_full_run_and_an_info_flag_is_not():
     assert p.refuse_bare_full(_config(["tests/ci"]), NO_ENV) is None                     # a directory below tests/ narrows
     for flag in ("help", "version", "markers", "showfixtures"):
         assert p.refuse_bare_full(_config(info=flag), NO_ENV) is None, flag
+
+
+def test_lf_narrows_only_with_failures_to_rerun_and_a_tests_subdirectory_narrows(tmp_path):
+    cfg = _config(lf=True)
+    cfg.rootpath = tmp_path
+    (tmp_path / "tests").mkdir()
+    assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL                      # empty cache: --lf runs everything
+    cache = tmp_path / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "lastfailed").write_text('{"tests/test_x.py::test_y": true}')
+    assert p.refuse_bare_full(cfg, NO_ENV) is None
+    (cache / "lastfailed").write_text("{}")
+    assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
+    assert p.refuse_bare_full(_config(cwd=ROOT / "tests" / "ci"), NO_ENV) is None   # started inside a tests/ subdirectory
+    assert p.refuse_bare_full(_config(cwd=ROOT / "tests"), NO_ENV) == p.REFUSAL
 
 
 def test_local_full_one_overrides_the_refusal_and_nothing_else_does():

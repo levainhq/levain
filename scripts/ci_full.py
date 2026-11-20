@@ -17,6 +17,7 @@ stdlib only; every external call is a `gh` or `git` argv list, so no branch name
 from __future__ import annotations
 
 import json
+import urllib.parse
 from pathlib import Path
 import subprocess
 import sys
@@ -64,7 +65,7 @@ def pick_run(runs, branch, sha, not_before, exclude=()):
         created = parse_time(r.get("created_at"))
         if created is None or created < not_before:
             continue
-        if best is None or created > parse_time(best["created_at"]):
+        if best is None or (created, r.get("id", 0)) > (parse_time(best["created_at"]), best.get("id", 0)):
             best = r
     return best
 
@@ -111,10 +112,19 @@ def main(argv):
         if a.startswith("--repo="):
             repo = a.split("=", 1)[1]
         elif a.startswith("--timeout-min="):
-            timeout = int(a.split("=", 1)[1]) * 60
+            try:
+                timeout = int(a.split("=", 1)[1]) * 60
+            except ValueError:
+                timeout = 0
+            if timeout <= 0:
+                print("ci_full: --timeout-min needs a positive whole number", file=sys.stderr)
+                return 2
         elif a.startswith("--"):
             print(f"ci_full: unknown option {a}", file=sys.stderr)
             return 2
+    if any(a.startswith("-") for a in args):
+        print("ci_full: a branch name cannot start with '-'", file=sys.stderr)
+        return 2
     if len(args) > 1:
         print("usage: ci_full.py [BRANCH] [--repo=OWNER/NAME] [--timeout-min=N]", file=sys.stderr)
         return 2
@@ -130,20 +140,23 @@ def main(argv):
         print("ci_full: main and land/** run through the landing chain, not a dispatch", file=sys.stderr)
         return 2
 
-    local = _run(["git", "-C", ROOT, "rev-parse", branch])
+    local = _run(["git", "-C", ROOT, "rev-parse", "--verify", f"refs/heads/{branch}"])
     remote = _run(["git", "-C", ROOT, "ls-remote", "origin", f"refs/heads/{branch}"])
-    if local.returncode != 0 or remote.returncode != 0 or not remote.stdout.strip():
+    remote_lines = [ln.split() for ln in remote.stdout.splitlines() if ln.split()[1:] == [f"refs/heads/{branch}"]]
+    if local.returncode != 0 or remote.returncode != 0 or not remote_lines:
         print(f"ci_full: branch {branch} is not pushed to origin (or not local): push it first", file=sys.stderr)
         return 2
-    sha, remote_sha = local.stdout.strip(), remote.stdout.split()[0]
+    sha, remote_sha = local.stdout.strip(), remote_lines[0][0]
     if sha != remote_sha:
         print(f"ci_full: origin/{branch} is at {remote_sha[:10]}, local {branch} at {sha[:10]}: push first, CI tests what origin holds", file=sys.stderr)
         return 2
 
+    runs_path = f"actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch&branch={urllib.parse.quote(branch, safe='')}&per_page=20"
     try:
-        before = {r.get("id") for r in _api(repo, f"actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch&branch={branch}&per_page=20")["workflow_runs"]}
-    except (RuntimeError, KeyError, ValueError):
-        before = set()
+        before = {r.get("id") for r in _api(repo, runs_path)["workflow_runs"]}
+    except (RuntimeError, KeyError, ValueError) as e:
+        print(f"ci_full: could not list the existing runs, so a new run cannot be told from an old one: {e}", file=sys.stderr)
+        return 2
     t0 = datetime.now(timezone.utc)
     p = _run(["gh", "workflow", "run", WORKFLOW, "--repo", repo, "--ref", branch])
     if p.returncode != 0:
@@ -157,7 +170,7 @@ def main(argv):
     while run is None and time.time() < deadline:
         time.sleep(5)
         try:
-            runs = _api(repo, f"actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch&branch={branch}&per_page=20")["workflow_runs"]
+            runs = _api(repo, runs_path)["workflow_runs"]
         except (RuntimeError, KeyError, ValueError) as e:
             print(f"ci_full: {e}", file=sys.stderr)
             continue
