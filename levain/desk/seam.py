@@ -371,8 +371,8 @@ def _header(conn: sqlite3.Connection, kind: str, read_at: str, head: int, floor:
 
 
 def _in_flight_drift(store: CoordStore, body: dict) -> list[str]:
-    """The lines saying an ``in_flight`` entry names a board item the board no longer reads as open, beside the list. This section
-    is never cut, so a board that cannot be read is one line here and never fails the section; with no board id named, the board is not read."""
+    """The lines saying an ``in_flight`` entry names a board item the board no longer reads as open, beside the list.
+    A board that cannot be read is one line here and never fails the section; with no board id named, the board is not read."""
     from levain.desk import board_cli
 
     if not board_cli.in_flight_ids(body):
