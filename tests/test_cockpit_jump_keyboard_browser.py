@@ -36,6 +36,9 @@ PAD = ("(() => { const b = document.getElementById('board'); let n = b.querySele
 DRAWN = ("[...document.querySelectorAll('#board .panel > .phead h2')].filter(h => !['notifications', 'topology'].includes(h.closest('.panel').dataset.ckPanel))"
          ".map(h => h.textContent)")
 LISTED = "[...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent)"
+# the rows of one kind (the .pk column), in list order
+LISTED_OF = "(k) => [...document.querySelectorAll('.palette-list li')].filter(li => li.querySelector('.pk').textContent === k).map(li => li.querySelector('.pl').textContent)"
+PLACE_BTNS = "document.querySelectorAll('[data-ia-place-btn]').length"
 ARROW = "document.querySelector('.palette-input').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}));"
 STATE = ("JSON.stringify({probe: 'jump', open: !!document.querySelector('.palette'), "
          " active: document.activeElement === document.querySelector('.palette-input') ? 'input' : (document.activeElement ? (document.activeElement.id || document.activeElement.className || document.activeElement.tagName) : null)})")
@@ -56,10 +59,15 @@ def _run(tmp_path: Path, steps: list[dict], w: int = 1280, h: int = 900) -> dict
 @needs_browser
 def test_an_empty_query_lists_every_panel_past_the_fourteenth(tmp_path: Path) -> None:
     steps = [{"eval": "document.getElementById('jumpbtn').click(); 1"},
-             {"eval": f"JSON.stringify({{probe: 'cap', listed: {LISTED}, drawn: {DRAWN}}})"}]
+             {"eval": f"JSON.stringify({{probe: 'cap', listed: ({LISTED_OF})('panel'), all: {LISTED}, places: ({LISTED_OF})('place'), nplaces: {PLACE_BTNS}, drawn: {DRAWN},"
+                      " at: Object.fromEntries(window.LevainCockpitKinds.jumpTargets().filter(t => t.kind === 'panel').map(t => [t.label, t.place]))})"}]
     (got,) = _vals(_run(tmp_path, steps))
     assert len(got["drawn"]) > 14, got
-    assert got["listed"] == got["drawn"], got        # every panel, in the page's draw order, none cut
+    assert [t for t in got["drawn"] if t not in got["all"]] == [], got               # every board panel title is listed, none cut
+    # the list groups by place now (the current place's panels first), so the board's draw order holds inside each place (the board's own titles only)
+    for place in set(got["at"].values()):
+        assert [t for t in got["listed"] if t in got["drawn"] and got["at"].get(t) == place] == [t for t in got["drawn"] if got["at"].get(t) == place], (place, got)
+    assert got["nplaces"] > 0 and len(got["places"]) == got["nplaces"], got         # and the places are listed too
 
 
 READ_SEL = ("(() => { const i = document.querySelector('.palette-input'), l = document.querySelector('.palette-list'),"

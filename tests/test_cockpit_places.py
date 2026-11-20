@@ -251,9 +251,17 @@ const panel = (id, title, modes) => { const p = new N("section"); p.dataset.ckPa
 const ids = [["episodes", "Recent episodes", "board"], ["tray", "List", "morning board"], ["notifications", "Notifications", "board"],
   ["topology", "Topology", "build"], ["agents", "Agents", "build"], ["crystals", "Crystals", "memory"]];
 const panels = ids.map(([id, t, m]) => panel(id, t, m));
-const heads = panels.map((p) => Object.assign(new N("h2"), { text: p.title, closest: () => p }));
-globalThis.document.querySelectorAll = (sel) => (sel === "#board .panel > .phead h2" ? heads : []);
-out.listed = K.jumpItems("").map((i) => i.label);
+// the builder reads the page: every node the jump selector matches (data-ck-panel here), its heading, its tab list, its closest zone
+const heads = panels.map((p) => Object.assign(new N("h2"), { text: p.title }));
+panels.forEach((p, i) => Object.assign(p, {
+  querySelector: (q) => (q === "h2" ? heads[i] : null), getAttribute: () => null, matches: () => false,
+  closest: (sel) => (sel === "[data-modes]" && p.dataset.modes ? p : null), isConnected: true }));
+const act = Object.assign(new N("button"), { querySelector: () => Object.assign(new N("span"), { text: "Notifications" }) });
+act.dataset.phoneJump = "notifications";
+globalThis.document.querySelectorAll = (sel) => (sel.indexOf("data-ck-panel") >= 0 ? panels : sel.indexOf("data-phone-jump") >= 0 ? [act] : []);
+const items = K.jumpItems("");
+out.listed = items.filter((i) => i.kind === "panel").map((i) => i.label);
+out.listedActions = items.filter((i) => i.kind === "action").map((i) => i.label);
 const by = (id) => panels.find((p) => p.dataset.ckPanel === id);
 out.fromHome = [K.revealTab(by("episodes")), document.body.dataset.mode];
 out.fromMemory = [K.revealTab(by("episodes")), document.body.dataset.mode];       // already there: no change
@@ -265,6 +273,7 @@ out.crystals = [K.revealTab(by("crystals")), document.body.dataset.mode];
 """, tmp_path)
     assert "Recent episodes" in out["listed"] and "Agents" in out["listed"], out
     assert "Notifications" not in out["listed"] and "Topology" not in out["listed"], out
+    assert out["listedActions"] == ["Notifications"], out                               # the action is listed on purpose; only the panel is not drawn
     assert out["fromHome"] == [True, "memory"] and out["fromMemory"] == [False, "memory"], out
     assert out["agents"] == [False, "board"] and out["agentsWrote"] == [], out         # choosing Agents on Home writes no address and remounts nothing
     assert out["crystals"] == [True, "memory"], out
@@ -278,7 +287,7 @@ def test_choosing_recent_episodes_in_the_jump_box_ends_on_the_drawn_panel(tmp_pa
               " i.dispatchEvent(new Event('input')); const items = [...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent);"
               " i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return JSON.stringify(items); })()")
     LISTED = ("(() => { document.getElementById('jumpbtn').click(); const i = document.querySelector('.palette-input');"
-              " const t = [...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent); i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return JSON.stringify(t); })()")
+              " const t = [...document.querySelectorAll('.palette-list li')].map(li => [li.querySelector('.pk').textContent, li.querySelector('.pl').textContent]); i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return JSON.stringify(t); })()")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
@@ -293,7 +302,8 @@ def test_choosing_recent_episodes_in_the_jump_box_ends_on_the_drawn_panel(tmp_pa
     strs = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith(("{", "["))]
     listed, chosen1, shown1, chosen2, shown2 = strs
     assert any("episodes" in t.lower() for t in chosen1), chosen1                  # the fixture offers the panel
-    assert not [t for t in listed if t in ("Notifications", "Topology")], listed
+    assert not [t for k, t in listed if k == "panel" and t in ("Notifications", "Topology")], listed   # no such panel is listed ...
+    assert ["action", "Notifications"] in listed and not [t for k, t in listed if t == "Topology"], listed   # ... the Notifications action is
     assert shown1 == {"place": "memory", "shown": True}, shown1
     assert shown2 == {"place": "memory", "shown": True}, shown2
 

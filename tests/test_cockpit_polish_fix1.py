@@ -17,7 +17,11 @@ from tests.test_cockpit_places import PRESS, READY, SETTLE
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 
 OPEN_JUMP = "document.getElementById('jumpbtn').click(); 1"
-CHOOSE_FIRST = """(() => { const li = document.querySelector('.palette-list li'); if (!li) return 'none'; window.__lbl = li.querySelector('.pl').textContent; li.click(); return 1; })()"""
+# the first row of kind panel that the board draws (the list now opens with the places, whose first row is Home, then the current place's
+# own panels: on Settings those are Settings panels, which are not a jump away from Settings, so the first board panel is the one chosen)
+CHOOSE_FIRST = """(() => { const board = [...document.querySelectorAll('#board .panel > .phead h2')].map((h) => h.textContent);
+  const li = [...document.querySelectorAll('.palette-list li')].find((x) => x.querySelector('.pk').textContent === 'panel' && board.includes(x.querySelector('.pl').textContent));
+  if (!li) return 'none'; window.__lbl = li.querySelector('.pl').textContent; li.click(); return 1; })()"""
 # the panel the palette's first row named, drawn or not, and the place the page is on
 PROBE_PANEL = """(() => { const want = window.__lbl; let drawn = null;
   for (const h of document.querySelectorAll('#board .panel > .phead h2')) if (h.textContent === want) drawn = h.closest('.panel').getClientRects().length > 0;
