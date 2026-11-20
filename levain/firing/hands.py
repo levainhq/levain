@@ -123,8 +123,9 @@ class HandsSetupError(RuntimeError):
 
 class GitProbeError(HandsSetupError):
     """The git ownership probe could not be carried out. The text is what ran and what came back
-    (the command, its exit code, the first line of its error output); it says nothing about what
-    git does in a repository whose git directory belongs to another user."""
+    (the command, its exit code, the first line of its error output) or the step of preparing the
+    scratch repository that the system refused and its own text; it says nothing about what git
+    does in a repository whose git directory belongs to another user."""
 
 
 # --- the Linux egress boundary --------------------------------------------------------------------
@@ -1350,14 +1351,15 @@ def git_version() -> str:
     return subprocess.run([_abs("git"), "--version"], capture_output=True, text=True, cwd="/", env=child_env()).stdout.strip()
 
 
-#: The most characters of a failed command's first output line that a :class:`GitProbeError` carries.
+#: The most characters of a failed command's output line that a :class:`GitProbeError` carries, the
+#: "..." of a cut line included.
 _PROBE_LINE_MAX = 200
 
 
 def _probe_failure(argv: list[str], returncode: int, stderr: str | bytes | None, stdout: str | bytes | None) -> GitProbeError:
     """A :class:`GitProbeError` for ``argv`` that exited with ``returncode``: the command, the code
-    and one line of what it printed, cut to :data:`_PROBE_LINE_MAX` characters. The line is the first
-    one, across the error output and then the standard output, that starts with git's own ``fatal:``
+    and one line of what it printed, at most :data:`_PROBE_LINE_MAX` characters with the "..." of a
+    cut. The line is the first one, across the error output and then the standard output, that starts with git's own ``fatal:``
     or ``error:``; with none, the first non-empty line. The first line alone can be a warning that
     ``sudo`` printed ahead of git (an unresolvable host name, for one), which would hide the line that
     says why git failed."""
@@ -1368,7 +1370,7 @@ def _probe_failure(argv: list[str], returncode: int, stderr: str | bytes | None,
     first = "no output"
     if lines:
         chosen = next((ln for ln in lines if ln.startswith(("fatal:", "error:"))), lines[0])
-        first = chosen if len(chosen) <= _PROBE_LINE_MAX else chosen[:_PROBE_LINE_MAX] + "..."
+        first = chosen if len(chosen) <= _PROBE_LINE_MAX else chosen[:_PROBE_LINE_MAX - 3] + "..."
     return GitProbeError(f"`{shlex.join(argv)}` exited {returncode}: {first}")
 
 
@@ -1380,7 +1382,8 @@ def _make_gitcheck_repo(scratch: Path, repo: Path, env: dict[str, str]) -> None:
     0700 git directory owned by ``nobody`` cannot be entered by the operator, whose git then says
     "not a git repository" and never reaches the ownership check. Only the paths named here are
     changed; the ownership part stays with the caller. Raises :class:`GitProbeError` when ``git
-    init`` cannot be started or exits non-zero."""
+    init`` cannot be started or exits non-zero; an ``OSError`` from a chmod or the walk is left for
+    the caller, which names it."""
     argv = [_abs("git"), "init", "-q", str(repo)]
     try:
         made = subprocess.run(argv, env=env, cwd="/", capture_output=True)
@@ -1410,11 +1413,15 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
     True: ``git status`` exited non-zero and its output says "dubious ownership". False: it exited
     0 (git worked in that repository). Any other non-zero exit, and a ``git init`` or ``git status``
     that could not be started or failed, measured nothing about the refusal: it raises
-    :class:`GitProbeError` with the command, the exit code and the first line of what it printed."""
-    nobody = pwd.getpwnam("nobody")
-    op = pwd.getpwnam(operator)
-    scratch = Path(tempfile.mkdtemp(prefix="levain-gitcheck-"))
+    :class:`GitProbeError` with the command, the exit code and the first line of what it printed.
+    So does a step of preparing the scratch repository that the system refused (no ``nobody`` or
+    operator account, no scratch directory, a chmod or chown that failed): the error carries the
+    exception's own text."""
+    scratch: Path | None = None
     try:
+        nobody = pwd.getpwnam("nobody")
+        op = pwd.getpwnam(operator)
+        scratch = Path(tempfile.mkdtemp(prefix="levain-gitcheck-"))
         repo = scratch / "r"
         env = {"PATH": SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
         _make_gitcheck_repo(scratch, repo, env)
@@ -1426,7 +1433,7 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
         argv = [SUDO, "-u", operator, "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
                 _abs("git"), "-C", str(repo), "status"]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, cwd="/", env=child_env())
+            r = subprocess.run(argv, capture_output=True, text=True, errors="replace", cwd="/", env=child_env())
         except OSError as exc:
             raise GitProbeError(f"`{shlex.join(argv)}` could not be started: {exc}") from exc
         if r.returncode == 0:
@@ -1434,8 +1441,13 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
         if "dubious ownership" in (r.stderr + r.stdout):
             return True
         raise _probe_failure(argv, r.returncode, r.stderr, r.stdout)
+    except (OSError, KeyError) as exc:
+        # A KeyError's str() is the repr of its key; its first argument is the text pwd wrote.
+        why = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+        raise GitProbeError(f"could not prepare the scratch repository: {why}") from exc
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def shared_root_problem(host: HostOS) -> str | None:
@@ -2086,7 +2098,7 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
             refused = git_refuses_foreign_gitdir(operator)
         except GitProbeError as exc:
             print(f"setup-isolation: refusing: the check of whether your git refuses a repository whose git "
-                  f"directory belongs to another user could not be carried out: {exc}.")
+                  f"directory belongs to another user could not be carried out: {exc}{'' if str(exc).endswith('.') else '.'}")
             return 1
     if not dry_run and not refused:
         print(f"setup-isolation: refusing: your git ({git_version() or 'git'}) works in a repository whose "

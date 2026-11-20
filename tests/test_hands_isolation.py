@@ -1465,12 +1465,44 @@ def test_a_long_first_line_is_cut_and_a_silent_failure_says_so(monkeypatch) -> N
     _probe_rig(monkeypatch, status=(1, "", "x" * 900 + "\nsecond line\n"))
     with pytest.raises(hands.GitProbeError) as err:
         hands.git_refuses_foreign_gitdir("someone")
-    assert "x" * hands._PROBE_LINE_MAX in str(err.value) and "x" * (hands._PROBE_LINE_MAX + 1) not in str(err.value)
+    quoted = str(err.value).split("exited 1: ", 1)[1]
+    assert quoted == "x" * (hands._PROBE_LINE_MAX - 3) + "..." and len(quoted) == hands._PROBE_LINE_MAX
     assert "second line" not in str(err.value)
     _probe_rig(monkeypatch, status=(2, "", ""))
     with pytest.raises(hands.GitProbeError) as err2:
         hands.git_refuses_foreign_gitdir("someone")
     assert "exited 2: no output" in str(err2.value)
+
+
+def test_a_line_of_exactly_the_cap_is_kept_whole_and_one_longer_is_cut_within_the_cap(monkeypatch) -> None:
+    cap = hands._PROBE_LINE_MAX
+    for length, whole in ((cap, True), (cap + 1, False)):
+        _probe_rig(monkeypatch, status=(1, "", "y" * length + "\n"))
+        with pytest.raises(hands.GitProbeError) as err:
+            hands.git_refuses_foreign_gitdir("someone")
+        quoted = str(err.value).split("exited 1: ", 1)[1]
+        assert len(quoted) == cap and quoted.endswith("...") != whole
+
+
+def test_output_that_is_not_utf8_does_not_escape_the_probe_as_a_decode_error(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(0, "", ""))
+    inner = hands.subprocess.run
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        if argv[0] == SUDO:  # a real child whose error output is not UTF-8, decoded by the real text=True path
+            return real_run(["/bin/sh", "-c", "printf 'fatal: bad \\377\\376 bytes\\n' >&2; exit 128"], **kw)
+        return inner(argv, **kw)
+
+    monkeypatch.setattr(hands.subprocess, "run", run)
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "exited 128" in str(err.value) and "fatal: bad" in str(err.value) and "bytes" in str(err.value)
+
+
+def test_bytes_that_are_not_utf8_reach_the_probe_failure_text_replaced() -> None:
+    err = hands._probe_failure(["git", "init"], 128, b"fatal: bad \xff\xfe name\n", b"")
+    assert "exited 128: fatal: bad" in str(err) and "name" in str(err)
 
 
 def test_the_probe_removes_its_scratch_directory_when_it_fails(monkeypatch, tmp_path: Path) -> None:
@@ -1488,6 +1520,56 @@ def test_the_gitcheck_repo_helper_raises_the_real_failure_of_git_init(tmp_path: 
     with pytest.raises(hands.GitProbeError) as err:
         hands._make_gitcheck_repo(tmp_path, blocker / "r", env)
     assert "init" in str(err.value) and "exited" in str(err.value) and "fatal:" in str(err.value)
+
+
+def test_a_scratch_directory_that_cannot_be_made_is_a_probe_failure_that_says_so(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(128, "", _DUBIOUS))
+
+    def mkdtemp(*a, **kw):
+        raise OSError(errno.ENOSPC, "No space left on device", "/tmp/levain-gitcheck-x")
+
+    monkeypatch.setattr(hands.tempfile, "mkdtemp", mkdtemp)
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert str(err.value).startswith("could not prepare the scratch repository: ")
+    assert "No space left on device" in str(err.value)
+
+
+def test_a_missing_nobody_account_is_a_probe_failure_that_names_it(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=(128, "", _DUBIOUS))
+    me = hands.pwd.getpwuid(os.getuid())
+
+    def getpwnam(name):
+        if name == "nobody":
+            raise KeyError("getpwnam(): name not found: 'nobody'")
+        return me
+
+    monkeypatch.setattr(hands.pwd, "getpwnam", getpwnam)
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert str(err.value) == "could not prepare the scratch repository: getpwnam(): name not found: 'nobody'"
+
+
+def test_a_chown_that_fails_is_a_probe_failure_and_the_scratch_directory_is_removed(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(hands.tempfile, "tempdir", str(tmp_path))
+    seen = _probe_rig(monkeypatch, status=(128, "", _DUBIOUS))
+
+    def lchown(*a, **kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(hands.os, "lchown", lchown)
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert str(err.value).startswith("could not prepare the scratch repository: ")
+    assert "Operation not permitted" in str(err.value)
+    assert not any(a[0] == SUDO for a in seen) and list(tmp_path.glob("levain-gitcheck-*")) == []
+
+
+def test_a_start_failure_already_named_is_not_wrapped_a_second_time(monkeypatch) -> None:
+    _probe_rig(monkeypatch, status=FileNotFoundError(errno.ENOENT, "No such file or directory", "/usr/bin/sudo"))
+    with pytest.raises(hands.GitProbeError) as err:
+        hands.git_refuses_foreign_gitdir("someone")
+    assert "could not be started" in str(err.value) and "could not prepare" not in str(err.value)
 
 
 def _setup_rig_up_to_the_probe(tmp_path: Path, monkeypatch):
@@ -1517,3 +1599,27 @@ def test_setup_isolation_still_says_the_git_works_when_the_probe_measured_that(t
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     out = capsys.readouterr().out
     assert _FALSE_CLAIM in out and "Upgrade git (2.37.1 or later" in out
+
+
+def test_setup_isolation_does_not_double_the_full_stop_that_ends_the_quoted_text(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed = _setup_rig_up_to_the_probe(tmp_path, monkeypatch)
+
+    def probe(operator):
+        raise hands.GitProbeError("`git init -q /tmp/r` exited 128: fatal: cannot mkdir /tmp/r: File exists.")
+
+    monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", probe)
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    out = capsys.readouterr().out.strip()
+    assert out.endswith("File exists.") and not out.endswith("..")
+
+
+def test_setup_isolation_keeps_the_ellipsis_of_a_cut_line_and_ends_a_bare_text_with_a_full_stop(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed = _setup_rig_up_to_the_probe(tmp_path, monkeypatch)
+    for text, ending in (("`git status` exited 1: " + "x" * 197 + "...", "xxx..."),
+                         ("`git status` exited 1: no output", "no output.")):
+        def probe(operator, text=text):
+            raise hands.GitProbeError(text)
+
+        monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", probe)
+        assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+        assert capsys.readouterr().out.strip().endswith(ending)
