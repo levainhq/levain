@@ -512,13 +512,11 @@ class SnapshotHost:
         """The attachments this host's cockpit holds now that the child's does not (sorted), recorded and logged when the set
         differs from the last decision's. This is PRESENCE, not EQUIVALENCE: it asks only whether the child's cockpit holds a
         consent reader, a question store and a note store wherever the serve's does. A child whose reader was built differently
-        (a serve may wrap its consent reader in a class that names no directory, while a factory attaches a plain one) passes,
-        and so does one whose store reads another place. Making the two the same reader is the factory's
-        to do; the host can only decline a child that holds nothing where the serve holds something, so that no factory makes a
-        panel derive blind unseen. The serve's side is read here, at each decision, because it attaches after this host is built
-        and whatever wraps a reader later does so after the host started. A child that has not been ready has told nothing yet, which is no gap
-        to name (``knows`` keeps it out of the routing until it has), and a ready frame with no list was read as an empty one by
-        the client. A gap is not a failure of the child: nothing here touches the fallback count, the backoff or the process."""
+        passes, and so does one whose store reads another place. Making the two the same reader is the factory's to do; the
+        host can only decline a child that holds nothing where the serve holds something, so that no factory makes a panel
+        derive blind unseen. The serve's side is read live at each decision, never cached. A child that has not been ready has
+        told nothing yet, which is no gap to name, and a ready frame with no list was read as an empty one by the client. A gap
+        is not a failure of the child: nothing here touches the fallback count, the backoff or the process."""
         child = self._child
         held = getattr(child, "attached", None) if child is not None else None
         gap: "tuple[str, ...]" = ()
