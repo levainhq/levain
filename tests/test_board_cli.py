@@ -254,6 +254,21 @@ def test_declaring_no_land_waiter_lets_the_native_producer_conclude_the_board(wo
     assert states(doc) == {"levain#3": "ready"} and doc["audit"] == [] and rc == 0
 
 
+def test_a_read_with_no_flow_band_says_the_band_evidence_was_not_supplied_in_the_json_and_the_table(world, tmp_path, capsys):
+    """levain#184: ``board state`` without ``--evidence-extra`` reads only Levain's own band, so an np- row's absence is
+    not a claim about flow's band; with flow's band supplied and the row absent from it, the old reason stands."""
+    link = [{"kind": "band", "ref": "np-d4384dc8"}]
+    items = write_items(tmp_path, item(3, depends=link))
+    argv = ("--items", str(items), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z", "--no-land-waiter")
+    rc, out, _ = run(capsys, "--json", *argv)
+    reason = json.loads(out)["items"][0]["reason"]
+    assert "band evidence not supplied" in reason and "--evidence-extra" in reason and "is not in the band" not in reason
+    rc, table, _ = run(capsys, *argv)
+    assert "band evidence not supplied" in table and "is not in the band" not in table
+    rc, doc, _ = board(capsys, world, items, extra_file(tmp_path, waiters=[]), "--no-land-waiter")
+    assert doc["items"][0]["reason"] == "band:np-d4384dc8 is not in the band"
+
+
 def _producer_file(tmp_path, name, *, store_id=None, age_s=0, complete=True, **rows):
     when = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
     blocks = {s: {"producer": name, "store_id": store_id, "captured_at": when, "complete": complete, "rows": r}

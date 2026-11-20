@@ -530,6 +530,45 @@ def test_a_dangling_band_link_is_not_declared_when_the_band_was_not_all_read():
     assert any(p.startswith("levain#1: not checked: band producer flow unreadable (stale 41 min)") for p in b.problems)
 
 
+_FLOW_ROW = "np-d4384dc8"
+
+
+def test_an_np_link_with_no_band_block_from_flow_says_the_band_evidence_was_not_supplied():
+    """levain#184: only Levain's own band was read, so an np- row's absence from it says nothing about flow's band; the
+    reason names what was missing and the way to supply it, and it is the same for a band-kind item's own row."""
+    link = [{"kind": "band", "ref": _FLOW_ROW}]
+    native_only = ev2(**whole("levain"), producers=("levain",))
+    got, _ = board_of(native_only, _item(1, depends_on=link), _item(2, done=_FLOW_ROW, done_kind="band"))
+    for iid in ("levain#1", "levain#2"):
+        assert got[iid].state == "unknown", iid
+        assert "band evidence not supplied" in got[iid].reason and "--evidence-extra" in got[iid].reason, got[iid].reason
+        assert _FLOW_ROW in got[iid].reason and "is not in the band" not in got[iid].reason, got[iid].reason
+
+
+def test_a_band_block_from_flow_that_lacks_the_np_row_keeps_the_is_not_in_the_band_reason():
+    link = [{"kind": "band", "ref": _FLOW_ROW}]
+    got, _ = board_of(ev2(**merged(whole("levain"), whole("flow"))), _item(1, depends_on=link),
+                      _item(2, done=_FLOW_ROW, done_kind="band"))
+    for iid in ("levain#1", "levain#2"):
+        assert got[iid].state == "unknown" and got[iid].reason == f"band:{_FLOW_ROW} is not in the band", iid
+
+
+def test_a_native_id_absent_from_the_native_band_keeps_the_is_not_in_the_band_reason():
+    """The new wording is for flow's rows only: a q- id is Levain's own, and Levain's block was supplied and whole."""
+    got, _ = board_of(ev2(**whole("levain"), producers=("levain",)),
+                      _item(1, depends_on=[{"kind": "band", "ref": "q-" + "0" * 24}]))
+    assert got["levain#1"].reason == "band:q-" + "0" * 24 + " is not in the band"
+
+
+def test_a_band_block_from_flow_that_has_the_np_row_open_reads_as_before():
+    row = {"id": _FLOW_ROW, "state": "open", "items": [], "by": "", "grade": "unknown"}
+    parts = merged(whole("levain"), whole("flow", band=[row]))
+    got, _ = board_of(ev2(**parts), _item(1, depends_on=[{"kind": "band", "ref": _FLOW_ROW}]),
+                      _item(2, done=_FLOW_ROW, done_kind="band"))
+    assert got["levain#1"].state == "blocked" and "band evidence not supplied" not in got["levain#1"].reason
+    assert got["levain#2"].state == "needs_you"
+
+
 def test_a_closed_item_skips_the_live_seat_check_aloud_when_the_seats_were_not_all_read():
     """F17: the item is done (git closed it); the check against a live seat could not be run, and its problems line says so."""
     main = [{"sha": "a" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#1"], "closes": ["levain#1"]}]

@@ -49,6 +49,8 @@ SCHEMA = "ready-v3"
 EVIDENCE_V = 2
 FLAT_EVIDENCE_V = 1
 FLAT_PRODUCER = "flow"
+#: The start of an id of flow's band (``np-`` then hex), as opposed to Levain's own ``q-`` question ids and ``source:ref`` authority rows.
+FLOW_BAND_ID_PREFIX = "np-"
 #: A producer block whose ``captured_at`` is older than this is not readable. One named constant so the line moves in one place.
 PRODUCER_MAX_AGE_S = 900
 #: A producer block captured MORE than this far ahead of ``now`` is not readable ("captured in the future").
@@ -734,6 +736,17 @@ def _compose(source: str, obj: Mapping[str, Any], *, now: datetime | None, store
     return rows, "; ".join(why) or None
 
 
+def _band_producers(obj: Mapping[str, Any]) -> frozenset[str]:
+    """The producers that supplied a band block, by name: the one flat producer when the flat form carries a band, else the
+    name each listed block carries."""
+    if obj.get("evidence_v") == FLAT_EVIDENCE_V:
+        return frozenset({FLAT_PRODUCER}) if "band" in obj else frozenset()
+    blocks = obj.get("band")
+    if not isinstance(blocks, (list, tuple)):
+        return frozenset()
+    return frozenset(b["producer"] for b in blocks if isinstance(b, Mapping) and isinstance(b.get("producer"), str) and b["producer"])
+
+
 @dataclass(frozen=True)
 class Evidence:
     """The merged evidence object (``evidence_v`` :data:`EVIDENCE_V`, or flow's flat form), parsed. Built by :meth:`from_dict`, which never raises: a source
@@ -758,6 +771,7 @@ class Evidence:
     band_grade: Mapping[str, str] = field(default_factory=dict)       # resolved band row -> how it was answered
     band_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)   # resolved band row -> the items EVERY resolver names
     band_flat: Mapping[str, tuple[str, ...]] = field(default_factory=dict)    # resolved band row -> its flat-form resolvers, when ALL are
+    band_producers: frozenset[str] = frozenset()       # the producers that supplied a band block (read or not), by the name the block carries
 
     @classmethod
     def from_dict(cls, obj: Any, *, now: datetime | None, store_id: str | None = None) -> "Evidence":
@@ -849,7 +863,8 @@ class Evidence:
         raw_fetched = obj.get("fetched_at")
         fetched_at = raw_fetched if isinstance(raw_fetched, str) and raw_fetched.strip() else None
         return cls(fetched_at, parse_timestamp(fetched_at), unreadable, main, chain, branches, refs_merged[0],
-                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade, band_items, band_flat)
+                   refs_merged[1], seats, band_open, band_resolved, waiters, documents, unattributed, band_grade, band_items, band_flat,
+                   _band_producers(obj))
 
     def unreadable_reason(self, source: str) -> str | None:
         """Why ``source`` cannot be trusted, or None. ``git`` stands for the four git-derived sources and ``notes`` for
@@ -1164,7 +1179,12 @@ def _chk_dangling_band(ctx: _Ctx, item: Item):
     if gone and "band" in ev.unreadable:        # "not in the band" is an absence: the rows that were read are not the whole band
         ctx.note(item, "band")
         return None
-    return (f"band:{gone[0]} is not in the band", tuple(gone)) if gone else None
+    if not gone:
+        return None
+    if gone[0].startswith(FLOW_BAND_ID_PREFIX) and FLAT_PRODUCER not in ev.band_producers:
+        # an np- row is one of flow's: with no band block from flow, its absence from the blocks that were read is no claim
+        return (f"band:{gone[0]}: band evidence not supplied (flow's band arrives through --evidence-extra)", tuple(gone))
+    return (f"band:{gone[0]} is not in the band", tuple(gone))
 
 
 def _chk_dangling_link(ctx: _Ctx, item: Item):
