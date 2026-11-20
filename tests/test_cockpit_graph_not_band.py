@@ -96,11 +96,10 @@ def test_no_lens_header_carries_a_waiting_on_you_count_at_desk_and_phone_width(t
 @needs_browser
 def test_the_real_page_says_no_number_of_what_waits_on_him_beside_the_band_that_does(tmp_path, monkeypatch):
     """Through the real provider and the real page: the Needs strip lists the pending request, and nothing in the graph card
-    or the Sessions card's jump line carries a count of it."""
+    carries a count of it."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = ("JSON.stringify({strip: document.querySelectorAll('#ck-needs .needs-row').length, "
-             "hdr: [...%s.querySelectorAll('.tv-stat, .tv-m')].map(s => s.textContent.replace(/\\s+/g, ' ')), "
-             "card: (document.querySelector('#k7-sessions') || {innerText: ''}).innerText.replace(/\\s+/g, ' ')})") % TV
+             "hdr: [...%s.querySelectorAll('.tv-stat, .tv-m')].map(s => s.textContent.replace(/\\s+/g, ' '))})") % TV
     for name, first in WIDTHS:
         for lens in ("work", "agents"):
             out = _run(tmp_path, src, [{"eval": f"document.querySelector('#ck-hlens [data-tv={lens}]').click(); 1"},
@@ -109,7 +108,6 @@ def test_the_real_page_says_no_number_of_what_waits_on_him_beside_the_band_that_
             got = json.loads(out[-1])
             assert got["strip"] >= 1, (name, lens, got)                                      # the band has the row
             assert got["hdr"] and not [f for f in got["hdr"] if "waiting" in f.lower()], (name, lens, got["hdr"])
-            assert not __import__("re").search(r"\d+\s+waiting on you", got["card"], __import__("re").I), (name, lens, got["card"])
 
 
 @needs_browser

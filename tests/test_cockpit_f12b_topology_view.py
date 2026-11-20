@@ -1,4 +1,4 @@
-"""F12b, the work view: the topology panel's value drawn in the Build tab's Sessions card (topology_view.js). Two kinds of
+"""F12b, the work view: the topology panel's value drawn in the page header lens (topology_view.js). Two kinds of
 test. Through the real server, the provider's own value: the Work lens is the default at 1440, the switch and what persists, a
 bare install, a click on a waiting task. And a literal value handed to the renderer in the same page, for the shapes this
 install's provider never sends yet (every state, a failed task, a cost, a conflict) and for the widths."""

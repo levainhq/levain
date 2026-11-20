@@ -167,7 +167,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the kind of the role an agent's current spec pins (levain.agents.role.ROLE_KINDS), or "unreadable" when that role's
     # row fails the check every read of a stored role passes (a test pins the two vocabularies together)
     "agent_kind": ("enum", _enum("job", "role", "unreadable")),
-    "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
+    "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what a Sessions row carries for the tile's busiest-seat line (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
     # THE LIST (levain.cockpit.list_panel): one view over band + board + intentions, each row labelled with its surface
     "surface": ("enum", _enum("band", "board", "intention", "talk", "drop", "kept")),

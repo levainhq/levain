@@ -341,7 +341,7 @@
         if (mdRow) line.md = true;
         if (head.id === "sessions") {
           line.wrapMeta = true;
-          // the Build tab's session row (paintBuildSessions below): the provider's own measures, never a full cwd
+          // the Sessions tile's busiest-seat line: the provider's own measures, never a full cwd
           const sv = (r.facets || {}).session_view;
           if (isObj(sv)) line.sess = Object.assign({ agent: typeof (r.facets || {}).agent === "string" ? r.facets.agent : "", active: (r.facets || {}).session_activity === "active" }, sv);
           // the transcript button's key: the row id is "session:<stem>" (the stem is a hash, not the session id)
@@ -2181,8 +2181,8 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     resizeSkies();
     fillGrids();
-    // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop), the Sessions card on Build only
-    try { paintHeaderLens(); paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
+    // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop)
+    try { paintHeaderLens(); } catch (_) { /* the lens repaints on the next poll */ }
     // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
     if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
   }
@@ -2326,108 +2326,8 @@
     }
   }
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
-  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) { tintRepos(); paintBuild(); } }, 1500);
-  // ---- K7: the Build tab ----
-  // Sessions is a count tile on Morning and Board; on Build it is a large card of its own, drawn here from the same panel
-  // state (so one read feeds both) into #k7-sessions, with the headings the Build tab carries. Nothing here reads a store.
-  const K7_NONE_SESSIONS = "No agent session yet: start Claude Code or Codex in a workspace.";
-  const K7_NONE_RESULTS = "No results yet: finished jobs and checks appear here.";
-  let k7Sig = "";
-  function k7Time(iso) {
-    const t = parseIso(iso);
-    return isNaN(t) ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  }
-  function k7Ago(iso, now) {
-    const t = parseIso(iso);
-    if (isNaN(t)) return "";
-    const s = Math.max(0, Math.floor((now - t) / 1000));
-    return s < 60 ? s + " s ago" : s < 3600 ? Math.floor(s / 60) + " m ago" : s < 86400 ? Math.floor(s / 3600) + " h ago" : Math.floor(s / 86400) + " d ago";
-  }
+  if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) { tintRepos(); try { paintHeaderLens(); } catch (e) { /* a lens that cannot paint leaves the page as the tiles drew it */ } } }, 1500);
   const k7K = (n) => (n >= 1000 ? Math.round(n / 1000) + "K" : String(n));
-  // the context meter: how much of the model's window (Codex states it) or of the operator's warn line (Claude Code does not)
-  // the session holds. A session at or past the warn line (either agent, not compacted) says OVER in words and in red: that
-  // reads on a screenshot and on touch, and is not the orange of a session waiting on a decision. Never a number the
-  // transcript did not give.
-  function k7Meter(v, waiting) {
-    const m = el("div", "k7-meter");
-    const head = el("div", "k7-meter-h");
-    head.appendChild(el("span", "k7-meter-l", "CONTEXT"));
-    const bar = el("div", "k7-bar");
-    const fill = el("i");
-    bar.appendChild(fill);
-    let label = "not read", frac = 0, over = false;
-    if (isNum(v.tokens) && v.compacted) { label = "compacted"; }
-    else if (isNum(v.tokens) && v.tokens > 0) {
-      const hasWin = isNum(v.window) && v.window > 0;
-      const wall = hasWin ? v.window : (isNum(v.warn) && v.warn > 0 ? v.warn : 0);
-      frac = wall ? Math.min(1, v.tokens / wall) : 0;
-      // Codex states its window: a percentage of it. Claude Code does not: the bar is measured against the warn line, and says so
-      label = hasWin ? Math.round((v.tokens / v.window) * 100) + "%" : (wall ? k7K(v.tokens) + " of " + k7K(wall) + " warn" : k7K(v.tokens));
-      over = isNum(v.warn) && v.warn > 0 && v.tokens >= v.warn;
-    }
-    fill.style.width = Math.round(frac * 100) + "%";
-    if (over) head.appendChild(el("span", "k7-over", "OVER"));
-    head.appendChild(el("span", "k7-meter-v", label));
-    m.append(head, bar);
-    if (typeof v.context === "string" && v.context) m.title = v.context;
-    if (waiting) m.classList.add("waiting");
-    if (over) m.classList.add("over");
-    if (label === "not read") m.classList.add("unread");
-    return m;
-  }
-  function k7Limits(v) {
-    const l = v.limits;
-    if (!isObj(l)) return null;
-    // the blocking fact first (a halted session), then that nobody is counting; a session nobody counts is never drawn as healthy
-    const parts = [];
-    let tone = "ok";
-    if (typeof l.halted === "string" && l.halted) { parts.push("halted: " + l.halted); tone = "over"; }
-    if (l.counting !== true) { parts.push("limits: not counting"); tone = "over"; }
-    if (!parts.length && typeof l.metric === "string" && l.metric) { parts.push(l.metric); tone = l.status === "over" || l.status === "amber" ? l.status : "ok"; }
-    return parts.length ? el("div", "k7-limits " + tone, parts.join(" \u00b7 ")) : null;
-  }
-  function k7Row(ln, now) {
-    const v = ln.sess, live = v.active === true;
-    const waiting = typeof v.waiting === "string" && v.waiting !== "";
-    const row = el("div", "k7-srow" + (live ? " live" : " quiet") + (waiting ? " waiting" : ""));
-    const dot = el("i", "k7-sdot " + (live ? "live" : "quiet"));
-    dot.setAttribute("aria-hidden", "true");
-    const who = el("div", "k7-who");
-    const top = el("div", "k7-who-t");
-    top.appendChild(el("b", "k7-agent", v.agent || "agent"));
-    if (ln.repo) { const chip = el("span", "k7-repo", ln.repo); chip.dataset.repoFacet = ln.repo; top.appendChild(chip); }
-    who.append(top, el("div", "k7-cwd", v.cwd || ""));
-    const nowc = el("div", "k7-now");
-    let said;
-    let tick = null;      // [prefix, iso]: an "N s ago" the page keeps current in place, without drawing the card again
-    if (waiting) said = "waiting on a decision (" + v.waiting + (isNum(v.waiting_n) && v.waiting_n > 1 ? " +" + (v.waiting_n - 1) : "") + ")";
-    else if (live) { tick = v.tool ? [v.tool + " \u00b7 ", v.tool_at] : ["last hook ", v.last_seen]; said = tick[0] + k7Ago(tick[1], now); }
-    else said = v.tool ? "last tool " + k7Time(v.tool_at) : "last hook " + k7Time(v.last_seen);
-    const toolEl = el("div", "k7-tool", said);
-    if (tick) { toolEl.dataset.k7Pre = tick[0]; toolEl.dataset.k7At = tick[1]; }
-    nowc.appendChild(toolEl);
-    const lim = k7Limits(v);
-    if (lim) nowc.appendChild(lim);
-    // "ended" would claim what no hook announces: a quiet session says when it last fired one
-    row.append(dot, who, nowc, k7Meter(v, waiting), el("div", "k7-when", live ? "since " + k7Time(v.first_seen) : "last active " + k7Time(v.last_seen)));
-    return row;
-  }
-  function k7Host() {
-    let sec = document.getElementById("k7-sessions");
-    if (sec) return sec;
-    const after = document.getElementById("ck-widgets");
-    if (!after || !after.parentNode) return null;
-    sec = el("section", "k7-sess frame");
-    sec.id = "k7-sessions";
-    sec.hidden = true;
-    after.parentNode.insertBefore(sec, after.nextSibling);
-    return sec;
-  }
-  function k7Heading(title, gloss) {
-    const h = el("div", "k7-head");
-    h.append(el("h3", null, title), el("span", null, gloss));
-    return h;
-  }
   // A waiting task or node links to the Needs-you item it waits on: the strip's card with that id is scrolled to and lit (on Build, the bar's
   // chip is). An item with no card (decided, no longer waiting) opens the Decisions focus view, where its row is marked and scrolled to by
   // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
@@ -2499,7 +2399,7 @@
     hSig = sig;
     host.hidden = false;
     TV.release();                 // the old body's resize observer and stream go with it
-    const repaint = () => { hSig = ""; k7Sig = ""; paintHeaderLens(); paintBuildSessions(); };
+    const repaint = () => { hSig = ""; paintHeaderLens(); };
     const toggle = TV.headerToggle(lens, () => { if (TV.replaying && TV.replaying()) TV.returnToLive(); repaint(); });
     if (lens === "events") {
       // the Event graph keeps the bar the other two lenses draw: the switch, a hairline, then the band's own figures at the same size
@@ -2521,99 +2421,6 @@
     bar.appendChild(toggle);
     host.replaceChildren(bar, el("p", "k7-none err", I.tfault ? "Topology unavailable: " + I.tfault : "The topology could not be drawn."));
     if (fail) hSig = "";
-  }
-  function paintBuildSessions() {
-    const sec = k7Host();
-    if (!sec) return;
-    const s = Array.from(states).find((o) => o.pid === "sessions" && o.ctx && o.ctx.widget && o.p && o.p.isConnected);
-    if (!s || document.body.dataset.mode !== "build") {
-      k7Sig = "";            // coming back to Build draws the card again
-      if (!s) sec.hidden = true;
-      return;
-    }
-    const lines = (s.data.lines || []).filter((l) => l && isObj(l.sess));
-    const now = Date.now();
-    const I = topoInfo();
-    const TV = I.TV, ts = I.ts, tfault = I.tfault || "", tv = I.tv;
-    // the signature is content only: the clock does not repaint the card (a focused button would lose focus), it moves the "ago" words
-    const sig = JSON.stringify([s.fault || "", s.stale ? 1 : 0, lines.map((l) => [l.sess, l.repo]), s.data.empty || "", I.lens, I.lens === "events" ? tfault : "",
-                                tv ? TV.signature(tv, "agents") : (TV && ts && ts.data && ts.data.topology ? TV.signature({ e: ts.data.topology.errors, u: ts.data.topology.unreadable }, "") : "")]);
-    if (sig === k7Sig && !sec.hidden) {
-      for (const t of sec.querySelectorAll(".k7-tool[data-k7-at]")) {
-        const w = t.dataset.k7Pre + k7Ago(t.dataset.k7At, now);
-        if (t.textContent !== w) t.textContent = w;
-      }
-      return;
-    }
-    k7Sig = sig;
-    sec.hidden = false;
-    const card = el("div", "panel k7-card");
-    const head = el("div", "k7-card-h");
-    const live = lines.filter((l) => l.sess.active === true).length;
-    const ttl = el("h2", null, "Sessions");
-    head.appendChild(ttl);
-    if (lines.length) {
-      const pill = el("span", "ck-count", String(lines.length));
-      head.append(pill, el("span", "k7-sum", live + " live · " + (lines.length - live) + " quiet"));
-    }
-    head.appendChild(el("span", "k7-sp"));
-    if (lines.length) {
-      const day = new Date(now).toDateString();
-      const today = lines.filter((l) => { const t = parseIso(l.sess.first_seen); return !isNaN(t) && new Date(t).toDateString() === day; }).length;
-      head.appendChild(el("span", "k7-stats", "started today " + today));
-      const open = el("button", "k7-open", "all details");
-      open.type = "button";
-      open.title = "open the full session list with each session's transcript";
-      open.addEventListener("click", () => s.p.click());
-      head.appendChild(open);
-    }
-    card.appendChild(head);
-    // the topology is the header's: this card is the session list, with the topology fault said here only while the Event graph is the header's view
-    if (tfault && I.lens === "events") card.appendChild(el("p", "k7-none err", "Topology unavailable: " + tfault));
-    if (s.fault) card.appendChild(el("p", "k7-none err", "Sessions unavailable: " + s.fault));
-    else if (!lines.length) {
-      card.appendChild(el("p", "k7-none", K7_NONE_SESSIONS));
-      // an empty graph that could not read a source says so beside the empty line, never in place of it
-      const q = TV && ts && ts.data && ts.data.topology ? TV.quietLine(ts.data.topology) : null;
-      if (q) card.appendChild(q);
-      card.classList.add("k7-lone");
-    } else { const body = el("div", "k7-srows"); for (const ln of lines) body.appendChild(k7Row(ln, now)); card.appendChild(body); }
-    // a failed refresh that kept the rows says so under them (levain#173)
-    if (s.stale && !s.fault) card.appendChild(el("p", "k7-none err", "Sessions could not refresh just now: showing the last read"));
-    // Lost if closed (F12c): its own panel, right of the card from 1440 px, below it under that; drawn whenever the topology feed is
-    let lost = null;
-    try { if (TV && TV.renderLost) lost = tfault ? TV.renderLostFault(tfault) : tv ? TV.renderLost(tv) : null; } catch (e) { lost = null; }
-    const wrap = el("div", "k7-sess-wrap" + (lost ? " k7-has-lost" : ""));
-    wrap.appendChild(card);
-    if (lost) wrap.appendChild(lost);
-    sec.replaceChildren(k7Heading("Sessions", "Who is working right now, and how much room they have left."), wrap);
-    tintRepos();
-  }
-  // "Results & edits": the Work zone's own heading, shown on Build only, and the one line a Results card says when no job has
-  // ever been recorded (the jobs panel is optional: an install with none has no card to say so)
-  function paintBuildZone() {
-    const zone = document.querySelector('.ck-zone[data-zone="operate"]');
-    if (!zone) return;
-    const head = zone.querySelector(".zone-head");
-    if (head && !head.querySelector(".k7-zt")) {
-      const t = el("div", "zone-title k7-zt", "Results & edits");
-      const g = el("span", "zone-gloss k7-zg", "What the sessions produced.");
-      head.append(t, g);
-    }
-    const grid = zone.querySelector(".ck-zgrid");
-    if (grid && grid.querySelector('[data-ck-panel="jobs"]')) for (const old of grid.querySelectorAll(".k7-results-none")) old.remove();   // a real Results card replaces the placeholder
-    if (grid && !grid.querySelector('[data-ck-panel="jobs"]') && !grid.querySelector(".k7-results-none")) {
-      const p = el("div", "panel ck-dash k7-results-none");
-      p.dataset.ckPanel = "jobs-none";
-      p.dataset.modes = "build";
-      const h = el("div", "phead");
-      h.appendChild(el("h2", null, "Results"));
-      p.append(h, el("div", "pbody", K7_NONE_RESULTS));
-      grid.appendChild(p);
-    }
-  }
-  function paintBuild() {
-    try { paintHeaderLens(); paintBuildSessions(); paintBuildZone(); } catch (e) { /* a Build tab that cannot paint leaves the page as the tiles drew it */ }
   }
 
   // The glance is a compact strip (one bordered row of equal tiles) whenever fewer than four tiles show; four or more are full
@@ -2646,7 +2453,7 @@
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
     tintRepos();
-    paintBuild();
+    try { paintHeaderLens(); } catch (e) { /* a lens that cannot paint leaves the page as the tiles drew it */ }
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       // more than four tiles wrap into rows of at most four (6 -> 3 x 2), whatever the tab: a tile never shares a row so narrow it clips its text
@@ -2876,7 +2683,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

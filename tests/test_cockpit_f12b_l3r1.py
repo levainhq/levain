@@ -12,10 +12,6 @@ from tests.test_cockpit_k7_build import _sessions_fixture
 from tests.test_cockpit_topology import _good, _panel
 
 
-# a faulted or bare topology draws the Sessions card and no .tv: the card is what such a test waits for
-CARD = "document.querySelector('#k7-sessions .k7-card')"
-
-
 def _lost(**by_node: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"node": n, "dirty": 0, "dirty_names": [], "unpushed": 0, "branches": [], "uncaptured_episodes": None, "running_children": 0, **o}
             for n, o in by_node.items()]
@@ -33,7 +29,7 @@ def test_a_node_with_work_to_lose_carries_an_at_risk_mark_in_both_lenses_and_unk
     probe = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('[data-node]')].map(n => [n.dataset.node, "
              "(n.querySelector('.tv-risk') || {title: null}).title])))") % TV
     # K10 S6 (c90269cd) drew the Agents lens as a graph: a node at risk wears a .tv-gnode-risk dot, and the words ("not tracked") live in the
-    # Work chip and in the Lost if closed panel
+    # Work chip
     probe_g = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('svg.tv-graph g[data-node]')].map(n => [n.dataset.node, "
                "!!n.querySelector('.tv-gnode-risk')])))") % TV
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(v, "agents")}, {"eval": probe_g}])
