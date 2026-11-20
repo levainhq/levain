@@ -1796,3 +1796,21 @@ def test_repos_reports_a_stub_that_keeps_a_hand_copy_of_board_items_and_lets_fre
     assert "(alpha#1, alpha#2, flow#9, +1 more)" in run(capsys, "repos")[1]
     (a / "next.md").write_text("pre-track content\n- [ ] alpha#1 a\n")
     assert f"stale: {where} still holds pre-track content" in run(capsys, "repos")[1]      # the marker rule is first and unchanged
+
+
+def test_repos_reports_a_stub_larger_than_the_bound_and_never_reads_a_copy_past_it_as_clean(decision_seal, store, tmp_path, mkrepo, capsys):
+    """levain#179 L3 round 1: the read is one byte past the bound, so a copy past it is not missed and an id cut at the bound is not read short."""
+    a = mkrepo("alpha")
+    track_ready(capsys, tmp_path, store, a, "alpha", retire=[{"repo": "alpha", "path": "next.md"}])
+    ok(capsys, "track", "alpha", "--words", "go", *A)
+    where = os.path.realpath(a) + "/next.md"
+    marker = "<!-- levain: tracked stub -->\n"
+    big = br.STUB_READ_MAX
+    for text in (marker + "x" * big + "\n- [ ] alpha#1 copied past the bound\n",                          # a list line beyond the bound
+                 marker + "x" * (big - len(marker) - 9) + "\n- alpha#123\n"):                              # an id that straddles the bound
+        (a / "next.md").write_text(text)
+        rc, out, _ = run(capsys, "repos")
+        assert rc == 3 and f"stale: {where} stub is larger than {big} bytes: a stub holds a few lines" in out, text[-30:]
+        assert "hand copy" not in out
+    (a / "next.md").write_text(marker + "x" * (big - len(marker)))                                         # exactly the bound: a stub
+    assert "stale" not in run(capsys, "repos")[1]

@@ -88,7 +88,7 @@ STUB_MARKER = "<!-- levain: tracked stub -->"
 ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9._#-])(?:" + bs.ID_RE.pattern + r")(?![0-9A-Za-z_])")
 #: A line that is a list item or a checkbox: the shape a hand copy of board items takes.
 _LIST_LINE = re.compile(r"\s*(?:(?:[-*+]|[0-9]+[.)])\s+|\[[ xX]\]\s+)")
-STUB_READ_MAX = 65536                       # bytes of a stub read for the check; a stub is a few lines
+STUB_READ_MAX = 65536                       # the most bytes a stub may hold; a stub is a few lines (a longer one is reported stale)
 TRACKING_AUDIT_HOURS = 72
 CHARTER_REF = "refs/remotes/origin/main"
 LAUNCH_WORDS = "first seat launched here"
@@ -1340,15 +1340,20 @@ def _stale_stubs(view: View, cur: rf.Repo) -> list[str]:
         p = Path(owner.path) / e["path"]
         try:
             with p.open("rb") as fh:
-                text = fh.read(STUB_READ_MAX).decode("utf-8", "replace")
+                raw = fh.read(STUB_READ_MAX + 1)        # one byte past the bound says the file runs past it
         except FileNotFoundError:
             continue
         except OSError as exc:
             out.append(f"{p}: unreadable ({type(exc).__name__})")
             continue
+        text = raw[:STUB_READ_MAX].decode("utf-8", "replace")
         head, _, rest = text.partition("\n")
         if head.strip() != STUB_MARKER:
             out.append(f"stale: {p} still holds pre-track content; the board is the source since {cur.track_at}")
+            continue
+        if len(raw) > STUB_READ_MAX:           # a copy past the bound is unread, and an id cut at it is read short: not a stub to trust
+            out.append(f"stale: {p} stub is larger than {STUB_READ_MAX} bytes: a stub holds a few lines; the board is the source "
+                       f"since {cur.track_at}")
             continue
         copied = list(dict.fromkeys(i for ln in rest.splitlines() if _LIST_LINE.match(ln) for i in ID_IN_TEXT.findall(ln)))
         if copied:
