@@ -1,4 +1,4 @@
-# ND-8 runbook: install the TAOSERV night key (a step for Phill's hands; steps 0 to 3 and probes 1 to 17 have run, see the status below)
+# ND-8 runbook: install the TAOSERV night key (a step for Phill's hands; steps 0 to 3 (bar the logrotate service start) and probes 1 to 17 have run, see the status below)
 
 Board row levain#17. Code: `levain/desk/night_key.py` (stdlib only, one file). Tests: `tests/test_night_key.py`.
 Design: `project_memory/1112-15_night_desk/night_desk_design.md` 2.7 and 8.1. The row's gate says "his go; after the Sat 11-14
@@ -13,7 +13,7 @@ same sha256, the journal showing the restart) and so was the rate-file check aft
 corrections are in the text: the logrotate stanza needs `su root root` (`/var/log` is group-writable, so logrotate
 refused it without), and probe 9 exited 255 after `PTY allocation request failed` rather than 2 (no PTY was granted).
 The seat's machine address in the probes is the IP with `-o HostKeyAlias=transalliesohio.org`: the name is behind
-Cloudflare, which does not carry SSH. The rest of this file is the original text, apart from the note in section 4.
+Cloudflare, which does not carry SSH. The rest of this file is the original text, apart from the corrections named above and the note in section 4.
 
 **UNVERIFIED ON TAOSERV (the part not run).** Nothing below was executed by a build lane. Every path, the account name, the file modes, the
 sudoers shape, the ACLs, the logrotate stanza and the sshd keywords are written from Ubuntu defaults and the OpenSSH manual,
@@ -238,16 +238,18 @@ Define once in that shell:
 ```
 nk() { SSH_AUTH_SOCK= ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.levain/night/known_hosts -i ~/.levain/night/taoserv_night "$@"; }
 ```
-Use the address and the alias, never the bare name `TAOSERV`, for every ssh, sftp, scp and ssh-keyscan call here: the name does not
+Use the address and the alias, never the bare name `TAOSERV`, for every ssh, sftp, scp and ssh-keyscan call in this runbook (the
+proof in section 5 and the rollback's expected message included): the name does not
 resolve under `-F /dev/null` (it is behind Cloudflare, which does not carry SSH). The form that ran on 11-20 was
 `nk -o HostKeyAlias=transalliesohio.org nightkey@172.233.220.105 <words>`: the address in place of `nightkey@TAOSERV`, plus the
-alias, the pin the laptop's `~/.ssh/config` carries for `transalliesohio.org` (the address is that file's, not this runbook's).
+alias, the pin the laptop's `~/.ssh/config` carries for `transalliesohio.org`.
 Probes 12 and 13 take the same `-o HostKeyAlias=transalliesohio.org`, and an expected output that names `nightkey@TAOSERV` prints the
 address instead. The seat's own generated config (levain#47) was found on 11-20 to carry no alias: levain#206.
 `BatchMode` will not prompt for an unknown host key, so first put TAOSERV's host key in `~/.levain/night/known_hosts`, filed
-under the alias name `transalliesohio.org` (the installed file's one entry is; `ssh-keyscan` takes no `-o`, so scan the address and
-rewrite its first field: `ssh-keyscan -t ed25519 172.233.220.105 | sed 's/^[^ ]*/transalliesohio.org/' > ~/.levain/night/known_hosts`,
-a form this seat did not run; then compare `ssh-keygen -lf ~/.levain/night/known_hosts`
+under the alias name `transalliesohio.org` (the installed file's one entry is, so a seat that has it skips this scan; `ssh-keyscan`
+takes no `-o`, so scan the address, drop its `#` banner lines, rewrite the first field, and check the result before it replaces the
+file: `ssh-keyscan -t ed25519 172.233.220.105 | grep -v '^#' | sed 's/^[^ ]*/transalliesohio.org/' > ~/.levain/night/known_hosts.new`,
+a form this seat did not run, then one non-empty line in `known_hosts.new` and `mv` it over `known_hosts`; then compare `ssh-keygen -lf ~/.levain/night/known_hosts`
 with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on TAOSERV: the fingerprints must be identical).
 After each probe, on TAOSERV: `sudo tail -n 2 /var/log/levain-night-key.log`. Every log line is
 `<UTC time> verb=<verb or -> outcome=<outcome> sha256=<hash of the exact request> src=<the seat's address>`, and never
@@ -263,7 +265,7 @@ holds the request text. To check a hash: `printf %s 'disk; id' | sha256sum` on a
 | 6 | `nk nightkey@TAOSERV restart_service mysql; echo $?` | `refused`, `2` | `verb=- outcome=refused:grammar`; mysql not restarted |
 | 7 | `nk nightkey@TAOSERV Disk; echo $?` | `refused`, `2` | `verb=- outcome=refused:grammar` |
 | 8 | `nk -T nightkey@TAOSERV; echo $?` (a shell, no command) | `refused`, `2` | `verb=- outcome=refused:no-command` |
-| 9 | `nk -tt nightkey@TAOSERV; echo $?` (an interactive shell with a PTY) | `PTY allocation request failed`, then `refused`, `2` | `verb=- outcome=refused:no-command`. A `refused:pty` line means a PTY WAS granted: STOP (the key line's `restrict`/`no-pty` did not take; check step 3.2) |
+| 9 | `nk -tt nightkey@TAOSERV; echo $?` (an interactive shell with a PTY) | `PTY allocation request failed`, then exit `255` (measured 11-15: no PTY was granted) | `verb=- outcome=refused:no-command`. A `refused:pty` line means a PTY WAS granted: STOP (the key line's `restrict`/`no-pty` did not take; check step 3.2) |
 | 10 | `nk nightkey@TAOSERV internal-sftp; echo $?` | `refused`, `2` | `verb=- outcome=refused:grammar` |
 | 11 | `nk -s nightkey@TAOSERV sftp; echo $?` (the sftp subsystem) | `refused` or a protocol error, nonzero | `verb=- outcome=refused:grammar` (the subsystem request reaches the program as a request and is refused) |
 | 12 | `SSH_AUTH_SOCK= sftp -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=~/.levain/night/known_hosts -i ~/.levain/night/taoserv_night nightkey@TAOSERV; echo $?` | `Connection closed` (or similar), nonzero, no `sftp>` prompt | `verb=- outcome=refused:grammar` |
@@ -281,7 +283,8 @@ site three times first). Check only that probe 17 wrote the state: `sudo cat /va
 On the machine the night seat runs on: the full-sudo key and the ssh-agent holding it must not be readable by the seat's user,
 its environment, or its launch (`SSH_AUTH_SOCK` unset in the seat's environment; no `IdentityAgent` or `IdentityFile` for TAOSERV
 in any ssh config the seat's HOME holds; effects.py's `NIGHT_ALIAS` names `taoserv-night`). The client config for the alias,
-in a file used with `-F` (effects.py's KNOWN EDGE asks for this pin):
+in a file used with `-F` (effects.py's KNOWN EDGE asks for this pin). With the pinned `known_hosts` filed under the alias (section 4),
+this stanza also needs `HostKeyAlias transalliesohio.org` until levain#206 has the generated copy carry it:
 ```
 Host taoserv-night
     HostName REPLACE-WITH-TAOSERV-ADDRESS
