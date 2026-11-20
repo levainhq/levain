@@ -343,7 +343,7 @@
   // in the mint reply alone, shown once in this node and kept nowhere, and the list never carries a hash. The block joins the
   // Devices grid beside Paired devices (S4.2, C7) and kicks its own read: a first read once the stored token has arrived, one on a
   // tab brought back, and a slow pulse.
-  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfBusy = false, nfGen = 0, nfReadId = 0, nfReading = false;
+  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfUrgentCap = null, nfBusy = false, nfGen = 0, nfReadId = 0, nfReading = false;
   function buildNotify() {
     nfPanel = el("div", "panel k-list dev-panel nf-panel");
     nfPanel.dataset.modes = "board";
@@ -356,6 +356,7 @@
     nfList = el("div", "dev-list nf-list");
     body.appendChild(nfList);
     const form = el("form", "nf-form");
+    form.noValidate = true;     // the card's own error line speaks for the cap field, not the browser's bubble
     nfName = el("input", "dev-label nf-name");
     nfName.type = "text"; nfName.maxLength = 40; nfName.placeholder = "Name, e.g. Backup";
     nfName.setAttribute("aria-label", "Name for the new notify token");
@@ -369,6 +370,13 @@
     nfUrgent = el("input", "nf-urgent"); nfUrgent.type = "checkbox"; nfUrgent.checked = false;
     l.appendChild(nfUrgent); l.appendChild(document.createTextNode(" urgent: this token can wake you through sleep"));
     boxes.appendChild(l);
+    const capLab = el("label", "nf-check nf-cap");
+    capLab.appendChild(document.createTextNode("Urgent per hour "));
+    nfUrgentCap = el("input", "dev-label nf-urgent-cap");
+    nfUrgentCap.type = "number"; nfUrgentCap.min = "1"; nfUrgentCap.step = "1"; nfUrgentCap.inputMode = "numeric";
+    nfUrgentCap.placeholder = "optional";
+    capLab.appendChild(nfUrgentCap);
+    boxes.appendChild(capLab);
     form.appendChild(boxes);
     const go = el("button", "dev-btn nf-mint", "Create notify token");
     go.type = "submit";
@@ -428,8 +436,15 @@
     return null;
   }
   async function createNotify() {
+    nfSay("");
     const name = nfName.value.trim();
     if (!name) { nfSay("Give the notify token a name."); return; }
+    // the cap rides along only on an urgent token and only when the field holds one; what the server allows stays the server's to say
+    let cap = null;
+    if (nfUrgent.checked && (nfUrgentCap.value !== "" || nfUrgentCap.validity.badInput)) {
+      if (!/^[0-9]+$/.test(nfUrgentCap.value.trim()) || Number(nfUrgentCap.value) < 1) { nfSay("Urgent per hour must be a whole number above zero, or left empty."); return; }
+      cap = Number(nfUrgentCap.value);
+    }
     if (nfBusy) return;     // a second mint would replace the first one's only shown secret
     nfBusy = true; nfGen++;
     try {
@@ -437,9 +452,10 @@
       const src = nfSource.value.trim();
       if (src) body.source = src;
       if (nfUrgent.checked) body.urgent = true;
+      if (cap !== null) body.urgent_per_hour = cap;
       const got = await notifyCall("/webpush/notify/tokens", body);
       if (!got || !got.token) return;
-      nfName.value = ""; nfSource.value = ""; nfUrgent.checked = false;
+      nfName.value = ""; nfSource.value = ""; nfUrgent.checked = false; nfUrgentCap.value = "";
       showNewNotify(got.token, got.record || {});
     } finally { nfBusy = false; nfGen++; }
   }

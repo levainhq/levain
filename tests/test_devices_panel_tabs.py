@@ -12,6 +12,7 @@ from pathlib import Path
 from levain.cockpit.firejournal import revoke_digest
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
+from tests.test_cockpit_webpush import _signed
 from tests.test_pair_card_w1b import _drive, needs_browser
 
 # the Paired devices section is drawn on the Settings place only (levain#141 polish): the page is taken there while it is awaited
@@ -208,3 +209,55 @@ def test_no_fix_line_when_every_paired_row_is_fresh(tmp_path, monkeypatch) -> No
             {"eval": "document.querySelectorAll('.dev-zone .dev-stale-note, .dev-zone .dev-stale').length"},
         ])
     assert out["values"][-1] == 0, out["values"]
+
+
+# levain#10 (ND-7): the notify-token card sets the urgent per-hour cap through an optional field beside the Urgent box.
+NF_READY = "(document.querySelector('.ia-places [data-ia-place-btn=settings]').click(), document.querySelector('.nf-panel') && !document.querySelector('.nf-panel').hidden && 1)"
+# the page's fetch records each mint body it is asked to send, then lets the request through to the scratch server
+NF_STUB = ("(() => { const f = window.fetch.bind(window); window.__mints = [];"
+           " window.fetch = (u, o) => { if (String(u).endsWith('/webpush/notify/tokens') && o && o.method === 'POST') window.__mints.push(JSON.parse(o.body));"
+           " return f(u, o); }; return 1; })()")
+
+
+def _nf_mint(name: str, *, urgent: bool, cap: str) -> dict:
+    """Fill the card (the box ticked or not, the cap field holding ``cap``), submit, and answer what the page sent and said."""
+    js = ("(() => { const q = (s) => document.querySelector(s); window.__n = window.__mints.length;"
+          f" q('.nf-name').value = {json.dumps(name)}; q('.nf-urgent').checked = {json.dumps(urgent)}; q('.nf-urgent-cap').value = {json.dumps(cap)};"
+          " q('.nf-form').requestSubmit(); return 1; })()")
+    return {"eval": js}
+
+
+def _nf_settle(name: str) -> dict:
+    """A mint is settled when its new-token block shows (the card has cleared its fields by then) or the card has said why it sent nothing."""
+    shown = f"document.querySelector('.nf-new') && !document.querySelector('.nf-new').hidden && document.querySelector('.nf-new').dataset.name === {json.dumps(name)}"
+    return {"until": f"({shown}) || (document.querySelector('.nf-note') && !document.querySelector('.nf-note').hidden && 1)", "ms": 10000}
+
+
+NF_STATE = ("JSON.stringify({mints: window.__mints, note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+            " cap: document.querySelector('.nf-urgent-cap').value, box: document.querySelector('.nf-urgent').checked})")
+
+
+@needs_browser
+def test_the_notify_card_sends_the_urgent_cap_only_when_urgent_is_ticked_and_the_field_holds_a_positive_whole_number(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    q = tmp_path / "signq"
+    q.mkdir(mode=0o700)
+    with _signed(src, q) as (port, _httpd):
+        steps = [{"until": NF_READY, "ms": 20000}, {"eval": NF_STUB}]
+        for name, urgent, cap in [("ok-cap", True, "20"), ("not-urgent", False, "20"), ("no-cap", True, ""), ("zero", True, "0"),
+                                  ("negative", True, "-3"), ("fraction", True, "2.5"), ("quiet-bad", False, "0")]:
+            steps += [_nf_mint(name, urgent=urgent, cap=cap), _nf_settle(name), {"eval": NF_STATE}]
+        out = _drive(tmp_path, monkeypatch, f"http://localhost:{port}/#write_token={T}", steps)
+        stored = {r["name"]: r["urgent_per_hour"] for r in _call(port, "GET", "/webpush/notify/tokens", token=T)[1]["tokens"]}
+    seen = [json.loads(v) for v in out["values"][2:] if isinstance(v, str) and v.startswith("{")]
+    assert len(seen) == 7, out["values"]
+    ok, not_urgent, no_cap, zero, negative, fraction, quiet_bad = seen
+    assert ok["mints"] == [{"name": "ok-cap", "urgent": True, "urgent_per_hour": 20}], ok
+    assert ok["cap"] == "" and ok["box"] is False, ok                                   # cleared after a mint, like the other fields
+    assert not_urgent["mints"][-1] == {"name": "not-urgent"}, not_urgent               # an unticked box sends no cap, whatever the field holds
+    assert no_cap["mints"][-1] == {"name": "no-cap", "urgent": True}, no_cap          # an empty field sends none: the server's default applies
+    for bad in (zero, negative, fraction):
+        assert len(bad["mints"]) == 3, bad                                              # nothing was sent
+        assert "whole number" in bad["note"] and bad["cap"] != "", bad                  # the card says so in words and keeps what was typed
+    assert stored["ok-cap"] == 20 and stored["no-cap"] == 3 and "zero" not in stored, stored     # the scratch server kept the typed cap, and the default otherwise
+    assert quiet_bad["mints"][-1] == {"name": "quiet-bad"}, quiet_bad                  # a bad value in a field the unticked box ignores is no error
