@@ -43,10 +43,6 @@ class Read:
     filtered: tuple[tuple[int, str], ...] = ()
     stale: bool = False
     as_of: str | None = None
-    # the instant the provider knows this content goes out of date (its next due, an expiry, a day rollover), an ISO string
-    # like ``as_of``. Advisory: an attached host re-derives the panel at it and serves it in the head; it is never part of
-    # the content, so a derive that moves only this changes nothing a client holds. A bare cockpit ignores it.
-    valid_until: str | None = None
     note: str | None = None      # this read's own note line; None keeps the registration's ``note``
     empty: str | None = None     # this read's own sentence for status empty; None keeps the registration's
     # the STORED record a line or prose value's ``value_version`` hashes, when what is displayed is a
@@ -56,6 +52,11 @@ class Read:
     # snapshot and reported only on a request that carries a ``q``, so a query-less read never reports what it hides
     hidden_skipped: tuple[tuple[int, str], ...] = ()
     hidden_note: str = ""        # a sentence for the note line of a search that reaches the hidden part
+    # the instant the provider knows this content goes out of date (its next due, an expiry, a day rollover), an ISO string
+    # like ``as_of``. Advisory (levain#157 D6, R13): meant for a derive host to re-derive the panel at, and to be served as
+    # a head field; never part of the content, so a derive that moves only this changes nothing a client holds. Last of the
+    # fields so no positional caller's arguments shift.
+    valid_until: str | None = None
 
 
 @dataclass(frozen=True)
