@@ -617,11 +617,16 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"do": REREAD,
              "until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && ({_REVOKE}.disabled ? 'locked' : 'unlocked')", "ms": 30000},
             {"eval": "window.__release(); 1"},
-            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
-            {"eval": f"{_CARD}.querySelector('.sign-note').className"},
-            # complement MED 1 / LOW 6: the ceremony has ended and the live card has said it; a later board read draws the
-            # card plain, never the old refusal again
-            {"eval": f"window.__shown = {_CARD}; window.__failList = 1; 1"},
+            # the note's class is read in this SAME evaluation as its text, and kept for the next step: a step of its own that asked
+            # the card again could land on a redraw's empty slot (land run 44728065186, step 10 read null)
+            {"until": (f"(() => {{ const c = {_CARD}; const n = c && c.querySelector('.sign-note'); const r = c && c.querySelector('.grant-revoke');"
+                       f" if (!n || !r || r.disabled || !/nothing was revoked/.test(n.textContent)) return null;"
+                       f" window.__refusalClass = n.className; window.__shown = c; window.__failList = 1; return n.textContent; }})()"), "ms": 30000},
+            {"eval": "window.__refusalClass"},
+            # complement MED 1 / LOW 6: the ceremony has ended and the live card has said it (``window.__shown``, taken in the wait
+            # above, in the same evaluation that arms ``window.__failList``: a redraw between the two would be a card drawn before the
+            # listing failed); a later board read draws the card plain, never the old refusal again
+            {"eval": "window.__failList"},
             # every listing read fails: the redraw is a card with NO sign line (no note element), and it is seen here
             {"do": REREAD, "every": 8000,
              "until": (f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected"
