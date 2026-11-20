@@ -18,6 +18,15 @@ class ProfileMismatch(RuntimeError):
     """The guest is not the host OS the chosen profile describes."""
 
 
+def cd_run(directory: str) -> tuple[str, ...]:
+    """The words that run the rest of an argv from ``directory`` (put them just before the command): a ``/bin/sh`` that
+    changes into it and execs the command, so stdin and the exit status are the command's own. ``env -C`` is not used:
+    Apple's ``env`` has it only from macOS 15.4 (shell_cmds-326), and an older clone would refuse every call. The
+    directory is a positional argument, never interpolated into the script. ``stage_call.py`` is copied alone into the
+    guest and carries its own copy of this tuple (a test holds the two equal)."""
+    return ("/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", directory)
+
+
 @dataclass(frozen=True)
 class HostProfile:
     name: str                      # "darwin" / "linux": also levain's own host key (layout.STORE[host])
@@ -46,9 +55,11 @@ class HostProfile:
         return ("sudo", "-n", self.python, "-I", f"{self.tools_dir}/guest_ops.py")
 
     def dispatch_argv(self) -> tuple[str, ...]:
-        """The dispatch-user guest_dispatch invocation prefix."""
+        """The dispatch-user guest_dispatch invocation prefix. The command runs from the dispatch dir (:func:`cd_run`): sudo
+        keeps the caller's cwd, which the dispatch account cannot read on a fresh image (the admin home is 0700), so
+        ``os.getcwd()`` raised PermissionError (levain#133 leg 6)."""
         return ("sudo", "-n", "-u", self.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={self.store}/dispatch",
-                self.python, "-I", f"{self.tools_dir}/guest_dispatch.py")
+                *cd_run(f"{self.store}/dispatch"), self.python, "-I", f"{self.tools_dir}/guest_dispatch.py")
 
     def ps_argv(self) -> list[str]:
         return [self.ps_bin, "-Ao", self.ps_columns]
