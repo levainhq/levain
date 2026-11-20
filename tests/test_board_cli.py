@@ -262,7 +262,8 @@ def test_a_read_with_no_flow_band_says_the_band_evidence_was_not_supplied_in_the
     argv = ("--items", str(items), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z", "--no-land-waiter")
     rc, out, _ = run(capsys, "--json", *argv)
     reason = json.loads(out)["items"][0]["reason"]
-    assert "band evidence not supplied" in reason and "--evidence-extra" in reason and "is not in the band" not in reason
+    assert ("band evidence not supplied (flow's band arrives through --evidence-extra or a saved --producer flow)" in reason
+            and "is not in the band" not in reason)
     rc, table, _ = run(capsys, *argv)
     assert "band evidence not supplied" in table and "is not in the band" not in table
     rc, doc, _ = board(capsys, world, items, extra_file(tmp_path, waiters=[]), "--no-land-waiter")
@@ -274,6 +275,22 @@ def _producer_file(tmp_path, name, *, store_id=None, age_s=0, complete=True, **r
     blocks = {s: {"producer": name, "store_id": store_id, "captured_at": when, "complete": complete, "rows": r}
               for s, r in {"seats": [], "band": [], "waiters": [], **rows}.items()}
     (tmp_path / f"evidence.{name}.json").write_text(json.dumps({"evidence_v": 2, "blocks": blocks}), encoding="utf-8")
+
+
+def test_a_saved_flow_producer_supplies_flows_band_so_the_not_supplied_text_does_not_show(world, tmp_path, capsys):
+    """levain#184: flow's band can arrive through a saved ``--producer flow`` (evidence.flow.json) as well as ``--evidence-extra``:
+    with that block supplied and lacking the np- id the old reason stands, and with the id held the link reads clean."""
+    row = {"id": "np-d4384dc8", "state": "open", "items": [], "by": "", "grade": "unknown"}
+    items = write_items(tmp_path, item(3, depends=[{"kind": "band", "ref": "np-d4384dc8"}]))
+    argv = ("--json", "--items", str(items), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z", "--no-land-waiter",
+            "--producer", "flow")
+    _producer_file(tmp_path, "flow", band=[])
+    doc = json.loads(run(capsys, *argv)[1])
+    assert doc["items"][0]["reason"] == "band:np-d4384dc8 is not in the band"
+    _producer_file(tmp_path, "flow", band=[row])
+    doc = json.loads(run(capsys, *argv)[1])
+    assert "band evidence not supplied" not in doc["items"][0]["reason"] and "is not in the band" not in doc["items"][0]["reason"]
+    assert doc["items"][0]["state"] == "blocked"
 
 
 def test_an_external_producer_file_beside_the_items_supplies_the_waiters(world, tmp_path, capsys):

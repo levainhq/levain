@@ -541,8 +541,19 @@ def test_an_np_link_with_no_band_block_from_flow_says_the_band_evidence_was_not_
     got, _ = board_of(native_only, _item(1, depends_on=link), _item(2, done=_FLOW_ROW, done_kind="band"))
     for iid in ("levain#1", "levain#2"):
         assert got[iid].state == "unknown", iid
-        assert "band evidence not supplied" in got[iid].reason and "--evidence-extra" in got[iid].reason, got[iid].reason
+        assert ("band evidence not supplied (flow's band arrives through --evidence-extra or a saved --producer flow)"
+                in got[iid].reason), got[iid].reason
         assert _FLOW_ROW in got[iid].reason and "is not in the band" not in got[iid].reason, got[iid].reason
+
+
+def test_with_a_q_id_and_an_np_id_both_absent_and_no_flow_block_the_first_absent_id_decides_the_wording():
+    """levain#184, a stated ordering: ``gone[0]`` picks the wording, so the same two absent ids read differently by the order the
+    item lists them; the refs named are the same either way."""
+    q, np_ = {"kind": "band", "ref": "q-" + "0" * 24}, {"kind": "band", "ref": _FLOW_ROW}
+    got, _ = board_of(ev2(**whole("levain"), producers=("levain",)), _item(1, depends_on=[q, np_]), _item(2, depends_on=[np_, q]))
+    assert got["levain#1"].reason == "band:q-" + "0" * 24 + " is not in the band"
+    assert got["levain#2"].reason == (f"band:{_FLOW_ROW}: band evidence not supplied "
+                                      "(flow's band arrives through --evidence-extra or a saved --producer flow)")
 
 
 def test_a_band_block_from_flow_that_lacks_the_np_row_keeps_the_is_not_in_the_band_reason():
