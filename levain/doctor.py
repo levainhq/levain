@@ -3400,13 +3400,28 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     ok, out = _probe([sys.executable, "-P", "-m", "anneal_memory", "--version"])
     if ok:
         version = (out.strip().splitlines() or ["present"])[0]
-        results.append(
-            CheckResult(
-                "anneal-memory module",
-                True,
-                f"importable via {sys.executable} ({version}){script_failure}",
+        verdict, requirement = _anneal_range_verdict(version)
+        if verdict is False:
+            results.append(
+                CheckResult(
+                    "anneal-memory module",
+                    False,
+                    f"importable via {sys.executable} ({version}), but levain requires "
+                    f"{requirement}{script_failure}",
+                    f"{sys.executable} -m pip install -U '{requirement}'",
+                )
             )
-        )
+        else:
+            unchecked = (
+                "" if verdict else "; levain's required range was not checked (it could not be read or compared)"
+            )
+            results.append(
+                CheckResult(
+                    "anneal-memory module",
+                    True,
+                    f"importable via {sys.executable} ({version}){script_failure}{unchecked}",
+                )
+            )
     else:
         results.append(
             CheckResult(
@@ -3417,6 +3432,69 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             )
         )
     return results
+
+
+_SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)$")
+
+
+def _release_tuple(text: str) -> tuple[int, ...] | None:
+    """A plain release (`2.0.1`) as a tuple, else None. A pre/post/dev/local suffix is None."""
+    if not re.fullmatch(r"\d+(?:\.\d+)*", text):
+        return None
+    return tuple(int(part) for part in text.split("."))
+
+
+def _anneal_requirement() -> str | None:
+    """The anneal-memory requirement levain's own installed metadata declares, as declared.
+
+    None when there is no `levain` distribution (a bare source checkout), no unconditional
+    anneal-memory entry, or the metadata cannot be read. `packaging` is not a levain
+    dependency, so the caller compares release tuples itself.
+    """
+    import importlib.metadata as metadata
+
+    try:
+        declared = metadata.requires("levain") or []
+    except Exception:  # noqa: BLE001 - metadata trouble is an unknown, not a failure
+        return None
+    for entry in declared:
+        if not isinstance(entry, str) or ";" in entry:
+            continue  # an extra/marker entry is not the base requirement
+        if re.split(r"[\s<>=!~(\[]", entry.strip(), maxsplit=1)[0].lower().replace("_", "-") == "anneal-memory":
+            return entry.strip()
+    return None
+
+
+def _anneal_range_verdict(version_line: str) -> tuple[bool | None, str]:
+    """(True in range | False out of range | None unknown, the requirement as declared).
+
+    An unknown is never a pass or a fail: no requirement, a specifier this helper does not
+    model (`~=`, `===`, a wildcard), or a version that is not a plain release.
+    """
+    requirement = _anneal_requirement()
+    if requirement is None:
+        return None, ""
+    tokens = version_line.split()
+    installed = next((t for t in reversed(tokens) if _release_tuple(t.lstrip("vV"))), None)
+    have = _release_tuple(installed.lstrip("vV")) if installed else None
+    spec_text = re.sub(r"^[A-Za-z0-9_.-]+\s*", "", requirement).strip().strip("()")
+    if have is None or not spec_text:
+        return None, requirement
+    verdict = True
+    for clause in spec_text.split(","):
+        match = _SPEC_RE.match(clause.strip())
+        want = _release_tuple(match.group(2)) if match else None
+        if match is None or want is None or match.group(1) in ("===", "~="):
+            return None, requirement
+        width = max(len(have), len(want))
+        a = have + (0,) * (width - len(have))
+        b = want + (0,) * (width - len(want))
+        op = match.group(1)
+        holds = {
+            ">=": a >= b, ">": a > b, "<=": a <= b, "<": a < b, "==": a == b, "!=": a != b,
+        }[op]
+        verdict = verdict and holds
+    return verdict, requirement
 
 
 def _anneal_invocation(*args: str) -> str:
