@@ -609,9 +609,12 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             # a draw that follows the close (a fold from a search, a resize or a late row; a whole-board redraw from a fresh read) draws the
             # card's control again: the focus must ride along. A board redraw arrives on its own some 300 ms after the close on a loaded
             # box, so the test asks for each instead of hoping to meet one; unchanged input still folds the card
-            {"eval": f"{TRAY}.querySelector('.ep-search-input').dispatchEvent(new Event('input', {{bubbles: true}})); new Promise(r => setTimeout(() => r(1), 150))"},
-            {"eval": "window.LevainDashboard.redraw(); "
-                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); setTimeout(tick, 100); }})"},
+            # each step waits for the control it started from to be replaced (up to a cap), so it cannot pass on the node it began with
+            {"eval": f"window.__prev = {TRAY}.querySelector('[data-list-more]'); "
+                     f"{TRAY}.querySelector('.ep-search-input').dispatchEvent(new Event('input', {{bubbles: true}})); "
+                     "new Promise(r => { const t0 = Date.now(); const tick = () => (!window.__prev.isConnected || Date.now() - t0 > 3000) ? r(1) : setTimeout(tick, 50); tick(); })"},
+            {"eval": f"window.__prev = {TRAY}.querySelector('[data-list-more]'); window.LevainDashboard.redraw(); "
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => ((!window.__prev.isConnected && ({focus_is_control})) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
