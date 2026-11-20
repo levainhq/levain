@@ -432,15 +432,15 @@ def test_the_lease_line_points_to_start_desk_only_when_the_button_is_drawn(tmp_p
     words = "document.querySelector('.dv-zone .dv-leasewords').textContent"
     with desk_page(tmp_path) as (stub, base):
         out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, _TAP_DESK, _OPEN,
-            put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none .dv-start')"),
+            put(get={"status": 200, "json": wired(lease={"state": "none", "open_desk": True})}), until("document.querySelector('.dv-lease-none .dv-open')"),
             {"eval": "JSON.stringify({w: " + words + ", marker: 'lw'})"},
             put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"),
             {"eval": "(() => { window.LevainSignSheet.openDrop = null; return 1; })()"},
             put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"),
-            {"eval": "JSON.stringify({w: " + words + ", start: !!document.querySelector('.dv-zone .dv-start'), marker: 'lw'})"}])
+            {"eval": "JSON.stringify({w: " + words + ", start: !!document.querySelector('.dv-zone .dv-open'), marker: 'lw'})"}])
     with_btn, without = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"marker":"lw"' in v]
-    assert with_btn["w"].endswith("To start one, use Start desk below."), with_btn
-    assert "Start desk" not in without["w"] and not without["start"] and without["w"].endswith("A typed line never starts a desk."), without
+    assert with_btn["w"].endswith("To start one, use Open a Desk below."), with_btn
+    assert "Open a Desk" not in without["w"] and not without["start"] and without["w"].endswith("A typed line never starts a desk."), without
 
 
 def test_the_context_model_never_makes_a_non_finite_bar_and_the_desk_commands_keep_their_positions(tmp_path):

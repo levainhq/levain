@@ -116,9 +116,9 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
         caps = None
     try:
         lease = port.lease()
-        lease_view = {"state": lease.state, "holder": lease.holder, "age_s": lease.age_s}
+        lease_view = {"state": lease.state, "holder": lease.holder, "age_s": lease.age_s, "open_desk": getattr(lease, "open_desk", False) is True}
     except Exception:       # noqa: BLE001 - a lease that cannot be asked is not known: say so, never a 500 on a poll
-        lease_view = {"state": "unknown", "holder": None, "age_s": None}
+        lease_view = {"state": "unknown", "holder": None, "age_s": None, "open_desk": False}
     events: list[dict[str, str]] = []
     cursor: str | None = None
     readable = True

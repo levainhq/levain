@@ -87,7 +87,7 @@ def oid(n: int = 1) -> str:
 def test_the_result_dataclasses_have_their_pinned_field_names():
     names = lambda c: [f.name for f in dataclasses.fields(c)]      # noqa: E731
     assert names(DeskCaps) == ["adapter", "wake", "receipts", "lease", "replies", "words_max"]
-    assert names(LeaseView) == ["state", "holder", "age_s"]
+    assert names(LeaseView) == ["state", "holder", "age_s", "open_desk"]
     assert names(PostResult) == ["outcome", "ref", "thread_id", "reason", "replayed"]
     assert names(DeskEvent) == ["by", "kind", "text", "at"]
     assert names(EventBatch) == ["events", "cursor", "readable"]
@@ -402,7 +402,7 @@ def test_lease_reads_the_allowlisted_fields_only(rig):
     rig.lease_src.write_text(json.dumps({"state": "held", "holder": "desk 25", "age_s": 180, "pid": 9, "secret": "x"}))
     v = rig.port().lease()
     assert v == LeaseView("held", "desk 25", 180)
-    assert {f.name for f in dataclasses.fields(v)} == {"state", "holder", "age_s"}
+    assert {f.name for f in dataclasses.fields(v)} == {"state", "holder", "age_s", "open_desk"}
     (rec,) = rig.recs()
     assert rec["argv"][0] == "lease" and rec["stdin"] == ""
 
@@ -564,3 +564,19 @@ def test_the_double_holds_the_same_caller_fault_checks():
         d.post("hi", outbox_id="short", origin=ORIGIN)
     with pytest.raises(DeskPortError):
         d.post("hi", outbox_id=oid(), origin="nobody")
+
+
+def test_the_lease_read_carries_open_desk_only_as_the_json_true_and_never_on_an_unknown_lease():
+    from levain.desk.desk_port import _parse_lease
+    held = {"state": "held", "holder": "desk 25", "age_s": 1200}
+    assert _parse_lease(json.dumps({**held, "open_desk": True})) == LeaseView("held", "desk 25", 1200, True)      # a stalled desk
+    assert _parse_lease(json.dumps({"state": "none", "open_desk": True})) == LeaseView("none", open_desk=True)    # no_lease
+    for bad in (False, None, "true", 1, [True], {}):
+        assert _parse_lease(json.dumps({**held, "open_desk": bad})).open_desk is False, bad
+    assert _parse_lease(json.dumps(held)).open_desk is False                                    # a host that does not say: no button
+    assert _parse_lease(json.dumps({"state": "unknown", "open_desk": True})) == LeaseView("unknown")
+    with pytest.raises(ValueError):
+        LeaseView("unknown", open_desk=True)
+    d = ScriptedDeskPort()
+    d.script_lease("held", "desk 25", 1200, True)
+    assert d.lease().open_desk is True

@@ -29,7 +29,9 @@ Host output shapes (the host's side of the contract; anything else degrades to `
   refusal (its first line is the reason), any other code, a timeout or a kill: the command started and may have
   delivered. ``post`` appends nothing to argv; the words are STDIN.
 * ``lease``: no extra argv; stdout is one JSON object ``{"state": "held"|"none"|"unknown", "holder": str|null,
-  "age_s": int|null}``; only those three fields are read.
+  "age_s": int|null, "open_desk": bool?}``; only those four fields are read. ``open_desk`` is the host's own answer to "would
+  a verified start request open a desk now" (levain#154): the cockpit's one Open a Desk button is drawn from it and from nothing else.
+  Anything but the JSON ``true`` reads as false.
 * ``events``: argv gets the thread id, then ``--after <cursor>`` when a cursor is given; stdout is one JSON object
   ``{"events": [{"by": "script"|"desk", "kind": "took"|"held"|"reply", "text": str, "at": str}], "cursor": str|null}``.
   The door's output cap (:data:`levain.desk.room_host.OUTPUT_MAX`) bounds one batch; a batch cut mid-JSON is unreadable.
@@ -144,9 +146,12 @@ class LeaseView:
     state: str
     holder: Optional[str] = None
     age_s: Optional[int] = None
+    open_desk: bool = False
 
     def __post_init__(self) -> None:
         _enum("state", self.state, LEASE_STATES)
+        if not isinstance(self.open_desk, bool) or (self.open_desk and self.state == "unknown"):
+            raise ValueError("open_desk is a bool, and an unknown lease never offers a desk")
         _opt_str("holder", self.holder, _HOLDER_MAX)
         if self.age_s is not None and (isinstance(self.age_s, bool) or not isinstance(self.age_s, int)
                                        or not 0 <= self.age_s <= _AGE_MAX):
@@ -616,8 +621,10 @@ def _parse_lease(text: str) -> LeaseView:
     try:
         state = doc.get("state")
         if state == "held":
-            return LeaseView("held", doc.get("holder"), doc.get("age_s"))
-        if state in ("none", "unknown"):
+            return LeaseView("held", doc.get("holder"), doc.get("age_s"), doc.get("open_desk") is True)
+        if state == "none":
+            return LeaseView(state, open_desk=doc.get("open_desk") is True)
+        if state == "unknown":
             return LeaseView(state)
     except ValueError:
         pass
@@ -662,8 +669,8 @@ class ScriptedDeskPort:
         self._context_on, self._context = False, None
         self._n = 0
 
-    def script_lease(self, state: str, holder: Optional[str] = None, age_s: Optional[int] = None) -> None:
-        self._lease = LeaseView(state, holder, age_s)
+    def script_lease(self, state: str, holder: Optional[str] = None, age_s: Optional[int] = None, open_desk: bool = False) -> None:
+        self._lease = LeaseView(state, holder, age_s, open_desk)
 
     def script_post(self, outcome: str, *, ref: Optional[str] = None, thread_id: Optional[str] = None,
                     reason: Optional[str] = None) -> None:
