@@ -228,8 +228,6 @@
     .panel, .panel.span2, .panel.k-brief, .panel.k-form, .panel.k-metric-grid, .panel.k-count-queue, .panel.k-reading { grid-column: 1 / -1; }
     .readout { margin-left: 0; }
   }
-  body[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
-  body[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
 
   .panel {
     background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg);
@@ -1323,9 +1321,7 @@ body.ke .ck-legend .legendbar { font-size: var(--fs-meta); color: var(--label); 
 body.ke .ck-secthead { display: flex; align-items: baseline; gap: var(--sp-4); margin-top: var(--sec); }
 body.ke .ck-secthead[hidden] { display: none; }
 /* a mode that hides every card in a region hides its header too (the cards' own mode rule is near the top) */
-body.ke[data-mode="morning"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="morning"]))),
 body.ke[data-mode="board"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="board"]))),
-body.ke[data-mode="build"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="build"]))),
 body.ke[data-mode="memory"] .ck-secthead:not(:has(+ section > :is(:not([data-modes]), [data-modes~="memory"]))) { display: none; }
 body.ke .ck-secthead h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-secthead span { font-size: var(--fs-meta); color: var(--meta); }
@@ -1333,10 +1329,8 @@ body.ke .ck-secthead + .ck-widgets { margin-top: var(--sp-4); }
 /* the strip stands clear of the Needs-you cards above it, not 12px off their ring */
 body.ke .ck-needs ~ .ck-widgets { margin-top: var(--sp-6); }
 /* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
-   is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
-body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
+   is display:flex); this one carries body.ke so a mode (Home, Memory) hides a card the manifest did not give that mode. */
 body.ke[data-mode="board"] [data-modes]:not([data-modes~="board"]),
-body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]),
 body.ke[data-mode="memory"] [data-modes]:not([data-modes~="memory"]) { display: none; }
 body.ke .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
 body.ke .zone-head .zone-title { margin: 0; }
@@ -1786,11 +1780,11 @@ body.ke .needs-terminal .consent-cmd { margin-top: 0; }
 @media (max-width: 480px) { body.ke .consent-kv { grid-template-columns: minmax(0, 1fr); gap: 0; } body.ke .consent-kv dd { margin-bottom: var(--sp-2); } }
 /* the other tabs carry the header alone: one line saying how many wait */
 body.ke .needs-bar { display: none; }
-body.ke[data-mode="build"] .needs-answered, body.ke[data-mode="memory"] .needs-answered,
-body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
-body.ke[data-mode="build"] #ck-needs .needs-headline, body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
-body.ke[data-mode="build"] #ck-needs:not([data-waiting]), body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
-body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
+body.ke[data-mode="memory"] .needs-answered,
+body.ke[data-mode="memory"] .needs-grid,
+body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
+body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
+body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
   background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-lg); }
 body.ke .needs-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
 body.ke .needs-bar-title { font: var(--fw-bold) var(--fs-h)/1.2 var(--round); color: var(--text); }
@@ -1934,7 +1928,6 @@ body.ke .ck-widgets[data-shape="tiles"] .w .sub ~ .sub, body.ke .ck-widgets[data
 body.ke .ck-widgets[data-shape="tiles"] .w .row { flex-wrap: wrap; white-space: normal; }
 body.ke .ck-widgets[data-shape="tiles"] > .ck-card.w[data-signal="on"] { border-color: var(--wait-ring);
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 8px 28px -12px color-mix(in oklch, var(--accent) calc(var(--glow-a) * 100%), transparent); }
-body.ke[data-mode="build"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="build"]),
 body.ke[data-mode="memory"] .ck-widgets > .ck-card.w[data-modes]:not([data-modes~="memory"]) { display: none; }
 
 /* the cards size to what they hold (up to their size class, then they scroll) */
@@ -1946,9 +1939,7 @@ body.ke .ck-zgrid .panel { display: flex; flex-direction: column; }
 body.ke .zone-head { display: none; }
 body.ke[data-mode="board"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
 body.ke[data-mode="board"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
-body.ke[data-mode="morning"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="morning"])),
 body.ke[data-mode="board"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="board"])),
-body.ke[data-mode="build"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="build"])),
 body.ke[data-mode="memory"] .ck-zone:not(:has(.ck-zgrid .panel[data-modes~="memory"])) { display: none; }
 
 /* two columns of cards on every tab; a card that stands for the whole row (Tray on Morning, a section, an empty line, a card alone in its
@@ -1959,7 +1950,6 @@ body.ke .ck-col { display: contents; }
 body.ke .ck-zgrid .panel[data-stretch], body.ke .ck-zgrid .panel.ck-fold, body.ke .ck-zgrid .panel.ck-dash { grid-column: 1 / -1; }
 body.ke .ck-zgrid .panel.ck-fold { order: 90; }
 body.ke .ck-zgrid .panel.ck-dash { order: 95; }
-body.ke[data-mode="morning"] .ck-zgrid .panel[data-ck-panel="tray"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel^="section:"] { grid-column: 1 / -1; }
 body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="wraps"] { align-self: start; }
 body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
@@ -1991,34 +1981,14 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now until a saved layout says otherwise) */
-
+/* the repo chip a row carries (dashboard_core.js) is hidden in a row unless a place draws it (the Tray, the List); the Results rows' outcome dot follows */
 /* the repo chip a row carries (dashboard_core.js) is drawn only where a place shows it; the Results rows and the Work zone heading follow */
 .row > .k7-repo { display: none; }
 .k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
 .k7-none.err { color: var(--bad); }
 .k7-repo { display: inline-block; padding: 0 var(--sp-3); border-radius: var(--r-pill); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--sans); color: var(--label); background: var(--card-2); }
 .k7-repo.rp-tag { margin-right: 0; vertical-align: baseline; color: var(--tag-ink); background: color-mix(in oklch, var(--tag) 15%, transparent); }
-/* Results & edits */
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head { display: flex; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-title:not(.k7-zt),
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .zone-gloss:not(.k7-zg) { display: none; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { display: block; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
-body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
-@media (min-width: 721px) {
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1; align-self: start; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
-}
-body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
-  background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
-body.ke .ck-zgrid .panel.k7-results-none .phead { padding: 0; flex: none; }
-body.ke .ck-zgrid .panel.k7-results-none .pbody { padding: 0; flex: 1 1 200px; min-width: 0; overflow: visible; color: var(--label); font-size: var(--fs-body); }
 body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
-@media (max-width: 720px) {
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
-}
 body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
@@ -2533,15 +2503,6 @@ body.ke[data-mode="board"] .ck-zgrid .panel[data-ck-panel="tray"] { max-height: 
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8, 32px); align-items: start; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .grp-col { display: block; min-width: 0; }
-/* L3 a Tray with ONE group (flow's "Also pending") would fill the left column and leave the right one empty: the lone group takes
-   both columns and its rows run down two columns under one heading, so it reads like the two-group Tray beside it */
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { grid-column: 1 / -1; columns: 2; column-gap: var(--sp-8, 32px); }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .grp-head { column-span: all; }
-body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .row { break-inside: avoid; }
-@media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
-  body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
 body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="intention_close"] { order: -1; }
 
 /* ═══════════════════════════ NARROW VIEW (1023+13): the cockpit at half a laptop screen ═══════════════════════════ */

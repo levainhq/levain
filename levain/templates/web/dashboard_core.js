@@ -1184,14 +1184,13 @@
     for (const g of document.querySelectorAll(".ck-zgrid")) if (g.dataset.ckZone === zone) return ckNodesOf(g, key)[0] || null;
     return null;
   }
-  // A card whose place CSS `order` pins (a fold line, a dashed line, Recent episodes on the Board, the Build jobs / edits / loops rows) takes
+  // A card whose place CSS `order` pins (a fold line, a dashed line, Recent episodes on the Board) takes
   // a move as a no-op: it gets no move buttons and is never a neighbour. One set of keys here, never a CSS selector list beside it.
   const CK_PIN_BOARD = new Set(["episodes"]);
-  const CK_PIN_BUILD = new Set(["jobs", "jobs-none", "edits"]);
   function ckPinned(zone, key, nodes) {
     if (nodes.some((n) => n.classList.contains("ck-fold") || n.classList.contains("ck-dash"))) return true;
     const mode = document.body && document.body.dataset ? document.body.dataset.mode : "";
-    return (mode === "board" && CK_PIN_BOARD.has(key)) || (mode === "build" && zone === "operate" && CK_PIN_BUILD.has(key));
+    return mode === "board" && CK_PIN_BOARD.has(key);
   }
   // What a zone's controls need, read once per pass: the folded set, which cards are pinned, which are movable AND on screen (a card in
   // another tab is not a neighbour), and whether the gate is shut.
