@@ -36,7 +36,7 @@
     // the flag is only ever true on the board page with no view up: anything else that changed the page's own state ends it
     if (settingsOn() && (roomOn() || deskOn() || mode() !== "board")) document.body.classList.remove(SETTINGS_ON);
     var p = place();
-    if (document.body.dataset.iaPlace !== p) { document.body.dataset.iaPlace = p; if (remeasure) remeasure(); }
+    if (document.body.dataset.iaPlace !== p) { document.body.dataset.iaPlace = p; if (remeasure) remeasure(); queueHeads(); }
     // scoped to the places bar: other controls carry aria-current of their own
     var bar = document.querySelectorAll(".ia-places [data-ia-place-btn]");
     for (var i = 0; i < bar.length; i++) {
@@ -151,6 +151,7 @@
       var d = document.createElement("div");
       d.className = "ia-head";
       d.dataset.iaHead = h[0];
+      d.setAttribute("data-ia-empty", "1");   // hidden until the first sync finds a block under it, so no head flashes over an undrawn page
       var t = document.createElement("h3");
       t.textContent = h[1];
       var s = document.createElement("span");
@@ -160,6 +161,49 @@
       var anchor = HEAD_BEFORE[h[0]] ? deck.querySelector(":scope > " + HEAD_BEFORE[h[0]]) : null;
       if (anchor) deck.insertBefore(d, anchor); else deck.appendChild(d);
     });
+  }
+
+  // levain#164: a Home section head is shown only while a block it owns is drawn. A bare install (no desk, no flow-desk panel, no Machine
+  // panels) would otherwise show "Desk" and "Machine" over nothing. dashboard.css orders each block under its head by the same selectors
+  // (the `order` rules for the drop box, the flow-desk, board, tray, inbox, roster and so on); this map is the page's copy of that ownership.
+  var HEAD_OWNS = {
+    desk: ["#ck-drop", '.panel[data-ck-panel="flow-desk"]'],
+    work: ['.panel[data-ck-panel="tray"]', '.panel[data-ck-panel="board"]', '.panel[data-ck-panel="inbox"]'],
+    machine: ["#ck-skycol", '.panel[data-ck-panel="roster"]', '.panel[data-ck-panel="agents"]', '.panel[data-ck-panel="agent_calls"]',
+      '.panel[data-ck-panel="stream"]', '.panel[data-ck-panel="scheduled_jobs"]', '.panel[data-ck-panel="jobs"]', '.panel[data-ck-panel="edits"]'],
+    glance: ["#ck-widgets"]
+  };
+  // drawn = it has a box with some height (a hidden block has none, and an emptied container can have a box of no height)
+  function drawn(el) {
+    if (!el || !el.getClientRects) return false;
+    var rs = el.getClientRects();
+    for (var i = 0; i < rs.length; i++) if (rs[i].height > 0) return true;
+    return false;
+  }
+  // only on Home: elsewhere the heads are not displayed and the blocks under them are not either, so nothing there can be measured
+  function syncHeads() {
+    if (document.body.dataset.iaPlace !== "home") return;
+    var heads = document.querySelectorAll(".deck .ia-head");
+    for (var i = 0; i < heads.length; i++) {
+      var sels = HEAD_OWNS[heads[i].dataset.iaHead], any = false;
+      if (!sels) { heads[i].removeAttribute("data-ia-empty"); continue; }   // a head this map does not know stays shown: never hide what is not understood
+      for (var j = 0; j < sels.length && !any; j++) {
+        var els = document.querySelectorAll(sels[j]);
+        for (var k = 0; k < els.length && !any; k++) any = drawn(els[k]);
+      }
+      if (any) heads[i].removeAttribute("data-ia-empty"); else heads[i].setAttribute("data-ia-empty", "1");
+    }
+  }
+  // a panel that updates every frame (the stream, the agent calls) would otherwise ask for a measure every frame: one sync per HEADS_GAP_MS
+  var HEADS_GAP_MS = 250, headsQueued = false, headsAt = 0;
+  function queueHeads() {
+    if (headsQueued) return;
+    headsQueued = true;
+    var run = function () { headsQueued = false; headsAt = Date.now(); syncHeads(); };
+    var wait = Math.max(0, HEADS_GAP_MS - (Date.now() - headsAt));
+    if (wait > 0) window.setTimeout(run, wait);
+    else if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+    else window.setTimeout(run, 0);
   }
 
   // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, on a screen at least
@@ -221,7 +265,13 @@
     addGraphToggle();
     watchNotifyLabel();
     new MutationObserver(paint).observe(document.body, { attributes: true, attributeFilter: ["class", "data-mode"] });
+    // a block drawn, removed or shown later (the board's panels arrive after the first paint) re-asks which heads have something under them;
+    // the heads' own attribute is outside the filter, so this cannot feed itself
+    var deck = document.querySelector(".deck");
+    if (deck) new MutationObserver(queueHeads).observe(deck, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "class"] });
+    window.addEventListener("resize", queueHeads);   // a block a media query hides or shows changes with the width
     paint();
+    queueHeads();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();
