@@ -44,9 +44,9 @@ STUB2 = r"""(() => { const real = window.fetch.bind(window); window.__reads = 0;
 TOLD = "document.dispatchEvent(new CustomEvent('levain:fresh'))"     # what the stream says after it has applied a panel
 # A server that has only just started makes the first page do one corrective whole-board read after the stream's hello (the watcher's first
 # build is a new generation, levain#138). Every test below injects its failure into the NEXT manifest read, so that read must not be the
-# startup one: wait for the settled board (the shared step: live chip, no cockpit read in flight, started or finished, nothing drawn), then
+# startup one: wait for the page's own read to finish, then for the settled board (the shared step: live chip, no cockpit read in flight, started or finished, nothing drawn), then
 # zero the counters so a test counts only what it caused.
-QUIET = [BOARD_SETTLED, {"eval": "(window.__reads = 0, window.__wbReads = 0, 1)"}]
+QUIET = [{"until": "!window.LevainBootFacts().inflight && 1", "ms": 30000}, BOARD_SETTLED, {"eval": "(window.__reads = 0, window.__wbReads = 0, 1)"}]
 
 
 # sample the page every 250 ms for `ms`: what the line says and what the shim's facts say
