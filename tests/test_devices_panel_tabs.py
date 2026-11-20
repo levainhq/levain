@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from levain.cockpit.firejournal import revoke_digest
+from levain.webpush.notify_tokens import URGENT_PER_HOUR
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
 from tests.test_cockpit_webpush import _signed
@@ -219,12 +220,20 @@ NF_STUB = ("(() => { const f = window.fetch.bind(window); window.__mints = [];"
            " return f(u, o); }; return 1; })()")
 
 
-def _nf_mint(name: str, *, urgent: bool, cap: str) -> dict:
-    """Fill the card (the box ticked or not, the cap field holding ``cap``), submit, and answer what the page sent and said."""
-    js = ("(() => { const q = (s) => document.querySelector(s); window.__n = window.__mints.length;"
-          f" q('.nf-name').value = {json.dumps(name)}; q('.nf-urgent').checked = {json.dumps(urgent)}; q('.nf-urgent-cap').value = {json.dumps(cap)};"
-          " q('.nf-form').requestSubmit(); return 1; })()")
+def _nf_fill(name: str, *, urgent: bool, cap: str | None) -> dict:
+    """Fill the card: the name, the Urgent box ticked or not, and the cap field set to ``cap`` (None leaves it empty and focuses it for typing)."""
+    set_cap = "q('.nf-urgent-cap').value = ''; q('.nf-urgent-cap').focus();" if cap is None else f"q('.nf-urgent-cap').value = {json.dumps(cap)};"
+    js = ("(() => { const q = (s) => document.querySelector(s);"
+          f" q('.nf-name').value = {json.dumps(name)}; q('.nf-urgent').checked = {json.dumps(urgent)}; {set_cap} return 1; }})()")
     return {"eval": js}
+
+
+NF_SUBMIT = {"eval": "(() => { document.querySelector('.nf-form').requestSubmit(); return 1; })()"}
+
+
+def _nf_mint(name: str, *, urgent: bool, cap: str) -> list[dict]:
+    """The steps that fill the card with ``cap`` set by script, then submit it."""
+    return [_nf_fill(name, urgent=urgent, cap=cap), NF_SUBMIT]
 
 
 def _nf_settle(name: str) -> dict:
@@ -234,30 +243,95 @@ def _nf_settle(name: str) -> dict:
 
 
 NF_STATE = ("JSON.stringify({mints: window.__mints, note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
-            " cap: document.querySelector('.nf-urgent-cap').value, box: document.querySelector('.nf-urgent').checked})")
+            " cap: document.querySelector('.nf-urgent-cap').value, box: document.querySelector('.nf-urgent').checked,"
+            " bad: document.querySelector('.nf-urgent-cap').validity.badInput, aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
+# the line the card shows for a cap it will not send, and for an unticked Urgent box over a typed cap
+NF_WHOLE = "whole number"
+NF_TICK = "tick Urgent"
 
 
-@needs_browser
-def test_the_notify_card_sends_the_urgent_cap_only_when_urgent_is_ticked_and_the_field_holds_a_positive_whole_number(tmp_path, monkeypatch) -> None:
+def _nf_run(tmp_path, monkeypatch, steps_for_cases: list[dict]) -> tuple[list[dict], dict]:
+    """Open the card on a scratch signed server, run the steps, and answer what each NF_STATE read said plus each token's stored cap."""
     _root, src, _ids = _install(tmp_path)
     q = tmp_path / "signq"
     q.mkdir(mode=0o700)
     with _signed(src, q) as (port, _httpd):
-        steps = [{"until": NF_READY, "ms": 20000}, {"eval": NF_STUB}]
-        for name, urgent, cap in [("ok-cap", True, "20"), ("not-urgent", False, "20"), ("no-cap", True, ""), ("zero", True, "0"),
-                                  ("negative", True, "-3"), ("fraction", True, "2.5"), ("quiet-bad", False, "0")]:
-            steps += [_nf_mint(name, urgent=urgent, cap=cap), _nf_settle(name), {"eval": NF_STATE}]
+        steps = [{"until": NF_READY, "ms": 20000}, {"eval": NF_STUB}] + steps_for_cases
         out = _drive(tmp_path, monkeypatch, f"http://localhost:{port}/#write_token={T}", steps)
         stored = {r["name"]: r["urgent_per_hour"] for r in _call(port, "GET", "/webpush/notify/tokens", token=T)[1]["tokens"]}
     seen = [json.loads(v) for v in out["values"][2:] if isinstance(v, str) and v.startswith("{")]
-    assert len(seen) == 7, out["values"]
-    ok, not_urgent, no_cap, zero, negative, fraction, quiet_bad = seen
+    return seen, stored
+
+
+@needs_browser
+def test_the_notify_card_sends_the_urgent_cap_only_when_urgent_is_ticked_and_the_field_holds_a_positive_whole_number(tmp_path, monkeypatch) -> None:
+    steps: list[dict] = []
+    for name, urgent, cap in [("ok-cap", True, "20"), ("no-cap", True, ""), ("zero", True, "0"), ("negative", True, "-3"), ("fraction", True, "2.5")]:
+        steps += _nf_mint(name, urgent=urgent, cap=cap) + [_nf_settle(name), {"eval": NF_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 5, seen
+    ok, no_cap, zero, negative, fraction = seen
     assert ok["mints"] == [{"name": "ok-cap", "urgent": True, "urgent_per_hour": 20}], ok
-    assert ok["cap"] == "" and ok["box"] is False, ok                                   # cleared after a mint, like the other fields
-    assert not_urgent["mints"][-1] == {"name": "not-urgent"}, not_urgent               # an unticked box sends no cap, whatever the field holds
+    assert isinstance(ok["mints"][0]["urgent_per_hour"], int), ok
+    assert ok["cap"] == "" and ok["box"] is False and ok["aria"] is None, ok         # cleared after a mint, like the other fields
     assert no_cap["mints"][-1] == {"name": "no-cap", "urgent": True}, no_cap          # an empty field sends none: the server's default applies
     for bad in (zero, negative, fraction):
-        assert len(bad["mints"]) == 3, bad                                              # nothing was sent
-        assert "whole number" in bad["note"] and bad["cap"] != "", bad                  # the card says so in words and keeps what was typed
-    assert stored["ok-cap"] == 20 and stored["no-cap"] == 3 and "zero" not in stored, stored     # the scratch server kept the typed cap, and the default otherwise
-    assert quiet_bad["mints"][-1] == {"name": "quiet-bad"}, quiet_bad                  # a bad value in a field the unticked box ignores is no error
+        assert len(bad["mints"]) == 2, bad                                              # nothing was sent
+        assert NF_WHOLE in bad["note"] and bad["cap"] != "" and bad["aria"] == "true", bad    # the card says so in words, marks the field, keeps what was typed
+    assert stored["ok-cap"] == 20 and stored["no-cap"] == URGENT_PER_HOUR and "zero" not in stored, stored   # the scratch server kept the typed cap, and its default otherwise
+
+
+@needs_browser
+def test_a_cap_typed_with_urgent_unticked_is_refused_in_words_and_kept_not_dropped(tmp_path, monkeypatch) -> None:
+    # a person who types a cap and forgets the box must hear it: the token is not minted, nothing is sent, the typed value stays
+    steps = _nf_mint("forgot-tick", urgent=False, cap="20") + [_nf_settle("forgot-tick"), {"eval": NF_STATE}]
+    # the same field, then the box ticked and sent again: the refusal cleared and the typed value went out as typed
+    steps += [{"eval": "(() => { document.querySelector('.nf-urgent').checked = true; document.querySelector('.nf-form').requestSubmit(); return 1; })()"},
+              _nf_settle("forgot-tick"), {"eval": NF_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    refused, sent = seen
+    assert refused["mints"] == [], refused
+    assert NF_TICK in refused["note"] and refused["cap"] == "20" and refused["box"] is False and refused["aria"] == "true", refused
+    assert sent["mints"] == [{"name": "forgot-tick", "urgent": True, "urgent_per_hour": 20}] and sent["note"] == "" and sent["aria"] is None, sent
+    assert stored == {"forgot-tick": 20}, stored
+
+
+@needs_browser
+def test_a_cap_the_page_cannot_hold_as_a_whole_number_is_refused_and_nothing_is_sent(tmp_path, monkeypatch) -> None:
+    # "1e3" is a number the field accepts; 9007199254740993 is a digit string the field accepts and a double cannot hold exactly
+    steps: list[dict] = []
+    for name, cap in [("sci", "1e3"), ("past-exact", "9007199254740993")]:
+        steps += _nf_mint(name, urgent=True, cap=cap) + [_nf_settle(name), {"eval": NF_STATE}]
+    # 309 digits typed into the field (a real edit, as a person pastes): the engine's own number rules decide what the field then holds,
+    # and the card sends nothing whichever way they go
+    steps += [_nf_fill("huge", urgent=True, cap=None),
+              {"eval": "(() => { document.querySelector('.nf-urgent-cap').focus(); return document.execCommand('insertText', false, '9'.repeat(309)) ? 1 : 0; })()"},
+              NF_SUBMIT, _nf_settle("huge"), {"eval": NF_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 3, seen
+    assert seen[2]["bad"] is True or len(seen[2]["cap"]) == 309, seen[2]       # the long digit string was taken into the field, then read as a bad input or kept whole
+    for bad in seen:
+        assert bad["mints"] == [], bad
+        assert NF_WHOLE in bad["note"] and bad["aria"] == "true", bad
+    assert stored == {}, stored
+
+
+@needs_browser
+def test_a_non_numeric_cap_typed_into_the_number_field_is_refused_and_nothing_is_sent(tmp_path, monkeypatch) -> None:
+    # the field's value reads empty while it holds a typed letter; only validity.badInput says the person typed something
+    steps = [_nf_fill("typed-e", urgent=True, cap=None), {"key": "e"}, {"eval": NF_STATE}, NF_SUBMIT, _nf_settle("typed-e"), {"eval": NF_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    typed, refused = seen
+    assert typed["cap"] == "" and typed["bad"] is True, typed                      # the setup is what it claims: an empty value over a bad input
+    assert refused["mints"] == [] and NF_WHOLE in refused["note"] and refused["aria"] == "true", refused
+    assert stored == {}, stored
+
+
+@needs_browser
+def test_a_cap_above_what_the_server_allows_reaches_the_error_line_in_the_servers_words_and_is_kept(tmp_path, monkeypatch) -> None:
+    steps = _nf_mint("too-high", urgent=True, cap="100001") + [_nf_settle("too-high"), {"eval": NF_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    (refused,) = seen
+    assert refused["mints"] == [{"name": "too-high", "urgent": True, "urgent_per_hour": 100001}], refused   # the card left the bound to the server
+    assert "whole number from 1 to 100000" in refused["note"] and refused["cap"] == "100001", refused      # the server's words, and the typed value kept
+    assert stored == {}, stored

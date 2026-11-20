@@ -375,6 +375,7 @@
     nfUrgentCap = el("input", "dev-label nf-urgent-cap");
     nfUrgentCap.type = "number"; nfUrgentCap.min = "1"; nfUrgentCap.step = "1"; nfUrgentCap.inputMode = "numeric";
     nfUrgentCap.placeholder = "optional";
+    nfUrgentCap.addEventListener("input", () => nfUrgentCap.removeAttribute("aria-invalid"));
     capLab.appendChild(nfUrgentCap);
     boxes.appendChild(capLab);
     form.appendChild(boxes);
@@ -439,11 +440,19 @@
     nfSay("");
     const name = nfName.value.trim();
     if (!name) { nfSay("Give the notify token a name."); return; }
-    // the cap rides along only on an urgent token and only when the field holds one; what the server allows stays the server's to say
+    // the cap rides along only on an urgent token; a value in the field with Urgent unticked is refused, never dropped, and what was typed stays;
+    // a whole number the page can hold exactly is sent, and what the server allows beyond that stays the server's to say
     let cap = null;
-    if (nfUrgent.checked && (nfUrgentCap.value !== "" || nfUrgentCap.validity.badInput)) {
-      if (!/^[0-9]+$/.test(nfUrgentCap.value.trim()) || Number(nfUrgentCap.value) < 1) { nfSay("Urgent per hour must be a whole number above zero, or left empty."); return; }
-      cap = Number(nfUrgentCap.value);
+    nfUrgentCap.removeAttribute("aria-invalid");
+    if (nfUrgentCap.value !== "" || nfUrgentCap.validity.badInput) {
+      let refusal = "";
+      if (!nfUrgent.checked) refusal = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
+      else {
+        const n = /^[0-9]+$/.test(nfUrgentCap.value) ? Number(nfUrgentCap.value) : NaN;
+        if (Number.isSafeInteger(n) && n >= 1) cap = n;
+        else refusal = "Urgent per hour must be a whole number above zero, or left empty.";
+      }
+      if (refusal) { nfSay(refusal); nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.focus(); return; }
     }
     if (nfBusy) return;     // a second mint would replace the first one's only shown secret
     nfBusy = true; nfGen++;
