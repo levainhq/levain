@@ -194,12 +194,16 @@
       if (any) heads[i].removeAttribute("data-ia-empty"); else heads[i].setAttribute("data-ia-empty", "1");
     }
   }
-  var headsQueued = false;
+  // a panel that updates every frame (the stream, the agent calls) would otherwise ask for a measure every frame: one sync per HEADS_GAP_MS
+  var HEADS_GAP_MS = 250, headsQueued = false, headsAt = 0;
   function queueHeads() {
     if (headsQueued) return;
     headsQueued = true;
-    var run = function () { headsQueued = false; syncHeads(); };
-    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run); else window.setTimeout(run, 0);
+    var run = function () { headsQueued = false; headsAt = Date.now(); syncHeads(); };
+    var wait = Math.max(0, HEADS_GAP_MS - (Date.now() - headsAt));
+    if (wait > 0) window.setTimeout(run, wait);
+    else if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(run);
+    else window.setTimeout(run, 0);
   }
 
   // levain#141 polish: the masthead (and, on Home, the places bar under it) stays pinned while the page scrolls, on a screen at least

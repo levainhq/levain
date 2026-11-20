@@ -578,7 +578,7 @@ HEAD_BLOCKS = {
 }
 HEADS_NOW = ("JSON.stringify([...document.querySelectorAll('.deck .ia-head')].map((h) => { const own = %s[h.dataset.iaHead] || [];"
              " return { head: h.dataset.iaHead, shown: getComputedStyle(h).display !== 'none',"
-             " owned: own.reduce((n, s) => n + [...document.querySelectorAll(s)].filter((e) => e.getClientRects().length > 0).length, 0) }; }))") % json.dumps(HEAD_BLOCKS)
+             " owned: own.reduce((n, s) => n + [...document.querySelectorAll(s)].filter((e) => [...e.getClientRects()].some((r) => r.height > 0)).length, 0) }; }))") % json.dumps(HEAD_BLOCKS)
 
 
 @needs_browser
