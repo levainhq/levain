@@ -171,7 +171,7 @@ def test_use_writes_the_config_atomically_and_a_second_use_changes_nothing(tmp_p
     seed.board("use", str(d), "--producer", "flow")                                        # the config is EXACTLY the flags: no_land_waiter off
     assert board_store.read_config(d) == {"producers": ["flow"], "no_land_waiter": False, "tiers": {}}
     seed.board("use", str(d))                                                              # no flag is the default: `use` clears the config
-    assert board_store.read_config(d) == {"producers": [], "no_land_waiter": False}
+    assert board_store.read_config(d) == {"producers": [], "no_land_waiter": False, "tiers": {}}
     fresh = tmp_path / "fresh"
     seed.board("use", str(fresh))                                                          # no flag and no config: nothing is written
     assert not (fresh / board_store.CONFIG_NAME).exists()
