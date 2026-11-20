@@ -176,7 +176,7 @@ def test_a_board_that_read_no_item_and_says_why_is_unreadable_never_an_empty_lis
 def test_a_repo_the_board_holds_no_item_of_is_one_line():
     assert board_cli.open_lines(_doc(("ready",)), "ghost") == ["ghost: the board holds no items for it"]
     assert board_cli.open_lines(_doc(("ready",), audit=[{"kind": "unknown", "id": "levain#1", "why": "x"}]), "ghost") == \
-        ["ghost: the board holds no items for it"]
+        ["ghost: the board holds no items for it", "  audit: 1 entries on other repos (read them with levain board state)"]
 
 
 def test_a_repo_with_no_items_keeps_the_problem_lines_and_the_counted_audit_after_its_one_line():
@@ -336,3 +336,94 @@ def test_in_flight_naming_an_open_item_or_no_board_id_reports_nothing():
 def test_an_id_is_found_inside_text_but_a_token_that_only_ends_like_one_is_not():
     assert board_cli.in_flight_ids(_body("see levain#12.", "levain#12 again", "x-levain#3", "levain#305x", "Levain#4", "other.repo#7")) == \
         ["levain#12", "x-levain#3", "other.repo#7"]
+
+
+# ------------------------------------------------------------------------------------------------ the second round (L3 round 1)
+def test_one_in_flight_item_naming_thousands_of_ids_adds_a_bounded_number_of_drift_lines():
+    n = 2000
+    doc = _doc(())
+    doc["items"] = [{**_doc(("done",))["items"][0], "id": f"a#{k}"} for k in range(1, n + 1)]
+    got = board_cli.in_flight_drift(_body(" ".join(f"a#{k}" for k in range(1, n + 1))), doc)
+    assert len(got) == board_cli.MAX_DRIFT_LINES + 1
+    assert got[-1] == f"+{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board open)"
+    assert sum(len(ln) for ln in got) < 4000
+    few = board_cli.in_flight_drift(_body(" ".join(f"a#{k}" for k in range(1, board_cli.MAX_DRIFT_LINES + 1))), doc)
+    assert len(few) == board_cli.MAX_DRIFT_LINES and not any(ln.startswith("+") for ln in few)      # at the bound: no count line
+
+
+def test_an_id_named_twice_in_one_entry_reports_once():
+    assert board_cli.in_flight_ids(_body("levain#1 (retry of levain#1)", "levain#1 again", "levain#2 and levain#2")) == ["levain#1", "levain#2"]
+    got = board_cli.in_flight_drift(_body("levain#1 (retry of levain#1)"), _board_with(n1="done"))
+    assert got == ["in_flight names levain#1, which the board reads as done: it is not open"]
+
+
+def test_a_state_that_is_not_a_string_is_open_and_drawn_with_unknown_never_none():
+    doc = _doc(("ready",))
+    base = doc["items"][0]
+    for n, bad in enumerate((["a", "list"], {"a": "dict"}, None, "from_the_future"), 2):
+        doc["items"].append({**base, "id": f"levain#{n}", "state": bad})
+    doc["items"].append({k: v for k, v in {**base, "id": "levain#9"}.items() if k != "state"})            # a missing state
+    for i in doc["items"][1:]:
+        assert board_cli._is_open(i)                                           # no TypeError on an unhashable state
+    view = board_cli.open_view(doc)
+    assert {i["id"] for i in view["items"]} == {i["id"] for i in doc["items"]}
+    lines = board_cli.open_lines(doc)
+    assert not any(ln.startswith("None") for ln in lines)
+    assert lines.index("unknown: 4") < lines.index("from_the_future: 1") < lines.index("ready (work): 1")      # four unread items share one heading
+    bodies = _body("levain#2", "levain#3", "levain#4", "levain#5", "levain#9")
+    assert board_cli.in_flight_drift(bodies, doc) == []                                  # an unread state is never "not open"
+
+
+def test_a_repo_filter_that_hides_audit_entries_says_how_many_in_one_line_and_in_the_json():
+    doc = _doc(("ready", "ready"), audit=[{"kind": "unknown", "id": "levain#1", "why": "x"}, {"kind": "unknown", "id": "levain#2", "why": "y"},
+                                           {"kind": "unknown", "id": None, "why": "store-wide"}])
+    doc["items"][1]["id"] = "other#1"
+    doc["audit"][1]["id"] = "other#1"
+    line = "  audit: 1 entries on other repos (read them with levain board state)"
+    assert line in board_cli.open_lines(doc, "levain") and board_cli.open_view(doc, "levain")["audit_outside_repo"] == 1
+    assert board_cli.open_lines(doc, "ghost") == ["ghost: the board holds no items for it",
+                                                  "  audit (whole board): 1 unknown (read them with levain board state)",
+                                                  "  audit: 2 entries on other repos (read them with levain board state)"]
+    assert not any("on other repos" in ln for ln in board_cli.open_lines(doc))              # no filter: nothing is hidden, nothing said
+    assert "audit_outside_repo" not in board_cli.open_view(doc)
+    assert board_cli.open_view(_doc(("ready",)), "levain")["audit_outside_repo"] == 0 and \
+        not any("on other repos" in ln for ln in board_cli.open_lines(_doc(("ready",)), "levain"))
+
+
+def test_the_verb_pairs_exit_3_with_the_line_that_says_the_audit_is_on_another_repo(tmp_path, capsys, monkeypatch):
+    doc = _doc(("ready",), audit=[{"kind": "unknown", "id": "levain#1", "why": "x"}])
+    monkeypatch.setattr(board_cli, "state_doc", lambda read, say: (3, doc))
+    rc = main(["board", "open", "--repo", "ghost"])
+    out = capsys.readouterr().out
+    assert rc == 3 and out == "ghost: the board holds no items for it\n  audit: 1 entries on other repos (read them with levain board state)\n"
+    rc = main(["board", "open", "--repo", "ghost", "--json"])
+    assert rc == 3 and json.loads(capsys.readouterr().out)["audit_outside_repo"] == 1
+    rc = main(["board", "open", "--json"])
+    assert "audit_outside_repo" not in json.loads(capsys.readouterr().out)
+
+
+def test_the_verb_description_says_json_keeps_the_whole_audit_only_without_repo(capsys):
+    with pytest.raises(SystemExit):
+        main(["board", "open", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "the whole board's without --repo" in text and "audit_outside_repo" in text
+
+
+def test_a_repo_name_with_a_newline_cannot_forge_a_line():
+    for lines in (board_cli.open_lines(_doc(("ready",)), "ghost\n  open: 99 of 99 items\x1b[31m"),
+                  board_cli.open_lines(_doc(("ready",)), "levain\nforged")):
+        assert all("\n" not in ln and "\x1b" not in ln for ln in lines)
+        assert lines[0].startswith("ghost open: 99 of 99 items") or lines[0].startswith("levain forged")
+
+
+def test_the_id_pattern_in_text_is_built_on_the_stores_grammar_and_its_flags():
+    import re
+
+    from levain.desk import board_registry as br
+
+    assert bs.ID_RE.flags == re.compile("x").flags                       # the construction assumes no flag the pattern was compiled with
+    assert br.ID_IN_TEXT.flags == bs.ID_RE.flags
+    for ok_id in ("levain#4", "a.b-c#120", "0x#1"):
+        assert bs.ID_RE.fullmatch(ok_id) and br.ID_IN_TEXT.findall(f"see {ok_id}.") == [ok_id]
+    for bad in ("Levain#4", "levain#04", "levain#0"):
+        assert not bs.ID_RE.fullmatch(bad) and br.ID_IN_TEXT.findall(bad) == [], bad

@@ -60,7 +60,7 @@ from levain.desk import board_producers as bp
 from levain.desk.board_state import (COLUMNS, EVIDENCE_V, FLAT_EVIDENCE_V, FLAT_PRODUCER, PRODUCER_SOURCES, STATE_COLUMN, STATE_KIND, Evidence, FlatBlock, derive_all,
                                       fold, parse_timestamp)
 
-__all__ = ["CLOSED_COLUMNS", "EXTRA_KEYS", "ITEMS_ENV", "OPEN_STATES", "READ_BY_CLI", "in_flight_drift", "in_flight_ids", "only_repo", "open_lines", "open_view", "read_board", "register", "run_open",
+__all__ = ["CLOSED_COLUMNS", "EXTRA_KEYS", "ITEMS_ENV", "OPEN_STATES", "READ_BY_CLI", "MAX_DRIFT_LINES", "in_flight_drift", "in_flight_ids", "only_repo", "open_lines", "open_view", "read_board", "register", "run_open",
            "run_state", "state_doc", "table_lines"]
 
 ITEMS_ENV = bs.ITEMS_ENV
@@ -128,9 +128,10 @@ def register(subparsers: Any) -> None:
                      "read of the derived board (the same read as `board state`, never stored), so it cannot drift from it. Exit "
                      "codes are `board state`'s: 0 when the audit is empty, 3 when it is not, 2 or 4 when the board cannot be read. "
                      "An untracked repo keeps its own file: the board holds no items for it. In the text, a landed_not_closed audit entry "
-                     "prints in full and every other audit kind as one count line (--json keeps the whole audit). With --repo, --json "
-                     "adds repo_has_items: false when the board holds no item of that repo (an empty items list is then not 'nothing "
-                     "open') and true when it does."))
+                     "prints in full and every other audit kind as one count line (--json keeps the audit of the read: the whole "
+                     "board's without --repo). With --repo, --json adds repo_has_items: false when the board holds no item of that repo "
+                     "(an empty items list is then not 'nothing open') and true when it does, and audit_outside_repo: how many audit "
+                     "entries on other repos the filter hid (the exit code is the whole board's; the text says so in one line)."))
     o.add_argument("--json", action="store_true", help="Print the open selection as JSON: the document's own item dicts, no new fields.")
     o.add_argument("--repo", default=None, metavar="NAME",
                    help="Only the items of this repo (the NAME in item ids NAME#N). The whole board is still read.")
@@ -853,6 +854,9 @@ def _print_table(doc: dict[str, Any]) -> None:
 
 
 # ------------------------------------------------------------------------------------------------ the open view
+#: The most drift lines a handoff's ``in_flight`` can add to a brief or a plan; the ids past it are one count line. A handoff item may
+#: name any number of ids, and every line lands in a section that is never cut.
+MAX_DRIFT_LINES = 20
 #: The columns whose items are not open (cut, parked and out of 1.0 sit in ``off``; finished work in ``done``). Open is every state
 #: OUTSIDE them, taken from :data:`STATE_COLUMN`: a state added to the board reaches the view by its column, and a state this reader
 #: does not know is open too (an item the board cannot read is never "not open").
@@ -863,13 +867,21 @@ OPEN_STATES = tuple(s for s, c in STATE_COLUMN.items() if c not in CLOSED_COLUMN
 _OPEN_ORDER = tuple(sorted(OPEN_STATES, key=lambda s: ["unknown", *COLUMNS].index(STATE_COLUMN[s])))
 
 
-def _is_open(item: dict[str, Any]) -> bool:
-    return STATE_COLUMN.get(item.get("state")) not in CLOSED_COLUMNS
-
-
-def _rank(item: dict[str, Any]) -> tuple[int, str]:
+def _group(item: dict[str, Any]) -> str:
+    """The state an item is grouped and drawn under: its own when it is a string, else ``unknown`` (a missing, null or structured
+    state is a board the reader cannot read: it is open and drawn with the items it cannot read, never under ``None``)."""
     state = item.get("state")
-    return (_OPEN_ORDER.index(state) if state in _OPEN_ORDER else 0), str(state)    # a state not known here is drawn with ``unknown``
+    return state if isinstance(state, str) else "unknown"
+
+
+def _is_open(item: dict[str, Any]) -> bool:
+    return STATE_COLUMN.get(_group(item)) not in CLOSED_COLUMNS
+
+
+def _rank(item: dict[str, Any]) -> tuple[int, bool, str]:
+    state = _group(item)
+    # a state not known here is drawn with ``unknown``, after the items whose state is the word ``unknown``
+    return (_OPEN_ORDER.index(state) if state in _OPEN_ORDER else 0), state != "unknown" and state not in _OPEN_ORDER, state
 
 
 def _one_line(value: Any) -> str:
@@ -880,8 +892,10 @@ def _one_line(value: Any) -> str:
 def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, Any]:
     """The open items of ``doc`` (what :func:`state_doc` returns), as the document's own item dicts in drawing order, with the
     audit, ``problems`` and ``reader`` it carries (:func:`only_repo` for ``repo_name``). A pure function of ``doc``: nothing is
-    stored, and no key the document does not hold is added, except ``repo_has_items`` on a repo filter: whether the board holds
-    any item (open or not) of that repo, so an empty ``items`` for a repo the board does not know is never read as "nothing open"."""
+    stored, and no key the document does not hold is added, except on a repo filter: ``repo_has_items`` (whether the board holds
+    any item, open or not, of that repo, so an empty ``items`` for a repo the board does not know is never read as "nothing open")
+    and ``audit_outside_repo`` (how many audit entries the filter hid: the exit code is the whole board's, so a hidden entry can be
+    why it is 3)."""
     kept = only_repo(doc, repo_name)
     items = sorted((i for i in kept["items"] if _is_open(i)), key=_rank)
     out = {"schema": kept.get("schema"), "as_of": kept.get("as_of"), "items": items, "audit": kept.get("audit", []),
@@ -889,6 +903,7 @@ def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, An
     out.update({k: kept[k] for k in ("repo_filter", "reader_scope") if k in kept})
     if repo_name is not None:
         out["repo_has_items"] = bool(kept["items"])
+        out["audit_outside_repo"] = len(doc.get("audit", [])) - len(kept.get("audit", []))      # what the filter hid: the exit code counts it
     return out
 
 
@@ -898,24 +913,33 @@ def in_flight_ids(body: Any) -> list[str]:
     found: list[str] = []
     for entry in entries if isinstance(entries, list) else []:
         text = entry.get("item") if isinstance(entry, dict) else None
-        found += [i for i in br.ID_IN_TEXT.findall(text) if i not in found] if isinstance(text, str) else []
+        for iid in br.ID_IN_TEXT.findall(text) if isinstance(text, str) else []:
+            if iid not in found:
+                found.append(iid)
     return found
 
 
 def in_flight_drift(body: Any, doc: dict[str, Any]) -> list[str]:
     """One line for each board id a handoff's ``in_flight`` names that the board reads outside the open set (done, cut, parked,
     out of 1.0): a hand-kept list that has drifted from the board. A name the board does not hold, or holds open, says nothing.
-    A report only: a handoff is written once under its lease, so nothing here refuses it."""
+    At most :data:`MAX_DRIFT_LINES` lines, then one line counting the rest. A report only: a handoff is written once under its
+    lease, so nothing here refuses it."""
     by_id = {i.get("id"): i for i in doc.get("items", [])}
-    out = []
+    out: list[str] = []
+    omitted = 0
     for iid in in_flight_ids(body):
         found = by_id.get(iid)
         if found is not None and not _is_open(found):
-            out.append(f"in_flight names {iid}, which the board reads as {found.get('state')}: it is not open")
+            if len(out) < MAX_DRIFT_LINES:
+                out.append(f"in_flight names {iid}, which the board reads as {found.get('state')}: it is not open")
+            else:
+                omitted += 1
+    if omitted:
+        out.append(f"+{omitted} more in_flight ids the board reads as not open (read them with levain board open)")
     return out
 
 
-def _heading(state: Any, count: int) -> str:
+def _heading(state: str, count: int) -> str:
     column, kind = STATE_COLUMN.get(state), STATE_KIND.get(state)
     name = str(state) if column in (None, state) else f"{column} / {state}"
     return f"{_one_line(name)}{f' ({kind})' if kind else ''}: {count}"
@@ -948,21 +972,25 @@ def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     total = len(whole["items"])
     view = open_view(doc, repo_name)
     problems = problem_lines(view)
+    outside = view.get("audit_outside_repo", 0)
+    elsewhere = [f"  audit: {outside} entries on other repos (read them with levain board state)"] if outside else []
+    name = _one_line(repo_name) if repo_name is not None else None       # a name from the command line: one line, never a forged one
     if not doc["items"] and problems:
         lines = ["open: unreadable: no item of the board could be read"]
     elif total == 0 and repo_name is not None:
-        return [f"{repo_name}: the board holds no items for it", *_audit_lines(view), *problems]
+        return [f"{name}: the board holds no items for it", *_audit_lines(view), *elsewhere, *problems]
     else:
         lines = [f"open: {len(view['items'])} of {total} items, as of {view['as_of'] or 'unknown'}"
-                 + (f" ({repo_name})" if repo_name is not None else "")]
+                 + (f" ({name})" if name is not None else "")]
         group = object()
         for s in view["items"]:
-            if s.get("state") != group:
-                group = s.get("state")
-                lines.append(_heading(group, sum(1 for i in view["items"] if i.get("state") == group)))
+            if _group(s) != group:
+                group = _group(s)
+                lines.append(_heading(group, sum(1 for i in view["items"] if _group(i) == group)))
             lines.append(f"  {_one_line(s['id'])}  {_one_line(s.get('title', ''))} -- {_one_line(s['reason'])}")
     scoped = view.get("reader_scope") == "board"
     lines += _audit_lines(view)
+    lines += elsewhere
     lines += problems
     label = "reader (whole board): " if scoped else ""
     for name in view["reader"].get("diverged", []):

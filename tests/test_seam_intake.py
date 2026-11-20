@@ -630,3 +630,39 @@ def test_plan_reports_a_stale_in_flight_entry_of_the_last_handoff_beside_the_boa
     assert "in_flight names levain#3" not in line
     fake_board(monkeypatch, board_doc(("levain#3", "ready")))
     assert "the last handoff's" not in seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
+
+
+def _hand_off_plan(w, tmp_path, entries):
+    w.run("coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path, _body(in_flight=entries))), "--request-id", "r1",
+          "--token", str(w.token), "--queue-dir", str(w.q))
+
+
+def test_plan_bounds_the_drift_suffix_when_one_in_flight_item_names_thousands_of_ids(tmp_path, capsys, monkeypatch):
+    """levain#179 L3 round 1: one valid handoff item can name thousands of ids; the plan's board line stays small and counts the rest."""
+    from levain.desk import board_cli
+
+    w = World(tmp_path, capsys)
+    n = 2000
+    fake_board(monkeypatch, board_doc(("levain#1", "ready"), *[(f"a#{k}", "done") for k in range(1, n + 1)]))
+    _hand_off_plan(w, tmp_path, [{"item": " ".join(f"a#{k}" for k in range(1, n + 1)), "owner": "seat-9", "why": "w"}])
+    line = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
+    assert line.count("in_flight names a#") == board_cli.MAX_DRIFT_LINES
+    assert f"+{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open" in line
+    assert len(line) < 6000
+
+
+def test_plan_keeps_the_open_list_when_the_last_handoff_body_does_not_read(tmp_path, capsys, monkeypatch):
+    """levain#179 L3 round 1: only the drift step is guarded; a body that does not parse adds one cannot-derive clause."""
+    import types
+
+    w = World(tmp_path, capsys)
+    fake_board(monkeypatch, board_doc(("levain#3", "ready")))
+    _hand_off_plan(w, tmp_path, [{"item": "the s4 lane", "owner": "seat-9", "why": "w"}])
+    for bad in (ValueError("Expecting value"), TypeError("the JSON object must be str, bytes or bytearray, not NoneType")):
+        def loads(_text, bad=bad):
+            raise bad
+
+        monkeypatch.setattr(seam_plan, "json", types.SimpleNamespace(loads=loads))
+        line = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[3]
+        assert line.startswith("board: 1 open (levain#3)") and line.endswith("; last handoff in_flight: cannot-derive"), line
+        assert "board: cannot-derive" not in line

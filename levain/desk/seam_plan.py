@@ -131,8 +131,14 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
             # no new body exists yet: the last handoff's in_flight is what a desk carries forward, so it is what is checked
             has_handoffs = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone()
             last = conn.execute("SELECT body FROM seam_handoffs ORDER BY handoff_id DESC LIMIT 1").fetchone() if has_handoffs else None
-            drift = board_cli.in_flight_drift(json.loads(last[0]), doc) if last else []
-            stale = "".join(f"; the last handoff's {d}" for d in drift)
+            drift: list[str] = []
+            unreadable = ""
+            if last:
+                try:        # only this step is guarded: a handoff body that does not read must not hide the open list that did
+                    drift = board_cli.in_flight_drift(json.loads(last[0]), doc)
+                except (TypeError, ValueError):
+                    unreadable = "; last handoff in_flight: cannot-derive"
+            stale = "".join(f"; the last handoff's {d}" for d in drift) + unreadable
             unread = f" (+{len(problems)} problem line(s) in the read)" if problems else ""       # a zero over a read that had problems says so
             if not items:
                 return "board: 0 open items" + unread + stale
