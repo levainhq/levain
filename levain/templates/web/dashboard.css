@@ -3779,7 +3779,7 @@ body.ia[data-ia-place="home"] #ck-widgets { order: 61; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="agents"], [data-ck-panel="jobs"], [data-ck-panel="edits"]) { display: flex !important; }
 body.ia[data-ia-place="home"] .panel:is([data-ck-panel="notifications"], [data-ck-panel="episodes"], [data-ck-panel="topology"]) { display: none !important; }
 body.ia[data-ia-place="home"] #ck-h-widgets { display: none !important; }
-body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: grid !important; }
+body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; }
 /* the drop box is the desk's reply box: shown on Home in every width (Board mode was the only place it showed before) */
 body.ia[data-ia-place="home"] #ck-drop[hidden] { display: none; }
 
@@ -3829,8 +3829,8 @@ body.ia[data-ia-place="home"] .panel[data-ck-panel="flow-desk"] { height: auto !
 body.ia[data-ia-place="home"] .panel .pbody { overflow: auto; }
 
 /* ── the glance: the widgets small, between the Desk and Work ────────────────────────────────────────────────────────────────────── */
-body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) !important; gap: var(--sp-4) !important; }
-body.ia[data-ia-place="home"] #ck-widgets > * { min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
+body.ia[data-ia-place="home"] #ck-widgets { flex-wrap: wrap; gap: var(--sp-4) !important; }
+body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - (var(--ck-n, 4) - 1) * var(--sp-4)) / var(--ck-n, 4) - 1px); min-width: 0; min-height: 0 !important; height: auto !important; padding: var(--sp-4) var(--sp-5) !important; }
 body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-size: var(--fs-h) !important; }
 
 /* ── the spans: laptop three across, tablet two, phone one ───────────────────────────────────────────────────────────── */
@@ -3862,7 +3862,6 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
      said "24 more", so it is taller than the other two on a phone */
   body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { height: 720px !important; }
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
-  body.ia[data-ia-place="home"] #ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
 }
 
 /* (after the phone block, whose 38 px it overrides) a finger is the pointer: the masthead's three actions and the places are the page's touch targets at any width, not only on a phone */
@@ -3938,12 +3937,11 @@ body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; 
   body.ia[data-ia-place="home"] .ck-mctl .ck-jarbox { margin-left: 0; }
 }
 /* board row #144: at 1101-1180 the four-up Machine row and the five At a glance tiles left one panel / tile alone on a row.
-   Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row of three-up tiles that GROW, so whatever the last row holds fills it
-   (a tile the mode hides takes no place, which a counted grid cannot know). */
+   Machine: 2 + 2, then the 4-4-4 row. Glance: a wrapping row whose tile basis is the column count fillGrids chose (--ck-n: its P1 rule
+   leaves no lone tile where a divisor fits) and whose tiles GROW, so whatever the last row holds fills it (a tile the mode hides takes no
+   place, which a counted grid cannot know). */
 @media (1100px < width <= 1180px) {
   body.ia[data-ia-place="home"] .panel:is([data-ck-panel="roster"], [data-ck-panel="agents"], [data-ck-panel="agent_calls"], [data-ck-panel="stream"]) { grid-column: span 6 !important; }
-  body.ia[data-ia-place="home"] #ck-widgets:not([hidden]) { display: flex !important; flex-wrap: wrap; }
-  body.ia[data-ia-place="home"] #ck-widgets > * { flex: 1 1 calc((100% - 2 * var(--sp-4)) / 3 - 1px); min-width: 0; }
 }
 
 /* ── levain#141 polish: header, now line, drop, Home order ── */
