@@ -138,18 +138,9 @@ def host_refusal() -> str | None:
 
 
 def vendor_missing(vendor: str) -> str | None:
-    """Why ``vendor`` cannot start as the hands account, or None (leg 6 fix, L2 MED 4): the hands prefix runs it as
-    a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one installed only in the
-    operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare ``env: claude: No
-    such file or directory`` after the locks, the sweep and the prepare. Looked up as the operator, on that PATH and
-    nothing else: a binary the operator cannot see there the hands account cannot either."""
-    import shutil
-    from levain.firing import confinement
-    if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
-        return None
-    return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}); install {vendor} where the "
-            "hands account can run it, under /usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors "
-            "puts claude and codex there)")
+    """Why ``vendor`` cannot start as the hands account, or None: :func:`levain.firing.hands_login.vendor_missing`,
+    which the login shares (levain#139); this name stays the chat's own patch point."""
+    return hl.vendor_missing(vendor)
 
 
 def project_layer(workspace: Path, vendor: str) -> Path | None:
