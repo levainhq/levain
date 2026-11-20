@@ -680,7 +680,7 @@ def test_a_holder_that_ends_normally_after_a_contended_close_reaps_the_child(rig
     pid = proc.pid
     entered, go = threading.Event(), threading.Event()
 
-    def held(panel_id: str, deadline: float, timeout_s: float) -> ChildAnswer:
+    def held(panel_id: str, deadline: float, timeout_s: float, require_attached: "frozenset[str]") -> ChildAnswer:
         entered.set()
         go.wait(30)
         return ChildAnswer("ok", {"v": 1}, None, 1)         # the holder had its answer: it ends normally, never through _kill

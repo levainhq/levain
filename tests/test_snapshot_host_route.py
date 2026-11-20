@@ -56,11 +56,13 @@ class FakeChild:
         self.answer = answer or ok_answer
         self.known = known
         self.calls: list[tuple[str, float]] = []
+        self.required: "list[frozenset[str]]" = []      # the ``require_attached`` each ask came with
         self.closed = 0
         self.warmed = 0
 
-    def derive(self, panel_id: str, timeout_s: float) -> ChildAnswer:
+    def derive(self, panel_id: str, timeout_s: float, require_attached: "frozenset[str]" = frozenset()) -> ChildAnswer:
         self.calls.append((panel_id, timeout_s))
+        self.required.append(require_attached)
         return self.answer(panel_id, timeout_s)
 
     def knows(self, panel_id: str) -> bool:

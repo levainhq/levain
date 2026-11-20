@@ -40,7 +40,10 @@ child is not run in this process while the child is in its backoff: it gets the 
 
 The child is also used only while its cockpit holds every attachment (consent reader, question store, note store) the serve's
 cockpit holds, which its ready frame states: a gap sends every panel here, is named by ``child_attach_gap``, and ends the moment
-the two match. See ``_note_attach_gap`` for what that check does and does not promise.
+the two match. The routing decision reads the child's last ready frame; the request itself carries the serve's set and the
+client checks it against the child it has up before it writes the request (``DeriveChild.derive``'s ``require_attached``), so a
+child respawned since the decision is checked too. A serve cockpit that cannot say what it holds counts as a gap. See
+``_note_attach_gap`` for what that check does and does not promise.
 
 ``ServerProbe`` is what the change stream watches in a served cockpit: the engine probe's counter folded with the
 serve's own watch token, since the panels the serve composes itself read stores no derive publishes.
@@ -304,6 +307,8 @@ FIRST_DISCOVERY_BOUND_S = 3.0
 # stands for in ``attached_of`` (consent to the consent reader, questions to the question store, notes to the note store). The
 # child's ready frame lists the ones its cockpit holds.
 ATTACHMENTS = ("consent", "questions", "notes")
+# What ``child_attach_gap`` names when the serve's own cockpit cannot say which attachments it holds (not an attachment).
+UNREADABLE = "unreadable"
 
 
 def attached_of(cockpit: "Cockpit") -> "frozenset[str]":
@@ -396,6 +401,7 @@ class SnapshotHost:
         self._hung: set[str] = set()                    # panels whose last child derive hung (the child was killed for it)
         self._child_fallbacks = 0
         self._attach_gap: "tuple[str, ...]" = ()        # the last decision's gap (the host logs a change, not each derive)
+        self._unreadable_logged = False                 # the serve's cockpit failed to say what it holds, and the host said so
         self._child_closed = False
         self._lock = threading.Lock()
         self._started = False
@@ -509,20 +515,31 @@ class SnapshotHost:
             return False
         return not self._note_attach_gap()
 
+    def _serve_attached(self) -> "frozenset[str] | None":
+        """The attachments the serve's cockpit holds now, or None when it cannot say. The first time it cannot, this host logs
+        one warning (a flag, not one per call: a cockpit that cannot say does so at every decision)."""
+        try:
+            return attached_of(self._cockpit)
+        except Exception:  # noqa: BLE001 - what the caller does with None is the decision
+            with self._route_lock:
+                first = not self._unreadable_logged
+                self._unreadable_logged = True
+            if first:
+                _log.warning("the serve's cockpit cannot say which attachments it holds; panels derive in this process, "
+                             "never in the derive child, while it cannot", exc_info=True)
+            return None
+
     def _gap_against(self, held: "frozenset[str] | None") -> "tuple[str, ...]":
         """The attachments the serve's cockpit holds now that ``held`` does not (sorted). ``held`` None is nothing known of the
-        child, which is no gap; a cockpit that cannot say what it holds is no gap either, and no reason to lose a derive."""
+        child, which is no gap. A cockpit that cannot say what it holds IS a gap (``UNREADABLE``): the check cannot show the
+        child holds what the serve holds, and a panel derived in this process is always safe, where one sent to a child that
+        lacks a reader reads short or blind with nothing to show for it."""
         if held is None:
             return ()
-        try:
-            return tuple(sorted(attached_of(self._cockpit) - held))
-        except Exception:  # noqa: BLE001 - a cockpit that cannot say what it holds is no reason to lose a derive
-            return ()
-
-    def _answer_has_gap(self, ans: "ChildAnswer") -> bool:
-        """Whether the child that gave ``ans`` lacks an attachment the serve's cockpit holds now. An answer that names no set
-        (``attached`` None) is not checked."""
-        return bool(self._gap_against(ans.attached))
+        mine = self._serve_attached()
+        if mine is None:
+            return (UNREADABLE,)
+        return tuple(sorted(mine - held))
 
     def _note_attach_gap(self) -> "tuple[str, ...]":
         """The attachments this host's cockpit holds now that the child's does not (sorted), recorded and logged when the set
@@ -539,7 +556,9 @@ class SnapshotHost:
             changed = gap != self._attach_gap
             before, self._attach_gap = self._attach_gap, gap
         if changed:
-            if gap:
+            if gap == (UNREADABLE,):
+                pass                    # ``_serve_attached`` has said so, once
+            elif gap:
                 _log.warning("derive child not used: its cockpit lacks %s that the serve's cockpit holds; every panel derives "
                              "in this process until the child holds them", ", ".join(gap))
             else:
@@ -593,25 +612,34 @@ class SnapshotHost:
         """``(result, ms)``: ``pid`` derived in the warm child, and how long the child says the derive took (None when this was
         not a derive to learn from). A timeout is the loop's own timeout row (the child is killed by then), and so is a
         derive of a panel that just hung while the child is in its backoff: it is not run here. A child that died, sent
-        something malformed, or does not hold the panel leaves this derive to run here, counted; a host that is stopping gets
-        a result the loop does not store. Nothing in the child's answer retires a panel."""
+        something malformed, or does not hold the panel leaves this derive to run here, counted; a child that lacks an
+        attachment the serve holds (``lacks``) was not asked and leaves it to run here uncounted, with the hung mark and the
+        routed set as they were; a host that is stopping gets a result the loop does not store. Nothing in the child's answer
+        retires a panel."""
         child = self._child
         assert child is not None
         if self._child_closed:
             return DeriveResult("error", None, error=STOPPING_TEXT), None
         timeout_s = self._timeout_for(pid)
+        need = self._serve_attached()
+        if need is None:
+            # the serve cannot say what it holds, so the child cannot be shown to hold it: not asked, and no failure of the child
+            self._note_attach_gap()
+            return self._derive_here(pid), None
         ans: "ChildAnswer | None" = None
         try:
-            ans = child.derive(pid, timeout_s)
+            # the child checks ``need`` against the child it has up when it is about to write the request, so a respawn
+            # inside the call is checked too
+            ans = child.derive(pid, timeout_s, require_attached=need)
         except Exception:  # noqa: BLE001 - the client never raises; one that does is a child that could not answer
             pass
         if self._child_closed:
             return DeriveResult("error", None, error=STOPPING_TEXT), None
         if ans is not None:
             failure = ans.failure
-            if failure is None and self._answer_has_gap(ans):
-                # the child that answered is not one whose set the routing decision saw (it may have been respawned inside
-                # the ask): its answer is not used, and this is no failure of the child
+            if failure == "lacks":
+                # the child that is up lacks an attachment the serve holds and was not asked: this derive runs here. It is no
+                # failure of the child, so nothing is counted, backed off or marked, and the panel stays routed
                 self._note_attach_gap()
                 return self._derive_here(pid), None
             if failure is None:

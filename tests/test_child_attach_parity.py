@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -317,44 +318,118 @@ def test_a_child_that_answers_with_a_set_that_still_covers_the_serve_is_used(mak
     assert host.child_attach_gap == () and host.child_fallbacks == 0
 
 
-def test_the_answer_carries_the_set_of_the_child_that_gave_it(procs, monkeypatch):
+def test_a_respawned_child_that_lacks_an_attachment_and_would_hang_is_never_asked_so_nothing_hangs(
+        make_host, procs, monkeypatch):
+    """The codex hole: the decision saw child A, A died, and the ask respawned child B before it wrote the request. B lacks
+    the attachment and its derive of the panel would run for a minute. The check is at the point of use, on B, so the request is
+    never written: the panel derives here at once, no timeout row, nothing marked hung, no fallback counted."""
+    monkeypatch.delenv("DERIVE_CHILD_STUB_SLOW_S", raising=False)      # this process's own derive of the panel reads no time
+    c = _child(procs, monkeypatch, "consent")
+    host = make_host(_serve_cockpit("consent"), heavy={"slow5"}, derive_child=c)
+    host._timeout_for = lambda pid: 15.0                                # type: ignore[method-assign]
+    assert host._routed("slow5")                                        # decided on child A
+    first = c.pid
+    os.killpg(first, signal.SIGKILL)
+    c._proc.wait(timeout=30)
+    c._env[ATTACH_ENV] = ""                                             # child B attaches nothing...
+    c._env["DERIVE_CHILD_STUB_SLOW_S"] = "60"                           # ...and its derive of slow5 takes a minute
+    started = time.monotonic()
+    res = host._derive("slow5")
+    elapsed = time.monotonic() - started
+    procs.note(c)
+    assert c.pid is not None and c.pid != first and c.attached == frozenset()
+    assert res.status == "ok" and res.body["rows"][0]["title"] == "slow", res       # the host's own derive, not a timeout row
+    assert elapsed < 10.0, elapsed
+    assert "slow5" not in host._hung and host.child_fallbacks == 0
+    assert c._failures == 0 and c._not_before == 0.0
+    assert host.child_attach_gap == ("consent",)
+
+
+# ------------------------------------------------------------------------------------------------ the check at the point of use
+
+
+def test_a_derive_that_requires_what_the_child_lacks_is_not_asked_and_costs_the_child_nothing(procs, monkeypatch):
+    c = _child(procs, monkeypatch, "")
+    pid = c.pid
+    ans = c.derive("pid", 30.0, require_attached=frozenset({"notes", "consent"}))
+    assert ans.failure == "lacks" and "lacks consent, notes" in (ans.error or "")      # the missing names, sorted
+    assert ans.status is None and not ans.hung
+    assert "lacks" in client_mod.FAILURES
+    assert next(c._ids) == 1                                    # no request id was spent: nothing was written to the child
+    assert c._failures == 0 and c._not_before == 0.0
+    assert c.pid == pid and c.knows("pid")                      # alive, not killed
+    again = c.derive("pid", 30.0)                               # no requirement: the same child answers
+    assert again.failure is None and again.status == "ok" and c.pid == pid
+
+
+def test_a_derive_whose_requirement_the_child_meets_is_asked(procs, monkeypatch):
     c = _child(procs, monkeypatch, "consent,notes")
-    ans = c.derive("pid", 30.0)
-    assert ans.failure is None and ans.attached == frozenset({"consent", "notes"})
+    for need in (frozenset(), frozenset({"consent"}), frozenset({"consent", "notes"})):
+        ans = c.derive("pid", 30.0, require_attached=need)
+        assert ans.failure is None and ans.status == "ok", (need, ans)
+    assert c._failures == 0
+
+
+def test_the_requirement_is_checked_against_the_child_that_will_be_asked_not_the_one_that_died(procs, monkeypatch):
+    c = _child(procs, monkeypatch, "consent")
+    assert c.derive("pid", 30.0, require_attached=frozenset({"consent"})).failure is None
     os.killpg(c.pid, signal.SIGKILL)
     c._proc.wait(timeout=30)
     c._env[ATTACH_ENV] = ""
-    ans = c.derive("pid", 30.0)
+    ans = c.derive("pid", 30.0, require_attached=frozenset({"consent"}))
     procs.note(c)
-    assert ans.failure is None and ans.attached == frozenset()      # the new child's own set, not the dead one's
-    assert client_mod.ChildAnswer("ok", {}, None, 1).attached is None
+    assert ans.failure == "lacks" and c.pid is not None and c.attached == frozenset()
+    assert c._failures == 0 and c._not_before == 0.0
 
 
-def _answering(attached: "frozenset[str] | None"):
-    return lambda pid, t: client_mod.ChildAnswer("ok", {"v": 1, "marker": "child", "panel": pid}, None, 5, attached=attached)
-
-
-def test_an_answer_with_no_attached_set_is_not_checked(make_host):
-    """A child answer built without the field (a stub that predates it) is taken as it always was."""
-    child = FakeChild(ok_answer)                                    # builds ChildAnswer with no attached: None
+def test_a_lacks_answer_derives_here_and_counts_and_marks_nothing(make_host):
+    child = FakeChild(lambda p, t: client_mod.ChildAnswer(None, None, None, None, "lacks", "the child's cockpit lacks consent"))
     child.attached = frozenset({"consent"})                         # type: ignore[attr-defined]
     host = make_host(_serve_cockpit("consent"), heavy={"fast"}, derive_child=child)
+    host._hung.add("fast")
     res = host._derive("fast")
-    assert res.body.get("marker") == "child" and child.asked() == ["fast"]
-
-
-def test_an_answer_whose_set_lacks_what_the_serve_holds_is_dropped_and_derived_here(make_host):
-    child = FakeChild(_answering(frozenset()))
-    child.attached = frozenset({"consent"})                         # type: ignore[attr-defined]
-    host = make_host(_serve_cockpit("consent"), heavy={"fast"}, derive_child=child)
-
-    def move(pid: str, t: float):
-        child.attached = frozenset()                                # type: ignore[attr-defined]
-        return _answering(frozenset())(pid, t)
-
-    child.answer = move
-    res = host._derive("fast")
-    assert child.asked() == ["fast"]                                # asked once on the old word
+    assert child.asked() == ["fast"] and child.required == [frozenset({"consent"})]    # asked with the serve's own set
     assert res.status == "ok" and res.body.get("marker") != "child" and len(res.body["rows"]) == 3
-    assert host.child_fallbacks == 0 and host.child_attach_gap == ("consent",)
-    assert not host._routed("fast")                                 # and the next decision keeps it here
+    assert host.child_fallbacks == 0
+    assert "fast" in host._hung                                     # a gap changes nothing in what the child did
+    assert "fast" in host.routed_panels() and "fast" not in host._child_lacks
+
+
+def test_a_matching_child_is_asked_with_the_serves_set_and_its_answer_is_the_one_used(make_host):
+    child = FakeChild(ok_answer)
+    child.attached = frozenset({"consent", "notes"})                # type: ignore[attr-defined]
+    host = make_host(_serve_cockpit("consent"), heavy={"fast"}, derive_child=child)
+    res = host._derive("fast")
+    assert res.body.get("marker") == "child" and child.required == [frozenset({"consent"})]
+
+
+# ------------------------------------------------------------------------------------------------ a cockpit that cannot say what it holds
+
+
+def test_a_cockpit_that_cannot_say_what_it_holds_derives_in_process_and_logs_one_warning(make_host, caplog, monkeypatch):
+    child = FakeChild(ok_answer)
+    child.attached = frozenset({"consent"})                         # type: ignore[attr-defined]
+    host = make_host(_serve_cockpit(), heavy={"fast"}, derive_child=child)
+
+    def cannot_say(cockpit: Any) -> "frozenset[str]":
+        raise RuntimeError("the cockpit cannot say what it holds")
+
+    monkeypatch.setattr(sh, "attached_of", cannot_say)
+    with caplog.at_level(logging.INFO, logger="levain.cockpit.snapshot_host"):
+        for _ in range(4):
+            res = host._derive("fast")
+            assert res.status == "ok" and res.body.get("marker") != "child"
+        res, _ms = host._derive_via_child("fast")               # the point of use on its own: it does not ask blind either
+        assert res.body.get("marker") != "child"
+        assert host.child_attach_gap != ()
+    assert child.asked() == [] and host.child_fallbacks == 0
+    warnings = [r for r in caplog.records if r.name == "levain.cockpit.snapshot_host" and r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+
+def test_a_child_nothing_is_known_of_is_still_no_gap_when_the_cockpit_cannot_say(make_host, monkeypatch):
+    child = FakeChild()
+    child.attached = None                                           # type: ignore[attr-defined]
+    host = make_host(_serve_cockpit(), heavy={"fast"}, derive_child=child)
+    monkeypatch.setattr(sh, "attached_of", lambda ck: (_ for _ in ()).throw(RuntimeError("no")))
+    assert host.child_attach_gap == ()

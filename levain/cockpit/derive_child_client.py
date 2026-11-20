@@ -13,6 +13,8 @@ that into the row it publishes.
   ``bad_reply``       the child answered something that is not a well-formed answer; it is killed, its stream cannot be trusted.
   ``refused``         no child was asked: the last failure's backoff has not elapsed, the client is closed, or ``timeout_s``
                       is not a finite number over zero. Nothing is touched: the child and the backoff stay as they were.
+  ``lacks``           the child that is up now does not hold every attachment the call required (``require_attached``), so it
+                      was not asked: no request was written, and the child, the failure count and the backoff stay as they were.
 
 One deadline. ``timeout_s`` is spent from the moment of the call: the wait for the turn, the start of a child and the answer all
 draw on it, none restarts it. A child still building its cockpit when the deadline comes is not the derive's fault: the call
@@ -62,7 +64,7 @@ READY_PANELS_MAX = 4096
 # (``snapshot_host.ATTACHMENTS``), so a newer child that names one this client does not know still reads as well formed.
 READY_ATTACHED_MAX = 16
 # Every ``ChildAnswer.failure`` a caller can see.
-FAILURES = ("timeout", "died", "refused", "bad_reply")
+FAILURES = ("timeout", "died", "refused", "bad_reply", "lacks")
 # How long a child may take to say it is ready: the factory builds the whole cockpit first (seconds).
 READY_TIMEOUT_S = 30.0
 # SIGTERM to SIGKILL (seconds).
@@ -86,10 +88,8 @@ class ChildAnswer:
     ``error``, which says what happened. With none, ``status`` is the derive's status ("error" included), ``body`` and
     ``valid_until`` (epoch seconds, or None) are the loop's own, ``duration_ms`` is the child's measure of the derive, and
     ``error`` is the derive's error text when it has one. ``hung`` is True only for a ``timeout`` that killed the child at
-    this derive's own deadline (the panel is the one that did not come back). ``attached`` is the set of attachments held by the
-    child that gave this answer (the client's record of that child's ready frame, read as the answer is built), so a caller that
-    checks it checks the child that answered, not an earlier one. It is None on an answer with a ``failure`` and on one built
-    without it."""
+    this derive's own deadline (the panel is the one that did not come back). A ``lacks`` failure means the child was not
+    asked: the panel was not derived by it at all."""
 
     status: "str | None"
     body: Any
@@ -98,7 +98,6 @@ class ChildAnswer:
     failure: "str | None" = None
     error: "str | None" = None
     hung: bool = False
-    attached: "frozenset[str] | None" = None
 
 
 def backoff_s(failures: int, base_s: float, cap_s: float) -> float:
@@ -251,10 +250,12 @@ class DeriveChild:
 
     # ---- the ask
 
-    def derive(self, panel_id: str, timeout_s: float) -> ChildAnswer:
+    def derive(self, panel_id: str, timeout_s: float, require_attached: "frozenset[str]" = frozenset()) -> ChildAnswer:
         """Ask the child to derive ``panel_id``. ``timeout_s`` (a positive finite number: anything else, an integer too big
         for a float included, is ``refused`` and touches nothing) bounds the wait for the turn, the start and the answer
-        together, counted from this moment. The call returns by then, except that a failure that ENDS the child takes the
+        together, counted from this moment. ``require_attached``: the attachments the child must hold; it is checked against
+        the child that is up once the call has it ready (a child started inside this call included) and before the request is
+        written, and one that lacks any is ``lacks`` and is not asked. The call returns by then, except that a failure that ENDS the child takes the
         ending too: SIGTERM, up to ``term_grace_s`` for a child that will not leave, then SIGKILL and the reap, which waits at
         most ``_REAP_BOUND_S`` before the leader is left to a reaper thread. So the real worst case is ``timeout_s`` plus
         ``term_grace_s`` plus ``_REAP_BOUND_S`` (a leader that ignores SIGTERM costs the whole grace; one stuck in the kernel
@@ -268,7 +269,7 @@ class DeriveChild:
             if not acquired:
                 return _lost_answer("timeout", f"waited {timeout_s:g}s for the child's turn")
             try:
-                return self._ask(panel_id, deadline, timeout_s)
+                return self._ask(panel_id, deadline, timeout_s, require_attached)
             except _Lost as lost:
                 if lost.costly:
                     self._failed()
@@ -282,8 +283,11 @@ class DeriveChild:
             if acquired:
                 self._release_turn()
 
-    def _ask(self, panel_id: str, deadline: float, timeout_s: float) -> ChildAnswer:
+    def _ask(self, panel_id: str, deadline: float, timeout_s: float, require_attached: "frozenset[str]") -> ChildAnswer:
         proc = self._ensure_ready(deadline)
+        missing = sorted(require_attached - (self._attached or frozenset()))
+        if missing:                         # nothing is written: the child stays as it is and no failure is counted
+            raise _Lost("lacks", f"the child's cockpit lacks {', '.join(missing)}", costly=False)
         if self._clock() >= deadline:       # the start used the whole call: nothing was asked, so nothing is blamed on the panel
             raise _Lost("timeout", "the child was ready only when the deadline came", costly=False)
         rid = next(self._ids)
@@ -316,8 +320,7 @@ class DeriveChild:
             raise bad("error is not a string")
         self._failures = 0              # a child that answers is a healthy one, whatever the derive said
         self._not_before = 0.0
-        return ChildAnswer(status, frame.get("body"), None if valid_until is None else float(valid_until), ms, None, error,
-                           attached=self._attached)
+        return ChildAnswer(status, frame.get("body"), None if valid_until is None else float(valid_until), ms, None, error)
 
     # ---- the child's life
 
