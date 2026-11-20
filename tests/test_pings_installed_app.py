@@ -172,7 +172,7 @@ def test_the_pair_card_of_an_installed_desktop_app_says_it_needs_its_own_code_an
             {"until": w1b.CARD, "ms": 15000},
             {"eval": f"{card} === null"},
         ], flags)
-    assert other["values"][-1] == ("This installed app keeps its own sign-in here, so it needs one pairing code: get one from the "
+    assert other["values"][-1] == ("This installed app has no sign-in yet, so it needs one pairing code: get one from the "
                                    "Devices panel on any device that is already paired."), other["values"]
     assert tab["values"][-1] is True, tab["values"]
 
