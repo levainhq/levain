@@ -691,3 +691,219 @@ def test_a_pair_route_whose_broker_is_not_settled_is_counted_and_logged(tmp_path
             httpd.broker = real
     assert (st, out.get("error")) == (503, "broker_unavailable"), (st, out)
     assert _refusal_lines(caplog) == ["refused 503 route=pair gate=pair_broker n=1"], _refusal_lines(caplog)
+
+
+# === round 2 fixes (L3 r1): the RULE is every GET read waits on the page gate ========================================
+# Only a POST, notify and the room's per-tick read keep ``request_gate``'s instant 503. Voice, job, recall, substrate and
+# a host's extra_json routes were still on it.
+
+HOST_ROUTE = "/host/extra.json"
+
+
+@pytest.fixture
+def extra_rig(wide_rig):
+    base, httpd, qn, nn = wide_rig
+    httpd.extra_json[HOST_ROUTE] = lambda: b'{"host": true}'
+    return base, httpd, qn, nn
+
+
+_R2_PATHS = ["/substrate.json", "/recall.json?keyword=ship", "/job.json?id=nonesuch", "/job.json", HOST_ROUTE]
+
+
+def test_the_legacy_gets_and_a_host_route_are_served_while_every_request_gate_slot_is_held(extra_rig) -> None:
+    """``/substrate.json``, ``/recall.json``, ``/job.json`` (both answers) and an extra_json route answer as they do free
+    with every ``request_gate`` and read slot held. Red on 0926b45aa: each is the instant ``request_gate`` 503."""
+    base, httpd, _qn, _nn = extra_rig
+    free = {p: _http(base, p, PUSH_TOKEN) for p in _R2_PATHS}
+    assert [free[p][0] for p in _R2_PATHS] == [200, 200, 200, 400, 200], {p: v[0] for p, v in free.items()}
+    assert free[HOST_ROUTE][2] == b'{"host": true}'
+    req_held = _hold(httpd.request_gate, web_server._MAX_INFLIGHT)
+    read_held = _hold(httpd.read_gate, web_server._MAX_READ_INFLIGHT)
+    try:
+        got = {p: _http(base, p, PUSH_TOKEN) for p in _R2_PATHS}
+    finally:
+        _release(httpd.read_gate, read_held)
+        _release(httpd.request_gate, req_held)
+    for p in _R2_PATHS:     # status, content type and body as free (a header like Date differs)
+        assert got[p][0] == free[p][0] and got[p][2] == free[p][2], p
+        assert got[p][1].get("content-type") == free[p][1].get("content-type"), p
+
+
+def test_the_legacy_gets_and_a_host_route_wait_on_the_page_gate_then_503_named_by_a_bounded_key(
+        extra_rig, stats, monkeypatch, caplog) -> None:
+    base, httpd, _qn, _nn = extra_rig
+    monkeypatch.setattr(web_server, "_PAGE_READ_WAIT_SECONDS", 0.2)
+    held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOG):
+            outs = [_http(base, p, PUSH_TOKEN) for p in _R2_PATHS]
+    finally:
+        _release(httpd.page_gate, held)
+    assert all(st == 503 and body == b"busy\n" and hdrs.get("retry-after") == "2" for st, hdrs, body in outs), outs
+    keys = {ln.split(" gate=")[0].removeprefix("refused 503 route=") for ln in _refusal_lines(caplog)}
+    assert keys == {"substrate", "recall", "job", "extra"}, keys
+    assert HOST_ROUTE not in "\n".join(_refusal_lines(caplog))      # a host's path is never a key
+    assert stats.snapshot()["extra"]["refused_503"] == 1
+    _all_page_slots_free(httpd)
+    assert _http(base, HOST_ROUTE, PUSH_TOKEN)[0] == 200
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_voice_json_is_served_under_request_gate_saturation_and_waits_on_the_page_gate(tmp_path: Path, qdir, monkeypatch,  # noqa: F811
+                                                                                    stats, caplog) -> None:
+    """``GET /cockpit/voice.json`` (mic.js fetches it on every load). Red on 0926b45aa: the instant ``request_gate`` 503."""
+    vr = pytest.importorskip("tests.test_cockpit_voice_routes")
+    rig = vr.Rig(tmp_path, qdir, monkeypatch)
+    monkeypatch.setattr(web_server, "_PAGE_READ_WAIT_SECONDS", 0.2)
+    with vr.served(rig) as (port, httpd):
+        free = vr.call(port, "GET", vr.VOICE_JSON)
+        assert free[0] == 200, free
+        req_held = _hold(httpd.request_gate, web_server._MAX_INFLIGHT)
+        try:
+            got = vr.call(port, "GET", vr.VOICE_JSON)
+            assert got[0] == 200 and got[2] == free[2], got
+            assert {k: v for k, v in got[1].items() if k in ("content-type", "cache-control", "vary")} == \
+                {k: v for k, v in free[1].items() if k in ("content-type", "cache-control", "vary")}
+        finally:
+            _release(httpd.request_gate, req_held)
+        page_held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+        try:
+            with caplog.at_level(logging.WARNING, logger=LOG):
+                st, hdrs, body = vr.call(port, "GET", vr.VOICE_JSON)
+        finally:
+            _release(httpd.page_gate, page_held)
+        assert (st, body, hdrs.get("retry-after")) == (503, b"busy\n", "2")
+        assert _refusal_lines(caplog) == ["refused 503 route=voice gate=page_wait n=1"], _refusal_lines(caplog)
+        _all_page_slots_free(httpd)
+
+
+def test_the_converted_gets_give_their_page_slot_back_when_the_builder_raises(extra_rig, monkeypatch) -> None:
+    base, httpd, _qn, _nn = extra_rig
+
+    def boom():
+        raise RuntimeError("builder fault")
+
+    httpd.extra_json[HOST_ROUTE] = boom
+    monkeypatch.setattr(web_server, "build_substrate_json", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(web_server, "build_recall_json", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(web_server, "build_job_json", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    for _ in range(web_server._PAGE_READS_INFLIGHT + 1):       # more reads than slots: a leak would 503 the last
+        for p in _R2_PATHS[:3] + [HOST_ROUTE]:
+            assert _http(base, p, PUSH_TOKEN)[0] in (200, 500), p
+    _all_page_slots_free(httpd)
+
+
+# --- item 2: a page slot never leaks when the peer probe itself raises -----------------------------------------------
+
+def test_a_peer_probe_that_raises_after_the_wait_gives_the_slot_back(wide_rig, monkeypatch) -> None:
+    """Red on 0926b45aa: ``_peer_open`` raising after ``page_gate.acquire`` left the slot taken for ever."""
+    base, httpd, qn, _nn = wide_rig
+
+    def broken(self):
+        raise RuntimeError("probe fault")
+
+    monkeypatch.setattr(web_server._Handler, "_peer_open", broken)
+    held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+    out: list = []
+
+    def get():
+        try:
+            out.append(_http(base, f"/cockpit/question/{qn}.json", PUSH_TOKEN, timeout=10)[0])
+        except (OSError, http.client.HTTPException) as exc:      # the handler's thread died: the socket closes
+            out.append(type(exc).__name__)
+
+    t = threading.Thread(target=get, daemon=True)
+    try:
+        t.start()
+        end = time.monotonic() + 5.0
+        while httpd.page_waiters < 1 and time.monotonic() < end:
+            time.sleep(0.01)
+        assert httpd.page_waiters == 1
+        httpd.page_gate.release()          # a slot frees: the waiter takes it and its probe raises
+        held.pop()
+        t.join(10)
+    finally:
+        _release(httpd.page_gate, held)
+    assert out and out[0] != 200, out
+    _all_page_slots_free(httpd)           # every one of the four is free: none leaked
+    monkeypatch.undo()
+    assert _http(base, f"/cockpit/question/{qn}.json", PUSH_TOKEN)[0] == 200
+
+
+# --- item 3: a read refused at the read gate keeps its slow line -----------------------------------------------------
+
+def test_a_slow_refused_read_logs_the_slow_line_and_a_fast_one_does_not(caplog) -> None:
+    st = web_server._RouteStats(clock=_Clock())
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        st.record_refusal("/cockpit/panel/tray.json", "read_wait", ms=5003.0)
+        st.record_refusal("/cockpit/panel/tray.json", "read_wait", ms=40.0)
+        st.record_refusal("band", "page_wait")                           # no time given: no slow line
+    slow = [r.getMessage() for r in caplog.records if r.getMessage().startswith("slow cockpit read")]
+    assert slow == ["slow cockpit read: route=panel/tray ms=5003 gate_wait_ms=5003 refused=503"], slow
+    assert st.snapshot()["panel/tray"] == {"count": 2, "total_ms": 5043.0, "max_ms": 5003.0, "refused_503": 2, "aborted": 0}
+
+
+# --- item 4: the refusal log's tracked pairs never exceed the constant -----------------------------------------------
+
+def test_the_refusal_log_never_tracks_more_pairs_than_its_bound(caplog) -> None:
+    st = web_server._RouteStats(clock=_Clock())
+    cap = web_server._RouteStats._REFUSAL_KEYS_MAX
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        for i in range(600):
+            st.record_refusal("band", f"gate{i}")                     # 600 distinct pairs
+            assert len(st._refusal_log) <= cap, (i, len(st._refusal_log))
+    assert len(st._refusal_log) == cap and ("other", "other") in st._refusal_log
+    assert sum(r[3] for r in st._rows.values()) == 600                # every refusal still counted
+
+
+# --- item 5: key_for names the envelope POSTs and every prefix the file serves ---------------------------------------
+
+def test_key_for_names_the_envelope_posts_like_the_list_and_every_write_prefix() -> None:
+    key = web_server._RouteStats.key_for
+    assert key("/cockpit/envelope/list.json") == key("/cockpit/envelope/revoke") == \
+        key(web_server._ENVELOPE_PREFIX + "ev-123/revoke") == "envelope"
+    assert key("/cockpit/hostgrant/revoke") == "hostgrant"
+    assert key("/cockpit/dispatch/dj-1/answer") == "dispatch"
+    assert key("/cockpit/coord/drop") == "coord" and key("/cockpit/pair/offer") == "pair"
+    assert key("/webpush/subscribe") == key("/webpush/center/read") == "push"
+    assert key("/job.json?id=SECRET") == "job" and key("/recall.json?keyword=SECRET") == "recall"
+    assert key("extra") == "extra"
+    assert key("/host/extra.json") == "other"      # a host's path is named by the caller, never guessed
+
+
+# --- item 6: flush_due samples its clock under the lock --------------------------------------------------------------
+
+def test_flush_due_samples_the_clock_under_the_stats_lock() -> None:
+    clock = _Clock()
+    st = web_server._RouteStats(clock=clock)
+    held_at_sample: list[bool] = []
+
+    def probing():
+        held_at_sample.append(st._lock.locked())
+        return clock.t
+
+    st.record_refusal("band", "page_wait")
+    st.record_refusal("band", "page_wait")                              # a tail is pending
+    st._clock = probing
+    clock.t += 2.0
+    st.flush_due()
+    assert held_at_sample == [True], held_at_sample                     # red before: sampled outside the lock
+    assert st._pending_n == 0
+
+
+# --- item 8: a refused question read is one count, one refusal, and the abandoned one no refusal ---------------------
+
+def test_a_refused_question_read_is_one_count_one_refusal_one_line_and_an_abandoned_one_no_refusal(
+        wide_rig, stats, monkeypatch, caplog) -> None:
+    base, httpd, qn, _nn = wide_rig
+    monkeypatch.setattr(web_server, "_PAGE_READ_WAIT_SECONDS", 0.2)
+    held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOG):
+            assert _http(base, f"/cockpit/question/{qn}.json", PUSH_TOKEN)[0] == 503
+    finally:
+        _release(httpd.page_gate, held)
+    row = stats.snapshot()["question/<n>"]
+    assert (row["count"], row["refused_503"], row["aborted"]) == (1, 1, 0), row     # record() counts the request, the refusal its 503
+    assert row["total_ms"] >= 150.0 and row["max_ms"] == row["total_ms"], row         # the one time is the wait
+    assert _refusal_lines(caplog) == ["refused 503 route=question/<n> gate=page_wait n=1"], _refusal_lines(caplog)
