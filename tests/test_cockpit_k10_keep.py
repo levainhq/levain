@@ -15,7 +15,7 @@ from typing import Any
 
 from anneal_memory.spores import IntentionStore
 from tests._cockpit_reread import REREAD
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_k4a_needs import DESKTOP
 from tests.test_cockpit_scroll_keep_page import _serve_plain
@@ -71,6 +71,7 @@ def test_a_re_read_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) ->
         out = _drive(tmp_path, f"{url}/", [
             DESKTOP,
             {"until": f"{PANEL} && {GIANT_ROW} && {GIANT_ROW}.classList.contains('has-more') && 1", "ms": 30000},
+            BOARD_SETTLED,   # a fresh install's first hello may draw the board again, which would reset the scroll this test sets
             {"eval": COUNT_RENDERS},
             {"eval": OPEN_AND_SCROLL},
             {"eval": REREAD},
@@ -79,7 +80,7 @@ def test_a_re_read_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) ->
             {"eval": STATE},
         ])
     v = out["values"]
-    _assert_held(v[2], v[-1], "the re-read")
+    _assert_held(v[3], v[-1], "the re-read")
 
 
 @needs_browser

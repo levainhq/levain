@@ -123,7 +123,12 @@ def test_panel_cache_keys_on_class_profile_row_limit_and_skips_search_unknown_an
         return real(*a, **kw)
 
     monkeypatch.setattr(ck, "_panel_compute", counting)
+    # the key also holds the panel's committed-read count (levain#138: an announced panel's refetch never gets an older
+    # cached body), so the call whose own read committed is followed by ONE compose under the new count, sharing that
+    # read's snapshot (no provider call); from there identical reads share it
+    ck.panel(pid, credential_class="token")
     p1 = ck.panel(pid, credential_class="token")
+    n[0] = 1
     assert ck.panel(pid, credential_class="token") is p1 and n[0] == 1
     assert ck.panel(pid, credential_class="none") is not p1 and n[0] == 2
     assert ck.panel(pid, credential_class="token", profile="compact") is not p1 and n[0] == 3
