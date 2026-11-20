@@ -393,9 +393,9 @@ NF_RETYPE = ("(() => { const c = document.querySelector('.nf-urgent-cap'); c.foc
 
 
 @needs_browser
-def test_editing_the_cap_field_leaves_the_mark_and_the_cap_note_agreeing_and_never_clears_another_note(tmp_path, monkeypatch) -> None:
+def test_editing_the_cap_field_clears_the_mark_and_the_cap_note_together_and_never_clears_another_note(tmp_path, monkeypatch) -> None:
     # a refused cap edited to another cap the card would refuse: assistive technology is read the mark, the sighted reader the note,
-    # so the two are both there or both gone (levain#192); the edit is a real one, through the engine's own input event
+    # so an edit takes both away (levain#192), and only the input listener does it; the edit is a real one, through the engine's own input event
     retype = lambda text: {"eval": NF_RETYPE % json.dumps(text)}
     steps = [_nf_fill("whole", urgent=True, cap=None), retype("1.5"), NF_SUBMIT, _nf_settle("whole"), {"eval": NF_STATE}]    # 0: refused, marked
     steps += [retype("2.5"), {"eval": NF_STATE}]                                                                          # 1: another invalid value
@@ -409,10 +409,43 @@ def test_editing_the_cap_field_leaves_the_mark_and_the_cap_note_agreeing_and_nev
         assert state["mints"] == [], state
     refused, edited, again, tick_refused, tick_edited, nameless, kept = seen
     assert NF_WHOLE in refused["note"] and refused["aria"] == "true", refused
-    assert edited["cap"] == "2.5" and (edited["aria"] == "true") == (NF_WHOLE in edited["note"]), edited           # the mark and the note agree
+    assert edited["cap"] == "2.5" and edited["note"] == "" and edited["aria"] is None, edited                      # the edit took the mark and the note, both
     assert NF_WHOLE in again["note"] and again["aria"] == "true", again
     assert NF_TICK in tick_refused["note"] and tick_refused["aria"] == "true", tick_refused
-    assert tick_edited["cap"] == "21" and (tick_edited["aria"] == "true") == (NF_TICK in tick_edited["note"]), tick_edited
+    assert tick_edited["cap"] == "21" and tick_edited["note"] == "" and tick_edited["aria"] is None, tick_edited
     assert nameless["note"] == NF_NAME_NOTE and nameless["aria"] is None, nameless
     assert kept["cap"] == "22" and kept["note"] == NF_NAME_NOTE and kept["aria"] is None, kept                    # another note stays through an edit
     assert stored == {}, stored
+
+
+# the Revoke button writes the same shared note (cleared at the start of a call, replaced by a failure), so the cap field's mark goes with it
+NF_REVOKE = lambda name: {"eval": f"(() => {{ document.querySelector('.nf-row[data-name=' + {json.dumps(json.dumps(name))} + '] .nf-revoke').click(); return 1; }})()"}
+NF_REVOKE_FAILS = {"eval": ("(() => { const f = window.fetch.bind(window);"
+                            " window.fetch = (u, o) => String(u).endsWith('/webpush/notify/tokens/revoke')"
+                            " ? Promise.resolve(new Response(JSON.stringify({message: 'refused for the test'}), {status: 500})) : f(u, o); return 1; })()")}
+NF_ROWS_STATE = ("JSON.stringify({rows: Array.from(document.querySelectorAll('.nf-row')).map((r) => r.dataset.name),"
+                 " note: document.querySelector('.nf-note').hidden ? '' : document.querySelector('.nf-note').textContent,"
+                 " aria: document.querySelector('.nf-urgent-cap').getAttribute('aria-invalid')})")
+
+
+def _nf_row_gone(name: str) -> dict:
+    return {"until": f"!document.querySelector('.nf-row[data-name=' + {json.dumps(json.dumps(name))} + ']') && 1", "ms": 10000}
+
+
+@needs_browser
+def test_a_revoke_while_the_cap_refusal_shows_takes_the_field_mark_with_the_note_and_so_does_a_failed_revoke(tmp_path, monkeypatch) -> None:
+    steps = _nf_mint("keep-a", urgent=True, cap="") + [_nf_settle("keep-a")]
+    steps += _nf_mint("keep-b", urgent=True, cap="") + [_nf_settle("keep-b")]
+    refuse = [_nf_fill("refused", urgent=True, cap="1.5"), NF_SUBMIT, _nf_settle("refused"), {"eval": NF_ROWS_STATE}]
+    steps += refuse + [NF_REVOKE("keep-a"), _nf_row_gone("keep-a"), {"eval": NF_ROWS_STATE}]       # 0: refused and marked; 1: a revoke that went through
+    steps += refuse + [NF_REVOKE_FAILS, NF_REVOKE("keep-b"),                                      # 2: refused and marked again; 3: a revoke the server turns down
+              {"until": "document.querySelector('.nf-note') && document.querySelector('.nf-note').textContent.startsWith('Could not change') && 1", "ms": 10000},
+              {"eval": NF_ROWS_STATE}]
+    seen, stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 4, seen
+    refused, revoked, refused_again, failed = seen
+    for r in (refused, refused_again):
+        assert NF_WHOLE in r["note"] and r["aria"] == "true", r
+    assert revoked["rows"] == ["keep-b"] and revoked["note"] == "" and revoked["aria"] is None, revoked        # the note went, and the mark with it
+    assert failed["rows"] == ["keep-b"] and "refused for the test" in failed["note"] and failed["aria"] is None, failed   # another note, no mark
+    assert "keep-a" not in stored and "keep-b" in stored and "refused" not in stored, stored

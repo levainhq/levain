@@ -396,13 +396,18 @@
     return nfPanel;
   }
   function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
-  // the two lines the cap field owns, each set together with the mark on the field: the tick-Urgent line is made untrue by ticking the box,
-  // and either is stale once the value is edited, so the mark and the line go together, and no other note on the shared line is touched
+  // the two lines the cap field owns: the tick-Urgent line is made untrue by ticking the box, and either is stale once the value is edited.
+  // nfSay is the only function that writes the shared note, and it sets or removes aria-invalid on the cap field in the same call, so the
+  // mark is on exactly while the note is one of these two lines: any other message, including "", takes the mark off. nfClearCapRefusal
+  // (the cap field's input, the Urgent box's change) clears only when the note is one of the two, so it never clears another message
   const NF_CAP_NEEDS_URGENT = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
   const NF_CAP_WHOLE = "Urgent per hour must be a whole number above zero, or left empty.";
-  function nfSay(msg) { nfNote.textContent = msg; nfNote.hidden = !msg; }
+  function nfSay(msg) {
+    nfNote.textContent = msg; nfNote.hidden = !msg;
+    if (msg === NF_CAP_NEEDS_URGENT || msg === NF_CAP_WHOLE) nfUrgentCap.setAttribute("aria-invalid", "true");
+    else nfUrgentCap.removeAttribute("aria-invalid");
+  }
   function nfClearCapRefusal() {
-    nfUrgentCap.removeAttribute("aria-invalid");
     if (nfNote.textContent === NF_CAP_NEEDS_URGENT || nfNote.textContent === NF_CAP_WHOLE) nfSay("");
   }
   function paintNotify(tokens) {
@@ -448,7 +453,6 @@
   async function createNotify() {
     if (nfBusy) return;     // a second mint would replace the first one's only shown secret; a dropped submit leaves the note and the field mark as they were
     nfSay("");
-    nfUrgentCap.removeAttribute("aria-invalid");
     const name = nfName.value.trim();
     if (!name) { nfSay("Give the notify token a name."); return; }
     // the cap rides along only on an urgent token; a value in the field with Urgent unticked is refused, never dropped, and what was typed stays;
@@ -462,7 +466,7 @@
         if (Number.isSafeInteger(n) && n >= 1) cap = n;
         else refusal = NF_CAP_WHOLE;
       }
-      if (refusal) { nfSay(refusal); nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.focus(); return; }
+      if (refusal) { nfSay(refusal); nfUrgentCap.focus(); return; }
     }
     nfBusy = true; nfGen++;
     try {
