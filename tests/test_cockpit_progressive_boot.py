@@ -282,7 +282,7 @@ function makeEnv(opts) {
     LevainDashboard: { render: (view, o) => { renderN++; if ((opts.throwOnRender || []).indexOf(renderN) >= 0) throw new Error("render " + renderN + " threw"); renders.push(view); }, hasUnsavedEdit: () => editing, jobsActive: () => false, releaseLoading: (why, keep) => { released.push(why); releasedKeep.push(keep === undefined ? null : Array.from(keep).sort()); } },
     dispatchEvent() {} };
   const doc = { getElementById: (id) => (id === "store" ? store : id === "stamp" ? stamp : regions[id] || null), documentElement: html, dispatchEvent() {},
-    addEventListener(t, f) { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }),
+    addEventListener(t, f) { (listeners[t] = listeners[t] || []).push(f); }, querySelector: (sel) => { if (sel === "main.frame") return null; throw new Error("unmodeled querySelector: " + sel); }, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }),
     visibilityState: "visible", body: { dataset: {} } };
   const fakeSet = (f, ms) => { if (RETRY.has(ms) || ms === HOLD_MS) { if (ms === HOLD_MS) holdArms++; const h = { fake: true, f, ms }; timers.push(h); return h; } return real.setTimeout(f, ms); };
   const fakeClear = (h) => { if (h && h.fake) { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); } else real.clearTimeout(h); };

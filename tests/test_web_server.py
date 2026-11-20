@@ -1323,21 +1323,23 @@ class TestWriteBoundary:
                 status = e.code
         assert status == 404
 
-    def test_rate_gate_503(self, tmp_path: Path) -> None:
-        # Saturate the bounded gate, then a store read returns a clean 503.
-        from levain.web_server import _MAX_INFLIGHT
+    def test_rate_gate_503(self, tmp_path: Path, monkeypatch) -> None:
+        # Saturate the page gate (a GET read waits on it, levain#157), then a store read returns a clean 503 after the wait.
+        from levain import web_server
+        from levain.web_server import _PAGE_READS_INFLIGHT
 
+        monkeypatch.setattr(web_server, "_PAGE_READ_WAIT_SECONDS", 0.2)
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, httpd):
-            held = [httpd.request_gate.acquire(blocking=False) for _ in range(_MAX_INFLIGHT)]
+            held = [httpd.page_gate.acquire(blocking=False) for _ in range(_PAGE_READS_INFLIGHT)]
             assert all(held)
             try:
                 status, _, _ = _request(base + "/substrate.json", method="GET")
             except urllib.error.HTTPError as e:
                 status = e.code
             finally:
-                for _ in range(_MAX_INFLIGHT):
-                    httpd.request_gate.release()
+                for _ in range(_PAGE_READS_INFLIGHT):
+                    httpd.page_gate.release()
         assert status == 503
 
 

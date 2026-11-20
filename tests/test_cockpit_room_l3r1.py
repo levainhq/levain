@@ -17,14 +17,16 @@ HUGE = "9" * 5000           # past int()'s 4300-digit limit: isdigit() holds, in
 
 
 def _free_slots(h) -> int:
-    held = 0
+    """Free slots of the request gate and of the page gate (a room read takes a page slot), counted together."""
+    held: list = []
     try:
-        while h.request_gate.acquire(blocking=False):
-            held += 1
+        for gate in (h.request_gate, h.page_gate):
+            while gate.acquire(blocking=False):
+                held.append(gate)
     finally:
-        for _ in range(held):
-            h.request_gate.release()
-    return held
+        for gate in held:
+            gate.release()
+    return len(held)
 
 
 @pytest.mark.parametrize("q", [f"after={HUGE}", f"after=1&wait={HUGE}", f"after=1&wait=1&live_seq={HUGE}",

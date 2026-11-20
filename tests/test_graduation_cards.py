@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from levain.autonomic import ActionManifest, ActionRisk, Posture, RiskClass
 from levain.cockpit.graduation_cards import NO_POLICY_NOTE
 from levain.cockpit.graduation_cards import card_of, graduation_view, read_steps
+from tests._page_gate_stub import page_gate_fields
 from tests.autonomic_test_only_coverage import TestOnlyCoverage
 from tests.test_autonomic_graduation_due import LATER, LOW, _binding, _due, _store, policy
 
@@ -85,21 +86,21 @@ def _route(server) -> tuple[int, dict]:
 
 def test_the_proposals_route_carries_the_graduations_beside_the_proposals(tmp_path):
     s = _store(tmp_path, _binding())
-    status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace(),
+    status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace(), **page_gate_fields(),
                                           autonomic_store_dir=s.path,
                                           graduation_engine=lambda apply: _due(s, TestOnlyCoverage([]), apply=apply)))
     assert status == 200 and body["proposals"] == []
     [card] = body["graduations"]["cards"]
     assert card["to"] == Posture.ON_LOOP.name and card["command"] is None
-    status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace()))
+    status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace(), **page_gate_fields()))
     assert body == {"proposals": []}                       # nothing wired: the payload as it was
 
 
-def test_a_slow_engine_does_not_hold_the_request_gate(tmp_path):
+def test_a_slow_engine_does_not_hold_the_page_gate(tmp_path):
     # RULINGS_R1 item 7: the cards are built after the gate is released, so a slow authority log never 503s the
-    # other consent-body routes
+    # other consent-body routes (a consent body read waits on the page gate, levain#157)
     s = _store(tmp_path, _binding())
-    gate = threading.Lock()
+    gate = threading.BoundedSemaphore(1)
     free_while_building = []
 
     def engine(apply):
@@ -109,7 +110,7 @@ def test_a_slow_engine_does_not_hold_the_request_gate(tmp_path):
             gate.release()
         return _due(s, TestOnlyCoverage([]), apply=apply)
 
-    status, body = _route(SimpleNamespace(request_gate=gate, consent_reader=SimpleNamespace(),
+    status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace(), **page_gate_fields(gate),
                                           autonomic_store_dir=s.path, graduation_engine=engine))
     assert status == 200 and free_while_building == [True] and len(body["graduations"]["cards"]) == 1
 

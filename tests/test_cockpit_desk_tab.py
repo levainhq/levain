@@ -173,7 +173,7 @@ def test_the_read_carries_the_ports_caps_lease_and_the_threads_receipts(tmp_path
         assert status == 200 and cold["wired"] is True, cold
         assert cold["caps"] == {"adapter": "scripted", "wake": "event", "receipts": True, "lease": True, "replies": True,
                                 "words_max": 2000}
-        assert cold["lease"] == {"state": "held", "holder": "desk 25", "age_s": 180}
+        assert cold["lease"] == {"state": "held", "holder": "desk 25", "age_s": 180, "open_desk": False}
         assert (cold["thread_id"], cold["events"], cold["cursor"], cold["readable"]) == (None, [], None, True)
         status, got = _get(base, f"{READ}?thread={THREAD}")
         assert [(e["by"], e["kind"], e["text"], e["at"]) for e in got["events"]] == [
@@ -183,7 +183,7 @@ def test_the_read_carries_the_ports_caps_lease_and_the_threads_receipts(tmp_path
         status, more = _get(base, f"{READ}?thread={THREAD}&after={got['cursor']}")
         assert [e["kind"] for e in more["events"]] == ["held"] and more["cursor"] == "3"
         scripted.script_lease("none")
-        assert _get(base, READ)[1]["lease"] == {"state": "none", "holder": None, "age_s": None}
+        assert _get(base, READ)[1]["lease"] == {"state": "none", "holder": None, "age_s": None, "open_desk": False}
 
 
 def test_an_unreadable_thread_says_so_and_is_never_no_events_yet(tmp_path, qdir, scripted):  # noqa: F811
@@ -412,7 +412,7 @@ def test_end_to_end_over_a_host_command_the_whole_path(tmp_path, qdir, host):  #
     port = HostCommandDeskPort(host.cmds, host.claims)
     with _serve(tmp_path, port) as base:
         status, got = _get(base, READ)
-        assert status == 200 and got["lease"] == {"state": "held", "holder": "desk 25", "age_s": 180}, got
+        assert status == 200 and got["lease"] == {"state": "held", "holder": "desk 25", "age_s": 180, "open_desk": False}, got
         assert got["caps"]["adapter"] == "host-command" and got["caps"]["receipts"] is True
         status, sent = send(base, "a line for the desk", oid(1))
         assert status == 200 and sent["outcome"] == "accepted" and sent["thread_id"] == THREAD, sent

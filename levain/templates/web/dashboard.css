@@ -2777,7 +2777,7 @@ body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.
 .rv .rv-md .md-code-b { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
 .rv .rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }          /* a bidi control in a seat's link text cannot reorder the words after it */
 .rv .rv-md .md-quote { color: var(--label); }
-/* The same draw in the chat panel's reply and the Room's agent lines (none sits inside .rv): source newlines are no longer
+/* The same draw in the chat panel's reply and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
    preserved, the blocks carry their own breaks, code is mono and wraps or scrolls inside the column. */
 .chat-text.rv-md, .sess-text.rv-md { white-space: normal; }
 .chat-text.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
@@ -2840,7 +2840,7 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
 .rv .dv-ctx-none .dv-ctxwords, .rv .dv-ctx-pending .dv-ctxwords, .rv .dv-ctx-unreadable .dv-ctxwords { color: var(--label); }
 .rv .dv-ctx-soft .dv-ctxwords { border-left: 2px solid var(--warn); padding-left: var(--sp-2); }
 .rv .dv-ctx-hard .dv-ctxwords { color: var(--text); border-left: 2px solid var(--bad); padding-left: var(--sp-2); }
-.rv .dv-droplink, .rv .dv-start { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .dv-droplink, .rv .dv-open { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .dv-you .dv-status { margin-top: var(--sp-1); text-align: right; }
 .rv .dv-sending { opacity: .55; }
 .rv .dv-refused .dv-status, .rv .dv-failed .dv-status { color: var(--text); border-right: 2px solid var(--bad); padding-right: var(--sp-2); }

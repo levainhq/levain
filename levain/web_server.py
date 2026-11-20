@@ -141,6 +141,7 @@ from levain.writes import (
     MAX_BODY_BYTES,
     ActionVerb,
     EditError,
+    request_received,
 )
 
 if TYPE_CHECKING:
@@ -268,9 +269,9 @@ def _is_write_route(route: str) -> bool:
 
 
 # levain's sign-request ceremony hosted by the cockpit (DESIGN_SIGN D4): GET /cockpit/sign.json lists the requests and
-# POST /cockpit/sign/<id>/{challenge,answer,deny,attempt} runs the caller's levain.consent.sign.Signer, each behind the write
-# gate (a surface token on every bind, the Host allowlist, same-origin only, the request gate). Served only when
-# make_server was given a Signer: without one every path here is 404.
+# POST /cockpit/sign/<id>/{challenge,answer,deny,attempt} runs the caller's levain.consent.sign.Signer, each behind a
+# surface token on every bind, the Host allowlist and same-origin only (the POSTs then take ``request_gate``, the listing
+# ``page_gate``). Served only when make_server was given a Signer: without one every path here is 404.
 _SIGN_LIST_PATH = "/cockpit/sign.json"
 _SIGN_PREFIX = "/cockpit/sign/"
 _SIGN_ACTIONS = ("challenge", "answer", "deny", "attempt")
@@ -296,14 +297,14 @@ _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for
 _SIGN_ONE_SUFFIX = ".json"
 # PLAN M17 "9a": the grants' passkey revoke, the phone's own ceremony (levain.consent.grant_phone.GrantPhone, built by
 # make_server from the caller's Signer): GET /cockpit/grant/list.json lists each grant with the passkeys that may revoke
-# it, and POST /cockpit/grant/<id>/{revoke-challenge,revoke} runs it, behind the sign routes' gate exactly. Served only
+# it, and POST /cockpit/grant/<id>/{revoke-challenge,revoke} runs it, behind the sign routes' checks. Served only
 # beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
 _GRANT_LIST_PATH = "/cockpit/grant/list.json"
 _GRANT_PREFIX = "/cockpit/grant/"
 # The envelopes' passkey revoke (board row 153), the same ceremony over the desk store the Signer's queue names
 # (levain.desk.envelope_revoke.EnvelopeRevoke, built by make_server from the Signer, never from the consent
 # reader's directory): GET /cockpit/envelope/list.json and POST /cockpit/envelope/<id>/{revoke-challenge,revoke}, behind
-# the grant routes' gate exactly, and served only beside a Signer.
+# the grant routes' checks, and served only beside a Signer.
 _ENVELOPE_LIST_PATH = "/cockpit/envelope/list.json"
 _ENVELOPE_PREFIX = "/cockpit/envelope/"
 # HOST GRANTS (board levain#66, S5a): GET /cockpit/hostgrant/list.json lists the live host grants of the operator's own
@@ -1079,8 +1080,8 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # Bounded concurrency for the expensive routes (the per-request store read + writes).
 # ThreadingHTTPServer spawns a thread per connection; without a gate a burst could
 # pile up unbounded store reads / file writes. Static assets (cached bytes) bypass the gate.
-# Past the cap the POSTs, the substrate read and a consent body get a clean instant 503; the
-# cockpit GET reads (below) wait instead. The cap of 8 holds for every gated route together.
+# Past the cap the writes (the POSTs), notify and the room tick get a clean instant 503; every GET read (below) waits
+# instead. The cap of 8 holds for every request_gate route together.
 _MAX_INFLIGHT = 8
 # The cockpit reads also share a smaller pool, so a read burst can never hold every slot:
 # this many stay free for the instant-503 routes (a write must not 503 for a whole burst).
@@ -1089,14 +1090,23 @@ _MAX_READ_INFLIGHT = _MAX_INFLIGHT - _RESERVED_SLOTS
 
 # The cockpit's GET reads (the manifest and one request per panel; a page load bursts ~28 of them, two
 # open pages double it) wait this long for a slot before the 503, and at most ``_MAX_READ_WAITERS`` of them
-# wait at once, so a flood still cannot pile up threads without bound. Every other gated route (the POSTs,
-# the substrate read, a consent body) keeps the instant 503 past the cap, but reads hold at most
-# ``_MAX_READ_INFLIGHT`` slots, so those routes always find ``_RESERVED_SLOTS`` free of a read burst.
+# wait at once, so a flood still cannot pile up threads without bound. The routes that keep the instant 503 past
+# the cap (the writes) still find ``_RESERVED_SLOTS`` free of a read burst, since reads hold at
+# most ``_MAX_READ_INFLIGHT`` slots.
 _READ_WAIT_SECONDS = 5.0
 _MAX_READ_WAITERS = 64
 # the Desk view's polls in flight at once, on a gate of their own (``desk_gate``): one page's overlapping polls and a
 # second device's, never more
 _DESK_READS_INFLIGHT = 2
+# Every GET read a page load or its pollers fires, bar the panel and manifest reads (which have the read pool), takes a
+# gate of their own (``page_gate``), never ``request_gate``: on ``request_gate`` they raced the panel burst for the
+# slots reserved past it and lost at once with an instant 503. They wait up to ``_PAGE_READ_WAIT_SECONDS`` for a slot,
+# and at most ``_MAX_PAGE_WAITERS`` wait at once, so a flood still cannot pile up threads without bound. The rule: a GET
+# read waits on the page gate. Only a write (a POST), notify and the room's per-tick read keep ``request_gate``'s instant
+# 503: a write is never retried by the page, notify is a service's call and the tick re-asks in a moment.
+_PAGE_READS_INFLIGHT = 4
+_PAGE_READ_WAIT_SECONDS = 5.0
+_MAX_PAGE_WAITERS = 32
 
 _log = logging.getLogger(__name__)
 
@@ -1110,20 +1120,38 @@ COCKPIT_READ_CACHE_TTL_S = 1.5
 
 
 class _RouteStats:
-    """In-process latency and refusal counters for the cockpit GET reads. A bounded dict keyed by route TEMPLATE
-    (``panel/<id>``, ``manifest``, ``question/<n>``, ``events``, ...), never a raw path: at most
-    ``_ROUTE_PANEL_IDS_MAX`` panel ids plus a fixed handful of other keys. Holds counts and times only, no request
-    content. ``snapshot()`` is the read-only shape; there is no network route for it (no new surface)."""
+    """In-process latency and refusal counters for the cockpit's reads and the refusals of every gated route. A bounded
+    dict keyed by route TEMPLATE (``panel/<id>``, ``manifest``, ``question/<n>``, ``band``, ``consent/<id>``, ...),
+    never a raw path: at most ``_ROUTE_PANEL_IDS_MAX`` panel ids plus a fixed handful of other keys. Holds counts and
+    times only, no request content. ``snapshot()`` is the read-only shape; there is no network route for it (no new
+    surface). ``clock`` times the refusal log's one-line-per-second bound, injectable so a test drives it. It counts
+    REFUSALS by design: only the question and panel/manifest reads are also timed (count, total, max); a served read
+    of any other route adds no row time."""
 
-    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other")
+    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other", "notify", "verb",
+              "band", "board", "threads", "room", "sign", "consent/<id>", "consent/standing", "note/<n>",
+              "session/<id>", "desk", "voice", "substrate", "job", "recall", "extra", "envelope", "hostgrant", "dispatch", "coord",
+              "pair", "push")
+    # A gate whose refusal the page tolerates by design (the Desk view skips a 503): logged at INFO, not WARNING.
+    _TOLERATED_GATES = frozenset({"desk_gate"})
+    _REFUSAL_LOG_INTERVAL_S = 1.0
+    _REFUSAL_KEYS_MAX = 512        # distinct (route key, gate) pairs the refusal log tracks; later ones fold into other
+    _GATE_NAME_MAX = 64            # a gate name is a fixed word from this file (a credential's reason is one too)
 
-    def __init__(self) -> None:
+    def __init__(self, clock: "Callable[[], float]" = time.monotonic) -> None:
         self._lock = threading.Lock()
-        self._rows: dict[str, list[float]] = {}   # key -> [count, total_ms, max_ms, refused_503]
+        self._clock = clock
+        self._rows: dict[str, list[float]] = {}   # key -> [count, total_ms, max_ms, refused_503, aborted]
+        self._refusal_log: dict[tuple[str, str], list[float]] = {}   # (key, gate) -> [last line time or -inf, pending]
+        self._pending_n = 0      # refusals counted but not yet in a log line, over every pair (read outside the lock)
 
     @classmethod
     def key_for(cls, path: str) -> str:
         path = path.split("?", 1)[0]
+        if path in cls._FIXED:        # a template key passed as itself
+            return path
+        if path.startswith("panel/") and re.fullmatch(r"[A-Za-z0-9_.:-]{1,48}", path[len("panel/"):]):
+            return path
         if path == "/cockpit/manifest.json":
             return "manifest"
         if path == "/cockpit/events":
@@ -1133,7 +1161,52 @@ class _RouteStats:
         if path.startswith("/cockpit/panel/") and path.endswith(".json"):
             pid = path[len("/cockpit/panel/"):-len(".json")]
             return f"panel/{pid}" if re.fullmatch(r"[A-Za-z0-9_.:-]{1,48}", pid) else "panel/other"
-        return "freshness" if path.startswith("/cockpit/fresh") else "other"
+        if path.startswith("/cockpit/fresh"):
+            return "freshness"
+        if path == _BAND_PATH:
+            return "band"
+        if path == cockpit_board.BOARD_PATH:
+            return "board"
+        if cockpit_room.is_room_path(path):
+            return "room"
+        if path in (_SIGN_LIST_PATH, _GRANT_LIST_PATH) or path.startswith((_SIGN_PREFIX, _GRANT_PREFIX)):
+            return "sign"
+        if path in (_CONSENT_BODY_PREFIX + PROPOSALS_ID + _CONSENT_BODY_SUFFIX,
+                    _CONSENT_BODY_PREFIX + GRANTS_ID + _CONSENT_BODY_SUFFIX):
+            return "consent/standing"
+        if path.startswith(_CONSENT_BODY_PREFIX):
+            return "consent/<id>"
+        if path.startswith(_NOTE_BODY_PREFIX):
+            return "note/<n>"
+        if path.startswith(_SESSION_LOG_PREFIX):
+            return "session/<id>"
+        if path.startswith(_ENVELOPE_PREFIX):     # the list and the passkey revoke POSTs
+            return "envelope"
+        if path.startswith(_HOSTGRANT_PREFIX):
+            return "hostgrant"
+        if path == _DISPATCH_LIST or path.startswith(_DISPATCH_PREFIX):
+            return "dispatch"
+        if path in (_COORD_LIST, _DESK_LIST) or path.startswith(_COORD_PREFIX):     # the drop sheet's read, either spelling
+            return "coord"
+        if cockpit_desk.is_desk_path(path) or path.startswith(_DESK_PREFIX):
+            return "desk"
+        if path.startswith("/cockpit/pair/"):
+            return "pair"
+        if path.startswith(_PUSH_PREFIX):
+            return "push"
+        if path == cockpit_voice.VOICE_JSON or path.startswith("/cockpit/voice/"):
+            return "voice"
+        if path == _NOTIFY_PATH:       # a service's POST, refused at the request gate: named, not lumped into "other"
+            return "notify"
+        if path == _COCKPIT_VERB_PATH:     # the cockpit's write verb, refused at the same gate
+            return "verb"
+        if path == "/substrate.json":
+            return "substrate"
+        if path == "/job.json":
+            return "job"
+        if path == "/recall.json":
+            return "recall"
+        return "other"      # "extra" is passed by name (a host's route path is unknown here); see _refused
 
     def _row(self, key: str) -> tuple[str, list[float]]:
         # returns the EFFECTIVE key (a folded panel id comes back as "panel/other") with its row
@@ -1147,6 +1220,7 @@ class _RouteStats:
 
     def record(self, path: str, ms: float, *, gate_wait_ms: float = 0.0, refused: bool = False,
                aborted: bool = False) -> None:
+        self.flush_due()     # every cockpit read reports a refusal burst's quiet tail
         key = self.key_for(path)
         with self._lock:
             key, row = self._row(key)
@@ -1160,6 +1234,65 @@ class _RouteStats:
         if ms > _SLOW_READ_MS:
             _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d%s%s", key, ms, gate_wait_ms,
                          " refused=503" if refused else "", " aborted" if aborted else "")
+
+    def record_refusal(self, path_or_key: str, gate: str, *, ms: "float | None" = None) -> None:
+        """Count one 503 refusal into its route's row and log it: ONE line per (route key, gate) per
+        ``_REFUSAL_LOG_INTERVAL_S`` at most (a warning; INFO for a ``_TOLERATED_GATES`` gate), ``n`` counting the refusals
+        of that pair since its last line. The refusals a burst holds back after its first line are logged by
+        :meth:`flush_due`, which this and every :meth:`record` call. The route is a template key (a raw path is reduced
+        to one) and the gate a short name set in this file: no token, id or query reaches a log line. ``ms`` set means
+        the refusal is also the request's one count (a refused read counted nowhere else): the row's count and times
+        take it too."""
+        key = self.key_for(path_or_key)
+        gate = "".join(c for c in gate if c.isprintable())[: self._GATE_NAME_MAX] or "other"
+        with self._lock:
+            key, row = self._row(key)
+            if ms is not None:
+                row[0] += 1
+                row[1] += ms
+                row[2] = max(row[2], ms)
+            row[3] += 1
+            pair = (key, gate)
+            slot = self._refusal_log.get(pair)
+            if slot is None:
+                if len(self._refusal_log) >= self._REFUSAL_KEYS_MAX - 1:   # one place stays for the fold pair itself
+                    pair = ("other", "other")
+                slot = self._refusal_log.setdefault(pair, [float("-inf"), 0.0])
+            slot[1] += 1
+            self._pending_n += 1
+            now = self._clock()
+            emit = now - slot[0] >= self._REFUSAL_LOG_INTERVAL_S
+            n = int(slot[1])
+            if emit:
+                slot[0], slot[1] = now, 0.0
+                self._pending_n -= n
+        if emit:
+            self._log_refusal(pair, n)
+        if ms is not None and ms > _SLOW_READ_MS:      # the read's slow line, as ``record`` logs one: the wait is the whole time
+            _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d refused=503", key, ms, ms)
+        self.flush_due()
+
+    def flush_due(self) -> None:
+        """Log the line of every (route, gate) pair that holds refusals no line has carried and whose interval has
+        elapsed, so a burst's tail is reported by the next read or refusal of ANY route instead of waiting for one more
+        refusal of its own pair. One counter check, no lock, when nothing is pending."""
+        if not self._pending_n:
+            return
+        due: list[tuple[tuple[str, str], int]] = []
+        with self._lock:
+            now = self._clock()     # under the lock: a line another thread wrote just now is seen, so no pair logs twice in an interval
+            for pair, slot in self._refusal_log.items():
+                if slot[1] > 0 and now - slot[0] >= self._REFUSAL_LOG_INTERVAL_S:
+                    n = int(slot[1])
+                    slot[0], slot[1] = now, 0.0
+                    self._pending_n -= n
+                    due.append((pair, n))
+        for pair, n in due:
+            self._log_refusal(pair, n)
+
+    def _log_refusal(self, pair: "tuple[str, str]", n: int) -> None:
+        _log.log(logging.INFO if pair[1] in self._TOLERATED_GATES else logging.WARNING,
+                 "refused 503 route=%s gate=%s n=%d", pair[0], pair[1], n)
 
     def snapshot(self) -> dict[str, dict[str, float]]:
         with self._lock:
@@ -1969,6 +2102,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     read_gate: threading.BoundedSemaphore
     read_waiters: int
     read_waiters_lock: threading.Lock
+    # the page's GET reads bar the panel and manifest reads: a gate of their own with a bounded wait, so a page's read
+    # never refuses against its own panel burst
+    page_gate: threading.BoundedSemaphore
+    page_waiters: int
+    page_waiters_lock: threading.Lock
     # ``is_loopback_bind`` is computed from the ACTUAL bound address (un-foolable) and gates
     # whether the substrate READS need a token (intention-220). ``write_token`` is the ``browser``
     # surface's token: minted on a writable server given no tokens at all, None when the caller's
@@ -2369,7 +2507,13 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _presence_cache: Any = _UNSET   # reset per request in handle_one_request
-    _reads_invalidated = False      # likewise: whether this request has dropped the shared read cache yet
+    _reads_invalidated = False      # likewise: whether this request has invalidated its reads yet
+    # likewise, a cockpit verb POST: the panel ids its fire reported touching (None: drop every read), the verb name once it
+    # reached dispatch, and when do_POST began (monotonic, and as an ISO time for the edits ledger row)
+    _write_touched: "frozenset[str] | None" = None
+    _write_verb: "str | None" = None
+    _post_t0: "float | None" = None
+    _post_received_at: "str | None" = None
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
@@ -2463,6 +2607,10 @@ class _Handler(GuardedHandler):
         self._presence_cache = _UNSET
         self._post_headers = []
         self._reads_invalidated = False
+        self._write_touched = None
+        self._write_verb = None
+        self._post_t0 = None
+        self._post_received_at = None
         self.command = None     # a kept-alive connection's previous verb is not this request's
         try:
             try:
@@ -2473,8 +2621,10 @@ class _Handler(GuardedHandler):
                 # request refused at a gate was never admitted and never invalidates (_admitted_write)
                 if self._reads_invalidated or self._admitted_write(None):
                     self._invalidate_reads()
-        except _CredentialUnavailable:
+                self._log_write_time()
+        except _CredentialUnavailable as exc:
             self.close_connection = True
+            self._refused("credential:" + str(exc.args[0] if exc.args else "unavailable"))
             try:
                 self._send(json.dumps({"error": "broker_unavailable",
                                        "message": "the cockpit is starting or busy; try again shortly"}).encode("utf-8"),
@@ -2485,7 +2635,7 @@ class _Handler(GuardedHandler):
                 pass        # the client went away first
 
     def _admitted_write(self, code: "int | None") -> bool:
-        """Whether THIS request may have written, so the shared read cache must drop what it holds (1106 solid2 r1).
+        """Whether THIS request may have written, so the reads it made stale must be invalidated (1106 solid2 r1).
         A write method (not GET / HEAD) AND either a verified surface or paired credential resolved on this request
         (a write route admitted it, whatever the write then answered), or a 2xx answer (the routes whose credential
         is not a surface token: the pairing claim's code, a notify token, a push receipt's endpoint hash, the chat
@@ -2500,14 +2650,51 @@ class _Handler(GuardedHandler):
         return code is not None and 200 <= code < 300
 
     def _invalidate_reads(self) -> None:
+        first = not self._reads_invalidated
         self._reads_invalidated = True
         cockpit = getattr(self.server, "cockpit", None)
-        if cockpit is not None:
-            cockpit.invalidate_reads()
+        if cockpit is None:
+            return
+        touched = self._write_touched
+        if touched is None:
+            cockpit.invalidate_reads()          # a write that named no panels: every read goes cold
+        elif touched:
+            # only the panels the fire reported; the background refresh of a refresher panel is asked once per write
+            cockpit.invalidate_reads(touched, refresh=first)
+        # an empty set is a dry run: it wrote nothing, so nothing a read holds is stale
+
+    def _note_fired(self, result: Any) -> None:
+        """Keep what a cockpit verb's answer says it touched, for the invalidation ``send_response`` makes before the status
+        line: a landed fire's ``touched`` panels that are registered, or nothing for a dry run. Any other answer, and a
+        ``touched`` that names no registered panel, leaves the set unset, so every read goes cold."""
+        if not isinstance(result, dict):
+            return
+        touched = result.get("touched")
+        if result.get("dry_run") is True:
+            self._write_touched = frozenset()
+        elif isinstance(touched, list):
+            cockpit = getattr(self.server, "cockpit", None)
+            known = set(cockpit.panel_ids) if cockpit is not None else set()
+            # only registered panels count; none left means the answer named nothing real, so every read goes cold
+            got = frozenset(p for p in touched if isinstance(p, str) and p in known)
+            if got:
+                self._write_touched = got
+
+    def _log_write_time(self) -> None:
+        """One stderr line for a cockpit verb POST that reached dispatch: ``cockpit write <verb> <ms> ms``, the time from
+        do_POST's start to the response written, and a ``slow cockpit write`` warning past the slow-read threshold."""
+        verb, t0 = self._write_verb, self._post_t0
+        if verb is None or t0 is None:
+            return
+        ms = int((time.monotonic() - t0) * 1000)
+        name = "".join(c for c in verb[:64] if c.isprintable() and not c.isspace()) or "?"
+        print(f"cockpit write {name} {ms} ms", file=sys.stderr, flush=True)
+        if ms > _SLOW_READ_MS:
+            _log.warning("slow cockpit write: verb=%s ms=%d", name, ms)
 
     def send_response(self, code: int, message: "str | None" = None) -> None:
-        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write drops the shared read cache BEFORE its status line is
-        written. Every handler answers through here after its write committed (send_error included), so a client
+        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write invalidates the reads it made stale BEFORE its status line is
+        written: every cached read, or only those of the panels a cockpit verb named (``_invalidate_reads``). Every handler answers through here after its write committed (send_error included), so a client
         that holds the response and reads at once, on any connection, never gets a read cached or begun before the
         write. The ``finally`` in :meth:`handle_one_request` is only the fallback."""
         if not self._reads_invalidated and self._admitted_write(code):
@@ -2777,8 +2964,7 @@ class _Handler(GuardedHandler):
         request_id = unquote(path[len(_CONSENT_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
         status, payload = 404, {"error": "not_found", "message": "no such consent request listed"}
         if _CONSENT_ID.fullmatch(request_id):
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 from levain.consent.listing import entry_body, find_entry
@@ -2831,7 +3017,7 @@ class _Handler(GuardedHandler):
             except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
                 status, payload = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
             if request_id == PROPOSALS_ID and status == 200:
                 # 14b S4: the graduation cards and steps beside the proposals, read-only, built after the gate is
                 # released (RULINGS_R1 item 7: a slow authority log never holds it). The store and the engine are the
@@ -2848,7 +3034,7 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _serve_question_body(self, path: str, *, head: bool) -> None:
+    def _serve_question_body(self, path: str, *, head: bool, since: "float | None" = None) -> None:
         """``GET /cockpit/question/<n>.json``: one question's body (what, options, rec, blocks, agent, filed_at, and
         its answer if any). The consent body's gate, exactly: reached only through ``_route``, then a surface token
         on every bind, judged by the one compare every token check here uses, before the id is looked at. Read-only:
@@ -2860,9 +3046,7 @@ class _Handler(GuardedHandler):
         status, payload = 404, {"error": "not_found", "message": "no such question"}
         store = getattr(self.server, "question_store", None)
         if store is not None and _QUESTION_ID.fullmatch(n):
-            if not self.server.request_gate.acquire(blocking=False):
-                self._q503 = True
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head, since=since):
                 return
             try:
                 q = store.get(int(n))
@@ -2892,7 +3076,7 @@ class _Handler(GuardedHandler):
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
                 status, payload = 500, _store_fault("question", exc)
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
@@ -2915,8 +3099,7 @@ class _Handler(GuardedHandler):
             self._send(b"", "application/json; charset=utf-8", status=200, head=True, headers=hdrs,
                        cache_control="private, no-store")
             return
-        if not self.server.request_gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+        if not self._page_slot_or_refuse(head=head):
             return
         try:
             from levain import band_view
@@ -2930,7 +3113,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
             status, payload = 500, _store_fault("band", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
@@ -2942,10 +3125,10 @@ class _Handler(GuardedHandler):
         the ceremony is pinned to (a page served elsewhere sends the operator there). Reached only
         through ``_route`` (Host allowlist, cross-site refusal), then the write gate's other checks before the
         directory is read: same-origin only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every
-        bind, the request gate. Without a signer, 404. Keys that cannot be read list no signers and say why in
+        bind, a page-gate slot. Without a signer, 404. Keys that cannot be read list no signers and say why in
         ``note``; the rows still list, as on the phone page.
 
-        ``GET /cockpit/sign/<id>.json`` (``one``), behind the same gate: ``{request, signers, credentials, origin}``
+        ``GET /cockpit/sign/<id>.json`` (``one``), behind the same checks and slot: ``{request, signers, credentials, origin}``
         with that one
         request's row (:meth:`levain.consent.sign.Signer.row`), or 404 when it is not open, whatever the listing's
         cap."""
@@ -2987,7 +3170,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - a directory that cannot be read is an answer, never a dead connection
             status, payload = 500, _store_fault("sign request", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
@@ -3005,9 +3188,10 @@ class _Handler(GuardedHandler):
                            head=head)
 
     def _sign_read_admitted(self, *, head: bool, what: str, route: str = "") -> bool:
-        """The sign reads' gate past ``_route`` (the sign listing's and the grant listing's, one code path): same-origin
-        only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every bind, then the request gate,
-        which True leaves HELD for the caller to release. False: the refusal was sent."""
+        """The gate every credentialed GET read of the sign family passes past ``_route``: same-origin only
+        (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every bind, then a page-gate slot
+        (:meth:`_page_slot_or_refuse`), which True leaves HELD for the caller to :meth:`_release_page_slot`. False: the
+        refusal was sent. Callers are the GET handlers only; a POST or write takes ``request_gate`` itself."""
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if self.headers.get("Sec-Fetch-Site") not in (None, _SAME_ORIGIN):
             self._send(json.dumps({"error": "forbidden", "message": "cross-origin read refused"}).encode("utf-8"),
@@ -3017,10 +3201,7 @@ class _Handler(GuardedHandler):
         if not (self._push_gate_ok(route) if route in _PRESENCE_TOKEN_ROUTES else self._off_box_token_valid()):
             self._gated_read_403(f"{what} need", head=head)
             return False
-        if not self.server.request_gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
-            return False
-        return True
+        return self._page_slot_or_refuse(head=head)
 
     def _serve_push(self, path: str, *, head: bool, read: bool = False) -> None:
         """A web push GET (OS-4) through :func:`levain.webpush.routes.handle` over the Signer's queue: an app-shell
@@ -3085,7 +3266,7 @@ class _Handler(GuardedHandler):
             self._send(body, "application/json; charset=utf-8", status=status, head=head,
                        headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
 
     def _push_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any] | bytes, int]":
         """A web push POST (OS-4), its credential already checked. Every subscription is stored under a PAIRED
@@ -3458,6 +3639,7 @@ class _Handler(GuardedHandler):
         if clen is None or self._refuse_oversize(clen, _NOTIFY_MAX_REQUEST, 0):    # never drained: it is not read
             return
         if not self.server.request_gate.acquire(blocking=False):
+            self._refused("request_gate")
             return self._reject(503, "notify_busy", "server busy")
         try:
             raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
@@ -3590,7 +3772,7 @@ class _Handler(GuardedHandler):
     def _serve_grant_list(self, *, head: bool) -> None:
         """``GET /cockpit/grant/list.json``: :meth:`levain.consent.grant_phone.GrantPhone.listing` (each grant with
         ``instance`` and ``signers``, the passkeys that may revoke it, and the notes) plus ``origin``, the page the
-        ceremony is pinned to, behind the sign listing's gate exactly. Without a Signer, 404."""
+        ceremony is pinned to, behind :meth:`_sign_read_admitted`. Without a Signer, 404."""
         grants = self.server.grant_phone
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if grants is None:
@@ -3617,13 +3799,13 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
             status, payload = 500, _store_fault("grant", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
     def _serve_envelope_list(self, *, head: bool) -> None:
-        """``GET /cockpit/envelope/list.json``: :meth:`EnvelopeRevoke.listing` plus ``origin``, behind the grant listing's
-        gate exactly. Without a Signer, 404."""
+        """``GET /cockpit/envelope/list.json``: :meth:`EnvelopeRevoke.listing` plus ``origin``, behind
+        :meth:`_sign_read_admitted`. Without a Signer, 404."""
         env = self.server.envelope_revoke
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if env is None:
@@ -3649,7 +3831,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
             status, payload = 500, _store_fault("envelope", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
@@ -3671,11 +3853,11 @@ class _Handler(GuardedHandler):
                                                  "paired from the cockpit or the laptop"}, 403
 
     def _serve_hostgrant_list(self, path: str, *, head: bool) -> None:
-        """``GET /cockpit/hostgrant/list.json``: :meth:`HostGrantSurface.listing` behind the sign listing's gate exactly
-        (``_sign_read_admitted``: Host via ``_route``, fetch metadata, a credential on every bind, the request gate), then
-        the launch-grant rule (:meth:`_coord_may_launch`, read once). 404 for every path under the prefix unless the server
-        was handed ``host_grants``; no helper is started for a refusal. A request that waits on another's listing gives its
-        request-gate slot back first, so host-grant work holds one slot at most while it spawns."""
+        """``GET /cockpit/hostgrant/list.json``: :meth:`HostGrantSurface.listing` behind :meth:`_sign_read_admitted` (Host
+        via ``_route``, fetch metadata, a credential on every bind, a page slot), then the launch-grant rule
+        (:meth:`_coord_may_launch`, read once). 404 for every path under the prefix unless the server was handed
+        ``host_grants``; no helper is started for a refusal. A request that waits on another's listing gives its page
+        slot back first, so host-grant work holds one slot at most while it spawns."""
         surface = self.server.host_grants
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if surface is None or path != _HOSTGRANT_LIST_PATH:
@@ -3689,7 +3871,7 @@ class _Handler(GuardedHandler):
         def release() -> None:
             if not released:
                 released.append(True)
-                self.server.request_gate.release()
+                self._release_page_slot()
 
         try:
             if not self._coord_may_launch(self._coord_device()):
@@ -3736,7 +3918,7 @@ class _Handler(GuardedHandler):
     def _serve_consent_sheet(self, request_id: str, *, head: bool) -> None:
         """``GET /cockpit/consent/<id>/sheet.json`` (OS-2): ``{request, signers, credentials, origin, rp_id}`` with the
         request's sheet row (:meth:`ConsentSheet.row`), or 404 ``not_open`` once it is no longer open to a passkey here,
-        behind the sign listing's gate exactly. Without a consent sheet, 404 ``not_found``."""
+        behind :meth:`_sign_read_admitted`. Without a consent sheet, 404 ``not_found``."""
         sheet = self.server.consent_sheet
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if sheet is None:
@@ -3764,7 +3946,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is an answer, never a dead connection
             status, payload = 500, _store_fault("consent request", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
@@ -3783,7 +3965,7 @@ class _Handler(GuardedHandler):
         """``GET /cockpit/dispatch/<job>/sheet.json`` (OS-2): ``{request, signers, credentials, origin, rp_id}`` with the
         job's sheet row (:meth:`DispatchSheet.row`), or 404 ``not_open`` once it is final or unknown;
         ``GET /cockpit/dispatch.json`` (``job_id`` None): ``{requests, note, overflow, origin, rp_id}``, every live job as
-        a row. Behind the sign listing's gate exactly. Without a dispatch sheet, 404 ``not_found``."""
+        a row. Behind :meth:`_sign_read_admitted`. Without a dispatch sheet, 404 ``not_found``."""
         sheet = self.server.dispatch_sheet
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if sheet is None:
@@ -3823,14 +4005,14 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
             status, payload = 500, _store_fault("dispatch job", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
     def _serve_coord_sheet(self, *, head: bool) -> None:
         """``GET /cockpit/coord/drops.json`` (OS-2): the drop sheet's read, ``{coord_drops, coord_store_id, coord_repos,
-        coord_signers, coord_note, ..., credentials, origin, rp_id}`` (:meth:`CoordSheet.listing`), behind the sign listing's
-        gate exactly, plus ``coord_may_launch`` for this request's credential. Without a coord sheet, 404 ``not_found``."""
+        coord_signers, coord_note, ..., credentials, origin, rp_id}`` (:meth:`CoordSheet.listing`), behind
+        :meth:`_sign_read_admitted`, plus ``coord_may_launch`` for this request's credential. Without a coord sheet, 404 ``not_found``."""
         sheet = self.server.coord_sheet
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if sheet is None:
@@ -3855,7 +4037,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
             status, payload = 500, _store_fault("desk drops", exc)
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
@@ -4135,8 +4317,7 @@ class _Handler(GuardedHandler):
         status, payload = 404, {"error": "not_found", "message": "no such note"}
         store = getattr(self.server, "note_store", None)
         if store is not None and _QUESTION_ID.fullmatch(n):
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 note = store.get(int(n))
@@ -4151,7 +4332,7 @@ class _Handler(GuardedHandler):
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
                 status, payload = 500, _store_fault("note", exc)
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
@@ -4198,7 +4379,7 @@ class _Handler(GuardedHandler):
             self._gated_read_403("the room record needs", head=head)
             return
         query = urllib.parse.urlsplit(self.path).query
-        # the query is parsed once, up front, with no gate held: a malformed one can neither hold a request slot nor
+        # the query is parsed once, up front, with no gate held: a malformed one can neither hold a page slot nor
         # leak one (L3 room r1 codex HIGH), and both branches below refuse the same bad parameters alike (r1 LOWs)
         try:
             after, thread = cockpit_room.parse_cursor(query)
@@ -4219,15 +4400,14 @@ class _Handler(GuardedHandler):
                      "stream": [], "proposals": [], "live": None}, after, thread)
             status, payload = reader()
         else:
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 host = self.server.room_host
                 status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
                                                           view=host.view if host is not None else None, query=query)
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
         if wait is not None and status == 200 and not head:
             waited = self._room_wait(path, directory, query, wait, (status, payload), live_seq, reader=reader)
             if waited is None:
@@ -4246,10 +4426,11 @@ class _Handler(GuardedHandler):
                    live_seq: "int | None" = None, *,
                    reader: "Callable[[], tuple[int, dict[str, Any]]] | None" = None,
                    ) -> "tuple[int, dict[str, Any]] | None":
-        """The long-poll half of ``_serve_room`` (``first`` is the read the request gate already admitted). The wait holds
-        NO ``request_gate`` or read slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy
-        gate skips the tick), and the wait itself is counted by ``room_waiters`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503
-        with ``Retry-After``, like ``stream_gate``). Before each re-read the credential is re-checked by the change
+        """The long-poll half of ``_serve_room`` (``first`` is the answer in hand: the store read under the page slot
+        ``_serve_room`` has already released, or the no-store empty room). The wait holds NO ``request_gate``, page or read
+        slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy gate skips the tick), and
+        the wait itself is counted by ``room_waiter_gate`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503 with
+        ``Retry-After``, like ``stream_gate``, counted and logged as that gate). Before each re-read the credential is re-checked by the change
         stream's own check (``_stream_allowed``: a paired device must still be live, the epoch and the journal read
         fresh); a surface token is never revoked from the panel, so it has none. None: the caller answers 403.
 
@@ -4282,6 +4463,7 @@ class _Handler(GuardedHandler):
             return read()
 
         if not srv.room_waiter_gate.acquire(blocking=False):
+            self._refused("room_waiter_gate")     # the caller sends this payload as the 503
             return 503, {"error": "busy", "message": "too many rooms waiting; read again shortly"}
         try:
             return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop,
@@ -4326,7 +4508,7 @@ class _Handler(GuardedHandler):
         query = urllib.parse.urlsplit(self.path).query
         gate = self.server.desk_gate
         if gate is None or not gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            self._send_busy(head=head, gate="desk_gate")
             return
         try:
             status, payload = cockpit_desk.serve_desk(self.server.desk_port, query)
@@ -4357,7 +4539,7 @@ class _Handler(GuardedHandler):
 
     def _serve_voice(self, *, head: bool) -> None:
         """``GET /cockpit/voice.json`` (V1-4): which providers have a key, the caps and the estimated spend. Gated as
-        ``room.json`` is (a surface token on every bind, then a non-blocking ``request_gate`` slot); 404 without a room
+        ``room.json`` is (a surface token on every bind), then a page-gate slot (the page fetches it on every load); 404 without a room
         host and a broker. Reads the authority log and, if it exists, the ledger read-only: no keychain, no file
         created."""
         srv = self.server
@@ -4371,8 +4553,7 @@ class _Handler(GuardedHandler):
                        "application/json; charset=utf-8", status=404, head=head, headers=vary,
                        cache_control="private, no-store")
             return
-        if not srv.request_gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+        if not self._page_slot_or_refuse(head=head):
             return
         failed = None
         body: "dict[str, Any] | None" = None
@@ -4385,7 +4566,7 @@ class _Handler(GuardedHandler):
         except Exception as exc:  # noqa: BLE001 - fixed words; the log names the type only
             failed = type(exc).__name__
         finally:
-            srv.request_gate.release()
+            self._release_page_slot()
         status = 200
         if failed is not None or body is None:
             _log.warning("voice: voice.json could not be built (%s)", failed)
@@ -4459,6 +4640,7 @@ class _Handler(GuardedHandler):
             self._reject(413, "too_large", cockpit_voice.WORDS["too_long"])
             return None
         if not srv.voice_gate.acquire(blocking=False):
+            self._refused("voice_gate")
             self._reject(503, "voice_busy", cockpit_voice.WORDS["voice_busy"])
             return None
         try:
@@ -4558,6 +4740,7 @@ class _Handler(GuardedHandler):
                 self.close_connection = True
                 return early
             if srv.voice_chunk_gate is None or not srv.voice_chunk_gate.acquire(blocking=False):
+                self._refused("voice_chunk_gate")
                 self._reject(503, "voice_busy", cockpit_voice.WORDS["voice_busy"])
                 return None
             try:
@@ -4599,15 +4782,14 @@ class _Handler(GuardedHandler):
         if not self._off_box_token_valid():
             self._gated_read_403("the board needs", head=head)
             return
-        if not self.server.request_gate.acquire(blocking=False):
-            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+        if not self._page_slot_or_refuse(head=head):
             return
         try:
             payload = _board_value(self.server)
         except Exception as exc:  # noqa: BLE001 - never a dead connection
             payload = {"error": "board_unreadable", "message": f"the board could not be built ({type(exc).__name__})"}
         finally:
-            self.server.request_gate.release()
+            self._release_page_slot()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
                    status=500 if "error" in payload else 200, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
@@ -4630,11 +4812,10 @@ class _Handler(GuardedHandler):
         # install's own log does not hold, and one route must give one answer.
         if reader is not None:
             if _HOST_SESSION_STEM.fullmatch(stem) and ".." not in stem:
-                if not self.server.request_gate.acquire(blocking=False):
-                    self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                if not self._page_slot_or_refuse(head=head):
                     return
                 try:
-                    # The reader runs inside the request gate, as read_session does, so a host reader must be bounded.
+                    # The reader runs inside the page slot, as read_session does, so a host reader must be bounded.
                     body = reader(stem, datetime.now(timezone.utc))
                     if body is not None:
                         if not isinstance(body, dict) or not isinstance(body.get("events"), list):
@@ -4649,10 +4830,9 @@ class _Handler(GuardedHandler):
                     _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
                     status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
                 finally:
-                    self.server.request_gate.release()
+                    self._release_page_slot()
         elif root is not None:     # the stem is checked by read_session (its STEM), the one place it is
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 from levain.cockpit.session_log import read_session
@@ -4666,23 +4846,90 @@ class _Handler(GuardedHandler):
                 _log.warning("session transcript read failed: %s: %s", type(exc).__name__, exc)
                 status, payload = 500, {"error": "internal", "message": "the session's transcript could not be read"}
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
         if blob is None:
             blob = json.dumps(payload).encode("utf-8")
         self._send(blob, "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _refused(self, gate: str, route: "str | None" = None, ms: "float | None" = None) -> None:
+        """Count and log one 503 refusal of this request's route at ``gate`` (a fixed name, never request content).
+        ``route`` is a template key for a route its path cannot name (a host's registered route): ``extra``. ``ms``
+        set makes the refusal the request's one timed count too (see :meth:`_RouteStats.record_refusal`)."""
+        _ROUTE_STATS.record_refusal(route or getattr(self, "path", ""), gate, ms=ms)
+
+    def _send_busy(self, *, head: bool, gate: str = "request_gate", retry_after: bool = False,
+                   route: "str | None" = None, ms: "float | None" = None) -> None:
+        """The plain 503 ``busy`` a gated route answers when it has no slot, counted and logged through
+        :meth:`_refused`; ``retry_after`` adds the ``Retry-After`` header."""
+        self._refused(gate, route, ms)
+        self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head,
+                   headers=[("Retry-After", "2")] if retry_after else None)
+
+    def _acquire_page_slot(self) -> "str | None":
+        """Take a ``page_gate`` slot for one of the page's per-load reads, waiting up to ``_PAGE_READ_WAIT_SECONDS``.
+        None: a slot is held, and the caller MUST :meth:`_release_page_slot`. Else the refusal's gate name:
+        ``page_wait`` (the wait timed out), ``page_waiters_full`` (``_MAX_PAGE_WAITERS`` already wait, refused at
+        once) or ``abandoned`` (the client closed its end during the wait: the slot is given back and the connection
+        closed, nothing is answered, as the panel path does). Waiters are counted under the lock and a newcomer takes
+        the fast path only while none wait; the waiters themselves are not served in arrival order (the semaphore is
+        not FIFO), so under sustained saturation one may lose a freed slot and time out as ``page_wait``."""
+        srv = self.server
+        with srv.page_waiters_lock:
+            if srv.page_waiters == 0 and srv.page_gate.acquire(blocking=False):
+                return None
+            if srv.page_waiters >= _MAX_PAGE_WAITERS:
+                return "page_waiters_full"
+            srv.page_waiters += 1
+        try:
+            got = srv.page_gate.acquire(timeout=_PAGE_READ_WAIT_SECONDS)
+        finally:
+            with srv.page_waiters_lock:
+                srv.page_waiters -= 1
+        if not got:
+            return "page_wait"
+        try:
+            open_ = self._peer_open()
+        except BaseException:      # the slot is ours and no caller holds it yet: never leak it
+            srv.page_gate.release()
+            raise
+        if not open_:     # the client gave up during its wait: skip the store read nobody will receive
+            srv.page_gate.release()
+            self.close_connection = True
+            return "abandoned"
+        return None
+
+    def _release_page_slot(self) -> None:
+        self.server.page_gate.release()
+
+    def _page_slot_or_refuse(self, *, head: bool, route: "str | None" = None, since: "float | None" = None) -> bool:
+        """Take a page slot, or answer the counted 503 ``busy`` with ``Retry-After`` and return False. An abandoned
+        wait (the client left) answers nothing and is no refusal: False, the connection closing. ``since`` (a
+        ``time.monotonic()`` start) is for a route whose dispatcher times the read itself: the outcome is then left in
+        ``_page_outcome`` (``refused`` or ``abandoned``) and a refusal is recorded once WITH its wait as the time."""
+        gate = self._acquire_page_slot()
+        if gate is None:
+            return True
+        if since is not None:
+            self._page_outcome = "abandoned" if gate == "abandoned" else "refused"
+        if gate != "abandoned":
+            self._send_busy(head=head, gate=gate, retry_after=True, route=route,
+                            ms=None if since is None else (time.monotonic() - since) * 1000.0)
+        return False
+
     def _acquire_read_slot(self) -> bool:
         """Take a read-pool slot and a ``request_gate`` slot for a cockpit read, waiting up to
         ``_READ_WAIT_SECONDS`` behind at most ``_MAX_READ_WAITERS`` other waiting reads. A read does not take
         the fast path while others wait, so it cannot barge past them. False (the caller answers 503) when
-        the wait times out or the waiting room is full. Pair with ``_release_read_slot``."""
+        the wait times out or the waiting room is full; ``_refusal_gate`` then names which. Pair with ``_release_read_slot``."""
         srv = self.server
+        self._refusal_gate = ""
         deadline = time.monotonic() + _READ_WAIT_SECONDS
         with srv.read_waiters_lock:
             if srv.read_waiters == 0 and srv.read_gate.acquire(blocking=False):
                 queued = False
             elif srv.read_waiters >= _MAX_READ_WAITERS:
+                self._refusal_gate = "read_waiters_full"
                 return False
             else:
                 srv.read_waiters += 1
@@ -4694,10 +4941,12 @@ class _Handler(GuardedHandler):
                 with srv.read_waiters_lock:
                     srv.read_waiters -= 1
             if not got:
+                self._refusal_gate = "read_wait"
                 return False
         if srv.request_gate.acquire(timeout=max(0.0, deadline - time.monotonic())):
             return True
         srv.read_gate.release()
+        self._refusal_gate = "request_gate_wait"
         return False
 
     def _release_read_slot(self) -> None:
@@ -4772,12 +5021,14 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Retry-After", "2")] if status == 503 else None, cache_control=cache_control)
 
-    def _pair_refuse(self, status: int, error: str, message: str) -> None:
+    def _pair_refuse(self, status: int, error: str, message: str, *, gate: str = "request_gate") -> None:
         """A pair POST refused before its body is read: closed at once, the body never read (G1: draining an
         unauthenticated or busy request's body outside any gate let a slow-body client hold a server thread; a
         client may see a TCP RST before the refusal, and the page's one retry covers it), ``Retry-After`` on a 503
         (F5)."""
         self.close_connection = True
+        if status == 503:
+            self._refused(gate)
         self._pair_send({"error": error, "message": message}, status)
 
     def _pair_call(self, fn: "Callable[[Any], dict[str, Any]]") -> "tuple[dict[str, Any], int]":
@@ -4790,12 +5041,14 @@ class _Handler(GuardedHandler):
         try:
             broker.start_async()
         except Exception:  # noqa: BLE001 - G5: a starter thread that cannot start is the controlled 503
+            self._refused("pair_broker")
             return {"error": "broker_unavailable", "message": "the cockpit broker could not start; try again"}, 503
         state = broker.wait_settled(_PAIR_WAIT_S)
         db = broker.active_db() if state is Lifecycle.ACTIVE else None
         if db is None:
             if state is Lifecycle.INSTALL_DISABLED:
                 return {"error": "install_disabled", "message": f"write-disabled: {broker.disabled_reason}"}, 403
+            self._refused("pair_broker")
             return {"error": "broker_unavailable", "message": f"the cockpit broker is {state.value}"}, 503
         try:
             return fn(db), 200
@@ -4819,6 +5072,7 @@ class _Handler(GuardedHandler):
             self._send(b"", cockpit_stream.CONTENT_TYPE, head=True)
             return
         if not srv.stream_gate.acquire(blocking=False):
+            self._refused("stream_gate")
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503)
             return
         sub = None
@@ -4877,7 +5131,7 @@ class _Handler(GuardedHandler):
             self._serve_sheet(head=head, consent=True)
             return
         consent_read = _consent_sheet_read(path)
-        if consent_read is not None:                # its read rides the sign listing's gate exactly
+        if consent_read is not None:                # its read waits on the page gate (_sign_read_admitted)
             self._serve_consent_sheet(consent_read, head=head)
             return
         if _dispatch_sheet_id(path) is not None:    # the same sheet over a dispatch job (OS-2)
@@ -4886,15 +5140,15 @@ class _Handler(GuardedHandler):
         if path == _COORD_SHEET:                    # the drop sheet's page (OS-2): the same shell
             self._serve_sheet(head=head, coord=True)
             return
-        if path in (_COORD_LIST, _DESK_LIST):                     # its read rides the sign listing's gate exactly
+        if path in (_COORD_LIST, _DESK_LIST):                     # its read waits on the page gate (_sign_read_admitted)
             self._serve_coord_sheet(head=head)
             return
         dispatch_read = _dispatch_sheet_read(path)
-        if dispatch_read is not None or path == _DISPATCH_LIST:     # its reads ride the sign listing's gate exactly
+        if dispatch_read is not None or path == _DISPATCH_LIST:     # its reads wait on the page gate (_sign_read_admitted)
             self._serve_dispatch_sheet(dispatch_read, head=head)
             return
         # Web push (OS-4): the app shell (worker, manifest, icons) token-free and always served, the reads beside a
-        # Signer only, on the sign reads' own gate
+        # Signer only, on the page gate (_sign_read_admitted)
         if path in _push_static():
             self._serve_push(path, head=head)
             return
@@ -4906,13 +5160,13 @@ class _Handler(GuardedHandler):
         if path == _SIGN_LIST_PATH or _sign_one(path) is not None:
             self._serve_sign_list(head=head, one=_sign_one(path))
             return
-        if path == _GRANT_LIST_PATH:      # the grants' revoke listing rides that gate exactly (PLAN M17 "9a")
+        if path == _GRANT_LIST_PATH:      # the grants' revoke listing (PLAN M17 "9a"): a page-gate read
             self._serve_grant_list(head=head)
             return
-        if path == _ENVELOPE_LIST_PATH:   # the envelopes' revoke listing, the same gate (board row 153)
+        if path == _ENVELOPE_LIST_PATH:   # the envelopes' revoke listing (board row 153): a page-gate read
             self._serve_envelope_list(head=head)
             return
-        if path.startswith(_HOSTGRANT_PREFIX):   # host grants: the same gate; 404 for every path unless mounted
+        if path.startswith(_HOSTGRANT_PREFIX):   # host grants: a page-gate read; 404 for every path unless mounted
             self._serve_hostgrant_list(path, head=head)
             return
         if path == _PAIR_LIST:            # PAIR RP-4: an AUTHED pair route, a token on every bind
@@ -4957,11 +5211,18 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             _tq = time.monotonic()
-            self._q503 = False
+            self._page_outcome = ""
             try:
-                self._serve_question_body(path, head=head)
-            finally:   # a client that left mid-send (BrokenPipe) is still one counted read
-                _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0, refused=self._q503)
+                self._serve_question_body(path, head=head, since=_tq)
+            finally:
+                # ONE record per request: a read refused after its wait was counted and timed by ``record_refusal`` (and
+                # its slow line carries ``refused=503``), so it adds nothing here; an abandoned wait is one ``aborted``;
+                # anything else (served, 403, 404, a client that left mid-send) is one normal read
+                _ms = (time.monotonic() - _tq) * 1000.0
+                if self._page_outcome == "abandoned":
+                    _ROUTE_STATS.record(path, _ms, gate_wait_ms=_ms, aborted=True)
+                elif self._page_outcome != "refused":
+                    _ROUTE_STATS.record(path, _ms)
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
@@ -4994,9 +5255,10 @@ class _Handler(GuardedHandler):
                 self._serve_stream(head=head)
                 return
             _t0 = time.monotonic()
+            self._refusal_gate = ""
             if not self._acquire_read_slot():
                 _wait = (time.monotonic() - _t0) * 1000.0
-                _ROUTE_STATS.record(path, _wait, gate_wait_ms=_wait, refused=True)
+                _ROUTE_STATS.record_refusal(path, self._refusal_gate or "read_wait", ms=_wait)
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             _wait = (time.monotonic() - _t0) * 1000.0
@@ -5035,11 +5297,8 @@ class _Handler(GuardedHandler):
             return
 
         if path == "/substrate.json":
-            # Bound concurrent store reads (the expensive route); past the cap → 503.
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(
-                    b"busy\n", "text/plain; charset=utf-8", status=503, head=head
-                )
+            # Bound concurrent store reads (the expensive route): a read of the page's own, so it waits on the page gate.
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 body = build_substrate_json(
@@ -5063,17 +5322,14 @@ class _Handler(GuardedHandler):
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
         if path == "/recall.json":
             # Read-only keyword search over episodes (intention-107). Bounded like
-            # /substrate.json — the store read is the expensive part; past the cap → 503.
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(
-                    b"busy\n", "text/plain; charset=utf-8", status=503, head=head
-                )
+            # /substrate.json — the store read is the expensive part; it waits on the page gate.
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 from urllib.parse import parse_qs, urlsplit
@@ -5090,7 +5346,7 @@ class _Handler(GuardedHandler):
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
@@ -5108,8 +5364,8 @@ class _Handler(GuardedHandler):
             # (gated, GET/HEAD only — no write path), so it rides this same envelope. Returns the
             # job's status/result; FAILS CLOSED on a corrupt job store (500) so a poll never reports
             # a false `unknown` that would make the operator re-propose a duplicate expensive job.
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            # The page polls it while a job runs, so it waits on the page gate.
+            if not self._page_slot_or_refuse(head=head):
                 return
             try:
                 from urllib.parse import parse_qs, urlsplit
@@ -5135,20 +5391,20 @@ class _Handler(GuardedHandler):
                 ).encode("utf-8")
                 status_code = 500
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
             self._send(body, "application/json; charset=utf-8", status=status_code, head=head)
             return
 
         # Downstream-registered dynamic JSON routes (the FleetView extension point):
-        # read-only, gated EXACTLY like /substrate.json so a control plane's extra views
+        # read-only, gated EXACTLY like /substrate.json (the page gate) so a control plane's extra views
         # ride this same security envelope (Host allowlist, CSP, concurrency gate, the
         # bind-refusal contract) instead of standing up a second server that would
         # duplicate — and could drift from — that contract. GET/HEAD only; there is no
-        # POST path to them, so an extra route can never become a write surface.
+        # POST path to them, so an extra route can never become a write surface. A refusal is counted
+        # under the one key "extra" (a host's route path is never a stats key).
         json_builder = self.server.extra_json.get(path)
         if json_builder is not None:
-            if not self.server.request_gate.acquire(blocking=False):
-                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            if not self._page_slot_or_refuse(head=head, route="extra"):
                 return
             try:
                 body = json_builder()
@@ -5170,7 +5426,7 @@ class _Handler(GuardedHandler):
                     {"errors": {"server": f"{type(exc).__name__}: {exc}"}}
                 ).encode("utf-8")
             finally:
-                self.server.request_gate.release()
+                self._release_page_slot()
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
@@ -5292,6 +5548,8 @@ class _Handler(GuardedHandler):
         socket. The rate-gate is acquired BEFORE the body read, so the bounded
         read+drain+write phase is itself concurrency-bounded; a slowloris is capped by
         the gate + the 30s socket timeout. The write layer does the actual edit."""
+        self._post_t0 = time.monotonic()
+        self._post_received_at = datetime.now(timezone.utc).isoformat()
         # Same Host allowlist as reads (DNS rebinding), then CSRF layer 1: a write must come from
         # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
         if self._refuse_write_origin():
@@ -5403,6 +5661,7 @@ class _Handler(GuardedHandler):
                  or (sign is not None and sign[1] == "attempt"))
         if not (self.server.request_gate.acquire(timeout=5) if waits
                 else self.server.request_gate.acquire(blocking=False)):
+            self._refused("request_gate")
             return self._reject(503, "busy", "server busy")
         result: dict[str, object] | None = None
         try:
@@ -5584,12 +5843,17 @@ class _Handler(GuardedHandler):
                     result = self._pending_post(pending[0], pending[1], req)
                 else:
                     # one dispatch for the cockpit route and both legacy aliases (design §4.3)
-                    result = dispatch_verb(
-                        registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
-                        credential=self._credential(), install_class=self._install_class(),
-                        route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
-                        job_runtime=self.server.job_runtime, broker=self.server.broker,
-                        signed_for=self._signed_for, signer=self.server.signer)
+                    if route == _COCKPIT_VERB_PATH and isinstance(req, dict) and isinstance(req.get("verb"), str):
+                        self._write_verb = req["verb"]
+                    with request_received(self._post_received_at):
+                        result = dispatch_verb(
+                            registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
+                            credential=self._credential(), install_class=self._install_class(),
+                            route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
+                            job_runtime=self.server.job_runtime, broker=self.server.broker,
+                            signed_for=self._signed_for, signer=self.server.signer)
+                    if route == _COCKPIT_VERB_PATH:
+                        self._note_fired(result)
             except EditError as exc:
                 self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
@@ -5632,7 +5896,7 @@ class _Handler(GuardedHandler):
         the code is the credential. Its own 2-slot semaphore (RP-4); the label is the offer's (RP-6); no lockout
         (RP-5); nothing of the body is ever logged."""
         if not self.server.pair_claim_gate.acquire(blocking=False):
-            return self._pair_refuse(503, "busy", "server busy")
+            return self._pair_refuse(503, "busy", "server busy", gate="pair_claim_gate")
         try:
             req = self._pair_body()
             if req is None:
@@ -5673,7 +5937,7 @@ class _Handler(GuardedHandler):
         already ran or run here; the body is capped at 512 bytes; its own 2-slot semaphore; the store authenticates the
         report by the endpoint hash it names and bounds how much one device may write (levain.webpush.routes.receipt)."""
         if not self.server.receipt_gate.acquire(blocking=False):
-            return self._pair_refuse(503, "busy", "server busy")
+            return self._pair_refuse(503, "busy", "server busy", gate="receipt_gate")
         try:
             if self._refuse_non_json():
                 return
@@ -6374,8 +6638,9 @@ def make_server(
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()} | proxied_hosts
     httpd.proxied_hosts = proxied_hosts
-    # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
-    # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
+    # Bound the expensive routes (store read + writes). The panel and manifest reads wait briefly for a read-pool slot
+    # (see _acquire_read_slot) and leave _RESERVED_SLOTS free of a burst; the page's other GET reads wait on page_gate
+    # (see _acquire_page_slot); the writes, notify and the room tick answer 503 at once past request_gate's cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     # premium voice (V1-4): its own small gate, never request_gate; the real providers' HTTP; per-provider last reads
     httpd.desk_gate = threading.BoundedSemaphore(_DESK_READS_INFLIGHT)
@@ -6391,6 +6656,9 @@ def make_server(
     httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()
+    httpd.page_gate = threading.BoundedSemaphore(_PAGE_READS_INFLIGHT)
+    httpd.page_waiters = 0
+    httpd.page_waiters_lock = threading.Lock()
     view = VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)) if cockpit is not None else None
     pinned = False
     try:
