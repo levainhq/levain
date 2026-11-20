@@ -14,7 +14,6 @@ from levain.cockpit import room as cockpit_room
 from levain.web_server import make_server
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_room import TOKEN, World, _call, _serve_room
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 
 GET = cockpit_room.ROOM_PATH
 OWNER_KEY = "room-wait-owner-key"                  # the `browser` surface token: the owner key, honoured on the box only

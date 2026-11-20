@@ -363,7 +363,6 @@ def test_three_pages_bursting_at_once_do_not_starve_the_band_and_board_reads(tmp
 from tests.test_cockpit_room import TOKEN as ROOM_TOKEN  # noqa: E402
 from tests.test_cockpit_room import World, _serve_room  # noqa: E402
 from tests.test_cockpit_room import _call as _room_call  # noqa: E402
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401  (fixture)
 from tests.test_cockpit_webpush import T as PUSH_TOKEN  # noqa: E402
 from tests.test_cockpit_webpush import _signed  # noqa: E402
 from levain.consent.notes import NoteStore  # noqa: E402

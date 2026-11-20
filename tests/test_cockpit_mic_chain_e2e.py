@@ -26,7 +26,6 @@ from tests.test_cockpit_k2a import TOKEN  # noqa: E402
 from tests.test_cockpit_voice_routes import (VALUE, _clock_before_the_openai_cutoff, call, js, rig, served,  # noqa: E402,F401
                                              pytestmark)
 from tests.test_cockpit_flip_parity import _drive, needs_browser  # noqa: E402
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401  (fixture: the consent directory the server reads)
 from tests.test_voice_deepgram_stream import METADATA, results  # noqa: E402
 from tests.test_voice_room_hook import HEAD, INIT, _to_room  # noqa: E402
 from tests.test_voice_wsclient import Server  # noqa: E402

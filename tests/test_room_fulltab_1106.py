@@ -12,7 +12,6 @@ from pathlib import Path
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _serve
 from tests.test_cockpit_room_join import _rig
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 
 WEB = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web"
 

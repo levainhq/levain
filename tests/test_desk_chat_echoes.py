@@ -590,9 +590,12 @@ def test_the_thread_read_carries_the_tool_name_of_a_result_and_reads_a_store_tha
     s.show("tool_call", body="", turn_id="t-1", call_id="toolu_b", tool_name="Bash")
     s.show("tool_result", body="1\talpha\n2\tbeta", turn_id="t-1", call_id="toolu_b", tool_name="Bash")
     assert svc.read_next(world["launch"]) == 2
-    got = threads.thread_stream(qdir, world["thread"])
-    assert [(i["kind"], i.get("tool_name")) for i in got["stream"] if i["kind"].startswith("vendor_tool")] == [
-        ("vendor_tool_call", "Bash"), ("vendor_tool_result", "Bash")]
+    conn = threads._open(qdir)
+    try:
+        facts, _gap = threads._event_facts(conn, {world["launch"]})
+    finally:
+        conn.close()
+    assert sorted(f[3] for f in facts.values()) == ["Bash", "Bash"]
 
 
 def test_a_reader_of_a_store_without_the_column_draws_every_name_as_none(qdir, store, world):
@@ -600,10 +603,14 @@ def test_a_reader_of_a_store_without_the_column_draws_every_name_as_none(qdir, s
     c, _m = _released_store(qdir, store, world)
     c.close()
     assert "tool_name" not in [r[1] for r in raw(qdir).execute("PRAGMA table_info(chat_events)")]
-    got = threads.thread_stream(qdir, world["thread"])               # read-only: it migrates nothing
-    assert [i for i in got["stream"] if i["kind"] == "vendor_agent_text"], got
+    conn = threads._open(qdir)                                      # read-only: it migrates nothing
+    try:
+        facts, _gap = threads._event_facts(conn, {world["launch"]})
+    finally:
+        conn.close()
+    assert facts, facts
     assert "tool_name" not in [r[1] for r in raw(qdir).execute("PRAGMA table_info(chat_events)")]
-    assert all(i.get("tool_name") is None for i in got["stream"])
+    assert all(f[3] is None for f in facts.values())
 
 
 def test_non_additive_column_is_refused_and_nothing_changes(qdir, store, world, monkeypatch):

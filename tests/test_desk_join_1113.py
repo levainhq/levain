@@ -22,7 +22,6 @@ from levain import web_server
 from levain.desk.desk_port import DeskCaps, ScriptedDeskPort
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_desk_pane_page import PHONE, _OPEN, _TAP_DESK, _TOKENED, _no_ban_words, typed, until
 
 ASSET = "/desk_tab_view.js"

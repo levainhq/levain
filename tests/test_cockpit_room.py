@@ -19,7 +19,6 @@ from levain.desk.store import CoordError
 from tests.test_chat_room_send import LIVE, Clock, Counting, _attach, _open_room_thread, _room_launch, _thread
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from levain.desk.legacy import ROLE_DESK
 
 def scripted(*sends):

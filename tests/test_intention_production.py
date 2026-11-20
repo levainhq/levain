@@ -13,7 +13,6 @@ from levain import germinate as g
 from levain.consent.questions import QuestionStore
 from levain.intentions import guarded_intention_store
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 
 
 def _get(base: str, path: str) -> tuple[int, dict]:

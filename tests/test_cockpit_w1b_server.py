@@ -333,7 +333,7 @@ def test_every_separately_gated_read_names_what_would_help_and_keeps_its_headers
     with _signed(src, qdir) as (port, _h):
         # the grant listing shares the sign listing's gate (_sign_read_admitted) and is unrouted on this server
         for path in ("/webpush/key", "/webpush/record", "/cockpit/sign.json", "/cockpit/consent/x.json", "/cockpit/question/1.json", "/cockpit/note/1.json",
-                     "/cockpit/band.json", "/cockpit/threads.json", "/cockpit/board.json", "/cockpit/session/x.json"):
+                     "/cockpit/band.json", "/cockpit/board.json", "/cockpit/session/x.json"):
             st, out, hdrs = _call(port, "GET", path)
             assert (st, out.get("auth")) == (403, "owner"), (path, st, out)
             assert "token" in out["message"] and hdrs.get("cache-control") == "private, no-store", (path, hdrs)

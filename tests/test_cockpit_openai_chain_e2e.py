@@ -18,7 +18,6 @@ from levain.cockpit import voice as cockpit_voice  # noqa: E402
 from levain.voice import meter as vmeter, openai_stream  # noqa: E402
 from tests.test_cockpit_voice_routes import (_clock_before_the_openai_cutoff, js, rig, served, pytestmark)  # noqa: E402,F401
 from tests.test_cockpit_voice_stream_routes import CLOSE, CHUNK, PCM, keyed, open_session, post  # noqa: E402
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401
 from tests.test_voice_openai_stream import committed, delta, done  # noqa: E402
 from tests.test_voice_wsclient import Server  # noqa: E402
 
