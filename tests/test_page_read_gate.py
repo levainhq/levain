@@ -905,7 +905,7 @@ def test_a_refused_question_read_is_one_count_one_refusal_one_line_and_an_abando
     finally:
         _release(httpd.page_gate, held)
     row = stats.snapshot()["question/<n>"]
-    assert (row["count"], row["refused_503"], row["aborted"]) == (1, 1, 0), row     # record() counts the request, the refusal its 503
+    assert (row["count"], row["refused_503"], row["aborted"]) == (1, 1, 0), row     # one row count for the refused read, and its 503, from the one record_refusal call
     assert row["total_ms"] >= 150.0 and row["max_ms"] == row["total_ms"], row         # the one time is the wait
     assert _refusal_lines(caplog) == ["refused 503 route=question/<n> gate=page_wait n=1"], _refusal_lines(caplog)
 
@@ -963,9 +963,8 @@ def test_a_question_read_whose_client_left_during_the_wait_is_one_aborted_and_no
             httpd.page_gate.release()                                     # a slot frees: the waiter takes it, sees nobody
             held.pop()
             end = time.monotonic() + 5.0
-            while not stats.snapshot().get("question/<n>") and time.monotonic() < end:
-                time.sleep(0.01)
-            time.sleep(0.2)
+            while stats.snapshot().get("question/<n>", {}).get("aborted", 0) < 1 and time.monotonic() < end:
+                time.sleep(0.01)          # the row is written by the waiter's own thread: wait for it, not for a fixed time
     finally:
         s.close()
         _release(httpd.page_gate, held)
