@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from scripts.vm_harness.driver import GuestError
-from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, profile_named
+from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, cd_run, profile_named
 from scripts.vm_harness.journey8 import LEVAIN_ROOT, StepResult, levain_argv
 from scripts.vm_harness.runbook import Evidence, RunbookError, Verdict, capture, judge, overall
 from scripts.vm_harness.threec10 import (CRED_NAME_RE, INSTALL_SCRIPT, REMOVE_SCRIPT, USD, VERIFY_SCRIPT, FetchError,
@@ -307,13 +307,13 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
 
     def dispatch_argv(verb: Sequence[str]) -> tuple[str, ...]:
         """A levain verb as the STOPGAP runs it (np-667d731c (b)): as the dispatch account, against ``L/dispatch``, verified
-        against the run server's authority replica. ``file``, ``sign`` and ``authorise`` also name the data root. ``env -C`` sets the
-        cwd to the dispatch dir: sudo keeps the caller's cwd (the admin home, 0700 on a fresh image), which the dispatch account
-        cannot read, so ``os.getcwd()`` raised PermissionError."""
+        against the run server's authority replica. ``file``, ``sign`` and ``authorise`` also name the data root. The command runs
+        from the dispatch dir (:func:`~scripts.vm_harness.host_profile.cd_run`): sudo keeps the caller's cwd (the admin home, 0700
+        on a fresh image), which the dispatch account cannot read, so ``os.getcwd()`` raised PermissionError."""
         extra = ("--dispatch-dir", dispatch_dir(cfg))
         if verb[:2] in (("dispatch", "file"), ("dispatch", "sign"), ("dispatch", "authorise")):
             extra += ("--data-root", authority_root(cfg))
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "-C", dispatch_dir(cfg), f"HOME={dispatch_dir(cfg)}",*levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", f"HOME={dispatch_dir(cfg)}", *cd_run(dispatch_dir(cfg)), *levain_argv(cfg.profile, (*verb, *extra), cfg.levain_root))
 
     def operator(*verb: str, stdin: str | None = None, timeout: float = 300) -> tuple[str, int]:
         """A levain verb as the stopgap runs it: (merged output, exit code). A refusal (exit 2) is data, not an error."""
@@ -360,7 +360,7 @@ def run_wave3(guest, stdin_run, evidence_dir, cfg: Config, *, fetch=default_fetc
             sleep(cfg.poll_s)
 
     def dispatch_user_argv() -> tuple[str, ...]:
-        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "-C", dispatch_dir(cfg), "PATH=/usr/bin:/bin", f"HOME={dispatch_dir(cfg)}", cfg.profile.python, "-I", "-")
+        return ("sudo", "-n", "-u", cfg.profile.dispatch_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={dispatch_dir(cfg)}", *cd_run(dispatch_dir(cfg)), cfg.profile.python, "-I", "-")
 
     def tickets(job: str) -> list[dict]:
         sock = f"{cfg.profile.run_dir}/control/control.sock"

@@ -59,8 +59,22 @@ def test_run_pins_cwd_to_root_and_the_dispatch_argv_sets_home(tmp_path, monkeypa
     a = _args(tmp_path)
     for argv in (SC.as_dispatch(a, ["x"]), SC.as_dispatch_script(a, [])):
         assert f"HOME={a.dispatch_dir}" in argv      # the recorded failure: ~/.levain/consent/... unreadable under admin's HOME
-        i = argv.index("/usr/bin/env")
-        assert argv[i + 1:i + 3] == ["-C", a.dispatch_dir]   # the recorded failure: getcwd() PermissionError under admin's 0700 home
+        # the recorded failure: getcwd() PermissionError under admin's 0700 home; the command runs from the dispatch dir
+        i = argv.index("/bin/sh")
+        assert tuple(argv[i:i + 5]) == SC.cd_run(a.dispatch_dir)
+        assert argv.index(f"HOME={a.dispatch_dir}") < i           # the env assignments come first, the command last
+
+
+def test_the_two_copies_of_the_cd_words_are_equal_and_really_change_directory(tmp_path):
+    """stage_call.py is copied alone into the guest, so it keeps its own cd_run; the two must not drift."""
+    from scripts.vm_harness import host_profile
+    d = tmp_path / "a dir with 'quotes' and $dollars"
+    d.mkdir()
+    assert SC.cd_run(str(d)) == host_profile.cd_run(str(d))
+    r = subprocess.run([*host_profile.cd_run(str(d)), "/bin/pwd", "-P"], cwd="/", capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and r.stdout.strip() == os.path.realpath(d)     # the directory was a positional argument
+    bad = subprocess.run([*host_profile.cd_run(str(tmp_path / "missing")), "/usr/bin/true"], capture_output=True, text=True, timeout=30)
+    assert bad.returncode != 0 and "/usr/bin/true" not in bad.stdout          # a missing dir never runs the command
 
 
 # ---- J: provider_policy read: [] refused every contract ----------------------------------------------------------------------

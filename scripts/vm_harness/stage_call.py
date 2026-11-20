@@ -90,17 +90,23 @@ def json_in(text: str):
     return None
 
 
+def cd_run(directory):
+    """The words that run the rest of an argv from ``directory``: this file is copied alone into the guest, so it carries its
+    own copy of ``host_profile.cd_run`` (``tests/test_vm_harness_stage_call.py`` holds the two equal)."""
+    return ("/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", directory)
+
+
 def as_dispatch(a, argv):
     """Prefix for a command that must run as the dispatch account (wave3_e2e.dispatch_argv's form). --as-user '' = host test."""
     if a.as_user:
-        return ["sudo", "-n", "-u", a.as_user, "/usr/bin/env", "-C", a.dispatch_dir, "PATH=/usr/bin:/bin", f"HOME={a.dispatch_dir}", f"PYTHONPATH={a.levain_root}", *argv]
+        return ["sudo", "-n", "-u", a.as_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={a.dispatch_dir}", f"PYTHONPATH={a.levain_root}", *cd_run(a.dispatch_dir), *argv]
     return ["/usr/bin/env", f"PYTHONPATH={a.levain_root}", *argv]
 
 
 def as_dispatch_script(a, script_args):
     """``python -I -`` as the dispatch account with SCRIPT on stdin (the READ_TICKETS pattern)."""
     if a.as_user:
-        return ["sudo", "-n", "-u", a.as_user, "/usr/bin/env", "-C", a.dispatch_dir, "PATH=/usr/bin:/bin", f"HOME={a.dispatch_dir}", a.python, "-I", "-", *script_args]
+        return ["sudo", "-n", "-u", a.as_user, "/usr/bin/env", "PATH=/usr/bin:/bin", f"HOME={a.dispatch_dir}", *cd_run(a.dispatch_dir), a.python, "-I", "-", *script_args]
     return [a.python, "-I", "-", *script_args]
 
 
