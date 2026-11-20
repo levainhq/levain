@@ -262,11 +262,14 @@ def test_a_read_with_no_flow_band_says_the_band_evidence_was_not_supplied_in_the
     argv = ("--items", str(items), "--repo", str(world.w), "--since", "2026-11-12T00:00:00Z", "--no-land-waiter")
     rc, out, _ = run(capsys, "--json", *argv)
     reason = json.loads(out)["items"][0]["reason"]
+    assert rc == 3                                  # unknown is an audit entry: the exit code names it
     assert ("band evidence not supplied (flow's band arrives through --evidence-extra or a saved --producer flow)" in reason
             and "is not in the band" not in reason)
     rc, table, _ = run(capsys, *argv)
+    assert rc == 3                                  # unknown is an audit entry: the exit code names it
     assert "band evidence not supplied" in table and "is not in the band" not in table
     rc, doc, _ = board(capsys, world, items, extra_file(tmp_path, waiters=[]), "--no-land-waiter")
+    assert rc == 3                                  # unknown is an audit entry: the exit code names it
     assert doc["items"][0]["reason"] == "band:np-d4384dc8 is not in the band"
 
 

@@ -546,14 +546,15 @@ def test_an_np_link_with_no_band_block_from_flow_says_the_band_evidence_was_not_
         assert _FLOW_ROW in got[iid].reason and "is not in the band" not in got[iid].reason, got[iid].reason
 
 
-def test_with_a_q_id_and_an_np_id_both_absent_and_no_flow_block_the_first_absent_id_decides_the_wording():
-    """levain#184, a stated ordering: ``gone[0]`` picks the wording, so the same two absent ids read differently by the order the
-    item lists them; the refs named are the same either way."""
+def test_a_genuinely_absent_q_id_is_never_hidden_by_an_unsupplied_np_id_in_either_order():
+    """levain#184: a q- id is Levain's own and Levain's band was whole, so its absence is a real claim that supplying flow's band
+    would not clear; the reason names it first, then the np- row's missing evidence, whichever order the item lists them in."""
     q, np_ = {"kind": "band", "ref": "q-" + "0" * 24}, {"kind": "band", "ref": _FLOW_ROW}
     got, _ = board_of(ev2(**whole("levain"), producers=("levain",)), _item(1, depends_on=[q, np_]), _item(2, depends_on=[np_, q]))
-    assert got["levain#1"].reason == "band:q-" + "0" * 24 + " is not in the band"
-    assert got["levain#2"].reason == (f"band:{_FLOW_ROW}: band evidence not supplied "
-                                      "(flow's band arrives through --evidence-extra or a saved --producer flow)")
+    want = ("band:q-" + "0" * 24 + " is not in the band; "
+            f"band:{_FLOW_ROW}: band evidence not supplied (flow's band arrives through --evidence-extra or a saved --producer flow)")
+    assert got["levain#1"].reason == got["levain#2"].reason == want
+    assert got["levain#1"].refs == ("q-" + "0" * 24, _FLOW_ROW) and got["levain#2"].refs == (_FLOW_ROW, "q-" + "0" * 24)
 
 
 def test_a_band_block_from_flow_that_lacks_the_np_row_keeps_the_is_not_in_the_band_reason():

@@ -1183,11 +1183,14 @@ def _chk_dangling_band(ctx: _Ctx, item: Item):
         return None
     # FLAT_PRODUCER is flow's name in both evidence forms; this wording relies on the unreadable-band early return above firing first
     # (a ``producers`` list that omits a stale flow block is not a CLI-reachable input)
-    if gone[0].startswith(FLOW_BAND_ID_PREFIX) and FLAT_PRODUCER not in ev.band_producers:
-        # an np- row is one of flow's: with no band block from flow, its absence from the blocks that were read is no claim
-        return (f"band:{gone[0]}: band evidence not supplied (flow's band arrives through --evidence-extra or a saved --producer flow)",
-                tuple(gone))
-    return (f"band:{gone[0]} is not in the band", tuple(gone))
+    # an np- row is one of flow's: with no band block from flow, its absence from the blocks that were read is no claim; a ref
+    # that is not an unsupplied np- row is a real absence, and an unsupplied one never hides it
+    unsupplied = [] if FLAT_PRODUCER in ev.band_producers else [r for r in gone if r.startswith(FLOW_BAND_ID_PREFIX)]
+    absent = [r for r in gone if r not in unsupplied]
+    no_flow = (f"band:{unsupplied[0]}: band evidence not supplied "
+               "(flow's band arrives through --evidence-extra or a saved --producer flow)") if unsupplied else None
+    here = f"band:{absent[0]} is not in the band" if absent else None
+    return ("; ".join(x for x in (here, no_flow) if x), tuple(gone))
 
 
 def _chk_dangling_link(ctx: _Ctx, item: Item):
