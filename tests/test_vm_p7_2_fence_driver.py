@@ -96,6 +96,15 @@ ROWS = [
     ("two calls in flight across the revoke",
      [*_ok(1, done="2026-11-20T10:00:02.000Z"), *_ok(2, at="2026-11-20T09:59:59.000Z", done=STRADDLE),
       _use(3, at=AFTER_1), _fenced(3)], "FAIL", "3-IN-FLIGHT", "more than one call in flight"),
+    ("the sole call before the revoke is in flight, then a fenced call",
+     [*_ok(1, at="2026-11-20T09:59:59.000Z", done=STRADDLE), _use(2, at=AFTER_1), _fenced(2)],
+     "INCOMPLETE", "2-PRE", "still in flight"),
+    ("one call in flight and a second call before the revoke with no result at all, then a fenced call",
+     [*_ok(1, at="2026-11-20T09:59:58.000Z", done=STRADDLE), _use(2, at="2026-11-20T09:59:59.000Z"),
+      _use(3, at=AFTER_1), _fenced(3)], "INCOMPLETE", "2-PRE", "still in flight"),
+    ("a call finished before the revoke, a second before it with no result at all, then a fenced call",
+     [*_ok(1), _use(2, at="2026-11-20T09:59:59.000Z"), _use(3, at=AFTER_1), _fenced(3)],
+     "INCOMPLETE", "5-UNPLACED", "no result at all"),
     ("a call executed after the revoke, then a fenced call",
      [*_ok(1), _use(2, at=AFTER_1), _result(2, "ok", LATE), _use(3, at=AFTER_2), _fenced(3)],
      "FAIL", "4-AFTER", "a call executed after the revoke"),
@@ -678,6 +687,18 @@ def test_a_group_whose_members_are_all_gone_is_stopped_without_error():
     proc.wait(timeout=30)
     children.stop_all()
     assert proc.poll() == 0
+
+
+def test_a_second_stop_signals_no_group_already_stopped(monkeypatch):
+    """The group id of a stopped registration may belong to another process group by the time the context exits."""
+    children = D._Children()
+    proc = children.add(subprocess.Popen(EXIT(0), start_new_session=True), group=True)
+    proc.wait(timeout=30)
+    children.stop_all()
+    sent = []
+    monkeypatch.setattr(D.os, "killpg", lambda *a: sent.append(a))
+    children.stop_all()
+    assert sent == [] and children.procs == []
 
 
 def test_a_process_added_without_a_group_is_never_signalled_as_one(monkeypatch):

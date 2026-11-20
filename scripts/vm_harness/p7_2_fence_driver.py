@@ -21,14 +21,17 @@ its stamp, each ``result`` with its stamp and its error flag, and the revoke ins
 decided it:
   1 LINK: every result is linked to its call by tool_use id. A result with no matching call, or a call with no readable stamp,
     is UNPLACED.
-  2 PRE: at least one call with a non-error result whose own stamp is before the revoke. None: INCOMPLETE.
+  2 PRE: at least one call with a non-error result stamped before the revoke (the result's stamp, not only the call's: a call
+    whose result lands at or after the revoke may have been admitted after it, so it proves nothing about the live fence).
+    None: INCOMPLETE.
   3 IN-FLIGHT: a call stamped before the revoke whose result is stamped at or after it was admitted before the revoke (the
     workload is sequential ``sleep`` calls). One such call is tolerated; more than one is a FAIL.
   4 AFTER: the FIRST call stamped at or after the revoke (file order breaks a tie) must come back as an ERROR result, linked by
     id, that carries the fence's words (``broker_client.SLOT_FENCED_TEXT``) and a reason. A non-error result there is a FAIL
     (the call executed), and so is an error result without the fence's words. No result, or no such call, is INCOMPLETE. A
     record that is not a linked tool result is never evidence: fence words found only there make INCOMPLETE.
-  5 UNPLACED: an unplaced non-error result is INCOMPLETE, never a PASS.
+  5 UNPLACED: an unplaced non-error result, or a call stamped before the revoke with no result at all, is INCOMPLETE, never a
+    PASS.
   6 PASS: only when 2, 3 and 4 hold and 5 does not apply.
 It does NOT pin the reason's words (they are the fence's, ``levain.qbroker.fence``), and it does not read the fire's exit code.
 The reason is recorded in RESULT.txt for the person reading it.
@@ -212,7 +215,7 @@ def judge_events(events: Sequence[tuple], revoked: datetime | None) -> Finding:
     orphans = [r for r in results if r[1] not in known]
     unplaced = sum(1 for r in orphans if not r[3])
     unlinked_fence = any(e[0] == "unlinked" for e in events) or any(r[4] for r in orphans)
-    pre = in_flight = 0
+    pre = in_flight = unresolved = 0
     after: list[tuple] = []
     for order, u in enumerate(uses):
         res = result_of.get(u[1])
@@ -222,13 +225,18 @@ def judge_events(events: Sequence[tuple], revoked: datetime | None) -> Finding:
             unplaced += 1 if ran else 0
         elif called >= revoked:
             after.append((called, order, u, res))
+        elif res is None:
+            unresolved += 1
         elif ran:
             done = _when(res[2])
             if done is None:
                 unplaced += 1
-            else:
+            elif done < revoked:
                 pre += 1
-                in_flight += 1 if done >= revoked else 0
+            else:
+                # Stamped before the revoke but finished at or after it: the gate may have admitted it after the revoke, so it
+                # is no proof that a call ran under the live fence. It is tolerated (one) but never counts as a pre call.
+                in_flight += 1
     if in_flight > 1:
         return Finding("FAIL", R_IN_FLIGHT, "rule 3 IN-FLIGHT: more than one call in flight across the revoke: a stale fence "
                                             "or a parallel workload")
@@ -243,14 +251,18 @@ def judge_events(events: Sequence[tuple], revoked: datetime | None) -> Finding:
                                             "than the fence (an error result without the fence's words)", first[2][2], first[2][1],
                            None, res[5], res[2] if isinstance(res[2], str) else None)
     if pre == 0:
-        return Finding("INCOMPLETE", R_PRE, "rule 2 PRE: no call ran before the revoke: rerun in a fresh world with a larger "
-                                            "--revoke-after-s (its timer starts when the session is recorded)")
+        return Finding("INCOMPLETE", R_PRE, "rule 2 PRE: no call ran before the revoke" +
+                       (" (the only call stamped before it was still in flight when it landed)" if in_flight else "") +
+                       ": rerun in a fresh world with a larger --revoke-after-s (its timer starts when the session is recorded)")
     if first is None or first[3] is None:
         if unlinked_fence:
             return Finding("INCOMPLETE", R_AFTER, "rule 4 AFTER: the fence's words appear only in an unlinked record: the "
                                                   "transcript shape is not the one this judge reads")
         return Finding("INCOMPLETE", R_AFTER, "rule 4 AFTER: no call after the revoke" if first is None else
                        "rule 4 AFTER: no result for the first call after the revoke")
+    if unresolved:
+        return Finding("INCOMPLETE", R_UNPLACED, "rule 5 UNPLACED: a call stamped before the revoke has no result at all, so it "
+                                                 "may have run after it")
     if unplaced:
         return Finding("INCOMPLETE", R_UNPLACED, "rule 5 UNPLACED: a non-error result could not be placed against the revoke "
                                                  "(no matching call, or a stamp that is missing or unreadable)")
@@ -295,7 +307,7 @@ def expected_text(cfg: "FenceConfig") -> str:
         "reading a non-pass: rule 2-PRE = no call ran before the revoke (INCOMPLETE); 3-IN-FLIGHT = more than one call in flight "
         "(FAIL); 4-AFTER = the first call after the revoke executed, or was refused by something other than the fence (FAIL), or "
         "has no linked result or the fence's words are only in an unlinked record (INCOMPLETE); 5-UNPLACED = a non-error result "
-        "could not be placed (INCOMPLETE); 0-INPUT = no transcript record or no revoke instant (INCOMPLETE)",
+        "could not be placed, or a call before the revoke has no result (INCOMPLETE); 0-INPUT = no transcript record or no revoke instant (INCOMPLETE)",
         "NOT read back: the fire's exit code, the model's own words, the reason's exact text",
     ])
 
@@ -639,12 +651,14 @@ class _Children:
 
     def stop_all(self) -> None:
         """Newest first: SIGTERM, then SIGKILL once :data:`STOP_GRACE_S` has passed and the process (or, for a grouped one, its
-        group) is still there. A descendant that left the group (a session of its own) is not reached."""
+        group) is still there. A descendant that left the group (a session of its own) is not reached. Each registration is
+        drained as it is stopped, so a later call signals nothing already stopped (a group id may have been reused by then)."""
         if self.stopping:
             return
         self.stopping = True
         try:
-            for proc, pgid in reversed(self.procs):
+            while self.procs:
+                proc, pgid = self.procs.pop()
                 self._stop(proc, pgid)
         finally:
             self.stopping = False
