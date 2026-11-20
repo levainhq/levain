@@ -60,7 +60,7 @@ jobs:
             echo "=== round $i"
             pytest -n "$WORKERS" -q -rf --basetemp=/tmp/levain-pt-$i \
               tests/test_cockpit_k10_keep.py \
-              tests/test_cockpit_flip_parity.py::test_a_send_that_throws_leaves_the_keep_and_agenda_forms_with_a_fixed_line_and_live_buttons \
+              tests/test_list_page_keep_agenda.py::test_a_send_that_throws_leaves_the_keep_and_agenda_forms_with_a_fixed_line_and_live_buttons \
               tests/test_list_page_browser.py::test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_layout \
               2>&1 | tail -12
             [ "${PIPESTATUS[0]}" -eq 0 ] || rc=1
