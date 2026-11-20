@@ -77,7 +77,7 @@ PROBE_B = ("JSON.stringify({probe: 'focus', b: window.__b, inB: (() => { const p
            " return !!p && p.contains(document.activeElement); })(), active: document.activeElement ? document.activeElement.tagName : null})")
 # the reader answers where focus should be: a real press on blank page (the click also blurs what held it), or a key
 PRESS_BLANK = ("document.activeElement && document.activeElement.blur(); document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true})); 1")
-KEY_AWAY = ("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Shift', bubbles: true})); document.activeElement && document.activeElement.blur(); 1")
+KEY_AWAY = ("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'a', bubbles: true})); document.activeElement && document.activeElement.blur(); 1")
 BLUR = "document.activeElement && document.activeElement.blur(); 1"
 
 

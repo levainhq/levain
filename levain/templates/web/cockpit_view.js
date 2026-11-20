@@ -2584,16 +2584,25 @@
     focusIt(held, scroll);
     if (!jumpKey(held) || !document.body || typeof root.MutationObserver !== "function") return;
     const obs = new root.MutationObserver(() => {
-      const a = document.activeElement;
-      if (held.isConnected || (a && a !== document.body)) return;
-      const next = livePanel(held);
-      if (next === held) return;
-      held = next;
-      focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
-      if (document.activeElement === held) me.stop();
+      try {
+        const a = document.activeElement;
+        if (held.isConnected || (a && a !== document.body)) return;
+        const next = livePanel(held);
+        if (next === held) return;
+        held = next;
+        focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
+        if (document.activeElement === held) me.stop();
+      } finally {
+        // looking a node up may add and remove a node of its own in the page: those records are not a redraw, so they are not heard
+        obs.takeRecords();
+      }
     });
     const timer = root.setTimeout(() => me.stop(), HAND_OFF_MS);
-    const answered = () => me.stop();
+    // a held key (the repeat of the Enter that chose) and a bare modifier are not an answer
+    const answered = (ev) => {
+      if (ev && ev.type === "keydown" && (ev.repeat || ["Shift", "Control", "Alt", "Meta"].indexOf(ev.key) >= 0)) return;
+      me.stop();
+    };
     const me = { stop() {
       obs.disconnect();
       root.clearTimeout(timer);
@@ -2604,9 +2613,29 @@
     obs.observe(document.body, { childList: true, subtree: true });
     for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
   }
+  // Whether a dialog is up over the page: a modal, the presence sheet while it has a box, the pairing veil while it has one. Over one the
+  // page behind is not the reader's to move through.
+  function dialogOpen() {
+    if (document.querySelector(".modal-overlay")) return true;
+    return ["pr-sheet", "ck-unpaired"].some((id) => { const d = document.getElementById(id); return !!(d && d.getClientRects().length); });
+  }
+  // Put focus where the reader was: the opener (its successor when a redraw replaced it), else `prefer`, else the Jump button. True when
+  // something took it, so a jump never ends with focus on <body>.
+  function settleFocus(back, prefer) {
+    const opener = back && back !== document.body ? livePanel(back) : null;
+    for (const t of [opener, prefer, document.getElementById("jumpbtn")]) {
+      if (!t || !t.isConnected || typeof t.focus !== "function") continue;
+      if (t !== back && t.tabIndex < 0 && !t.hasAttribute("tabindex")) t.setAttribute("tabindex", "-1");
+      t.focus();
+      if (document.activeElement === t) return true;
+    }
+    return false;
+  }
+  // Which open or choose is the latest: a landing that waits on frames only lands for the choice that started it, and never over an open Jump.
+  let jumpGen = 0;
   function openJump() {
-    // over an open dialog the page behind is not the reader's to move through: the same test the page's plain keys use
-    if (palette || document.querySelector(".modal-overlay")) return;
+    if (palette || dialogOpen()) return;
+    jumpGen++;
     const dlg = el("div", "palette");
     dlg.setAttribute("role", "dialog");
     dlg.setAttribute("aria-label", "Jump");
@@ -2633,34 +2662,45 @@
     const close = (restore) => {
       dlg.remove();
       palette = null;
-      if (restore && back && back !== document.body && back.isConnected && typeof back.focus === "function") back.focus();
+      if (restore && back && back !== document.body) settleFocus(back, null);
     };
     palette = { dlg: dlg, input: input, close: close };
     const choose = (it) => {
       close();
+      const gen = ++jumpGen;
+      const live = () => gen === jumpGen && !palette;
+      // the palette is already closed, so a target that never comes up gives focus back to the opener, else `prefer`, else the Jump button
+      const giveUp = (prefer) => { const a = document.activeElement; if (live() && (!a || a === document.body)) settleFocus(back, prefer); };
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
       const raf = typeof root.requestAnimationFrame === "function" ? root.requestAnimationFrame.bind(root) : null;
       const drawn = (n) => !!n && typeof n.getClientRects === "function" && n.getClientRects().length > 0;
       // a place paints a frame after the switch: wait (a bounded number of frames) for the node to be drawn, then land
       const whenDrawn = (get, fn, tries) => {
+        if (!live()) return;
         const n = get();
-        if (drawn(n) || !raf || (tries || 0) >= 30) return fn(n);
+        if (drawn(n)) return fn(n);
+        if (!raf || (tries || 0) >= 30) return giveUp(null);
         raf(() => whenDrawn(get, fn, (tries || 0) + 1));
       };
       if (it.kind === "action") {
-        // the masthead button's own click: the dialog opens exactly as a press opens it, and takes focus itself
-        it.node.click();
+        // the masthead button's own click: the dialog opens exactly as a press opens it, and takes focus itself. The button is looked up
+        // again by what it opens, in case the masthead was rebuilt since the list was drawn.
+        const key = it.node.dataset && it.node.dataset.phoneJump;
+        const act = (key && document.querySelector('.ia-act[data-phone-jump="' + key + '"]')) || it.node;
+        act.click();
         return; }
       if (it.kind === "place") {
         const P = root.LevainPlaces;
         if (P && typeof P.go === "function") P.go(it.place);
         const firstContainer = () => Array.from(document.querySelectorAll(".panel, .dv-zone, .rv-zone, #ck-needs")).find((n) => drawn(n) && !n.closest("[hidden]")) || null;
         const settled = (tries) => {
+          if (!live()) return;
           const up = document.body.dataset.iaPlace === it.place;
           const first = up ? firstContainer() : null;
           if (first) return landOnPanel(first, true);
           if (raf && tries < 30) raf(() => settled(tries + 1));
+          else giveUp(document.querySelector('[data-ia-place-btn="' + it.place + '"]'));
         };
         settled(0);
         return; }
@@ -2769,9 +2809,7 @@
       if (ev.defaultPrevented) return;
       if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.close(true); else openJump(); return; }
       if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
-      if (document.querySelector(".modal-overlay")) return;
-      const sheet = document.getElementById("pr-sheet");
-      if (sheet && sheet.getClientRects().length) return;   // the presence sheet is a dialog too: its keys are its own
+      if (dialogOpen()) return;   // a dialog's keys are its own
       if (ev.key === "/") {
         const all = visibleFilters();
         if (!all.length) return;

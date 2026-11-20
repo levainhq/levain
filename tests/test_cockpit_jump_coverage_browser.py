@@ -67,6 +67,12 @@ INJECT_AND_COLLECT = "(() => { " + INJECT + "; document.getElementById('jumpbtn'
 LANDED = "!document.querySelector('.palette') && document.activeElement && document.activeElement !== document.body"
 
 
+def _in(label: str) -> str:
+    """The condition: Jump is closed and focus is on the node labelled `label`, or inside it (not merely off <body>)."""
+    return ("(() => { " + LAB + " const a = document.activeElement; const t = a && a.closest ? a.closest(" + json.dumps(SEL) + ") : null;"
+            f" return !document.querySelector('.palette') && !!t && lab(t) === {json.dumps(label)}; }})()")
+
+
 def _until(cond: str, ms: int = 4000) -> dict:
     """Wait for a condition (polled), up to ms, then go on: the assertion after it is the judge, not the wait."""
     return {"eval": ("new Promise(res => { const t0 = Date.now(); const f = () => { let ok = false; try { ok = !!(" + cond + "); } catch (e) {}"
@@ -94,13 +100,13 @@ def _vals(out: dict, probe: str) -> list[dict]:
     return [g for g in got if g["probe"] == probe]
 
 
-def _run(tmp_path: Path, steps: list[dict], w: int = 1280, h: int = 1000) -> dict:
+def _run(tmp_path: Path, steps: list[dict], w: int = 1280, h: int = 1000, write: bool = True) -> dict:
     tmp_path.mkdir(parents=True, exist_ok=True)
     root, src, _ids = _install(tmp_path)
     _seed_more(root)
     _seed_phone(root)
-    with _serve(src, write_token="T", surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        return _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": {"w": w, "h": h, "dpr": 1}}, READY, SETTLE, *steps])
+    with _serve(src, write_token="T" if write else None, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        return _drive(tmp_path, f"{url}/#write_token=T" if write else f"{url}/", [{"emulate": {"w": w, "h": h, "dpr": 1}}, READY, SETTLE, *steps])
 
 
 def _expected(cov: dict, ever: set) -> Counter:
@@ -211,7 +217,7 @@ def test_a_target_the_page_redrew_after_the_list_was_drawn_is_found_again_and_fo
     for kind, label, start, _want in CASES:
         steps += [*_go(start), CTRL_K, _until("document.querySelectorAll('.palette-list li').length"), _pick(kind, label),
                   {"eval": f"JSON.stringify({{probe: 'swap', done: ({SWAP})({json.dumps(label)})}})"},
-                  ENTER, _until(LANDED), {"eval": AT_LABEL}]
+                  ENTER, _until(_in(label)), {"eval": AT_LABEL}]
     run = _run(tmp_path, steps)
     assert [s["done"] for s in _vals(run, "swap")] == [True] * len(CASES), _vals(run, "swap")
     for (kind, label, _start, want), got in zip(CASES, _vals(run, "atl")):
@@ -223,9 +229,9 @@ def test_a_redraw_after_landing_hands_focus_to_the_successor_for_every_kind_of_t
     steps: list[dict] = [{"eval": "1"}]
     for kind, label, start, _want in CASES:
         steps += [*_go(start), CTRL_K, _until("document.querySelectorAll('.palette-list li').length"), _pick(kind, label),
-                  ENTER, _until(LANDED),
+                  ENTER, _until(_in(label)),
                   {"eval": "JSON.stringify({probe: 'swap', done: (" + SWAP_FOCUSED + ")()})"},
-                  _until(LANDED), {"eval": AT_LABEL}]
+                  _until(_in(label)), {"eval": AT_LABEL}]
     run = _run(tmp_path, steps)
     assert [s["done"] for s in _vals(run, "swap")] == [True] * len(CASES), _vals(run, "swap")
     for (kind, label, _start, want), got in zip(CASES, _vals(run, "atl")):
@@ -278,3 +284,103 @@ def test_a_titled_panel_the_hidden_attribute_really_hides_is_not_listed(tmp_path
     listed = {"eval": "JSON.stringify({probe: 'ls', labels: [...document.querySelectorAll('.palette-list li .pl')].map(n => n.textContent)})"}
     (got,) = _vals(_run(tmp_path, [{"eval": inject}, listed]), "ls")
     assert "Zz shown one" in got["labels"] and "Zz hidden one" not in got["labels"], got["labels"]
+
+
+# ---- the review round: a probe that must not re-fire the hand-off, dialogs, a stale landing, a rebuilt opener, never ending on <body> -------
+OPEN_LIST = [CTRL_K, _until("document.querySelectorAll('.palette-list li').length")]
+PALETTE_STATE = ("JSON.stringify({probe: 'pal', open: !!document.querySelector('.palette'),"
+                 " input: document.activeElement === document.querySelector('.palette-input')})")
+
+
+def _choose(kind: str, label: str) -> list[dict]:
+    return [*OPEN_LIST, _pick(kind, label), ENTER]
+
+
+@needs_browser
+def test_a_hand_off_with_no_live_successor_does_not_hold_the_page_in_a_loop(tmp_path: Path) -> None:
+    """The hand-off watches the whole page. Asking whether a same-key node under a hidden ancestor is hidden by the attribute adds and
+    removes a node in the page; those changes must not wake the hand-off again, or the page never reaches a timer."""
+    gone = ("(() => { const a = document.activeElement.closest('[data-ck-panel]'); const w = document.createElement('div'); w.hidden = true;"
+            " w.appendChild(a.cloneNode(true)); document.body.appendChild(w); a.remove(); const t0 = Date.now();"
+            " return new Promise(r => setTimeout(() => r(JSON.stringify({probe: 'live', ms: Date.now() - t0, body: document.activeElement === document.body})), 0)); })()")
+    steps = [{"eval": "1"}, *_choose("panel", "Work board"), _until(_in("Work board")), {"eval": gone}]
+    (got,) = _vals(_run(tmp_path, steps), "live")
+    assert got["ms"] < 1500, got                                                          # a timer ran: the page was not held in a loop
+    assert got["body"], got                                                                # and the only same-key node is hidden, so there is no successor
+
+
+SHEET_UP = "(() => { const s = document.getElementById('pr-sheet'); s.hidden = false; s.style.display = 'block'; return s.getClientRects().length; })()"
+SHEET_DOWN = "(() => { const s = document.getElementById('pr-sheet'); s.hidden = true; s.style.display = ''; return 1; })()"
+VEIL_UP = ("(() => { const v = document.createElement('div'); v.id = 'ck-unpaired'; v.className = 'pair-veil'; v.setAttribute('role', 'dialog');"
+           " v.textContent = 'Pair this browser'; document.body.appendChild(v); return v.getClientRects().length; })()")
+VEIL_DOWN = "(() => { document.getElementById('ck-unpaired').remove(); return 1; })()"
+BTN = {"eval": "document.getElementById('jumpbtn').click(); 1"}
+
+
+@needs_browser
+def test_ctrl_k_and_the_jump_button_do_nothing_over_the_presence_sheet_and_the_pairing_veil(tmp_path: Path) -> None:
+    state = {"eval": PALETTE_STATE}
+    steps = [{"eval": "1"}, {"eval": SHEET_UP}, CTRL_K, _wait(150), state, BTN, _wait(150), state, {"eval": SHEET_DOWN},
+             {"eval": VEIL_UP}, CTRL_K, _wait(150), state, BTN, _wait(150), state, {"eval": VEIL_DOWN},
+             CTRL_K, _wait(150), state]                                                   # nothing up: it opens
+    sheet_key, sheet_btn, veil_key, veil_btn, free = _vals(_run(tmp_path, steps), "pal")
+    for got in (sheet_key, sheet_btn, veil_key, veil_btn):
+        assert not got["open"], got
+    assert free["open"] and free["input"], free
+
+
+@needs_browser
+def test_a_choice_that_draws_late_does_not_take_focus_from_a_reopened_jump(tmp_path: Path) -> None:
+    inject = ("(() => { const p = document.createElement('div'); p.className = 'panel'; p.dataset.ckPanel = 'zz-late'; p.style.display = 'none';"
+              " const h = document.createElement('h2'); h.textContent = 'Zz late panel'; p.appendChild(h); document.body.appendChild(p);"
+              " document.addEventListener('keydown', function f(e) { if (e.key !== 'Enter') return; document.removeEventListener('keydown', f, true);"
+              "   let k = 0; const t = () => { if (++k < 18) requestAnimationFrame(t); else p.style.display = ''; }; requestAnimationFrame(t); }, true);"
+              " document.getElementById('jumpbtn').click(); return 1; })()")
+    steps = [{"eval": inject}, _until("document.querySelectorAll('.palette-list li').length"), _pick("panel", "Zz late panel"), ENTER,
+             CTRL_K, _wait(900), {"eval": PALETTE_STATE}]                                 # reopened at once; the panel is drawn while it is up
+    (got,) = _vals(_run(tmp_path, steps), "pal")
+    assert got["open"] and got["input"], got
+
+
+@needs_browser
+def test_escape_gives_focus_back_to_the_rebuilt_opener_and_never_to_the_body(tmp_path: Path) -> None:
+    focus_panel = {"eval": "(() => { const p = document.querySelector('#board .panel[data-ck-panel=work_board]'); p.tabIndex = -1; p.focus(); return document.activeElement === p ? 1 : 0; })()"}
+    at = {"eval": ("(() => { const a = document.activeElement, t = a && a.closest ? a.closest('[data-ck-panel]') : null;"
+                   " return JSON.stringify({probe: 'esc', open: !!document.querySelector('.palette'), body: a === document.body,"
+                   " key: t ? t.dataset.ckPanel : '', btn: !!a && a.id === 'jumpbtn', live: !!a && a.isConnected}); })()")}
+    drop = {"eval": "(() => { document.querySelector('#board .panel[data-ck-panel=work_board]').remove(); return 1; })()"}
+    steps = [{"eval": "1"}, focus_panel, *OPEN_LIST, {"eval": f"({SWAP})('Work board') ? 1 : 0"}, ESC, _wait(100), at,    # redrawn while Jump was up
+             focus_panel, *OPEN_LIST, drop, ESC, _wait(100), at]                                                        # gone with no successor
+    redrawn, gone = _vals(_run(tmp_path, steps), "esc")
+    assert not redrawn["open"] and not redrawn["body"] and redrawn["key"] == "work_board" and redrawn["live"], redrawn
+    assert not gone["open"] and not gone["body"] and gone["btn"], gone
+
+
+@needs_browser
+def test_a_place_that_never_comes_up_and_a_target_that_never_draws_do_not_leave_focus_on_the_body(tmp_path: Path) -> None:
+    at = {"eval": ("(() => { const a = document.activeElement; return JSON.stringify({probe: 'end', open: !!document.querySelector('.palette'), body: a === document.body,"
+                   " opener: a === window.__a, tab: document.querySelector('[data-ck-panel=zz-never]') ? document.querySelector('[data-ck-panel=zz-never]').getAttribute('tabindex') : 'none',"
+                   " place: document.body.dataset.iaPlace}); })()")}
+    mk_never = ("(() => { const p = document.createElement('div'); p.className = 'panel'; p.dataset.ckPanel = 'zz-never'; p.style.display = 'none';"
+                " const h = document.createElement('h2'); h.textContent = 'Zz never panel'; p.appendChild(h); document.body.appendChild(p); return 1; })()")
+    focus_a = {"eval": "window.__a = document.querySelector('.ia-places [data-ia-place-btn=home]'); window.__a.focus(); 1"}
+    # no write token: the Desk refuses, so the place never comes up
+    ro = [{"eval": "1"}, focus_a, *_choose("place", "Desk"), _wait(1500), at]
+    (read_only,) = _vals(_run(tmp_path / "ro", ro, write=False), "end")
+    assert not read_only["open"] and not read_only["body"] and read_only["opener"], read_only
+    never = [{"eval": mk_never}, focus_a, *_choose("panel", "Zz never panel"), _wait(1500), at]
+    (undrawn,) = _vals(_run(tmp_path / "nd", never), "end")
+    assert not undrawn["open"] and not undrawn["body"] and undrawn["opener"] and undrawn["tab"] is None, undrawn
+
+
+@needs_browser
+def test_key_repeat_and_a_bare_modifier_do_not_end_the_hand_off(tmp_path: Path) -> None:
+    send = lambda init: {"eval": f"document.dispatchEvent(new KeyboardEvent('keydown', {init})); 1"}
+    steps: list[dict] = [{"eval": "1"}]
+    for init in ("{key: 'Enter', repeat: true, bubbles: true}", "{key: 'Shift', bubbles: true}"):
+        steps += [*_choose("panel", "Work board"), _until(_in("Work board")), send(init),
+                  {"eval": "JSON.stringify({probe: 'swap', done: (" + SWAP_FOCUSED + ")()})"}, _until(_in("Work board")), {"eval": AT_LABEL}]
+    run = _run(tmp_path, steps)
+    assert [s["done"] for s in _vals(run, "swap")] == [True, True], _vals(run, "swap")
+    for got in _vals(run, "atl"):
+        assert got["label"] == "Work board" and not got["body"], got
