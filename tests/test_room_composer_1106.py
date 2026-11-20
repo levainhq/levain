@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_cockpit_room import _assets, _boot, _serve_room, w, _UNTIL_READY  # noqa: F401  (fixture)
 
 _KEY = ("const key = (o) => { const e = new KeyboardEvent('keydown', Object.assign({key: 'Enter', bubbles: true, cancelable: true}, o));"

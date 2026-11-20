@@ -20,7 +20,7 @@ WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 
 STATE = ("(() => { const q = (s) => document.querySelector(s); const box = (n) => { if (!n) return null; const r = n.getBoundingClientRect();"
          " return {shown: n.getClientRects().length > 0, top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), right: Math.round(r.right), h: Math.round(r.height)}; };"
-         " const row = q('#ck-mctl'); const amb = [...document.querySelectorAll('#ck-mctl .sky-toggle')].filter(b => !b.classList.contains('sky-toggle-ghost'))[0];"
+         " const row = q('#ck-mctl'); const amb = [...document.querySelectorAll('#ck-mctl .sky-toggle')][0];"
          " return JSON.stringify({open: document.body.classList.contains('ia-graph-open'), btn: q('[data-ia-graph-toggle]').textContent, expanded: q('[data-ia-graph-toggle]').getAttribute('aria-expanded'), controls: q('[data-ia-graph-toggle]').getAttribute('aria-controls'),"
          " row: box(row), toggle: box(q('[data-ia-graph-toggle]')), calm: box(q('#calmbtn')), calmIn: !!(row && row.contains(q('#calmbtn'))), calmPressed: q('#calmbtn').getAttribute('aria-pressed'),"
          " amb: box(amb), ambIn: !!(amb && row.contains(amb)), ambPressed: amb ? amb.getAttribute('aria-pressed') : null, mastCalm: !!q('header.masthead #calmbtn'), phoneCalm: !!q('#calmphone'),"
@@ -90,7 +90,7 @@ def test_closed_shows_no_selector_open_stacks_row_selector_graph_and_remembers_t
 @needs_browser
 def test_calm_and_ambient_work_from_the_machine_row(tmp_path: Path, monkeypatch) -> None:
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    AMB = "document.querySelector('#ck-mctl .sky-toggle:not(.sky-toggle-ghost)').click(); 1"
+    AMB = "document.querySelector('#ck-mctl .sky-toggle').click(); 1"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}},

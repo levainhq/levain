@@ -18,7 +18,6 @@ import pytest
 from levain.consent.questions import QuestionStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_mic_page import _fake
 from tests.test_voice_room_hook import A, SETTINGS, _room, _run, _set, _to_room
 

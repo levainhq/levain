@@ -26,7 +26,6 @@ from levain.cockpit import voice as cockpit_voice  # noqa: E402
 from levain.desk.desk_port import DeskCommands, HostCommandDeskPort, ScriptedDeskPort  # noqa: E402
 from tests.test_cockpit_desk_tab import _call, _serve  # noqa: E402
 from tests.test_cockpit_flip_parity import _drive, needs_browser  # noqa: E402
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401  (fixture: the consent directory the server reads)
 from tests.test_desk_pane_page import _OPEN, _TAP_DESK, _TOKENED, CLICK_SEND, desk_page, put, typed, until, wired  # noqa: E402
 from tests.test_desk_view_1114 import VOICE_INIT  # noqa: E402
 

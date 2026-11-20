@@ -535,3 +535,12 @@ def _night_armed_for_the_verb_tests(monkeypatch):
         return
     monkeypatch.setattr(_fx, "NIGHT_ARMING_FACTS",
                         {"nd7_ruled": "np-00000007", "nd8_done": "np-00000008", "nd9_read": "np-00000009"})
+
+
+@pytest.fixture
+def qdir(tmp_path, monkeypatch):
+    """The default consent directory (``$LEVAIN_HOME/consent``), the one the server's consent reader names."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    d = tmp_path / "lh" / "consent"
+    d.mkdir(parents=True, mode=0o700)
+    return d

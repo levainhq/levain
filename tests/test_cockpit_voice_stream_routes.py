@@ -24,7 +24,6 @@ from tests.test_cockpit_pairing_http import PROXY  # noqa: E402
 from tests.test_cockpit_voice_routes import (MESH_TOKEN, VALUE, call, head, js, no_leak, raw, rig,  # noqa: E402,F401
                                              served, pytestmark, _clock_before_the_openai_cutoff)
 from tests.test_cockpit_voice_routes import Rig  # noqa: E402,F401
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401  (fixture: the consent directory the server reads)
 from levain.webpush import notify_tokens, presence_tokens  # noqa: E402
 
 OPEN = cockpit_voice.STREAM_OPEN

@@ -11,7 +11,6 @@ from levain.cockpit import room as cockpit_room
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_room import _serve_room, w  # noqa: F401  (fixture)
 from tests.test_cockpit_k2a import TOKEN
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 
 WEB = Path(cockpit_room.__file__).resolve().parents[1] / "templates" / "web"
 PROSE = {"autocapitalize": "sentences", "autocorrect": "on", "spellcheck": "true", "inputmode": "text", "autocomplete": "off"}

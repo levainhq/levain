@@ -49,7 +49,6 @@ from tests.test_cockpit_k2a import TOKEN, _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY  # noqa: E402
 from tests.test_cockpit_room import World  # noqa: E402
 from tests.test_cockpit_sign_card import _free_port  # noqa: E402
-from tests.test_cockpit_threads_mount import qdir  # noqa: E402,F401  (fixture: the consent directory the server reads)
 from tests.test_cockpit_webpush import NS  # noqa: E402
 from tests.test_voice_custody import FakeSecurity  # noqa: E402
 

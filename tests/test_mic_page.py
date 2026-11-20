@@ -14,7 +14,6 @@ import http.client
 import json
 
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
-from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_voice_room_hook import _op, _room, _run, _set, _to_room, needs_browser
 
 FAKE = """

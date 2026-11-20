@@ -27,8 +27,8 @@ from levain.consent.questions import QuestionStore  # noqa: E402
 from levain.cockpit import card_script  # noqa: E402
 from levain.cockpit import voice as cockpit_voice  # noqa: E402
 from levain.voice.text import speakable  # noqa: E402
-from tests.test_cockpit_voice_routes import (  # noqa: E402,F401  (rig, qdir: fixtures taken by name)
-    SPEAK, TOKEN, call, js, qdir, rig, served,
+from tests.test_cockpit_voice_routes import (  # noqa: E402,F401  (rig: a fixture taken by name; qdir is the conftest's)
+    SPEAK, TOKEN, call, js, rig, served,
 )
 
 HERE = Path(__file__).resolve().parent

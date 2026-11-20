@@ -22,8 +22,8 @@ import pytest
 
 from levain.cockpit import voice as cockpit_voice
 from tests.test_cockpit_k2a import TOKEN
-from tests.test_cockpit_voice_routes import (  # noqa: F401  (fixtures: rig, qdir, the pinned clock)
-    SOURCE, _clock_before_the_openai_cutoff, qdir, rig, served)
+from tests.test_cockpit_voice_routes import (  # noqa: F401  (fixtures: rig, the pinned clock)
+    SOURCE, _clock_before_the_openai_cutoff, rig, served)
 from tests.test_pair_card_w1b import _drive, needs_browser
 
 pytestmark = pytest.mark.skipif(subprocess.run(["which", "ssh-keygen"], capture_output=True).returncode != 0,
