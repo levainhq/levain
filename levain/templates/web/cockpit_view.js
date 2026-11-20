@@ -1649,7 +1649,10 @@
   // chrome rebuilt, which only the one mount path (render) does.
   function shapeOf(entry, data) {
     const sr = data.search || {};
-    return JSON.stringify([entry.title, entry.edit_class || "", entry.source || "", entry.modes || "", entry.banner || null,
+    // digits are data: an age ("last read 5m") and a count in a title or a banner repaint in place (readInPlace), so they do not make a shape
+    const digitless = (t) => String(t).replace(/\d+/g, "#");
+    const banner = entry.banner && entry.banner.length ? entry.banner.map((b) => [b.tone || "", !!b.alert, digitless(b.text)]) : null;
+    return JSON.stringify([digitless(entry.title), entry.edit_class || "", entry.source || "", entry.modes || "", banner,
       data.kind, !!data.typed, data.error || "", data.markdown != null, data.note || "", data.footer || "",
       sr.on === true, sr.scope || "", sr.fields || [],
       data.action ? [data.action.verb, data.action.fields] : null, data.form ? data.form.verb : null,
@@ -1674,6 +1677,7 @@
     if (!s.searchable && !boardBox) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
     s.carry = root.LevainDashboard && root.LevainDashboard.buildKept ? root.LevainDashboard.buildKept() : null;
     s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
+    s.banner = ((ctx && ctx.entry && ctx.entry.banner) || []).map((b) => String(b.text));   // what the drawn banner lines say (a copy whose chrome cannot be repainted in place compares against it)
     if (data.kind === "count-queue") {
       // the figure is data, not chrome: paint() keeps it current
       const big = el("div", "cq");
@@ -2018,6 +2022,21 @@
     if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
     const shape = shapeOf(entry, data);
     if (live.some((s) => s.shape !== shape)) return false;
+    // a copy whose title or banner lines are not the panel's own `.phead h2` and `[data-bn]` nodes (a focus view, a hero or widget label)
+    // cannot be repainted in place: a changed title or banner text there is the old reload
+    const bannerNow = (entry.banner || []).map((b) => String(b.text));
+    for (const s of live) {
+      const own = !s.modal && s.p && s.p.querySelector && s.p.querySelector(".phead h2");
+      if (own) {
+        // a tabbed card's visible tab labels were drawn from the entry titles at first render: a new title cannot be repainted from here
+        if (own.classList && own.classList.contains("ck-tab-own") && String(entry.title) !== String(s.title)) return false;
+        // a count pill with no count to show would sit beside a stale title: a reload redraws it
+        const nx0 = own.nextElementSibling;
+        if (nx0 && nx0.classList && nx0.classList.contains("ck-count") && !(Number.isInteger(entry.count) && entry.count >= 0)) return false;
+        continue;
+      }
+      if (String(entry.title) !== String(s.title) || JSON.stringify(bannerNow) !== JSON.stringify(s.banner || [])) return false;
+    }
     for (const s of live) {
       s.data = data;
       s.fault = "";
@@ -2025,6 +2044,31 @@
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
       const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
+      // the title and the banner lines move with the digits the shape lets through (a count, an age): repainted where they stand
+      const h2 = s.p && s.p.querySelector ? s.p.querySelector(".phead h2") : null;
+      if (h2 && !s.modal) {
+        // a zone card's " (N)" tail was lifted into a sibling .ck-count pill (dashboard_core ckCountPill): repaint it the way it was drawn
+        const nx = h2.nextElementSibling;
+        const pill = nx && nx.classList && nx.classList.contains("ck-count") ? nx : null;
+        let shown = String(entry.title);
+        if (pill && Number.isInteger(entry.count) && entry.count >= 0) {
+          const tail = " (" + entry.count + ")";
+          if (shown.endsWith(tail)) shown = shown.slice(0, -tail.length).replace(/\s+$/, "");
+          pill.textContent = String(entry.count);
+          pill.hidden = entry.count === 0;
+        }
+        if (h2.textContent !== shown) h2.textContent = shown;
+      }
+      s.title = entry.title;
+      if (s.ctx && s.ctx.entry) s.ctx.entry = entry;   // a later focus view opens with the current title and banner
+      s.banner = (entry.banner || []).map((b) => String(b.text));
+      // a banner line is drawn into the panel or into its body node; either way it carries its index in data-bn
+      if (s.p && s.p.querySelectorAll) {
+        for (const n of Array.from(s.p.querySelectorAll("[data-bn]"))) {
+          const b = (entry.banner || [])[Number(n.dataset.bn)];
+          if (b && n.__bt !== String(b.text)) { if (core.setRichText) core.setRichText(n, b.text); else n.textContent = b.text; n.__bt = String(b.text); }
+        }
+      }
       repaintKeeping(s);   // a body repainted in place keeps the rows the reader expanded and its scroll position
       const sr = data.search || {};
       if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
