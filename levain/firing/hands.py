@@ -1344,6 +1344,19 @@ def git_version() -> str:
     return subprocess.run([_abs("git"), "--version"], capture_output=True, text=True, cwd="/", env=child_env()).stdout.strip()
 
 
+def _make_gitcheck_repo(repo: Path, env: dict[str, str]) -> bool:
+    """``git init`` the scratch repository and set the modes the operator's git needs to reach it.
+    The caller's umask must not decide them (a runsheet's ``umask 077`` is kept by sudo): a 0700 git
+    directory owned by ``nobody`` cannot be entered by the operator, whose git then says "not a git
+    repository" and never reaches the ownership check."""
+    if subprocess.run([_abs("git"), "init", "-q", str(repo)], env=env, cwd="/", capture_output=True).returncode:
+        return False
+    os.chmod(repo.parent, 0o755)
+    os.chmod(repo, 0o755)
+    os.chmod(repo / ".git", 0o755)
+    return True
+
+
 def git_refuses_foreign_gitdir(operator: str) -> bool:
     """MEASURED, as root at setup: in a scratch repository whose worktree is the operator's and
     whose git directory belongs to ``nobody``, the operator's git must refuse to work. A version
@@ -1354,9 +1367,8 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
     try:
         repo = scratch / "r"
         env = {"PATH": SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
-        if subprocess.run([_abs("git"), "init", "-q", str(repo)], env=env, cwd="/", capture_output=True).returncode:
+        if not _make_gitcheck_repo(repo, env):
             return False
-        os.chmod(scratch, 0o755)
         for root, dirs, files in os.walk(repo / ".git"):
             for name in [*dirs, *files]:
                 os.lchown(os.path.join(root, name), nobody.pw_uid, nobody.pw_gid)

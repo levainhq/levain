@@ -1298,3 +1298,19 @@ def test_a_setup_whose_record_cannot_be_synced_is_a_clean_failure_not_a_tracebac
     monkeypatch.setattr(hands, "record_hands", lambda *a, **kw: (_ for _ in ()).throw(HandsSetupError("could not be synced")))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     assert "could not be synced" in capsys.readouterr().out
+
+
+def test_the_foreign_gitdir_probe_fixture_does_not_inherit_a_private_umask(tmp_path: Path) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    repo = scratch / "r"
+    env = {"PATH": hands.SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    old = os.umask(0o077)
+    try:
+        assert hands._make_gitcheck_repo(repo, env)
+    finally:
+        os.umask(old)
+    other_can_enter_and_read = stat.S_IROTH | stat.S_IXOTH
+    for path in (scratch, repo, repo / ".git"):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode & other_can_enter_and_read == other_can_enter_and_read, f"{path.name} is {oct(mode)}: another user cannot read and enter it"
