@@ -62,7 +62,10 @@ class StubLauncher:
             {"occurrence_id": launch.occurrence_id, "session_key": launch.session_key, "auth": launch.auth,
              "usd_micros": launch.usd_micros, "harness": launch.harness, "model": launch.model}), encoding="utf-8")
         child = ctl.GatedChild([sys.executable, "-c", _VENDOR, str(self.dir)])
-        (self.dir / f"gate-{n}.pid").write_text(str(child.process.pid), encoding="utf-8")
+        pid_file = self.dir / f"gate-{n}.pid"
+        pending = self.dir / f"gate-{n}.pid.tmp"
+        pending.write_text(str(child.process.pid), encoding="utf-8")
+        os.replace(pending, pid_file)                # a reader sees the whole pid or no file
         return child
 
     def _count(self) -> int:
@@ -93,7 +96,7 @@ class StubLauncher:
                 continue
             try:
                 os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):   # macOS answers EPERM for a group of unreaped zombies
                 return StopResult(True, "p10b-stub: the group was already gone")
             until = time.monotonic() + max(0.0, deadline_s)
             while time.monotonic() < until:

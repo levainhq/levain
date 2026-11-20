@@ -177,7 +177,8 @@ class Session(Install):
             lo, hi = now - timedelta(days=1), now + timedelta(days=1)
         return ctl.launch(open_agent_store(self.store_dir), oid, authority=AgentAuthority(self.world.root),
                           window=ctl.Window(ctl._stamp(lo), ctl._stamp(hi), None), now=now, on_input=None,
-                          executor=executor or SessionExecutor(None, max_exposure_usd_micros=EXPOSURE_USD_MICROS))
+                          executor=(executor if executor is not None
+                                    else SessionExecutor(None, max_exposure_usd_micros=EXPOSURE_USD_MICROS)))
 
     def launched(self) -> str:
         """A manual occurrence claimed and launched (asserted ``launched``): its id."""
@@ -206,7 +207,7 @@ class Session(Install):
             if proc.poll() is None:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):   # the group is gone or going (macOS: EPERM for unreaped zombies)
                     pass
             proc.wait(30)
 

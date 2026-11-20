@@ -44,8 +44,10 @@ def _after(minutes: int) -> str:
 
 
 def _running(s: Session, oid: str) -> None:
-    """Wait until the stub's vendor was started for ``oid`` (the fire recorded its session and released the gate)."""
-    until("the stub's vendor to start", lambda: s.started() == 1 and s.row(oid)["session_key"] is not None)
+    """Wait until the stub's launch for ``oid`` is complete: the row holds its session key, one spawn is counted, and the
+    gate's pid file (the last thing the launcher writes) is there."""
+    until("the stub's vendor to start", lambda: s.started() == 1 and s.row(oid)["session_key"] is not None
+          and (s.stubdir / "gate-1.pid").exists())
 
 
 def _ended_clean(s: Session, oid: str) -> None:
@@ -64,6 +66,7 @@ def test_p10b_a_fire_without_the_entry_cannot_reach_the_stub(s):
     s.register()
     oid = s.launched()
     proc = ctl.spawn_fire(s.store_dir, oid, env=s.env())
+    s._fires.append(proc)                                   # the case's teardown kills it if it runs on
     assert proc.wait(120) == 1
     assert (s.row(oid)["state"], s.started()) == ("launched", 0)
     assert f"the install names launcher {STUB_LAUNCHER!r}, which is not registered" in s.fire_log(oid)
