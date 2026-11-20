@@ -244,7 +244,7 @@ resolve under `-F /dev/null` (it is behind Cloudflare, which does not carry SSH)
 `nk -o HostKeyAlias=transalliesohio.org nightkey@172.233.220.105 <words>`: the address in place of `nightkey@TAOSERV`, plus the
 alias, the pin the laptop's `~/.ssh/config` carries for `transalliesohio.org`.
 Probes 12 and 13 take the same `-o HostKeyAlias=transalliesohio.org`, and an expected output that names `nightkey@TAOSERV` prints the
-address instead. The seat's own generated config (levain#47) was found on 11-20 to carry no alias: levain#206.
+address instead. The seat's own generated config (levain#47) was found on 11-20 to carry no alias; `write_config` takes `host_key_alias=` since levain#206 (step 5).
 `BatchMode` will not prompt for an unknown host key, so first put TAOSERV's host key in `~/.levain/night/known_hosts`, filed
 under the alias name `transalliesohio.org` (the installed file's one entry is, so a seat that has it skips this scan; `ssh-keyscan`
 takes no `-o`, so scan the address, drop its `#` banner lines, rewrite the first field, and check the result before it replaces the
@@ -284,9 +284,9 @@ On the machine the night seat runs on: the full-sudo key and the ssh-agent holdi
 its environment, or its launch (`SSH_AUTH_SOCK` unset in the seat's environment; no `IdentityAgent` or `IdentityFile` for TAOSERV
 in any ssh config the seat's HOME holds; effects.py's `NIGHT_ALIAS` names `taoserv-night`). The client config for the alias,
 in a file used with `-F` (effects.py's KNOWN EDGE asks for this pin). With the pinned `known_hosts` filed under the alias (section 4),
-this stanza also needs `HostKeyAlias transalliesohio.org` (the commented line in the block) until levain#206 has the generated copy carry it:
+this hand-written stanza also needs `HostKeyAlias transalliesohio.org` (the commented line in the block); the generated copy takes it as `host_key_alias=` (levain#206):
 ```
-# until levain#206: also add the line   HostKeyAlias transalliesohio.org
+# also add the line   HostKeyAlias transalliesohio.org
 Host taoserv-night
     HostName REPLACE-WITH-TAOSERV-ADDRESS
     User nightkey
@@ -297,7 +297,7 @@ Host taoserv-night
     RequestTTY no
     ForwardAgent no
 ```
-The seat's copy is written by `levain.desk.night_ssh.write_config(<address>, <the seat's HOME>)` to `<HOME>/.levain/night/ssh_config` (it adds `GlobalKnownHostsFile none` and `StrictHostKeyChecking yes`); that file must exist before any armed night, or every covered restart exits 255 and is journaled `failed`.
+The seat's copy is written by `levain.desk.night_ssh.write_config(<address>, <the seat's HOME>, host_key_alias=<the name the pinned known_hosts files the key under>)` (levain#206; with the address as `HostName`, leave the keyword out only if the pinned file holds the key under that address) to `<HOME>/.levain/night/ssh_config` (it adds `GlobalKnownHostsFile none` and `StrictHostKeyChecking yes`); that file must exist before any armed night, or every covered restart exits 255 and is journaled `failed`.
 Proof: from the seat's real environment, `ssh -o BatchMode=yes <old-account>@TAOSERV true` must FAIL to authenticate (this is
 the row's done line: "from the seat's real environment the old key cannot authenticate"). Wiring `-F` into
 `effects._night_argv` is a change to ND-3a's file and is a separate row.
