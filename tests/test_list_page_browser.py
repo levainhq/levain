@@ -603,8 +603,10 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
             # waits for the focus to come back (up to 10 s) instead of a fixed 400 ms: a loaded CI runner failed this twice on 11-20
-            {"eval": "document.querySelector('#levain-modal .modal-close').click(); new Promise(r => { const t0 = Date.now(); const tick = () => ((document.activeElement && document.activeElement.hasAttribute('data-list-more')) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); })"},
-            {"eval": f"!!({focus_is_control})"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); "
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
+            {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
     wide = json.loads(out["values"][-6])
     assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
