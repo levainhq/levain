@@ -2666,6 +2666,10 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="intenti
 .dev-meta { margin-top: var(--sp-1); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
 .dev-revoked .dev-name { color: var(--label); text-decoration: line-through; text-decoration-color: var(--faint); }
 .dev-pill { flex: none; }
+/* a row with a status chip (revoked, not seen): the chip wraps under the name when the line is narrow, so the name keeps a readable
+   width (levain#161). Scoped to rows that carry a chip: the other rows keep their one-line shape and their buttons beside the text. */
+.dev-row:has(.dev-pill) { flex-wrap: wrap; }
+.dev-row:has(.dev-pill) .dev-main { flex: 1 1 12rem; }
 /* a quiet chip: the muted warning tone, never the red of a refusal */
 .dev-stale { color: var(--warn); }
 .dev-none { margin: 0; padding: var(--sp-4) 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
