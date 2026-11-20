@@ -261,6 +261,7 @@ class TestOffIsLegacy:
                 _read_frame(r)
                 reads.rows = [_row(1), _row(2)]
                 httpd.stream_watcher.watch_s = 0.2
+                httpd.stream_watcher.backstop_s = 0.2     # a provider change moves no store the token watches: only the backstop build sees it
                 got = _await_events(r)
                 assert [(e[0], e[2].get("id")) for e in got] == [("panel-changed", "od")], got
             finally:
