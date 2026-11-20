@@ -3388,9 +3388,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
         ok, out = _probe([am_cli, "--version"])
         if ok:
             version = (out.strip().splitlines() or ["present"])[0]
-            results.append(
-                CheckResult("anneal-memory CLI", True, f"{am_cli} ({version})")
-            )
+            results.append(_anneal_version_result("anneal-memory CLI", am_cli, version))
             return results
         # A script that exists but cannot run (a moved venv's stale shebang) is not the
         # end of the question: every consumer falls back to the module form, so doctor
@@ -3400,28 +3398,11 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     ok, out = _probe([sys.executable, "-P", "-m", "anneal_memory", "--version"])
     if ok:
         version = (out.strip().splitlines() or ["present"])[0]
-        verdict, requirement = _anneal_range_verdict(version)
-        if verdict is False:
-            results.append(
-                CheckResult(
-                    "anneal-memory module",
-                    False,
-                    f"importable via {sys.executable} ({version}), but levain requires "
-                    f"{requirement}{script_failure}",
-                    f"{sys.executable} -m pip install -U '{requirement}'",
-                )
+        results.append(
+            _anneal_version_result(
+                "anneal-memory module", f"importable via {sys.executable}", version, script_failure
             )
-        else:
-            unchecked = (
-                "" if verdict else "; levain's required range was not checked (it could not be read or compared)"
-            )
-            results.append(
-                CheckResult(
-                    "anneal-memory module",
-                    True,
-                    f"importable via {sys.executable} ({version}){script_failure}{unchecked}",
-                )
-            )
+        )
     else:
         results.append(
             CheckResult(
@@ -3432,6 +3413,26 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             )
         )
     return results
+
+
+def _anneal_version_result(name: str, where: str, version: str, tail: str = "") -> CheckResult:
+    """The ONE judgement of a runnable anneal's version, shared by the script and module branches.
+
+    In range: ok, the plain "<where> (<version>)" detail. Out of range: not ok, with the declared
+    requirement and a pip hint. Unknown (see `_anneal_range_verdict`): ok, noted as not checked.
+    """
+    verdict, requirement = _anneal_range_verdict(version)
+    if verdict is False:
+        return CheckResult(
+            name,
+            False,
+            f"{where} ({version}), but levain requires {requirement}{tail}",
+            f"{sys.executable} -m pip install -U '{requirement}'",
+        )
+    unchecked = (
+        "" if verdict else "; levain's required range was not checked (it could not be read or compared)"
+    )
+    return CheckResult(name, True, f"{where} ({version}){tail}{unchecked}")
 
 
 _SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)$")
