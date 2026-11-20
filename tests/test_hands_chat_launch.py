@@ -552,6 +552,32 @@ def test_a_settings_file_that_is_not_a_json_object_refuses_a_claude_chat_by_name
     assert_released(rig)
 
 
+@pytest.mark.parametrize("env", [{"HTTPS_PROXY": "http://p:1"}, {"ENABLE_CLAUDEAI_MCP_SERVERS": "true"},
+                                 "HTTPS_PROXY=x", ["A=B"], None, 0],
+                         ids=["proxy", "undoes-connectors-off", "string", "list", "null", "number"])
+def test_a_hands_settings_env_that_is_not_an_empty_object_refuses_a_claude_chat_naming_env(rig, env):
+    """A settings env block can set any variable of the next hands process, ENABLE_CLAUDEAI_MCP_SERVERS included,
+    so a non-empty one is refused, and a non-object one fails closed as an unreadable layer."""
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "settings.json").write_text(json.dumps({"theme": "dark", "env": env}))
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+        launch(rig, "claude", spawn=fake)
+    assert "settings.json" in str(info.value) and "env" in str(info.value) and fake.started == []
+    assert_released(rig)
+
+
+def test_an_empty_env_object_in_hands_settings_does_not_refuse_a_claude_chat(rig):
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "settings.json").write_text('{"env": {}}')
+    fake = FakeVendor(rig)
+    assert launch(rig, "claude", spawn=fake) == 0 and len(fake.started) == 1
+
+
 def test_a_settings_value_that_merely_mentions_a_key_name_does_not_refuse_a_claude_chat(rig):
     """The key names are keys only at the top level: a value or a nested key holding the text is not one."""
     rig.register("alpha", callback_port=49601)

@@ -225,6 +225,9 @@ CLAUDE_USER_LAYER = ("agents", "plugins/installed_plugins.json", "plugins/market
 MARKETPLACES_REMOVE_CLAUSE = (" and `plugins/known_marketplaces.json` beside it (whether leaving that file "
                               "brings the tree back is not measured)")
 _CLAUDE_SETTINGS_KEYS = ("enabledPlugins", "extraKnownMarketplaces", "mcpServers")
+#: The settings ``env`` block sets variables of the next hands process, which can undo the chat's own environment
+#: (the connectors-off variable among them), so it is refused as a key too, except as an empty object: a plain claude
+#: run writes no env block, and an empty one sets nothing.
 
 
 def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> str | None:
@@ -252,6 +255,8 @@ def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> str | Non
                                "remove it")
     if any(k in settings for k in _CLAUDE_SETTINGS_KEYS):
         return f"{d}/settings.json"
+    if "env" in settings and settings["env"] != {}:
+        return f"{d}/settings.json, its `env` key"
     return None
 
 
