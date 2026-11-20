@@ -2297,7 +2297,7 @@
       // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
-    // Build's repo chips (session rows) take the sky's hue for a repo its registry knows, and stay neutral otherwise
+    // A repo chip on a row takes the sky's hue for a repo its registry knows, and stays neutral otherwise
     for (const c of document.querySelectorAll(".k7-repo[data-repo-facet]")) {
       const facet = (c.dataset.repoFacet || "").toLowerCase();
       const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
@@ -2314,12 +2314,12 @@
   // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
   if (typeof document !== "undefined" && document.documentElement) root.setInterval(() => { if (!document.hidden) { tintRepos(); try { paintHeaderLens(); } catch (e) { /* a lens that cannot paint leaves the page as the tiles drew it */ } } }, 1500);
   const k7K = (n) => (n >= 1000 ? Math.round(n / 1000) + "K" : String(n));
-  // A waiting task or node links to the Needs-you item it waits on: the strip's card with that id is scrolled to and lit (on Build, the bar's
-  // chip is). An item with no card (decided, no longer waiting) opens the Decisions focus view, where its row is marked and scrolled to by
+  // A waiting task or node links to the Needs-you item it waits on: the strip's card with that id is scrolled to and lit.
+  // An item with no card (decided, no longer waiting) opens the Decisions focus view, where its row is marked and scrolled to by
   // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
   function openNeedsYouCard(card) {
     const N = root.LevainNeeds;
-    if (N && N.go(card)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
+    if (N && N.go(card)) return;   // the strip's card is lit; the strip is on the page only while the item waits
     const mark = (tries) => {
       const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
       if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
@@ -2328,7 +2328,7 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
-  // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
+  // The topology panel's state, read once for the header lens. The panel is hidden on the page (the header draws it), so a
   // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
   // "unavailable" card (an external panel, no state of its own).
   function topoInfo() {

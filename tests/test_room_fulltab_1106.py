@@ -39,7 +39,7 @@ _MEASURE = """(() => { const q = s => document.querySelector(s), r = n => { cons
     send: r(q('.rv-send')), rotate: r(q('.rv-rotate')), stream: r(stream), column: Math.round((stream.getBoundingClientRect().width - pad(stream)) * 10) / 10,
     scrolls: q('.rv-body').scrollHeight > q('.rv-body').clientHeight, rotateText: q('.rv-rotate').textContent,
     history: document.querySelectorAll('.rv-zone [class*=history], .rv-zone [class*=thread-list], .rv-zone .th-body').length,
-    threadsShown: visible(q('.th-zone')), cardChrome: getComputedStyle(q('.rv-zone')).borderTopWidth + ' ' + getComputedStyle(q('.rv')).borderTopWidth + ' ' + getComputedStyle(q('.rv')).boxShadow,
+    cardChrome: getComputedStyle(q('.rv-zone')).borderTopWidth + ' ' + getComputedStyle(q('.rv')).borderTopWidth + ' ' + getComputedStyle(q('.rv')).boxShadow,
     bodyOverflow: getComputedStyle(document.body).overflow, mastTop: r(q('.masthead')).t, strip: r(q('#ck-phonetabs')),
     inputFont: parseFloat(getComputedStyle(q('.rv-input')).fontSize), mainShown: visible(q('main.frame')), jump: q('.rv-jump').hidden}); })()"""
 
@@ -65,7 +65,7 @@ def _common(g, frac=0.6):
     # the room owns the tab: the page itself does not scroll, the conversation is the one scroller, nothing else of the page shows
     assert g["scrollH"] <= g["vh"] + 1 and g["scrollW"] <= g["vw"] + 1, g
     assert g["bodyOverflow"] == "hidden" and g["scrolls"], g
-    assert not g["mainShown"] and not g["threadsShown"] and g["history"] == 0, g       # no history list, no threads, the board is gone
+    assert not g["mainShown"] and g["history"] == 0, g       # no history list, no threads, the board is gone
     assert g["cardChrome"].startswith("0px 0px"), g                                       # no card chrome around the room
     # the composer is pinned to the bottom of the viewport
     assert abs(g["dock"]["b"] - g["vh"]) <= 1, g

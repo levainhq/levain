@@ -1981,7 +1981,7 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now until a saved layout says otherwise) */
-/* the repo chip a row carries (dashboard_core.js) is drawn only where a place shows it; the Results rows and the Work zone heading follow */
+/* the repo chip a row carries (dashboard_core.js) is drawn only where a place shows it; the Results rows follow */
 .row > .k7-repo { display: none; }
 .k7-none { margin: 0; padding: 0 var(--sp-6) var(--sp-5); color: var(--label); font-size: var(--fs-body); }
 .k7-none.err { color: var(--bad); }
@@ -2215,8 +2215,8 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
   font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
 .layoutreset:hover { color: var(--text); }
 .ck-zreset { margin-left: auto; align-self: center; font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
-/* F12b: the work view (topology_view.js) inside the Build tab's Sessions card. The topology panel is the feed, not a card of its own:
-   Sessions draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
+/* F12b: the work view (topology_view.js) in the header lens. The topology panel is the feed, not a card of its own:
+   the lens draws it. State colour is the page's: orange only for waiting on you, amber stuck, red failed, green running, quiet done. */
 .panel.k-topology:not(.ck-faulted), [data-ck-panel="topology"]:not([data-ck-external]):not(.ck-faulted) { display: none !important; }   /* a faulted panel is the one error panel: cockpit_view.js marks it, and it stays */
 .tv { container-type: inline-size; padding: 0 var(--sp-6) var(--sp-6); min-width: 0; }
 /* N1 the lens switch: a recessed track holding three keys; the chosen one is a raised, lit key (its top edge catches the light,
