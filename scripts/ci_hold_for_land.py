@@ -28,8 +28,11 @@ DEFAULT_TIMEOUT_S = 2400
 # next land run, so a land run that finished within this many seconds still blocks.
 DEFAULT_GRACE_S = 180
 GH_CALL_TIMEOUT_S = 60
+# A single transient API failure (a 502 after a long wait) must not release a hold the land run still needs: this many
+# failures IN A ROW release it (fail open).
+API_ERRORS_TO_RELEASE = 3
 # Land runs are push runs of this workflow; the list is newest first.
-RUNS_PATH = "repos/{repo}/actions/workflows/test.yml/runs?per_page=50"
+RUNS_PATH = "repos/{repo}/actions/workflows/test.yml/runs?event=push&per_page=100"
 # One page (per_page in the path) is enough: a run that can block is queued, running, or finished within the grace, i.e.
 # among the newest runs. [judged by levain-speed 8, 11-19, against project_memory/1119-51_gate503/return_R.md: the newest
 # page spans hours of this workflow's runs and a land run lasts minutes]
@@ -134,12 +137,19 @@ def main():
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     own = os.environ.get("GITHUB_RUN_ID") or None
     start = _monotonic()
+    errors = 0
     while True:
         try:
             runs = _gh_runs(repo)
-        except Exception as exc:  # fail open: an API or JSON error releases the run
-            print("released: api error (%s: %s)" % (type(exc).__name__, _clean(exc)), flush=True)
-            return 0
+        except Exception as exc:  # fail open: API or JSON errors in a row release the run
+            errors += 1
+            if errors >= API_ERRORS_TO_RELEASE:
+                print("released: api error (%s: %s)" % (type(exc).__name__, _clean(exc)), flush=True)
+                return 0
+            print("api error %d, retrying (%s)" % (errors, type(exc).__name__), flush=True)
+            _sleep(poll_s)
+            continue
+        errors = 0
         blockers = blocking_land_runs(runs, _utcnow(), grace_s, own)
         if not blockers:
             print("released: no land run", flush=True)

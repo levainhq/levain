@@ -139,7 +139,7 @@ def test_it_releases_at_once_when_nothing_blocks(monkeypatch, capsys):
     assert w.slept == [] and len(w.calls) == 1
     assert "released: no land run" in capsys.readouterr().out
     assert w.calls[0][:2] == ["gh", "api"]
-    assert w.calls[0][2] == "repos/levainhq/levain/actions/workflows/test.yml/runs?per_page=50"
+    assert w.calls[0][2] == "repos/levainhq/levain/actions/workflows/test.yml/runs?event=push&per_page=100"
 
 
 def test_it_waits_then_releases_when_the_blocker_clears(monkeypatch, capsys):
@@ -171,13 +171,23 @@ def test_it_releases_on_an_api_error(monkeypatch, capsys):
     w = World(monkeypatch, [RuntimeError("HTTP 502")])
     assert hold.main() == 0
     out = capsys.readouterr().out
-    assert out.strip().startswith("released: api error") and w.slept == []
+    assert out.strip().splitlines()[-1].startswith("released: api error")
+    assert len(w.calls) == hold.API_ERRORS_TO_RELEASE and len(w.slept) == hold.API_ERRORS_TO_RELEASE - 1
+
+
+def test_one_transient_api_error_does_not_release_a_blocked_hold(monkeypatch, capsys):
+    blocking = [run("land/x", "in_progress", id=5)]
+    w = World(monkeypatch, [blocking, RuntimeError("HTTP 502"), blocking, [run("land/x", "completed", id=5, ended_ago=1000)]])
+    assert hold.main() == 0
+    out = capsys.readouterr().out
+    assert "api error 1, retrying" in out and out.strip().splitlines()[-1] == "released: no land run"
+    assert len(w.calls) == 4
 
 
 def test_it_releases_on_a_json_error(monkeypatch, capsys):
     World(monkeypatch, ["badjson"])
     assert hold.main() == 0
-    assert capsys.readouterr().out.strip().startswith("released: api error")
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("released: api error")
 
 
 def test_it_releases_when_gh_is_missing(monkeypatch, capsys):
@@ -196,7 +206,7 @@ def test_it_releases_when_an_error_comes_after_some_waiting(monkeypatch, capsys)
     assert hold.main() == 0
     out = capsys.readouterr().out
     assert "holding: land run 5" in out and out.strip().splitlines()[-1].startswith("released: api error")
-    assert len(w.slept) == 1
+    assert len(w.slept) == hold.API_ERRORS_TO_RELEASE
 
 
 def test_it_releases_on_the_timeout_and_exits_zero(monkeypatch, capsys):
