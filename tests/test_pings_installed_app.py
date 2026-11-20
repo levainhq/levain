@@ -155,7 +155,9 @@ def test_an_installed_non_apple_app_with_no_push_api_says_device_not_browser(rig
 
 
 @needs_browser
-def test_the_pair_card_note_is_for_the_ios_home_screen_app_only(tmp_path, monkeypatch) -> None:
+def test_the_pair_card_of_an_installed_desktop_app_says_it_needs_its_own_code_and_a_tab_says_nothing(tmp_path, monkeypatch) -> None:
+    # levain#171 (his words: the key was not brought over to the web app): an installed app that is not iOS reaches the pair card only
+    # when it holds no key, so the card names it; the same page in a browser tab draws no note
     _root, src, _ids = _install(tmp_path)
     card = "document.querySelector('#ck-unpaired .pair-installed')"
     with _serve(src, extra_hosts=[w1b.NAME]) as (port, _h):
@@ -164,9 +166,15 @@ def test_the_pair_card_note_is_for_the_ios_home_screen_app_only(tmp_path, monkey
         other = w1b._drive(tmp_path, monkeypatch, url, [
             {"init": DISPLAY_MODE_ONLY},
             {"until": w1b.CARD, "ms": 15000},
+            {"eval": f"{card} && {card}.textContent"},
+        ], flags)
+        tab = w1b._drive(tmp_path, monkeypatch, url, [
+            {"until": w1b.CARD, "ms": 15000},
             {"eval": f"{card} === null"},
         ], flags)
-    assert other["values"][-1] is True, other["values"]      # an installed app that is not iOS shares the browser's sign-in: no note
+    assert other["values"][-1] == ("This installed app keeps its own sign-in here, so it needs one pairing code: get one from the "
+                                   "Devices panel on any device that is already paired."), other["values"]
+    assert tab["values"][-1] is True, tab["values"]
 
 
 
