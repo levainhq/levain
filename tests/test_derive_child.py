@@ -869,3 +869,46 @@ def test_a_parent_killed_while_the_child_answers_leaves_no_process(rig: Rig):
     finally:
         parent.kill()
         parent.wait(timeout=10)
+
+
+# ------------------------------------------------------------------------------------------------ the child marks itself live
+
+
+_HOME_FACTORY = '''\
+from levain import home_guard
+from levain.cockpit.engine import Cockpit, ProviderSpec, Read, RowIn
+
+home_guard.UNMARKED_ACTION = "refuse"
+
+
+def _read(ctx):
+    from levain.consent.queue import default_queue_dir
+    return Read(rows=(RowIn("r1", str(default_queue_dir()), {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": "r1"}),))
+
+
+def factory():
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="home", kind="triage-list", title="home", priority="feed", read=_read, order="time.desc",
+                             facets=frozenset({"at"}), version_fields=("id",)))
+    return ck
+'''
+
+
+def test_a_provider_that_resolves_the_levain_home_in_the_child_finds_it_marked_live(rig: Rig, tmp_path: Path):
+    """The child is started with no marker (the environment a serve hands it carries none) and no ``$LEVAIN_HOME``; a provider in
+    it resolves the consent directory. A child that did not mark itself would be an unmarked production run, and the factory
+    here sets the guard's action to refuse, so that run answers an error (and, under the warn action, leaves a row in the
+    home's guard log). Marked, the derive answers the real-home path and the log is not written."""
+    fake_home = tmp_path / "fake-home"
+    (fake_home / ".levain").mkdir(parents=True)
+    factory_dir = tmp_path / "factory"
+    factory_dir.mkdir()
+    (factory_dir / "home_factory.py").write_text(_HOME_FACTORY, encoding="utf-8")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home)}     # no pytest variable, no marker, no LEVAIN_HOME
+    c = DeriveChild("home_factory:factory", syspath=[str(factory_dir)], stderr=rig.err, env=env, term_grace_s=2.0)
+    rig.clients.append(c)
+    ans = rig.ask(c, "home")
+    assert ans.failure is None and ans.status == "ok", (ans.status, ans.error, rig.stderr_text())
+    assert _rows(ans) == [str((fake_home / ".levain" / "consent").resolve())]
+    assert not (fake_home / ".levain" / "home_guard.log").exists()
+    assert "no levain launcher" not in rig.stderr_text()

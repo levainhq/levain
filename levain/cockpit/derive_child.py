@@ -243,6 +243,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
 
 if __name__ == "__main__":
+    # A provider the factory builds may resolve the levain home, and the marker crosses no exec: this entry marks itself.
+    from levain.home_guard import mark_live
+    mark_live()
     code = main()
     # Leave without the interpreter's thread join: a provider thread still hung in a read must not hold an exiting child open.
     try:
