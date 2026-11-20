@@ -34,7 +34,7 @@ MEASURE = r"""(() => {
   const clock = $('.clock'), date = $('.date'), box = $('.clockbox'), text = $('.band-state .ftext'), age = $('.band-state .fage');
   const meta = document.getElementById('ck-wrapline'), wrap = $('.wrapline'), events = $('.events');
   return new Promise((done) => setTimeout(() => done(JSON.stringify({
-    vw: document.documentElement.clientWidth, sw: document.documentElement.scrollWidth,
+    iw: window.innerWidth, vw: document.documentElement.clientWidth, sw: document.documentElement.scrollWidth,
     tokSp5: px('var(--sp-5)'), tokMeta: px('var(--fs-meta)'),
     padTop: parseFloat(getComputedStyle(band).paddingTop),
     clock: R(clock), date: R(date), clockbox: R(box), boxOfClock: clock.closest('.clockbox') === box && date.closest('.clockbox') === box,
@@ -82,7 +82,7 @@ def test_the_phone_head_is_three_ordered_groups(tmp_path: Path, width: int) -> N
     """At 390 and 360 px on Home: the clock row, the state line under it, the status row under a hairline; no overlap, no sideways scroll."""
     g = _open(tmp_path, [{"emulate": {"w": width, "h": 844, "dpr": 2, "mobile": True}}, {"touch": True}, READY, SETTLE, {"eval": MEASURE}], touch=True)[-1]
     clock, date, box, text, age, meta = g["clock"], g["date"], g["clockbox"], g["text"], g["age"], g["meta"]
-    assert g["vw"] == width, g
+    assert g["iw"] == width, g                  # the emulated width took (innerWidth: a classic scrollbar, as on Linux, narrows clientWidth)
     # 1. the clock and the date are one row, in one clockbox
     mid = lambda r: (r["top"] + r["bottom"]) / 2  # noqa: E731
     assert g["boxOfClock"] and abs(mid(clock) - mid(date)) <= 4, g
@@ -116,7 +116,7 @@ def test_the_desktop_and_tablet_head_has_room_under_the_places_bar(tmp_path: Pat
     rows = _open(tmp_path, [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, SETTLE] + steps, touch=False)
     assert len(rows) == 2, rows
     for g, w in zip(rows, (1440, 768)):
-        assert g["vw"] == w, g
+        assert g["iw"] == w, g
         assert g["tokSp5"] > 0 and g["padTop"] == g["tokSp5"], (w, g)
         assert g["clock"]["top"] - g["tabsBottom"] >= g["tokSp5"] - 0.5, (w, g)
         assert g["sw"] <= g["vw"], (w, g)
@@ -131,7 +131,7 @@ def test_the_breakpoint_is_between_720_and_721(tmp_path: Path) -> None:
     rows = _open(tmp_path, [{"emulate": {"w": 721, "h": 900, "dpr": 1}}, READY, SETTLE] + steps, touch=False)
     assert len(rows) == 2, rows
     for g, w, direction in zip(rows, (721, 720), ("row", "column")):
-        assert g["vw"] == w and g["dir"] == direction, (w, g)
+        assert g["iw"] == w and g["dir"] == direction, (w, g)
         assert g["sw"] <= g["vw"] and g["tokSp5"] > 0 and g["padTop"] == g["tokSp5"], (w, g)
 
 
