@@ -84,13 +84,48 @@ jobs:
           VERIFIED_RUN: ${{ needs.gate.outputs.run_id }}
         run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
 
+  hold:
+    # 11-19: three land runs queued 9.6 to 45.7 minutes behind seat workflow_dispatch runs. The account's 20-job cap serves
+    # jobs in the order they were created (no priority), and a seat dispatch that created its ~18 jobs while a land run ran,
+    # or just before the next land push, put them ahead of that landing's 24 jobs (measured by chain_idle.py, which lives in
+    # flow's repo, not here). Admission control is the only lever GitHub-hosted runners give: a seat dispatch creates no
+    # heavy job while a land/** run exists, so its jobs enter the queue after the land run's. This job waits (scripts/
+    # ci_hold_for_land.py) while any land/** run of this workflow is queued or running, or finished within a short grace
+    # (chained land runs are minutes apart); the heavy jobs `needs:` it.
+    # FAIL OPEN, on purpose: an API error or the timeout releases the run, and the job cannot turn the run red
+    # (continue-on-error), because the seat's proof is unchanged by a hold: only its start is delayed, and a red `hold`
+    # would read as a red seat. The heavy jobs keep their own `always() && !cancelled()` guard, so a skipped, failed or
+    # released `hold` never skips them. Seat-branch dispatches only (the same predicate as the matrix's 3.12-only arm):
+    # a land push, a main push, a PR, a tag and the nightly skip this job and run exactly what they ran before.
+    name: hold for land runs
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') }}
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    # above the script's own timeout (HOLD_TIMEOUT_S, 2400 s) plus the checkout
+    timeout-minutes: 45
+    # least privilege: read the run list, and check out the one script
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/ci_hold_for_land.py
+          sparse-checkout-cone-mode: false
+
+      - name: Wait while a land run exists
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_hold_for_land.py
+
   stage0:
     # The whole-tree invariant tests (tests/ci/invariant_tests.txt, marker `invariant`), so a rule broken by a change in a
     # file the author never opened still turns the run red. It runs BESIDE the heavy jobs, not in front of them (11-17,
     # landing throughput: it sat ~332 s median ahead of every shard): no job `needs:` it, and a red stage0 is a failed
     # job of the run, which is a red run. It skips only where the gate skips everything, a main sha already verified elsewhere.
     name: stage 0 (invariant tests)
-    needs: gate
+    needs: [gate, hold]
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
@@ -129,7 +164,7 @@ jobs:
     # would emit for TEST_SHARDS. It keeps its name because the check name is read elsewhere. A new test file needs no list
     # change: each shard job's `pick` fails on a collected file that no shard holds.
     name: plan test shards
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -154,7 +189,7 @@ jobs:
 
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; without always() the
     # implicit success() sees the skipped gate and skips this matrix (a land/** run once went green without
     # the unit suite). A failed, errored or cancelled gate runs the shards too (fail closed); only a gate that
@@ -291,7 +326,7 @@ jobs:
     # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -344,7 +379,7 @@ jobs:
     # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
     # skip). It runs the floor test files only.
     name: bwrap floor live (Python 3.12)
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -402,7 +437,7 @@ jobs:
     # file, nothing collected fails, any skip fails). The shard count is the matrix's own length (strategy.job-total).
     # Python 3.13 everywhere but a workflow_dispatch on a ref that is neither main nor land/**; that runs 3.12 only.
     name: cockpit browser tests (Python ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -496,7 +531,7 @@ jobs:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
     # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
     name: setup-isolation e2e (${{ matrix.os }})
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -536,7 +571,7 @@ jobs:
     # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
     # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
     name: chat egress srt (${{ matrix.os }})
-    needs: gate
+    needs: [gate, hold]
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
