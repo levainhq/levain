@@ -3716,7 +3716,7 @@ body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head { displ
 /* The zone head is not drawn on Home, but the Reset layout control lives in it and only shows while a layout is saved: it is the one
    child kept, placed in the Work head's row (the Work head takes the rest of the row from 721 px; below that it has a row of its own). */
 body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head:has(> [data-layout-reset]) {
-  display: flex; order: 30; justify-content: flex-end; align-self: end; margin: 0; }
+  display: flex; order: 30; justify-content: flex-end; align-self: end; margin: 0; grid-column: 1 / -1; }
 body.ia[data-ia-place="home"] .ck-zone[data-zone="operate"] > .zone-head > :not([data-layout-reset]) { display: none; }
 body.ia[data-ia-place="home"] .deck > .frame:not(.masthead):not(.ia-places),
 body.ia[data-ia-place="home"] :is(#ck-band, #ck-skycol) { padding-inline: 0; margin: 0; }
