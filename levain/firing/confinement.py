@@ -3928,13 +3928,14 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
                          tuple(cfg.hands_egress_ports))
 
 
-#: Claude Code adds the signed-in claude.ai account's connectors (its mail, drive and calendar connectors) to every session,
-#: ``--strict-mcp-config`` included. The hands account signs in as the operator, so without this every hands Claude start
-#: reached connectors outside the registry. Measured on a fresh macOS 15.7.7 hands account 11-20 (levain#139, leg 6 step 12):
-#: ``claude mcp list`` showed five connected claude.ai connectors; with this variable it said "No MCP servers configured"
-#: (project_memory/1118-vm/leg6_fresh_evidence/chat_mcplist.txt and chat_mcplist_off.txt). Slot runs say the same in their
-#: settings (``disableClaudeAiConnectors``, ``levain.slot.render``); the hands account has no settings of ours, so the
-#: environment, which every hands start gets from :func:`_hands_env`, carries it.
+#: The hands account signs in as the operator, and a Claude Code start WITHOUT ``--strict-mcp-config`` (``claude mcp list``, a
+#: status or login probe) adds that account's claude.ai connectors (its mail, drive and calendar connectors). Measured on a
+#: fresh macOS 15.7.7 hands account 11-20 (levain#139, leg 6): ``claude mcp list`` showed five connected claude.ai connectors;
+#: with this variable it said "No MCP servers configured" (project_memory/1118-vm/leg6_fresh_evidence/chat_mcplist.txt and
+#: chat_mcplist_off.txt). The chat's strict start did NOT show them (levain-leg6 2's 14:30 correction in the desk log), so this
+#: is defence in depth for the non-strict starts. Slot runs say the same in their settings (``disableClaudeAiConnectors``,
+#: ``levain.slot.render``); the hands account has no settings of ours, so the environment, which every hands start gets from
+#: :func:`_hands_env`, carries it.
 HANDS_NO_CLAUDEAI_CONNECTORS = ("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
 
 

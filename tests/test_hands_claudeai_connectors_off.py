@@ -1,8 +1,9 @@
 """Every hands-uid start carries ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` (levain#139, leg 6 step 12).
 
-The hands Claude signs in as the operator, and Claude Code then adds the account's claude.ai connectors (mail, drive,
-calendar) to the session even under ``--strict-mcp-config``: measured as the hands user, ``claude mcp list`` showed five
-connected connectors; with the variable it said "No MCP servers configured". The variable rides the hands environment
+The hands Claude signs in as the operator, and a Claude Code start without ``--strict-mcp-config`` adds the account's
+claude.ai connectors (mail, drive, calendar): measured as the hands user, ``claude mcp list`` showed five connected
+connectors; with the variable it said "No MCP servers configured" (the chat's strict start did not show them: defence in
+depth, levain-leg6 2's 14:30 correction). The variable rides the hands environment
 (``confinement._hands_env``), so each builder below, which is how login, status, logout, the ``claude mcp`` verbs and the
 chat start the vendor, is checked on its production argv for both hosts.
 """
