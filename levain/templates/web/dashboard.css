@@ -4003,6 +4003,11 @@ body.ia :is(#ck-needs, #ck-drop, #ck-state-slot, .panel, .ia-head, .dev-zone, .c
   body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) { flex: 1 1 100%; justify-content: flex-start; }
   body.ia .masthead #freshline:is([data-state="stale"], [data-state="down"], [data-state="failed"], [data-state="refused"]) :is(.fl-state, .fl-age) {
     flex: 0 1 auto; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+  /* the "updating" cue is the age, and an age is never cut (levain#169: at 320 the shared row left 72 px and it read "live · up..."). The live
+     and connecting line is sized by its own text and never shrunk, so where the buttons' row has not the room for it the line wraps to its own
+     row (320 only, and only while a read says "updating"); a line with no age is a dot and a word and shares the row at every phone width. */
+  body.ia .masthead #freshline:is([data-state="live"], [data-state="connecting"]) { flex: 1 0 auto; min-width: 0; }
+  body.ia .masthead #freshline:is([data-state="live"], [data-state="connecting"]) .fl-age { flex: 0 0 auto; overflow: visible; text-overflow: clip; }
   /* the presence chip is the row after the buttons at every phone width: beside them it left the line a few characters of room (481 to 640) */
   body.ia .masthead #presencebtn { order: 5; flex: 1 1 100%; width: auto; justify-content: flex-start; }
   /* its own full row, cut with an ellipsis rather than past the edge: it now carries a read's failure and what to do about it */
