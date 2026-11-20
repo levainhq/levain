@@ -151,8 +151,8 @@ def main():
                 print("released: api error (%d in a row; %s: %s)" % (errors, type(exc).__name__, _clean(exc)), flush=True)
                 return 0
             if _monotonic() - start + poll_s > timeout_s:
-                print("released: api error (hold budget of %d s spent; %s: %s)" % (timeout_s, type(exc).__name__, _clean(exc)),
-                      flush=True)
+                print("released: api error (a retry would pass the hold budget of %d s; %s: %s)"
+                      % (timeout_s, type(exc).__name__, _clean(exc)), flush=True)
                 return 0
             print("api error %d, retrying (%s)" % (errors, type(exc).__name__), flush=True)
             _sleep(poll_s)

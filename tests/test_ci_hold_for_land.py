@@ -222,8 +222,9 @@ def test_api_errors_after_a_long_wait_release_at_the_timeout_not_after_more_retr
     monkeypatch.setenv("HOLD_POLL_S", "30")
     monkeypatch.setenv("HOLD_TIMEOUT_S", "40")
     assert hold.main() == 0
-    # the budget ran out with fewer errors in a row than the cap: the line says so, never "N in a row"
-    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("released: api error (hold budget of 40 s spent;")
+    # a retry would pass the budget with fewer errors in a row than the cap: the line says so (not that the budget is spent: it
+    # releases before the next sleep would cross it), never "N in a row"
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("released: api error (a retry would pass the hold budget of 40 s;")
     assert sum(w.slept) <= 40
 
 
