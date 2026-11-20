@@ -151,6 +151,7 @@
       var d = document.createElement("div");
       d.className = "ia-head";
       d.dataset.iaHead = h[0];
+      d.setAttribute("data-ia-empty", "1");   // hidden until the first sync finds a block under it, so no head flashes over an undrawn page
       var t = document.createElement("h3");
       t.textContent = h[1];
       var s = document.createElement("span");
@@ -172,13 +173,20 @@
       '.panel[data-ck-panel="stream"]', '.panel[data-ck-panel="scheduled_jobs"]', '.panel[data-ck-panel="jobs"]', '.panel[data-ck-panel="edits"]'],
     glance: ["#ck-widgets"]
   };
-  function drawn(el) { return !!(el && el.getClientRects && el.getClientRects().length); }
+  // drawn = it has a box with some height (a hidden block has none, and an emptied container can have a box of no height)
+  function drawn(el) {
+    if (!el || !el.getClientRects) return false;
+    var rs = el.getClientRects();
+    for (var i = 0; i < rs.length; i++) if (rs[i].height > 0) return true;
+    return false;
+  }
   // only on Home: elsewhere the heads are not displayed and the blocks under them are not either, so nothing there can be measured
   function syncHeads() {
     if (document.body.dataset.iaPlace !== "home") return;
     var heads = document.querySelectorAll(".deck .ia-head");
     for (var i = 0; i < heads.length; i++) {
-      var sels = HEAD_OWNS[heads[i].dataset.iaHead] || [], any = false;
+      var sels = HEAD_OWNS[heads[i].dataset.iaHead], any = false;
+      if (!sels) { heads[i].removeAttribute("data-ia-empty"); continue; }   // a head this map does not know stays shown: never hide what is not understood
       for (var j = 0; j < sels.length && !any; j++) {
         var els = document.querySelectorAll(sels[j]);
         for (var k = 0; k < els.length && !any; k++) any = drawn(els[k]);
@@ -256,7 +264,8 @@
     // a block drawn, removed or shown later (the board's panels arrive after the first paint) re-asks which heads have something under them;
     // the heads' own attribute is outside the filter, so this cannot feed itself
     var deck = document.querySelector(".deck");
-    if (deck) new MutationObserver(queueHeads).observe(deck, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "class", "style"] });
+    if (deck) new MutationObserver(queueHeads).observe(deck, { childList: true, subtree: true, attributes: true, attributeFilter: ["hidden", "class"] });
+    window.addEventListener("resize", queueHeads);   // a block a media query hides or shows changes with the width
     paint();
     queueHeads();
   }

@@ -567,8 +567,8 @@ def test_the_collapsed_graph_strip_hides_the_event_graph_too(tmp_path: Path) -> 
     assert shut["toggle"]["h"] > 0 and shut["toggle"]["y"] + shut["toggle"]["h"] <= shut["card"]["y"] + 1, shut   # the toggle sits in the Machine control row above the card (levain#141 polish: it no longer floats over the card)
 
 
-# levain#164: the blocks each Home head owns (the page's own copy lives in dashboard_places.js HEAD_OWNS; this is the test's, so a block
-# added to one and not the other shows as a disagreement here)
+# levain#164: the blocks each Home head owns. The page's own copy is dashboard_places.js HEAD_OWNS and dashboard.css orders the same blocks;
+# this is the test's third copy, so it checks the page's heads against what is drawn, not the copies against each other.
 HEAD_BLOCKS = {
     "desk": ["#ck-drop", '.panel[data-ck-panel="flow-desk"]'],
     "work": ['.panel[data-ck-panel="tray"]', '.panel[data-ck-panel="board"]', '.panel[data-ck-panel="inbox"]'],
