@@ -356,7 +356,20 @@ def _install_session_home(basetemp=None) -> None:
         os.environ.pop(name, None)     # the live marker too: a shell that holds it never opens the real home to a test
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_cmdline_main(config):
+    # the local-run policy (tests/local_run_policy.py): refuse a bare full run off CI and cap the xdist workers, before
+    # xdist reads maxprocesses
+    from tests import local_run_policy
+    message = local_run_policy.refuse_bare_full(config)
+    if message:
+        raise pytest.UsageError(message)
+    local_run_policy.cap_workers(config)
+
+
 def pytest_configure(config):
+    from tests import local_run_policy
+    local_run_policy.background_qos()     # this process and everything it spawns, workers and browsers included
     # ``pytest_testnodedown`` is an xdist hook: a module-level one makes a plain-pytest run (no pytest-xdist) fail with
     # "unknown hook" at startup, which is why the keyguard's controller-side hook is registered only when xdist is loaded
     if config.pluginmanager.hasplugin("xdist") and not config.pluginmanager.has_plugin("levain-keyguard-xdist"):
