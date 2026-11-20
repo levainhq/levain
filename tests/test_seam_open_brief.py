@@ -1084,7 +1084,7 @@ def test_one_in_flight_item_naming_thousands_of_ids_adds_a_bounded_drift_and_the
     text = _brief(world).text
     lines = text.splitlines()
     assert sum(1 for ln in lines if ln.startswith("  in_flight names a#")) == board_cli.MAX_DRIFT_LINES
-    assert f"  +{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board open)" in lines
+    assert f"  +{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board state)" in lines
 
 
 def test_the_open_reads_the_board_once_when_in_flight_names_an_id_and_both_sections_agree(world, monkeypatch):

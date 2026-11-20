@@ -176,7 +176,7 @@ def test_a_board_that_read_no_item_and_says_why_is_unreadable_never_an_empty_lis
 def test_a_repo_the_board_holds_no_item_of_is_one_line():
     assert board_cli.open_lines(_doc(("ready",)), "ghost") == ["ghost: the board holds no items for it"]
     assert board_cli.open_lines(_doc(("ready",), audit=[{"kind": "unknown", "id": "levain#1", "why": "x"}]), "ghost") == \
-        ["ghost: the board holds no items for it", "  audit: 1 entries on other repos (read them with levain board state)"]
+        ["ghost: the board holds no items for it", "  audit: 1 entry on other repos (read them with levain board state)"]
 
 
 def test_a_repo_with_no_items_keeps_the_problem_lines_and_the_counted_audit_after_its_one_line():
@@ -345,7 +345,7 @@ def test_one_in_flight_item_naming_thousands_of_ids_adds_a_bounded_number_of_dri
     doc["items"] = [{**_doc(("done",))["items"][0], "id": f"a#{k}"} for k in range(1, n + 1)]
     got = board_cli.in_flight_drift(_body(" ".join(f"a#{k}" for k in range(1, n + 1))), doc)
     assert len(got) == board_cli.MAX_DRIFT_LINES + 1
-    assert got[-1] == f"+{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board open)"
+    assert got[-1] == f"+{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board state)"
     assert sum(len(ln) for ln in got) < 4000
     few = board_cli.in_flight_drift(_body(" ".join(f"a#{k}" for k in range(1, board_cli.MAX_DRIFT_LINES + 1))), doc)
     assert len(few) == board_cli.MAX_DRIFT_LINES and not any(ln.startswith("+") for ln in few)      # at the bound: no count line
@@ -379,7 +379,7 @@ def test_a_repo_filter_that_hides_audit_entries_says_how_many_in_one_line_and_in
                                            {"kind": "unknown", "id": None, "why": "store-wide"}])
     doc["items"][1]["id"] = "other#1"
     doc["audit"][1]["id"] = "other#1"
-    line = "  audit: 1 entries on other repos (read them with levain board state)"
+    line = "  audit: 1 entry on other repos (read them with levain board state)"
     assert line in board_cli.open_lines(doc, "levain") and board_cli.open_view(doc, "levain")["audit_outside_repo"] == 1
     assert board_cli.open_lines(doc, "ghost") == ["ghost: the board holds no items for it",
                                                   "  audit (whole board): 1 unknown (read them with levain board state)",
@@ -395,7 +395,7 @@ def test_the_verb_pairs_exit_3_with_the_line_that_says_the_audit_is_on_another_r
     monkeypatch.setattr(board_cli, "state_doc", lambda read, say: (3, doc))
     rc = main(["board", "open", "--repo", "ghost"])
     out = capsys.readouterr().out
-    assert rc == 3 and out == "ghost: the board holds no items for it\n  audit: 1 entries on other repos (read them with levain board state)\n"
+    assert rc == 3 and out == "ghost: the board holds no items for it\n  audit: 1 entry on other repos (read them with levain board state)\n"
     rc = main(["board", "open", "--repo", "ghost", "--json"])
     assert rc == 3 and json.loads(capsys.readouterr().out)["audit_outside_repo"] == 1
     rc = main(["board", "open", "--json"])

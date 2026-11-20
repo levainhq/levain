@@ -935,7 +935,7 @@ def in_flight_drift(body: Any, doc: dict[str, Any]) -> list[str]:
             else:
                 omitted += 1
     if omitted:
-        out.append(f"+{omitted} more in_flight ids the board reads as not open (read them with levain board open)")
+        out.append(f"+{omitted} more in_flight ids the board reads as not open (read them with levain board state)")
     return out
 
 
@@ -973,7 +973,7 @@ def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     view = open_view(doc, repo_name)
     problems = problem_lines(view)
     outside = view.get("audit_outside_repo", 0)
-    elsewhere = [f"  audit: {outside} entries on other repos (read them with levain board state)"] if outside else []
+    elsewhere = [f"  audit: {outside} {'entry' if outside == 1 else 'entries'} on other repos (read them with levain board state)"] if outside else []
     name = _one_line(repo_name) if repo_name is not None else None       # a name from the command line: one line, never a forged one
     if not doc["items"] and problems:
         lines = ["open: unreadable: no item of the board could be read"]
