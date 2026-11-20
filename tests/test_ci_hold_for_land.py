@@ -217,6 +217,20 @@ def test_it_releases_when_an_error_comes_after_some_waiting(monkeypatch, capsys)
     assert len(w.slept) == hold.API_ERRORS_TO_RELEASE
 
 
+def test_api_errors_after_a_long_wait_release_at_the_timeout_not_after_more_retries(monkeypatch, capsys):
+    w = World(monkeypatch, [[run("land/x", "in_progress", id=5)], RuntimeError("HTTP 502")])
+    monkeypatch.setenv("HOLD_POLL_S", "30")
+    monkeypatch.setenv("HOLD_TIMEOUT_S", "40")
+    assert hold.main() == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1].startswith("released: api error")
+    assert sum(w.slept) <= 40
+
+
+def test_the_evaluator_models_githubs_case_insensitive_startswith():
+    # GitHub compares strings case-insensitively: a dispatch on `Land/x` is land-like to the workflow's `if`
+    assert _hold_if("workflow_dispatch", "refs/heads/Land/x") is False
+
+
 def test_it_releases_on_the_timeout_and_exits_zero(monkeypatch, capsys):
     w = World(monkeypatch, [[run("land/x", "in_progress", id=5)]])
     monkeypatch.setenv("HOLD_POLL_S", "30")

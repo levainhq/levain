@@ -147,7 +147,7 @@ def main():
             runs = _gh_runs(repo)
         except Exception as exc:  # fail open: API or JSON errors in a row release the run
             errors += 1
-            if errors >= API_ERRORS_TO_RELEASE:
+            if errors >= API_ERRORS_TO_RELEASE or _monotonic() - start + poll_s > timeout_s:
                 print("released: api error (%s: %s)" % (type(exc).__name__, _clean(exc)), flush=True)
                 return 0
             print("api error %d, retrying (%s)" % (errors, type(exc).__name__), flush=True)

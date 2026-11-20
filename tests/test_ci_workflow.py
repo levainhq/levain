@@ -212,7 +212,7 @@ def evaluate_job_if(cond, results, outputs, event, ref, cancelled=False):
     if py.strip():
         value = bool(eval(py, {"__builtins__": {}}, {"R": results, "O": outputs, "EV": event, "REF": ref,
                                                      "CANCELLED": cancelled,
-                                                     "SW": lambda prefix: ref.startswith(prefix)}))
+                                                     "SW": lambda prefix: ref.casefold().startswith(prefix.casefold())}))
     else:
         value = True
     return value
