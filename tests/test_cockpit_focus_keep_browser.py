@@ -23,7 +23,7 @@ READ = ("JSON.stringify({kept: document.activeElement.classList.contains('list-i
 # the board's own redraws, and every passive read the page refused for the field (the status line says so each time)
 COUNT = ("window.__redraws = 0; window.__deferred = 0; "
          "new MutationObserver(() => { window.__redraws++; }).observe(document.getElementById('board'), {childList: true}); "
-         "new MutationObserver(() => { if (/deferred/.test(document.getElementById('stamp').textContent)) window.__deferred++; })"
+         "new MutationObserver(() => { if (/the read waits until you finish/.test(document.getElementById('stamp').textContent)) window.__deferred++; })"
          ".observe(document.getElementById('stamp'), {childList: true, characterData: true, subtree: true}); 1")
 REDRAWN = "window.__redraws > 0 && 1"
 

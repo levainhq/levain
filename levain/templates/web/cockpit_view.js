@@ -687,6 +687,8 @@
   // payload through the same mapper, against this manifest, so it draws exactly what a full load would.
   let lastManifest = null;
   let manifestAt = 0;
+  // the manifest heads the board was last drawn from, and when: the freshness line (fresh_line.js) reads each panel's status and as_of here
+  const freshHeads = () => ({ heads: lastManifest && lastManifest.panels ? lastManifest.panels : null, at: manifestAt });
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
@@ -1921,15 +1923,58 @@
   // A brief-region panel other than the state line has no copy on the page (the Today card is not drawn): an announcement of it has
   // nothing to repaint, and answering false would reload the whole board each time it changes. Its own read still records the held
   // etag, so the stream's manifest diff stops announcing the same change.
+  // A panel read in place records the read: its etag and when (the held map), and its own status and read time, which also become its head in the
+  // manifest the page keeps. The freshness line reads the heads, so a panel read fresh stops being named stale until the next whole read.
+  // The held record also says whether the panel's last read failed (`err`): a good read clears it, noteFault sets it.
+  function noteApplied(pid, raw) {
+    const heldMap = root.LevainCockpitHeld;
+    if (heldMap && raw && typeof raw.etag === "string") {
+      const rec = { etag: raw.etag, at: Date.now(), err: "" };
+      if (typeof raw.status === "string") rec.status = raw.status;
+      if (typeof raw.as_of === "string") rec.as_of = raw.as_of;
+      heldMap[pid] = Object.assign({}, heldMap[pid], rec);
+    }
+    const heads = lastManifest && lastManifest.panels;
+    if (heads && heads[pid] && raw) {
+      const nx = {};
+      if (typeof raw.status === "string") nx.status = raw.status;
+      if (typeof raw.as_of === "string") nx.as_of = raw.as_of;
+      heads[pid] = Object.assign({}, heads[pid], nx);
+    }
+  }
+  function noteFault(pid, why) {
+    const heldMap = root.LevainCockpitHeld;
+    if (heldMap && heldMap[pid]) heldMap[pid] = Object.assign({}, heldMap[pid], { err: String(why || "read failed") });
+  }
+  // the freshness line is told that a read settled (never from a heartbeat): the one dispatch of `levain:fresh` for a panel read
+  function tellFresh() {
+    try { if (typeof document !== "undefined" && typeof document.dispatchEvent === "function" && typeof root.CustomEvent === "function") document.dispatchEvent(new root.CustomEvent("levain:fresh")); } catch (_) { /* a page without events has no line to tell */ }
+  }
   const briefUndrawn = (pid) => { const r = lastManifest && lastManifest.regions; return !!(r && Array.isArray(r.brief) && pid !== "state" && r.brief.indexOf(pid) >= 0); };
+  // refetchPanel is the ONE place a panel read's outcome is published, for the stream and for every direct caller alike (a write's refetch, the
+  // topology's replay): the held record (noteApplied / noteFault) and the line (tellFresh). A superseded or declined read publishes nothing.
   async function refetchPanel(pid) {
+    let r;
+    try { r = await readInPlace(pid); } catch (e) { noteFault(pid, e && e.message ? e.message : e); r = "fault"; }
+    if (r === "applied" || r === "fault") tellFresh();
+    return r;
+  }
+  async function readInPlace(pid) {
     if (!liveOf(pid).length) {
-      if (!briefUndrawn(pid)) return false;
-      try {
-        const raw = await readPanel(pid), heldMap = root.LevainCockpitHeld;
-        if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
-      } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
-      return "applied";
+      if (briefUndrawn(pid)) {
+        try {
+          noteApplied(pid, await readPanel(pid));
+        } catch (_) { /* never drawn: a failed read stays as quiet as the panel; the next diff announces it again */ }
+        return "applied";
+      }
+      // A panel the whole read could not read is drawn as a plain error card with no live node. Its retry must cost one read of that
+      // panel, not a board: answering false here would make the stream reload every panel on every retry step and every event. A
+      // failed read throws to refetchPanel (the one publisher, answering "fault", which the stream bounds without a reload); a read that
+      // succeeds answers false, because only a whole draw can mount the panel, and that one reload is the right one. (The brief panels
+      // above are never drawn and stay quiet whatever their read says.)
+      const held = root.LevainCockpitHeld && root.LevainCockpitHeld[pid];
+      if (held && held.err) await readPanel(pid);
+      return false;
     }
     // a scrubbed past (topology_view.js Replay) pauses the topology's live refetch: answered without a read; Live reads it again
     if (pid === "topology" && root.LevainTopologyView && root.LevainTopologyView.paused && root.LevainTopologyView.paused()) return "applied";
@@ -1944,7 +1989,7 @@
     if (boardEpoch !== epoch) return false;
     const live = liveOf(pid);
     if (!live.length) return false;
-    if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }
+    if (fault) { for (const s of live) { s.fault = fault; paint(s); } noteFault(pid, fault); return "fault"; }
     const core = root.LevainDashboard;
     if (!lastManifest || !core) return false;
     let view, entry, data;
@@ -1952,7 +1997,12 @@
       view = mapSnapshot({ manifest: lastManifest, panels: { [pid]: raw } }, { elapsedMs: Date.now() - manifestAt });
       entry = view.layout.find((e) => e.id === pid);
       data = view.extra_panels[pid];
-    } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return "fault"; }
+    } catch (e) {
+      const why = "could not be mapped (" + (e && e.message ? e.message : e) + ")";
+      for (const s of live) { s.fault = why; paint(s); }
+      noteFault(pid, why);
+      return "fault";
+    }
     if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
     const shape = shapeOf(entry, data);
     if (live.some((s) => s.shape !== shape)) return false;
@@ -1968,8 +2018,7 @@
     }
     if (core.adoptPanel) core.adoptPanel(pid, view);
     // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
-    const heldMap = root.LevainCockpitHeld;
-    if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
+    noteApplied(pid, raw);
     return "applied";
   }
 
@@ -2806,7 +2855,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

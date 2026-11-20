@@ -20,7 +20,7 @@ from anneal_memory.spores import IntentionStore
 from levain.consent.queue import default_queue_dir
 from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 
 TRAY = "document.querySelector('[data-ck-panel=tray]')"
@@ -310,7 +310,8 @@ def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None
 
 _MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0;"
            "window.matchMedia=function(q){const m=o(q);if(/max-width:\\s*720px/.test(q)){const a=m.addEventListener.bind(m);"
-           "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
+           # counts the LIST's placeholder listener only: another module (the freshness line, levain#159) may watch the same width once
+           "m.addEventListener=function(t,f,c){if(f&&f.name==='setPlaceholders')window.__mqAdds++;return a(t,f,c);};}return m;};})()")
 
 _LISTFIX_PROBE = f"""(() => {{
   const T = document.querySelector('#levain-modal .modal-body') || {TRAY}; const rows = [];
@@ -681,6 +682,7 @@ def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_lay
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            BOARD_SETTLED,        # a fresh install's first hello may draw the board again: "idle" is counted from the settled board
             {"eval": f"window.__m = {TRAY}.querySelector('[data-list-more]'); window.__n = 0; "
                      f"new MutationObserver((r) => {{ window.__n += r.length; }}).observe({TRAY}, {{childList: true}}); 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"},

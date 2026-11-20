@@ -17,6 +17,7 @@ from anneal_memory import Store
 from levain.writes import ActionVerb
 from tests._inbox_fake import inbox_downstream
 from tests._page_drive_run import run as run_driver
+from tests._waits import scaled
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS
 
@@ -102,6 +103,54 @@ def landed_tap(target: str, until: str | None = None, **step: Any) -> list[dict[
     return [{"eval": _arm_clicks(target)},
             {"tap": target, "until": until or "window.__tapClicks >= 1 && 1", "retry_if": "!(window.__tapClicks >= 1)",
              "ms": 30000, **step}]
+
+
+# A page that has just drawn its board is not yet at rest. On a freshly installed cockpit the change stream's first hello is compared
+# with the server's manifest, and a panel head that has moved since the page's boot read (its own band read numbers the rows, the
+# stream's first build is a new generation) makes the page draw the whole board once more a moment later, replacing every node a test
+# had already taken hold of. A test that clicks, scrolls or counts changes on the first draw must start from the settled board.
+# BOARD_SETTLED waits for the stream's live chip (the hello has been taken), then for a stretch in which the page has no cockpit read in
+# flight (the change stream's own long-lived request apart), has started none, and has drawn nothing: no panel added or removed and no
+# element added or removed inside one. A redraw that is under way is a read in flight, and a read that finished before the step began
+# (the page's resource timings) restarts the stretch too, so a slow read does not end the wait early. Both lengths are scaled by
+# LEVAIN_TEST_WAIT_SCALE like every other wait a test sets on a page, and held under the driver's own limit for one async step. A page
+# that never reaches that state in time fails the drive with the step's own words (what the chip said, what was in flight, when the
+# board was last drawn), never a later assertion on a node that was replaced under the test. One step, one collected value (1).
+_SETTLED_JS = """(async () => {
+  const QUIET_MS = __QUIET__, DEADLINE_MS = __DEADLINE__, sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const t0 = performance.now(); let lastDraw = null, liveAt = 0, state = 'no chip';
+  if (!window.__settledReads) {
+    const real = window.fetch.bind(window); window.__settledReads = { inflight: 0, last: 0 };
+    window.fetch = (u, o) => { if (String((u && u.url) || u).indexOf('/cockpit/events') >= 0) return real(u, o);
+      const s = window.__settledReads; s.inflight++; s.last = performance.now();
+      const done = () => { s.inflight--; s.last = performance.now(); };
+      let p; try { p = real(u, o); } catch (e) { done(); throw e; }
+      return p.then((r) => { done(); return r; }, (e) => { done(); throw e; }); };
+  }
+  const reads = window.__settledReads;
+  // a cockpit read that finished before this step began is in the page's resource timings, not in the counter above
+  const lastResourceEnd = () => { let t = 0; for (const e of performance.getEntriesByType('resource')) if (e.name.indexOf('/cockpit/') >= 0 && e.name.indexOf('/cockpit/events') < 0) t = Math.max(t, e.responseEnd); return t; };
+  const inPanel = (n) => n.nodeType === 1 && (n.hasAttribute('data-ck-panel') || !!n.querySelector('[data-ck-panel]'));
+  const seen = new MutationObserver((rs) => { for (const r of rs) {
+    const inside = r.target && r.target.closest && r.target.closest('[data-ck-panel]');
+    for (const n of [...r.addedNodes, ...r.removedNodes]) if (inPanel(n) || (inside && n.nodeType === 1)) lastDraw = performance.now(); } });
+  seen.observe(document, { subtree: true, childList: true });
+  try {
+    while (performance.now() - t0 < DEADLINE_MS) {
+      const chip = document.querySelector('.livechip'), now = performance.now();
+      state = chip ? String(chip.dataset.state) : 'no chip';
+      if (state !== 'live') liveAt = 0; else if (!liveAt) liveAt = now;
+      const since = Math.max(liveAt, lastDraw === null ? 0 : lastDraw, reads.last, lastResourceEnd());
+      if (liveAt && reads.inflight === 0 && now - since >= QUIET_MS) return 1;
+      await sleep(50);
+    }
+  } finally { seen.disconnect(); }
+  throw new Error('the board never settled: the live chip said ' + JSON.stringify(state) + ', ' + reads.inflight + ' cockpit read(s) in flight, and the board was last drawn '
+    + (lastDraw === null ? 'not at all since this step began' : Math.round(performance.now() - lastDraw) + ' ms ago')
+    + ' (a settled board is live, with no read in flight, started or drawn for ' + QUIET_MS + ' ms)');
+})()"""
+_SETTLED_STEP_LIMIT_MS = 55000    # the driver cuts one async step off a little later than this, whatever the scale
+BOARD_SETTLED = {"eval": _SETTLED_JS.replace("__QUIET__", str(int(min(scaled(2.5) * 1000, 10000)))).replace("__DEADLINE__", str(int(min(scaled(25) * 1000, _SETTLED_STEP_LIMIT_MS))))}
 
 
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:

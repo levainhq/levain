@@ -20,6 +20,7 @@ from levain.cockpit import board
 from levain.cockpit.engine import BOARD_CATEGORIES, KINDS
 from levain.consent.questions import QuestionStore
 from tests.test_one_board_browser import MODAL, ORDER, SETTLED, _seed
+from tests._cockpit_reread import REREAD
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_questions import lh  # noqa: F401  (fixture)
@@ -439,7 +440,7 @@ def test_a_board_kind_panel_carries_a_filter_and_a_count_and_draws_no_line_for_a
             {"eval": facts(pnl)},
             {"shot": str(shots / "board_filter_face_typed.png")},
             # a refresh that rebuilds the panel keeps what was typed (L3 r1): the old node is gone, the query and the narrowing stay
-            {"eval": f"window.__old = {panel}; document.getElementById('refresh').click(); 1"},
+            {"eval": f"window.__old = {panel}; {REREAD}"},
             {"until": f"{panel} && {panel} !== window.__old && {panel}.querySelector('.xfilter-input') && 1"},
             {"until": f"{panel}.querySelectorAll('.bd-row').length === 1"},
             {"eval": "JSON.stringify({kept: document.querySelector('[data-ck-panel=boardkind] .xfilter-input').value})"},

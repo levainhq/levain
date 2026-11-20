@@ -3,7 +3,7 @@
 Held: the entity named once in the masthead (the brand side's wordmark; #entity stays in the markup, undrawn), the jar out of the masthead
 and drawn into #ck-jarbox when the page has one, the masthead controls on one line, the now line on one baseline, Drop to the desk's
 inner padding, Home's order with the At a glance block between the Desk and Work (and the document order of those blocks the same, so
-Tab walks the drawn order), the phone's header row with Sync and Jump beside Drop, Grants and Notifications (44 px targets on touch),
+Tab walks the drawn order), the phone's header row with Jump and the freshness line beside Drop, Grants and Notifications (44 px targets on touch),
 the sticky masthead (below the dialogs, never over the drop box a jump lands on), Work's rows at tablet width, and 44 px icon buttons on
 touch at 1101-1500.
 
@@ -105,7 +105,7 @@ console.log(JSON.stringify(out));
 
 ONE = r"""(() => { const R = (e) => e.getBoundingClientRect(), mid = (e) => Math.round((R(e).top + R(e).bottom) / 2);
   const unit = document.querySelector('.masthead .unit'), ent = document.getElementById('entity');
-  const ctl = [...document.querySelectorAll('.masthead .ia-act, .masthead #refresh, .masthead #jumpbtn, .masthead .themesw')].filter(e => R(e).width > 0);
+  const ctl = [...document.querySelectorAll('.masthead .ia-act, .masthead #freshline, .masthead #jumpbtn, .masthead .themesw')].filter(e => R(e).width > 0);
   const mids = ctl.map(mid);
   return JSON.stringify({ unitShown: unit.getClientRects().length > 0, entityText: ent.textContent, wordText: document.querySelector('.masthead .wordmark').textContent, word: !!document.querySelector('.masthead .wordmark').getClientRects().length,
     jarInMasthead: !!document.querySelector('.masthead #jar, .masthead .jar'), spread: Math.max(...mids) - Math.min(...mids), n: ctl.length, sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }); })()"""
@@ -127,15 +127,15 @@ def test_the_masthead_names_the_entity_once_holds_no_jar_and_keeps_its_controls_
 
 PHONE_ROW = r"""(() => { const b = document.getElementById('presencebtn'); b.hidden = false; b.querySelector('.pr-chip-t').textContent = 'here';
   return new Promise(r => setTimeout(r, 300)).then(() => { const R = (s) => document.querySelector(s).getBoundingClientRect();
-    const rows = ['.ia-act[data-phone-jump=drop]', '.ia-act[data-phone-jump=grants]', '.ia-act[data-phone-jump=notifications]', '#refresh', '#jumpbtn'].map((s) => R(s));
-    return JSON.stringify({ tops: rows.map((r) => Math.round(r.top)), heights: rows.map((r) => Math.round(r.height)), widths: rows.map((r) => Math.round(r.width)),
-      chipTop: Math.round(R('#presencebtn').top), rowBottom: Math.round(Math.max(...rows.map((r) => r.bottom))), sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }); }); })()"""
+    const rows = ['.ia-act[data-phone-jump=drop]', '.ia-act[data-phone-jump=grants]', '.ia-act[data-phone-jump=notifications]', '#jumpbtn'].map((s) => R(s)), line = R('#freshline');
+    return JSON.stringify({ line: { top: Math.round(line.top), bottom: Math.round(line.bottom), left: Math.round(line.left), right: Math.round(line.right) }, tops: rows.map((r) => Math.round(r.top)), heights: rows.map((r) => Math.round(r.height)), widths: rows.map((r) => Math.round(r.width)),
+      chipTop: Math.round(R('#presencebtn').top), rowBottom: Math.round(Math.max(...rows.map((r) => r.bottom))), rowRight: Math.round(Math.max(...rows.map((r) => r.right))), sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth }); }); })()"""
 
 
 @needs_browser
-def test_on_a_phone_sync_and_jump_share_the_row_of_drop_grants_and_notifications(tmp_path: Path) -> None:
-    """With the presence chip drawn (it takes a row of its own) at 390, 600 and 720, the five buttons are one row, the chip is below it,
-    and every one is a 44 px target on touch."""
+def test_on_a_phone_jump_and_the_freshness_line_share_the_row_of_drop_grants_and_notifications(tmp_path: Path) -> None:
+    """With the presence chip drawn (it takes a row of its own) at 390, 600 and 720, the four buttons are one row with the freshness line beside
+    them (never above or below it), the chip is below it, and every button is a 44 px target on touch (the line is read-only)."""
     steps: list = []
     for w in (390, 600, 720):
         steps += [{"emulate": {"w": w, "h": 844, "dpr": 2, "mobile": True}}, SETTLE, {"eval": PHONE_ROW}]
@@ -146,6 +146,9 @@ def test_on_a_phone_sync_and_jump_share_the_row_of_drop_grants_and_notifications
         assert max(g["tops"]) - min(g["tops"]) <= 2, (w, g)                  # one row
         assert g["chipTop"] >= min(g["tops"]), (w, g)                         # the chip is never above them (at 390 and 600 it is a row below; at 720 it fits beside)
         assert min(g["heights"]) >= 44 and min(g["widths"]) >= 44, (w, g)
+        row_top, row_bottom = min(g["tops"]), g["rowBottom"]
+        assert row_top - 1 <= g["line"]["top"] and g["line"]["bottom"] <= row_bottom + 1, (w, g)   # the line sits on that row
+        assert g["line"]["left"] >= g["rowRight"] - 1, (w, g)                                      # after Jump, never over a button
         assert g["sw"] <= g["cw"], (w, g)
 
 
@@ -163,7 +166,7 @@ def test_icon_only_header_buttons_are_44_px_on_touch_from_1101_to_1500(tmp_path:
     rows = _vals(out)
     assert len(rows) == 3, out["values"]
     for g in rows:
-        assert g["coarse"] is True and g["n"] >= 8, g
+        assert g["coarse"] is True and g["n"] >= 7, g      # Drop, Grants, Notifications, Jump and the three theme buttons
         assert g["small"] == [], g
 
 

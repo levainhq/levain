@@ -11,13 +11,29 @@
   "use strict";
   const storeEl = document.getElementById("store");
   const stampEl = document.getElementById("stamp");
-  const btn = document.getElementById("refresh");
 
   // Report transient status WITHOUT clobbering the store-path subtitle (#store):
   // a momentary fetch blip shouldn't erase the identity of what we're viewing.
+  // `stampFailure`: the stamp holds a read-failure text, which a good read of any kind ends (see the levain:fresh listener below)
+  let stampFailure = false;
   function status(msg) {
     if (stampEl) stampEl.textContent = msg;
+    stampFailure = false;
   }
+
+  // What this shim knows about how current the page is, for the masthead's freshness line (fresh_line.js). The line is told when
+  // a read starts, settles or fails (`levain:fresh`) and asks for these facts then; nothing here is a timer.
+  // `failure` is the last read that failed ({why, at, refused}); whether it STILL stands is never stored, only derived (failureStands).
+  let lastWholeAt = 0, failure = null;
+  function fresh() {
+    try { if (typeof document.dispatchEvent === "function" && typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("levain:fresh")); } catch (_) { /* a page without events has no line to tell */ }
+  }
+  window.LevainBootFacts = function () {
+    const f = failureStands() ? failure : null;
+    return { wholeDrawn: wholeDrawn, lastWholeAt: lastWholeAt, inflight: inflight, inflightAt: inflightAt, refused: !!(f && f.refused), failed: f ? f.why : "" };
+  };
+  // the stamp's failure text ends where the line's failure does: the same derivation
+  document.addEventListener("levain:fresh", function () { if (stampFailure && !failureStands()) status(""); });
 
   let inflight = false;
   // A foreground (pwa_resume.js) after a long freeze: iOS kills the sockets of a frozen page, so a read that was in flight may
@@ -25,15 +41,16 @@
   // dead, its late result is discarded, and the next read starts.
   let loadGen = 0, inflightAt = 0, inflightPassive = true;
   const STUCK_MS = 8000;
-  // A FAILED first read (a radio still waking on foreground, a proxy hiccup) used to leave the cold "connecting…" line and an empty
-  // board with nothing to try again until the next foreground: Phill 11-06 saw both phones sit there. Until a board has been drawn
-  // once, a failure says so in the line and re-reads on a short backoff (and when the network returns); a refusal (token) is not retried.
-  // `wholeDrawn` is a WHOLE board (a part does not count), and it is what
-  // ends the retry: a read that fails after a part was drawn leaves the reader a part, so it is retried like a first read that drew nothing.
-  // What bounds the chain: one timer at a time (retryT), the backoff below (2, 4, 8, 15 s, then 30 s for as long as the server keeps failing,
-  // the same as before a part was ever drawn), and it ends at the first whole draw or a refusal; a persistently failing server is read once
-  // per 30 s, never in a tight loop.
-  let wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0, refusedStop = false;
+  // A FAILED read (a radio still waking on foreground, a proxy hiccup) must not leave the page with nothing to try again until the next
+  // foreground: Phill 11-06 saw both phones sit on the cold "connecting…" line with an empty board, and with no re-read key a failure after
+  // the first draw would sit the same way. A failure says so (the cold line before a board is drawn, the freshness line after) and re-reads
+  // on a short backoff (and when the network returns); a refusal (token) is not retried.
+  // `wholeDrawn` is a WHOLE board (a part does not count): before it, a read that fails after a part was drawn leaves the reader a part,
+  // so it is retried like a first read that drew nothing.
+  // What bounds the chain: one timer at a time (retryT), the backoff below (RETRY_MS, its last step repeated for as long as the server keeps
+  // failing), and it ends at the next good read of ANY kind (a whole draw, a panel applied in place, a poll) or a refusal; a persistently
+  // failing server is read once per last step, never in a tight loop.
+  let wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0;
   let holdT = 0, holdSpent = false;     // the watchdog on an inert part (boardMark): its timer, and whether it has already released the page
   // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
@@ -41,7 +58,7 @@
   // A draw ends the cold line's fault text and a queued retry; only a WHOLE draw resets the backoff. A part (the shells, or what a read has
   // landed so far) is drawn on every read of a board not yet whole, so if it reset the backoff a read that kept failing after its part (the
   // whole draw throwing, a later step rejecting) would be retried every 2 s for good.
-  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; if (whole === true) { wholeDrawn = true; retryN = 0; } refusedStop = false; clearTimeout(retryT); retryT = 0; }
+  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; if (whole === true) { wholeDrawn = true; retryN = 0; } clearTimeout(retryT); retryT = 0; }
   // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
   // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
   // - `html[data-board-whole]` is the positive "nothing more is coming that would replace this board" signal. It is set by the code that has
@@ -58,7 +75,7 @@
   //   left pulsing; a later whole draw replaces the board like any redraw. No count of failures releases the part.
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
-  //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
+  //   tabs, the theme switch, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
   //   the zones, but the hero, the Needs strip, the notes and the widgets (the tiles) are its siblings, and those are where a
   //   reader first acts (dashboard.html; renderKe in dashboard_core.js fills them). The drop (#ck-drop) is NOT in the list: renderDropHero
   //   builds its card once and refreshes it in place, so the whole draw never replaces it, and an inert drop would make a tap on the Drop
@@ -87,17 +104,32 @@
   function releaseShells(why, keep) {
     try { const d = window.LevainDashboard; if (d && typeof d.releaseLoading === "function") d.releaseLoading(why, keep); } catch (_) { /* nothing drawn to release */ }
   }
+  // a read of any kind (a whole draw, a panel applied in place by the stream, a manifest poll) landed after `t`: the page is current again
+  function readSince(t) {
+    if (lastWholeAt > t) return true;
+    try {
+      const S = typeof window.LevainStreamFacts === "function" ? window.LevainStreamFacts() : null;
+      if (S && S.pollOkAt > t) return true;
+      const H = window.LevainCockpitHeld || {};
+      return Object.keys(H).some(function (id) { return !!(H[id] && H[id].at > t); });
+    } catch (_) { return false; }
+  }
+  // THE derivation of "the read failed": a failure stands only while no read of any kind is newer than it. The line's facts, the stamp, the retry
+  // chain and the `online` handler all ask here, so none of them can call the page failed or current on its own.
+  function failureStands() { return !!failure && !readSince(failure.at); }
+  function refusalStands() { return failureStands() && failure.refused; }
   function retryUntilDrawn(why, refused) {
-    if (wholeDrawn) return;
     // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
-    // put up the token prompt. Say it and stop; the next foreground or the Refresh button reads again.
+    // put up the token prompt. Say it and stop; the next foreground reads again. Before a board is drawn the cold line says it; after,
+    // the freshness line does (the failure's `refused`), and the cold line is left alone (nothing would clear it).
     if (refused) {
-      refusedStop = true;
-      if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
-      releaseShells("the cockpit refused this device");     // shells drawn before the refusal would otherwise load for good
+      if (!wholeDrawn) {
+        if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
+        releaseShells("the cockpit refused this device");     // shells drawn before the refusal would otherwise load for good
+      }
       return;
     }
-    if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
+    if (!wholeDrawn && storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
     if (retryT) return;
     // only a FAILED read advances the backoff
     retryMs = RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)];
@@ -106,7 +138,9 @@
   function armRetry(why) {
     retryT = setTimeout(function () {
       retryT = 0;
-      if (wholeDrawn || refusedStop) return;
+      if (refusalStands()) return;
+      // a drawn board is retried only while its failure stands: a read of any kind since ends the chain
+      if (wholeDrawn && !failureStands()) { retryN = 0; return; }
       // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead, on the
       // SAME delay (no read failed, so the backoff does not advance)
       if (inflight) { armRetry(why); return; }
@@ -119,7 +153,7 @@
   // part drawn (no watchdog armed).
   function holdingPart(refused) { return !refused && holdT !== 0; }
   // (the node harnesses that load this file hand it a window with no event API)
-  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!wholeDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
+  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if ((!wholeDrawn || failureStands()) && !refusalStands() && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -693,7 +727,7 @@
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
   // would discard an in-progress edit/capture textarea (intention-108). The PASSIVE triggers
-  // (refresh-button, visibilitychange) defer while the operator is mid-edit — never the
+  // (visibilitychange, the foreground) defer while the operator is mid-edit — never the
   // save's own commit→load reload (passive:false), which MUST rebuild to close the editor
   // and show saved state. Deferring loses nothing: the substrate only changes on a wrap,
   // so the next visibility flip / the save's reload re-reads.
@@ -708,12 +742,12 @@
     if (!d || typeof d.hasUnsavedEdit !== "function") return true;
     return d.hasUnsavedEdit();
   }
-  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the refresh button,
+  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the transport's reload,
   // the tab coming back, a stale re-read) is flushed by the same release, and a timer checks again once a focus-only hold has aged out.
   let idleT = 0;
   const IDLE_RECHECK_MS = 10250;
   function refuseForEdit(msg) {
-    status(msg || "editing — refresh deferred");
+    status(msg || "editing — the read waits until you finish");
     deferredReload = true;
     refuseArm();
     return false;
@@ -1001,16 +1035,166 @@
     const words = resultWords(state);
     notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
     if (notice) paintNow(notice); else clearBusy(base.row_id || null);
-    const redrew = await afterWrite();
+    const touched = touchedOf(d);
+    if (touched && !words) paintRow(base.row_id || null, d.row, base.verb);
+    const redrew = await afterWrite(touched);
     if (!words && redrew === false && !pendingReload) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
-      notice = { key: base.row_id || null, text: "Saved. The page could not refresh; reload to see it.", cls: "note" };
+      notice = { key: base.row_id || null, text: "Saved. The page could not read the new state yet; it will read again.", cls: "note" };
       paintNow(notice);
     }
     return { ok: true, data: d };
   }
 
-  // reload after a landed write, deferring while an async job polls (as postWrite does)
-  async function afterWrite() {
+  // The refetch each write is waiting on, by panel id: { done } of the last one a write asked for, held only while it is in
+  // flight (its own settling removes it, whatever it answered).
+  const writeRefetches = new Map();
+  let dedupInstalled = false;
+  let viewRefetch = null;             // the view's own refetch, kept once the de-dup stands in front of it
+
+  // The panels a landed write says it changed: a non-empty list of ids, else null (an older server, which says nothing:
+  // the whole-board path below runs).
+  function touchedOf(d) {
+    if (!d || !Array.isArray(d.touched)) return null;
+    const ids = Array.from(new Set(d.touched.filter((x) => typeof x === "string" && x)));
+    return ids.length ? ids : null;
+  }
+
+  // Whether a snooze's new `next` ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM") is after now on this page's own clock: a day-only date
+  // is in the future from the day after today, a timed one when its minute is ahead. Anything else (a clear, a past date, a
+  // string that is no date) is not.
+  function isFutureNext(next) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/.exec(typeof next === "string" ? next : "");
+    if (!m) return false;
+    const now = new Date();
+    if (m[4] !== undefined) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime() > now.getTime();
+    return Date.UTC(+m[1], +m[2] - 1, +m[3]) > Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  }
+
+  // The row as the write left it, drawn at once from the write's own answer (the panel read after it can take seconds): the
+  // offered actions take the new row version (the next write on this row must not be refused stale meanwhile), and the person
+  // SEES the change. A snooze to a future date takes the row out of the List's now-view: it is collapsed and hidden from
+  // assistive tech, never removed, so the panel read that follows settles it. Otherwise the new words go into the row's clause
+  // where the row has one, and any other changed field dims the row with a title that says it was updated. Inline styles and
+  // attributes only. A `row` that names another row than the one written is not painted.
+  function paintRow(key, row, verb) {
+    if (!key) return;
+    const have = row && typeof row === "object" ? row : null;
+    if (have && typeof have.id === "string" && have.id !== key) return;
+    const ver = have && typeof have.row_version === "string" ? have.row_version : null;
+    const target = live && live.rows ? live.rows[key] : null;
+    if (target && ver) {
+      target.row_version = ver;
+      if (Array.isArray(target.actions)) for (const a of target.actions) if (a && a.target && typeof a.target === "object") a.target.row_version = ver;
+    }
+    const leaves = verb === "intention_surface_at" && !!have && isFutureNext(have.next);
+    const words = have && typeof have.text === "string" ? have.text : null;
+    const others = have ? Object.keys(have).filter((k) => k !== "id" && k !== "row_version" && k !== "text") : [];
+    for (const el of document.querySelectorAll("[data-row-key]")) {
+      if (el.dataset.rowKey !== key) continue;
+      if (ver) el.dataset.rowVersion = ver;
+      if (have && typeof have.next === "string") el.dataset.rowNext = have.next;
+      el.dataset.rowUpdated = "1";
+      if (el.classList && typeof el.classList.add === "function") el.classList.add("row-updated");
+      if (!have || !el.style) continue;
+      if (leaves) {
+        el.style.display = "none";
+        if (typeof el.setAttribute === "function") el.setAttribute("aria-hidden", "true");
+        continue;
+      }
+      let placed = false;
+      if (words !== null && typeof el.querySelector === "function") {
+        const clause = el.querySelector(".clause");
+        if (clause) { clause.textContent = words; placed = true; }
+      }
+      // a text the row has no clause for, or any other changed field (the row has no obvious place for it): dim the row
+      if (others.length || (words !== null && !placed)) {
+        el.style.opacity = "0.55";
+        el.title = "Updated; the list is refreshing";
+      }
+    }
+  }
+
+  // A call through the view for a panel the write refetched, while the write's read R is still in flight, is never handed R: R
+  // began with the write's response, and the announcement behind the call may be about a change R predates (another writer, a
+  // refresher tick, an agent), so R's payload could be the older one and nothing would announce again. The call waits for R to
+  // settle (answered, faulted or superseded) and then makes ONE read of its own, shared by every call that arrived meanwhile.
+  // The wait is bounded by PANEL_TIMEOUT_MS, since R has no deadline of its own; when it runs out the entry is dropped, so a hung
+  // R holds no later call at all. The call carries the panel id only, so there is no etag to compare against R's: a call that
+  // lands in flight always costs the one extra read. Once R has settled its entry is gone and a call reads for itself at once.
+  function installRefetchDedup() {
+    const V = window.LevainCockpitView;
+    if (dedupInstalled || !V || typeof V.refetchPanel !== "function") return;
+    dedupInstalled = true;
+    viewRefetch = V.refetchPanel;
+    V.refetchPanel = function (pid) {
+      const w = writeRefetches.get(pid);
+      if (!w) return viewRefetch.apply(V, arguments);
+      if (!w.next) {
+        w.next = new Promise(function (resolve, reject) {
+          let went = false, timer = 0;
+          const go = function () {
+            if (went) return;
+            went = true;
+            clearTimeout(timer);
+            if (writeRefetches.get(pid) === w) writeRefetches.delete(pid);
+            try { resolve(viewRefetch.call(V, pid)); } catch (e) { reject(e); }
+          };
+          timer = setTimeout(go, PANEL_TIMEOUT_MS);
+          w.done.then(go, go);
+        });
+      }
+      return w.next;
+    };
+  }
+
+  // Refetch ONLY the panels a write touched, in the place they are drawn, in the background: nothing here waits on a read and
+  // no whole-board load is waited on. A panel the page cannot repaint in place (answered false) asks for the board read, below.
+  function refetchTouched(ids) {
+    installRefetchDedup();
+    const V = window.LevainCockpitView;
+    const read = viewRefetch || (V && V.refetchPanel);
+    if (typeof read !== "function") return false;
+    let boardAsked = false;
+    for (const pid of ids) {
+      let done;
+      try { done = Promise.resolve(read.call(V, pid)); } catch (_) { done = Promise.resolve("fault"); }
+      done = done.catch(() => "fault");
+      const mine = { done };
+      writeRefetches.set(pid, mine);
+      done.then(() => { if (writeRefetches.get(pid) === mine) writeRefetches.delete(pid); });
+      // A panel the view cannot repaint in place (false), or whose read faulted or threw ("fault"; the repaint the write drew
+      // would otherwise stand with nothing to settle it), asks for the board read, NOT passive and not awaited here: the rebuild
+      // it makes is what closes the form or the state editor the write came from (a passive read is refused for an open edit
+      // and would leave that form on "saving..."), and a non-passive read that finds one in flight is latched to run after it.
+      // One write asks for it once, whatever number of its panels answered so, and not at all when a re-read is already owed.
+      // A board read that fails says so through the page's own failed-read line (load() sets it).
+      // While a job polls that rebuild would detach the job's live result box, the case the job deferral exists for: the
+      // fallback asks no read now and latches `deferredReload`, which onJobsIdle() flushes as one board read.
+      done.then((r) => {
+        if ((r !== false && r !== "fault") || boardAsked || pendingReload) return;
+        if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
+          deferredReload = true;
+          return;
+        }
+        boardAsked = true;
+        load().catch(() => {});
+      });
+    }
+    return true;
+  }
+
+  // after a landed write: with the panels it touched, an in-place background refetch of those (resolves at once, true when
+  // started); without (an older server), the reload of the whole board, deferring while an async job polls (as postWrite does).
+  // A board read already out when the write lands began before it and may draw the pre-write board over the rows the refetches
+  // paint, so one re-read is latched after it (the latch a non-passive load sets when it finds one in flight). While an async
+  // job polls, the refetch still runs (the write's own change is real now) but the data a job verb changes moves when the job
+  // ends, so the same deferral the whole-board path sets is set too: the board is read once more when the last job ends.
+  async function afterWrite(touched) {
+    if (touched) {
+      if (inflight) pendingReload = true;
+      if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) deferredReload = true;
+      return refetchTouched(touched);
+    }
     if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
       deferredReload = true;
       return undefined;
@@ -1295,15 +1479,18 @@
     }
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
-    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: panels[id] && panels[id].error !== undefined && panels[id].status === undefined ? null : (manifest.panels[id] || {}).etag || null }]));
+    // `err` marks a panel this read could not read (drawn as unavailable): a failure the stream reads again on its bounded schedule
+    heldNext = Object.fromEntries(ids.map((id) => {
+      const p = panels[id], unread = !!p && p.error !== undefined && p.status === undefined;
+      return [id, { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" }];
+    }));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: held }, { elapsedMs: Date.now() - fetchedAt });
   }
 
   async function load(opts) {
     const passive = !!(opts && opts.passive);
-    // a read the operator or the page's own foreground asks for re-opens the retry chain; only the chain's own timer / online
-    // re-reads (auto) stay shut after a refusal
-    if (!(opts && opts.auto)) refusedStop = false;
+    // a refusal is not unsaid by the ASKING for another read (a foreground that is deferred for an edit made no request, one in flight has not
+    // answered): it ends at a read's answer (a good one, or a failure that is not a refusal)
     if (inflight) {
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
@@ -1324,7 +1511,7 @@
     inflightPassive = passive;
     const myGen = ++loadGen;
     let landed = false, reread = false;
-    if (btn) btn.disabled = true;
+    fresh();
     try {
       if (fragmentTokenPending) await fragmentTokenPending;   // a link's token is being checked: read with the token that settles
       if (useManifest) {
@@ -1361,7 +1548,8 @@
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
         }
-        status("read " + new Date().toLocaleTimeString());
+        lastWholeAt = Date.now();
+        status("");     // the transient line is cleared; the freshness line says how current the page is
         showNotice();
         landed = true; drawnOnce(true);
         return true;
@@ -1374,7 +1562,7 @@
       // so it never prompts — iPad VIEWING stays open. The token, once entered, also unlocks writes.
       if (res.status === 403 && await isTokenReject(res)) {
         // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
-        // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard
+        // re-read (visibilitychange): re-check here, mirroring the post-fetch render guard
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
         // FIND-1 / the intention-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
@@ -1382,12 +1570,13 @@
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
         if (res.status === 403) {
           // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
-          // stored token so the next explicit refresh re-prompts, and surface it plainly. Scoped to
+          // stored token so the next explicit load re-prompts, and surface it plainly. Scoped to
           // the token-reject branch: a non-token 403 (Host/CSRF — plain-text body) never reaches here,
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
-          refusedStop = true;
+          failure = { why: "off-box token missing or invalid", at: Date.now(), refused: true };
           status("read refused — off-box token missing or invalid");
+          stampFailure = true;
           boardMark(true);     // refused: no whole draw is coming for this read
           return false;
         }
@@ -1411,7 +1600,8 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       boardMark(true);
-      status("read " + new Date().toLocaleTimeString());
+      lastWholeAt = Date.now();
+      status("");
       landed = true; drawnOnce(true);
       return true;
     } catch (e) {
@@ -1419,8 +1609,11 @@
       // the token changed while the board was read (nothing of it was drawn as the credential the page no longer holds): no failure and no
       // backoff, the board is read again at once as the page's credential now, as a passive read (an open edit defers it, see refuseForEdit)
       if (e && e.credentialChanged) { reread = true; return false; }
-      status("read failed: " + (e && e.message ? e.message : e));
       const refused = !!(e && e.refused);
+      // the reason, and for a refusal the remedy, are written where a touch screen reads them (the stamp), not only in the line's title
+      status(refused ? "not signed in: pair this device again" : "read failed: " + (e && e.message ? e.message : e));
+      stampFailure = true;
+      failure = { why: String(e && e.message ? e.message : e || "read failed"), at: Date.now(), refused: refused };
       // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog
       // releases it); anything else (no part drawn, a refusal, or the watchdog already fired) releases the page as it is, and the retry
       // below still reads again
@@ -1430,7 +1623,7 @@
     } finally {
      if (myGen === loadGen) {
       inflight = false;
-      if (btn) btn.disabled = false;
+      fresh();
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
       // Always non-passive → never deferred, so a saved edit's state always lands.
       if (pendingReload) { pendingReload = false; load(); }
@@ -1450,17 +1643,15 @@
     let passive = true;
     if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) {
       passive = inflightPassive;     // an authoritative (save) reload that crossed the freeze is replaced by an authoritative one
-      loadGen++; inflight = false;
-      if (btn) btn.disabled = false;   // the superseded read's own finally is skipped: the button is freed here, whatever the new read does
+      loadGen++; inflight = false;     // the superseded read's own finally is skipped, so the flag is dropped here
     }
     load({ passive: passive }).then(function (ok) { if (ok && storeEl && !inflight) storeEl.removeAttribute("data-cold"); });   // only a read that landed: a failed one leaves the placeholder
   });
 
-  // The refresh button + visibilitychange are PASSIVE re-reads → load({passive:true}),
+  // visibilitychange is a PASSIVE re-read → load({passive:true}),
   // which defers (and reports) while an edit is open. The substrate only changes on a
   // wrap, so we don't poll; visibilitychange catches "something moved while you were
   // away" — but never at the cost of the operator's in-progress text.
-  if (btn) btn.addEventListener("click", function () { load({ passive: true }); });
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") load({ passive: true });
   });

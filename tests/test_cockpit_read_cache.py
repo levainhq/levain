@@ -123,7 +123,12 @@ def test_panel_cache_keys_on_class_profile_row_limit_and_skips_search_unknown_an
         return real(*a, **kw)
 
     monkeypatch.setattr(ck, "_panel_compute", counting)
+    # the key also holds the panel's committed-read count (levain#138: an announced panel's refetch never gets an older
+    # cached body), so the call whose own read committed is followed by ONE compose under the new count, sharing that
+    # read's snapshot (no provider call); from there identical reads share it
+    ck.panel(pid, credential_class="token")
     p1 = ck.panel(pid, credential_class="token")
+    n[0] = 1
     assert ck.panel(pid, credential_class="token") is p1 and n[0] == 1
     assert ck.panel(pid, credential_class="none") is not p1 and n[0] == 2
     assert ck.panel(pid, credential_class="token", profile="compact") is not p1 and n[0] == 3
@@ -204,10 +209,10 @@ def test_over_http_two_surface_tokens_never_cross_and_a_post_invalidates(tmp_pat
         # still run after the response, urlopen would return before it had happened
         calls, real = [], ck.invalidate_reads
 
-        def slow_invalidate() -> None:
+        def slow_invalidate(*a, **k) -> None:
             time.sleep(0.5)
             calls.append(time.monotonic())
-            real()
+            real(*a, **k)
 
         ck.invalidate_reads = slow_invalidate
         gen = ck._rc_gen
