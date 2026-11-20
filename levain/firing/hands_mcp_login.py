@@ -790,8 +790,10 @@ def claude_launch_path(hands: HandsIdentity) -> str:
 #: an in-process loopback tool server that ``--strict-mcp-config`` does not govern.
 #: Why a flag and not the hands ``~/.claude/settings.json``: that file is the account's own, and
 #: :func:`levain.firing.hands_chat.claude_user_layer` already refuses an ``enabledPlugins`` key in it; a ``--settings``
-#: value is a layer the account cannot edit from its home. ``syncClaudeAiSkills: false`` there also hides skills an
-#: earlier chat already synced for this start, without moving them. The flag is carried only by the chat's own argv: a
+#: value is a layer the account cannot edit from its home (organization-managed settings outrank it, by the vendor's
+#: settings precedence as documented, not measured here: on a machine under a managed policy that enables one of these
+#: plugins or the syncs, the managed value wins and these keys are not the switch). ``syncClaudeAiSkills: false`` there
+#: also hides skills an earlier chat already synced for this start, without moving them. The flag is carried only by the chat's own argv: a
 #: ``claude -p`` the hands model runs from the chat's shell inherits the environment but not the flag, so the account-skill
 #: sync can run there (a narrowing the comment below already allows for the account's own shell).
 #: MEASURED: Claude Code 2.1.329, fresh macOS VM, 11-20 (project_memory/1118-vm/leg6_fresh_evidence/): ``skills/synced``,

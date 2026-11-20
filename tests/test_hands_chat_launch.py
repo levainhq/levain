@@ -844,7 +844,7 @@ def test_a_ctrl_c_before_the_start_is_a_line_and_exit_130_with_the_locks_release
     assert_released(rig)
 
 
-CLAUSE = "; remove it and `plugins/known_marketplaces.json` beside it (whether leaving that file brings the tree back is not measured)"
+CLAUSE = " and `plugins/known_marketplaces.json` beside it (whether leaving that file brings the tree back is not measured)"
 
 
 def test_a_marketplaces_refusal_names_the_known_marketplaces_file_beside_it_and_says_it_is_not_measured(rig):

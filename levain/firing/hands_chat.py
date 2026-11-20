@@ -212,7 +212,7 @@ def project_layer(workspace: Path, vendor: str) -> Path | None:
 #: checked; then the same again also removing ``known_marketplaces.json``.
 CLAUDE_USER_LAYER = ("agents", "plugins/installed_plugins.json", "plugins/marketplaces")
 #: Appended to the refusal only when the refused path ends in ``plugins/marketplaces`` (see the comment above).
-MARKETPLACES_REMOVE_CLAUSE = ("; remove it and `plugins/known_marketplaces.json` beside it (whether leaving that file "
+MARKETPLACES_REMOVE_CLAUSE = (" and `plugins/known_marketplaces.json` beside it (whether leaving that file "
                               "brings the tree back is not measured)")
 _CLAUDE_SETTINGS_KEYS = ("enabledPlugins", "extraKnownMarketplaces", "mcpServers")
 
