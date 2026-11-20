@@ -314,6 +314,68 @@ def test_an_unreadable_previous_install_names_no_replacement(world, capsys):
     assert "replaced" not in out and W.read_install(store.directory).cockpit_root == cockpit
 
 
+def test_a_tilde_cockpit_root_other_than_the_dream_installs_is_refused(world, capsys, monkeypatch):
+    store, cockpit, tmp_path = world
+    home = tmp_path / "home"
+    (home / "b").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    _dream_install(store, cockpit)
+    code, out, err = _run(store, capsys, "--cockpit-root", "~/b", "--launcher", "stub")
+    assert code == 1 and out == "" and "nothing written" in err
+    assert str(home / "b") in err and str(cockpit) in err
+    assert not _file(store).exists()
+
+
+def test_a_tilde_cockpit_root_naming_the_dream_installs_root_is_written(world, capsys, monkeypatch):
+    store, cockpit, tmp_path = world
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _dream_install(store, cockpit)
+    code, out, err = _run(store, capsys, "--cockpit-root", "~/cockpit")
+    assert code == 0, err
+    assert W.read_install(store.directory).cockpit_root == cockpit and f"cockpit_root: {cockpit}" in out.splitlines()
+
+
+def test_a_tilde_cockpit_root_is_named_expanded_as_replaced(world, capsys, monkeypatch):
+    store, cockpit, tmp_path = world
+    monkeypatch.setenv("HOME", str(tmp_path))
+    other = tmp_path / "other"
+    other.mkdir()
+    assert _run(store, capsys, "--cockpit-root", str(cockpit))[0] == 0
+    code, out, _ = _run(store, capsys, "--cockpit-root", "~/other")
+    assert code == 0 and f"replaced cockpit_root {cockpit} -> {other}" in out.splitlines()
+
+
+def test_an_os_error_reading_the_dream_install_does_not_bar_the_write(world, capsys, monkeypatch):
+    from levain.dream import agent as DA
+    store, cockpit, _ = world
+    _dream_install(store, cockpit)
+
+    def _raise(_):
+        raise PermissionError("scratch: unreadable")
+    monkeypatch.setattr(DA, "read_install", _raise)
+    code, _, err = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert code == 0, err
+    assert W.read_install(store.directory).cockpit_root == cockpit
+
+
+def test_an_os_error_reading_the_previous_install_names_no_replacement(world, capsys, monkeypatch):
+    store, cockpit, tmp_path = world
+    other = tmp_path / "other"
+    other.mkdir()
+    assert _run(store, capsys, "--cockpit-root", str(cockpit))[0] == 0
+    real, calls = W.read_install, []
+
+    def _first_raises(d):
+        calls.append(d)
+        if len(calls) == 1:
+            raise PermissionError("scratch: unreadable")
+        return real(d)
+    monkeypatch.setattr(W, "read_install", _first_raises)
+    code, out, err = _run(store, capsys, "--cockpit-root", str(other))
+    assert code == 0, err
+    assert "replaced" not in out and real(store.directory).cockpit_root == other
+
+
 def test_a_too_deep_values_is_said_not_raised(world, capsys):
     code, out, err = _run(world[0], capsys, "--cockpit-root", str(world[1]), "--values", '{"a":' * 20000)
     assert code == 1 and out == "" and "recursion" in err and "nothing written" in err

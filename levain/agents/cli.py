@@ -708,7 +708,7 @@ def _dream_cockpit_root(store_dir) -> Path | None:
         return None
     try:
         return dream_agent.read_install(store_dir).cockpit_root
-    except ValueError:
+    except (ValueError, OSError):
         return None
 
 
@@ -728,17 +728,19 @@ def run_session_install(args: argparse.Namespace) -> int:
     store = _open(args)
     if store is None:
         return 1
+    # `~` is expanded before the check, so the check and the write see one path. A path still relative after it is
+    # not checked here.
+    root = args.cockpit_root.expanduser()
     dream_root = _dream_cockpit_root(store.directory)
-    if (dream_root is not None and args.cockpit_root.is_absolute()
-            and dream_root.resolve() != args.cockpit_root.resolve()):
-        return _fail("session-install", f"--cockpit-root {args.cockpit_root} is not the cockpit root the dream "
+    if dream_root is not None and root.is_absolute() and dream_root.resolve() != root.resolve():
+        return _fail("session-install", f"--cockpit-root {root} is not the cockpit root the dream "
                                         f"install names ({dream_root}): one store has one cockpit (nothing written)")
     try:
         previous_root = session_wire.read_install(store.directory).cockpit_root
-    except ValueError:      # no previous root to name as replaced
+    except (ValueError, OSError):      # no previous root to name as replaced
         previous_root = None
     try:
-        path = session_wire.write_install(store.directory, cockpit_root=args.cockpit_root, launcher=args.launcher,
+        path = session_wire.write_install(store.directory, cockpit_root=root, launcher=args.launcher,
                                           episodic_path=args.episodic_path, values=values, workspaces=workspaces)
     except session_wire.InstallRefused as exc:
         return _fail("session-install", f"{exc} (nothing written)")
@@ -749,8 +751,8 @@ def run_session_install(args: argparse.Namespace) -> int:
     except session_wire.InstallRefused as exc:
         return _fail("session-install", f"wrote {path} but cannot read it back: {exc}")
     print(f"wrote {path}")
-    if previous_root is not None and previous_root.resolve() != install.cockpit_root.resolve():
-        print(f"replaced cockpit_root {previous_root} -> {install.cockpit_root}")
+    if previous_root is not None and previous_root.resolve() != root.resolve():
+        print(f"replaced cockpit_root {previous_root} -> {root}")
     print(f"cockpit_root: {install.cockpit_root}")
     print(f"launcher: {install.launcher if install.launcher is not None else '(none)'}")
     print(f"episodic_path: {install.episodic_path if install.episodic_path is not None else '(none)'}")
