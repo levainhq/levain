@@ -11,6 +11,7 @@ LEVAIN_LOCAL_WORKERS_MAX=N moves the worker cap. None of them applies on CI, whe
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -54,11 +55,13 @@ def names_whole_tree(positional, invocation_dir, root_dir):
 
 
 def has_last_failed(root_dir):
-    """True when pytest's cache holds failures to rerun: `--lf` on an empty cache runs everything, so only then it narrows."""
+    """True when pytest's cache holds failures to rerun: `--lf` on an empty or unreadable cache runs everything, so only then
+    it narrows."""
     try:
-        return bool(Path(root_dir, ".pytest_cache", "v", "cache", "lastfailed").read_text(encoding="utf-8").strip("{} \n"))
-    except (OSError, UnicodeError):
+        data = json.loads(Path(root_dir, ".pytest_cache", "v", "cache", "lastfailed").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
         return False
+    return bool(data)
 
 
 def inside_tests_subdir(invocation_dir, root_dir):

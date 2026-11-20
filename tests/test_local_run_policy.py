@@ -59,6 +59,8 @@ def test_lf_narrows_only_with_failures_to_rerun_and_a_tests_subdirectory_narrows
     cfg.known_args_namespace.cacheclear = False
     (cache / "lastfailed").write_bytes(b"\xff\xfe")                            # unreadable cache state is not a narrowing
     assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
+    (cache / "lastfailed").write_text("garbage {")                              # not JSON: pytest reads it as empty too
+    assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
     (cache / "lastfailed").write_text("{}")
     assert p.refuse_bare_full(cfg, NO_ENV) == p.REFUSAL
     assert p.refuse_bare_full(_config(cwd=ROOT / "tests" / "ci"), NO_ENV) is None   # started inside a tests/ subdirectory
