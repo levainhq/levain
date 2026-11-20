@@ -857,12 +857,17 @@ class _ChangeProbe:
         self._cockpit = cockpit
 
     def change_seq(self) -> int:
-        # the publish counter: a heartbeat is no panel change, so the file's own change token (which a heartbeat moves) is not used
+        # the store's publish counter, which moves when a panel's body or status did, plus the count of publishes the host
+        # told the cockpit of (``note_publish``): a row that lands with the body it had still flips a panel from stale and
+        # pending to current, and moves only the second. A heartbeat is no panel change, so the file's own change token
+        # (which a heartbeat moves) is not used. Both only grow
         meta = self._cockpit._reader.meta()
         try:
-            return int(meta.get("publish_seq", 0))
+            seq = int(meta.get("publish_seq", 0))
         except (TypeError, ValueError):
-            return 0
+            seq = 0
+        with self._cockpit._pub_cv:
+            return seq + self._cockpit._pub_ticket
 
     def snapshot(self) -> "tuple[dict[str, str], str]":
         return self._cockpit._probe_snapshot()

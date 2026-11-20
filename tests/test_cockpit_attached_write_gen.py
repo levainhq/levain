@@ -356,9 +356,11 @@ def test_the_change_stream_does_not_wait_for_a_write(rig: WriteRig, monkeypatch)
     assert time.monotonic() - t0 < 5.0
     assert after["alpha"] != before["alpha"] and after["beta"] == before["beta"]    # announced: the panel is now said to be pending
     assert rig.ck.write_wait_counts()["waits"] == 0
-    rig.publish_by_hand("alpha", 1)
+    seq = probe.change_seq()
+    rig.publish_by_hand("alpha", 1)                            # the row lands with the body it had: no panel change of its own
+    assert probe.change_seq() != seq                           # and is announced, the stale and pending flags having flipped
     settled, _v = probe.snapshot()
-    assert settled["alpha"] == before["alpha"]                 # and announced again when the row lands
+    assert settled["alpha"] == before["alpha"]
 
 
 # --- nothing waited for when nothing was written ------------------------------------------------------------------------
