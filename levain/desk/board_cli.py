@@ -17,6 +17,8 @@ file (or an explicit ``--evidence-extra``/``--now``) is unreadable or unusable; 
 unreadable, every item reads unknown, the audit says so, exit 3. The whole-board read (no ``--repo``) REFUSES, exit 2, where it
 cannot know which repos to read: a torn or unreadable registry (it fails closed, as the seat launch does), or no tracked repo
 that can be read. The ``--repo`` read keeps a registry problem as an audit line.
+``levain board open`` is the same read narrowed to the open items (:func:`open_view`); its ``--repo`` is a NAME (the ``NAME`` of ids
+``NAME#N``) that filters what is printed after the whole board is read, where ``state``'s ``--repo`` is the PATH of a repository to read.
 
 Known edges. Git writes (a pull, a checkout) take no store lock, so the three store files can come from two commits. Git evidence
 is read after the store snapshot, so a trailer for an item added after the snapshot can read ``unknown_id_in_trailer`` once.
@@ -125,7 +127,10 @@ def register(subparsers: Any) -> None:
         description=("The items the board reads as still open: every state outside the off and done columns, unknown first. A pure "
                      "read of the derived board (the same read as `board state`, never stored), so it cannot drift from it. Exit "
                      "codes are `board state`'s: 0 when the audit is empty, 3 when it is not, 2 or 4 when the board cannot be read. "
-                     "An untracked repo keeps its own file: the board holds no items for it."))
+                     "An untracked repo keeps its own file: the board holds no items for it. In the text, a landed_not_closed audit entry "
+                     "prints in full and every other audit kind as one count line (--json keeps the whole audit). With --repo, --json "
+                     "adds repo_has_items: false when the board holds no item of that repo (an empty items list is then not 'nothing "
+                     "open') and true when it does."))
     o.add_argument("--json", action="store_true", help="Print the open selection as JSON: the document's own item dicts, no new fields.")
     o.add_argument("--repo", default=None, metavar="NAME",
                    help="Only the items of this repo (the NAME in item ids NAME#N). The whole board is still read.")
@@ -875,12 +880,15 @@ def _one_line(value: Any) -> str:
 def open_view(doc: dict[str, Any], repo_name: str | None = None) -> dict[str, Any]:
     """The open items of ``doc`` (what :func:`state_doc` returns), as the document's own item dicts in drawing order, with the
     audit, ``problems`` and ``reader`` it carries (:func:`only_repo` for ``repo_name``). A pure function of ``doc``: nothing is
-    stored, and no key the document does not hold is added."""
+    stored, and no key the document does not hold is added, except ``repo_has_items`` on a repo filter: whether the board holds
+    any item (open or not) of that repo, so an empty ``items`` for a repo the board does not know is never read as "nothing open"."""
     kept = only_repo(doc, repo_name)
     items = sorted((i for i in kept["items"] if _is_open(i)), key=_rank)
     out = {"schema": kept.get("schema"), "as_of": kept.get("as_of"), "items": items, "audit": kept.get("audit", []),
            "problems": kept.get("problems", []), "reader": kept.get("reader", {})}
     out.update({k: kept[k] for k in ("repo_filter", "reader_scope") if k in kept})
+    if repo_name is not None:
+        out["repo_has_items"] = bool(kept["items"])
     return out
 
 
@@ -913,9 +921,29 @@ def _heading(state: Any, count: int) -> str:
     return f"{_one_line(name)}{f' ({kind})' if kind else ''}: {count}"
 
 
+def _audit_lines(view: dict[str, Any]) -> list[str]:
+    """The audit as ``board open`` prints it: a ``landed_not_closed`` entry in full (it is open work: close it or name what remains),
+    every other kind as one count line (the whole of them is ``board state``'s, and ``--json``'s)."""
+    scoped = view.get("reader_scope") == "board"
+    out = []
+    for a in view["audit"]:
+        if a["kind"] == "landed_not_closed":
+            tag = "(whole board) " if scoped and a["id"] is None else ""
+            out.append(f"  audit {tag}{a['kind']}: {a['id'] or '-'}: {_one_line(a['why'])} (close it or name what remains)")
+    counts: dict[tuple[bool, str], int] = {}
+    for a in view["audit"]:
+        if a["kind"] != "landed_not_closed":
+            key = (scoped and a["id"] is None, str(a["kind"]))
+            counts[key] = counts.get(key, 0) + 1
+    for (whole, kind), n in sorted(counts.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        out.append(f"  audit{' (whole board)' if whole else ''}: {n} {_one_line(kind)} (read them with levain board state)")
+    return out
+
+
 def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
-    """The lines ``levain board open`` prints for ``doc``. A repo the board holds no item of is ONE line; a board that read no item
-    and says why (``problems``) is ``unreadable``, never an empty list."""
+    """The lines ``levain board open`` prints for ``doc``. A repo the board holds no item of is ONE line, and the problem lines and the
+    audit (counted) stay after it: a torn line may be that repo's own; a board that read no item and says why (``problems``) is
+    ``unreadable``, never an empty list. The tail is the audit (:func:`_audit_lines`), the ``problems`` lines and the diverged branches."""
     whole = only_repo(doc, repo_name)
     total = len(whole["items"])
     view = open_view(doc, repo_name)
@@ -923,7 +951,7 @@ def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
     if not doc["items"] and problems:
         lines = ["open: unreadable: no item of the board could be read"]
     elif total == 0 and repo_name is not None:
-        return [f"{repo_name}: the board holds no items for it"]
+        return [f"{repo_name}: the board holds no items for it", *_audit_lines(view), *problems]
     else:
         lines = [f"open: {len(view['items'])} of {total} items, as of {view['as_of'] or 'unknown'}"
                  + (f" ({repo_name})" if repo_name is not None else "")]
@@ -934,10 +962,7 @@ def open_lines(doc: dict[str, Any], repo_name: str | None = None) -> list[str]:
                 lines.append(_heading(group, sum(1 for i in view["items"] if i.get("state") == group)))
             lines.append(f"  {_one_line(s['id'])}  {_one_line(s.get('title', ''))} -- {_one_line(s['reason'])}")
     scoped = view.get("reader_scope") == "board"
-    for a in sorted(view["audit"], key=lambda a: a["kind"] != "landed_not_closed"):
-        tag = "(whole board) " if scoped and a["id"] is None else ""
-        hint = " (close it or name what remains)" if a["kind"] == "landed_not_closed" else ""
-        lines.append(f"  audit {tag}{a['kind']}: {a['id'] or '-'}: {_one_line(a['why'])}{hint}")
+    lines += _audit_lines(view)
     lines += problems
     label = "reader (whole board): " if scoped else ""
     for name in view["reader"].get("diverged", []):

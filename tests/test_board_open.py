@@ -140,15 +140,29 @@ def test_an_item_text_with_control_characters_prints_as_one_clean_line():
     assert "\n" not in line and "\x1b" not in line and "two lines" in line
 
 
-def test_the_tail_names_landed_not_closed_first_the_problems_and_the_diverged_branches():
+def test_the_tail_prints_landed_not_closed_in_full_the_other_audit_kinds_counted_the_problems_and_the_diverged_branches():
     doc = _doc(("ready",), audit=[{"kind": "unknown", "id": "levain#1", "why": "x"},
                                   {"kind": "landed_not_closed", "id": "levain#2", "why": "main holds it"}])
     doc["problems"] = ["line 4: not json"]
     doc["reader"]["diverged"] = ["seat/x"]
     tail = [ln for ln in board_cli.open_lines(doc) if "audit" in ln or "problem" in ln or "diverged" in ln]
     assert tail[0].startswith("  audit landed_not_closed: levain#2: main holds it") and "close it or name what remains" in tail[0]
-    assert tail[1].startswith("  audit unknown: levain#1")
+    assert tail[1] == "  audit: 1 unknown (read them with levain board state)"
     assert tail[2] == "  problem: line 4: not json" and tail[3].startswith("  diverged: seat/x")
+
+
+def test_many_audit_lines_of_two_kinds_print_the_open_work_in_full_and_the_rest_as_one_count_per_kind():
+    audit = [{"kind": "unattributed_work", "id": None, "why": f"commit {n:040d}"} for n in range(798)]
+    audit += [{"kind": "unknown", "id": f"levain#{n}", "why": "x"} for n in range(1, 18)]
+    audit += [{"kind": "landed_not_closed", "id": "levain#1", "why": "main holds it"}]
+    doc = _doc(("ready", "ready"), audit=audit)
+    lines = board_cli.open_lines(doc)
+    assert len(lines) < 10 and sum(1 for ln in lines if "landed_not_closed" in ln) == 1
+    assert "  audit: 798 unattributed_work (read them with levain board state)" in lines
+    assert "  audit: 17 unknown (read them with levain board state)" in lines
+    assert not any("commit 000" in ln for ln in lines)
+    whole = json.loads(json.dumps(board_cli.open_view(doc)))
+    assert len(whole["audit"]) == len(audit)                                    # --json keeps the whole audit
 
 
 def test_a_board_that_read_no_item_and_says_why_is_unreadable_never_an_empty_list():
@@ -165,13 +179,21 @@ def test_a_repo_the_board_holds_no_item_of_is_one_line():
         ["ghost: the board holds no items for it"]
 
 
+def test_a_repo_with_no_items_keeps_the_problem_lines_and_the_counted_audit_after_its_one_line():
+    doc = _doc(("ready",), audit=[{"kind": "unknown", "id": None, "why": "store-wide"}, {"kind": "unknown", "id": None, "why": "again"}])
+    doc["problems"] = ["line 9: not json"]
+    assert board_cli.open_lines(doc, "ghost") == ["ghost: the board holds no items for it",
+                                                  "  audit (whole board): 2 unknown (read them with levain board state)",
+                                                  "  problem: line 9: not json"]
+
+
 def test_a_repo_filter_keeps_that_repos_items_and_says_the_reader_is_the_whole_boards():
     doc = _doc(("ready", "ready"))
     doc["items"][1]["id"] = "other#1"
     doc["audit"] = [{"kind": "unknown", "id": None, "why": "store-wide"}]
     lines = board_cli.open_lines(doc, "levain")
     assert lines[0].endswith("(levain)") and lines[0].startswith("open: 1 of 1 items")
-    assert not any("other#1" in ln for ln in lines) and "  audit (whole board) unknown: -: store-wide" in lines
+    assert not any("other#1" in ln for ln in lines) and "  audit (whole board): 1 unknown (read them with levain board state)" in lines
 
 
 def test_an_unreadable_board_says_unreadable_and_exits_as_state_does(tmp_path, capsys, monkeypatch):
@@ -238,13 +260,14 @@ def test_the_verb_writes_neither_the_store_nor_the_repository(world, tmp_path, c
     assert snapshot(items, world) == before
 
 
-def test_an_untracked_repo_is_one_line_and_the_exit_code_is_states(world, tmp_path, capsys):
+def test_an_untracked_repo_is_one_line_then_the_whole_boards_audit_and_the_exit_code_is_states(world, tmp_path, capsys):
     world.commit("someone forgot the trailer")
     world.push_main()
     items = write_items(tmp_path, item(1))
     rc_state, _, _ = open_run(capsys, items, verb="state")
     rc, out, _ = open_run(capsys, items, "--repo", "ghost")
-    assert rc == rc_state == 3 and out == "ghost: the board holds no items for it\n"
+    assert rc == rc_state == 3          # the exit is the whole board's, so the audit that causes it stays on the screen
+    assert out == "ghost: the board holds no items for it\n  audit (whole board): 1 unattributed_work (read them with levain board state)\n"
 
 
 def test_the_json_is_the_open_selection_with_the_documents_own_items_and_no_new_field(world, tmp_path, capsys):
@@ -257,6 +280,22 @@ def test_the_json_is_the_open_selection_with_the_documents_own_items_and_no_new_
     assert set(opened) == {"schema", "as_of", "items", "audit", "problems", "reader"}
     assert opened["items"] == [i for i in state["items"] if i["state"] in OPEN_BY_RULING]
     assert opened["audit"] == state["audit"] and opened["problems"] == state["problems"]
+
+
+def test_the_json_for_a_repo_filter_says_whether_the_board_holds_any_item_of_it(world, tmp_path, capsys):
+    items = write_items(tmp_path, item(1), item(2))
+    world.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    world.push_main()
+    _, ids, doc = open_ids(capsys, items, "--repo", "ghost")
+    assert ids == [] and doc["repo_has_items"] is False
+    _, ids, doc = open_ids(capsys, items, "--repo", "levain")
+    assert ids == ["levain#2"] and doc["repo_has_items"] is True
+    _, _, doc = open_ids(capsys, items)
+    assert "repo_has_items" not in doc                                          # only a repo filter says it
+    world.commit("land two", trailers=("Board-Item: levain#2", "Board-Closes: levain#2"))
+    world.push_main()
+    _, ids, doc = open_ids(capsys, items, "--repo", "levain")
+    assert ids == [] and doc["repo_has_items"] is True                          # nothing open, but the repo is known
 
 
 # ------------------------------------------------------------------------------------------------ the in_flight drift check
