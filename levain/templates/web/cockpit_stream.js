@@ -24,6 +24,8 @@
   var MANIFEST = "/cockpit/manifest.json";
   var HEARTBEAT_MS = 15000;          // silence past two beats means the stream is dead
   var POLL_MS = 30000;
+  var SLOW_RETRY_MS = 60000;           // a faulted panel past its bounded steps is read again no more often than this
+  var slowAt = Object.create(null);    // panel id -> when its last slow retry started
   var BACKOFF_MS = [1000, 2000, 4000, 8000, 15000, 30000];
   var FAULT_RETRY_MS = [5000, 15000, 60000];
   var PENDING_RETRY_MS = [5000, 15000, 60000];   // the last step repeats while a reload is still pending
@@ -234,7 +236,14 @@
     var ids = Object.keys(heads), have = Object.keys(h);
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
-      if (h[id] && h[id].etag === heads[id].etag) return;
+      if (h[id] && h[id].etag === heads[id].etag) {
+        // a panel whose last read failed still holds the head's etag, so the compare alone would never read it again: past the bounded
+        // steps it is read again by a poll or a hello, at most once per SLOW_RETRY_MS (levain#173)
+        if (!(h[id].err && (tries[id] || 0) >= FAULT_RETRY_MS.length && Date.now() - (slowAt[id] || 0) >= SLOW_RETRY_MS)) return;
+        slowAt[id] = Date.now();
+        reread(id);
+        return;
+      }
       // a panel never read (held `err`, no etag) differs from every head, so this read is a retry taken early (it replaces the pending timer
       // and spends the step); once the budget is spent it waits for an event or a recovery
       if (h[id] && h[id].err && !h[id].etag) {
@@ -286,6 +295,11 @@
     staleSince = null;
     tell();
     var o = owed; owed = [];
+    // the visible edge gives every panel whose last read failed a fresh budget: the iPad's tab was away, and what failed there is worth a try now
+    var hh = held();
+    Object.keys(hh).forEach(function (id) {
+      if (hh[id] && hh[id].err) { delete tries[id]; if (o.indexOf(id) < 0) o.push(id); }
+    });
     o.forEach(function (id) { reread(id); });
     if (pending) wantReload();
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }

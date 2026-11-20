@@ -440,6 +440,45 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     await settle();
     ok(calls.length === before + 1 && h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "a fresh fault is read again and has retry steps left: " + (calls.length - before));
   }
+  // ---- levain#173: a panel whose read failed holds the head's etag, so the etag compare alone would never read it again ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    ok(!h.live().some((t) => [5000, 15000, 60000].includes(t.ms)), "the bounded steps are spent");
+    // the page recorded the failure on the record that still carries the head's etag (what noteFault does)
+    h.win.LevainCockpitHeld.a.etag = "1"; h.win.LevainCockpitHeld.a.err = "Load failed";
+    const before = calls.length;
+    h.fetches[0].push(frame("hello", "E.1:2", { epoch: "E.1", resync: true }));
+    await settle();
+    ok(calls.length === before + 1 && calls[calls.length - 1] === "a", "a hello past the spent steps reads the faulted panel once: " + (calls.length - before));
+    h.fetches[0].push(frame("hello", "E.1:3", { epoch: "E.1", resync: true }));
+    await settle();
+    ok(calls.length === before + 1, "a second hello within the slow-retry gap reads nothing: " + (calls.length - before));
+    // a healthy panel with the same etag is never read by this path
+    h.win.LevainCockpitHeld.b.err = "";
+    ok(!calls.includes("b"), "a panel with no failed read is not read: " + calls);
+  }
+  // ---- levain#173: the visible edge gives a faulted panel a fresh budget ----
+  {
+    const h = boot({});
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "fault"; };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    for (const ms of [5000, 15000, 60000]) { const t = h.live().find((x) => x.ms === ms); t.off = true; t.fn(); await settle(); }
+    h.win.LevainCockpitHeld.a.etag = "1"; h.win.LevainCockpitHeld.a.err = "Load failed";
+    const before = calls.length;
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    ok(calls.slice(before).includes("a"), "the visible edge reads a panel whose last read failed, though its steps were spent: " + calls.slice(before));
+    ok(h.live().some((t) => t.ms === 5000), "and its retry steps start over");
+  }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
 """
