@@ -3452,7 +3452,7 @@ body.ke .ck-zgrid .panel .nc-pbody { padding: 0 var(--sp-2) var(--sp-3) var(--sp
 .nf-form .nf-urgent-cap { flex: 0 0 8rem; }
 /* a refused field is shown without colour: a thicker border all round and a thicker one still on the inline-start side, which follows the
    writing direction and is a border, so it stays when forced colours drop shadows; the colour is a third cue */
-.nf-form :is(.nf-urgent-cap, .nf-name)[aria-invalid="true"] { border-width: 2px; border-inline-start-width: 6px; border-color: var(--bad); }
+.nf-form :is(.nf-urgent-cap, .nf-name)[aria-invalid="true"] { border-style: solid; border-width: 2px; border-inline-start-width: 6px; border-color: var(--bad); }
 /* the note is a live region that stays rendered while empty, so it takes no room until it has words */
 .nf-note:empty { margin: 0; padding: 0; }
 .nf-new .dev-url { width: 100%; margin: var(--sp-3) 0; }

@@ -453,8 +453,7 @@ def test_a_revoke_while_the_cap_refusal_shows_takes_the_field_mark_with_the_note
 
 # levain#196: a refused field names its reason to assistive technology (aria-describedby to the note) and shows it without colour
 # (a thicker border on the inline-start side, read here as computed style). The note is rendered and empty when idle and only its
-# text changes; a refusal tied to a field is carried by the link and the focus, so the note is not also announced, and a message
-# tied to no field is announced politely.
+# text changes; it is a polite live region for every message, whether or not a field is described by it.
 def _nf_link(field: str) -> dict:
     return {"eval": ("(() => { const c = document.querySelector('%s'); const id = c.getAttribute('aria-describedby');"
                      " const note = document.querySelector('.nf-note'); const n = id ? document.getElementById(id) : null; const cs = getComputedStyle(c);"
@@ -497,7 +496,7 @@ def test_the_refused_cap_field_is_described_by_the_refusal_and_looks_invalid_wit
     for marked, words in ((refused, NF_TICK), (whole, NF_WHOLE)):
         assert marked["aria"] == "true" and marked["id"], marked
         assert marked["same"] is True and words in marked["text"] and marked["hidden"] is False and marked["height"] > 0, marked   # the link resolves to the visible refusal
-        assert marked["live"] == "off" and marked["focused"] is True, marked                                # one channel: the link and the focus, not the live region
+        assert marked["live"] == "polite" and marked["role"] == "status" and marked["focused"] is True, marked   # the note stays a polite live region while it describes the field
         assert _px(marked["left"]) > _px(marked["right"]) and _px(marked["left"]) > _px(plain["left"]), (plain, marked)    # a thicker inline-start border, not a colour
         assert _px(marked["top"]) > _px(plain["top"]) and marked["shadow"] == "none", (plain, marked)
     assert _px(rtl["right"]) > _px(rtl["left"]) and _px(rtl["right"]) > _px(plain["right"]), (plain, rtl)      # the thick side follows the direction
@@ -529,9 +528,58 @@ def test_the_refused_empty_name_is_marked_and_described_like_the_cap_field_until
     plain, refused, cap_side, typed = seen
     assert plain["aria"] is None and plain["id"] is None, plain
     assert refused["aria"] == "true" and refused["id"] and refused["same"] is True and refused["text"] == NF_NAME_NOTE, refused
-    assert refused["live"] == "off" and refused["focused"] is True, refused                                  # one channel: the link and the focus
+    assert refused["live"] == "polite" and refused["focused"] is True, refused                               # polite while it describes the field
     assert _px(refused["left"]) > _px(refused["right"]) and _px(refused["left"]) > _px(plain["left"]), (plain, refused)
     assert _px(refused["top"]) > _px(plain["top"]) and refused["shadow"] == "none", (plain, refused)
     assert cap_side["aria"] is None and cap_side["id"] is None, cap_side                                     # the cap field is not marked by the name refusal
     assert typed["aria"] is None and typed["id"] is None and typed["note"] == "" and typed["live"] == "polite", typed   # a typed name takes the mark, the link and the note
     assert typed["left"] == plain["left"] and typed["top"] == plain["top"], (plain, typed)
+
+
+# a refusal submitted again while its field already has focus: focusing is then a no-op, so the live note is what says it again. The
+# note's text is cleared and written, which a live region sees as a change, and the note stays polite.
+NF_OBSERVE = {"eval": ("(() => { const n = document.querySelector('.nf-note'); window.__muts = []; window.__obs = new MutationObserver((rs) => window.__muts.push(...rs));"
+                       " window.__obs.observe(n, {childList: true, characterData: true, subtree: true}); return 1; })()")}
+
+
+def _nf_rewrite(field: str) -> dict:
+    return {"eval": ("(() => { const n = document.querySelector('.nf-note');"
+                     " const muts = window.__muts.concat(window.__obs.takeRecords()).map((r) => ({removed: r.removedNodes.length, added: Array.from(r.addedNodes).map((x) => x.textContent).join('')}));"
+                     " return JSON.stringify({muts: muts, note: n.textContent, live: n.getAttribute('aria-live'), role: n.getAttribute('role'),"
+                     " aria: document.querySelector('%s').getAttribute('aria-invalid'), focused: document.activeElement === document.querySelector('%s')}); })()") % (field, field)}
+
+
+def _rewritten(state: dict, words: str) -> None:
+    assert state["live"] == "polite" and state["role"] == "status" and state["aria"] == "true" and state["focused"] is True, state
+    assert words in state["note"], state
+    muts = state["muts"]
+    cleared = [i for i, m in enumerate(muts) if m["removed"] and not m["added"]]
+    written = [i for i, m in enumerate(muts) if words in m["added"]]
+    assert cleared and written and min(cleared) < max(written), state       # cleared, then written: a live region sees a change
+
+
+@needs_browser
+def test_the_same_refusal_submitted_again_with_its_field_already_focused_is_rewritten_into_a_polite_note(tmp_path, monkeypatch) -> None:
+    steps = [NF_SUBMIT_NAMELESS, NF_NAME_LINK, NF_OBSERVE, NF_SUBMIT, _nf_rewrite(".nf-name")]                              # 0: held focus, then 1: submitted again
+    steps += [_nf_fill("whole", urgent=True, cap="1.5"), NF_SUBMIT, _nf_settle("whole"), NF_CAP_LINK, NF_OBSERVE, NF_SUBMIT, _nf_rewrite(".nf-urgent-cap")]
+    seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 4, seen
+    name_first, name_again, cap_first, cap_again = seen
+    assert name_first["focused"] is True and cap_first["focused"] is True, (name_first, cap_first)           # the focus was already there: no move to announce
+    _rewritten(name_again, NF_NAME_NOTE)
+    _rewritten(cap_again, NF_WHOLE)
+
+
+NF_TYPE_SPACE = {"eval": ("(() => { const c = document.querySelector('.nf-name'); c.focus(); c.select();"
+                          " return document.execCommand('insertText', false, ' ') ? 1 : 0; })()")}
+
+
+@needs_browser
+def test_the_refused_empty_name_stays_marked_through_a_blank_edit_and_clears_on_a_letter(tmp_path, monkeypatch) -> None:
+    steps = [NF_SUBMIT_NAMELESS, NF_NAME_LINK, NF_TYPE_SPACE, NF_NAME_LINK, NF_TYPE_NAME, NF_NAME_LINK]
+    seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 3, seen
+    refused, blank, letter = seen
+    for state in (refused, blank):
+        assert state["aria"] == "true" and state["note"] == NF_NAME_NOTE, state                             # a space is not a name: the refusal stays
+    assert letter["aria"] is None and letter["note"] == "", letter

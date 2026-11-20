@@ -377,7 +377,7 @@
     nfUrgentCap.type = "number"; nfUrgentCap.min = "1"; nfUrgentCap.step = "1"; nfUrgentCap.inputMode = "numeric";
     nfUrgentCap.placeholder = "optional";
     nfUrgentCap.addEventListener("input", () => nfClearCapRefusal());
-    nfName.addEventListener("input", () => nfClearNameRefusal());
+    nfName.addEventListener("input", () => { if (nfName.value.trim()) nfClearNameRefusal(); });
     capLab.appendChild(nfUrgentCap);
     boxes.appendChild(capLab);
     form.appendChild(boxes);
@@ -399,9 +399,9 @@
   }
   function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
   // a refusal is tied to the field it is about: the cap lines to the cap field, the name line to the name field. nfSay is the only
-  // function that writes the shared note. For a line a field owns it marks that field aria-invalid, points its aria-describedby at the
-  // note, and turns the note's live announcement off, since the focus the caller gives the field reads the description; any other
-  // message, including "", leaves every field unmarked and the note polite. The tick-Urgent line is made untrue by ticking the box, and
+  // function that writes the shared note. For a line a field owns it marks that field aria-invalid and points its aria-describedby at the
+  // note; any other message, including "", leaves every field unmarked. The note is a polite live region for every message, so a refusal
+  // is announced even when the field already has focus; a double read is accepted over a silent refusal. The tick-Urgent line is made untrue by ticking the box, and
   // either cap line is stale once the value is edited; the clear functions below only clear a line the field owns
   const NF_CAP_NEEDS_URGENT = "Urgent per hour only applies to an urgent token: tick Urgent, or clear the field.";
   const NF_CAP_WHOLE = "Urgent per hour must be a whole number above zero, or left empty.";
@@ -412,7 +412,6 @@
   }
   function nfSay(msg) {
     const owner = nfOwner(msg);
-    nfNote.setAttribute("aria-live", owner ? "off" : "polite");
     nfNote.textContent = msg;
     for (const f of [nfUrgentCap, nfName]) {
       if (f === owner) { f.setAttribute("aria-invalid", "true"); f.setAttribute("aria-describedby", nfNote.id); }
