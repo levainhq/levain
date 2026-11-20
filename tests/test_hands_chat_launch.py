@@ -117,8 +117,8 @@ def test_a_server_revoked_after_an_earlier_prepare_is_absent_from_both_files_at_
     [seen] = fake.started
     assert set(seen["claude"]) == {"beta"} and set(seen["codex"]) == {"beta"}
     if vendor == "claude":
-        assert seen["argv"][-6:] == ["claude", "--settings", _FLAG_SETTINGS_JSON, "--strict-mcp-config", "--mcp-config",
-                                     hml.claude_launch_path(rig.h)]
+        assert seen["argv"][-6:] == ["claude", "--settings", _FLAG_SETTINGS_JSON, "--mcp-config",
+                                     hml.claude_launch_path(rig.h), "--strict-mcp-config"]
     else:
         assert seen["argv"][-11:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin", "--disable", "apps", "--disable", "skill_mcp_dependency_install", "--disable", "hooks"]
         assert f"CODEX_HOME={rig.hands_home}/.codex" in seen["argv"]

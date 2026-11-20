@@ -671,7 +671,7 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
 # every file as it was.
 #
 # Claude: ``<hands home>/.claude/levain-mcp.json``, the whole file Levain's, written fresh at every call; the launch
-# passes it as ``--strict-mcp-config --mcp-config <path>`` (:func:`claude_chat_argv`). Codex: the registry's tables go
+# passes it as ``--mcp-config <path> --strict-mcp-config`` (:func:`claude_chat_argv`). Codex: the registry's tables go
 # into ``<hands home>/.codex/config.toml`` between two marker lines, with the two file-store pins at the top level; any
 # other content of that file is kept. Codex has no strict flag, so a server the file declares outside the block would
 # launch beside the registry's: any such server refuses the call (L3 r1, codex HIGH), never merged and never deleted
@@ -826,9 +826,11 @@ HANDS_CLAUDE_FLAG_SETTINGS: dict[str, Any] = {
 def claude_chat_argv(hands: HandsIdentity, *extra: str) -> list[str]:
     """The hands account's Claude chat: the hands prefix with its config home, then ``claude`` reading ONLY the
     registry's servers from the launch file (``--strict-mcp-config``) and started with
-    :data:`HANDS_CLAUDE_FLAG_SETTINGS` (``--settings``, serialised the same way every time)."""
+    :data:`HANDS_CLAUDE_FLAG_SETTINGS` (``--settings``, serialised the same way every time). ``--mcp-config`` takes
+    a variadic list, so the ``--strict-mcp-config`` flag follows the file to close it: an extra, a positional prompt
+    included, is never read as a second config."""
     return [*hl._launch_prefix(hands, VENDOR),
-            *hands_claude_argv("--strict-mcp-config", "--mcp-config", claude_launch_path(hands), *extra,
+            *hands_claude_argv("--mcp-config", claude_launch_path(hands), "--strict-mcp-config", *extra,
                                settings=HANDS_CLAUDE_FLAG_SETTINGS)]
 
 

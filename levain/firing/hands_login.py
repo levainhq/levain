@@ -933,8 +933,6 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     say = emit or _write_out
     try:
         gone = vendor_refusal(hands, vendor, entity_dir=entity_dir)      # before the lock: nothing is held or changed
-    except HandsRefused:
-        raise
     except HandsLoginError as exc:
         raise HandsRefused(f"{exc}; the login was not started") from None
     if gone is not None:

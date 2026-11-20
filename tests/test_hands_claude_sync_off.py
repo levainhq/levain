@@ -91,6 +91,17 @@ def test_the_chat_argv_passes_the_constant_as_compact_sorted_json_before_any_ext
     assert argv[-1] == "-p" and argv.index("--settings") < argv.index("-p")
 
 
+def test_a_positional_extra_is_never_read_as_a_second_mcp_config(monkeypatch):
+    # L3 r1 on levain#202 (complement MED): ``--mcp-config <configs...>`` is variadic in ``claude --help`` (2.1.329), so
+    # whatever directly follows the file is taken as another config; a flag must close the list before any extra.
+    monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
+    argv = hands_mcp_login.claude_chat_argv(_hands(), "say hello")
+    path = argv[argv.index("--mcp-config") + 1]
+    assert path == hands_mcp_login.claude_launch_path(_hands())
+    assert argv[argv.index(path) + 1] == "--strict-mcp-config"
+    assert argv[-1] == "say hello" and argv.index("say hello") > argv.index("--strict-mcp-config")
+
+
 def test_the_codex_chat_argv_takes_no_settings_flag(monkeypatch):
     monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
     assert "--settings" not in hands_mcp_login.codex_chat_argv(_hands())
