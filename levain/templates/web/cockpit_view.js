@@ -2452,7 +2452,6 @@
   // the place buttons and the actions. A node with no label of its own is not listed.
   const JUMP_ROW_CAP = 14;
   const JUMP_NODES = "[data-ck-panel], section.ck-zone, #ck-needs, #ck-drop, #board .panel, .dev-zone .panel";
-  const JUMP_PLACES = ["home", "desk", "room", "memory", "settings"];
   const JUMP_LABEL_OF = tableOf({ state: "State line" });   // a node whose markup carries no text of its own to name it
   let palette = null;
   const squash = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
@@ -2479,9 +2478,38 @@
     if (id && PLACED_ON[id]) return PLACED_ON[id];
     return onHome ? "home" : "memory";
   }
+  // Whether the hidden attribute is what takes a node out of the page: it is not when a rule of the page's own gives the node a box (the
+  // Notify tokens panel is marked hidden and is painted in Settings). A node with no box where it is may only be out because its place
+  // or mode is not up, so a copy of it without its modes, in the same place in the page, says what the attribute alone does.
+  function hiddenByAttr(n) {
+    const css = root.getComputedStyle;
+    for (let a = n; a; a = a.parentElement) {
+      if (!a.hidden) continue;
+      if (typeof css !== "function" || !a.parentNode) return true;
+      if (css.call(root, a).display !== "none") continue;
+      const probe = a.cloneNode(false);
+      probe.removeAttribute("data-modes");
+      a.parentNode.insertBefore(probe, a);
+      const none = css.call(root, probe).display === "none";
+      probe.remove();
+      if (none) return true;
+    }
+    return false;
+  }
+  // What a target is known by across a redraw, which replaces the node but not what it is: its data-ck-panel, else its id, else its label
+  // with the kind of node it is and the place that draws it. Kept per node, so a node the page has since dropped still has its key.
+  const JUMP_KEYS = new WeakMap();
+  function jumpKey(n) {
+    if (JUMP_KEYS.has(n)) return JUMP_KEYS.get(n);
+    if (!n.isConnected) return "";
+    const key = (n.dataset && n.dataset.ckPanel) ? "p:" + n.dataset.ckPanel : n.id ? "#" + n.id
+      : "l:" + jumpLabel(n) + "|" + (n.classList && n.classList.contains("ck-card") ? "card" : "node") + "|" + jumpPlaceOf(n, "home");
+    JUMP_KEYS.set(n, key);
+    return key;
+  }
   function jumpTargets() {
     const P = root.LevainPlaces, here = P && typeof P.place === "function" ? P.place() : "";
-    const places = [], mine = [], other = [], actions = [], seen = new Set();
+    const places = [], mine = [], other = [], actions = [];
     for (const b of document.querySelectorAll("[data-ia-place-btn]")) {
       const c = b.cloneNode(true);
       for (const x of c.querySelectorAll(".ia-needs")) x.remove();
@@ -2489,11 +2517,11 @@
     }
     const found = [];
     for (const n of document.querySelectorAll(JUMP_NODES)) {
-      if (seen.has(n) || NOT_DRAWN[n.dataset.ckPanel] || n.closest("[hidden]")) continue;
-      seen.add(n);
+      if (NOT_DRAWN[n.dataset.ckPanel] || hiddenByAttr(n)) continue;
       const label = jumpLabel(n), at = jumpPlaceOf(n, here);
       if (!label || !at) continue;
       found.push({ kind: n.classList.contains("ck-card") || n.matches("#ck-needs, #ck-drop, p#state") ? "card" : "panel", label: label, place: at, node: n });
+      jumpKey(n);
     }
     // a zone that only wraps a panel of the same name is that panel's heading, not a second place to go
     for (const t of found) {
@@ -2529,17 +2557,22 @@
     }
     return items.concat(rows.slice(0, JUMP_ROW_CAP));
   }
-  // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
-  // id (a redraw replaces every panel and card node), else the node as given.
+  // The node the page holds now for a node the jump listed: the node itself while it is on the page, else the node the same rule lists
+  // under the same key (a redraw replaces the panel and card nodes, and the Neocortex, Identity and Needs nodes, wherever they sit), else
+  // the node as given.
   function livePanel(node) {
-    const id = node.dataset ? node.dataset.ckPanel : "";
-    if (node.isConnected || !id) return node;
-    return Array.from(document.querySelectorAll("[data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
+    if (node.isConnected) return node;
+    const key = jumpKey(node);
+    if (!key) return node;
+    const next = Array.from(document.querySelectorAll(JUMP_NODES)).find((n) => jumpKey(n) === key && !hiddenByAttr(n));
+    if (!next) return node;
+    JUMP_KEYS.set(next, key);
+    return next;
   }
   // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
   let handOff = null;
-  // Focus a panel the jump chose. A redraw replaces every panel node, so the panel is looked up again by its id, and for 3 s a redraw
-  // that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
+  // Focus a panel the jump chose. A redraw replaces the nodes, so the panel is looked up again by its key, and for 3 s a redraw anywhere
+  // on the page that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
   // hand-off, the 3 s, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
   // focus back from where they went).
   function landOnPanel(node, scroll) {
@@ -2548,8 +2581,7 @@
     const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
     let held = livePanel(node);
     focusIt(held, scroll);
-    const board = document.getElementById("board");
-    if (!held.dataset || !held.dataset.ckPanel || !board || typeof root.MutationObserver !== "function") return;
+    if (!jumpKey(held) || !document.body || typeof root.MutationObserver !== "function") return;
     const obs = new root.MutationObserver(() => {
       const a = document.activeElement;
       if (held.isConnected || (a && a !== document.body)) return;
@@ -2568,11 +2600,12 @@
       if (handOff === me) handOff = null;
     } };
     handOff = me;
-    obs.observe(board, { childList: true });
+    obs.observe(document.body, { childList: true, subtree: true });
     for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
   }
   function openJump() {
-    if (palette) return;
+    // over an open dialog the page behind is not the reader's to move through: the same test the page's plain keys use
+    if (palette || document.querySelector(".modal-overlay")) return;
     const dlg = el("div", "palette");
     dlg.setAttribute("role", "dialog");
     dlg.setAttribute("aria-label", "Jump");
@@ -2587,7 +2620,11 @@
     input.setAttribute("aria-expanded", "true");
     input.setAttribute("aria-controls", list.id);
     input.setAttribute("aria-autocomplete", "list");
-    box.append(input, list);
+    // "nothing matches" is said outside the listbox (a listbox holds options only) and announced as a status
+    const none = el("p", "pl-none");
+    none.setAttribute("role", "status");
+    none.style.cssText = "margin: 0; padding: 0 var(--sp-4) var(--sp-3);";
+    box.append(input, list, none);
     dlg.appendChild(box);
     const back = document.activeElement;
     document.body.appendChild(dlg);
@@ -2661,7 +2698,8 @@
         li.addEventListener("click", () => choose(it));
         list.appendChild(li);
       });
-      if (!items.length) list.appendChild(el("li", "pl-none", "nothing matches"));
+      none.textContent = items.length ? "" : "nothing matches";
+      input.setAttribute("aria-expanded", items.length ? "true" : "false");
       mark(false);
     };
     // the selection moves without a redraw: the highlight, the id the input names, and the row kept inside the scrolled list
@@ -2675,11 +2713,15 @@
       if (cur) input.setAttribute("aria-activedescendant", cur.id); else input.removeAttribute("aria-activedescendant");
       if (cur && scroll && typeof cur.scrollIntoView === "function") cur.scrollIntoView({ block: "nearest" });
     };
-    const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); };
+    const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); list.scrollTop = 0; };
     input.addEventListener("input", refresh);
-    input.addEventListener("keydown", (ev) => {
+    // Esc is the dialog's, from wherever focus sits inside it; Tab stays on the input (one stop: the list is driven by the arrow keys)
+    dlg.addEventListener("keydown", (ev) => {
       if (ev.key === "Escape") { ev.preventDefault(); close(true); }
-      else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); mark(true); }
+      else if (ev.key === "Tab") { ev.preventDefault(); input.focus(); }
+    });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); mark(true); }
       else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); mark(true); }
       else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
     });
