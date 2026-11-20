@@ -76,3 +76,55 @@ def test_only_the_hands_environment_names_it_under_firing():
 def test_the_variable_is_a_name_claude_code_documents():
     from levain.claude_code_env_names import VENDOR_ENV_NAMES
     assert NAME in VENDOR_ENV_NAMES
+
+
+# --- levain#202: the layer the hands account cannot undo, ``--settings`` on every Levain-built Claude command ------
+
+SETTINGS_NAME = "disableClaudeAiConnectors"
+
+
+def _claude_starts(h: HandsIdentity) -> dict[str, list[str]]:
+    """Every Levain-built argv whose program is ``claude``: login, status, logout, the ``claude mcp`` verbs, the chat."""
+    return {
+        "login": hands_login.login_argv(h, "claude"),
+        "status": hands_login.status_argv(h, "claude"),
+        "logout": hands_login.logout_argv(h, "claude"),
+        "mcp list": hands_mcp_login._argv(h, "list"),
+        "mcp add": hands_mcp_login._argv(h, "add", "--transport", "http", "x", "http://127.0.0.1:1/mcp"),
+        "mcp remove": hands_mcp_login._argv(h, "remove", "x"),
+        "chat": hands_mcp_login.claude_chat_argv(h),
+        "chat through the chat module": hands_chat.chat_argv(h, "claude"),
+    }
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_every_claude_argv_carries_the_connectors_off_settings_pair_once(monkeypatch, system):
+    import json
+    monkeypatch.setattr(confinement.platform, "system", lambda: system)
+    for what, argv in _claude_starts(_hands()).items():
+        assert argv.count("--settings") == 1, what
+        i = argv.index("--settings")
+        assert argv[i - 1] == "claude", what                  # the pair sits right after the program: one place to move it
+        assert json.loads(argv[i + 1])[SETTINGS_NAME] is True, what
+
+
+def test_the_settings_pair_has_one_builder_and_the_connectors_only_pair_is_exactly_the_key():
+    import json
+    pair = confinement.hands_claude_argv()
+    assert pair[0] == "claude" and pair[1] == "--settings" and json.loads(pair[2]) == {SETTINGS_NAME: True}
+    assert len(pair) == 3
+    both = confinement.hands_claude_argv("auth", "status", settings={"x": 1})
+    assert json.loads(both[2]) == {SETTINGS_NAME: True, "x": 1} and both[3:] == ["auth", "status"]
+
+
+def test_only_the_one_builder_writes_the_settings_flag_under_firing():
+    firing = Path(confinement.__file__).parent
+    assert sorted(p.name for p in firing.rglob("*.py") if '"--settings"' in p.read_text()) == ["confinement.py"]
+
+
+def test_the_codex_argvs_take_no_settings_flag(monkeypatch):
+    monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
+    h = _hands()
+    for argv in (hands_login.login_argv(h, "codex"), hands_login.status_argv(h, "codex"),
+                 hands_mcp_login.codex_chat_argv(h)):
+        assert "--settings" not in argv

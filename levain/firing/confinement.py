@@ -3939,10 +3939,24 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 #: :func:`_hands_env`, carries it. IT IS A DEFAULT, NOT A BOUNDARY (L3 r1 on levain#139, four seats, the vendor's settings
 #: reference cited, not measured here): the hands account owns its ``~/.claude/settings.json``, whose ``env`` block is
 #: documented to overwrite the process environment, and a hands shell can export or prefix the variable itself. The layer that
-#: the hands account cannot undo is the settings key passed with ``--settings``: the hands CHAT carries it
-#: (:data:`levain.firing.hands_mcp_login.HANDS_CLAUDE_FLAG_SETTINGS`); the subcommand starts do not (board
-#: row levain#202), because ``claude --settings ... <subcommand>`` is unmeasured on the VM.
+#: the hands account cannot undo is the settings key passed with ``--settings``, carried by every Claude command Levain builds
+#: for the hands account (:func:`hands_claude_argv`: login, status, logout, the ``claude mcp`` verbs and the chat); the
+#: variable stays as the first layer.
 HANDS_NO_CLAUDEAI_CONNECTORS = ("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
+
+#: The settings object every hands Claude command is started with; a chat adds its own keys to it
+#: (:data:`levain.firing.hands_mcp_login.HANDS_CLAUDE_FLAG_SETTINGS`).
+HANDS_CLAUDE_BASE_SETTINGS: dict = {"disableClaudeAiConnectors": True}
+
+
+def hands_claude_argv(*args: str, settings: dict | None = None) -> list[str]:
+    """``claude --settings <compact sorted JSON> <args...>``: the ONE place a hands Claude argv is built, and the one place
+    the flag sits (right after the program). NOT YET RUN on a real guest: whether Claude Code parses ``--settings`` ahead of
+    the ``auth`` and ``mcp`` subcommands is a fresh-VM measurement; if it does not, moving the pair after the subcommand
+    is a change to this return value alone. ``settings`` is merged over :data:`HANDS_CLAUDE_BASE_SETTINGS`."""
+    merged = {**HANDS_CLAUDE_BASE_SETTINGS, **(settings or {})}
+    return ["claude", "--settings", json.dumps(merged, sort_keys=True, separators=(",", ":")), *args]
+
 
 #: Stops Claude Code's official-marketplace autoinstall, which is read to be what put the marketplace into
 #: ``~/.claude/plugins/marketplaces`` (a path :data:`levain.firing.hands_chat.CLAUDE_USER_LAYER` refuses, so the next chat

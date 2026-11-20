@@ -44,7 +44,7 @@ from typing import Any, Callable
 from levain import pathid
 from levain.authority import STOPPED_BORN, STOPPED_CURRENT
 from levain.firing import hands_login as hl
-from levain.firing.confinement import HandsIdentity
+from levain.firing.confinement import HANDS_CLAUDE_BASE_SETTINGS, HandsIdentity, hands_claude_argv
 from levain.hands_mcp import registration_problems
 
 VENDOR = "claude"
@@ -185,7 +185,7 @@ def _stamp() -> str:
 # --- the vendor, as the hands user -----------------------------------------------------------------------------
 
 def _argv(hands: HandsIdentity, *sub: str) -> list[str]:
-    return [*hl._launch_prefix(hands, VENDOR), "claude", "mcp", *sub]
+    return [*hl._launch_prefix(hands, VENDOR), *hands_claude_argv("mcp", *sub)]
 
 
 def add_argv(hands: HandsIdentity, entry: dict[str, Any]) -> list[str]:
@@ -818,7 +818,7 @@ def claude_launch_path(hands: HandsIdentity) -> str:
 HANDS_CLAUDE_FLAG_SETTINGS: dict[str, Any] = {
     "syncClaudeAiSkills": False,
     "syncClaudeAiPlugins": False,
-    "disableClaudeAiConnectors": True,
+    **HANDS_CLAUDE_BASE_SETTINGS,
     "enabledPlugins": {"cc-plugin-easel@builtin": False, "claude-platform@builtin": False},
 }
 
@@ -827,9 +827,9 @@ def claude_chat_argv(hands: HandsIdentity, *extra: str) -> list[str]:
     """The hands account's Claude chat: the hands prefix with its config home, then ``claude`` reading ONLY the
     registry's servers from the launch file (``--strict-mcp-config``) and started with
     :data:`HANDS_CLAUDE_FLAG_SETTINGS` (``--settings``, serialised the same way every time)."""
-    settings = json.dumps(HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
-    return [*hl._launch_prefix(hands, VENDOR), "claude", "--strict-mcp-config", "--mcp-config",
-            claude_launch_path(hands), "--settings", settings, *extra]
+    return [*hl._launch_prefix(hands, VENDOR),
+            *hands_claude_argv("--strict-mcp-config", "--mcp-config", claude_launch_path(hands), *extra,
+                               settings=HANDS_CLAUDE_FLAG_SETTINGS)]
 
 
 #: Codex features switched off for every hands chat (L3 r3 G4, codex HIGH): an installed or remote plugin can carry an

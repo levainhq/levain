@@ -51,7 +51,8 @@ from typing import Callable, Iterator
 
 from levain import hands_live
 from levain.firing.confinement import (
-    HANDS_PYTHON, HANDS_ZSH, ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_for, hands_prefix,
+    HANDS_PYTHON, HANDS_ZSH, ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_claude_argv, hands_for,
+    hands_prefix,
     load_confinement_config,
 )
 from levain.launch import child_env
@@ -62,8 +63,8 @@ VENDORS = ("claude", "codex")
 #: writes there, the login argv and the status argv (the program is found on the hands PATH).
 _VENDOR = {
     "claude": {"env": "CLAUDE_CONFIG_DIR", "dir": ".claude", "cred": ".credentials.json",
-               "login": ("claude", "auth", "login"), "status": ("claude", "auth", "status"),
-               "logout": ("claude", "auth", "logout"), "page": "https://claude.ai/settings (the account's active sessions)"},
+               "login": tuple(hands_claude_argv("auth", "login")), "status": tuple(hands_claude_argv("auth", "status")),
+               "logout": tuple(hands_claude_argv("auth", "logout")), "page": "https://claude.ai/settings (the account's active sessions)"},
     "codex": {"env": "CODEX_HOME", "dir": ".codex", "cred": "auth.json",
               "login": ("codex", "login", "--device-auth"), "status": ("codex", "login", "status"),
               "logout": ("codex", "logout"), "page": "https://chatgpt.com/ (Settings, Security, the signed-in devices)"},

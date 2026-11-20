@@ -33,6 +33,7 @@ _REAL_SECURITY = hands_login.SECURITY
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
 CLAUDE_SHIM = """#!/bin/sh
+if [ "$1" = "--settings" ]; then echo "$2" >> "$SHIM_LOG.settings"; shift 2; fi
 echo "$HOME|$CLAUDE_CONFIG_DIR|$PATH|$*" >> "$SHIM_LOG"
 CRED="$CLAUDE_CONFIG_DIR/.credentials.json"
 case "$1 $2" in
@@ -216,7 +217,7 @@ def test_login_argv_runs_as_hands_with_pinned_home_and_fixed_path(monkeypatch, s
                          "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", var}
     assert argv[-len(hands_login._VENDOR[vendor]["login"]):] == list(hands_login._VENDOR[vendor]["login"])
     # one login command each, never the operator's home
-    assert "--device-auth" in argv if vendor == "codex" else argv[-3:] == ["claude", "auth", "login"]
+    assert "--device-auth" in argv if vendor == "codex" else argv[-2:] == ["auth", "login"] and argv[-5] == "claude"
     assert all(os.path.expanduser("~") not in a for a in argv)
     # the same shape for status, with the same pinned home
     sargv = hands_login.status_argv(h, vendor)
@@ -1030,3 +1031,10 @@ def test_a_probe_that_cannot_run_is_a_refusal_not_a_pass(rig):
     rig.broken = True
     with pytest.raises(hands_login.HandsRefused, match="a password is required"):
         _login(rig, "claude")
+
+
+def test_login_and_status_start_claude_with_the_connectors_off_settings(rig):
+    import json
+    _login(rig, "claude")
+    sent = [json.loads(ln) for ln in Path(f"{rig.log}.settings").read_text().splitlines()]
+    assert len(sent) == 2 and all(s["disableClaudeAiConnectors"] is True for s in sent)      # the login, then its status
