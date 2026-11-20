@@ -139,3 +139,26 @@ def test_run_doctor_prints_the_ceiling_row_when_the_ceiling_is_absent(tmp_path, 
 
 def test_no_isolation_install_no_row(tmp_path):
     assert doctor._check_dispatch_ceiling(host="linux", store=tmp_path / "absent", owner=ME) == []
+
+
+def test_a_malformed_dispatch_auth_file_keeps_the_row_and_its_hint(tmp_path, monkeypatch):
+    """An unreadable dispatch_auth leaves the /1 hint; the row never degrades to a hint-less generic one."""
+    import levain.slot.services.dispatch_run as DR
+    store = _store(tmp_path)
+
+    def boom(*_a, **_k):
+        raise ValueError("malformed dispatch_auth")
+
+    monkeypatch.setattr(DR, "read_dispatch_auth", boom)
+    rows = _rows(store)
+    assert len(rows) == 1 and "set-ceiling" in (rows[0].hint or "")
+    assert T.CEILING_FORMAT in (rows[0].hint or "")
+
+
+def test_a_valid_ceiling_never_reads_dispatch_auth(tmp_path, monkeypatch):
+    import levain.slot.services.dispatch_run as DR
+    store = _store(tmp_path)
+    (store / "policy" / layout.policy_dispatch_ceiling_path("linux").name).write_text(json.dumps(DOC))
+    os.chmod(store / "policy" / layout.policy_dispatch_ceiling_path("linux").name, 0o644)
+    monkeypatch.setattr(DR, "read_dispatch_auth", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read")))
+    assert _rows(store) == []

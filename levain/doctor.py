@@ -2138,15 +2138,20 @@ def _check_dispatch_ceiling(*, host: str | None = None, store: Path | None = Non
     if store is None or not (store / "policy" / layout.operator_record_path(host).name).is_file():
         return []
     path = store / "policy" / layout.policy_dispatch_ceiling_path(host).name
-    from levain.slot.services.dispatch_run import read_dispatch_auth
-    hint = _dispatch_ceiling_hint(
-        host, read_dispatch_auth(store / "policy" / layout.POLICY_DISPATCH_AUTH, owner)[0] == "passthrough")
     try:
         T.read_ceiling(path, owner)
-    except Refused as exc:
-        return [CheckResult(name, True, f"{path} is absent or unusable ({exc.detail}): every mint refuses "
-                            "ticket-ceiling:file until it is set", hint, warn=True)]
-    except OSError as exc:
+    except (Refused, OSError) as exc:
+        # The hint is built only on a row that shows it, and an unreadable dispatch_auth file leaves the /1 form
+        # (never loses the set-ceiling line).
+        from levain.slot.services.dispatch_run import read_dispatch_auth
+        try:
+            passthrough = read_dispatch_auth(store / "policy" / layout.POLICY_DISPATCH_AUTH, owner)[0] == "passthrough"
+        except Exception:  # noqa: BLE001
+            passthrough = False
+        hint = _dispatch_ceiling_hint(host, passthrough)
+        if isinstance(exc, Refused):
+            return [CheckResult(name, True, f"{path} is absent or unusable ({exc.detail}): every mint refuses "
+                                "ticket-ceiling:file until it is set", hint, warn=True)]
         return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", hint, warn=True)]
     return []
 
