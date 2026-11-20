@@ -822,12 +822,16 @@ def test_a_slow_stream_read_that_finishes_last_does_not_overwrite_a_newer_one(ri
     slow: list[dict[str, Any]] = []
     t = threading.Thread(target=lambda: slow.append(ck._stream_health()))
     t.start()
-    while not log:
-        engine.time.sleep(0.001)                                  # the first read is under way and waiting
-    engine.time.sleep(0.01)
-    assert ck._stream_health()["state"] == "degraded"             # a later request reads the newer state and stores it
-    gate.set()
-    t.join(10)
+    try:
+        deadline = engine.time.monotonic() + 10
+        while not log:
+            assert engine.time.monotonic() < deadline, "the first stream read never began"
+            engine.time.sleep(0.001)                              # the first read is under way and waiting
+        engine.time.sleep(0.01)
+        assert ck._stream_health()["state"] == "degraded"         # a later request reads the newer state and stores it
+    finally:
+        gate.set()                                                # the waiting read is always let go, so no thread outlives the test
+        t.join(10)
     assert slow and slow[0]["state"] == "degraded"                # the older read is told what the cache holds
     assert ck._stream_health()["state"] == "degraded" and len(log) == 2
 
@@ -842,12 +846,14 @@ def test_the_stream_health_a_caller_gets_is_its_own_copy(rig: Rig, monkeypatch: 
 
 
 def test_the_stream_window_runs_from_the_end_of_the_read(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(engine, "STREAMS_READ_TTL_S", 0.25)
+    # the window is wide enough that a stalled runner between the two calls does not expire it, and the read is longer
+    # than the window: a window that ran from the read's BEGINNING would be spent when the first call returns
+    monkeypatch.setattr(engine, "STREAMS_READ_TTL_S", 1.0)
     log: list[str] = []
 
     def slow() -> dict[str, Any]:
         log.append("read")
-        engine.time.sleep(0.3)                                    # longer than the window
+        engine.time.sleep(1.1)                                    # longer than the window
         return {engine.INPUTS_STREAM_ID: {"state": "ok", "last_event_at": None}}
     monkeypatch.setattr(rig.reader, "streams", slow)
     rig.ck._stream_health()
