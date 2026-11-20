@@ -55,6 +55,14 @@ def test_a_land_run_that_just_completed_blocks_inside_the_grace_and_not_after():
     assert hold.blocking_land_runs([run("land/x", "completed", id=2, ended_ago=181)], NOW, 180, 99) == []
 
 
+def test_a_runner_clock_a_little_behind_the_api_still_blocks_a_just_finished_land_run():
+    # the API's updated_at reads a few seconds AFTER the runner's now: still inside the grace
+    assert ids(hold.blocking_land_runs([run("land/x", "completed", id=2, ended_ago=-5)], NOW, 180, 99)) == [2]
+    # the edge of the tolerance, and a timestamp far in the future (garbage) that does not block
+    assert ids(hold.blocking_land_runs([run("land/x", "completed", id=2, ended_ago=-hold.CLOCK_SKEW_S)], NOW, 180, 99)) == [2]
+    assert hold.blocking_land_runs([run("land/x", "completed", id=2, ended_ago=-hold.CLOCK_SKEW_S - 1)], NOW, 180, 99) == []
+
+
 @pytest.mark.parametrize("branch", ["seat/x", "landing/x", "main", "land", "seat/land/x", "x/land/y", "Land/x", "", None])
 def test_only_a_branch_that_starts_with_land_slash_blocks(branch):
     assert hold.blocking_land_runs([run(branch, "in_progress")], NOW, 180, 99) == []

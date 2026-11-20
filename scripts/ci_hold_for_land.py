@@ -27,6 +27,8 @@ DEFAULT_TIMEOUT_S = 2400
 # Chained land runs are only a short while apart: a hold that released in the gap would put the seat's jobs ahead of the
 # next land run, so a land run that finished within this many seconds still blocks.
 DEFAULT_GRACE_S = 180
+# How far in the future a completed run's timestamp may read, against the runner's clock, and still count as finished now.
+CLOCK_SKEW_S = 60
 GH_CALL_TIMEOUT_S = 60
 # A single transient API failure (a 502 after a long wait) must not release a hold the land run still needs: this many
 # failures IN A ROW release it (fail open).
@@ -86,7 +88,9 @@ def blocking_land_runs(runs, now, grace_s, own_run_id=None):
                 blockers.append(run)
             elif status == "completed":
                 ended = _finished_at(run)
-                if ended is not None and 0 <= (now - ended).total_seconds() <= grace_s:
+                # the API stamps `ended`, the runner's clock gives `now`: a runner a little behind makes a just-finished
+                # run read as ending slightly in the future, which is inside the grace, not outside it
+                if ended is not None and -CLOCK_SKEW_S <= (now - ended).total_seconds() <= grace_s:
                     blockers.append(run)
         except Exception:  # an odd run must never turn the hold red
             continue
