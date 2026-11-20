@@ -37,6 +37,7 @@ class WriteRig(Rig):
         self.dirty_calls: list[tuple[tuple[str, ...], int]] = []
         self.forward = True
         self.fail: BaseException | None = None
+        self.before_dirty: Any = None          # called inside the hook before it answers: a test's way to interleave a reader
         self.locks_free_in_dirty: list[bool] = []
         self.publishes: list[tuple[str, int, int]] = []
         self._pub = threading.Condition()
@@ -68,6 +69,8 @@ class WriteRig(Rig):
             free.append(got)
         self.locks_free_in_dirty.append(all(free))
         self.dirty_calls.append((ids, write_gen))
+        if self.before_dirty is not None:
+            self.before_dirty()
         if self.fail is not None:
             raise self.fail
         if self.forward:
@@ -845,3 +848,31 @@ def test_a_panel_read_that_waited_is_composed_against_the_clock_after_the_wait(r
     rig.ck.panel("alpha")
     t.join(10)
     assert seen == [rig.clock()]
+
+
+def test_a_read_blocked_for_a_write_is_released_when_the_host_turns_out_not_to_have_been_told(rig: WriteRig, monkeypatch) -> None:
+    """The requirement is recorded before the host is told, so a read can start waiting for it, and the hook can then raise: the
+    read must not sit out the bound for a row nobody is coming to derive."""
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    got: dict[str, Any] = {}
+
+    def reader() -> None:
+        got["out"] = rig.ck.panel("alpha")
+
+    t = threading.Thread(target=reader)
+
+    def interleave() -> None:
+        t.start()
+        deadline = time.monotonic() + 10
+        while rig.ck.write_wait_counts()["waits"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    rig.before_dirty = interleave
+    rig.fail = RuntimeError("the host is gone")
+    began = time.monotonic()
+    rig.ck.invalidate_reads(["alpha"])
+    t.join(10)
+    assert not t.is_alive() and time.monotonic() - began < 10
+    assert got["out"]["stale"] is True and got["out"]["pending"] is False
+    assert rig.ck.write_wait_counts() == {"waits": 1, "timeouts": 0}

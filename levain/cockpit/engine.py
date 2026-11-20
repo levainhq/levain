@@ -2976,6 +2976,7 @@ class Cockpit:
                     self._write_unsent[pid] = max(self._write_unsent.get(pid, 0), write_gen)
                 self.host_dirty_errors += 1
                 self.last_host_dirty_error = exc
+            self._wake_waiters()      # a read already blocked for this write's row is not going to get it
         else:
             with self._rc_lock:
                 for pid in ids:
@@ -2985,6 +2986,9 @@ class Cockpit:
     def note_publish(self, panel_id: str, gen: int, write_gen: int) -> None:
         """The host's word that it published a row (the shape of a derive loop's ``on_publish``): wakes every read blocked
         for a row. The arguments are not trusted to say whether the row answers a write: a woken read looks at the row."""
+        self._wake_waiters()
+
+    def _wake_waiters(self) -> None:
         with self._pub_cv:
             self._pub_ticket += 1
             self._pub_cv.notify_all()
@@ -3051,6 +3055,8 @@ class Cockpit:
                     return
                 if not self._answers_write(row, req):
                     behind[pid] = req
+            with self._rc_lock:      # a host that failed to be told of the write while this read waited answers no one
+                behind = {pid: req for pid, req in behind.items() if not self._unsent_for(pid, req)}
             if not behind:
                 return
             left = deadline - time.monotonic()
