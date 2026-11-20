@@ -924,6 +924,16 @@ class QuestionStore:
             rows = conn.execute(f"{_select(conn)} ORDER BY q.n DESC LIMIT ?", (min(max(int(limit), 0), _N_MAX),)).fetchall()
         return [self._question_of(r) for r in rows]
 
+    def filed_since(self, agent: str, agent_session_id: str, stamp: str) -> int:
+        """How many questions ``agent``'s session has filed at or after ``stamp`` (a :func:`utc_stamp` text), answered
+        or not; ``0`` when there is no store yet."""
+        with self._peek() as conn:
+            if conn is None:
+                return 0
+            row = conn.execute("SELECT COUNT(*) FROM questions WHERE agent = ? AND agent_session_id = ? AND "
+                               "filed_at >= ?", (agent, agent_session_id, stamp)).fetchone()
+        return int(row[0])
+
     # --- answering -----------------------------------------------------------------------------------
     def answer(self, ref: Any, *, option: str | None = None, text: str | None = None, channel: str) -> Answer:
         """Answer a question once: exactly one of ``option`` (one of its keys) or ``text`` (kept verbatim, any

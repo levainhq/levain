@@ -58,7 +58,7 @@ import time
 import types
 import urllib.parse
 from collections.abc import Callable, Collection, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
@@ -3706,7 +3706,9 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     unreadable record is decided by one launch-row read and VERIFIES. The one skip beyond those: a fresh
     wake-turn record (:func:`_fresh_wake`). A desk session is checked against the view its prompt hook
     staged, which commits here (:func:`_stop_desk`). Every store read and the view's write wait within ONE bound
-    (HOOK_BUSY_MS); the ``closed`` notices' write keeps its own (:func:`mark_closed_shown`). A turn that ends here
+    (HOOK_BUSY_MS); the ``closed`` notices' write keeps its own (:func:`mark_closed_shown`). A band turn is also read
+    for a question put to the operator in prose with no row filed since the turn began (:func:`_ask_reason`; wake
+    turns included), and its reason joins the reprint reason when both apply. A turn that ends here
     removes its record (compare-and-delete). Never raises, never writes the operator's data beyond
     that commit."""
     deadline = time.monotonic() + HOOK_BUSY_MS / 1000
@@ -3733,10 +3735,63 @@ def _hook_stop(payload: Any, environ: Mapping[str, str] | None, agent: str, dead
         else:
             rec = raw = None
             fact = _turn_fact(session, None, directory, env, agent, max(0.0, deadline - time.monotonic()))
+        shown = _shown_lines(directory, fact, session)       # a desk's staged block is cleared by its commit
         out = _stop_turn(directory, fact, rec, payload, message, deadline)
+        ask = _ask_reason(directory, fact, rec, payload, message, shown, agent)
+        if ask is not None:
+            return ask if out is None else f"{out}\n\n{ask}"
         if out is None and raw is not None:
             _remove_if(_session_file(directory, session, "turn.rec"), raw)    # the turn ended: its record is spent
         return out
+    except Exception:
+        return None
+
+
+ASK_FILER = ("levain ask --what \"<the question, one line>\" --option <key>=<label> --option <key>=<label> --rec <key> "
+             "--blocks \"<what waits on the answer>\"")
+ASK_NOTE = ("The row takes 2-6 options (keys lowercase a-z, 0-9, _ or -); when the answer is not a choice you can list, "
+            "file it with --open and no options and no --rec, and the operator answers in words.")
+
+
+def _shown_lines(directory: Path | str, fact: TurnFact, session: str) -> list[str] | None:
+    """The lines of the block this turn's prompt hook showed the seat (what every reply reprints), read before the
+    Stop commit that can clear them; ``[]`` when none or unreadable, ``None`` when a view with items kept no block (the
+    lines are unknown)."""
+    try:
+        if not fact.band:
+            return []
+        if fact.coord:
+            got = _read_staged(directory, session)
+            return [] if got is None else got[0]["block"].splitlines()
+        row = _view_row(QuestionStore(directory), fact.viewer)
+        if row is None:
+            return []
+        view, _gen, block = row
+        return None if block is None and view.open_list else (block or "").splitlines()
+    except Exception:
+        return []
+
+
+def _ask_reason(directory: Path | str, fact: TurnFact, rec: dict | None, payload: dict, message: str,
+                shown: list[str] | None, agent: str) -> str | None:
+    """The reason to refuse this turn's end because the reply asks the operator something in prose and no question
+    was filed since the turn began, or ``None``. Only a band turn with a turn record, and never on a continuation
+    (``stop_hook_active``); one claim per turn (:func:`_claim_retry`). The agent files the row itself: nothing is
+    filed here. Never raises."""
+    try:
+        if rec is None or not fact.band or shown is None or payload.get("stop_hook_active"):
+            return None
+        from levain import operator_ask
+
+        verdict = operator_ask.detect(message, drop_lines=shown)
+        if verdict is None or verdict.addressee == "agent":
+            return None
+        stamp = utc_stamp(datetime.fromtimestamp(rec["at"] / 1e9, timezone.utc))
+        if QuestionStore(directory).filed_since(agent, payload["session_id"], stamp) > 0:
+            return None
+        if not _claim_retry(directory, "opq:" + fact.viewer, rec["at"]):
+            return None
+        return f"{operator_ask.refusal(ASK_FILER, verdict)} {ASK_NOTE}"
     except Exception:
         return None
 
