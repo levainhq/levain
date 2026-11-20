@@ -69,5 +69,18 @@ def test_a_present_unusable_ceiling_is_a_row_with_the_same_remedy(tmp_path):
     assert len(rows) == 1 and "set-ceiling" in (rows[0].hint or "")
 
 
+def test_the_hint_says_the_operator_picks_the_figures(tmp_path):
+    assert "not a recommendation" in (_rows(_store(tmp_path))[0].hint or "")
+
+
+def test_run_doctor_prints_the_ceiling_row_when_the_ceiling_is_absent(tmp_path, capsys, monkeypatch):
+    # deleting the row's core.extend line in _run_doctor turns this red
+    store = _store(tmp_path)
+    real = doctor._check_dispatch_ceiling
+    monkeypatch.setattr(doctor, "_check_dispatch_ceiling", lambda: real(host="linux", store=store, owner=ME))
+    doctor.run_doctor(tmp_path / "install")
+    assert "dispatch ceiling:" in capsys.readouterr().out
+
+
 def test_no_isolation_install_no_row(tmp_path):
     assert doctor._check_dispatch_ceiling(host="linux", store=tmp_path / "absent", owner=ME) == []

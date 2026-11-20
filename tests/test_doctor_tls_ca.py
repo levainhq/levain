@@ -1,23 +1,40 @@
 """The doctor's ``TLS trust store`` row (levain#198): a python.org Python on macOS ships no CA bundle until its
-``Install Certificates.command`` runs, so the broker's HTTPS to a provider fails CERTIFICATE_VERIFY_FAILED. The row
-reads the store through an injectable probe, so no test needs a broken Python."""
+``Install Certificates.command`` runs, so this Python's HTTPS to a provider fails CERTIFICATE_VERIFY_FAILED. The row
+reads the store through an injectable probe, so no test needs a broken Python; the real probe is exercised in a fresh
+interpreter."""
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from levain import doctor
 
+_PY = "/Users/phillipclapham/Briefcase/levain/.venv/bin/python3"
+_REPO = str(Path(__file__).resolve().parent.parent)
+_SCRIPT = ("import sys; sys.path.insert(0, sys.argv[1]); from levain import doctor; "
+           "print('row' if doctor._check_tls_trust(version=(3, 13), prefix='/x', platform='linux') else 'none')")
 
-def _probe(x509_ca: int, cafile: bool = False, capath: bool = False):
-    return lambda: {"x509_ca": x509_ca, "cafile_readable": cafile, "capath_readable": capath}
+
+def _probe(x509_ca: int, capath: bool = False):
+    return lambda: {"x509_ca": x509_ca, "capath_readable": capath}
 
 
-def test_empty_store_and_no_default_paths_fails_naming_the_command():
+def test_empty_store_and_no_default_paths_warns_naming_the_command():
     base = "/Library/Frameworks/Python.framework/Versions/3.13"
     rows = doctor._check_tls_trust(probe=_probe(0), version=(3, 13), prefix=base, platform="darwin")
     assert len(rows) == 1 and rows[0].name == "TLS trust store"
-    assert not rows[0].ok
+    assert rows[0].ok and rows[0].warn
     assert "/Applications/Python 3.13/Install Certificates.command" in (rows[0].hint or "")
+
+
+def test_the_detail_speaks_of_this_python_not_the_broker():
+    rows = doctor._check_tls_trust(probe=_probe(0), version=(3, 13), prefix="/x", platform="linux")
+    assert "this Python (the one running levain)" in rows[0].detail
+    assert "broker" not in rows[0].detail
 
 
 def test_the_command_follows_the_running_version_not_a_hard_coded_one():
@@ -31,7 +48,7 @@ def test_a_python_org_prefix_decides_the_command():
     # the command is named only for a python.org framework build: any other Python gets words, not a path to run
     rows = doctor._check_tls_trust(probe=_probe(0), version=(3, 12), prefix="/opt/homebrew/opt/python@3.12",
                                    platform="darwin")
-    assert not rows[0].ok
+    assert rows[0].warn
     assert "Install Certificates.command" not in (rows[0].hint or "")
 
 
@@ -41,12 +58,11 @@ def test_loaded_certificates_leave_no_row():
                                    platform="darwin") == []
 
 
-def test_a_readable_default_cafile_or_capath_leaves_no_row():
-    # capath certificates load lazily, so an empty x509_ca alongside a readable path is not an empty store
-    for kw in ({"cafile": True}, {"capath": True}):
-        assert doctor._check_tls_trust(probe=_probe(0, **kw), version=(3, 13),
-                                       prefix="/Library/Frameworks/Python.framework/Versions/3.13",
-                                       platform="darwin") == []
+def test_a_readable_capath_leaves_no_row():
+    # capath certificates load lazily, so an empty x509_ca alongside a readable capath is not an empty store
+    assert doctor._check_tls_trust(probe=_probe(0, capath=True), version=(3, 13),
+                                   prefix="/Library/Frameworks/Python.framework/Versions/3.13",
+                                   platform="darwin") == []
 
 
 def test_a_probe_that_raises_is_a_warning_never_a_pass():
@@ -57,10 +73,44 @@ def test_a_probe_that_raises_is_a_warning_never_a_pass():
     assert len(rows) == 1 and rows[0].ok and rows[0].warn
 
 
-def test_the_real_probe_answers_the_three_facts():
+def test_the_real_probe_answers_the_two_facts():
     got = doctor._tls_store_probe()
-    assert set(got) == {"x509_ca", "cafile_readable", "capath_readable"}
+    assert set(got) == {"x509_ca", "capath_readable"}
     assert isinstance(got["x509_ca"], int)
+
+
+def _fresh(extra: dict) -> str:
+    # the real probe in a fresh interpreter: the default context reads SSL_CERT_FILE / SSL_CERT_DIR when created
+    env = {k: v for k, v in os.environ.items() if k not in ("SSL_CERT_FILE", "SSL_CERT_DIR")}
+    env.update(extra)
+    out = subprocess.run([_PY, "-I", "-c", _SCRIPT, _REPO], env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().splitlines()[-1]
+
+
+@pytest.mark.skipif(not os.path.exists(_PY), reason="the levain venv interpreter is not here")
+def test_an_empty_cafile_and_empty_capath_fire_the_row_in_a_fresh_interpreter(tmp_path):
+    empty_file = tmp_path / "empty.pem"
+    empty_file.write_text("")
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    assert _fresh({"SSL_CERT_FILE": str(empty_file), "SSL_CERT_DIR": str(empty_dir)}) == "row"
+
+
+@pytest.mark.skipif(not os.path.exists(_PY), reason="the levain venv interpreter is not here")
+def test_the_system_default_store_leaves_no_row_in_a_fresh_interpreter():
+    count = subprocess.run([_PY, "-I", "-c", "import ssl; print(ssl.create_default_context().cert_store_stats()['x509_ca'])"],
+                           capture_output=True, text=True, timeout=60)
+    if count.returncode != 0 or int(count.stdout.strip() or 0) == 0:
+        pytest.skip("that interpreter has no default CA store")
+    assert _fresh({}) == "none"
+
+
+def test_run_doctor_prints_the_trust_row_when_the_store_is_empty(tmp_path, capsys, monkeypatch):
+    # deleting the row's core.extend line in _run_doctor turns this red
+    monkeypatch.setattr(doctor, "_tls_store_probe", lambda: {"x509_ca": 0, "capath_readable": False})
+    doctor.run_doctor(tmp_path)
+    assert "TLS trust store: this Python" in capsys.readouterr().out
 
 
 def test_the_readme_install_section_names_the_command():

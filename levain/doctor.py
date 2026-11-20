@@ -2047,46 +2047,46 @@ _PYTHON_ORG_FRAMEWORK = "/Library/Frameworks/Python.framework/Versions/"
 
 
 def _tls_store_probe() -> dict:
-    """What the broker's own TLS context (``ssl.create_default_context()``) would trust: the CA certificates loaded now
-    and whether the default cafile or capath is readable (capath certificates load lazily, so a readable capath is a
-    store the count cannot show)."""
+    """What this Python's default TLS context (``ssl.create_default_context()``) trusts: the CA certificates it loaded
+    (the cafile loads eagerly, so the count already reflects it, an empty one included) and whether the default capath
+    is a readable, non-empty directory (capath certificates load lazily, so such a directory is a store the count
+    cannot show)."""
     import ssl
 
     stats = ssl.create_default_context().cert_store_stats()
-    paths = ssl.get_default_verify_paths()
-    capath = paths.capath
+    capath = ssl.get_default_verify_paths().capath
     return {"x509_ca": int(stats.get("x509_ca", 0)),
-            "cafile_readable": bool(paths.cafile) and os.access(paths.cafile, os.R_OK),
             "capath_readable": bool(capath) and os.path.isdir(capath) and os.access(capath, os.R_OK)
                                and any(True for _ in os.scandir(capath))}
 
 
 def _check_tls_trust(*, probe: Any = None, version: tuple | None = None, prefix: str | None = None,
                      platform: str | None = None) -> list[CheckResult]:
-    """The ``TLS trust store`` row: a Python whose default context trusts no CA cannot verify any server, so the
-    broker's HTTPS to a provider fails CERTIFICATE_VERIFY_FAILED. FAIL when the store is empty and no default cafile or
-    capath is readable; no row otherwise. The remedy names python.org's ``Install Certificates.command``, derived from
+    """The ``TLS trust store`` row: a Python whose default context trusts no CA cannot verify any server, so its HTTPS
+    fails CERTIFICATE_VERIFY_FAILED. The Python judged is the one running levain (the broker runs under a different
+    interpreter). WARN, not FAIL, when no CA certificate loaded and no readable non-empty capath exists (a minimal
+    container may legitimately have no store); no row otherwise. The remedy names python.org's ``Install Certificates.command``, derived from
     the running version, only for a python.org framework build (the one that ships it); any other Python gets words.
     Verification itself is not touched. ``probe``/``version``/``prefix``/``platform``: a test's seams."""
     name = "TLS trust store"
     try:
         got = (probe or _tls_store_probe)()
-        empty = got["x509_ca"] == 0 and not got["cafile_readable"] and not got["capath_readable"]
+        empty = got["x509_ca"] == 0 and not got["capath_readable"]
     except Exception as exc:  # noqa: BLE001 - cannot tell is a warning, never a pass
         return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", warn=True)]
     if not empty:
         return []
     major, minor = (version or sys.version_info[:2])[:2]
     prefix = sys.base_prefix if prefix is None else prefix
-    detail = ("this Python trusts no certificate authority (no CA certificates loaded, no readable default cafile or "
-              "capath): the broker cannot verify any provider and its HTTPS fails CERTIFICATE_VERIFY_FAILED")
+    detail = ("this Python (the one running levain) trusts no certificate authority (no CA certificates loaded, no "
+              "readable non-empty default capath): its HTTPS to a provider fails CERTIFICATE_VERIFY_FAILED")
     if (platform or sys.platform) == "darwin" and prefix.startswith(_PYTHON_ORG_FRAMEWORK):
         hint = (f"Run \"/Applications/Python {major}.{minor}/Install Certificates.command\" once (python.org's "
                 "installer ships no CA bundle until it runs), then run doctor again.")
     else:
         hint = ("Install a CA bundle this Python can read (its default cafile or capath), or point SSL_CERT_FILE at "
                 "one, then run doctor again.")
-    return [CheckResult(name, False, detail, hint)]
+    return [CheckResult(name, True, detail, hint, warn=True)]
 
 
 def _dispatch_ceiling_hint(host: str) -> str:
@@ -2095,8 +2095,8 @@ def _dispatch_ceiling_hint(host: str) -> str:
 
     doc = (f'{{"format":"{T.CEILING_FORMAT}","max_reserved_microdollars_per_run":1000000,'
            '"max_open_tickets":4,"max_runs_per_day":50}')
-    return (f"The operator sets it, once, with the install helper; nothing writes it for you. Edit the three numbers "
-            f"(the per-run figure is in micro-dollars) and run: echo '{doc}' | sudo "
+    return (f"The operator sets it, once, with the install helper; nothing writes it for you. You pick the three "
+            f"figures: the example values are not a recommendation, and the per-run figure is in micro-dollars. Edit them and run: echo '{doc}' | sudo "
             f"{layout.install_helper_path(host)} set-ceiling")   # type: ignore[arg-type]
 
 
