@@ -15,7 +15,7 @@ import pytest
 
 from tests._ke_dom import WEB
 from tests.test_cockpit_fresh_line import LIVE, _open, _vals
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_places import READY, SETTLE
 
@@ -42,6 +42,11 @@ STUB2 = r"""(() => { const real = window.fetch.bind(window); window.__reads = 0;
   window.__edit = (on) => { window.LevainDashboard.editHoldsRefresh = () => on; };
   return 1; })()"""
 TOLD = "document.dispatchEvent(new CustomEvent('levain:fresh'))"     # what the stream says after it has applied a panel
+# A server that has only just started makes the first page do one corrective whole-board read after the stream's hello (the watcher's first
+# build is a new generation, levain#138). Every test below injects its failure into the NEXT manifest read, so that read must not be the
+# startup one: wait for the settled board (the shared step: live chip, no cockpit read in flight, started or finished, nothing drawn), then
+# zero the counters so a test counts only what it caused.
+QUIET = [BOARD_SETTLED, {"eval": "(window.__reads = 0, window.__wbReads = 0, 1)"}]
 
 
 # sample the page every 250 ms for `ms`: what the line says and what the shim's facts say
@@ -71,7 +76,7 @@ def _at(rows: list[dict], ms: int) -> dict:
 @needs_browser
 def test_a_read_that_fails_after_the_board_is_drawn_is_read_again_until_one_lands(tmp_path: Path) -> None:
     """FIX-1: the cockpit has no Sync key, so a failed read of a DRAWN board must retry on its own (2 s, then 4 s), say so, and recover."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(12000, "window.__fails = 2; window.LevainCockpitTransport.reload(); 1")]
     rows = _rows(_open(tmp_path, steps))
     first = _at(rows, 500)
@@ -87,7 +92,7 @@ def test_a_read_that_fails_after_the_board_is_drawn_is_read_again_until_one_land
 @needs_browser
 def test_a_refusal_after_the_board_is_drawn_says_not_signed_in_and_stops(tmp_path: Path) -> None:
     """FIX-1: a refusal of a drawn board is not retried (a retry only asks again), shows 'not signed in', and the next foreground reads again."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(9000, "window.__mode = '401'; window.__fails = 5; window.LevainCockpitTransport.reload(); 1"),
              _sample(4000, "window.__fails = 0; window.dispatchEvent(new Event('online')); document.dispatchEvent(new CustomEvent('levain:resume', { detail: {} })); 1")]
     out = _open(tmp_path, steps)
@@ -108,7 +113,7 @@ def _title(rows_out: dict) -> str:
 def test_the_real_wiring_names_a_stale_head_a_failed_read_and_a_dropped_stream(tmp_path: Path) -> None:
     """L14: boot facts + stream facts + view heads, no seam. Each of the three exporters feeds the line a unit and a name; a mismatch fails here."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
-    steps = [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, LIVE, SETTLE, _run(STUB2), title,
+    steps = [{"emulate": {"w": 1440, "h": 900, "dpr": 1}}, READY, LIVE, SETTLE, _run(STUB2), *QUIET, title,
              _sample(5000, "window.__stale = 'work_board'; window.LevainCockpitTransport.reload(); 1"),                                  # 1: a stale head
              _sample(1500, "window.__stale = null; window.__r = null; window.LevainCockpitView.refetchPanel('work_board').then((r) => { window.__r = r; " + TOLD + "; }); 1"),   # 2: read fresh in place
              _sample(8000, "window.__fails = 2; window.LevainCockpitTransport.reload(); 1"),                                                  # 3: a failed read
@@ -134,7 +139,7 @@ def test_the_real_wiring_names_a_stale_head_a_failed_read_and_a_dropped_stream(t
 @needs_browser
 def test_a_good_read_of_another_kind_ends_the_failure_text_and_the_retry_chain(tmp_path: Path) -> None:
     """FIX-5 (and FIX-1's end): the stamp's 'read failed' text and the retry stop at a panel applied in place, without a whole read."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(600, "window.__fails = 1; window.LevainCockpitTransport.reload(); 1"),
              _sample(3500, "window.LevainCockpitView.refetchPanel('work_board').then(() => " + TOLD + "); 1")]
     out = _open(tmp_path, steps)
@@ -155,7 +160,7 @@ REFUSE = "window.__mode = '401'; window.__fails = 1; window.LevainCockpitTranspo
 def test_a_refusal_stands_until_a_read_answers_a_foreground_that_is_deferred_or_in_flight_does_not_unsay_it(tmp_path: Path) -> None:
     """A(a): the refusal ends at a read's answer, never at the request for one: a foreground read deferred for an edit makes no request, and one
     in flight has not answered, so neither may turn 'not signed in' into 'can't reach' (the failure text of a read that never refused)."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2), _sample(3600, REFUSE),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, _sample(3600, REFUSE),
              _sample(1500, "window.__edit(true); document.dispatchEvent(new CustomEvent('levain:resume', { detail: {} })); 1"),
              _sample(4000, "window.__edit(false); window.__fails = 1; window.__mode = 'drop'; window.__delay = 1500; document.dispatchEvent(new CustomEvent('levain:resume', { detail: {} })); 1")]
     refused, deferred, inflight = _samples(_open(tmp_path, steps))
@@ -169,7 +174,7 @@ def test_a_refusal_stands_until_a_read_answers_a_foreground_that_is_deferred_or_
 @needs_browser
 def test_a_failure_ended_by_a_read_of_another_kind_is_not_read_again_by_the_next_online_event(tmp_path: Path) -> None:
     """A(b): the line, the shim's facts and the `online` handler read ONE derivation: a failure stands only while no read of any kind is newer."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(600, "window.__fails = 1; window.LevainCockpitTransport.reload(); 1"),
              _sample(600, "window.LevainCockpitView.refetchPanel('work_board'); 1"),
              _sample(1800, "window.dispatchEvent(new Event('online')); 1")]
@@ -182,7 +187,7 @@ def test_a_failure_ended_by_a_read_of_another_kind_is_not_read_again_by_the_next
 @needs_browser
 def test_a_late_read_cannot_leave_the_stamp_and_the_line_telling_different_stories_about_a_refusal(tmp_path: Path) -> None:
     """A(c): after a refusal the stamp carries the remedy and the line says 'not signed in' for as long as the same derivation says the refusal stands."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2), _sample(3600, REFUSE),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, _sample(3600, REFUSE),
              _sample(1500, "window.LevainCockpitView.refetchPanel('work_board').then(() => " + TOLD + "); 1")]       # TOLD: a caller that says so itself
     refused, later = _samples(_open(tmp_path, steps))
     assert refused[-1]["state"] == "refused" and refused[-1]["stamp"].startswith("not signed in"), refused[-1]
@@ -194,7 +199,7 @@ def test_a_late_read_cannot_leave_the_stamp_and_the_line_telling_different_stori
 def test_a_panel_that_could_not_be_read_at_the_whole_draw_is_named_and_read_again(tmp_path: Path) -> None:
     """B: a panel drawn as unavailable by a whole read is a failure the line names ('<Panel> unavailable') and the stream's bounded refetch reads again."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
-    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, title,
              _sample(4500, "window.__panelFail = 'work_board'; window.__wbReads = 0; window.LevainCockpitTransport.reload(); 1"),
              _sample(9000, "window.__panelFail = null; 1")]
     out = _open(tmp_path, steps)
@@ -210,7 +215,7 @@ def test_a_panel_that_could_not_be_read_at_the_whole_draw_is_named_and_read_agai
 def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_failure(tmp_path: Path) -> None:
     """B: refetchPanel is the ONE place that says a panel read settled; a caller that does not tell the line (a write's refetch, the topology's replay) is still heard."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
-    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, title,
              _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (unavailable)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1"),
              _sample(3500, "window.__panelFail = null; window.LevainCockpitView.refetchPanel('work_board'); 1")]
     out = _open(tmp_path, steps)
@@ -224,7 +229,7 @@ def test_a_panel_read_made_by_a_direct_caller_publishes_its_own_success_and_fail
 def test_a_parenthesis_that_is_part_of_a_panel_title_is_kept_in_the_line(tmp_path: Path) -> None:
     """A title's own parenthesis stays in the line (a year included); only the '(unavailable)' the heading adds is removed."""
     title = {"eval": "JSON.stringify({ probe: 'title', title: window.__panelTitle() })"}
-    steps = [READY, LIVE, SETTLE, _run(STUB2), title,
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, title,
              _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent += ' (remote)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1")]
     out = _open(tmp_path, steps)
     (failed,) = _samples(out)
@@ -234,7 +239,7 @@ def test_a_parenthesis_that_is_part_of_a_panel_title_is_kept_in_the_line(tmp_pat
 @needs_browser
 def test_a_title_that_ends_in_a_number_in_parentheses_keeps_it(tmp_path: Path) -> None:
     """The count is a pill beside the heading, never in its text, so a trailing '(2026)' is the title's own and only '(unavailable)' is stripped."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(4500, "document.querySelector('[data-panel-id=\"work_board\"] .phead h2').textContent = 'Annual plan (2026)'; window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board'); 1")]
     (failed,) = _samples(_open(tmp_path, steps))
     assert failed[-1]["state"] == "stale" and failed[-1]["words"] == "Annual plan (2026) stale", failed[-1]
@@ -243,7 +248,7 @@ def test_a_title_that_ends_in_a_number_in_parentheses_keeps_it(tmp_path: Path) -
 @needs_browser
 def test_a_failed_read_that_waits_on_an_open_edit_is_read_again_when_the_edit_closes(tmp_path: Path) -> None:
     """F: the line is honest while an edit holds the read ('can't reach', no request), and the read comes on its own once the edit is gone, with no event to say so."""
-    steps = [READY, LIVE, SETTLE, _run(STUB2),
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET,
              _sample(4500, "window.__fails = 1; window.LevainCockpitTransport.reload(); window.__edit(true); 1"),
              _sample(13000, "window.__edit(false); 1")]
     held, freed = _samples(_open(tmp_path, steps))
@@ -372,7 +377,7 @@ UNREAD_RETRY = r"""(async () => {
 def test_the_retry_of_a_panel_unreadable_at_the_whole_draw_is_one_read_of_that_panel_not_a_whole_reload(tmp_path: Path) -> None:
     """A panel the whole read could not read has no live node. Its retry through refetchPanel is ONE request, to its own route (answered "fault", which the
     stream bounds without a reload); answering false with no read made every retry step a whole reload of the board. A read that lands answers false."""
-    out = _open(tmp_path, [READY, LIVE, SETTLE, _run(STUB2), {"eval": UNREAD_RETRY}])
+    out = _open(tmp_path, [READY, LIVE, SETTLE, _run(STUB2), *QUIET, {"eval": UNREAD_RETRY}])
     (g,) = [v for v in _vals(out) if v.get("probe") == "unread"]
     assert g["drawn"] is True, g
     assert g["first"] == "fault", g
