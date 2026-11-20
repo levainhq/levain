@@ -1366,6 +1366,11 @@ class Cockpit:
                 isinstance(spec.backstop_s, (int, float)) and not isinstance(spec.backstop_s, bool)
                 and math.isfinite(spec.backstop_s) and spec.backstop_s > 0):
             raise CockpitRegistrationError(f"{sid}: backstop_s must be a positive finite number")
+        if spec.backstop_s is not None and spec.backstop_s > spec.stale_after_s:
+            # a panel no input moves re-derives only at its backstop; past stale_after_s it would show stale while correct
+            raise CockpitRegistrationError(
+                f"{sid}: backstop_s ({spec.backstop_s}) must be <= stale_after_s ({spec.stale_after_s})"
+            )
         if type(spec.inputs) is not tuple or not all(isinstance(i, (File, Dir, Sqlite, GitRefs, Poll)) for i in spec.inputs):
             # a derive host hashes and fingerprints these: anything else would be found on its poll thread, not here
             raise CockpitRegistrationError(
@@ -3906,7 +3911,9 @@ def _valid_until_iso(raw: Any) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        return _parse_iso(raw).isoformat()
+        dt = datetime.fromisoformat(raw)
+        # a naive time is read as local time, Python's own rule for a naive datetime, not as UTC the way ``_parse_iso`` does
+        return (dt.astimezone() if dt.tzinfo is None else dt).isoformat()
     except ValueError:
         return None
 

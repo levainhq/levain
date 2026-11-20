@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from levain.cockpit.derive import PanelPlan
+from levain.cockpit.derive import PanelPlan, due_panels
 from levain.cockpit.engine import Cockpit, CockpitRegistrationError, Read
 from levain.cockpit.snapshot_host import SnapshotHost
 
@@ -44,19 +44,35 @@ def _head(ck: Cockpit, pid: str) -> dict[str, Any]:
     return ck.manifest(NONE_CRED)["panels"][pid]
 
 
-def _provider(pid: str, until: "list[float | None]", **kw: Any):
+def _provider(pid: str, until: "list[float | None]", iso: Any = _iso, **kw: Any):
     """A panel whose every read returns the same rows and the next ``valid_until`` from ``until`` (the last one repeats)."""
     def read(ctx):
         t = until.pop(0) if len(until) > 1 else until[0]
-        return Read(rows=(_row(1),), valid_until=None if t is None else _iso(t))
+        return Read(rows=(_row(1),), valid_until=None if t is None else iso(t))
 
     return _simple(pid, read=read, **kw)
 
 
-def test_a_declared_valid_until_is_served_in_the_attached_head(host_for) -> None:
+@pytest.mark.parametrize("naive", [False, True])
+def test_a_declared_valid_until_is_served_in_the_attached_head(host_for, monkeypatch, naive: bool) -> None:
+    # a naive one is local time (here a zone west of UTC, where reading it as UTC would put it in the past)
+    iso = _iso
+    if naive:
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        iso = lambda t: datetime.fromtimestamp(t).isoformat()  # noqa: E731
+    try:
+        _served_valid_until_matches(host_for, iso)
+    finally:
+        if naive:
+            monkeypatch.undo()
+            time.tzset()
+
+
+def _served_valid_until_matches(host_for, iso: Any) -> None:
     t0 = time.time()
     ck = Cockpit()
-    ck.register(_provider("a", [t0 + 100]))
+    ck.register(_provider("a", [t0 + 100], iso=iso))
     host = host_for(ck)
     host.attach()
     host.run_once(t0)
@@ -79,7 +95,7 @@ def test_a_derive_that_moves_only_valid_until_keeps_the_generation(host_for) -> 
 def test_the_panel_is_due_at_its_valid_until_and_not_before(host_for) -> None:
     t0 = time.time()
     ck = Cockpit()
-    ck.register(_provider("a", [t0 + 100], backstop_s=100000))
+    ck.register(_provider("a", [t0 + 100], backstop_s=100000, stale_after_s=100000))
     host = host_for(ck)
     host.run_once(t0)
     assert "a" not in host.run_once(t0 + 99)
@@ -99,21 +115,29 @@ def test_a_per_panel_backstop_reaches_the_plan_and_re_derives_with_no_input_move
     assert "a" in host.run_once(t0 + 6)
 
 
-@pytest.mark.parametrize("bad", [0, -1, math.inf, math.nan, True])
+@pytest.mark.parametrize("bad", [0, -1, math.inf, math.nan, True, 901])
 def test_a_backstop_that_is_not_positive_and_finite_is_refused(bad: Any) -> None:
+    # 901 is past the default stale_after_s (900): the panel would show stale while correct
     ck = Cockpit()
     with pytest.raises(CockpitRegistrationError, match="backstop_s"):
-        ck.register(_simple("a", backstop_s=bad))
+        ck.register(_simple("a", backstop_s=bad, stale_after_s=900))
+    if bad == 901:
+        with pytest.raises(CockpitRegistrationError, match=r"stale_after_s \(900"):
+            ck.register(_simple("b", backstop_s=bad, stale_after_s=900))
 
 
 def test_the_queue_orders_dirty_first_then_light_before_heavy_then_oldest(host_for) -> None:
     ck = Cockpit()
     host = host_for(ck)
     loop = host._loop
-    loop.set_plans([PanelPlan(id="heavy_dirty", heavy=True), PanelPlan(id="light", heavy=False),
-                    PanelPlan(id="heavy_clean", heavy=True)])
-    for pid in ("heavy_dirty", "light", "heavy_clean"):
-        loop._states[pid].derived_at = 50.0
+    ids = ["heavy_dirty", "light_new", "light_old", "light_never", "heavy_clean"]
+    loop.set_plans([PanelPlan(id=i, heavy=i.startswith("heavy")) for i in ids])
+    ages = {"heavy_dirty": 50.0, "light_new": 60.0, "light_old": 10.0, "light_never": None, "heavy_clean": 5.0}
+    for pid, age in ages.items():
+        loop._states[pid].derived_at = age
     loop._states["heavy_dirty"].dirty_gen = 1
-    order = sorted(["heavy_clean", "light", "heavy_dirty"], key=loop._queue_key)
-    assert order == ["heavy_dirty", "light", "heavy_clean"]
+    want = ["heavy_dirty", "light_never", "light_old", "light_new", "heavy_clean"]
+    assert sorted(reversed(ids), key=loop._queue_key) == want
+    # due_panels reads the same order: every panel here is due at a backstop, so the one function decides
+    due = due_panels(loop._plans, loop._states, {}, None, now=1e9, backstop_s=1.0)
+    assert [pid for pid, _ in due] == want

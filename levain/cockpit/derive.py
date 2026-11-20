@@ -353,7 +353,7 @@ def due_panels(
     now: float,
     backstop_s: float,
 ) -> list[tuple[str, str]]:
-    """[(panel_id, reason)] of the due panels: dirty first, then the oldest derived_at (never derived first)."""
+    """[(panel_id, reason)] of the due panels, in ``queue_order``."""
     due = []
     for pid, plan in plans.items():
         st = states[pid]
@@ -361,12 +361,16 @@ def due_panels(
         if reason is not None:
             due.append((pid, reason))
 
-    def key(item: tuple[str, str]) -> tuple[int, float, str]:
-        st = states[item[0]]
-        return (0 if st.dirty_gen is not None else 1, st.derived_at if st.derived_at is not None else -1.0, item[0])
-
-    due.sort(key=key)
+    due.sort(key=lambda item: queue_order(item[0], plans.get(item[0]), states[item[0]]))
     return due
+
+
+def queue_order(pid: str, plan: PanelPlan | None, st: PanelState) -> tuple[int, int, float, str]:
+    """The one order panels are derived in: dirty first (a write's reader is waiting), then light before heavy so a slow
+    derive does not hold a quick one behind it (a dirty heavy panel still beats a clean light one), then the oldest
+    derived_at (never derived first), then the id."""
+    return (0 if st.dirty_gen is not None else 1, 1 if plan is not None and plan.heavy else 0,
+            st.derived_at if st.derived_at is not None else -1.0, pid)
 
 
 @dataclass
@@ -812,12 +816,7 @@ class DeriveLoop:
             self._run_job(job, self._clock())
 
     def _queue_key(self, pid: str) -> tuple[int, int, float, str]:
-        st = self._states[pid]
-        # dirty first (a write's reader is waiting), then light before heavy so a slow derive does not hold a quick one
-        # behind it; a dirty heavy panel still beats a clean light one
-        plan = self._plans.get(pid)
-        return (0 if st.dirty_gen is not None else 1, 1 if plan is not None and plan.heavy else 0,
-                st.derived_at if st.derived_at is not None else -1.0, pid)
+        return queue_order(pid, self._plans.get(pid), self._states[pid])
 
     # ---- one derive
 
