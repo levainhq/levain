@@ -801,3 +801,47 @@ def test_the_instant_of_a_write_is_taken_in_the_order_its_generation_is(rig: Wri
     older.join(10)
     gen, at = rig.ck._write_required["alpha"]
     assert gen == 2 and at == max(v.timestamp() for v in taken)
+
+
+# --- the request's clock is taken after the wait ----------------------------------------------------------------------------
+def answer_after_the_clock_moved(rig: WriteRig) -> threading.Thread:
+    def answer() -> None:
+        time.sleep(0.3)
+        rig.clock.advance(5)
+        rig.publish_by_hand("alpha", 1)
+
+    t = threading.Thread(target=answer)
+    t.start()
+    return t
+
+
+def test_a_manifest_that_waited_is_composed_against_the_clock_after_the_wait(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    t = answer_after_the_clock_moved(rig)
+    out = rig.ck.manifest(CRED)
+    t.join(10)
+    row = rig.reader.read("alpha")
+    assert out["generated_at"] == engine._iso(rig.clock()) and engine._iso_epoch(row.derived_at) <= out["generated_at"]
+    assert out["panels"]["alpha"]["stale"] is False
+
+
+def test_a_panel_read_that_waited_is_composed_against_the_clock_after_the_wait(rig: WriteRig, monkeypatch) -> None:
+    monkeypatch.setattr(engine, "WRITE_WAIT_S", 30.0)
+    rig.derive()
+    rig.forward = False
+    rig.ck.invalidate_reads(["alpha"])
+    seen: list[Any] = []
+    orig = rig.ck._attached_panel
+
+    def attached_panel(spec: Any, snap: Any, ctx: Any, *a: Any, **k: Any) -> Any:
+        seen.append(ctx.now)
+        return orig(spec, snap, ctx, *a, **k)
+
+    rig.ck._attached_panel = attached_panel
+    t = answer_after_the_clock_moved(rig)
+    rig.ck.panel("alpha")
+    t.join(10)
+    assert seen == [rig.clock()]

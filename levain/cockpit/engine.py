@@ -2672,11 +2672,8 @@ class Cockpit:
         read of the store; a serve-composed one reads its own stores under the request, in the manifest pool, as a bare
         cockpit reads every panel, and is told it is fresh (it is read now).
 
-        A read that is not an observation first waits, under one bound for all the panels, for the rows the writes that
-        touched them asked for (``_await_writes``). ``read_after`` marks an observation (the change stream's): it waits for
-        nothing, and sees a panel a write asked for as stale and pending until its row lands."""
-        if read_after is None:
-            self._await_writes([s.id for s in specs if not self.serve_composed(s.id)])
+        It does not wait for a write's row: ``_manifest_compute`` does, before it takes the request's clock. A panel a write
+        asked a row of that this read's row is not is stale and pending (``_write_owed``)."""
         try:
             stored: Any = self._reader.read_manifest()
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a fault of the request
@@ -3184,8 +3181,10 @@ class Cockpit:
         is shared: read-only for every caller.
 
         Attached: no read cache, no ``_obs_gen``: the manifest is composed from the heads the head layer keeps (one read
-        of the store per call), so there is no provider read to share or to order after. ``read_after`` reaches only the
-        serve-composed panels, whose reads are the bare ones."""
+        of the store per call, after the wait for the rows of the panels a write touched, which reads the store again
+        while it waits), so there is no provider read to share or to order after. ``read_after`` reaches only the
+        serve-composed panels, whose reads are the bare ones, and it also turns that wait off: a read that must see its
+        own writes passes none."""
         if self._reader is not None:
             return self._manifest_compute(credential, install_class=install_class, transport=transport,
                                           read_after=read_after)
@@ -3206,6 +3205,10 @@ class Cockpit:
         """``transport`` is the serving transport's write capability (``writable``,
         ``write_token_required``), which only the server knows; it is published when given. ``read_after``: see
         :meth:`manifest`."""
+        if self._reader is not None and read_after is None:
+            # one bound for every panel; ``read_after`` marks an observation (the change stream's): it waits for nothing and
+            # sees a panel a write asked a row of as stale and pending until the row lands. The clock is taken after the wait
+            self._await_writes([sid for sid in self._specs if not self.serve_composed(sid)])
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         if self._reader is not None:
@@ -3396,6 +3399,8 @@ class Cockpit:
                 raise QueryError("at is a read of the whole panel: it takes no q, row or limit")
             return self._panel_at(panel_id, at, profile=profile, credential_class=credential_class)
         q, limit = check_query(q, limit)
+        if self._reader is not None and not self.serve_composed(panel_id):
+            self._await_writes([panel_id])       # before the request's clock is taken
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs
@@ -3405,8 +3410,6 @@ class Cockpit:
         spec = specs_map.get(panel_id)
         if spec is None:
             return None
-        if self._reader is not None and not self.serve_composed(panel_id):
-            self._await_writes([panel_id])
         snap = self._snap_for(spec, ctx)
         if snap.fresh_info is not None:
             # attached: a read with no ``q`` is the head layer's; a search composes its own head (the hidden rows are let in)
