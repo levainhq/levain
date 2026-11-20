@@ -85,10 +85,10 @@ jobs:
         run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
 
   hold:
-    # 11-19: three land runs queued 9.6 to 45.7 minutes behind seat workflow_dispatch runs. The account's 20-job cap serves
-    # jobs in the order they were created (no priority), and a seat dispatch that created its ~18 jobs while a land run ran,
-    # or just before the next land push, put them ahead of that landing's 24 jobs (measured by chain_idle.py, which lives in
-    # flow's repo, not here). Admission control is the only lever GitHub-hosted runners give: a seat dispatch creates no
+    # 11-19: land runs queued for long stretches behind seat workflow_dispatch runs. The account's concurrent-job cap serves
+    # jobs in the order they were created (no priority), so a seat dispatch that created its jobs while a land run ran, or
+    # just before the next land push, put them ahead of that landing's (the queue wait is read from flow's chain_idle.py).
+    # Admission control is the only lever GitHub-hosted runners give: a seat dispatch creates no
     # heavy job while a land/** run exists, so its jobs enter the queue after the land run's. This job waits (scripts/
     # ci_hold_for_land.py) while any land/** run of this workflow is queued or running, or finished within a short grace
     # (chained land runs are minutes apart); the heavy jobs `needs:` it.
@@ -101,7 +101,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') }}
     continue-on-error: true
     runs-on: ubuntu-24.04
-    # above the script's own timeout (HOLD_TIMEOUT_S, 2400 s) plus the checkout
+    # above the script's own timeout (DEFAULT_TIMEOUT_S in scripts/ci_hold_for_land.py) plus the checkout
     timeout-minutes: 45
     # least privilege: read the run list, and check out the one script
     permissions:

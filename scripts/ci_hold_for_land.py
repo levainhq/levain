@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Hold a seat's workflow_dispatch run until no land/** run of this workflow exists (levain CI, 11-19).
 
-Why: the account's 20-job cap serves jobs in the order they were created, with no priority. A seat dispatch that
-creates its ~18 jobs while a land run runs, or just before the next land push, puts them ahead of the next land run's
-24 jobs, and the landing waits behind them. The `hold` job of .github/workflows/test.yml runs this script first and the
+Why: the account's concurrent-job cap serves jobs in the order they were created, with no priority. A seat dispatch that
+creates its jobs while a land run runs, or just before the next land push, puts them ahead of the next land run's,
+and the landing waits behind them. The `hold` job of .github/workflows/test.yml runs this script first and the
 heavy jobs `needs: hold`, so a seat's jobs are created only after the land run's.
 
 Fails OPEN on purpose: an API error, a bad JSON body or the timeout releases the run. The seat's proof is unchanged,
@@ -22,17 +22,17 @@ import time
 from datetime import datetime, timezone
 
 DEFAULT_POLL_S = 30
-# The workflow job's timeout-minutes must stay above this (it is 45 min; the wait is 40).
+# The workflow job's timeout-minutes (the `hold` job in test.yml) must stay above this.
 DEFAULT_TIMEOUT_S = 2400
-# Chained land runs are minutes apart (88 s between two on 11-20): a hold that released in the gap would put the seat's
-# jobs ahead of the next land run, so a land run that finished within this many seconds still blocks.
+# Chained land runs are only a short while apart: a hold that released in the gap would put the seat's jobs ahead of the
+# next land run, so a land run that finished within this many seconds still blocks.
 DEFAULT_GRACE_S = 180
 GH_CALL_TIMEOUT_S = 60
 # Land runs are push runs of this workflow; the list is newest first.
 RUNS_PATH = "repos/{repo}/actions/workflows/test.yml/runs?per_page=50"
-# One page of 50 is enough: a run that can block is queued, running, or finished within the grace, i.e. among the
-# newest runs. Measured 11-19/20 (research return_R): 30 runs of this workflow spanned 4.6 hours, a land run lasts
-# 14 to 50 minutes, so the newest 50 cover many hours and a blocking land run cannot have 50 newer runs above it.
+# One page (per_page in the path) is enough: a run that can block is queued, running, or finished within the grace, i.e.
+# among the newest runs. [judged by levain-speed 8, 11-19, against project_memory/1119-51_gate503/return_R.md: the newest
+# page spans hours of this workflow's runs and a land run lasts minutes]
 LAND_PREFIX = "land/"
 ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "pending", "requested"})
 
