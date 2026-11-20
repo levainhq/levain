@@ -284,7 +284,8 @@
   // (a count tile gets its button role when its body has been fitted, a moment after the draw): the ask waits for that tile and gives
   // focus to it then, only while focus is still on the page body, so it never takes focus from where the reader went in the meantime.
   let focusAsk = null;
-  // the ask names a DOM dataset value (always a string) and the tile model names its panel by e.id (a string or a number): both sides compare as strings
+  // the ask names an open tile by its panel id, or the List card's control by the tray's id, since the board draw replaces both and the
+  // successor must take the focus. It names a DOM dataset value (always a string) and the tile model names its panel by e.id (a string or a number): both sides compare as strings
   function askTileFocus(id) { focusAsk = id ? { id: String(id), until: Date.now() + 3000 } : null; }
   // the reader's own press or key is an answer to where focus should be: a pending ask is dropped on it (capture phase, so a handler that
   // the same input runs, such as Esc closing a focus view, still arms its own ask after this one has cleared). Added once, at load.
@@ -323,7 +324,10 @@
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
     { const ae = document.activeElement;   // a focused open tile is replaced by this draw: its successor takes the focus
-      if (ae && ae !== document.body && ae.dataset && ae.dataset.ckPanel && ae.classList.contains("w-open")) askTileFocus(ae.dataset.ckPanel); }
+      if (ae && ae !== document.body && ae.dataset && ae.dataset.ckPanel && ae.classList.contains("w-open")) askTileFocus(ae.dataset.ckPanel);
+      // the same for the List card's control (a closed focus view hands the focus back there): the fold that follows draws its successor,
+      // which takes the focus through the "tray" ask listMore already answers (a fold alone is covered the same way in foldRowsAt)
+      else if (ae && ae !== document.body && ae.dataset && ae.dataset.listMore) askTileFocus("tray"); }
     buildKept = kept;                  // a typed panel filled during this draw may owe the reader a later repaint of it
     board.replaceChildren();
 

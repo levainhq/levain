@@ -602,20 +602,27 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
-            # waits for the focus to come back (up to 10 s) instead of a fixed 400 ms: a loaded CI runner failed this twice on 11-20
+            # the close hands the focus to the control: this waits for that hand-back (up to 10 s, not a fixed 400 ms) and no more. The
+            # later loss of the focus was never a slow hand-back: the draw below is what moved it, and the next steps make that draw
             {"eval": "document.querySelector('#levain-modal .modal-close').click(); "
                      f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            # a draw that follows the close (a fold from a search, a resize or a late row; a whole-board redraw from a fresh read) draws the
+            # card's control again: the focus must ride along. A board redraw arrives on its own some 300 ms after the close on a loaded
+            # box, so the test asks for each instead of hoping to meet one; unchanged input still folds the card
+            {"eval": f"{TRAY}.querySelector('.ep-search-input').dispatchEvent(new Event('input', {{bubbles: true}})); new Promise(r => setTimeout(() => r(1), 150))"},
+            {"eval": "window.LevainDashboard.redraw(); "
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); setTimeout(tick, 100); }})"},
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
-    wide = json.loads(out["values"][-6])
+    wide = json.loads(out["values"][-8])
     assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
     assert wide["label"] and "desk owes 2" in wide["label"] and "open the full list" in wide["label"], wide
     assert wide["tags"] == [True], wide                                            # the carried row is tagged desk-owed, as the footer tags it
-    heads = json.loads(out["values"][-3])
+    heads = json.loads(out["values"][-5])
     assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
     assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
-    assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view
+    assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view, and stays on it through a fold
 
 
 @needs_browser
