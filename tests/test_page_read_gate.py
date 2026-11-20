@@ -357,7 +357,8 @@ def test_three_pages_bursting_at_once_do_not_starve_the_band_and_board_reads(tmp
 
 
 # === round 1 fixes (L1/L2): EVERY GET read a page load fires waits on the page gate ==================================
-# Only writes, voice, notify, the legacy substrate reads and the room's per-tick read keep ``request_gate``'s instant 503.
+# Only writes (the POSTs), notify and the room's per-tick read keep ``request_gate``'s instant 503; every other GET read
+# waits on the page gate (read the constants in ``web_server``, not a roster kept here).
 
 from tests.test_cockpit_room import TOKEN as ROOM_TOKEN  # noqa: E402
 from tests.test_cockpit_room import World, _serve_room  # noqa: E402
@@ -907,3 +908,78 @@ def test_a_refused_question_read_is_one_count_one_refusal_one_line_and_an_abando
     assert (row["count"], row["refused_503"], row["aborted"]) == (1, 1, 0), row     # record() counts the request, the refusal its 503
     assert row["total_ms"] >= 150.0 and row["max_ms"] == row["total_ms"], row         # the one time is the wait
     assert _refusal_lines(caplog) == ["refused 503 route=question/<n> gate=page_wait n=1"], _refusal_lines(caplog)
+
+
+# --- round 3 (L3 r2): the question route records ONE outcome ---------------------------------------------------------
+
+def _slow_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == LOG and r.getMessage().startswith("slow cockpit read")]
+
+
+def test_a_timed_out_question_read_is_one_refusal_line_one_slow_line_with_refused_503_and_one_row(
+        wide_rig, stats, monkeypatch, caplog) -> None:
+    base, httpd, qn, _nn = wide_rig
+    monkeypatch.setattr(web_server, "_PAGE_READ_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(web_server, "_SLOW_READ_MS", 0.0)
+    held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOG):
+            assert _http(base, f"/cockpit/question/{qn}.json", PUSH_TOKEN)[0] == 503
+    finally:
+        _release(httpd.page_gate, held)
+    assert _refusal_lines(caplog) == ["refused 503 route=question/<n> gate=page_wait n=1"], _refusal_lines(caplog)
+    slow = _slow_lines(caplog)
+    assert len(slow) == 1 and "route=question/<n>" in slow[0] and slow[0].endswith("refused=503"), slow   # no second line
+    row = stats.snapshot()["question/<n>"]
+    assert (row["count"], row["refused_503"], row["aborted"]) == (1, 1, 0), row
+    assert row["total_ms"] >= 150.0, row                                    # the wait is the time
+
+
+def test_a_question_read_whose_client_left_during_the_wait_is_one_aborted_and_no_refusal(
+        wide_rig, stats, monkeypatch, caplog) -> None:
+    import socket
+
+    base, httpd, qn, _nn = wide_rig
+    reads: list = []
+    real_get = QuestionStore.get
+
+    def spy(self, n):
+        reads.append(n)
+        return real_get(self, n)
+
+    monkeypatch.setattr(QuestionStore, "get", spy)
+    held = _hold(httpd.page_gate, web_server._PAGE_READS_INFLIGHT)
+    host, port = base.removeprefix("http://").split(":")
+    s = socket.create_connection((host, int(port)), timeout=10)
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOG):
+            s.sendall(f"GET /cockpit/question/{qn}.json HTTP/1.1\r\nHost: {host}:{port}\r\n{H}: {PUSH_TOKEN}\r\n\r\n".encode())
+            end = time.monotonic() + 5.0
+            while httpd.page_waiters < 1 and time.monotonic() < end:
+                time.sleep(0.01)
+            assert httpd.page_waiters == 1                                # a real waiter, before it leaves
+            s.close()                                                     # the client gives up
+            time.sleep(0.1)
+            httpd.page_gate.release()                                     # a slot frees: the waiter takes it, sees nobody
+            held.pop()
+            end = time.monotonic() + 5.0
+            while not stats.snapshot().get("question/<n>") and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(0.2)
+    finally:
+        s.close()
+        _release(httpd.page_gate, held)
+    assert reads == [], "the store was read for a client that had gone"
+    _all_page_slots_free(httpd)
+    row = stats.snapshot()["question/<n>"]
+    assert (row["count"], row["refused_503"], row["aborted"]) == (1, 0, 1), row
+    assert _refusal_lines(caplog) == [], _refusal_lines(caplog)
+
+
+def test_key_for_names_notify_and_the_cockpit_verb_not_other() -> None:
+    key = web_server._RouteStats.key_for
+    assert key(web_server._NOTIFY_PATH) == key("/notify?x=SECRET") == "notify"
+    assert key(web_server._COCKPIT_VERB_PATH) == "verb"
+    st = web_server._RouteStats()
+    st.record_refusal(web_server._NOTIFY_PATH, "request_gate")
+    assert st.snapshot()["notify"]["refused_503"] == 1 and "other" not in st.snapshot()

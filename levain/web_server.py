@@ -1128,7 +1128,7 @@ class _RouteStats:
     REFUSALS by design: only the question and panel/manifest reads are also timed (count, total, max); a served band,
     board, threads, consent, note or session read, and every page-gate read, adds no row time."""
 
-    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other",
+    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other", "notify", "verb",
               "band", "board", "threads", "room", "sign", "consent/<id>", "consent/standing", "note/<n>",
               "session/<id>", "desk", "voice", "substrate", "job", "recall", "extra", "envelope", "hostgrant", "dispatch", "coord",
               "pair", "push")
@@ -1198,6 +1198,10 @@ class _RouteStats:
             return "push"
         if path == cockpit_voice.VOICE_JSON or path.startswith("/cockpit/voice/"):
             return "voice"
+        if path == _NOTIFY_PATH:       # a service's POST, refused at the request gate: named, not lumped into "other"
+            return "notify"
+        if path == _COCKPIT_VERB_PATH:     # the cockpit's write verb, refused at the same gate
+            return "verb"
         if path == "/substrate.json":
             return "substrate"
         if path == "/job.json":
@@ -2989,7 +2993,7 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _serve_question_body(self, path: str, *, head: bool) -> None:
+    def _serve_question_body(self, path: str, *, head: bool, since: "float | None" = None) -> None:
         """``GET /cockpit/question/<n>.json``: one question's body (what, options, rec, blocks, agent, filed_at, and
         its answer if any). The consent body's gate, exactly: reached only through ``_route``, then a surface token
         on every bind, judged by the one compare every token check here uses, before the id is looked at. Read-only:
@@ -3001,7 +3005,7 @@ class _Handler(GuardedHandler):
         status, payload = 404, {"error": "not_found", "message": "no such question"}
         store = getattr(self.server, "question_store", None)
         if store is not None and _QUESTION_ID.fullmatch(n):
-            if not self._page_slot_or_refuse(head=head):
+            if not self._page_slot_or_refuse(head=head, since=since):
                 return
             try:
                 q = store.get(int(n))
@@ -4857,16 +4861,17 @@ class _Handler(GuardedHandler):
         self._send(blob, "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _refused(self, gate: str, route: "str | None" = None) -> None:
+    def _refused(self, gate: str, route: "str | None" = None, ms: "float | None" = None) -> None:
         """Count and log one 503 refusal of this request's route at ``gate`` (a fixed name, never request content).
-        ``route`` is a template key for a route its path cannot name (a host's registered route): ``extra``."""
-        _ROUTE_STATS.record_refusal(route or getattr(self, "path", ""), gate)
+        ``route`` is a template key for a route its path cannot name (a host's registered route): ``extra``. ``ms``
+        set makes the refusal the request's one timed count too (see :meth:`_RouteStats.record_refusal`)."""
+        _ROUTE_STATS.record_refusal(route or getattr(self, "path", ""), gate, ms=ms)
 
     def _send_busy(self, *, head: bool, gate: str = "request_gate", retry_after: bool = False,
-                   route: "str | None" = None) -> None:
+                   route: "str | None" = None, ms: "float | None" = None) -> None:
         """The plain 503 ``busy`` a gated route answers when it has no slot, counted and logged through
         :meth:`_refused`; ``retry_after`` adds the ``Retry-After`` header."""
-        self._refused(gate, route)
+        self._refused(gate, route, ms)
         self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head,
                    headers=[("Retry-After", "2")] if retry_after else None)
 
@@ -4905,14 +4910,19 @@ class _Handler(GuardedHandler):
     def _release_page_slot(self) -> None:
         self.server.page_gate.release()
 
-    def _page_slot_or_refuse(self, *, head: bool, route: "str | None" = None) -> bool:
+    def _page_slot_or_refuse(self, *, head: bool, route: "str | None" = None, since: "float | None" = None) -> bool:
         """Take a page slot, or answer the counted 503 ``busy`` with ``Retry-After`` and return False. An abandoned
-        wait (the client left) answers nothing and is no refusal: False, the connection closing."""
+        wait (the client left) answers nothing and is no refusal: False, the connection closing. ``since`` (a
+        ``time.monotonic()`` start) is for a route whose dispatcher times the read itself: the outcome is then left in
+        ``_page_outcome`` (``refused`` or ``abandoned``) and a refusal is recorded once WITH its wait as the time."""
         gate = self._acquire_page_slot()
         if gate is None:
             return True
+        if since is not None:
+            self._page_outcome = "abandoned" if gate == "abandoned" else "refused"
         if gate != "abandoned":
-            self._send_busy(head=head, gate=gate, retry_after=True, route=route)
+            self._send_busy(head=head, gate=gate, retry_after=True, route=route,
+                            ms=None if since is None else (time.monotonic() - since) * 1000.0)
         return False
 
     def _acquire_read_slot(self) -> bool:
@@ -5209,10 +5219,18 @@ class _Handler(GuardedHandler):
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             _tq = time.monotonic()
+            self._page_outcome = ""
             try:
-                self._serve_question_body(path, head=head)
-            finally:   # a client that left mid-send (BrokenPipe) is still one counted read; a refusal counts itself
-                _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0)
+                self._serve_question_body(path, head=head, since=_tq)
+            finally:
+                # ONE record per request: a read refused after its wait was counted and timed by ``record_refusal`` (and
+                # its slow line carries ``refused=503``), so it adds nothing here; an abandoned wait is one ``aborted``;
+                # anything else (served, 403, 404, a client that left mid-send) is one normal read
+                _ms = (time.monotonic() - _tq) * 1000.0
+                if self._page_outcome == "abandoned":
+                    _ROUTE_STATS.record(path, _ms, gate_wait_ms=_ms, aborted=True)
+                elif self._page_outcome != "refused":
+                    _ROUTE_STATS.record(path, _ms)
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
