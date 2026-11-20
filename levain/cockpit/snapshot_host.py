@@ -300,8 +300,9 @@ DERIVE_THREAD_PREFIX = "levain-cockpit-derive"
 FIRST_DISCOVERY_BOUND_S = 3.0
 
 
-# The attachments a cockpit gets after it is built that a derive can read, each named by the cockpit property that holds it: the
-# consent reader, the question store and the note store. The child's ready frame lists the ones its cockpit holds.
+# The attachments a cockpit gets after it is built that a derive can read: a name for each, mapped to the cockpit property it
+# stands for in ``attached_of`` (consent to the consent reader, questions to the question store, notes to the note store). The
+# child's ready frame lists the ones its cockpit holds.
 ATTACHMENTS = ("consent", "questions", "notes")
 
 
@@ -508,6 +509,21 @@ class SnapshotHost:
             return False
         return not self._note_attach_gap()
 
+    def _gap_against(self, held: "frozenset[str] | None") -> "tuple[str, ...]":
+        """The attachments the serve's cockpit holds now that ``held`` does not (sorted). ``held`` None is nothing known of the
+        child, which is no gap; a cockpit that cannot say what it holds is no gap either, and no reason to lose a derive."""
+        if held is None:
+            return ()
+        try:
+            return tuple(sorted(attached_of(self._cockpit) - held))
+        except Exception:  # noqa: BLE001 - a cockpit that cannot say what it holds is no reason to lose a derive
+            return ()
+
+    def _answer_has_gap(self, ans: "ChildAnswer") -> bool:
+        """Whether the child that gave ``ans`` lacks an attachment the serve's cockpit holds now. An answer that names no set
+        (``attached`` None) is not checked."""
+        return bool(self._gap_against(ans.attached))
+
     def _note_attach_gap(self) -> "tuple[str, ...]":
         """The attachments this host's cockpit holds now that the child's does not (sorted), recorded and logged when the set
         differs from the last decision's. This is PRESENCE, not EQUIVALENCE: it asks only whether the child's cockpit holds a
@@ -518,13 +534,7 @@ class SnapshotHost:
         told nothing yet, which is no gap to name, and a ready frame with no list was read as an empty one by the client. A gap
         is not a failure of the child: nothing here touches the fallback count, the backoff or the process."""
         child = self._child
-        held = getattr(child, "attached", None) if child is not None else None
-        gap: "tuple[str, ...]" = ()
-        if held is not None:
-            try:
-                gap = tuple(sorted(attached_of(self._cockpit) - held))
-            except Exception:  # noqa: BLE001 - a cockpit that cannot say what it holds is no reason to lose a derive
-                gap = ()
+        gap = self._gap_against(getattr(child, "attached", None) if child is not None else None)
         with self._route_lock:
             changed = gap != self._attach_gap
             before, self._attach_gap = self._attach_gap, gap
@@ -599,6 +609,11 @@ class SnapshotHost:
             return DeriveResult("error", None, error=STOPPING_TEXT), None
         if ans is not None:
             failure = ans.failure
+            if failure is None and self._answer_has_gap(ans):
+                # the child that answered is not one whose set the routing decision saw (it may have been respawned inside
+                # the ask): its answer is not used, and this is no failure of the child
+                self._note_attach_gap()
+                return self._derive_here(pid), None
             if failure is None:
                 self._mark(self._hung, pid, False)
                 if ans.status == "error" and ans.error == UNREGISTERED_TEXT:

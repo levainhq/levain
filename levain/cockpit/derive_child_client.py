@@ -86,7 +86,10 @@ class ChildAnswer:
     ``error``, which says what happened. With none, ``status`` is the derive's status ("error" included), ``body`` and
     ``valid_until`` (epoch seconds, or None) are the loop's own, ``duration_ms`` is the child's measure of the derive, and
     ``error`` is the derive's error text when it has one. ``hung`` is True only for a ``timeout`` that killed the child at
-    this derive's own deadline (the panel is the one that did not come back)."""
+    this derive's own deadline (the panel is the one that did not come back). ``attached`` is the set of attachments held by the
+    child that gave this answer (the client's record of that child's ready frame, read as the answer is built), so a caller that
+    checks it checks the child that answered, not an earlier one. It is None on an answer with a ``failure`` and on one built
+    without it."""
 
     status: "str | None"
     body: Any
@@ -95,6 +98,7 @@ class ChildAnswer:
     failure: "str | None" = None
     error: "str | None" = None
     hung: bool = False
+    attached: "frozenset[str] | None" = None
 
 
 def backoff_s(failures: int, base_s: float, cap_s: float) -> float:
@@ -312,7 +316,8 @@ class DeriveChild:
             raise bad("error is not a string")
         self._failures = 0              # a child that answers is a healthy one, whatever the derive said
         self._not_before = 0.0
-        return ChildAnswer(status, frame.get("body"), None if valid_until is None else float(valid_until), ms, None, error)
+        return ChildAnswer(status, frame.get("body"), None if valid_until is None else float(valid_until), ms, None, error,
+                           attached=self._attached)
 
     # ---- the child's life
 
@@ -374,8 +379,10 @@ class DeriveChild:
         attached = frame.get("attached", [])
         if not isinstance(attached, list) or len(attached) > READY_ATTACHED_MAX or not all(isinstance(a, str) for a in attached):
             raise _Lost("bad_reply", "the child's ready frame lists its attachments badly")
-        self._panels = frozenset(panels)
+        # ``_attached`` first: ``knows`` reads ``_panels``, and a reader that finds the panel list must then find the attachment
+        # set, not the None that means no child has been ready
         self._attached = frozenset(attached)
+        self._panels = frozenset(panels)
         self._ready = True
 
     def _gone(self, proc: "subprocess.Popen[bytes]") -> bool:
