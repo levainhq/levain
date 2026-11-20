@@ -1313,9 +1313,15 @@
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
     // `err` marks a panel this read could not read (drawn as unavailable): a failure the stream reads again on its bounded schedule
+    // `at` is when the page last read the panel SUCCESSFULLY: now for a good body, the earlier one (or none) for a panel this read could not
+    // read, so the freshness line never ages an unavailable panel from the failed attempt
+    const heldPrev = window.LevainCockpitHeld || {}, readAt = Date.now();
     heldNext = Object.fromEntries(ids.map((id) => {
       const p = panels[id], unread = !!p && p.error !== undefined && p.status === undefined;
-      return [id, { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" }];
+      const rec = { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" };
+      const at = unread ? (heldPrev[id] && heldPrev[id].at) : readAt;
+      if (typeof at === "number" && at > 0) rec.at = at;
+      return [id, rec];
     }));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: held }, { elapsedMs: Date.now() - fetchedAt });
   }

@@ -411,3 +411,26 @@ def test_a_failed_panel_read_keeps_the_rows_on_the_page_and_a_good_one_clears_th
     assert before["text"] > 0 and before["note"] == 0, before
     assert failed["unavailable"] is False and failed["note"] == 1 and failed["text"] == before["text"], (before, failed)
     assert healed["note"] == 0 and healed["unavailable"] is False, healed
+
+
+
+@needs_browser
+def test_an_unavailable_panels_age_counts_from_its_last_good_read_or_says_never_read(tmp_path: Path) -> None:
+    """levain#170: a panel the whole draw could not read ages from the page's last GOOD read of it, never from the failed attempt ('read just now'); one never read says so.
+
+    The failure is the page's own (its panel fetch rejects, as the board's unavailable answer). Injected: the failing fetch, and for the never-read case the held read time removed."""
+    good = {"eval": "JSON.stringify({ probe: 'good', at: window.LevainCockpitHeld.work_board.at, now: Date.now() })"}
+    steps = [READY, LIVE, SETTLE, _run(STUB2), *QUIET, good, _sample(6000, "1"),
+             _sample(4500, "window.__panelFail = 'work_board'; window.LevainCockpitTransport.reload(); 1"),
+             _sample(1500, "delete window.LevainCockpitHeld.work_board.at; window.LevainCockpitTransport.reload(); 1"),
+             _sample(1500, "window.__panelFail = null; window.LevainCockpitTransport.reload(); 1")]
+    out = _open(tmp_path, steps)
+    (g,) = [v for v in _vals(out) if v.get("probe") == "good"]
+    _, aged, never, healed = _samples(out)
+    r = aged[-1]
+    assert r["state"] == "stale" and r["words"].endswith(" unavailable"), r
+    secs = int(r["age"].removeprefix("read ").removesuffix("s ago")) if r["age"].endswith("s ago") else None
+    assert secs is not None and secs >= 10, (r, g)                         # counted from the good read (10+ s after it), not from the failed attempt ('read just now')
+    n = never[-1]
+    assert n["state"] == "stale" and n["age"] == "never read" and "Updated" not in n["title"], n
+    assert healed[-1]["state"] == "live" and healed[-1]["age"] == "", healed[-1]
