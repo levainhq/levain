@@ -399,8 +399,12 @@ def test_the_stager_cuts_the_snapshot_under_the_signed_withhold_and_refuses_any_
     assert exc.value.name == "workspace-member" and os.listdir(tmpdir_) == []
 
 
-def test_a_launcher_that_cannot_prove_the_signed_role_builds_nothing(tmp_path, tmpdir_):
-    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None)         # no signed-role source
+@pytest.mark.parametrize("sources", [
+    {},                                                      # no signed-role source
+    {"signed_of": lambda occ: signed_for()},                 # revert: the `self._link_of is None` refusal in build_workspace
+], ids=["no-signed-role-source", "no-link-source"])
+def test_a_launcher_that_cannot_prove_the_signed_role_builds_nothing(tmp_path, tmpdir_, sources):
+    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None, **sources)
     with pytest.raises(C.WorkspaceNotSent) as exc:
         launcher.build_workspace(launch_of(member(op_repo(tmp_path))))
     assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("signed-role-unavailable")
@@ -415,14 +419,6 @@ def test_the_client_builds_under_the_withhold_its_signed_role_declares_and_a_loo
     with pytest.raises(C.WorkspaceNotSent) as exc:
         launcher.build_workspace(launch_of(member(repo)))                       # the install's member says nothing
     assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("withhold-loosened")
-    assert os.listdir(tmpdir_) == []
-
-
-def test_a_launcher_with_no_link_source_builds_nothing(tmp_path, tmpdir_):
-    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None, signed_of=lambda occ: signed_for())
-    with pytest.raises(C.WorkspaceNotSent) as exc:       # revert: the `self._link_of is None` refusal in build_workspace
-        launcher.build_workspace(launch_of(member(op_repo(tmp_path))))
-    assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("signed-role-unavailable")
     assert os.listdir(tmpdir_) == []
 
 
@@ -832,12 +828,15 @@ def _ordered_client(w, events, sock):
     return client
 
 
-def test_the_snapshot_is_built_before_the_proof_is_read_and_before_the_connection_is_opened(w, tmp_path):
-    repo = op_repo(tmp_path)
+@pytest.mark.parametrize("with_workspace", [True, False], ids=["a-workspace", "no-workspace"])
+def test_the_snapshot_is_built_before_the_proof_is_read_and_before_the_connection_is_opened(w, tmp_path,
+                                                                                            with_workspace):
+    # with no workspace the build step still runs first and has nothing to do
+    ws = member(op_repo(tmp_path)) if with_workspace else None
     events: list = []
     sock = w.env.connect()
     client = _ordered_client(w, events, sock)
-    child = client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, member(repo)))
+    child = client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, ws))
     assert events == ["build", "proof", "connect"] and child.session == "sess-1"
     child._conn.close()
     w.env.drain()
@@ -852,16 +851,6 @@ def test_a_build_refusal_happens_with_no_proof_read_and_no_connection_opened(w, 
         client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, member(repo)))
     assert exc.value.name == S.WORKSPACE_REFUSED and events == ["build"]
     sock.close()
-    w.env.drain()
-
-
-def test_a_launch_with_no_workspace_builds_nothing_before_it_connects(w):
-    events: list = []
-    sock = w.env.connect()
-    client = _ordered_client(w, events, sock)
-    child = client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, None))
-    assert events == ["build", "proof", "connect"]                            # the build step runs and has nothing to do
-    child._conn.close()
     w.env.drain()
 
 
