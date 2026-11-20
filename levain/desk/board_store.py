@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from levain.desk import board_chain, work_attach
 from levain.desk.board_chain import TIER_MAX, is_tier
@@ -49,7 +49,7 @@ from levain.desk.board_chain import TIER_MAX, is_tier
 __all__ = [
     "BoardError", "ITEMS_ENV", "ITEMS_NAME", "LOCK_NAME", "NO_STORE", "POINTER_NAME", "STORE_ID_NAME", "Target",
     "TWO_STORES", "add", "amend", "build_record", "canonical_bytes", "chain_prev", "decide", "next_id", "read_item_lines", "read_pointer",
-    "resolve_store", "is_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config", "check_tier", "tier_vocabulary", "TIER_MAX", "is_tier",
+    "resolve_store", "is_store", "store_lock", "use", "CONFIG_NAME", "read_config", "write_config", "check_tier", "check_tier_shape", "set_tiers", "tier_vocabulary", "TIER_MAX", "is_tier",
 ]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
@@ -961,8 +961,6 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
         raise BoardError(f"repo {repo!r} must match {REPO_RE.pattern}")
     if done_kind not in DONE_KINDS:
         raise BoardError(f"done_kind {done_kind!r} is not one of {DONE_KINDS}")
-    if tier is not None:
-        check_tier(target, repo, tier)
     fields = {"title": _one_line(title, "title"), "words": str(words or ""), "origin": _one_line(origin, "origin"),
               "done": _one_line(done, "done", required=False) or None, "done_kind": done_kind, "tier": tier,
               "depends_on": [parse_link(d) for d in depends]}
@@ -1000,6 +998,8 @@ def add(target: Target, repo, title, origin, by, words="", done=None, done_kind=
                         return r, False
                     raise BoardError(f"key {key!r} was already used for {r['id']} with payload hash {r.get('payload_hash')}; "
                                      f"this add carries {payload_hash}")
+        if tier is not None:             # only a record about to be written is judged, and here, under the lock that appends it
+            check_tier(target, repo, tier)
         source = _read_relay(relay, fields.get("words"))
         return _graded(target, build_record("add", next_id(recs, repo), by, {"repo": repo, **fields}, now, author=author, source=source), seal), True
 
@@ -1051,7 +1051,7 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
             out[k] = v
         elif k == "tier":
             if v is not None:
-                check_tier(target, str(item_id).partition("#")[0], v)
+                check_tier_shape(v)
             out[k] = v
         else:
             if not isinstance(v, list) or not all(isinstance(d, str) for d in v):
@@ -1064,6 +1064,8 @@ def amend(target: Target, item_id, why, by, fields: dict, now=None, *, author, s
 
     def build(recs):
         _require_known(recs, item_id)
+        if out.get("tier") is not None:          # the vocabulary of the repo the STORED item belongs to, read under the appending lock
+            check_tier(target, next(r["repo"] for r in recs if r.get("op") == "add" and r["id"] == item_id), out["tier"])
         if "done" in out or "done_kind" in out:         # judge the RESULTING row, only when this amend touches the pair
             now_kind, now_done = _current_done(recs, item_id)
             _require_path_done(out.get("done_kind", now_kind), out["done"] if "done" in out else now_done)
@@ -1169,12 +1171,16 @@ def tier_vocabulary(target: Target, repo: str) -> tuple[str, ...] | None:
     return declared.get(repo)
 
 
-def check_tier(target: Target, repo: str, tier: Any) -> None:
-    """Refuse a tier that is not a well-shaped token, or is outside the vocabulary the repo declared. Writes only: a stored tier
-    is never judged here."""
+def check_tier_shape(tier: Any) -> None:
     if not is_tier(tier):
         raise BoardError(f"tier {tier!r} must be one short token: lowercase letters, digits, '.', '_' or '-', starting with a "
                          f"letter or digit, at most {TIER_MAX} characters")
+
+
+def check_tier(target: Target, repo: str, tier: Any) -> None:
+    """Refuse a tier that is not a well-shaped token, or is outside the vocabulary the repo declared. Writes only: a stored tier
+    is never judged here. The writers call it inside the locked build, so the config it reads is the one in force at the append."""
+    check_tier_shape(tier)
     declared = tier_vocabulary(target, repo)
     if declared is not None and tier not in declared:
         raise BoardError(f"tier {tier!r} is not one of the tiers {repo!r} declares: {', '.join(declared)}")
@@ -1189,7 +1195,7 @@ def _tiers_doc(tiers: Any) -> dict[str, list[str]]:
     for repo, names in tiers.items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
             raise BoardError(f"the board config's tiers name a repo {repo!r} that must match {REPO_RE.pattern}")
-        if not isinstance(names, list) or not names or not all(is_tier(n) for n in names):
+        if not isinstance(names, (list, tuple)) or not names or not all(is_tier(n) for n in names):
             raise BoardError(f"the board config's tiers for {repo!r} must be a non-empty list of well-shaped tier tokens "
                              f"(lowercase letters, digits, '.', '_', '-', at most {TIER_MAX} characters)")
         out[repo] = list(dict.fromkeys(names))
@@ -1211,10 +1217,13 @@ def _config_doc(producers: Any, no_land_waiter: Any, tiers: Any = None) -> dict[
     return doc
 
 
+_ABSENT = object()
+
+
 def _tiers_lenient(raw: Any) -> tuple[dict[str, tuple[str, ...]], dict[str | None, str]]:
     """A config's ``tiers`` as READ: the repos whose list is well-formed, and the problem of each that is not (the key None: the
     whole value is not a mapping). A bad value is never a refusal on a read: it declares nothing."""
-    if not raw:
+    if raw is _ABSENT or (isinstance(raw, Mapping) and not raw):      # only no key, or an empty mapping, declares nothing
         return {}, {}
     if not isinstance(raw, Mapping):
         return {}, {None: "tiers must map a repo name to its list of tiers"}
@@ -1251,7 +1260,7 @@ def _config_file(store_dir: Path | str) -> dict[str, Any] | None:
 
 def _tiers_state(store_dir: Path | str) -> tuple[dict[str, tuple[str, ...]], dict[str | None, str]]:
     doc = _config_file(store_dir)
-    return _tiers_lenient(None if doc is None else doc.get("tiers"))
+    return _tiers_lenient(_ABSENT if doc is None else doc.get("tiers", _ABSENT))
 
 
 def read_config(store_dir: Path | str) -> dict[str, Any]:
@@ -1265,41 +1274,95 @@ def read_config(store_dir: Path | str) -> dict[str, Any]:
         clean = _config_doc(doc["producers"], doc["no_land_waiter"])
     except BoardError as exc:
         raise BoardError(f"the board config {Path(store_dir) / CONFIG_NAME} cannot be used: {exc}") from None
-    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"], "tiers": _tiers_lenient(doc.get("tiers"))[0]}
+    return {"producers": clean["producers"], "no_land_waiter": clean["no_land_waiter"], "tiers": _tiers_lenient(doc.get("tiers", _ABSENT))[0]}
+
+
+def _publish_config(store_dir: Path, payload: bytes) -> bool:
+    """Replace the board config with ``payload``, atomically, the store lock already held. Returns whether it changed."""
+    target = store_dir / CONFIG_NAME
+    try:
+        if target.read_bytes() == payload:
+            return False
+    except OSError:
+        pass
+    tmp = store_dir / f".{CONFIG_NAME}.{os.getpid()}.{secrets.token_hex(4)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        try:
+            _write_bytes(fd, payload)
+        finally:
+            os.close(fd)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir_or_warn(store_dir, CONFIG_NAME)
+    return True
+
+
+def _raw_config(store_dir: Path) -> dict[str, Any] | None:
+    """The config file as a JSON object exactly as stored, or None when there is none or it is not one."""
+    try:
+        doc = json.loads((store_dir / CONFIG_NAME).read_bytes().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def write_config(store_dir: Path | str, producers: Any, no_land_waiter: Any, tiers: Any = None) -> bool:
     """Write the board config atomically (a temp file in the store dir, fsynced, renamed, directory fsynced). Returns whether the
-    config changed. The store dir is locked while it is written."""
+    config changed. The store dir is locked while it is written. ``tiers`` (any sequence per repo) replaces the declaration; left
+    None, the ``tiers`` already in the file are carried through exactly as stored, read under the same lock: this writer
+    never drops or rewrites a declaration, and a refused producer list (raised before the lock) leaves the file untouched."""
     store_dir = Path(store_dir)
     doc = _config_doc(producers, no_land_waiter, tiers)
-    payload = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
     try:
         with store_lock(store_dir, exclusive=True, setup=True):
-            target = store_dir / CONFIG_NAME
-            try:
-                if target.read_bytes() == payload:
-                    return False
-            except OSError:
-                pass
-            tmp = store_dir / f".{CONFIG_NAME}.{os.getpid()}.{secrets.token_hex(4)}"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            try:
-                try:
-                    _write_bytes(fd, payload)
-                finally:
-                    os.close(fd)
-                os.replace(tmp, target)
-            except OSError:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            _fsync_dir_or_warn(store_dir, CONFIG_NAME)
+            if tiers is None:
+                held = _raw_config(store_dir)
+                if held is not None and "tiers" in held:
+                    doc["tiers"] = held["tiers"]
+            return _publish_config(store_dir, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
     except OSError as exc:
         raise BoardError(f"cannot write the board config in {store_dir}: {exc}") from None
-    return True
+
+
+def set_tiers(store_dir: Path | str, repo: str, names: Sequence[str]) -> bool:
+    """Declare ``names`` as the tiers ``repo`` may use (empty: clear its declaration). The whole read-modify-write is one
+    exclusive store lock, and it touches ONLY ``tiers[repo]``: every other key of the config, and every other repo's entry (a
+    malformed one too), is carried through exactly as stored. Refuses a name that is not a well-shaped tier or is repeated, and a
+    ``tiers`` root that is not a mapping (it is not rewritten: fix board.json). Returns whether the file changed."""
+    store_dir = Path(store_dir)
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+        raise BoardError(f"repo {repo!r} must match {REPO_RE.pattern}")
+    names = list(names)
+    for n in names:
+        check_tier_shape(n)
+    if len(set(names)) != len(names):
+        raise BoardError(f"tiers for {repo!r} name a tier twice: {', '.join(names)}")
+    try:
+        with store_lock(store_dir, exclusive=True, setup=True):
+            doc = _config_file(store_dir)
+            if doc is None:
+                doc = _config_doc([], False)
+            held = doc.get("tiers", {})
+            if not isinstance(held, dict):
+                raise BoardError(f"the board config {store_dir / CONFIG_NAME} has a tiers value that is not a mapping: fix it by hand")
+            held = dict(held)
+            if names:
+                held[repo] = names
+            else:
+                held.pop(repo, None)
+            if held:
+                doc["tiers"] = held
+            else:
+                doc.pop("tiers", None)
+            return _publish_config(store_dir, (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
+    except OSError as exc:
+        raise BoardError(f"cannot write the board config in {store_dir}: {exc}") from None
 
 
 def use(directory: Path | str, environ: Mapping[str, str] | None = None,

@@ -1107,9 +1107,13 @@ def test_a_tier_is_judged_by_shape_when_no_vocabulary_is_declared(home, tmp_path
     assert rc == 2 and "must be one short token" in err
 
 
+def _conf(d):
+    return json.loads((d / bs.CONFIG_NAME).read_text("utf-8"))
+
+
 def test_a_declared_vocabulary_refuses_a_tier_outside_it_naming_the_list(home, tmp_path, capsys):
-    rc, out, err = run(capsys, "use", str(tmp_path / "store"), "--tiers", "levain=light,heavy", "--tiers", "other=x")
-    assert rc == 0 and "tiers levain: light, heavy" in out, err
+    use(capsys, tmp_path / "store")
+    assert run(capsys, "tiers", "levain", "light", "heavy")[0] == 0 and run(capsys, "tiers", "other", "x")[0] == 0
     assert _add(capsys, "light")[0] == 0
     rc, _, err = _add(capsys, "sonnet")
     assert rc == 2 and "light, heavy" in err
@@ -1117,23 +1121,45 @@ def test_a_declared_vocabulary_refuses_a_tier_outside_it_naming_the_list(home, t
     assert rc == 2 and "light, heavy" in err
     assert _add(capsys, "sonnet", repo="unlisted")[0] == 0          # a repo that declares nothing takes any well-shaped tier
     assert _add(capsys, "x", repo="other")[0] == 0 and _add(capsys, "y", repo="other")[0] == 2
-    rc, _, err = run(capsys, "use", str(tmp_path / "store"), "--tiers", "levain=Bad")
-    assert rc == 2 and "well-shaped" in err
+    rc, _, err = run(capsys, "tiers", "levain", "Bad")
+    assert rc == 2 and "must be one short token" in err
+    rc, _, err = run(capsys, "tiers", "levain", "a", "a")
+    assert rc == 2 and "twice" in err
 
 
-def test_use_keeps_a_declaration_it_does_not_name_replaces_and_clears(home, tmp_path, capsys):
-    d = tmp_path / "store"
-    run(capsys, "use", str(d), "--tiers", "levain=light,heavy", "--tiers", "other=x")
-    assert run(capsys, "use", str(d))[0] == 0                       # flagless: both declarations stay
-    assert bs.read_config(d)["tiers"] == {"levain": ("light", "heavy"), "other": ("x",)}
-    run(capsys, "use", str(d), "--tiers", "levain=mid")             # replaces that repo's list only
-    assert bs.read_config(d)["tiers"] == {"levain": ("mid",), "other": ("x",)}
-    run(capsys, "use", str(d), "--tiers", "other=")                 # an empty list clears that repo
-    assert bs.read_config(d)["tiers"] == {"levain": ("mid",)}
-    assert _add(capsys, "sonnet")[0] == 2 and _add(capsys, "mid")[0] == 0
+def test_board_tiers_replaces_and_clears_one_repo_and_carries_everything_else_raw(home, tmp_path, capsys):
+    d = use(capsys, tmp_path / "store")
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": ["ci"], "no_land_waiter": True, "extra": [1],
+                                                "tiers": {"keep": ["a"], "odd": "not a list"}}))
+    assert run(capsys, "tiers", "levain", "light", "heavy")[0] == 0
+    assert _conf(d) == {"config_v": 1, "producers": ["ci"], "no_land_waiter": True, "extra": [1],
+                        "tiers": {"keep": ["a"], "odd": "not a list", "levain": ["light", "heavy"]}}
+    assert run(capsys, "tiers", "levain", "mid")[0] == 0            # replaces
+    assert _conf(d)["tiers"]["levain"] == ["mid"]
+    assert run(capsys, "tiers", "levain")[0] == 0                   # no names clears
+    assert _conf(d)["tiers"] == {"keep": ["a"], "odd": "not a list"}
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": []}))
+    rc, _, err = run(capsys, "tiers", "levain", "x")                # a malformed root is never rewritten
+    assert rc == 2 and "fix it by hand" in err and _conf(d)["tiers"] == []
 
 
-@pytest.mark.parametrize("bad", ["light", {"levain": "light"}, {"levain": ["Bad Tier"]}, {"levain": []}])
+def test_use_never_drops_or_rewrites_the_declared_tiers(home, tmp_path, capsys):
+    d = use(capsys, tmp_path / "store")
+    run(capsys, "tiers", "levain", "light", "heavy")
+    before = _conf(d)["tiers"]
+    assert run(capsys, "use", str(d))[0] == 0                       # a flagless re-run
+    assert _conf(d)["tiers"] == before
+    assert run(capsys, "use", str(d), "--producer", "ci", "--no-land-waiter")[0] == 0     # a producer fix
+    assert _conf(d)["tiers"] == before and _conf(d)["producers"] == ["ci"]
+    from levain.desk import board_producers as bp
+    assert run(capsys, "use", str(d), "--producer", bp.NATIVE_PRODUCER)[0] == 2           # a refused producer list changes nothing
+    assert _conf(d)["tiers"] == before and _conf(d)["producers"] == ["ci"]
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": {"levain": "bad"}}))
+    assert run(capsys, "use", str(d), "--producer", "ci")[0] == 0   # a malformed declaration survives use, as stored
+    assert _conf(d)["tiers"] == {"levain": "bad"}
+
+
+@pytest.mark.parametrize("bad", ["light", [], None, False, 0, "", {"levain": "light"}, {"levain": ["Bad Tier"]}, {"levain": []}])
 def test_a_malformed_tiers_value_reads_as_none_declared_and_refuses_only_a_tier_write(home, tmp_path, capsys, bad):
     d = use(capsys, tmp_path / "store")
     assert _add(capsys, "sonnet")[0] == 0
@@ -1142,4 +1168,30 @@ def test_a_malformed_tiers_value_reads_as_none_declared_and_refuses_only_a_tier_
     assert run(capsys, "add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b")[0] == 0
     rc, _, err = _add(capsys, "light")
     assert rc == 2 and bs.CONFIG_NAME in err and "cannot be used" in err
-    assert _add(capsys, "light", repo="other")[0] == (2 if not isinstance(bad, dict) else 0)
+    assert _add(capsys, "light", repo="other")[0] == (0 if isinstance(bad, dict) else 2)
+
+
+def test_an_empty_mapping_or_no_key_declares_nothing(home, tmp_path, capsys):
+    d = use(capsys, tmp_path / "store")
+    (d / bs.CONFIG_NAME).write_text(json.dumps({"config_v": 1, "producers": [], "no_land_waiter": False, "tiers": {}}))
+    assert _add(capsys, "light")[0] == 0
+
+
+def test_a_retried_add_with_its_key_returns_the_id_before_the_vocabulary_is_asked(home, tmp_path, capsys):
+    use(capsys, tmp_path / "store")
+    base = ["add", "--repo", "levain", "--title", "t", "--origin", "o", "--by", "b", "--tier", "light", "--key", "k1",
+            "--payload-hash", HASH_A]
+    rc, first, _ = run(capsys, *base)
+    assert rc == 0
+    assert run(capsys, "tiers", "levain", "heavy")[0] == 0          # the vocabulary moved since
+    rc, again, err = run(capsys, *base)
+    assert rc == 0 and again == first, err
+
+
+def test_the_config_read_back_can_be_written_back(home, tmp_path, capsys):
+    d = use(capsys, tmp_path / "store")
+    run(capsys, "tiers", "levain", "light", "heavy")
+    conf = bs.read_config(d)
+    assert isinstance(conf["tiers"]["levain"], tuple)
+    assert bs.write_config(d, conf["producers"], conf["no_land_waiter"], conf["tiers"]) is False
+    assert _conf(d)["tiers"] == {"levain": ["light", "heavy"]}

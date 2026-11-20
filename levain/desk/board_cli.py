@@ -48,7 +48,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 from levain.desk import board_author as ba
 from levain.desk import board_evidence as be
@@ -136,7 +136,7 @@ def register(subparsers: Any) -> None:
 
     items_help = f"An explicit store (its items file or its directory); it must be this install's store. Default: ${ITEMS_ENV}."
     tier_help = ("A short token (lowercase letters, digits, '.', '_', '-'). If the repo declares its tiers "
-                 "(`board use --tiers REPO=a,b`), one of those.")
+                 "(`board tiers REPO a b`), one of those.")
     a = sub.add_parser("add", description="Capture an item; prints its id.")
     a.add_argument("--repo", required=True)
     a.add_argument("--title", required=True)
@@ -193,16 +193,20 @@ def register(subparsers: Any) -> None:
                         "the default, so `use` with none clears it.")
     u.add_argument("--no-land-waiter", dest="no_land_waiter", action="store_true",
                    help="This install runs no land waiter; saved in the board config (left off, it is saved as the default).")
-    u.add_argument("--tiers", dest="tiers", action="append", default=[], metavar="REPO=T1,T2",
-                   help="The tiers REPO may use (repeatable; none declared means any well-shaped tier); saved in the board config. "
-                        "Unlike --producer, a re-run keeps every declaration it does not name: --tiers REPO=a,b replaces that "
-                        "repo's list and --tiers REPO= clears it.")
     author_args(u)
     u.set_defaults(func=run_use)
+    t = sub.add_parser("tiers", description="Declare the tiers REPO may use (`board tiers levain light heavy`); with no names, clear "
+                                           "REPO's declaration (any well-shaped tier is then accepted). Replaces that repo's list only: "
+                                           "no other repo's entry and no other board config key is touched.")
+    t.add_argument("repo")
+    t.add_argument("names", nargs="*", metavar="NAME")
+    t.add_argument("--items", type=str, metavar="PATH", help=items_help)
+    t.set_defaults(func=run_tiers)
     # the desk's door opens these, each where it is defined (install.DESK_BOARD_VERBS is the same list, for its allow rules)
-    from levain.desk.door import door_ok_author
+    from levain.desk.door import door_ok_author, not_door
 
     door_ok_author(p, a, m, d, u)
+    not_door(t)       # the operator's policy: not a verb the desk's door opens
     br.register_cli(sub, author_args, _author, items_help, _seal, source_args, _relay)
     from levain.desk import board_context       # imported here: board_context reads this module's helpers
     board_context.register(sub)
@@ -511,31 +515,17 @@ def run_decide(args: argparse.Namespace) -> int:
     return 0
 
 
-def _tiers_flags(specs: Sequence[str]) -> dict[str, list[str]]:
-    """``--tiers REPO=a,b`` (repeatable) as ``{repo: [a, b]}``; the same repo named twice adds to its list, and ``REPO=`` is an
-    empty list (the repo's declaration is cleared)."""
-    out: dict[str, list[str]] = {}
-    for spec in specs:
-        repo, eq, names = spec.partition("=")
-        if not eq or not repo:
-            raise bs.BoardError(f"--tiers {spec!r} must read REPO=tier,tier (REPO= alone clears that repo's declaration)")
-        out.setdefault(repo, []).extend([n.strip() for n in names.split(",")] if names.strip() else [])
-    return out
-
-
-def _merged_tiers(store_dir: Path | str, flags: dict[str, list[str]]) -> dict[str, list[str]]:
-    """The declared tiers ``use`` writes: the ones already saved, with each repo named by ``--tiers`` replaced (an empty list
-    removes it). A saved config that cannot be read keeps nothing, as the rest of it is replaced by the default."""
+def run_tiers(args: argparse.Namespace) -> int:
     try:
-        kept = {r: list(v) for r, v in bs.read_config(store_dir)["tiers"].items()}
-    except bs.BoardError:
-        kept = {}
-    for repo, names in flags.items():
-        if names:
-            kept[repo] = names
-        else:
-            kept.pop(repo, None)
-    return kept
+        target = bs.resolve_store(args.items)
+        if not bs.is_store(target):
+            raise bs.BoardError("board tiers needs this install's store (levain board use <dir>), not a standalone items file")
+        changed = bs.set_tiers(target.store_dir, args.repo, args.names)
+    except bs.BoardError as exc:
+        return _refused(exc)
+    print(f"{args.repo}: {', '.join(args.names) if args.names else 'no declaration (any well-shaped tier)'}"
+          f"{'' if changed else ' (unchanged)'}")
+    return 0
 
 
 def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
@@ -543,9 +533,9 @@ def _write_use_config(args: argparse.Namespace) -> Callable[[Path], bool]:
     publishes the pointer or tombstones focus.json. With no flag and no config file there is nothing to write; with no flag and
     a file, the file is replaced by the default, which clears it (levain 29: ``use`` writes exactly its flags)."""
     def write(store_dir: Path) -> bool:
-        if not (args.producers or args.no_land_waiter or args.tiers or (Path(store_dir) / bs.CONFIG_NAME).exists()):
+        if not (args.producers or args.no_land_waiter or (Path(store_dir) / bs.CONFIG_NAME).exists()):
             return False
-        return bs.write_config(store_dir, args.producers, args.no_land_waiter, _merged_tiers(store_dir, _tiers_flags(args.tiers)))
+        return bs.write_config(store_dir, args.producers, args.no_land_waiter)
     return write
 
 
