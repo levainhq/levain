@@ -200,6 +200,42 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
 """
 
 
+# levain#168 fix round: a zone card's " (N)" tail lives in a sibling .ck-count pill (repaint both, never re-add the tail); a focus-view
+# copy has no .phead h2 to repaint, so a title change there still reloads
+DRIVER_PILL = DRIVER_CHROME_TEXT[:DRIVER_CHROME_TEXT.index("(async () => {")] + r"""
+Object.defineProperty(N.prototype, "nextElementSibling", { get() { if (!this.parent) return null; const k = this.parent.kids; return k[k.indexOf(this) + 1] || null; } });
+(async () => {
+  const mkc = (t, n) => Object.assign(mk(t, "ok", "2026-10-11T12:00:00+00:00"), { count: n });
+  const first = mkc("Tray (2)", 2);
+  const view = V.fromManifest({ manifest: manifest(first), panels: { p: first } });
+  const entry = view.layout.find((e) => e.id === "p");
+  const p = new N("div"); p.live = true; p.className = "panel";
+  const head = new N("div"); head.className = "phead"; const h2 = new N("h2"); h2.text = "Tray";
+  const pill = new N("span"); pill.className = "ck-count"; pill.text = "2"; pill.hidden = false;
+  head.appendChild(h2); head.appendChild(pill); p.appendChild(head);
+  globalThis.LevainDashboard = { renderPanel: () => new N("div"), measureClauses() {}, measureOverflow() {}, setRichText: (n, t) => { n.textContent = t; } };
+  const s = K.fill(p, view.extra_panels.p, { rows: () => {}, entry });
+  const host = new N("div"); host.className = "pbody"; host.appendChild(s.body); host.live = true; s.body.parent = host; host.kids = [s.body];
+  p.appendChild(host); s.p = p;
+  globalThis.LevainCockpitTransport = { readJson: async () => globalThis.__next };
+  globalThis.__next = mkc("Tray (3)", 3);
+  const r = await K.refetchPanel("p");
+  ok(r === "applied", "a count 2 -> 3 on a card with a pill answers applied: " + r);
+  ok(h2.textContent === "Tray", "the heading keeps no count tail: " + h2.textContent);
+  ok(pill.textContent === "3", "the pill shows the new count: " + pill.textContent);
+  ok(pill.hidden === false, "the pill is shown");
+  globalThis.__next = mkc("Tray (0)", 0);
+  ok(await K.refetchPanel("p") === "applied", "a count to 0 applies");
+  ok(h2.textContent === "Tray" && pill.textContent === "0" && pill.hidden === true, "count 0 hides the pill: " + h2.textContent + "/" + pill.textContent + "/" + pill.hidden);
+  // a modal copy: its chrome is not the panel's own head, so a changed title cannot be repainted in place
+  s.modal = true; head.remove(); s.title = "Tray (0)"; s.banner = [];
+  globalThis.__next = mkc("Tray (4)", 4);
+  ok(await K.refetchPanel("p") === false, "a modal copy whose title digits change declines (full reload)");
+  process.exit(failed ? 1 : 0);
+})().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
+"""
+
+
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 def test_an_age_tick_or_a_count_in_a_title_repaints_in_place(tmp_path: Path) -> None:
     drv = tmp_path / "chrome_text_driver.js"
@@ -221,3 +257,11 @@ def test_the_second_mount_path_is_gone() -> None:
     body = js[js.index("async function refetchPanel"):js.index("// ---- the modes and the keys ----")]
     assert "renderPanel" not in body and "replaceWith" not in body and "keepFocus" not in body and "hoverPanel" not in body
     assert "finalizeNode" not in (WEB / "dashboard_core.js").read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_count_pill_repaints_and_a_modal_copy_reloads(tmp_path: Path) -> None:
+    drv = tmp_path / "pill_driver.js"
+    drv.write_text(DRIVER_PILL, encoding="utf-8")
+    r = subprocess.run([NODE, str(drv), str(WEB / "cockpit_view.js")], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
