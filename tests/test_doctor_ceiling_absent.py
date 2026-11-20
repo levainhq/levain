@@ -10,6 +10,9 @@ from pathlib import Path
 from levain import doctor
 from levain.slot import layout
 from levain.slot import tickets as T
+from tests.test_routemaps import st  # noqa: F401
+from tests.test_slot_p7a1_passthrough_ticket import pt_args
+from tests.test_tickets import Clock, Rig, ticket_of
 
 ME = os.getuid()
 DOC = {"format": T.CEILING_FORMAT, "max_reserved_microdollars_per_run": 1000000,
@@ -20,6 +23,7 @@ def _store(tmp: Path) -> Path:
     store = tmp / "store"
     (store / "policy").mkdir(parents=True)
     os.chmod(store / "policy", 0o755)
+    (store / "policy" / layout.operator_record_path("linux").name).write_text("{}")   # the install's last write
     return store
 
 
@@ -44,6 +48,57 @@ def test_the_hinted_document_is_one_the_ticket_store_accepts(tmp_path):
     start = hint.index("{")
     doc = hint[start:hint.index("}", start) + 1]
     T.parse_ceiling(doc.encode())      # raises Refused when set-ceiling would refuse it
+
+
+def _hinted_doc(hint: str) -> bytes:
+    start = hint.index("{")
+    return hint[start:hint.index("}", start) + 1].encode()
+
+
+def _passthrough(store: Path) -> None:
+    p = store / "policy" / layout.POLICY_DISPATCH_AUTH
+    p.write_bytes(b"passthrough\n")
+    os.chmod(p, 0o644)
+
+
+def test_a_passthrough_install_hints_a_slash_two_document(tmp_path):
+    store = _store(tmp_path)
+    _passthrough(store)
+    hint = _rows(store)[0].hint or ""
+    c = T.parse_ceiling(_hinted_doc(hint))
+    assert c.max_calls_per_run is not None and T.CEILING_FORMAT_2 in hint
+
+
+def test_a_brokered_install_keeps_the_slash_one_document_and_says_a_subscription_run_needs_two(tmp_path):
+    hint = _rows(_store(tmp_path))[0].hint or ""
+    assert T.parse_ceiling(_hinted_doc(hint)).max_calls_per_run is None
+    assert "/2" in hint
+
+
+def test_the_passthrough_hint_passes_the_check_a_passthrough_mint_applies(tmp_path, st):
+    store = _store(tmp_path)
+    _passthrough(store)
+    doc = _hinted_doc(_rows(store)[0].hint or "")
+    (st.L / "policy").mkdir(exist_ok=True)
+    (st.L / "policy" / "dispatch_ceiling").write_bytes(doc)
+    (st.L / "policy" / "dispatch_ceiling").chmod(0o644)
+    ticket_of(Rig(st, Clock()).ask("RUN-TICKET-MINT", **pt_args()))   # a /1 ceiling refuses ceiling-lacks-subscription
+
+
+def test_a_retained_post_undo_store_gives_no_row(tmp_path):
+    store = _store(tmp_path)
+    (store / "policy" / layout.operator_record_path("linux").name).unlink()
+    assert _rows(store) == []
+
+
+def test_an_unreadable_ceiling_row_keeps_the_hint(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+
+    def boom(*a, **k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(T, "read_ceiling", boom)
+    (row,) = _rows(store)
+    assert "set-ceiling" in (row.hint or "")
 
 
 def test_doctor_never_writes_the_ceiling(tmp_path):

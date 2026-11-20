@@ -7,13 +7,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from levain import doctor
 
-_PY = "/Users/phillipclapham/Briefcase/levain/.venv/bin/python3"
+_PY = sys.executable
 _REPO = str(Path(__file__).resolve().parent.parent)
 _SCRIPT = ("import sys; sys.path.insert(0, sys.argv[1]); from levain import doctor; "
            "print('row' if doctor._check_tls_trust(version=(3, 13), prefix='/x', platform='linux') else 'none')")
@@ -79,6 +80,66 @@ def test_the_real_probe_answers_the_two_facts():
     assert isinstance(got["x509_ca"], int)
 
 
+class _Stub:
+    def __init__(self, x509_ca):
+        self._n = x509_ca
+
+    def cert_store_stats(self):
+        return {"x509_ca": self._n}
+
+
+def _stub_ssl(monkeypatch, x509_ca, capath):
+    import collections
+    import ssl
+    paths = collections.namedtuple("P", "capath")(capath)
+    monkeypatch.setattr(ssl, "create_default_context", lambda: _Stub(x509_ca))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: paths)
+
+
+def test_a_capath_list_is_probed_segment_by_segment(tmp_path, monkeypatch):
+    empty, full = tmp_path / "a", tmp_path / "b"
+    empty.mkdir()
+    full.mkdir()
+    (full / "x.pem").write_text("x")
+    _stub_ssl(monkeypatch, 0, os.pathsep.join([str(empty), str(full)]))
+    assert doctor._tls_store_probe()["capath_readable"] is True
+    _stub_ssl(monkeypatch, 0, os.pathsep.join([str(empty), str(tmp_path / "none")]))
+    assert doctor._tls_store_probe()["capath_readable"] is False
+
+
+def test_the_capath_scan_is_closed_and_skipped_when_certificates_loaded(tmp_path, monkeypatch):
+    (tmp_path / "x.pem").write_text("x")
+    closed = []
+    real = os.scandir
+
+    class _It:
+        def __init__(self, path):
+            self._it = real(path)
+
+        def __enter__(self):
+            return self._it
+
+        def __exit__(self, *exc):
+            closed.append(True)
+            self._it.close()
+
+    monkeypatch.setattr(os, "scandir", _It)
+    _stub_ssl(monkeypatch, 0, str(tmp_path))
+    assert doctor._tls_store_probe()["capath_readable"] is True and closed == [True]
+    closed.clear()
+    _stub_ssl(monkeypatch, 5, str(tmp_path))
+    doctor._tls_store_probe()
+    assert closed == []
+
+
+def test_an_unreadable_capath_is_not_a_store(tmp_path, monkeypatch):
+    def boom(path):
+        raise PermissionError("denied")
+    monkeypatch.setattr(os, "scandir", boom)
+    _stub_ssl(monkeypatch, 0, str(tmp_path))
+    assert doctor._tls_store_probe()["capath_readable"] is False
+
+
 def _fresh(extra: dict) -> str:
     # the real probe in a fresh interpreter: the default context reads SSL_CERT_FILE / SSL_CERT_DIR when created
     env = {k: v for k, v in os.environ.items() if k not in ("SSL_CERT_FILE", "SSL_CERT_DIR")}
@@ -88,7 +149,6 @@ def _fresh(extra: dict) -> str:
     return out.stdout.strip().splitlines()[-1]
 
 
-@pytest.mark.skipif(not os.path.exists(_PY), reason="the levain venv interpreter is not here")
 def test_an_empty_cafile_and_empty_capath_fire_the_row_in_a_fresh_interpreter(tmp_path):
     empty_file = tmp_path / "empty.pem"
     empty_file.write_text("")
@@ -97,7 +157,6 @@ def test_an_empty_cafile_and_empty_capath_fire_the_row_in_a_fresh_interpreter(tm
     assert _fresh({"SSL_CERT_FILE": str(empty_file), "SSL_CERT_DIR": str(empty_dir)}) == "row"
 
 
-@pytest.mark.skipif(not os.path.exists(_PY), reason="the levain venv interpreter is not here")
 def test_the_system_default_store_leaves_no_row_in_a_fresh_interpreter():
     count = subprocess.run([_PY, "-I", "-c", "import ssl; print(ssl.create_default_context().cert_store_stats()['x509_ca'])"],
                            capture_output=True, text=True, timeout=60)

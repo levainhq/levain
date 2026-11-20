@@ -2053,11 +2053,21 @@ def _tls_store_probe() -> dict:
     cannot show)."""
     import ssl
 
-    stats = ssl.create_default_context().cert_store_stats()
-    capath = ssl.get_default_verify_paths().capath
-    return {"x509_ca": int(stats.get("x509_ca", 0)),
-            "capath_readable": bool(capath) and os.path.isdir(capath) and os.access(capath, os.R_OK)
-                               and any(True for _ in os.scandir(capath))}
+    x509_ca = int(ssl.create_default_context().cert_store_stats().get("x509_ca", 0))
+    readable = False
+    if x509_ca == 0:
+        # SSL_CERT_DIR may name several directories, joined by os.pathsep; the default context takes each one
+        capath = ssl.get_default_verify_paths().capath or ""
+        for part in (p for p in capath.split(os.pathsep) if p):
+            try:
+                if os.path.isdir(part) and os.access(part, os.R_OK):
+                    with os.scandir(part) as it:
+                        if any(True for _ in it):
+                            readable = True
+                            break
+            except OSError:
+                continue
+    return {"x509_ca": x509_ca, "capath_readable": readable}
 
 
 def _check_tls_trust(*, probe: Any = None, version: tuple | None = None, prefix: str | None = None,
@@ -2089,15 +2099,25 @@ def _check_tls_trust(*, probe: Any = None, version: tuple | None = None, prefix:
     return [CheckResult(name, True, detail, hint, warn=True)]
 
 
-def _dispatch_ceiling_hint(host: str) -> str:
+def _dispatch_ceiling_hint(host: str, passthrough: bool = False) -> str:
+    """The remedy text. ``passthrough``: the run server's brokered launcher is off, so every dispatch mint is a
+    subscription one, and a mint of that kind refuses a ``/1`` ceiling (it needs the ``/2`` subscription maxima)."""
     from levain.slot import layout
     from levain.slot import tickets as T
 
-    doc = (f'{{"format":"{T.CEILING_FORMAT}","max_reserved_microdollars_per_run":1000000,'
-           '"max_open_tickets":4,"max_runs_per_day":50}')
-    return (f"The operator sets it, once, with the install helper; nothing writes it for you. You pick the three "
-            f"figures: the example values are not a recommendation, and the per-run figure is in micro-dollars. Edit them and run: echo '{doc}' | sudo "
-            f"{layout.install_helper_path(host)} set-ceiling")   # type: ignore[arg-type]
+    base = (f'"max_reserved_microdollars_per_run":1000000,"max_open_tickets":4,"max_runs_per_day":50')
+    if passthrough:
+        doc = (f'{{"format":"{T.CEILING_FORMAT_2}",{base},"max_calls_per_run":1000,'
+               '"max_tunnel_bytes_per_run":2147483648,"max_deadline_s":86400}')
+        figures = "the six figures"
+    else:
+        doc = f'{{"format":"{T.CEILING_FORMAT}",{base}}}'
+        figures = "the three figures"
+    note = "" if passthrough else (" A subscription (passthrough) run needs the /2 format, which adds three "
+                                   "per-run subscription maxima.")
+    return (f"The operator sets it, once, with the install helper; nothing writes it for you. You pick {figures}: "
+            f"the example values are not a recommendation, and the per-run dollar figure is in micro-dollars.{note} "
+            f"Edit them and run: echo '{doc}' | sudo {layout.install_helper_path(host)} set-ceiling")   # type: ignore[arg-type]
 
 
 def _check_dispatch_ceiling(*, host: str | None = None, store: Path | None = None, owner: int = 0) -> list[CheckResult]:
@@ -2114,16 +2134,20 @@ def _check_dispatch_ceiling(*, host: str | None = None, store: Path | None = Non
     if host is None:
         host = "darwin" if sys.platform == "darwin" else "linux"
     store = store if store is not None else layout.STORE.get(host)
-    if store is None or not (store / "policy").is_dir():
+    # "set up" is the operator record, which setup writes last and undo removes; the policy directory outlives undo
+    if store is None or not (store / "policy" / layout.operator_record_path(host).name).is_file():
         return []
     path = store / "policy" / layout.policy_dispatch_ceiling_path(host).name
+    from levain.slot.services.dispatch_run import read_dispatch_auth
+    hint = _dispatch_ceiling_hint(
+        host, read_dispatch_auth(store / "policy" / layout.POLICY_DISPATCH_AUTH, owner)[0] == "passthrough")
     try:
         T.read_ceiling(path, owner)
     except Refused as exc:
         return [CheckResult(name, True, f"{path} is absent or unusable ({exc.detail}): every mint refuses "
-                            "ticket-ceiling:file until it is set", _dispatch_ceiling_hint(host), warn=True)]
+                            "ticket-ceiling:file until it is set", hint, warn=True)]
     except OSError as exc:
-        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", warn=True)]
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})", hint, warn=True)]
     return []
 
 
