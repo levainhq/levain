@@ -4933,7 +4933,8 @@ class _Handler(GuardedHandler):
         ``page_wait`` (the wait timed out), ``page_waiters_full`` (``_MAX_PAGE_WAITERS`` already wait, refused at
         once) or ``abandoned`` (the client closed its end during the wait: the slot is given back and the connection
         closed, nothing is answered, as the panel path does). Waiters are counted under the lock and a newcomer takes
-        the fast path only while none wait, so it cannot barge past them."""
+        the fast path only while none wait; the waiters themselves are not served in arrival order (the semaphore is
+        not FIFO), so under sustained saturation one may lose a freed slot and time out as ``page_wait``."""
         srv = self.server
         with srv.page_waiters_lock:
             if srv.page_waiters == 0 and srv.page_gate.acquire(blocking=False):
