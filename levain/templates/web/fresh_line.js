@@ -38,6 +38,7 @@
     justNow: "just now",
     ageUpdatedNow: "updated just now",
     agePanelNow: "read just now",
+    agePanelNever: "never read",
     ageShort: "{age}",
     justNowShort: "<5s",
     updating: "updating",
@@ -114,8 +115,9 @@
       var kind = h.status === "error" || neverRead ? "error" : (h.status === "stale" || faulted[id] === true ? "stale" : "");
       var stale = kind !== "";
       var asOf = toMs(h.as_of), onServer = true;
-      // a panel the page could not read has aged from the page's own last read of it, on the page's clock, not from the server's
-      if (faulted[id]) { asOf = (held[id] && held[id].at) || boot.lastWholeAt || asOf; onServer = false; }
+      // a panel the page could not read has aged from the page's own last SUCCESSFUL read of it, on the page's clock, not from the server's;
+      // one never read has no age (the line says so), never the failed attempt's
+      if (faulted[id]) { asOf = (held[id] && held[id].at) || null; onServer = false; }
       return { id: id, title: stale ? (titleOf(id) || id) : id, kind: kind, asOfMs: asOf || null, onServerClock: onServer, stale: stale, pending: false };
     });
     var read;
@@ -174,6 +176,7 @@
       if (short) ageText = fresh ? STRINGS.justNowShort : fill(STRINGS.ageShort, { age: a });
       else ageText = key === "stale" ? (fresh ? STRINGS.agePanelNow : fill(STRINGS.agePanel, { age: a })) : (fresh ? STRINGS.ageUpdatedNow : fill(STRINGS.ageUpdated, { age: a }));
     }
+    else if (key === "stale" && stale[0].kind === "error") ageText = STRINGS.agePanelNever;   // an unavailable panel with no read time was never read
     // the first read says "connecting" already; the cue is for a re-read of a board that is up
     var updating = key !== "connecting" && !!(f.read.inflightAt && now - f.read.inflightAt >= UPDATING_MS);
     if (updating) age = STRINGS.updating; else age = ageText;
