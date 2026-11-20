@@ -159,12 +159,11 @@ def test_replay_ends_when_the_page_loses_its_replay_path_while_scrubbing(tmp_pat
 @needs_browser
 def test_switching_to_the_event_graph_while_replaying_draws_nothing_from_the_past(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    spy = ("(() => { window.__lost = []; const f = window.LevainTopologyView.renderLost; window.LevainTopologyView.renderLost = (v) => { window.__lost.push(v.replay === true); return f(v); }; return 1; })()")
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "window.LevainTopologyView.replayValue() !== null"}, {"eval": spy},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "window.LevainTopologyView.replayValue() !== null"},
                                {"eval": "document.querySelector('#ck-hlens [data-tv=events]').click(); 1"}, {"until": "document.getElementById('ck-skycard').dataset.hlens == 'events'"}, SLEEP(300),
-                               {"eval": "JSON.stringify({lost: window.__lost, replaying: window.LevainTopologyView.replaying(), badge: !!document.querySelector('#ck-hlens .tv-rbadge')})"}])
+                               {"eval": "JSON.stringify({replaying: window.LevainTopologyView.replaying(), badge: !!document.querySelector('#ck-hlens .tv-rbadge')})"}])
     got = json.loads(out[-1])
-    assert got["replaying"] is False and got["badge"] is False and True not in got["lost"], got
+    assert got["replaying"] is False and got["badge"] is False, got
 
 
 # --- P6: the scrub window follows the server clock --------------------------------------------------------

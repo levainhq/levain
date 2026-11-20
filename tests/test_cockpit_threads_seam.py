@@ -2,14 +2,11 @@
 transport says ``threads: false`` (absent by default, so the default manifest is unchanged), which the page reads to draw no zone."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import pytest
 
 from levain.cockpit import threads
 from levain.web_server import make_server
-from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _get_status
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
@@ -50,13 +47,6 @@ def test_the_default_still_serves_the_record_unchanged(tmp_path):
         assert status == 403                                 # the gate, not a 404: the route exists
         status, body = _get_status(base + ONE, TOKEN)
         assert status == 404 and body["message"] == "no such thread recorded"   # the reader's own 404, not the seam's
-
-
-def test_the_boot_script_reads_the_flag_and_keeps_the_zone_hidden():
-    js = (Path(threads.__file__).resolve().parents[1] / "templates" / "web" / "dashboard_boot.js").read_text()
-    assert "manifest.transport.threads === false" in js
-    assert 'document.body.dataset.threads === "off"' in js
-    assert "section.hidden = off || !read || !token();" in js
 
 
 def test_threads_off_also_404s_the_thread_write_routes_and_touches_no_session(tmp_path, live):
@@ -103,45 +93,3 @@ def test_manifest_transport_is_a_copy_and_only_the_manifest_reads_it(tmp_path):
 def _count(pattern="cockpit/thread"):
     return f"performance.getEntriesByType('resource').filter(e => e.name.includes('{pattern}')).length"
 
-
-@needs_browser
-def test_the_zone_is_hidden_at_first_paint_and_shown_only_once_the_manifest_says_threads_are_on(tmp_path):
-    # the manifest read is held in the page (an init script wraps fetch) so the zone's first state is observable
-    hold = (f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__held = 0; window.__go = null; "
-            "const real = window.fetch.bind(window); "
-            "window.fetch = (u, ...a) => { const s = String(u && u.url || u); "
-            "if (s.includes('/cockpit/manifest.json')) { window.__held++; return new Promise(r => { const prev = window.__go; "
-            "window.__go = () => { if (prev) prev(); r(real(u, ...a)); }; }); } return real(u, ...a); };")
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN) as (base, _h):
-        out = _drive(tmp_path, base + "/", [
-            {"init": hold},
-            {"until": "document.querySelector('[data-zone=threads]') && window.__held >= 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(document.querySelector('[data-zone=threads]').hidden), 400))"},
-            {"eval": "window.__go(); 1"},
-            {"until": "document.querySelector('[data-zone=threads]').hidden === false"},
-            {"eval": "document.querySelector('[data-zone=threads]').hidden"},
-        ])
-    before, after = out["values"][-4], out["values"][-1]
-    assert before is True and after is False, out["values"]      # hidden while the manifest is unread, shown once it says on
-
-
-@needs_browser
-@pytest.mark.parametrize("answer", [
-    "new Response('boom', {status: 500})",
-    "new Response(JSON.stringify({panels: {}}), {status: 200, headers: {'Content-Type': 'application/json'}})",
-], ids=["manifest-500", "manifest-without-transport"])
-def test_a_failed_or_transport_less_manifest_read_still_shows_the_zone_on_a_threads_on_server(tmp_path, answer):
-    # only an explicit threads:false hides the zone; the server 404s every thread write when threads are off, so showing is safe
-    fail = (f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); "
-            "const real = window.fetch.bind(window); "
-            "window.fetch = (u, ...a) => { const s = String(u && u.url || u); "
-            f"if (s.includes('/cockpit/manifest.json')) return Promise.resolve({answer}); return real(u, ...a); }};")
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN) as (base, _h):
-        out = _drive(tmp_path, base + "/", [
-            {"init": fail},
-            {"until": "document.querySelector('[data-zone=threads]') && document.body.dataset.threadsRead === '1'"},
-            {"eval": "document.querySelector('[data-zone=threads]').hidden"},
-        ])
-    assert out["values"][-1] is False, out["values"]

@@ -511,18 +511,13 @@ def test_an_old_view_over_a_current_replies_table_is_made_current_too(qdir, stor
         c.close()
 
 
-def test_every_reply_kind_maps_in_the_one_sql_fragment_and_has_a_label_in_the_thread_view() -> None:
-    from pathlib import Path
-
-    import levain
+def test_every_reply_kind_maps_in_the_one_sql_fragment() -> None:
     from levain.desk.chat import REPLY_KIND_CASE
 
-    js = (Path(levain.__file__).parent / "templates" / "web" / "thread_view.js").read_text()
     c = sqlite3.connect(":memory:")
     for kind in REPLY_KINDS:
         (mapped,) = c.execute("SELECT " + REPLY_KIND_CASE.format(col="'" + kind + "'")).fetchone()
         assert mapped is not None, kind
-        assert f"{mapped}:" in js, kind
 
 
 def test_a_refused_reply_numbers_nothing_in_the_band(qdir, store, token) -> None:

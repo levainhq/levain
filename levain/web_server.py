@@ -1484,8 +1484,6 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/card_format.js": ("card_format.js", "text/javascript; charset=utf-8"),
     # The envelope form the sign sheet draws (a pure file, one copy): loaded before /sign.js.
     "/envelope_form.js": ("envelope_form.js", "text/javascript; charset=utf-8"),
-    # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
-    "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
     # The room view (RM-F): the cockpit's one Claude room, over GET /cockpit/room.json and POST /cockpit/room/*.
     "/room_view.js": ("room_view.js", "text/javascript; charset=utf-8"),
     # The Desk view: a second full tab beside the room, over GET /cockpit/desk.json and POST /cockpit/desk/send.

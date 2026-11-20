@@ -50,18 +50,11 @@ def test_the_head_card_adds_no_text_field_so_there_is_no_name_to_classify() -> N
         assert "-" not in "".join(name), name
 
 
-def test_the_thread_view_links_the_card_by_a_safe_id_only() -> None:
-    tv = (WEB / "thread_view.js").read_text()
-    # unencoded (FINDINGS_h13b_r2 E1): the id matched the sheet's own pattern, which refuses "%", so th-a:b encoded is dropped
-    assert '"/sign/drop#thread=" + m.id' in tv and "encodeURIComponent(m.id)" not in tv and "[A-Za-z0-9._:-]{1,160}" in tv
-    assert 'setAttribute("rel", "noopener")' in tv
-
-
 def test_the_page_parses_and_assigns_no_undeclared_name() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("needs node")
-    for n in ("sign.js", "thread_view.js"):
+    for n in ("sign.js",):
         out = subprocess.run([node, "--check", str(WEB / n)], capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
     assert _undeclared_assignments(SIGN) == set()

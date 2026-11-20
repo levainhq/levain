@@ -13,7 +13,6 @@ import pytest
 from levain.desk.chat import ChatService, ChatStore
 from levain.desk.driver import ScriptedSession
 from levain.desk.envelopes import EnvelopeStore
-from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the default consent directory the server reads)
@@ -164,44 +163,6 @@ def test_stop_interrupts_the_launchs_turn_and_reports_the_drivers_answer(tmp_pat
         assert status == 409 and body["error"] == "no_session"
 
 
-_PAGE = ('<!doctype html><meta charset="utf-8"><div id="host"></div><script src="/thread_view.js"></script>'
-         '<script src="/tvc.js"></script>')
-_BOOT = ('window.__tv = LevainThreadView.mount(document.getElementById("host"),'
-         ' {pollMs: 0, stop: true, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
-
-
-def _assets(boot: str) -> dict:
-    return {"/tvc.html": ("text/html; charset=utf-8", _PAGE.encode()),
-            "/tvc.js": ("text/javascript; charset=utf-8", boot.encode())}
-
-
-# the stored thread has no turn row in it, so the Stop is dark (it is pressable only while a turn runs, 1105-49); this boot
-# gives the page one running turn on top of the real read, so the tap still reaches the real stop route
-_BOOT_RUNNING = ('const real = window.fetch.bind(window);\n'
-                 'const running = (u, o) => real(u, o).then(r => (o && o.method === "POST") || !/\\.json$/.test(u) || u.indexOf("/cockpit/thread/") !== 0 ? r :\n'
-                 '  r.text().then(t => { const j = JSON.parse(t); j.stream = (j.stream || []).concat([{gseq: 9999, kind: "vendor_turn_started", source: "vendor", launch_id: j.launch_id, body: null}]);\n'
-                 '    return {ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(j))}; }));\n'
-                 'window.__tv = LevainThreadView.mount(document.getElementById("host"),'
-                 ' {pollMs: 0, stop: true, fetch: running, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
-
-
-@needs_browser
-def test_a_work_thread_draws_a_stop_and_no_composer(tmp_path, live):
-    svc, cs, world, session = live
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=_assets(_BOOT_RUNNING)) as (base, _h):
-        out = _drive(tmp_path, base + "/tvc.html", [
-            {"until": "document.querySelector('.tv-row')"},
-            {"eval": "document.querySelector('.tv-row').click(); 1"},
-            {"until": "document.querySelector('.tv-stop')"},
-            {"eval": "JSON.stringify({input: document.querySelectorAll('.tv-input, .tv-send, .tv-composer').length})"},
-            {"eval": "document.querySelector('.tv-stop').click(); 1"},
-            {"until": "/Stop confirmed|Nothing was running/.test(document.querySelector('.tv-sendnote').textContent)"},
-        ])
-    assert json.loads(out["values"][3]) == {"input": 0}
-    assert _rows(cs) == []
-
-
 # --- roomfix1 R3: a Stop only where the server can reach a session -----------------------------------------------------
 
 def test_the_thread_body_says_whether_a_stop_can_reach_a_session(tmp_path, live):
@@ -224,17 +185,3 @@ def test_the_thread_body_says_whether_a_stop_can_reach_a_session(tmp_path, live)
     finally:
         other.close()
 
-
-@needs_browser
-def test_a_work_thread_whose_launch_no_session_holds_draws_no_stop(tmp_path, live):
-    svc, cs, world, session = live
-    svc.detach(world["launch"])
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=_assets(_BOOT)) as (base, _h):
-        out = _drive(tmp_path, base + "/tvc.html", [
-            {"until": "document.querySelector('.tv-row')"},
-            {"eval": "document.querySelector('.tv-row').click(); 1"},
-            {"until": "document.querySelector('.tv-title')"},
-            {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('.tv-stop').length), 300))"},
-        ])
-    assert out["values"][-1] == 0
