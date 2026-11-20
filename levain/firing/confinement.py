@@ -3935,7 +3935,11 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 #: chat_mcplist_off.txt). The chat's strict start did NOT show them (levain-leg6 2's 14:30 correction in the desk log), so this
 #: is defence in depth for the non-strict starts. Slot runs say the same in their settings (``disableClaudeAiConnectors``,
 #: ``levain.slot.render``); the hands account has no settings of ours, so the environment, which every hands start gets from
-#: :func:`_hands_env`, carries it.
+#: :func:`_hands_env`, carries it. IT IS A DEFAULT, NOT A BOUNDARY (L3 r1 on levain#139, four seats, the vendor's settings
+#: reference cited, not measured here): the hands account owns its ``~/.claude/settings.json``, whose ``env`` block is
+#: documented to overwrite the process environment, and a hands shell can export or prefix the variable itself. The layer that
+#: the hands account cannot undo is the settings key passed with ``--settings`` on every Levain-built Claude command (board
+#: row levain#202); it is not built because ``claude --settings ... <subcommand>`` is unmeasured on the VM.
 HANDS_NO_CLAUDEAI_CONNECTORS = ("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
 
 

@@ -69,7 +69,7 @@ def test_the_hands_environment_is_where_it_comes_from():
 def test_only_the_hands_environment_names_it_under_firing():
     """One source: a second place setting it could drift from the first."""
     firing = Path(confinement.__file__).parent
-    named = sorted(p.name for p in firing.glob("*.py") if NAME in p.read_text())
+    named = sorted(p.name for p in firing.rglob("*.py") if NAME in p.read_text())
     assert named == ["confinement.py"], named
 
 
