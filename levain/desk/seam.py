@@ -550,7 +550,8 @@ def _missing_close(conn: sqlite3.Connection, present: set[str], qdir: Path) -> l
 def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[str]:
     """The one board block (T7, levain#101): ``levain board state``'s own read (:func:`levain.desk.board_cli.read_board`,
     T3), never the v1 ready queue, which is retired and takes no more rows. A board that cannot be read raises, so the
-    brief's guard says ``Board: cannot-derive`` and never an empty board. Board changes are not in the ordered ``gseq``
+    brief's guard says ``Board: cannot-derive`` and never an empty board. It lists the OPEN items (``board_cli.open_view``), capped, and
+    names ``levain board open`` as where the rest are read. Board changes are not in the ordered ``gseq``
     stream the Since section reads (the board is a JSONL store, which no SQLite snapshot can join), so this block is the
     open's one account of the board."""
     from levain.desk import board_cli
@@ -563,12 +564,13 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
     problems = board_cli.problem_lines(doc)         # a repo that could not be read says so: never "0 items" over a failed read
     if not items and not audit and not problems:
         return ["Board: 0 items"]
-    lines = [f"Board: {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
+    open_items = board_cli.open_view(doc)["items"]  # the open ones, in the order ``levain board open`` draws them: done and cut are not spent slots
+    lines = [f"Board: {len(open_items)} open of {len(items)} item(s), {len(audit)} audit entr{'y' if len(audit) == 1 else 'ies'} "
              f"(levain board state, as of {doc.get('as_of') or 'unknown'})"]
-    for it in items[:_LIST_LINES]:
+    for it in open_items[:_LIST_LINES]:
         lines.append(_cap(f"  {it['id']} [{it['state']}] {it['reason']}"))
-    if len(items) > _LIST_LINES:
-        lines.append(f"  ... {len(items) - _LIST_LINES} more not listed")
+    if len(open_items) > _LIST_LINES:
+        lines.append(f"  ... {len(open_items) - _LIST_LINES} more open not listed: read them with `levain board open`")
     for a in audit[:_LIST_LINES]:
         lines.append(_cap(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}"))
     if len(audit) > _LIST_LINES:
