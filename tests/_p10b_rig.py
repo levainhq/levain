@@ -16,6 +16,8 @@ fire: the zone, the role, the registration, the signature, the tick, the revoke,
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -71,6 +73,7 @@ class Session(Install):
         self.episodic = tmp / "episodes.db"
         self._claims = 0
         self._agent: dict | None = None
+        self._fires: list[subprocess.Popen] = []
 
     # ------------------------------------------------------------------------------------------------- the CLI
     def env(self, now: str | None = None, spawn_gate: bool = False, kill: str | None = None) -> dict[str, str]:
@@ -190,7 +193,22 @@ class Session(Install):
         from levain.agents import controller as ctl
 
         argv = [sys.executable, str(ENTRY), "_fire", "--store", str(self.store_dir), oid]
-        return ctl.spawn_fire(self.store_dir, oid, argv=argv, env=self.env())
+        proc = ctl.spawn_fire(self.store_dir, oid, argv=argv, env=self.env())
+        self._fires.append(proc)
+        return proc
+
+    def close(self) -> None:
+        """The case's teardown, pass or fail: drop ``hold`` (a vendor still waiting on it ends) and kill, as its own group,
+        every fire this session started that still runs. A fire's gate holds the vendor's lifeline, so the vendor goes with
+        it."""
+        self.release()
+        for proc in self._fires:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.wait(30)
 
     def fired(self, oid: str, timeout: float = 120) -> int:
         """Fire ``oid`` and wait for its exit status."""
@@ -231,6 +249,11 @@ class Session(Install):
     # --------------------------------------------------------------------------------------------------- the reads
     def row(self, oid: str) -> dict:
         (got,) = self.rows(f"SELECT * FROM agent_occurrences WHERE occurrence_id = '{oid}'")
+        return got
+
+    def reservation(self, oid: str) -> dict:
+        """The occurrence's one reservation row (``state``, ``settled_reason``, ``reserved_usd_micros``, ``debited_usd_micros``)."""
+        (got,) = self.rows(f"SELECT * FROM agent_reservations WHERE occurrence_id = '{oid}'")
         return got
 
     def held(self, oid: str) -> tuple[list, list]:

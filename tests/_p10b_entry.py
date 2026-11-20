@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 STUB_LAUNCHER = "p10b-stub"      # the name the install names for the stub
+STUB_USAGE_USD_MICROS = 0        # the dollars the stub reports when it can read its usage (a readable run debits this)
 
 _VENDOR = (
     "import os, sys, time\n"
@@ -75,7 +76,7 @@ class StubLauncher:
 
         if (self.dir / "usage").exists() and (self.dir / "usage").read_text(encoding="utf-8").strip() == "unreadable":
             return Usage(None, None, None, "p10b-stub:unreadable")
-        return Usage(0, 10, 20, "p10b-stub")
+        return Usage(STUB_USAGE_USD_MICROS, 10, 20, "p10b-stub")
 
     def end_session(self, session_key: str, deadline_s: float):
         """The S1 END a reaper (a process that holds no child) asks: terminate the gate of the launch that carries this key
