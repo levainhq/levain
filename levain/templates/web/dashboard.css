@@ -3450,6 +3450,8 @@ body.ke .ck-zgrid .panel .nc-pbody { padding: 0 var(--sp-2) var(--sp-3) var(--sp
 .nf-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .nf-cap { display: flex; align-items: center; gap: var(--sp-3); }
 .nf-form .nf-urgent-cap { flex: 0 0 8rem; }
+/* a refused cap is shown without colour: a thicker border and an inset bar on the leading edge, with the colour as a third cue */
+.nf-form .nf-urgent-cap[aria-invalid="true"] { border-width: 2px; border-color: var(--bad); box-shadow: inset 4px 0 0 var(--bad); }
 .nf-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
 @media (max-width: 720px) { .nf-form .dev-btn { flex: 1 1 100%; min-height: var(--hit-min); } }
 

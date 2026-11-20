@@ -388,6 +388,7 @@
     nfNew = el("div", "dev-link nf-new"); nfNew.hidden = true;
     body.appendChild(nfNew);
     nfNote = el("p", "dev-note nf-note"); nfNote.hidden = true;
+    nfNote.id = "nf-note"; nfNote.setAttribute("role", "status"); nfNote.setAttribute("aria-live", "polite");   // a polite live region: its text is read when it changes
     body.appendChild(nfNote);
     nfPanel.appendChild(body);
     setTimeout(readNotify, 2500);
@@ -404,8 +405,9 @@
   const NF_CAP_WHOLE = "Urgent per hour must be a whole number above zero, or left empty.";
   function nfSay(msg) {
     nfNote.textContent = msg; nfNote.hidden = !msg;
-    if (msg === NF_CAP_NEEDS_URGENT || msg === NF_CAP_WHOLE) nfUrgentCap.setAttribute("aria-invalid", "true");
-    else nfUrgentCap.removeAttribute("aria-invalid");
+    // the describedby link is set and removed with the mark, so a screen reader reads the reason while the field is invalid and only then
+    if (msg === NF_CAP_NEEDS_URGENT || msg === NF_CAP_WHOLE) { nfUrgentCap.setAttribute("aria-invalid", "true"); nfUrgentCap.setAttribute("aria-describedby", nfNote.id); }
+    else { nfUrgentCap.removeAttribute("aria-invalid"); nfUrgentCap.removeAttribute("aria-describedby"); }
   }
   function nfClearCapRefusal() {
     if (nfNote.textContent === NF_CAP_NEEDS_URGENT || nfNote.textContent === NF_CAP_WHOLE) nfSay("");

@@ -449,3 +449,36 @@ def test_a_revoke_while_the_cap_refusal_shows_takes_the_field_mark_with_the_note
     assert revoked["rows"] == ["keep-b"] and revoked["note"] == "" and revoked["aria"] is None, revoked        # the note went, and the mark with it
     assert failed["rows"] == ["keep-b"] and "refused for the test" in failed["note"] and failed["aria"] is None, failed   # another note, no mark
     assert "keep-a" not in stored and "keep-b" in stored and "refused" not in stored, stored
+
+
+# levain#196: the refused cap field names the reason to assistive technology (aria-describedby to the note, the note a polite live region)
+# and shows it without colour (a thicker border and an inset marker, read here as computed style)
+NF_LINK = ("(() => { const c = document.querySelector('.nf-urgent-cap'); const id = c.getAttribute('aria-describedby');"
+           " const n = id ? document.getElementById(id) : null; const cs = getComputedStyle(c);"
+           " return JSON.stringify({aria: c.getAttribute('aria-invalid'), id: id, same: !!n && n === document.querySelector('.nf-note'),"
+           " text: n ? n.textContent : null, shown: !!n && !n.hidden && getComputedStyle(n).display !== 'none',"
+           " live: document.querySelector('.nf-note').getAttribute('role') || document.querySelector('.nf-note').getAttribute('aria-live'),"
+           " width: cs.borderTopWidth, shadow: cs.boxShadow}); })()")
+
+
+@needs_browser
+def test_the_refused_cap_field_is_described_by_the_visible_refusal_and_looks_invalid_without_colour(tmp_path, monkeypatch) -> None:
+    retype = {"eval": NF_RETYPE % json.dumps("21")}
+    steps = [{"eval": NF_LINK}]                                                                                         # 0: the unmarked field
+    steps += _nf_mint("forgot-tick", urgent=False, cap="20") + [_nf_settle("forgot-tick"), {"eval": NF_LINK}]            # 1: refused
+    steps += [retype, {"eval": NF_LINK}]                                                                                # 2: edited
+    steps += _nf_mint("whole", urgent=True, cap="1.5") + [_nf_settle("whole"), {"eval": NF_LINK}]                        # 3: refused as not whole
+    steps += [NF_SUBMIT_NAMELESS, {"eval": NF_LINK}]                                                                    # 4: another note replaces it
+    seen, _stored = _nf_run(tmp_path, monkeypatch, steps)
+    assert len(seen) == 5, seen
+    plain, refused, edited, whole, nameless = seen
+    assert plain["aria"] is None and plain["id"] is None, plain
+    for marked, words in ((refused, NF_TICK), (whole, NF_WHOLE)):
+        assert marked["aria"] == "true" and marked["id"], marked
+        assert marked["same"] is True and marked["shown"] is True and words in marked["text"], marked     # the link resolves to the visible refusal
+        assert marked["live"] in ("status", "polite"), marked                                              # the note is a live region
+        assert float(marked["width"].removesuffix("px")) > float(plain["width"].removesuffix("px")), (plain, marked)   # a thicker border, not a colour
+        assert marked["shadow"] != plain["shadow"] and marked["shadow"] != "none", (plain, marked)          # and an inset marker
+    for gone in (edited, nameless):
+        assert gone["aria"] is None and gone["id"] is None, gone                                           # the link goes with the mark
+        assert gone["width"] == plain["width"] and gone["shadow"] == plain["shadow"], (plain, gone)
