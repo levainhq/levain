@@ -2785,7 +2785,7 @@ body.ke .row:has(> .clause.clampable) > .ext-meta.review-mine:not(.clause):not(.
 .rv .rv-md .md-code-b { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
 .rv .rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }          /* a bidi control in a seat's link text cannot reorder the words after it */
 .rv .rv-md .md-quote { color: var(--label); }
-/* The same draw in the chat panel's reply, the thread view's agent line and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
+/* The same draw in the chat panel's reply and the Sessions transcript's agent lines (none sits inside .rv): source newlines are no longer
    preserved, the blocks carry their own breaks, code is mono and wraps or scrolls inside the column. */
 .chat-text.rv-md, .sess-text.rv-md { white-space: normal; }
 .chat-text.rv-md > :first-child, .sess-text.rv-md > :first-child { margin-top: 0; }
