@@ -387,3 +387,27 @@ def test_the_retry_of_a_panel_unreadable_at_the_whole_draw_is_one_read_of_that_p
     assert len(g["healedLog"]) == 1 and "work_board" in g["healedLog"][0], g["healedLog"]
     assert g["mounted"] is True, g
     assert sum("manifest" in u for u in g["reloadLog"]) == 1, g["reloadLog"]                                  # the one whole reload draws it
+
+
+@needs_browser
+def test_a_failed_panel_read_keeps_the_rows_on_the_page_and_a_good_one_clears_the_line(tmp_path: Path) -> None:
+    """levain#173: the iPad's band dropped panels to 'unavailable' on a failed read (WebKit's bare TypeError). The page's own fetch fails the work
+    board's read; the rows it showed stay, one quiet line says the refresh failed, and the next good read removes the line."""
+    body = "document.querySelector('[data-panel-id=\"work_board\"] .pbody, [data-panel-id=\"work_board\"] .panel-body, [data-panel-id=\"work_board\"]')"
+    snap = ("JSON.stringify({ probe: '%s', text: (" + body + ".textContent || '').replace(/could not refresh just now[^.]*/, '').trim().length,"
+            " note: document.querySelectorAll('[data-panel-id=\"work_board\"] .stale-note').length,"
+            " unavailable: /unavailable —/.test(" + body + ".textContent || '') })")
+    settle = "new Promise((r) => setTimeout(r, 800)).then(() => 1)"
+    steps = [READY, LIVE, SETTLE, _run(STUB2),
+             {"eval": snap % "before"},
+             {"eval": "window.__panelFail = 'work_board'; window.LevainCockpitView.refetchPanel('work_board').then(() => 1)"},
+             {"eval": settle},
+             {"eval": snap % "failed"},
+             {"eval": "window.__panelFail = null; window.LevainCockpitView.refetchPanel('work_board').then(() => 1)"},
+             {"eval": settle},
+             {"eval": snap % "healed"}]
+    got = {v["probe"]: v for v in _vals(_open(tmp_path, steps))}
+    before, failed, healed = got["before"], got["failed"], got["healed"]
+    assert before["text"] > 0 and before["note"] == 0, before
+    assert failed["unavailable"] is False and failed["note"] == 1 and failed["text"] == before["text"], (before, failed)
+    assert healed["note"] == 0 and healed["unavailable"] is False, healed

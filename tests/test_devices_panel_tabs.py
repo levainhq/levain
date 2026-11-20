@@ -163,6 +163,37 @@ def test_a_paired_row_not_seen_for_days_says_so_and_how_to_fix_it(tmp_path, monk
 
 
 @needs_browser
+def test_a_row_with_a_not_seen_chip_keeps_its_name_readable_at_phone_width(tmp_path, monkeypatch) -> None:
+    """levain#161: at 390 px the 'not seen for 3 days' chip sat beside the name in one flex line and squeezed it to ~69 px while a row
+    without the chip got ~203 px. The chip wraps under the name instead, so every row's name keeps a readable width."""
+    shots = os.environ.get("LEVAIN_PINGS_SHOTS", "")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src) as (port, httpd):
+        labels = ("A long device label for the iPad", "A long device label for the phone")
+        ids = {label: _pair(port, label=label)[0] for label in labels}
+        db = sqlite3.connect(str(Path(httpd.broker.data_root) / "cockpit.db"))
+        _stamp(db, ids, labels[0], seen=timedelta(days=3, hours=1), made=timedelta(days=9))
+        _stamp(db, ids, labels[1], seen=timedelta(minutes=5), made=timedelta(days=9))
+        db.commit()
+        db.close()
+        widths = ("JSON.stringify(Object.fromEntries([...document.querySelectorAll('.dev-list .dev-row')].map((r) => [r.querySelector('.dev-name').textContent,"
+                  " [Math.round(r.querySelector('.dev-name').getBoundingClientRect().width), !!r.querySelector('.dev-stale')]])))")
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"until": READY, "ms": 20000},
+            {"eval": widths},
+            {"eval": OVERFLOW},
+            *([{"shot": os.path.join(shots, "paired-stale-row-390.png"), "full": True}] if shots else []),
+        ])
+    v = out["values"]
+    got = json.loads(v[1])
+    stale, fresh = got[labels[0]], got[labels[1]]
+    assert stale[1] and not fresh[1], got
+    assert stale[0] >= 150 and stale[0] >= 0.8 * fresh[0], got
+    assert v[2] <= 0, v[2]
+
+
+@needs_browser
 def test_no_fix_line_when_every_paired_row_is_fresh(tmp_path, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src) as (port, httpd):

@@ -6,7 +6,7 @@
  * file refetches a moved panel through LevainCockpitView.refetchPanel and reloads the board when it must.
  *
  * refetchPanel answers "applied" (the panel took the new data), "fault" (the read failed: retried on a
- * short bounded schedule, then it waits for the next event) or false (the panel cannot be redrawn in place:
+ * short bounded schedule, then on a slow timer while the tab is visible) or false (the panel cannot be redrawn in place:
  * the board reloads). A wanted reload is PENDING: it survives an in-flight load or an open edit and clears
  * only once the board has been drawn again.
  *
@@ -24,6 +24,7 @@
   var MANIFEST = "/cockpit/manifest.json";
   var HEARTBEAT_MS = 15000;          // silence past two beats means the stream is dead
   var POLL_MS = 30000;
+  var SLOW_RETRY_MS = 120000;          // a faulted panel past its bounded steps is read again on this timer while the tab is visible
   var BACKOFF_MS = [1000, 2000, 4000, 8000, 15000, 30000];
   var FAULT_RETRY_MS = [5000, 15000, 60000];
   var PENDING_RETRY_MS = [5000, 15000, 60000];   // the last step repeats while a reload is still pending
@@ -84,7 +85,7 @@
     return h;
   }
 
-  // ---- a failed panel read: retried a few times, then it waits for the next event ----
+  // ---- a failed panel read: retried a few times, then on a slow timer while the tab is visible ----
   function clearFault(id) {
     var f = faults[id];
     if (f) { root.clearTimeout(f.timer); delete faults[id]; }
@@ -93,12 +94,17 @@
   function scheduleFault(id) {
     var n = tries[id] || 0;
     clearFault(id);
-    if (n >= FAULT_RETRY_MS.length) return;
     // a retry started while hidden would run unseen and spend the budget: it is owed to the visible edge instead
     if (paused) { if (owed.indexOf(id) < 0) owed.push(id); return; }
-    var f = { timer: 0 };
-    // a step is spent when its timer fires: a timer cancelled before that (a whole draw, a hide) spends nothing
-    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; tries[id] = (tries[id] || 0) + 1; refetch(id); } }, FAULT_RETRY_MS[n]);
+    var f = { timer: 0 }, slow = n >= FAULT_RETRY_MS.length;
+    // a step is spent when its timer fires: a timer cancelled before that (a whole draw, a hide) spends nothing. Past the steps the panel is still
+    // read again, on a slow timer (SLOW_RETRY_MS) that spends nothing and runs only while the tab is visible (levain#173)
+    f.timer = root.setTimeout(function () {
+      if (faults[id] !== f) return;
+      f.timer = 0;
+      if (!slow) tries[id] = (tries[id] || 0) + 1;
+      refetch(id);
+    }, slow ? SLOW_RETRY_MS : FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
 
@@ -236,7 +242,7 @@
     ids.forEach(function (id) {
       if (h[id] && h[id].etag === heads[id].etag) return;
       // a panel never read (held `err`, no etag) differs from every head, so this read is a retry taken early (it replaces the pending timer
-      // and spends the step); once the budget is spent it waits for an event or a recovery
+      // and spends the step); once the budget is spent the slow timer in scheduleFault reads it
       if (h[id] && h[id].err && !h[id].etag) {
         var n = tries[id] || 0;
         if (n >= FAULT_RETRY_MS.length) return;
@@ -286,6 +292,11 @@
     staleSince = null;
     tell();
     var o = owed; owed = [];
+    // the visible edge gives every panel whose last read failed a fresh budget: the iPad's tab was away, and what failed there is worth a try now
+    var hh = held();
+    Object.keys(hh).forEach(function (id) {
+      if (hh[id] && hh[id].err) { delete tries[id]; if (o.indexOf(id) < 0) o.push(id); }
+    });
     o.forEach(function (id) { reread(id); });
     if (pending) wantReload();
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
