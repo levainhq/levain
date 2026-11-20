@@ -609,3 +609,41 @@ def test_a_home_head_is_shown_only_over_a_block_that_is_drawn(tmp_path: Path) ->
         by = {h["head"]: h["shown"] for h in heads}
         assert by["desk"] is False and by["machine"] is False, heads   # nothing under Desk or Machine: no heading over an empty section
         assert by["work"] is True and by["glance"] is True, heads      # the heads that still have blocks stay
+
+
+# levain#218: the page scrolls as a whole (the window), and the places bar sticks at the top of it. The page is made long by padding the
+# bottom of Home's deck through the CSSOM (the page's CSP refuses a <style> element), so Home can be scrolled far past the band.
+LONG_HOME = ("(() => { const ss = document.styleSheets[0]; ss.insertRule('body.ia[data-ia-place=\"home\"] .deck { padding-bottom: 3000px !important; }',"
+             " ss.cssRules.length); return document.documentElement.scrollHeight; })()")
+# the band (the now line) overlaps the visible part of the window
+BAND_SEEN = ("(() => { const b = document.querySelector('#ck-band'); if (!b) return null; const r = b.getBoundingClientRect();"
+             " return r.height > 0 && r.bottom > 0 && r.top < window.innerHeight; })()")
+SCROLL_DOWN = "window.scrollTo(0, 1500); new Promise(r => setTimeout(() => r(window.scrollY), 300))"
+SETTLE_LONG = {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"}   # past a smooth scroll
+
+
+@needs_browser
+def test_tapping_home_while_on_home_brings_the_band_back_into_view(tmp_path: Path) -> None:
+    """levain#218: on Home, the Home button takes the page back up to the band, at a desktop and a phone width. Not held here: the other
+    places, and whether the landing feels right on his devices."""
+    _root, src, _ids = _install(tmp_path)
+    tap_home = {"tap": "document.querySelector('.ia-places [data-ia-place-btn=\"home\"]')"}
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        steps: list = []
+        for dev in ({"w": 1440, "h": 900, "dpr": 1}, {"w": 390, "h": 800, "dpr": 2, "mobile": True}):
+            steps += [{"emulate": dev}, READY, {"until": BAND_SEEN, "ms": 20000}, {"eval": LONG_HOME}, SETTLE,
+                      {"eval": SCROLL_DOWN},                
+                      {"eval": BAND_SEEN},
+                      tap_home, SETTLE_LONG,
+                      {"eval": BAND_SEEN},
+                      {"eval": "window.scrollY"},             # +5
+                      {"eval": STATE}]
+        out = _drive(tmp_path, f"{url}/#write_token=T", steps)
+    v = out["values"]
+    assert len(v) % 2 == 0, v
+    for chunk in (v[: len(v) // 2], v[len(v) // 2:]):
+        scrolled, before, _tap, _settle, after, y, state = chunk[-7:]
+        assert scrolled > 800, f"the page did not scroll down: {chunk}"
+        assert before is False, f"the band was still in view after scrolling away: {chunk}"
+        assert after is True and y < 300, f"Home tapped on Home did not bring the band back: {chunk}"
+        assert state["place"] == "home" and state["current"] == ["home"], chunk

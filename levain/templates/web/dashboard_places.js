@@ -53,7 +53,15 @@
       paint();
       return;
     }
-    if (where === "home") return clickHidden("[data-ia-mode=board]");
+    if (where === "home") {
+      // Already on Home, the button takes the page back up to the band. The page scrolls as a whole; the painted place is read, as the
+      // Drop handler below does, and a dialog's page is left where it is. Focus is not moved.
+      if (document.body.dataset.iaPlace === "home" && !dialogOpen()) {
+        var calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        try { window.scrollTo({ top: 0, behavior: calm ? "auto" : "smooth" }); } catch (_) { window.scrollTo(0, 0); }
+      }
+      return clickHidden("[data-ia-mode=board]");
+    }
     if (where === "desk") return clickHidden("[data-ia-jump=desk]");
     if (where === "room") return clickHidden("[data-ia-jump=room]");
     if (where === "memory") return clickHidden("[data-ia-mode=memory]");
