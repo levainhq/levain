@@ -20,7 +20,16 @@ every ``token_s`` and builds the manifest only when the token moved, or when ``b
 last build (what the token cannot see: the clock, an in-memory state, a store it does not name). A token of
 None means "not known": the build then runs every ``watch_s``, exactly as without a token. After a build the
 next token-driven build waits ``2 x`` how long that build took, so a token that never settles cannot run the
-build faster than it can finish."""
+build faster than it can finish.
+
+A server that reads the panels through a snapshot reader can give the Watcher a change probe instead (``probe=``;
+the token and the manifest build are then not used). The probe has two methods: ``change_seq()``, a cheap counter
+that moves only when a panel's content or the panel set changed, and ``snapshot()``, which returns
+``({panel_id: etag}, set_version)``. The Watcher looks at ``change_seq()`` every ``token_s`` and takes a snapshot
+only when it moved (and ``2 x`` the last snapshot's duration has passed), or when ``backstop_s`` has passed since the
+last one. ``set_version`` is opaque: a change of it
+with the same panel ids announces ``manifest-changed``, like a change of the id set. A counter that cannot be read
+is an unknown one: the snapshot then runs every ``watch_s``."""
 
 from __future__ import annotations
 
@@ -75,8 +84,11 @@ class Watcher:
     def __init__(self, read_manifest: Callable[[], dict[str, Any]], *, epoch: str,
                  watch_s: float = DEFAULT_WATCH_S, ring: int = DEFAULT_RING,
                  token: Callable[[], Any] | None = None, token_s: float = DEFAULT_TOKEN_S,
-                 backstop_s: float = DEFAULT_BACKSTOP_S) -> None:
+                 backstop_s: float = DEFAULT_BACKSTOP_S, probe: Any = None) -> None:
         self._read_manifest = read_manifest
+        self._probe = probe
+        self._seq_failed = False
+        self._set_version: str | None = None
         self._token = token
         self._token_failed = False
         self.token_s = token_s
@@ -94,6 +106,14 @@ class Watcher:
         self._ring: "collections.deque[tuple[int, str, dict[str, Any]]]" = collections.deque(maxlen=ring)
         self._etags: dict[str, Any] | None = None
 
+    def set_probe(self, probe: Any) -> None:
+        """Give the Watcher a change probe (or None to drop it) after construction, while no stream is open: the
+        observation a run began with is not swapped under it."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("the change probe cannot be replaced while the watcher runs")
+            self._probe = probe
+
     # ---- observation -------------------------------------------------------------
     @property
     def running(self) -> bool:
@@ -108,6 +128,23 @@ class Watcher:
     def _read(self) -> dict[str, Any]:
         heads = self._read_manifest()["panels"]
         return {pid: head.get("etag") for pid, head in heads.items()}
+
+    def _observe(self) -> tuple[dict[str, Any], str | None]:
+        """What one observation sees: the panel etags and the set version (None without a probe)."""
+        if self._probe is None:
+            return self._read(), None
+        etags, set_version = self._probe.snapshot()
+        return dict(etags), set_version
+
+    def _seq_now(self) -> Any:
+        """The probe's change counter, or None when it cannot be read (None = unknown: snapshot on the slow tick)."""
+        try:
+            return self._probe.change_seq()
+        except Exception:   # noqa: BLE001 - an unreadable counter is an unknown one, never a missed change
+            if not self._seq_failed:        # once per run, not once per look
+                self._seq_failed = True
+                log.exception("cockpit watcher: the change probe's counter could not be read (the slow tick snapshots instead)")
+            return None
 
     def _token_now(self) -> Any:
         """The change token, or None when there is none or it cannot be read (None = unknown: build on the slow tick)."""
@@ -166,9 +203,12 @@ class Watcher:
         self._seq = 0
         self._ring.clear()
         self._token_failed = False
-        tok = self._token_now()     # before the baseline: a change landing between them is seen as one next look
+        self._seq_failed = False
+        self._set_version = None
+        # before the baseline: a change landing between them is seen as one next look
+        tok = self._token_now() if self._probe is None else self._seq_now()
         try:
-            self._etags = self._read()
+            self._etags, self._set_version = self._observe()
         except Exception:   # noqa: BLE001 - the first good tick adopts a baseline and asks pages to reload
             log.exception("cockpit watcher: the baseline manifest read failed")
             self._etags = None
@@ -183,7 +223,31 @@ class Watcher:
         self._run_stop = None
         self._thread = None
 
+    def _loop_probe(self, stop: threading.Event, seq: Any) -> None:
+        last_snap = time.monotonic()
+        not_before = 0.0
+        gap = 0.0       # twice the last snapshot's duration: a counter that never settles cannot run snapshots faster than they finish
+        while not stop.wait(self.token_s):
+            now_seq = self._seq_now()
+            t = time.monotonic()
+            idle = t - last_snap
+            if now_seq is None:
+                due = idle >= self.watch_s
+            else:
+                due = (now_seq != seq and idle >= gap) or idle >= self.backstop_s
+            if not due or t < not_before:
+                continue
+            if self.tick(stop):
+                seq = now_seq
+                last_snap = time.monotonic()
+                gap = 2 * (last_snap - t)
+            else:
+                not_before = time.monotonic() + self.watch_s     # a snapshot that fails is retried on the slow tick
+
     def _loop(self, stop: threading.Event, tok: Any = None) -> None:
+        if self._probe is not None:
+            self._loop_probe(stop, tok)
+            return
         if self._token is None:
             while not stop.wait(self.watch_s):
                 self.tick(stop)
@@ -205,23 +269,28 @@ class Watcher:
             last_build = time.monotonic()
             gap = 2 * (last_build - began)
 
-    def tick(self, run: threading.Event | None = None) -> None:
-        """One observation. Any failure is this tick's alone: it is logged and the next tick tries again."""
+    def tick(self, run: threading.Event | None = None) -> bool:
+        """One observation. Any failure is this tick's alone: it is logged and the next tick tries again.
+        False when the observation failed. True otherwise, which includes a tick from a run that has been stopped or
+        replaced: that observation is read but discarded (nothing adopted, nothing announced). A True return is "the
+        look did not fail", not "this tick's observation is the watcher's current one"."""
         try:
-            now = self._read()
+            now, version = self._observe()
         except Exception:   # noqa: BLE001 - a watcher that dies would leave every page reading "live" over stale data
             log.exception("cockpit watcher: a manifest read failed")
-            return
+            return False
         with self._lock:
             if run is not None and run is not self._run_stop:
-                return      # a tick from a run that has been stopped (or replaced)
+                return True     # a tick from a run that has been stopped (or replaced)
             prev, self._etags = self._etags, now
-            if prev is None or set(prev) != set(now):
+            prev_version, self._set_version = self._set_version, version
+            if prev is None or set(prev) != set(now) or prev_version != version:
                 self._publish_locked("manifest-changed", {})
-                return
+                return True
             for pid, etag in now.items():
                 if prev[pid] != etag:
                     self._publish_locked("panel-changed", {"id": pid, "etag": etag})
+        return True
 
     def _publish_locked(self, event: str, data: dict[str, Any]) -> None:
         self._seq += 1
