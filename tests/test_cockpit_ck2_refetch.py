@@ -224,6 +224,7 @@ Object.defineProperty(N.prototype, "nextElementSibling", { get() { if (!this.par
   ok(h2.textContent === "Tray", "the heading keeps no count tail: " + h2.textContent);
   ok(pill.textContent === "3", "the pill shows the new count: " + pill.textContent);
   ok(pill.hidden === false, "the pill is shown");
+  ok(s.ctx.entry.title === "Tray (3)", "a later focus view opens with the current title: " + s.ctx.entry.title);
   globalThis.__next = mkc("Tray (0)", 0);
   ok(await K.refetchPanel("p") === "applied", "a count to 0 applies");
   ok(h2.textContent === "Tray" && pill.textContent === "0" && pill.hidden === true, "count 0 hides the pill: " + h2.textContent + "/" + pill.textContent + "/" + pill.hidden);
@@ -231,6 +232,17 @@ Object.defineProperty(N.prototype, "nextElementSibling", { get() { if (!this.par
   s.modal = true; head.remove(); s.title = "Tray (0)"; s.banner = [];
   globalThis.__next = mkc("Tray (4)", 4);
   ok(await K.refetchPanel("p") === false, "a modal copy whose title digits change declines (full reload)");
+  // a live pill with no count to show (the count disappeared): a reload redraws it
+  s.modal = false; head.kids = []; head.appendChild(h2); head.appendChild(pill); h2.parent = head; p.kids = [head, host]; head.parent = p; s.title = "Tray (3)";
+  globalThis.__next = mk("Tray (3)", "ok", "2026-10-11T12:00:00+00:00");
+  V.fromManifest({ manifest: manifest(globalThis.__next), panels: { p: globalThis.__next } });   // the manifest head no longer carries a count either
+  { const rr = await K.refetchPanel("p"); ok(rr === false, "a pill with the count gone declines (full reload): " + rr); }
+  // a tabbed card's tab labels cannot be repainted: a changed title declines, an unchanged one applies
+  pill.remove(); h2.className = "ck-tab-own"; s.title = "Tray (3)";
+  globalThis.__next = mk("Tray (4)", "ok", "2026-10-11T12:00:00+00:00");
+  ok(await K.refetchPanel("p") === false, "a tabbed card whose title changes declines (full reload)");
+  globalThis.__next = mk("Tray (3)", "ok", "2026-10-11T12:00:00+00:00");
+  ok(await K.refetchPanel("p") === "applied", "a tabbed card whose title is unchanged applies");
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
 """

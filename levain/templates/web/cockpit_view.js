@@ -2027,7 +2027,14 @@
     const bannerNow = (entry.banner || []).map((b) => String(b.text));
     for (const s of live) {
       const own = !s.modal && s.p && s.p.querySelector && s.p.querySelector(".phead h2");
-      if (own) continue;
+      if (own) {
+        // a tabbed card's visible tab labels were drawn from the entry titles at first render: a new title cannot be repainted from here
+        if (own.classList && own.classList.contains("ck-tab-own") && String(entry.title) !== String(s.title)) return false;
+        // a count pill with no count to show would sit beside a stale title: a reload redraws it
+        const nx0 = own.nextElementSibling;
+        if (nx0 && nx0.classList && nx0.classList.contains("ck-count") && !(Number.isInteger(entry.count) && entry.count >= 0)) return false;
+        continue;
+      }
       if (String(entry.title) !== String(s.title) || JSON.stringify(bannerNow) !== JSON.stringify(s.banner || [])) return false;
     }
     for (const s of live) {
@@ -2053,6 +2060,7 @@
         if (h2.textContent !== shown) h2.textContent = shown;
       }
       s.title = entry.title;
+      if (s.ctx && s.ctx.entry) s.ctx.entry = entry;   // a later focus view opens with the current title and banner
       s.banner = (entry.banner || []).map((b) => String(b.text));
       // a banner line is drawn into the panel or into its body node; either way it carries its index in data-bn
       if (s.p && s.p.querySelectorAll) {
