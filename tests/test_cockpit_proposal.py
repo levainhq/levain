@@ -19,6 +19,7 @@ from levain.consent.listing import KeyEvidence, read_evidence, read_listing
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.queue import ConsentQueue, authority_source
 from tests._h4 import h4_home
+from tests._page_gate_stub import page_gate_fields
 
 # The page under test reads its proposal window against the browser's real clock, so the seed is anchored to the
 # current hour: a fixed date ages out of that window (it did, nine days after 2026-10-17).
@@ -197,7 +198,8 @@ def _route(monkeypatch, seed, *, token: bool) -> tuple[int, dict]:
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     h = ws._Handler.__new__(ws._Handler)
     sent: list = []
-    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=ws._ConsentReader(seed.dir), surface_tokens={})
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=ws._ConsentReader(seed.dir), surface_tokens={},
+                              **page_gate_fields())
     h._off_box_token_valid = lambda: token
     h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
     h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
@@ -331,7 +333,7 @@ def _serve_route(seed, reader):
 
     h = ws._Handler.__new__(ws._Handler)
     sent: list = []
-    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=reader)
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=reader, **page_gate_fields())
     h._off_box_token_valid = lambda: True
     h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
     h._serve_consent_body("/cockpit/consent/proposals.json", head=False)

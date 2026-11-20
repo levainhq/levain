@@ -78,11 +78,13 @@ def test_the_view_script_is_app_shell_and_the_routes_are_reserved(tmp_path):
             make_server(src, port=0, extra_json={path: lambda: {}})
 
 
-def test_a_busy_server_answers_503_not_a_dead_connection(tmp_path, seeded):
+def test_a_busy_server_answers_503_not_a_dead_connection(tmp_path, seeded, monkeypatch):
+    # the thread reads are page reads: they wait on the page gate (a bounded wait), then answer 503
+    monkeypatch.setattr("levain.web_server._PAGE_READ_WAIT_SECONDS", 0.2)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=TOKEN) as (base, httpd):
         taken = 0
-        while httpd.request_gate.acquire(blocking=False):
+        while httpd.page_gate.acquire(blocking=False):
             taken += 1
         try:
             req = urllib.request.Request(base + threads.THREADS_LIST_PATH, headers={"X-Levain-Write-Token": TOKEN})
@@ -91,7 +93,7 @@ def test_a_busy_server_answers_503_not_a_dead_connection(tmp_path, seeded):
             assert e.value.code == 503
         finally:
             for _ in range(taken):
-                httpd.request_gate.release()
+                httpd.page_gate.release()
 
 
 # the thread reads the page has made, from resource timing (thread_view.js binds fetch at mount, so a wrapper installed
