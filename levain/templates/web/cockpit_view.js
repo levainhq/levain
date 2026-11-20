@@ -1537,12 +1537,6 @@
     const S = root.LevainSky;
     try { return !!(S && typeof S.isLevainFeed === "function" && S.isLevainFeed({ events: sky.events, dialect: sky.dialect })); } catch (_) { return false; }
   }
-  // the Build tab draws the sky as the compact strip the mock shows (merged lanes, its own header row), the others the full chart
-  function skySize() { return document.body && document.body.dataset && document.body.dataset.mode === "build" ? "strip" : "compact"; }
-  function skyNow(s) {
-    const k = s.skyParts;
-    return !!k && k.size === skySize();
-  }
   function skyCounts(sky) {
     const evs = Array.isArray(sky.events) ? sky.events : [];
     const repos = new Set(evs.map((e) => e && e.repo).filter((r) => typeof r === "string" && r));
@@ -1562,7 +1556,7 @@
   // animation keeps running instead of restarting. True when it did; false leaves the paint to remount.
   function updateSky(s, sky) {
     const k = s.skyParts;
-    if (!k || k.size !== skySize() || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
+    if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
     try { s.skyHandle.update({ events: sky.events, legend: sky.legend, dialect: sky.dialect }); } catch (_) { return false; }
     paintCounts(k.win, sky);
     paintLegend(k.legend, sky);
@@ -1595,7 +1589,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, size: skySize(), head: true, toggleHost: document.getElementById("ck-mctl") || document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("ck-jarbox") || document.getElementById("jumpbtn"), onHead: paintEventFigures } : { legend: false, size: skySize(), head: true, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend, dialect: sky.dialect }, hero ? { legend: false, toggleHost: document.getElementById("ck-mctl") || document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("ck-jarbox") || document.getElementById("jumpbtn"), onHead: paintEventFigures } : { legend: false, onHead: paintEventFigures }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -1603,7 +1597,7 @@
     // page's mount, which renderHero owns: this hands the legend to it (place) and never writes the live mount
     // itself. A sky anywhere else, or a page without the mount (place answers false), keeps it under its plot.
     if (!(hero && typeof hero.place === "function" && hero.place(legend))) host.appendChild(legend);
-    s.skyParts = { plot: plot, win: win, legend: legend, size: skySize() };
+    s.skyParts = { plot: plot, win: win, legend: legend };
   }
 
   // The strip chart's key: the real glyphs, drawn like the chart's own marks (sky.js). Page chrome, not data:
@@ -2162,13 +2156,6 @@
     catch (_) { /* an address that cannot be rewritten is still a working page */ }
   }
   // `fromReader`: the tab was chosen by the reader (a click, a key, the jump box), so the address follows; the first paint does not write it
-  // the sky is mounted at the size its tab wants; a tab switch remounts the ones drawn at the other size
-  function resizeSkies() {
-    for (const s of Array.from(states)) {
-      if (!s.skyParts || !s.skyHandle || !s.data || !s.data.sky || !s.body.isConnected || skyNow(s)) continue;
-      try { dropSky(s); s.body.replaceChildren(); paintSky(s, s.body, s.data.sky); } catch (_) { /* the next paint remounts */ }
-    }
-  }
   // Morning and Build are retired: a request for either, from the address, a stored choice, a key or a jump, is Home ("board") before
   // any attribute is written, so no path can pass through a mode that has no place on the page.
   function applyMode(m, fromReader) {
@@ -2179,7 +2166,6 @@
     save(MODE_KEY, m);
     if (fromReader || retired) writeHash(m);   // a retired name in the address is rewritten, so a reload does not name it again
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
-    resizeSkies();
     fillGrids();
     // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop)
     try { paintHeaderLens(); } catch (_) { /* the lens repaints on the next poll */ }
@@ -2683,7 +2669,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
