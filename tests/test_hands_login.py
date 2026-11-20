@@ -382,6 +382,20 @@ def test_the_hands_keychain_step_makes_library_preferences_without_which_securit
     assert (rig.hands_home / ".fake-security-default").read_text() == str(_kc(rig))
 
 
+def test_a_default_of_ours_with_library_preferences_since_removed_is_healed_not_refused_for_ever(rig):
+    """L3 r2 (complement LOW, deepseek MED): the directory is made on every path that can reach a set, not only when no
+    default exists: with ours the default, the directory gone and the search list lost, the set is a silent no-op
+    without it and every later login would refuse the same way."""
+    import shutil
+    _login(rig, "claude")
+    shutil.rmtree(rig.hands_home / "Library" / "Preferences")
+    (rig.hands_home / ".fake-security-list").unlink()                 # the search list drifted: a set is owed
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+    assert (rig.hands_home / "Library" / "Preferences").is_dir()
+    assert str(_kc(rig)) in (rig.hands_home / ".fake-security-list").read_text()
+
+
 def test_a_login_that_outlives_its_deadline_is_killed_and_swept(rig, monkeypatch):
     """V1 codex HIGH 2 / complement MED 1: the vendor's descendant holds the output open past a killed sudo; the
     read is bounded by the deadline and the sweep runs, under the lock. Also complement MED 2: a prompt with no

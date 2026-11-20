@@ -180,7 +180,9 @@ def vendor_missing(vendor: str) -> str | None:
     the hands prefix runs it as a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one
     installed only in the operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare
     ``env: claude: No such file or directory`` (exit 127) after the locks, the sweep and the prepare. Looked up as the
-    operator, on that PATH and nothing else: a binary the operator cannot see there the hands account cannot either."""
+    operator, on that PATH and nothing else: a binary the operator cannot see there the hands account cannot either. KNOWN
+    EDGE (L3 r2, codex MED, kept): the converse does not hold, so a binary the operator can run but the hands uid cannot
+    (a ``/usr/local/bin`` link into the operator's 0700 home) passes here and ends in the vendor launch's own error."""
     import shutil
     from levain.firing import confinement
     if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
@@ -742,10 +744,11 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
     if current is None:                      # none, or the printed one (ours included) does not exist
         _ensure_dir(hands, vendor, f"{home}/Library", entity_dir)
         _ensure_dir(hands, vendor, f"{home}/Library/Keychains", entity_dir)
-        # ``security default-keychain -s`` and ``list-keychains -s`` answer rc 0 and persist NOTHING while the account has no
-        # ``Library/Preferences`` (measured on a fresh macOS 15.7.7 hands account 11-20, levain#139,
-        # project_memory/1118-vm/leg6_fresh_evidence/l139_prefsdir_probe2.txt); with it they persist.
-        _ensure_dir(hands, vendor, f"{home}/Library/Preferences", entity_dir)
+    # ``security default-keychain -s`` and ``list-keychains -s`` answer rc 0 and persist NOTHING while the account has no
+    # ``Library/Preferences`` (measured on a fresh macOS 15.7.7 hands account 11-20, levain#139,
+    # project_memory/1118-vm/leg6_fresh_evidence/l139_prefsdir_probe2.txt); with it they persist. Made on every path that can
+    # reach a set (a default of ours that exists, with the directory since removed, included): ``Library`` is there then.
+    _ensure_dir(hands, vendor, f"{home}/Library/Preferences", entity_dir)
     st = _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True)
     if st is None:
         # The password is used here once and never stored: nothing ever unlocks this keychain.
