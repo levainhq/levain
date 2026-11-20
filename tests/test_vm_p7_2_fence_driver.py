@@ -30,11 +30,17 @@ WHY = "the agent is barred"
 REVOKED = "2026-11-20T10:00:00+00:00"
 EARLY = "2026-11-20T09:59:50.250Z"
 LATE = "2026-11-20T10:00:30.250Z"
+CALL = "2026-11-20T09:59:40.000Z"          # a call asked of the gate before the revoke
+CALL_LATE = "2026-11-20T10:00:10.000Z"     # a call asked of the gate after the revoke
+ORIGINAL_ANSWERS = getattr(D, "socket_answers", None)
 
 
-def _use(i, name="Bash"):
-    return {"type": "assistant", "message": {"role": "assistant", "content": [
+def _use(i, name="Bash", at=CALL):
+    rec = {"type": "assistant", "message": {"role": "assistant", "content": [
         {"type": "tool_use", "id": f"toolu_{i}", "name": name, "input": {"command": "sleep 15"}}]}}
+    if at is not None:
+        rec["timestamp"] = at
+    return rec
 
 
 def _result(i, text, at=None, **extra):
@@ -46,7 +52,7 @@ def _result(i, text, at=None, **extra):
 
 
 def _fenced(i, at=LATE, why=WHY, **extra):
-    return _result(i, SLOT_FENCED_TEXT.format(why=why), at, **extra)
+    return _result(i, SLOT_FENCED_TEXT.format(why=why), at, **{"is_error": True, **extra})
 
 
 def _observe(*records, **kw):
@@ -74,7 +80,8 @@ def test_a_transcript_with_a_refused_call_is_read_with_its_reason_and_what_ran_a
     o = D.observe_refusal(REFUSED, revoked_at=REVOKED)
     assert (o.refused, o.reason, o.tool, o.tool_use_id) == (True, WHY, "Bash", "toolu_3")
     assert (o.ran_before, o.ran_after, o.problem, o.refused_at, o.after_revoke) == (2, 0, None, LATE, True)
-    assert D.raw_line(o) == "P7-2 refused=1 ran_before=2 ran_after=0 after_revoke=1"
+    assert D.raw_line(o) == ("P7-2 refused=1 ran_before=2 ran_after_revoke=0 ran_unplaced=0 ran_after=0 "
+                             "after_revoke=1")
     assert D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
 
 
@@ -94,7 +101,7 @@ def test_a_reason_that_holds_a_parenthesis_is_read_whole():
 def test_a_refusal_that_is_the_first_call_is_not_a_pass():
     o = _observe(_use(1), _fenced(1))
     assert (o.refused, o.ran_before) == (True, 0)
-    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "no call had executed" in D.diagnose(o)
+    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "no call stamped before the revoke" in D.diagnose(o)
 
 
 def test_a_call_that_completes_after_the_refusal_is_not_a_pass():
@@ -118,7 +125,7 @@ def test_a_refusal_kept_only_in_a_hook_record_counts_and_only_the_first_is_read(
 
 def test_a_result_whose_content_is_a_list_of_text_parts_is_read():
     o = _observe(_use(1), _result(1, "ok"), _use(2),
-                 _result(2, [{"type": "text", "text": SLOT_FENCED_TEXT.format(why=WHY)}], LATE))
+                 _result(2, [{"type": "text", "text": SLOT_FENCED_TEXT.format(why=WHY)}], LATE, is_error=True))
     assert (o.refused, o.reason) == (True, WHY)
 
 
@@ -181,6 +188,38 @@ def test_the_pattern_is_built_from_the_broker_clients_words():
     rx = D.fenced_pattern()
     assert rx.search(SLOT_FENCED_TEXT.format(why="x")).group("why") == "x"
     assert rx.search("levain: STOPPED by a budget the operator set") is None
+
+
+def test_a_call_that_executed_after_the_revoke_then_a_fenced_call_is_not_a_pass():
+    o = _observe(_use(1), _result(1, "ok"), _use(2, at=CALL_LATE), _result(2, "ok", LATE), _use(3, at=CALL_LATE), _fenced(3))
+    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
+    assert (o.refused, o.ran_before, o.ran_after_revoke, o.ran_unplaced, o.ran_after, o.after_revoke) == (True, 1, 1, 0, 0, True)
+    assert "stamped at or after the revoke EXECUTED" in D.diagnose(o)
+
+
+def test_a_call_already_running_when_the_revoke_landed_counts_as_before_it():
+    """Its result is stamped after the revoke, but it was asked of the gate before: the clean sequence."""
+    o = _observe(_use(1), _result(1, "ok", EARLY), _use(2), _result(2, "ok", LATE), _use(3, at=CALL_LATE), _fenced(3))
+    assert (o.ran_before, o.ran_after_revoke, o.ran_unplaced, o.ran_after) == (2, 0, 0, 0)
+    assert D.judge([D.raw_line(o)], 0, D.VERDICT)[0]
+
+
+@pytest.mark.parametrize("stamp", [None, "", "yesterday", "2026-11-20T09:59:40"])
+def test_an_executed_call_with_no_readable_stamp_is_not_placed_and_is_not_a_pass(stamp):
+    o = _observe(_use(1), _result(1, "ok"), _use(2, at=stamp), _result(2, "ok"), _use(3, at=CALL_LATE), _fenced(3))
+    assert (o.ran_before, o.ran_after_revoke, o.ran_unplaced) == (1, 0, 1)
+    assert not D.judge([D.raw_line(o)], 0, D.VERDICT)[0] and "no readable stamp" in D.diagnose(o)
+
+
+def test_the_fences_words_in_a_result_that_is_not_an_error_are_a_call_that_ran():
+    words = SLOT_FENCED_TEXT.format(why=WHY)
+    o = _observe(_use(1), _result(1, words, LATE), _use(2), _result(2, "echo: " + words, LATE))
+    assert (o.refused, o.ran_before) == (False, 2) and o.problem and "fence's words" in o.problem
+
+
+def test_the_fences_words_in_an_error_result_are_the_refusal_and_a_later_clean_result_does_not_undo_it():
+    o = _observe(_use(1), _result(1, "ok"), _use(2), _fenced(2), _use(3), _result(3, "ok"))
+    assert (o.refused, o.tool_use_id, o.ran_after) == (True, "toolu_2", 1)
 
 
 # --- import and arguments ----------------------------------------------------------------------------------------------
@@ -276,6 +315,7 @@ def test_a_run_that_raises_is_incomplete_not_a_pass(tmp_path, capsys):
         raise RuntimeError("the fence server did not come up")
     rc, out = _exit(tmp_path, capsys, run_once=boom, extra=["--vendor-ready"])
     assert rc == 3 and "RESULT: INCOMPLETE" in out.out and "did not come up" in out.out
+    assert "--revoke-after-s" in out.out
 
 
 def test_a_run_whose_refusal_is_stamped_before_the_revoke_exits_nonzero(tmp_path, capsys):
@@ -291,22 +331,69 @@ def test_a_run_ended_by_a_signal_is_incomplete(tmp_path, capsys):
     assert rc == 3 and "RESULT: INCOMPLETE" in out.out and "SystemExit" in out.out
 
 
-def _fake_sudo(files):
+def test_an_exception_after_the_run_returns_is_incomplete_with_the_reason_in_result_txt(tmp_path, capsys):
+    bad = lambda cfg: D.Run(0, "oc-1", "s-0123456789abcdef", REFUSED, {"occurrences": 5}, REVOKED)    # noqa: E731
+    rc, out = _exit(tmp_path, capsys, run_once=bad, extra=["--vendor-ready"])
+    result = (tmp_path / "ev" / "RESULT.txt").read_text()
+    assert rc == 3 and result.startswith("RESULT: INCOMPLETE") and "TypeError" in result and "RESULT: INCOMPLETE" in out.out
+
+
+def _real_find_and_cat(seen):
+    """The driver's ``sudo -n`` calls, run for real on a scratch tree: the ``sudo -n`` words are dropped, the rest is executed."""
+    real = subprocess.run
+
     def run(argv, **kw):
-        if argv[2].endswith("find"):
-            return subprocess.CompletedProcess(argv, 0, "".join(f + "\n" for f in files), "")
-        return subprocess.CompletedProcess(argv, 0, files[argv[3]] , "")
+        seen.append(argv)
+        assert argv[:2] == ["sudo", "-n"]
+        return real(argv[2:], **kw)
     return run
 
 
-def test_the_transcript_is_read_from_the_fired_sessions_retained_tree_only(tmp_path, monkeypatch):
-    seen = []
-    files = {"/t/b.jsonl": "{\"b\": 1}\n", "/t/a.jsonl": "{\"a\": 1}\n{\"a\": 2}\n"}
-    inner = _fake_sudo(files)
-    monkeypatch.setattr(D.subprocess, "run", lambda argv, **kw: (seen.append(argv), inner(argv, **kw))[1])
-    cfg = D.FenceConfig("/r", tmp_path / "ev")
-    assert D.read_transcript(cfg, "s-0123456789abcdef") == ['{"a": 1}', '{"a": 2}', '{"b": 1}']
-    assert seen[0][3] == f"{cfg.profile.store}/retained/s-0123456789abcdef/tree"
+def _scratch_store(tmp_path, key="s-0123456789abcdef"):
+    profile = dataclasses.replace(D.profile_for_platform("darwin"), store=str(tmp_path / "store"))
+    tree = tmp_path / "store" / "retained" / key / "tree"
+    return D.FenceConfig("/r", tmp_path / "ev", profile=profile), tree
+
+
+def _put(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_the_transcript_is_read_from_the_fired_sessions_claude_config_only(tmp_path, monkeypatch):
+    seen: list = []
+    cfg, tree = _scratch_store(tmp_path)
+    projects = tree / "config" / "claude" / "projects"
+    _put(projects / "-work-repo" / "abc.jsonl", '{"a": 1}\n{"a": 2}\n')
+    _put(projects / "-work-repo" / "abc" / "subagents" / "agent-1.jsonl", '{"sub": 1}\n')
+    _put(tree / "repo" / "projects" / "fake.jsonl", '{"fake": 1}\n')
+    _put(tree / "repo" / "projects" / "x" / "fake2.jsonl", '{"fake": 2}\n')
+    monkeypatch.setattr(D, "TRANSCRIPT_WAIT_S", 0.0)
+    monkeypatch.setattr(D.subprocess, "run", _real_find_and_cat(seen))
+    assert D.read_transcript(cfg, "s-0123456789abcdef") == ['{"a": 1}', '{"a": 2}']
+    assert seen[0][3] == str(projects)
+
+
+def test_two_top_level_transcripts_are_incomplete_and_none_is_read(tmp_path, monkeypatch):
+    seen: list = []
+    cfg, tree = _scratch_store(tmp_path)
+    projects = tree / "config" / "claude" / "projects"
+    _put(projects / "-work-repo" / "abc.jsonl", '{"a": 1}\n')
+    _put(projects / "-other" / "def.jsonl", '{"b": 1}\n')
+    monkeypatch.setattr(D, "TRANSCRIPT_WAIT_S", 0.0)
+    monkeypatch.setattr(D.subprocess, "run", _real_find_and_cat(seen))
+    with pytest.raises(RuntimeError, match="exactly one top-level session transcript"):
+        D.read_transcript(cfg, "s-0123456789abcdef")
+    assert not any(argv[2].endswith("cat") for argv in seen)
+
+
+def test_a_transcript_only_in_the_workspace_repo_is_not_found(tmp_path, monkeypatch):
+    cfg, tree = _scratch_store(tmp_path)
+    _put(tree / "repo" / "projects" / "fake.jsonl", '{"fake": 1}\n')
+    monkeypatch.setattr(D, "TRANSCRIPT_WAIT_S", 0.0)
+    monkeypatch.setattr(D.subprocess, "run", _real_find_and_cat([]))
+    with pytest.raises(RuntimeError, match="no transcript file"):
+        D.read_transcript(cfg, "s-0123456789abcdef")
 
 
 def test_no_retained_transcript_is_incomplete_and_does_not_point_at_a_removed_option(tmp_path, monkeypatch):
@@ -410,22 +497,38 @@ def test_a_socket_that_answers_is_not_free_and_is_left_in_place(short_dir):
     assert not free and "answers" in note and path.exists()
 
 
-def test_a_stale_socket_this_operator_owns_is_free_and_removed(short_dir):
+def test_a_socket_that_refuses_a_connect_is_passed_through_and_never_removed(short_dir):
     path = short_dir / "fence.sock"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(str(path))
-    assert path.exists()
+    before = os.lstat(path)
     free, note = D.fence_socket_free(path)
-    assert free and "removed a stale socket" in note and not path.exists()
+    assert free and "refuses" in note and "left in place" in note
+    assert (os.lstat(path).st_dev, os.lstat(path).st_ino) == (before.st_dev, before.st_ino)
 
 
-def test_a_stale_socket_of_another_owner_is_not_free_and_not_touched(short_dir, monkeypatch):
+def test_the_probe_calls_no_removal(short_dir, monkeypatch):
     path = short_dir / "fence.sock"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(str(path))
-    monkeypatch.setattr(D.os, "geteuid", lambda: os.stat(path).st_uid + 1)
-    free, note = D.fence_socket_free(path)
-    assert not free and "not this operator's" in note and path.exists()
+    def refuse(*a, **k):
+        raise AssertionError("the probe removed something")
+    with monkeypatch.context() as scoped:
+        for name in ("unlink", "remove", "rmdir", "rename", "replace"):
+            scoped.setattr(D.os, name, refuse)
+        free = D.fence_socket_free(path)[0]
+    assert free and path.exists()
+
+
+def test_socket_answers_is_true_only_for_a_listening_server(short_dir):
+    path = short_dir / "fence.sock"
+    assert D.socket_answers(path) is False
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(path))
+        assert D.socket_answers(path) is False      # bound, not yet listening
+        server.listen(1)
+        assert D.socket_answers(path) is True
+    assert D.socket_answers(path) is False
 
 
 def test_a_file_that_is_not_a_socket_is_not_free_and_not_touched(short_dir):
@@ -460,6 +563,7 @@ def wired(tmp_path, monkeypatch):
     sock.touch()
     monkeypatch.setattr(D.subprocess, "Popen", Recording)
     monkeypatch.setattr(D, "_fence_socket", lambda profile: sock)
+    monkeypatch.setattr(D, "socket_answers", lambda path: True)
     monkeypatch.setattr(D, "revoke_mid_session", lambda rig, agent: revokes.append(agent))
     for name, value in (("FENCE_UP_TIMEOUT_S", 5.0), ("START_TIMEOUT_S", 5.0), ("STOP_GRACE_S", 5.0)):
         monkeypatch.setattr(D, name, value)
@@ -478,9 +582,9 @@ def _drive(w, rig):
         return D.fire_and_revoke(w.cfg, rig, "oc", "ag", os.environ, children)
 
 
-def test_a_fence_server_that_exits_at_once_is_an_error_and_the_fire_is_never_started(wired):
+def test_a_fence_server_that_exits_at_once_is_an_error_and_the_fire_is_never_started(wired, monkeypatch):
     wired.wire(EXIT(7), None)
-    os.unlink(wired.root / "fence.sock")
+    monkeypatch.setattr(D, "socket_answers", lambda path: False)
     with pytest.raises(RuntimeError, match=r"did not come up \(exit 7"):
         _drive(wired, _fake_rig(wired.root))
     assert len(wired.made) == 1 and all(p.poll() is not None for p in wired.made) and wired.revokes == []
@@ -520,6 +624,51 @@ def test_a_child_that_ignores_the_terminate_is_killed(wired, monkeypatch):
     assert all(p.poll() is not None for p in wired.made)
 
 
+def test_the_fence_is_not_up_while_its_socket_file_exists_but_nothing_answers(wired, monkeypatch, short_dir):
+    stale = short_dir / "fence.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(stale))
+    monkeypatch.setattr(D, "socket_answers", ORIGINAL_ANSWERS)
+    monkeypatch.setattr(D, "_fence_socket", lambda profile: stale)
+    monkeypatch.setattr(D, "FENCE_UP_TIMEOUT_S", 1.0)
+    wired.wire(SLEEP, None)
+    with pytest.raises(RuntimeError, match="did not come up"):
+        _drive(wired, _fake_rig(wired.root))
+    assert len(wired.made) == 1 and all(p.poll() is not None for p in wired.made) and stale.exists()
+
+
+def test_the_fence_is_up_once_its_socket_answers(wired, monkeypatch, short_dir):
+    path = short_dir / "fence.sock"
+    monkeypatch.setattr(D, "socket_answers", ORIGINAL_ANSWERS)
+    monkeypatch.setattr(D, "_fence_socket", lambda profile: path)
+    wired.wire(SLEEP, [sys.executable, "-c", "import time; time.sleep(0.3)"])
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(path))
+        server.listen(4)
+        rc, key, _ = _drive(wired, _fake_rig(wired.root))
+    assert (rc, key) == (0, "s-0123456789abcdef")
+
+
+def test_the_stop_reaches_what_the_fire_started_in_its_group(wired, tmp_path):
+    pidfile = tmp_path / "grandchild.pid"
+    fire = [sys.executable, "-c",
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+            f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+            "time.sleep(300)"]
+    wired.wire(SLEEP, fire)
+    wired.cfg.fire_timeout_s = 4.0
+    try:
+        with pytest.raises(RuntimeError, match="still running"):
+            _drive(wired, _fake_rig(wired.root))
+        assert pidfile.exists()
+        grandchild = int(pidfile.read_text())
+        assert _wait_gone(grandchild)
+    finally:
+        if pidfile.exists() and not _gone(int(pidfile.read_text())):
+            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
 def test_the_earlier_signal_handlers_are_put_back():
     before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     with D.stops_children_on_signals():
@@ -544,6 +693,7 @@ sleeper = [sys.executable, "-c", "import time; time.sleep(300)"]
 sock = work / "fence.sock"
 sock.touch()
 D._fence_socket = lambda profile: sock
+D.socket_answers = lambda path: True
 D.fence_server_command = lambda *a, **k: sleeper
 D.fire_command = lambda *a, **k: sleeper
 rig = type("Rig", (), {"store": type("S", (), {"directory": work}), "world": type("W", (), {"root": work}),
@@ -560,6 +710,13 @@ def _gone(pid):
     except ProcessLookupError:
         return True
     return False
+
+
+def _wait_gone(pid, seconds=10.0):
+    end = time.monotonic() + seconds
+    while not _gone(pid) and time.monotonic() < end:
+        time.sleep(0.1)
+    return _gone(pid)
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
@@ -589,3 +746,49 @@ def test_a_signal_stops_the_fence_and_the_fire_and_ends_the_run(tmp_path, sig):
             if not _gone(pid):
                 os.kill(pid, signal.SIGKILL)
         proc.communicate()
+
+
+#: a run whose world preparation is where the signal lands: the rig's constructor signals this very process
+PREPARE_SCRATCH = """
+import dataclasses, os, signal, subprocess, sys, types
+from pathlib import Path
+from scripts.vm_harness import p7_2_fence_driver as D
+work = Path(sys.argv[1])
+original = subprocess.Popen
+class Recording(original):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        with open(work / "pids", "a") as f:
+            f.write(str(self.pid) + "\\\\n")
+subprocess.Popen = Recording
+class Rig:
+    def __init__(self, root):
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("the signal did not end the run")
+package = types.ModuleType("tests")
+package.__path__ = []
+module = types.ModuleType("tests.test_agents_launch")
+module.Rig = Rig
+sys.modules["tests"], sys.modules["tests.test_agents_launch"] = package, module
+D._stage_paths = lambda profile: None
+profile = dataclasses.replace(D.profile_for_platform(sys.platform), tools_dir=str(work))
+cfg = D.FenceConfig("/r", work / "ev", vendor_ready=True, profile=profile)
+(work / "ev").mkdir()
+status, path = D.run(cfg, D.Facts(True, 501, True, True, True, True, True, True), run_once=D.real_run_once)
+print(status)
+print(path.read_text())
+"""
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_during_world_preparation_ends_the_run_incomplete_and_leaves_no_child(tmp_path, sig):
+    script = tmp_path / "scratch.py"
+    script.write_text(PREPARE_SCRATCH.replace("signal.SIGTERM)\n        raise", f"signal.{sig.name})\n        raise"))
+    work = tmp_path / "w"
+    work.mkdir()
+    env = {**os.environ, "PYTHONPATH": str(DRIVER.parents[2])}
+    r = subprocess.run([sys.executable, str(script), str(work)], env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    assert r.stdout.splitlines()[0] == "INCOMPLETE" and "SystemExit" in r.stdout
+    assert (work / "ev" / "RESULT.txt").read_text().startswith("RESULT: INCOMPLETE")
+    assert not (work / "pids").exists()
