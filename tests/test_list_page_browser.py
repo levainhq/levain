@@ -612,9 +612,9 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             # each step waits for the control it started from to be replaced (up to a cap), so it cannot pass on the node it began with
             {"eval": f"window.__prev = {TRAY}.querySelector('[data-list-more]'); "
                      f"{TRAY}.querySelector('.ep-search-input').dispatchEvent(new Event('input', {{bubbles: true}})); "
-                     "new Promise(r => { const t0 = Date.now(); const tick = () => (!window.__prev.isConnected || Date.now() - t0 > 3000) ? r(1) : setTimeout(tick, 50); tick(); })"},
+                     "new Promise(r => { const t0 = Date.now(); const tick = () => { const done = !window.__prev.isConnected; (done || Date.now() - t0 > 3000) ? r(done) : setTimeout(tick, 50); }; tick(); })"},
             {"eval": f"window.__prev = {TRAY}.querySelector('[data-list-more]'); window.LevainDashboard.redraw(); "
-                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => ((!window.__prev.isConnected && ({focus_is_control})) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => {{ const done = !window.__prev.isConnected && ({focus_is_control}); (done || Date.now() - t0 > 5000) ? r(!!done) : setTimeout(tick, 50); }}; tick(); }})"},
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
@@ -625,6 +625,8 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
     heads = json.loads(out["values"][-5])
     assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
     assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
+    assert out["values"][-3] is True, out["values"]                                # the search fold replaced the control (not a wait that timed out)
+    assert out["values"][-2] is True, out["values"]                                # the board redraw replaced it and the focus rode along
     assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view, and stays on it through a fold
 
 
