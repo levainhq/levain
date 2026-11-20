@@ -1150,7 +1150,7 @@
   // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
   // direct, full-width child.
   const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0 });
-  // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
+  // Top to bottom inside a side (the CSS used to draw this with `order`).
   const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0 });
   // ---- K5: collapse the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reordering was retired (levain#172). The
   // Memory and Identity zones are composed by composeMemory (their own rows and sections), so the layout does not reach them; the now band, sky, widgets and Needs-you strip are not zone cards and have no controls.
