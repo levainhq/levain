@@ -619,6 +619,29 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
 
 
 @needs_browser
+def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives_focus_to_it_when_the_page_draws_it_again(tmp_path: Path, monkeypatch: Any) -> None:
+    # the card is mid-redraw (drawn without its control) at the moment the view closes: the control the page draws next is given the focus (the ask acts only while focus is on the body; if .pexpand holds it, it stays there)
+    src = _carried_install(tmp_path, monkeypatch)
+    ctl = "document.querySelector('[data-ck-panel=tray] [data-list-more]')"
+    focus_is_control = f"document.activeElement && document.activeElement === {ctl}"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "document.querySelectorAll('[data-ck-panel=tray] .more-foot').forEach(n => n.remove()); 1"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"eval": "window.LevainDashboard.redraw(); "
+                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 3000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
+        ])
+    assert out["values"][-1] is True, out["values"]
+
+
+@needs_browser
 def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_and_a_search_finds_them_in_the_full_list(tmp_path: Path, monkeypatch: Any) -> None:
     src = _carried_install(tmp_path, monkeypatch, all_desk=True, intentions=False)
     type_q = lambda q: (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
