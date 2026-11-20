@@ -2445,17 +2445,72 @@
     return Array.from(document.querySelectorAll(".xfilter-input")).filter((i) => i.offsetParent !== null);
   }
 
-  // ---- the jump box: one search path with the filters. A panel title, a loaded row, or "search the store" ----
+  // ---- the jump box: one search path with the filters. A location, a loaded row, or "search the store" ----
+  // The targets, in the order the list shows them: the places first, then the current place's targets, then the other places' targets
+  // (each group in the page's draw order), then the masthead's actions; loaded rows and the store search follow. A target is found
+  // in the page, not named in a table: a node with a data-ck-panel, a zone, a board or settings panel, the Needs and Drop sections,
+  // the place buttons and the actions. A node with no label of its own is not listed.
   const JUMP_ROW_CAP = 14;
+  const JUMP_NODES = "[data-ck-panel], section.ck-zone, #ck-needs, #ck-drop, #board .panel, .dev-zone .panel";
+  const JUMP_PLACES = ["home", "desk", "room", "memory", "settings"];
+  const JUMP_LABEL_OF = tableOf({ state: "State line" });   // a node whose markup carries no text of its own to name it
   let palette = null;
+  const squash = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  // The label a node is listed under: its first h2, else h3, else .rv-title, else a card's .k, else its own aria-label.
+  function jumpLabel(n) {
+    for (const q of ["h2", "h3", ".rv-title", ".k"]) {
+      const h = n.querySelector(q);
+      if (h && squash(h.textContent)) return squash(h.textContent);
+    }
+    return squash(n.getAttribute("aria-label")) || JUMP_LABEL_OF[n.dataset.ckPanel] || "";
+  }
+  // The place a node is drawn in ("" when no place draws it): Settings, Desk and Room by their zone, then the tab list the node (or the
+  // zone's panels) carries; a widget card is drawn only on Home; the state line follows the place it is read from.
+  function jumpPlaceOf(n, here) {
+    if (n.closest(".dev-zone, .ck-thiscockpit")) return "settings";
+    if (n.closest(".dv-zone")) return "desk";
+    if (n.closest(".rv-zone")) return "room";
+    if (n.id === "state") return here === "memory" ? "memory" : "home";
+    const id = n.dataset.ckPanel;
+    const holder = n.closest("[data-modes]") || n.querySelector("[data-modes]");
+    const tabs = ((holder && holder.dataset.modes) || "").split(" ").filter(Boolean);
+    const onHome = !tabs.length || tabs.some((t) => t === "board" || RETIRED_MODES.indexOf(t) >= 0);
+    if (n.classList.contains("ck-card")) return onHome ? "home" : "";
+    if (id && PLACED_ON[id]) return PLACED_ON[id];
+    return onHome ? "home" : "memory";
+  }
+  function jumpTargets() {
+    const P = root.LevainPlaces, here = P && typeof P.place === "function" ? P.place() : "";
+    const places = [], mine = [], other = [], actions = [], seen = new Set();
+    for (const b of document.querySelectorAll("[data-ia-place-btn]")) {
+      const c = b.cloneNode(true);
+      for (const x of c.querySelectorAll(".ia-needs")) x.remove();
+      if (squash(c.textContent)) places.push({ kind: "place", label: squash(c.textContent), place: b.dataset.iaPlaceBtn, node: b });
+    }
+    const found = [];
+    for (const n of document.querySelectorAll(JUMP_NODES)) {
+      if (seen.has(n) || NOT_DRAWN[n.dataset.ckPanel] || n.closest("[hidden]")) continue;
+      seen.add(n);
+      const label = jumpLabel(n), at = jumpPlaceOf(n, here);
+      if (!label || !at) continue;
+      found.push({ kind: n.classList.contains("ck-card") || n.matches("#ck-needs, #ck-drop, p#state") ? "card" : "panel", label: label, place: at, node: n });
+    }
+    // a zone that only wraps a panel of the same name is that panel's heading, not a second place to go
+    for (const t of found) {
+      if (t.node.matches(".ck-zone") && found.some((o) => o !== t && t.node.contains(o.node) && fold(o.label) === fold(t.label))) continue;
+      (t.place === here ? mine : other).push(t);
+    }
+    for (const b of document.querySelectorAll(".ia-act[data-phone-jump]")) {
+      // Drop is the #ck-drop card above, so only the actions that open a dialog are listed here
+      if (b.dataset.phoneJump === "drop") continue;
+      const label = squash((b.querySelector(".ia-lbl") || b).textContent);
+      if (label) actions.push({ kind: "action", label: label, node: b });
+    }
+    return places.concat(mine, other, actions);
+  }
   function jumpItems(q) {
     const terms = termsOf(q);
-    const items = [];
-    for (const h of document.querySelectorAll("#board .panel > .phead h2")) {
-      const panel = h.closest(".panel");
-      if (NOT_DRAWN[panel.dataset.ckPanel]) continue;
-      if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel });
-    }
+    const items = jumpTargets().filter((t) => !terms.length || hits(fold(t.label), terms));
     const rows = [];
     if (terms.length) {
       for (const s of states) {
@@ -2475,11 +2530,11 @@
     return items.concat(rows.slice(0, JUMP_ROW_CAP));
   }
   // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
-  // id (a redraw replaces every panel node), else the node as given.
+  // id (a redraw replaces every panel and card node), else the node as given.
   function livePanel(node) {
     const id = node.dataset ? node.dataset.ckPanel : "";
     if (node.isConnected || !id) return node;
-    return Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
+    return Array.from(document.querySelectorAll("[data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
   }
   // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
   let handOff = null;
@@ -2523,7 +2578,7 @@
     dlg.setAttribute("aria-label", "Jump");
     const box = el("div", "palette-box");
     const input = el("input", "palette-input");
-    input.placeholder = "Jump to a panel or a row";
+    input.placeholder = "Jump to a place, a panel or a row";
     input.setAttribute("aria-label", "Jump to");
     const list = el("ul", "palette-list");
     list.setAttribute("role", "listbox");
@@ -2547,13 +2602,42 @@
       close();
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
-      if (it.kind === "panel") {
-        // a panel the current tab hides is reached through the first tab that shows it
-        // the panel as the page has it now: a redraw since the list was drawn has replaced the node the list holds
+      const raf = typeof root.requestAnimationFrame === "function" ? root.requestAnimationFrame.bind(root) : null;
+      const drawn = (n) => !!n && typeof n.getClientRects === "function" && n.getClientRects().length > 0;
+      // a place paints a frame after the switch: wait (a bounded number of frames) for the node to be drawn, then land
+      const whenDrawn = (get, fn, tries) => {
+        const n = get();
+        if (drawn(n) || !raf || (tries || 0) >= 30) return fn(n);
+        raf(() => whenDrawn(get, fn, (tries || 0) + 1));
+      };
+      if (it.kind === "action") {
+        // the masthead button's own click: the dialog opens exactly as a press opens it, and takes focus itself
+        it.node.click();
+        return; }
+      if (it.kind === "place") {
+        const P = root.LevainPlaces;
+        if (P && typeof P.go === "function") P.go(it.place);
+        const firstContainer = () => Array.from(document.querySelectorAll(".panel, .dv-zone, .rv-zone, #ck-needs")).find((n) => drawn(n) && !n.closest("[hidden]")) || null;
+        const settled = (tries) => {
+          const up = document.body.dataset.iaPlace === it.place;
+          const first = up ? firstContainer() : null;
+          if (first) return landOnPanel(first, true);
+          if (raf && tries < 30) raf(() => settled(tries + 1));
+        };
+        settled(0);
+        return; }
+      if (it.kind === "panel" || it.kind === "card") {
+        // the node as the page has it now: a redraw since the list was drawn has replaced the node the list holds
         const node = livePanel(it.node);
-        const changed = revealTab(node);
+        const P = root.LevainPlaces, here = P && typeof P.place === "function" ? P.place() : "";
+        const at = jumpPlaceOf(node, here);
+        // Settings is reached through its place; a target Home draws is reached through Home when it is not on a tab at all (the
+        // Needs and Drop sections); every other panel through the first tab that shows it
+        if (at === "settings" || at === "desk" || at === "room") { if (here !== at && P && P.go) P.go(at); }
+        else if (at === "home" && here !== "home" && !node.closest("[data-modes]") && !node.querySelector("[data-modes]") && node.id !== "state") { if (P && P.go) P.go("home"); }
+        else { revealTab(node.closest("[data-modes]") || node.querySelector("[data-modes]") || node); }
         if (node.ckShowTab) node.ckShowTab();
-        after(changed, () => landOnPanel(node, true));
+        whenDrawn(() => livePanel(node), (n) => landOnPanel(n, true));
         return; }
       // a row in a panel on another tab (crystals, a Memory section, an episode list) is reached through that panel's tab, the same way
       const changed = revealTab(it.state.p);
@@ -2571,7 +2655,8 @@
         li.setAttribute("role", "option");
         li.id = "palette-opt-" + i;
         li.setAttribute("aria-selected", i === sel ? "true" : "false");
-        li.append(el("span", "pk", it.kind === "panel" ? "panel" : it.kind === "store" ? "store" : "row"), el("span", "pl", it.label));
+        li.dataset.kind = it.kind;
+        li.append(el("span", "pk", it.kind), el("span", "pl", it.label));
         if (it.where) li.appendChild(el("span", "pw", it.where));
         li.addEventListener("click", () => choose(it));
         list.appendChild(li);
@@ -2602,6 +2687,9 @@
     refresh();
     input.focus();
   }
+
+  K.jumpLabel = jumpLabel;   // the one labeller: tests/test_cockpit_jump_coverage_browser.py reads its labels through it
+  K.jumpTargets = jumpTargets;
 
   function install() {
     // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
