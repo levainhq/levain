@@ -2446,6 +2446,7 @@
   }
 
   // ---- the jump box: one search path with the filters. A panel title, a loaded row, or "search the store" ----
+  const JUMP_ROW_CAP = 14;
   let palette = null;
   function jumpItems(q) {
     const terms = termsOf(q);
@@ -2455,6 +2456,7 @@
       if (NOT_DRAWN[panel.dataset.ckPanel]) continue;
       if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel });
     }
+    const rows = [];
     if (terms.length) {
       for (const s of states) {
         if (!onPage(s) || !s.searchable || NOT_DRAWN[s.pid]) continue;
@@ -2464,13 +2466,13 @@
           if (n < 5 && hits(hays[i] || "", terms)) {
             n++;
             const text = d.kind === "roster" ? it.name : d.kind === "log" ? logLine(it) : it.text;
-            items.push({ kind: "row", label: String(text), where: s.title, state: s, q: q });
+            rows.push({ kind: "row", label: String(text), where: s.title, state: s, q: q });
           }
         });
-        if ((d.search || {}).scope === "store") items.push({ kind: "store", label: "Search " + s.title + " for “" + q + "”", state: s, q: q });
+        if ((d.search || {}).scope === "store") rows.push({ kind: "store", label: "Search " + s.title + " for “" + q + "”", state: s, q: q });
       }
     }
-    return items.slice(0, 14);
+    return items.concat(rows.slice(0, JUMP_ROW_CAP));
   }
   // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
   // id (a redraw replaces every panel node), else the node as given.
@@ -2525,12 +2527,22 @@
     input.setAttribute("aria-label", "Jump to");
     const list = el("ul", "palette-list");
     list.setAttribute("role", "listbox");
+    list.id = "palette-list";
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-expanded", "true");
+    input.setAttribute("aria-controls", list.id);
+    input.setAttribute("aria-autocomplete", "list");
     box.append(input, list);
     dlg.appendChild(box);
+    const back = document.activeElement;
     document.body.appendChild(dlg);
-    palette = { dlg: dlg, input: input };
     let items = [], sel = 0;
-    const close = () => { dlg.remove(); palette = null; };
+    const close = (restore) => {
+      dlg.remove();
+      palette = null;
+      if (restore && back && back !== document.body && back.isConnected && typeof back.focus === "function") back.focus();
+    };
+    palette = { dlg: dlg, input: input, close: close };
     const choose = (it) => {
       close();
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
@@ -2557,6 +2569,7 @@
       items.forEach((it, i) => {
         const li = el("li");
         li.setAttribute("role", "option");
+        li.id = "palette-opt-" + i;
         li.setAttribute("aria-selected", i === sel ? "true" : "false");
         li.append(el("span", "pk", it.kind === "panel" ? "panel" : it.kind === "store" ? "store" : "row"), el("span", "pl", it.label));
         if (it.where) li.appendChild(el("span", "pw", it.where));
@@ -2564,16 +2577,28 @@
         list.appendChild(li);
       });
       if (!items.length) list.appendChild(el("li", "pl-none", "nothing matches"));
+      mark(false);
+    };
+    // the selection moves without a redraw: the highlight, the id the input names, and the row kept inside the scrolled list
+    const mark = (scroll) => {
+      let cur = null;
+      items.forEach((it, i) => {
+        const li = list.children[i];
+        li.setAttribute("aria-selected", i === sel ? "true" : "false");
+        if (i === sel) cur = li;
+      });
+      if (cur) input.setAttribute("aria-activedescendant", cur.id); else input.removeAttribute("aria-activedescendant");
+      if (cur && scroll && typeof cur.scrollIntoView === "function") cur.scrollIntoView({ block: "nearest" });
     };
     const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); };
     input.addEventListener("input", refresh);
     input.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") { ev.preventDefault(); close(); }
-      else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); draw(); }
-      else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); draw(); }
+      if (ev.key === "Escape") { ev.preventDefault(); close(true); }
+      else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); mark(true); }
+      else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); mark(true); }
       else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
     });
-    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(); });
+    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(true); });
     refresh();
     input.focus();
   }
@@ -2611,7 +2636,7 @@
     document.addEventListener("mouseover", (ev) => { const p = ev.target && ev.target.closest ? ev.target.closest(".panel") : null; if (p) hoverPanel = p; });
     document.addEventListener("keydown", (ev) => {
       if (ev.defaultPrevented) return;
-      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.dlg.remove(), palette = null; else openJump(); return; }
+      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.close(true); else openJump(); return; }
       if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
       if (document.querySelector(".modal-overlay")) return;
       const sheet = document.getElementById("pr-sheet");

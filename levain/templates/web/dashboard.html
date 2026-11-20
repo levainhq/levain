@@ -49,7 +49,7 @@
                cockpit_stream.js adopts it. The state words sit alone in the role=status span (the only part spoken); the age beside
                it is outside it, so a ticking age is never announced. Static here so the first paint already has the slot. -->
           <span class="livechip" id="freshline" data-state="connecting" title="Connecting: the board is being read."><span class="fl-state" role="status">connecting</span><span class="fl-age" hidden></span></span>
-          <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
+          <button id="jumpbtn" type="button" aria-keyshortcuts="Control+K Meta+K">Jump<kbd>⌘K</kbd></button>
         </div>
         <div class="themesw" role="group" aria-label="Theme">
           <button type="button" data-theme-set="system" aria-pressed="false" aria-label="Follow the system theme" title="System">&#9680;</button>
