@@ -113,14 +113,43 @@ def test_the_runtime_dir_is_a_fresh_tmpfs_after_its_ancestors_pins_and_before_an
             assert i > view[0], (op, args)
 
 
-def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path, rd, monkeypatch) -> None:
+def _only_sockets_under(monkeypatch, top: Path, foreign: Path | None = None) -> None:
+    """``/proc/net/unix`` lists every socket in the network namespace, other test workers' included, so a
+    foreign ``S.dirmngr`` whose home its owner deletes between the listing and the view fails the plan
+    with "could not list the gnupg home" (CI land runs 44656769259 and 44669581600, 2026-11-19: a vanished foreign
+    home is the plan's designed fail-closed refusal, and a transient one). A test that is about its own
+    sockets reads only those. ``foreign``: a path injected into the listing, standing for another
+    worker's socket; its directory is deleted once the plan has chosen its views, the vanish itself."""
+    real = conf._bound_unix_socket_paths
+    monkeypatch.setattr(conf, "_bound_unix_socket_paths", lambda: [
+        s for s in real() + ([str(foreign)] if foreign else []) if Path(s).resolve().is_relative_to(top.resolve())])
+    if foreign is not None:
+        real_views = conf._gnupg_home_views
+
+        def views_then_vanish(*a, **k):
+            out = real_views(*a, **k)
+            import shutil
+            shutil.rmtree(foreign.parent)
+            return out
+        monkeypatch.setattr(conf, "_gnupg_home_views", views_then_vanish)
+
+
+@pytest.mark.parametrize("foreign_worker", [False, True])
+def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path, rd, monkeypatch, foreign_worker) -> None:
     """``XDG_RUNTIME_DIR`` two levels under a directory bash can write (``~/.cache/xdg``): renaming its
     parent would carry the host's runtime dir, dirmngr included, to a name the next session has no view
     of. Its ancestors are pinned before its view, as a GNUPGHOME view's are. With the container sockets
-    allowed, so that no denied socket under the dir pins its ancestors by another road."""
+    allowed, so that no denied socket under the dir pins its ancestors by another road.
+    ``foreign_worker``: another worker's dirmngr home vanishes mid-plan; this test reads its own sockets only."""
     top = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvxd"))
     root = top / "a" / "xdg"
     s = _listen(root / "gnupg" / "S.gpg-agent")
+    foreign = None
+    if foreign_worker:
+        foreign = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvhm")) / ".docker" / "gh" / "S.dirmngr"
+        foreign.parent.mkdir(parents=True, mode=0o700)
+        foreign.write_text("")
+    _only_sockets_under(monkeypatch, top, foreign)
     monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
     try:
         root = root.resolve()
@@ -136,6 +165,8 @@ def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path,
         s.close()
         import shutil
         shutil.rmtree(top)
+        if foreign is not None:
+            shutil.rmtree(foreign.parents[2], ignore_errors=True)
 
 
 def test_no_socket_comes_back_on_its_own(tmp_path, rd) -> None:
