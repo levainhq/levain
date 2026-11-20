@@ -225,13 +225,22 @@ CLAUDE_USER_LAYER = ("agents", "plugins/installed_plugins.json", "plugins/market
 MARKETPLACES_REMOVE_CLAUSE = (" and `plugins/known_marketplaces.json` beside it (whether leaving that file "
                               "brings the tree back is not measured)")
 _CLAUDE_SETTINGS_KEYS = ("enabledPlugins", "extraKnownMarketplaces", "mcpServers")
-#: The settings ``env`` block sets variables of the next hands process, which can undo the chat's own environment
-#: (the connectors-off variable among them), so it is refused as a key too, except as an empty object: a plain claude
-#: run writes no env block, and an empty one sets nothing.
+#: Why a user-layer entry is refused, worded for the operator who must remove it. The settings ``env`` block is not a
+#: plugin: it sets variables of the next hands process and can undo the chat's own environment (the connectors-off
+#: variable among them), so it is refused as a key too, except as an empty object (a plain claude run writes no env
+#: block, and an empty one sets nothing).
+USER_LAYER_PLUGIN_REASON = ("a user-level agent, plugin or plugin setting ({where}), which can bring MCP servers the "
+                            "registry does not hold")
+USER_LAYER_ENV_REASON = ("a settings `env` block ({where}), which can reset the connectors-off variable and any other "
+                         "variable of the next hands process (an operator's proxy variable belongs in the operator "
+                         "layer)")
 
 
-def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> str | None:
-    """A user-level agent, plugin or plugin setting in the hands account's Claude config home, or None. Read as the
+def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> tuple[str, str] | None:
+    """``(where, why)`` for what the hands account's Claude config home holds that a chat must not start over, or None:
+    a user-level agent, plugin or plugin setting (:data:`USER_LAYER_PLUGIN_REASON`) or a non-empty settings ``env``
+    block (:data:`USER_LAYER_ENV_REASON`). When settings.json holds both kinds, every refused key is named and both
+    reasons are given. Read as the
     hands user (:func:`levain.firing.hands_login._lstat`, :func:`~levain.firing.hands_login.conf_read`), under the
     launch's locks; a read that fails raises, never reads as absent.
 
@@ -241,7 +250,7 @@ def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> str | Non
     d = hl.config_home(hands, "claude")
     for rel in CLAUDE_USER_LAYER:
         if hl._lstat(hands, "claude", f"{d}/{rel}", entity_dir=entity_dir, held=True) is not None:
-            return f"{d}/{rel}"
+            return f"{d}/{rel}", USER_LAYER_PLUGIN_REASON
     got = hl.conf_read(hands, "claude", d, "settings.json", entity_dir=entity_dir)
     if got is None:
         return None
@@ -251,13 +260,15 @@ def claude_user_layer(hands: HandsIdentity, entity_dir: Path | str) -> str | Non
         settings = None
     if not isinstance(settings, dict):
         raise HandsChatRefused(f"the hands account's Claude settings file {d}/settings.json is not one JSON object, "
-                               "so whether it enables a plugin or names an MCP server cannot be checked; fix or "
-                               "remove it")
-    if any(k in settings for k in _CLAUDE_SETTINGS_KEYS):
-        return f"{d}/settings.json"
-    if "env" in settings and settings["env"] != {}:
-        return f"{d}/settings.json, its `env` key"
-    return None
+                               "so whether it enables a plugin, names an MCP server or sets an environment "
+                               "variable cannot be checked; fix or remove it")
+    keys = [k for k in _CLAUDE_SETTINGS_KEYS if k in settings]
+    env = "env" in settings and settings["env"] != {}
+    if not keys and not env:
+        return None
+    reasons = ([USER_LAYER_PLUGIN_REASON] if keys else []) + ([USER_LAYER_ENV_REASON] if env else [])
+    named = ", ".join(f"`{k}`" for k in keys + (["env"] if env else []))
+    return f"{d}/settings.json, its {named} key", "; and ".join(reasons)
 
 
 def _layer_dir(d: Path, read: Callable[[str], bool]) -> Path | None:
@@ -801,10 +812,9 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                                        "which can name MCP servers the registry does not hold; remove it")
             user = claude_user_layer(hands, entity_dir) if vendor == "claude" else None
             if user is not None:
-                raise HandsChatRefused(f"the hands account's Claude config home holds a user-level agent, plugin or "
-                                       f"plugin setting ({user}), which can bring MCP servers the registry does not "
-                                       "hold; remove it" + (MARKETPLACES_REMOVE_CLAUSE
-                                                            if user.endswith("plugins/marketplaces") else ""))
+                where, why = user
+                raise HandsChatRefused(f"the hands account's Claude config home holds {why.format(where=where)}; remove it"
+                                       + (MARKETPLACES_REMOVE_CLAUSE if where.endswith("plugins/marketplaces") else ""))
             argv = chat_argv(hands, vendor)
             moved = hml.launch_still_live(res)          # L3 r3 G5: a revoke takes no hands lock; the last read
             if moved is not None:

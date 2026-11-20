@@ -563,9 +563,25 @@ def test_a_hands_settings_env_that_is_not_an_empty_object_refuses_a_claude_chat_
     home.mkdir(parents=True, exist_ok=True)
     (home / "settings.json").write_text(json.dumps({"theme": "dark", "env": env}))
     fake = FakeVendor(rig)
-    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+    with pytest.raises(hc.HandsChatRefused, match="connectors-off") as info:
         launch(rig, "claude", spawn=fake)
-    assert "settings.json" in str(info.value) and "env" in str(info.value) and fake.started == []
+    text = str(info.value)
+    assert "settings.json" in text and "`env`" in text and fake.started == []
+    assert "plugin setting" not in text and "MCP servers" not in text
+    assert_released(rig)
+
+
+def test_settings_with_a_plugin_key_and_an_env_block_names_both_keys_and_both_reasons(rig):
+    """The first matching key must not hide the env block: every refused key is listed."""
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "settings.json").write_text(json.dumps({"enabledPlugins": {}, "env": {"ENABLE_CLAUDEAI_MCP_SERVERS": "true"}}))
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="connectors-off") as info:
+        launch(rig, "claude", spawn=fake)
+    text = str(info.value)
+    assert "`enabledPlugins`" in text and "`env`" in text and "plugin setting" in text and fake.started == []
     assert_released(rig)
 
 
