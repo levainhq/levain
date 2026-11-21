@@ -524,8 +524,8 @@ class TestLifecycle:
 
             try:
                 _until(_live)
-            except AssertionError:
-                raise AssertionError(f"the host never read live: last worker_health() {seen}") from None
+            except AssertionError as exc:
+                raise AssertionError(f"the host never read live: last worker_health() {seen}") from exc
         finally:
             host.stop(timeout=10)
 
