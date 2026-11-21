@@ -19,3 +19,14 @@ def test_the_reload_wait_decisions_hold_against_stub_pages() -> None:
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     assert "# fail 0" in r.stdout or "ℹ fail 0" in r.stdout, r.stdout[-2000:]
     assert "# pass 0" not in r.stdout and "ℹ pass 0" not in r.stdout, "no test ran"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+def test_the_drive_evidence_block_carries_every_field_and_stays_bounded() -> None:
+    """The passive evidence record the driver writes into a timeout dump (tests/_drive_evidence.mjs), run in node against a stub event stream:
+    dialog timestamps and Chrome's reply to each, the request ring with a failed script and its errorText, window.__loadErrors, the shell-cache
+    entries, the resend count, and a size bound under a flood."""
+    r = subprocess.run([str(NODE), "--test", str(TESTS / "_drive_evidence.test.mjs")], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
+    assert "# fail 0" in r.stdout or "ℹ fail 0" in r.stdout, r.stdout[-2000:]
+    assert "# pass 0" not in r.stdout and "ℹ pass 0" not in r.stdout, "no test ran"

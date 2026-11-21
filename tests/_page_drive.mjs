@@ -23,6 +23,10 @@
 // (tests/_waits.py parses it by the same pattern); it is clamped to [1, 20]; anything else (2junk, inf, nan, 1e9999) is 1.
 // The fixed settle sleeps (emulate / scheme / motion / key) are not scaled.
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
+// The .txt and stderr also carry a drive-evidence block (tests/_drive_evidence.mjs): the dialogs and Chrome's replies to them, a ring of the
+// latest Document / Script / Stylesheet requests and failed loads, service-worker status events, the browser's target list, window.__loadErrors,
+// the service worker's shell-cache entries, and how many times the init reload was sent again. Everything in it is observed or read from the
+// browser and the page, never requested from the server.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>, "safe": {"top","bottom","left","right"} optional}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
@@ -230,8 +234,13 @@ if (!ws) {
 }
 let id = 0; let navStarts = 0; let mainCommits = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10)
 const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEventAt / navTrail: what the page last said and when, for the timeout block (a page that stops answering is told apart from one that never loaded)
+// The passive record of what a hang leaves (dialogs, the request ring, service-worker status events, the resend count): tests/_drive_evidence.mjs.
+// Loaded here, once, and tolerated absent: a copy of this file made without its sibling still drives, and just dumps without the block.
+let evidence = null; let evidenceMod = null;
+try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMod.createEvidence({ now: Date.now, t0: T0 }); } catch { evidence = null; }
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
+  if (evidence) evidence.onMessage(d);
   if (d.method) lastEventAt = Date.now();   // events only: the {id,result} replies to the driver's own commands (the timeout probe's included) are not the page speaking
   if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${Date.now() - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
   if (d.method === "Inspector.targetCrashed") consoleLog.push("PAGE CRASHED: Inspector.targetCrashed (the renderer died)");
@@ -253,7 +262,10 @@ ws.addEventListener("message", (m) => {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
   }
   // a prompt (the write-token ask) is declined, as an operator who has no token would
-  if (d.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: ++id, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+  if (d.method === "Page.javascriptDialogOpening") {
+    const i = ++id; if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
+    ws.send(JSON.stringify({ id: i, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+  }
   if (d.id && pend.has(d.id)) { const e = pend.get(d.id); pend.delete(d.id); e.res(d); }
 });
 ws.addEventListener("close", () => failPending(pend, "the page connection closed"));
@@ -264,7 +276,9 @@ const send = (method, params = {}) => new Promise((res, rej) => {
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
-for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable"]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
+for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable", ...(evidence ? ["ServiceWorker.enable"] : [])]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
+// a script or stylesheet that fails to load leaves its name in window.__loadErrors (read by the timeout dump); best-effort like the domains above
+if (evidence) { try { await Promise.race([send("Page.addScriptToEvaluateOnNewDocument", { source: evidenceMod.LOAD_ERRORS_SCRIPT }), sleep(3000)]); } catch {} }
 await send("Page.navigate", { url });
 const values = [], repressed = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
@@ -365,13 +379,61 @@ const stepArtifact = async (n) => {
   const o = await evaluateOutcome(`(() => { try { return JSON.stringify(${src}\n); } catch (e) { return "artifact error: " + String(e); } })()`, 3000);
   return "STEP ARTIFACT: " + ("error" in o ? "evaluation error: " + o.error : String(o.value));
 };
+// What the evidence record (tests/_drive_evidence.mjs) cannot hold, read once here and only ever by asking the browser or the page, never
+// the server: the browser's full target list (Target.getTargets on the shared Chrome's connection, /json otherwise), the page's
+// window.__loadErrors, and the service worker's shell-cache entries (one read-only evaluate in the worker target the `sw` step finds the same way).
+// Every read has its own bound, and a failed read is printed as a failure, never thrown.
+const readTargets = async () => {
+  let list = null; let source = ""; const why = [];
+  if (sharedPort && bws && ourTargetId) {
+    const r = await Promise.race([bsend("Target.getTargets").catch((e) => ({ thrown: e })), sleep(2000).then(() => null)]);
+    if (r && !r.thrown && !r.error && r.result?.targetInfos) { list = r.result.targetInfos.map((t) => ({ type: t.type, url: t.url, title: t.title, attached: t.attached })); source = "Target.getTargets"; }
+    else why.push("Target.getTargets: " + (!r ? "no answer within 2000ms" : r.thrown ? String(r.thrown.message || r.thrown) : JSON.stringify(r.error || "no targetInfos")).slice(0, 100));
+  }
+  let json = null;
+  try { json = await (await fetch(`http://127.0.0.1:${sharedPort || port}/json`, { signal: AbortSignal.timeout(2000) })).json(); }
+  catch (e) { why.push("/json: " + String(e && e.message || e).slice(0, 100)); }
+  if (!list && json) { list = json.map((t) => ({ type: t.type, url: t.url, title: t.title, attached: undefined })); source = "/json"; }
+  return { targets: list ? { source, list } : { error: "no target list (" + why.join("; ") + ")" }, json };
+};
+const readShellCache = async (json) => {
+  let origin = null; try { origin = new URL(url).origin; } catch {}
+  if (!origin || origin === "null") return { note: "the page's address has no origin" };
+  const target = (json || []).find((x) => x.type === "service_worker" && String(x.url).startsWith(origin + "/") && /\/sw\.js$/.test(x.url) && x.webSocketDebuggerUrl);
+  if (!target) return { note: json ? "no service worker target listed for " + origin : "no target list to find the service worker in" };
+  let sws = null;
+  try {
+    sws = await within(openSocket(target.webSocketDebuggerUrl, "the service worker"), 2000, "the service worker websocket");
+    const answer = await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error("no answer from the service worker within 3000ms")), 3000);
+      const gone = () => { clearTimeout(timer); rej(new Error("service worker closed")); };
+      sws.addEventListener("close", gone); sws.addEventListener("error", gone);
+      sws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id === 1) { clearTimeout(timer); res(d); } });
+      sws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: evidenceMod.SHELL_CACHE_PROBE, awaitPromise: true, returnByValue: true } }));
+    });
+    if (answer.error || answer.result?.exceptionDetails) return { note: "the read failed: " + String(JSON.stringify(answer.error || answer.result.exceptionDetails.exception?.description || answer.result.exceptionDetails.text)).slice(0, 150) };
+    return JSON.parse(answer.result.result.value);
+  } catch (e) { return { note: "the read failed: " + String(e && e.message || e).slice(0, 150) }; }
+  finally { try { sws && sws.close(); } catch {} }
+};
+const evidenceBlock = async () => {
+  if (!evidence) return "";
+  try {
+    const { targets, json } = await readTargets();
+    const pg = await evaluateOutcome("JSON.stringify({ loadErrors: window.__loadErrors || null })", 2000);
+    let page; if ("error" in pg) page = { error: pg.error }; else { try { page = JSON.parse(pg.value); } catch { page = { error: "unreadable answer" }; } }
+    return evidenceMod.renderEvidence(evidence, { targets, page, shell: await readShellCache(json) });
+  } catch (e) { return "--- drive evidence ---\nunavailable: " + String(e && e.message || e).slice(0, 200) + `\nresend fired: ${evidence.resends()}\n--- end drive evidence ---`; }
+};
 const shotOnTimeout = async (n) => {
-  let shotPath = null; let artifact = null;
+  let shotPath = null; let artifact = null; let block = "";
   try { artifact = await stepArtifact(n); } catch {}
-  try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact); } catch {}
+  try { block = await evidenceBlock(); } catch {}
+  if (block) console.error(block);   // ahead of the page-state block, whose own length cut then never reaches it; the same text goes into the txt
+  try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact, block); } catch {}
   await timeoutBlock(shotPath, artifact);
 };
-const shotOnTimeoutInner = async (n, setPath, artifact) => {
+const shotOnTimeoutInner = async (n, setPath, artifact, block = "") => {
   try {
     // the txt is written even when the screenshot is not (a wedged page answers neither): the text and state probes then say so themselves
     const p = join(dirname(stepsPath), `timeout-step-${n}.png`);
@@ -388,7 +450,7 @@ const shotOnTimeoutInner = async (n, setPath, artifact) => {
     // the page's own state beside its text: which tab, which address, which kept keys (a timeout names where the page was)
     const st = await answer("JSON.stringify({mode: document.body.dataset.mode, hash: location.hash, ready: document.readyState, local: Object.keys(localStorage), session: Object.keys(sessionStorage), savedMode: (() => { try { return [localStorage, sessionStorage].map((x) => Object.keys(x).filter((k) => /mode/i.test(k)).map((k) => k + '=' + x.getItem(k))); } catch (e) { return String(e); } })()})", 3000);
     writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail)
-      + (artifact ? "\n" + artifact : "") + "\n" + (typeof t.value === "string" ? t.value : "PAGE TEXT: " + JSON.stringify(t)));
+      + (block ? "\n" + block : "") + (artifact ? "\n" + artifact : "") + "\n" + (typeof t.value === "string" ? t.value : "PAGE TEXT: " + JSON.stringify(t)));
   } catch {}
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
@@ -498,6 +560,8 @@ for (const s of steps) {
       probe: (ms) => evaluateOutcome(NEW_DOCUMENT_PROBE, ms),
       committed: () => mainCommits > commitsBefore,
       resend: async () => {
+        const fired = evidence ? evidence.resendFired() : "?";
+        console.error(`page-drive: the init reload was sent again (resend fired: ${fired})`);
         const r = await sendWithin(3000, "Page.reload", {});
         if (r.timedOut) return { ok: false, why: "no answer to the second Page.reload" };
         if (r.error) return { ok: false, why: "refused: " + JSON.stringify(r.error) };
