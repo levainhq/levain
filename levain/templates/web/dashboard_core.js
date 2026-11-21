@@ -536,6 +536,10 @@
       // away closed it under the reader on the click and again on every redraw.
       let pin = -1;
       list.forEach((n, i) => { if (n.classList.contains("row-expanded")) pin = i; });
+      // the first row of a list always stays, however tall: the fold takes rows that do not fit AFTER it, never the one the card
+      // opens on. Without this a first row taller than the body folded itself and every row after it, and the card drew blank
+      // (levain#227, the Stream card with one long newest entry); the body clips that row under its fade and the foot opens the rest
+      pin = Math.max(pin, list.findIndex(isRow));
       for (const [i, n] of list.entries()) {
         const r = n.getBoundingClientRect();
         // rects are measured against where the body is scrolled to: add the scroll back, or a scrolled body folds too few rows
