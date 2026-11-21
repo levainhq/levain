@@ -3756,16 +3756,20 @@ def _pf_unbuilt(uid: int) -> bool:
 
 
 def verifier_uid(ctx: Ctx) -> int:
-    """``_levain_verify``'s uid, the account the confined verifier runs as. Absent = ``account-missing`` with
-    :data:`wall.VERIFIER_UNPROVISIONED` as the detail (levain#134): setup does not provision it while adopt-verify is
-    gated on 5g (PREL3_RULINGS 2a-12), so the refusal names that precondition instead of the bare account name. The
-    refusal NAME stays ``account-missing`` (the wire name the gate was ruled to fail closed with). Any other refusal
-    from the lookup passes through unchanged."""
+    """``_levain_verify``'s uid, the account the confined verifier runs as. Absent = ``account-missing`` with a
+    detail that names the precondition instead of the bare account name (levain#134), by host: Linux
+    :data:`wall.VERIFIER_MISSING`, any other host :data:`wall.VERIFIER_UNPROVISIONED`. Why the two differ is ruled in
+    ``j06_adopt_ruling.md`` (macOS) and ``j06_adopt_linux_ruling.md`` (Linux). The refusal NAME stays
+    ``account-missing`` on both (the wire name the gate was ruled to fail closed with). Any other refusal from the
+    lookup passes through unchanged."""
     try:
         return ctx.seams.account_uid(wall.EXPORT_ACCOUNT["verifier"])
     except Refused as e:
         if e.name != "account-missing":
             raise
+        host = ctx.seams.host
+        if host == "linux":
+            raise Refused("account-missing", wall.VERIFIER_MISSING.format(repair=repair_line(host))) from None
         raise Refused("account-missing", wall.VERIFIER_UNPROVISIONED) from None
 
 
@@ -4087,7 +4091,7 @@ def verify_sealed_run(ctx: Ctx, front: AdoptFront, export_class: str, bundle_dig
 
 def adopt_verify(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """``adopt-verify <session> --bundle-digest sha256:<hex>`` (CONTRACT §5.1; DESIGN §6.0): the caller by class
-    (:func:`verify_caller`), the verifier's account (:func:`verifier_uid`, ``account-missing`` naming the setup
+    (:func:`verify_caller`), the verifier's account (:func:`verifier_uid`, ``account-missing`` naming the
     precondition, levain#134), the alloc session lock (TRY, ``session-busy``), the alloc re-read under it and the caller
     re-checked (:func:`verify_caller_locked`: a changed alloc = ``no-session``), the root facts as adopt-open step 3
     (RETAINED, SCRUBBED, ``alloc.base``), the adopt lock (adopt-open's bounded wait, ``adopt-busy``: one sealed run

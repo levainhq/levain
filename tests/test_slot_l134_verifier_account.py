@@ -67,8 +67,8 @@ def test_the_gate_and_the_provisioning_move_together():
 
 # --- root: verifier_uid --------------------------------------------------------------------------------------------
 
-def _ctx(account_uid):
-    seams = RH.Seams(host="darwin", account_uid=account_uid)
+def _ctx(account_uid, host="darwin"):
+    seams = RH.Seams(host=host, account_uid=account_uid)
     return RH.Ctx(seams, None, os.getuid(), RG.OPERATOR, os.getuid(), {})
 
 
@@ -94,11 +94,40 @@ def test_verifier_uid_present_is_its_uid_and_other_refusals_pass_through():
     assert (e.value.name, e.value.detail) == ("account-out-of-range", "_levain_verify")
 
 
+# --- the detail is host-aware; the refusal name is not (levain#224, ``j06_adopt_linux_ruling.md``) ---------------------
+
+def test_macos_detail_is_the_unprovisioned_text_and_linux_names_the_managed_account_and_repair():
+    from levain.slot.layout import repair_line
+    with pytest.raises(Refused) as mac:
+        RH.verifier_uid(_ctx(_absent, "darwin"))
+    with pytest.raises(Refused) as lin:
+        RH.verifier_uid(_ctx(_absent, "linux"))
+    assert mac.value.name == lin.value.name == "account-missing"
+    assert mac.value.detail == wall.VERIFIER_UNPROVISIONED
+    d = lin.value.detail
+    assert d == wall.VERIFIER_MISSING.format(repair=repair_line("linux")) and d != wall.VERIFIER_UNPROVISIONED
+    assert d.startswith("_levain_verify:") and "managed account" in d and "missing" in d
+    assert "`" + repair_line("linux") + "`" in d and "creates it" in d
+    assert "setup does not create it" not in d and "5g" not in d and "yet" not in d
+    assert "Nothing was taken into your repo" in d and "--verifier-slots" in d
+    assert "\n" not in d and "\r" not in d and "{" not in d
+
+
+def test_linux_present_account_and_other_refusals_pass_through_as_on_macos():
+    assert RH.verifier_uid(_ctx({"_levain_verify": 794}.__getitem__, "linux")) == 794
+
+    def odd(name):
+        raise Refused("account-out-of-range", name)
+    with pytest.raises(Refused) as e:
+        RH.verifier_uid(_ctx(odd, "linux"))
+    assert (e.value.name, e.value.detail) == ("account-out-of-range", "_levain_verify")
+
+
 # --- root: the verb ----------------------------------------------------------------------------------------------
 
-def _verb(L, account_uid):
+def _verb(L, account_uid, host="darwin"):
     log: list = []
-    seams = RH.Seams(host="darwin", store=L, euid=lambda: 0, trusted=lambda st: True, account_uid=account_uid,
+    seams = RH.Seams(host=host, store=L, euid=lambda: 0, trusted=lambda st: True, account_uid=account_uid,
                      at=log.append)
     out, err = io.StringIO(), io.StringIO()
     rc = RH.main(["adopt-verify", S, "--bundle-digest", DIGEST], stdin=b"", env={"SUDO_UID": str(fx.UID)},
@@ -114,6 +143,15 @@ def test_adopt_verify_without_the_account_refuses_before_any_lock_or_root_fact(t
     rc, out, err, log = _verb(L, _absent)
     assert rc == RH.EXIT_REFUSED and out == {"ok": False, "refused": "account-missing"}
     assert "setup does not create it" in err and "_levain_verify" in err
+    assert "verify:account" not in log and "verify:2" not in log and "verify:3" not in log, log
+
+
+@GIT_ONLY
+def test_adopt_verify_on_linux_without_the_account_refuses_early_with_the_linux_detail(tmp_path):
+    L = fx.make_store(tmp_path, "delta")
+    rc, out, err, log = _verb(L, _absent, host="linux")
+    assert rc == RH.EXIT_REFUSED and out == {"ok": False, "refused": "account-missing"}
+    assert "managed account" in err and "repair" in err and "setup does not create it" not in err
     assert "verify:account" not in log and "verify:2" not in log and "verify:3" not in log, log
 
 
