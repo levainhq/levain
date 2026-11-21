@@ -542,6 +542,8 @@ class TestHttp:
                     c.close()
             assert any("subscribe failed" in rec.getMessage() and "RuntimeError" in rec.getMessage()
                        for rec in caplog.records)
+            # the stream's slot is released before the connection closes, so a failed subscribe leaks none
+            assert httpd.stream_gate._value == stream.DEFAULT_MAX_STREAMS
             c2 = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
             try:
                 c2.request("GET", "/cockpit/events")

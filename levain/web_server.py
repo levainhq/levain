@@ -279,7 +279,8 @@ class _CredentialUnavailable(Exception):
     device's is in a TRANSIENT state (STANDBY, ACTIVATING, DRAINING) after the bounded wait, or the paired-lookup
     semaphore is full (PAIR RT-1, RT-3, RU-1). Never cached, never folded into a gate's False: the one catch in
     ``_Handler.handle_one_request`` answers 503 ``broker_unavailable``. Every inner broad ``except`` on a dispatch
-    path re-raises it first (RU-5)."""
+    path re-raises it first (RU-5), except the stream's subscribe in ``_serve_stream``: it runs after the status is
+    out, where an answer would write a second status line, and the Watcher it calls never raises this."""
 
 
 class _PairFlight:
@@ -5427,7 +5428,9 @@ class _Handler(GuardedHandler):
 
     def _serve_stream(self, *, head: bool) -> None:
         """``GET /cockpit/events``: reached only through ``_route``, so the Host allowlist, the
-        cross-site refusal and the off-box token gate have already answered. Past the stream cap: 503."""
+        cross-site refusal and the off-box token gate have already answered. Past the stream cap: 503. The 200 and its
+        headers go out BEFORE the subscribe; a subscribe that raises ends the stream after the status (logged), and the
+        page reconnects."""
         srv = self.server
         # the credential is resolved (and may 503, RT-1) BEFORE any byte of the response is sent
         allowed = self._stream_allowed()
@@ -5441,9 +5444,9 @@ class _Handler(GuardedHandler):
         sub = None
         try:
             # The status line goes out before the subscribe: the first subscriber's subscribe builds the baseline
-            # manifest, which is as slow as the cockpit's slowest panel read, and a client waiting on its status line
-            # must not wait on that. The refusals that can still be answered with a status (the credential, the stream
-            # cap) are all settled above.
+            # (a manifest read, or the change probe's snapshot), which can be slow, and a client waiting on its status
+            # line must not wait on that. The refusals that can still be answered with a status are the credential
+            # step and the stream gate, both settled before this point.
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", cockpit_stream.CONTENT_TYPE)
