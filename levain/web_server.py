@@ -218,7 +218,6 @@ _PAIR_FOLLOWERS_MAX = 64          # requests that may wait on one token's lookup
 _PAIR_SLOW_LOOKUP_MS = 250        # a lookup that held its verify slot this long is logged (hold time, not refusals)
 _PAIR_SLOW_LOG_EVERY_S = 1.0      # ...as a warning at most this often; the others go to debug
 _PAIR_FOLLOW_GRACE_S = 2.0        # a follower waits the broker's own wait plus this for its leader's lookup
-_STREAM_UNCOMPARED_RECHECK_S = 0.5  # a paired stream with no clean revision to compare re-checks its device at most this often
 _PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-safe shape) is never looked up (RT-3)
 _UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
 # A browser paired by its own Turn on is labelled from its User-Agent by these words only (first match wins, so the
@@ -5298,9 +5297,11 @@ class _Handler(GuardedHandler):
         small read, no sqlite) are compared with the ones this stream holds. A moved epoch or revision re-runs the
         device check, so a revoke made by another process (``levain cockpit pair --revoke``) is seen on the next
         pass; a revision that cannot be compared (dirty, malformed or unreadable) is never adopted and never ends
-        the stream by itself: it re-runs the device check, at most once per ``_STREAM_UNCOMPARED_RECHECK_S``.
-        The baseline is the revision read before the lookup that admitted this request (``_pair_rev_seen``), taken
-        here as it stands, not read again after the credential check; when that is None the first pass runs the device
+        the stream by itself: it re-runs the device check on every pass (fail closed), so no pass rides on an earlier
+        check. Its cost, a journal read per pass while the marker is dirty, is bounded: the next paired lookup settles
+        a stuck marker. The baseline is the revision read before the lookup that admitted this request
+        (``_pair_rev_seen``), taken here as it stands, not read again after the credential check; when that is None
+        the first pass runs the device
         check and adopts the revision read just before it. In every check the epoch is read, then the revision, then the
         device; the revision is adopted only when the device check passed. The heartbeat re-check stays: every pass
         once a heartbeat interval has passed since the last heartbeat re-check runs the device check, the data path
@@ -5313,7 +5314,6 @@ class _Handler(GuardedHandler):
             return None
         srv, device = self.server, name[len(PAIRED_PREFIX):]
         seen_epoch, seen_rev = [self._pair_epoch_seen], [self._pair_rev_seen]
-        last_full = [float("-inf")]
 
         def allowed(recheck: bool) -> bool:
             epoch = srv.pair_epoch                                  # 1st
@@ -5323,14 +5323,10 @@ class _Handler(GuardedHandler):
                 rev = _pair_revision(broker.data_root) if broker is not None else None
             except Exception:  # noqa: BLE001 - an identity that cannot be read is no identity: a recheck, never "unchanged"
                 rev = None
-            if not recheck and epoch == seen_epoch[0]:
-                if rev is not None and rev == seen_rev[0]:
-                    return True
-                if rev is None and time.monotonic() - last_full[0] < _STREAM_UNCOMPARED_RECHECK_S:
-                    return True
-            last_full[0] = time.monotonic()
-            db = broker.active_db() if broker is not None else None
+            if not recheck and epoch == seen_epoch[0] and rev is not None and rev == seen_rev[0]:
+                return True                 # a None revision never takes this path: it checks on every pass
             try:
+                db = broker.active_db() if broker is not None else None
                 ok = db is not None and db.device_live(device)      # 3rd
             except Exception:  # noqa: BLE001 - a check that cannot run ends the stream; the page reconnects
                 return False

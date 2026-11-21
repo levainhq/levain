@@ -453,21 +453,28 @@ def _revokes_seen_clean_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     never between the revoke's dirty marker and its clean one (a pass in that window reads None and would add a check
     a test counting checks cannot tell apart)."""
     gate = threading.Lock()
+    held = [False]      # whether a dirty write took the gate; set and cleared only by the revoking thread
     real_bump = firejournal.bump_revision
     real_read = web_server._pair_revision
 
+    def release() -> None:
+        if held[0]:
+            held[0] = False
+            gate.release()
+
     def bump(root: Any, *, dirty: bool) -> None:
-        if dirty:
+        if dirty and not held[0]:
             gate.acquire()
+            held[0] = True
         try:
             real_bump(root, dirty=dirty)
         except BaseException:
             if dirty:
-                gate.release()      # the dirty write failed: no clean write follows, so nothing else will release
+                release()       # the dirty write failed: no clean write follows, so nothing else will release
             raise
         finally:
             if not dirty:
-                gate.release()      # the clean write, however it ended, closes the window the dirty write opened
+                release()       # a clean write, however it ended, closes the window a dirty write opened (if any)
 
     def read(root: Any) -> "str | None":
         with gate:
@@ -476,7 +483,10 @@ def _revokes_seen_clean_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     with monkeypatch.context() as m:
         m.setattr(firejournal, "bump_revision", bump)
         m.setattr(web_server, "_pair_revision", read)
-        yield
+        try:
+            yield
+        finally:
+            release()       # a dirty write whose commit failed made no clean write: the gate is let go at the end
 
 
 def _spy_device_live(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -542,11 +552,11 @@ def test_231_a_revoke_whose_clean_write_fails_still_ends_the_open_stream(src, mo
                 real(*a, **kw)
 
             monkeypatch.setattr(firejournal, "bump_revision", only_the_first)
-            monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0, raising=False)
+            monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0)
             _revoke_journal(httpd, [device])
             t0 = time.monotonic()
             assert revision_identity(httpd.broker.data_root) is None, "the marker stayed dirty"
-            _ends_within(pump, done, t0, 0.5 + 0.5 + 0.6)
+            _ends_within(pump, done, t0, 0.5 + 0.6)
         finally:
             s.close()
 
@@ -567,13 +577,101 @@ def test_231_an_unreadable_revision_neither_ends_a_good_stream_nor_hides_a_revok
             time.sleep(1.5)
             assert "at" not in done, "a revision that cannot be read ended a good stream"
             assert len(_ids(chunks)) > before, "the stream still got frames"
-            assert len(calls) <= 1.5 / 0.5 + 2, f"the uncomparable checks are rate limited, not {len(calls)}"
+            assert len(calls) > 1.5 / 0.5 + 2, f"an uncomparable revision checks on every pass, not {len(calls)} times"
             _revoke_journal(httpd, [device])
             t0 = time.monotonic()
-            _ends_within(pump, done, t0, 0.5 + 0.5 + 0.6)
+            _ends_within(pump, done, t0, 0.5 + 0.6)
         finally:
             stop.set()
             pub.join(2)
+            s.close()
+
+
+def test_231_a_check_that_passed_on_a_dirty_marker_lets_no_frame_through_after_the_revoke_commits(
+        src, monkeypatch) -> None:
+    """L3 r1 codex HIGH: a revoke made by another process while the stream's check passes on the revoke's own dirty
+    marker (the check runs between the dirty write and the commit, so it still sees the device live), and the revoke's
+    clean write then fails, so the marker stays dirty. A pass that cannot compare the revision runs the device check
+    every time, so no frame passes on the strength of that earlier check: at most the one frame already past its
+    check when the revoke commits is written, and the stream ends."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, chunks, pump, done = _stream_up(httpd, port, tok)
+        w = httpd.stream_watcher
+        armed, checked = threading.Event(), threading.Event()
+        real_live = CockpitDB.device_live
+
+        def live(self: Any, device_id: str) -> bool:
+            out = real_live(self, device_id)
+            if armed.is_set() and device_id == device:
+                checked.set()
+            return out
+
+        real_bump = firejournal.bump_revision
+        committed: dict = {}
+
+        def dirty_waits_for_a_check_then_clean_fails(root: Any, *, dirty: bool) -> None:
+            if dirty:
+                real_bump(root, dirty=True)
+                armed.set()
+                assert checked.wait(scaled(5)), "the stream ran a check on the dirty marker before the commit"
+                return
+            if "seq" not in committed:      # the first clean write runs after the commit
+                with w._lock:
+                    committed["seq"] = w._seq
+                committed["at"] = time.monotonic()
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(CockpitDB, "device_live", live)
+        monkeypatch.setattr(firejournal, "bump_revision", dirty_waits_for_a_check_then_clean_fails)
+        monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0)
+        stop, pub = _flow(httpd)
+        try:
+            time.sleep(0.4)
+            assert len(_ids(chunks)) > 3, "the flow is steady before the revoke"
+            _revoke_journal(httpd, [device])
+            assert revision_identity(httpd.broker.data_root) is None, "the marker stayed dirty"
+            _ends_within(pump, done, committed["at"], 0.5 + 0.6)
+            after = [i for i in _ids(chunks) if i > committed["seq"]]
+            assert len(after) <= 1, f"frames published after the revoke committed were written: {after}"
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_broker_that_raises_on_a_recheck_ends_the_stream_cleanly(src, monkeypatch) -> None:
+    """L3 r1 deepseek MED: the journal handle is taken inside the check's guard, so a broker that raises when a pass
+    must run the device check ends the stream (a check that cannot run), never an unhandled exception in the
+    stream's handler thread."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, _chunks, pump, done = _stream_up(httpd, port, tok_a)
+        errors: list[BaseException] = []
+        real_handle_error = httpd.handle_error
+
+        def recorded(request: Any, client_address: Any) -> None:
+            errors.append(sys.exc_info()[1])
+            real_handle_error(request, client_address)
+
+        monkeypatch.setattr(httpd, "handle_error", recorded)
+        raised: list[int] = []
+
+        def broken() -> Any:
+            raised.append(1)
+            raise RuntimeError("the broker cannot hand out its journal")
+
+        try:
+            monkeypatch.setattr(httpd.broker, "active_db", broken)
+            _revoke_journal(httpd, [b])      # another device's revoke moves the revision: the next pass checks
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+            assert raised, "the recheck asked the broker for its journal"
+            assert errors == [], f"the stream's handler thread died with an unhandled exception: {errors!r}"
+        finally:
             s.close()
 
 
