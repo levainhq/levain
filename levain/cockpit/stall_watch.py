@@ -10,7 +10,7 @@ interpreter by then; it shows what the other threads were waiting in.
 
 There is no live capture: an earlier version armed ``faulthandler.dump_traceback_later`` every tick so a C thread could
 write the stacks during the stall. That dump reads every thread's frames without the interpreter lock while they run.
-On 2026-11-21, in a process of about 100 threads, flow's bridge (which starts this watch) sat on one core for hours
+On 2026-11-21, in a process of about 100 threads, flow's bridge (which starts this watch) sat on one core
 with that thread spinning in the interpreter's thread-state check (``tstate_is_freed``) after a frame it printed as
 ``<invalid frame>``, and the ``cancel_dump_traceback_later`` the next tick makes waits for that thread (levain#238).
 Nothing in this module calls faulthandler's timed dump or cancels it.
