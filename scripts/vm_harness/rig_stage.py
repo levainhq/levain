@@ -12,6 +12,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
+#: Where setup's vendor copier puts the vendors, and where the hands account looks (its PATH names /usr/local/bin first,
+#: and ``hands login`` refuses by name when claude is not there).
+VENDOR_BIN = "/usr/local/lib/levain-vendor/bin"
+HANDS_BIN = "/usr/local/bin"
+VENDOR_NAMES = ("claude", "codex")
+
 FAKE_NAME = "fire_fakeclaude.c"
 FAKE_REPO_PATH = "tests/vm_fakes/fire_fakeclaude.c"
 SEED_NAME = "rig_seed.py"
@@ -53,3 +59,11 @@ def check_staged(dest: Path, canonical: bytes) -> None:
         raise RuntimeError(f"staged {FAKE_NAME} differs from the canonical {FAKE_REPO_PATH}")
     if not (Path(dest) / SEED_NAME).is_file():
         raise RuntimeError(f"staged rig has no {SEED_NAME}")
+
+
+def vendor_link_argvs(vendor_bin: str = VENDOR_BIN, hands_bin: str = HANDS_BIN) -> list[list[str]]:
+    """Commands (run as root in the guest) that make ``hands_bin/<name>`` a symlink to ``vendor_bin/<name>`` for each of
+    :data:`VENDOR_NAMES`. A link, never a copy, so the one vendored binary is what the hands account runs; ``-sfn``
+    replaces an earlier link and may point at a target that setup has not populated yet."""
+    return [["/bin/mkdir", "-p", hands_bin]] + [
+        ["/bin/ln", "-sfn", f"{vendor_bin}/{n}", f"{hands_bin}/{n}"] for n in VENDOR_NAMES]

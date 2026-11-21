@@ -115,3 +115,17 @@ def test_stage_into_a_reused_dir_drops_files_an_earlier_revision_left(tmp_path):
     assert {p.name for p in out} == {"g_vm.py", "fire_fakeclaude.c", "rig_seed.py"}
     assert not (up / "removed_helper.sh").exists() and not (up / "link_helper").is_symlink()
     assert (up / "g_vm.py").read_text() == "x = 1\n"
+
+
+def test_vendor_links_are_symlinks_into_the_vendor_prefix(tmp_path):
+    # revert: vendor_link_argvs returning nothing (only levain-vendor/bin would be populated)
+    vbin, hbin = tmp_path / "lib" / "bin", tmp_path / "usr" / "bin"
+    (hbin / "claude").parent.mkdir(parents=True)
+    (hbin / "claude").symlink_to("/nowhere")                          # an earlier link is replaced
+    for argv in rig_stage.vendor_link_argvs(str(vbin), str(hbin)):
+        subprocess.run(argv, check=True, timeout=30)
+    for n in ("claude", "codex"):
+        assert (hbin / n).is_symlink() and os.readlink(hbin / n) == f"{vbin}/{n}"
+    vbin.mkdir(parents=True)
+    (vbin / "claude").write_text("x")
+    assert (hbin / "claude").read_text() == "x"                       # resolves once setup fills the prefix
