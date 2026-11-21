@@ -1179,11 +1179,26 @@
     if (pb && core.measureOverflow) core.measureOverflow(pb);
   }
   // `searched`: the rows are what a query matched, so a line the card's clamp cuts opens whole (the match may be past the cut)
+  // A line is known by its time, its actor and a hash of its whole text; rows identical in all three are told apart by their place
+  // among those twins
+  function lineHash(s) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(36) + "." + (h1 >>> 0).toString(36);
+  }
   function paintLog(host, rows, searched) {
     const core = root.LevainDashboard;
+    const twins = new Map();
     for (const r of rows) {
       const row = el("div", "lrow");
-      row.dataset.keepKey = [r.at, r.actor, logLine(r).length].join("|");   // an opened line stays open across a redraw (captureKept)
+      const id = [r.at, r.actor, lineHash(logLine(r))].join("|"), n = twins.get(id) || 0;
+      twins.set(id, n + 1);
+      row.dataset.keepKey = id + "|" + n;   // an opened line stays open across a redraw (captureKept)
       if (searched) row.dataset.searchHit = "1";
       row.appendChild(el("span", "lsent", logLine(r)));
       row.appendChild(el("span", "lactor", r.actor));
@@ -1904,7 +1919,7 @@
     const core = root.LevainDashboard;
     const host = (s.body.closest ? s.body.closest(".pbody, .modal-body") : null) || s.body;
     const kept = core && core.captureKept ? core.captureKept(host) : null;
-    const hadRows = !!(s.body.querySelector && s.body.querySelector(".row"));
+    const hadRows = !!(s.body.querySelector && s.body.querySelector(".row, .lrow"));
     if (hadRows || (s.carry && Date.now() - s.born >= 15000)) s.carry = null;
     if (kept && s.carry) {
       for (const k of s.carry.open) kept.open.add(k);
@@ -1912,7 +1927,7 @@
     }
     const field = core && core.captureField ? core.captureField() : null;   // a focused field in a repainted body keeps its place, as in a board draw
     try { paint(s); } finally { if (core && core.restoreField) core.restoreField(field); }
-    if (s.body.querySelector && s.body.querySelector(".row")) s.carry = null;
+    if (s.body.querySelector && s.body.querySelector(".row, .lrow")) s.carry = null;
     if (core && core.settleKept) core.settleKept(host, kept);
     else if (core && core.measureClauses) core.measureClauses(host);   // a core without the keeper still re-measures its rows
   }

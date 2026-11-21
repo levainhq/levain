@@ -518,10 +518,11 @@
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
     const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) { const held = document.activeElement === old && !!old.dataset.listMore && panel.dataset.ckPanel === "tray"; old.remove(); if (held) askTileFocus("tray"); }   // a fold that replaces the List card's control (not another panel's "N more" foot) that held focus asks for the new one to be given it (the ask acts only while focus is on the body); the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
     const apartNow = listApart(panel);
-    if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
-    // every row is showing here: measure the clamped ones now, so a row this fold hides still has its caret when it is shown again
-    // (measureClauses leaves a hidden row as it was and would never have read it)
+    // every row is showing here: measure the clamped ones now, whether or not the card then overflows. A row this fold hides still has
+    // its caret when it is shown again (measureClauses leaves a hidden row as it was and would never have read it), and a card that
+    // fits, or one a resize has widened, has each row's caret decided by the width it has now
     measureClauses(body);
+    if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
     const limit = body.clientHeight - 34;   // room kept for the link
     const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
@@ -623,8 +624,9 @@
       // 2-line clause measures equal (no spurious toggle) [kimi L3]. .clampable only.
       const cut = clause.scrollHeight > clause.clientHeight;
       row.classList.toggle("has-more", cut);
-      // a line the search matched (paintLog marks it) that the clamp cuts opens whole, so the match is not hidden behind the cut
-      if (cut && row.dataset.searchHit) setExpanded(row, true);
+      // a line the search matched (paintLog marks it) that the clamp cuts opens whole, so the match is not hidden behind the cut. It
+      // opens once per painted row (the flag): a line the reader then closes stays closed through every later measure
+      if (cut && row.dataset.searchHit && !row.dataset.hitOpened) { row.dataset.hitOpened = "1"; setExpanded(row, true); }
     }
   }
 
@@ -1379,7 +1381,14 @@
     if (memResizeWired || typeof window.addEventListener !== "function") return;
     memResizeWired = true;
     let t = null;
-    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => { for (const g of document.querySelectorAll(".ck-zgrid")) { memClips(g); balanceStacks(g); } }, 150); });
+    // a new width changes how many lines each entry takes: the bounded bodies fold and measure their rows again
+    window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => {
+      for (const g of document.querySelectorAll(".ck-zgrid")) {
+        for (const b of g.querySelectorAll(".pbody.clamped")) measureOverflow(b);
+        measureClauses(g);
+        memClips(g); balanceStacks(g);
+      }
+    }, 150); });
   }
   function memClips(grid) {
     wireMemResize();

@@ -312,3 +312,176 @@ def test_a_cut_entry_the_fold_hides_is_still_measured_for_its_caret(tmp_path: Pa
         out = _drive(tmp_path, f"{url}/", [{"emulate": VIEWPORTS["phone390x800"]}, {"until": STATE}, SETTLE, {"eval": STATE}])
     rows = _state(out)
     assert rows[1]["folded"] and rows[1]["hasMore"], rows[1]
+
+
+# ---- fix round 2: a search hit can be closed, rows keep distinct identities, carried state is spent, the caret follows the width ----
+def _typed(q: str) -> str:
+    return (f"(() => {{ const i = {PANEL}.querySelector('.xfilter-input'); i.value = '{q}'; "
+            "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+
+
+def _hits(n: int) -> list[str]:
+    """Twelve rows: the first n long and matching 'quokka', the rest ordinary."""
+    return [f"{_words(450)} quokka" if i < n else f"an ordinary earlier entry number {i}" for i in range(12)]
+
+
+@needs_browser
+@pytest.mark.parametrize("vp", ["phone390x800", "desk1280x1000"])
+def test_a_search_hit_row_can_be_closed_and_stays_closed(vp, tmp_path: Path) -> None:
+    """With a query active, every long match opens once; its caret then closes it, and a re-measure or a resize never opens it again."""
+    smaller = dict(VIEWPORTS[vp], h=VIEWPORTS[vp]["h"] - 100)
+    with _serve(tmp_path, _log(_hits(3))) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS[vp]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.xfilter-input') && {PANEL}.querySelector('.lrow') && 1"},
+            SETTLE,
+            {"eval": _typed("quokka")},
+            {"until": f"{PANEL}.querySelectorAll('.lrow').length === 3 && 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": f"{ROW0_TOGGLE}.click(); 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"emulate": smaller},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    opened, closed, resized = _state(out, -6), _state(out, -3), _state(out, -1)
+    assert all(r["open"] for r in opened), opened                                   # every match opened once, on the search
+    for rows in (closed, resized):
+        assert not rows[0]["open"] and rows[0]["toggle"]["expanded"] == "false", rows[0]   # the reader's close stands
+        assert rows[0]["cut"] and rows[0]["toggle"]["shown"], rows[0]                       # and the caret to open it again is there
+        assert rows[1]["open"] and rows[2]["open"], rows                                    # the other matches are as they were
+
+
+@needs_browser
+def test_a_search_hit_opened_by_the_search_says_so_on_its_caret(tmp_path: Path) -> None:
+    with _serve(tmp_path, _log(_hits(1))) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.xfilter-input') && {PANEL}.querySelector('.lrow') && 1"},
+            SETTLE,
+            {"eval": _typed("quokka")},
+            {"until": f"{PANEL}.querySelectorAll('.lrow').length === 1 && 1"},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    row = _state(out)[0]
+    assert row["open"] and row["toggle"]["expanded"] == "true" and row["toggle"]["label"] == "collapse full text", row
+
+
+def _same_time(texts: list[str]) -> list[dict]:
+    return [{"verb": "wrap", "target": t, "actor": "desk", "at": "2026-11-20T11:59:00Z"} for t in texts]
+
+
+@needs_browser
+def test_two_entries_of_one_second_actor_and_length_open_one_at_a_time(tmp_path: Path) -> None:
+    """Same timestamp, actor and length used to share one keep key: opening one opened both after a redraw."""
+    alpha = ("alpha " * 100)[:450].strip()
+    bravo = ("bravo " * 100)[:450].strip()
+    again = "new Promise(r => window.LevainCockpitView.refetchPanel('stream').then(x => r(String(x))))"
+    keys = f"JSON.stringify([...{PANEL}.querySelectorAll('.lrow')].map(r => r.dataset.keepKey))"
+    with _serve(tmp_path, _same_time([alpha, bravo, bravo])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelectorAll('.lrow.has-more').length === 3 && 1"},
+            SETTLE,
+            {"eval": keys},
+            {"eval": f"{PANEL}.querySelectorAll('.lrow > .clause-toggle')[1].click(); 1"},
+            {"until": f"{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": again},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    k = json.loads(out["values"][-6])
+    assert len(set(k)) == 3, k                                                      # three entries, three identities (the two identical ones too)
+    assert [r["open"] for r in _state(out)] == [False, True, False], _state(out)    # only the one the reader opened
+
+
+@needs_browser
+def test_a_tall_card_with_one_long_entry_has_its_caret(tmp_path: Path) -> None:
+    """The body is taller than its content (nothing overflows): the long entry is still cut by the clamp and still has its caret."""
+    body = (f"(() => {{ const b = {PANEL}.querySelector(':scope > .pbody'); return JSON.stringify({{over: b.scrollHeight > b.clientHeight + 1,"
+            " h: b.clientHeight, sh: b.scrollHeight}); })()")
+    with _serve(tmp_path, _log([_words(450), "a short entry"])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 2400, "dpr": 1}},
+            {"until": STATE},
+            SETTLE,
+            {"eval": body},
+            {"eval": STATE},
+        ])
+    geo = json.loads(out["values"][-2])
+    rows = _state(out)
+    assert not geo["over"], geo                                                     # the geometry under test: the body does not overflow
+    assert rows[0]["cut"] and rows[0]["hasMore"] and rows[0]["toggle"]["shown"], rows[0]
+    assert not rows[1]["cut"] and not rows[1]["toggle"]["shown"], rows[1]
+
+
+@needs_browser
+def test_a_cut_entry_has_a_working_caret_at_desktop_width(tmp_path: Path) -> None:
+    """At 1280 px the card is narrow and an ordinary entry is cut: its caret shows and opens that one row, as on a phone."""
+    with _serve(tmp_path, _log([_words(200)] + [f"an ordinary earlier entry number {i}" for i in range(4)])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["desk1280x1000"]},
+            {"until": STATE},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": f"{ROW0_TOGGLE}.focus(); document.activeElement === {ROW0_TOGGLE} && 1"},
+            ENTER,
+            {"until": f"{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": STATE},
+        ])
+    closed, opened = _state(out, -4), _state(out)
+    assert closed[0]["cut"] and closed[0]["toggle"]["shown"], closed[0]
+    assert not any(r["toggle"]["shown"] for r in closed[1:] if not r["folded"] and not r["cut"]), closed
+    assert opened[0]["open"] and not opened[0]["cut"] and opened[0]["toggle"]["expanded"] == "true", opened[0]
+
+
+@needs_browser
+def test_a_closed_entry_stays_closed_when_the_panel_is_read_again_after_a_redraw(tmp_path: Path) -> None:
+    """Open a row, let a whole-board redraw restore it, close it: the next panel read within the carry window must not reopen it."""
+    again = "new Promise(r => window.LevainCockpitView.refetchPanel('stream').then(x => r(String(x))))"
+    with _serve(tmp_path, _log([_words(450)] + [f"an ordinary earlier entry number {i}" for i in range(4)])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.lrow.has-more') && 1"},
+            SETTLE,
+            {"eval": f"{ROW0_TOGGLE}.click(); 1"},
+            {"until": f"{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": "window.LevainDashboard.redraw(); 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": f"{ROW0_TOGGLE}.click(); 1"},
+            {"until": f"!{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": again},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    restored, closed_again = _state(out, -6), _state(out)
+    assert restored[0]["open"], restored[0]                                         # the redraw gave the open row back
+    assert not closed_again[0]["open"] and closed_again[0]["toggle"]["expanded"] == "false", closed_again[0]   # the close stands
+
+
+@needs_browser
+def test_the_caret_follows_the_width_after_the_first_paint(tmp_path: Path) -> None:
+    """An entry that fits one width and exceeds the clamp at another gets (and loses) its caret when the window changes."""
+    wide, narrow = {"w": 1920, "h": 1000, "dpr": 1}, VIEWPORTS["desk1280x1000"]
+    rows = _log([_words(200)] + [f"an ordinary earlier entry number {i}" for i in range(4)])
+    with _serve(tmp_path, rows) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": wide},
+            {"until": STATE},
+            SETTLE,
+            {"eval": STATE},
+            {"emulate": narrow},
+            SETTLE,
+            {"eval": STATE},
+            {"emulate": wide},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    fits, cut, fits_again = _state(out, -5), _state(out, -3), _state(out, -1)
+    assert not fits[0]["cut"] and not fits[0]["toggle"]["shown"], fits[0]           # fits at 1920: no caret
+    assert cut[0]["cut"] and cut[0]["toggle"]["shown"], cut[0]                      # narrowed: cut, so the caret appears
+    assert not fits_again[0]["cut"] and not fits_again[0]["toggle"]["shown"], fits_again[0]   # widened: the caret goes
