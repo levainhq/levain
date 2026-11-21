@@ -5,6 +5,7 @@ recording one added to the built-in panels."""
 
 from __future__ import annotations
 
+import functools
 import http.client
 import json
 import threading
@@ -18,7 +19,9 @@ from typing import Any, Callable
 import pytest
 
 from levain.cockpit import providers
-from levain.cockpit.derive import _UNSET, PanelState
+from levain.cockpit import derive as derive_module
+from levain.cockpit import snapshot_host as snapshot_host_module
+from levain.cockpit.derive import _UNSET, DeriveLoop, PanelState
 from levain.cockpit.engine import Cockpit, Read, RowIn
 from levain.cockpit.snapshot_host import DERIVE_THREAD_PREFIX, ServerProbe, SnapshotHost
 from levain.cockpit.snapshots import SnapshotWriter
@@ -157,9 +160,12 @@ def _loop_at_rest(loop: Any) -> bool:
 
 def _derived_and_idle(host: SnapshotHost) -> bool:
     """Every plan has a row, discovery has added the panels it will, and the loop is at rest (``_loop_at_rest``), now and
-    again after a quiet interval. A host whose token is unknown re-derives on a time bucket of ``unknown_token_s``; it is
-    pinned large here so no bucket turns inside a test."""
+    again after a quiet interval. A host whose token is unknown re-derives on a time bucket of ``unknown_token_s``, and every
+    panel re-derives on the loop's ``backstop_s`` (a derive that touches the store moves the token, so a second wave
+    follows); both are pinned large here so neither turns inside a test."""
     host.loop._unknown_token_s = 1e9
+    host.loop._backstop_s = 1e9
+    assert all(p.backstop_s is None for p in host.loop._plans.values()), "a panel with its own backstop bypasses the pin"
     plans = {p.id for p in host._plans()}
     if not _every_plan_has_a_row(host) or not _loop_at_rest(host.loop):
         return False
@@ -460,6 +466,37 @@ class TestStream:
     def test_a_subscribe_that_is_the_first_call_builds_the_cockpit_and_the_stream_still_runs(
         self, tmp_path: Path, monkeypatch
     ) -> None:
+        self._first_subscribe_then_a_change_to_od(tmp_path, monkeypatch)
+
+    def test_a_host_seen_at_rest_stays_at_rest_past_the_loops_backstop(self, tmp_path: Path, monkeypatch) -> None:
+        # levain#229: with the loop's backstop at 1 s, the host the stream tests wait on is derived again every second unless
+        # ``_derived_and_idle`` pins it: a stream test then had waves of derives, and of announcements, inside its window.
+        # What is counted is the loop deciding a panel is due for its backstop AFTER the pin (a job it had already decided
+        # on before the pin may still run, and is not counted): such a decision cannot be made once the pin holds.
+        monkeypatch.setattr(snapshot_host_module, "DeriveLoop", functools.partial(DeriveLoop, backstop_s=1.0))
+        decided: "list[tuple[float, str]]" = []
+        real_due_reason = derive_module.due_reason
+
+        def spy(plan, st, view, token, now, backstop_s):
+            reason = real_due_reason(plan, st, view, token, now, backstop_s)
+            if reason == "backstop":
+                decided.append((time.monotonic(), plan.id))
+            return reason
+
+        monkeypatch.setattr(derive_module, "due_reason", spy)
+        reads = Reads()
+        with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
+            assert _get(port, "/cockpit/manifest.json")[0] == 200       # builds the cockpit, attaches and starts its host
+            host = httpd._snapshot_host
+            _until(lambda: _derived_and_idle(host))     # the pin is set by this call, before it returns
+            assert host.loop._poll_s <= 1.0, "the window below must hold several polls"
+            pinned_at = time.monotonic()
+            time.sleep(3.0)
+            late = [d for d in decided if d[0] > pinned_at]
+            assert late == [], f"the loop decided a panel was due for its backstop after the pin: {late}"
+
+    @staticmethod
+    def _first_subscribe_then_a_change_to_od(tmp_path: Path, monkeypatch) -> None:
         # the watcher builds the cockpit under its own lock on the first subscribe: attaching must not need that lock
         reads = Reads()
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
