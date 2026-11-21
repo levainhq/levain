@@ -579,6 +579,8 @@ def test_setup_refuses_an_entity_already_set_up(tmp_path: Path, monkeypatch, cap
     monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
     monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: hands.pwd.getpwuid(os.getuid()))
     monkeypatch.setattr(hands, "host_os", lambda: "darwin")   # on Linux this is the linger repair
+    from levain.firing import hands_login
+    monkeypatch.setattr(hands_login, "security_shim_problem", lambda: None)   # the shim is exact: nothing to repair
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     assert "already set up" in capsys.readouterr().out
 
@@ -1623,3 +1625,132 @@ def test_setup_isolation_keeps_the_ellipsis_of_a_cut_line_and_ends_a_bare_text_w
         monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", probe)
         assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
         assert capsys.readouterr().out.strip().endswith(ending)
+
+
+# --- the root-owned security shim (levain#241, L3 r1): setup installs it, a repair run repairs it, undo removes it -------
+# Nothing here writes under /Library: the system directory is a tmp_path standing in for it, and the owner the check
+# expects (and the installer chowns to) is this test's own uid and gid.
+
+@pytest.fixture
+def sysdir(tmp_path: Path, monkeypatch) -> Path:
+    from levain.firing import confinement, hands_login
+    root = tmp_path / "sysroot"
+    (root / "Library" / "Application Support").mkdir(parents=True)
+    d = root / "Library" / "Application Support" / "Levain" / "hands-bin"
+    monkeypatch.setattr(confinement, "HANDS_SHIM_SYSTEM_DIR", str(d))
+    monkeypatch.setattr(hands_login, "SECURITY_SHIM_OWNER_UID", os.getuid())
+    monkeypatch.setattr(hands_login, "SECURITY_SHIM_WALK_FROM", str(root))
+    return d
+
+
+_ME = (os.getuid(), os.getgid())
+
+
+def test_the_darwin_setup_plan_installs_the_shim_and_the_linux_plan_does_not(tmp_path: Path) -> None:
+    (tmp_path / "d").mkdir()
+    (tmp_path / "l").mkdir()
+    assert any("security shim" in s.why and s.call is hands.install_hands_shim for s in _setup(tmp_path / "d", "darwin").steps)
+    assert not any("security shim" in s.why for s in _setup(tmp_path / "l", "linux").steps)
+
+
+def test_the_installer_makes_the_exact_root_owned_shim_and_leaves_a_right_one_alone(sysdir: Path) -> None:
+    from levain.firing import hands_login
+    ok, why = hands.install_hands_shim(owner=_ME)
+    assert ok, why
+    f = sysdir / "security"
+    assert hands_login.security_shim_problem() is None
+    assert f.read_text() == hands_login.SECURITY_SHIM_TEXT
+    assert f.stat().st_mode & 0o7777 == 0o755 and sysdir.stat().st_mode & 0o7777 == 0o755
+    assert sysdir.parent.stat().st_mode & 0o7777 == 0o755
+    assert (f.stat().st_uid, f.stat().st_gid) == _ME
+    ino = f.stat().st_ino
+    assert hands.install_hands_shim(owner=_ME) == (True, "already installed")
+    assert f.stat().st_ino == ino                                       # byte-for-byte right: not rewritten
+    assert sorted(p.name for p in sysdir.iterdir()) == ["security"]     # no temp file left
+
+
+@pytest.mark.parametrize("damage", ["bytes", "mode", "missing", "symlink-file", "dir-mode"])
+def test_a_repair_run_makes_a_damaged_shim_exact_again(sysdir: Path, tmp_path: Path, damage: str) -> None:
+    from levain.firing import hands_login
+    assert hands.install_hands_shim(owner=_ME)[0]
+    f = sysdir / "security"
+    if damage == "bytes":
+        f.write_text("#!/bin/sh\nexit 0\n")
+    elif damage == "mode":
+        f.chmod(0o4755)
+    elif damage == "missing":
+        f.unlink()
+    elif damage == "symlink-file":
+        f.unlink()
+        f.symlink_to(tmp_path / "elsewhere")
+    else:
+        sysdir.chmod(0o775)
+    assert hands_login.security_shim_problem() is not None
+    ok, why = hands.install_hands_shim(owner=_ME)
+    assert ok, why
+    assert hands_login.security_shim_problem() is None
+
+
+def test_the_installer_refuses_a_symlinked_directory_and_writes_through_nothing(sysdir: Path, tmp_path: Path) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    sysdir.parent.symlink_to(other)                                     # a link where the Levain directory goes
+    ok, why = hands.install_hands_shim(owner=_ME)
+    assert not ok and "symlink" in why
+    assert list(other.iterdir()) == []
+
+
+def test_undo_removes_the_shim_only_when_no_hands_account_remains(sysdir: Path, monkeypatch) -> None:
+    from levain.firing import hands_login
+    assert hands.install_hands_shim(owner=_ME)[0]
+    monkeypatch.setattr(hands, "other_hands_accounts", lambda host, except_user: ["_levain_other_ab12cd"])
+    ok, why = hands.remove_hands_shim(except_user="_levain_x")
+    assert ok and "kept" in why and (sysdir / "security").exists()
+    monkeypatch.setattr(hands, "other_hands_accounts", lambda host, except_user: [])
+    ok, why = hands.remove_hands_shim(except_user="_levain_x")
+    assert ok and not sysdir.exists() and not sysdir.parent.exists()    # the file and both directories
+    assert "not installed" in hands_login.security_shim_problem()
+    assert hands.remove_hands_shim(except_user="_levain_x")[0]          # idempotent
+
+
+def test_undo_keeps_a_levain_directory_that_holds_something_else(sysdir: Path, monkeypatch) -> None:
+    assert hands.install_hands_shim(owner=_ME)[0]
+    (sysdir.parent / "other-file").write_text("x")
+    monkeypatch.setattr(hands, "other_hands_accounts", lambda host, except_user: [])
+    assert hands.remove_hands_shim(except_user="_levain_x")[0]
+    assert not sysdir.exists() and (sysdir.parent / "other-file").exists()
+
+
+def test_the_account_counting_skips_retired_and_foreign_users(monkeypatch) -> None:
+    class E:
+        def __init__(self, n): self.pw_name = n
+    monkeypatch.setattr(hands.pwd, "getpwall", lambda: [E("root"), E("_levain_a_aaaaaa"), E("_levain_b_bbbbbb"),
+                                                         E("_levain_c_cccccc"), E("_levain_gone_dddddd")])
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, host: n != "_levain_c_cccccc")
+    monkeypatch.setattr(hands, "user_is_retired", lambda n, host: n == "_levain_b_bbbbbb")
+    assert hands.other_hands_accounts("darwin", "_levain_gone_dddddd") == ["_levain_a_aaaaaa"]
+
+
+def test_the_darwin_undo_plan_ends_with_the_shim_removal_and_the_linux_one_has_none(tmp_path: Path) -> None:
+    (tmp_path / "d").mkdir()
+    (tmp_path / "l").mkdir()
+    assert "security shim" in _undo(tmp_path / "d", "darwin").steps[-1].why
+    assert not any("security shim" in s.why for s in _undo(tmp_path / "l", "linux").steps)
+
+
+def test_a_setup_run_on_an_entity_already_set_up_installs_a_missing_shim_as_a_repair(tmp_path: Path, monkeypatch, capsys, sysdir) -> None:
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me)
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, host: True)
+    cfg_uid = json.loads((ed / ".levain" / "confinement.json").read_text())["hands_uid"]
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: type("P", (), {"pw_uid": cfg_uid, "pw_gid": os.getgid(), "pw_dir": str(tmp_path)})())
+    ran = []
+    monkeypatch.setattr(hands, "install_hands_shim", lambda **k: ran.append(1) or (True, "installed"))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=True) == 0
+    assert ran == [] and "security shim" in capsys.readouterr().out         # a dry run shows the step, runs nothing
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
+    assert ran == [1] and "the security shim is installed" in capsys.readouterr().out

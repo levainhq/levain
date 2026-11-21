@@ -3876,13 +3876,17 @@ builtin exit "$__levain_done"
 # directory under the operator's home (which the hands user cannot enter anyway).
 HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-#: macOS: the directory (under the hands home) that holds Levain's ``security`` shim and is FIRST on the hands PATH
-#: (levain#241).
-HANDS_SHIM_DIRNAME = ".levain-bin"
+#: macOS: the ROOT-OWNED system directory that holds Levain's ``security`` shim and is FIRST on the hands PATH (levain#241,
+#: L3 r1 fix: it is NOT under the hands home, where the hands user could plant a ``claude``/``cat`` beside the shim and
+#: have it run on the next login). ``sudo levain setup-isolation`` installs it (root:wheel, directory and file 0755);
+#: Levain only CHECKS it before a Claude hands start (:func:`levain.firing.hands_login.security_shim_problem`).
+HANDS_SHIM_SYSTEM_DIR = "/Library/Application Support/Levain/hands-bin"
 
 
-def hands_shim_dir(hands: "HandsIdentity") -> str:
-    return f"{hands.home}/{HANDS_SHIM_DIRNAME}"
+def hands_shim_dir() -> str:
+    """The directory of Levain's root-installed ``security`` shim (the module constant, read at call time so a test can
+    stand a temporary directory in for it)."""
+    return HANDS_SHIM_SYSTEM_DIR
 
 
 @dataclass(frozen=True)
@@ -3977,9 +3981,9 @@ HANDS_NO_MARKETPLACE_AUTOINSTALL = ("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AU
 def _hands_env(hands: HandsIdentity) -> dict[str, str]:
     """The whole environment a hands-user bash starts with (``env -i`` drops everything else, sudo's
     own variables included): every hands start, the vendors' login, status, logout, ``claude mcp`` verbs and chat
-    included, takes it from here. On macOS the PATH starts with the directory of Levain's ``security`` shim
-    (:func:`hands_shim_dir`); elsewhere it is :data:`HANDS_PATH` unchanged."""
-    path = f"{hands_shim_dir(hands)}:{HANDS_PATH}" if platform.system() == "Darwin" else HANDS_PATH
+    included, takes it from here. On macOS the PATH starts with the root-owned directory of Levain's ``security``
+    shim (:func:`hands_shim_dir`); elsewhere it is :data:`HANDS_PATH` unchanged."""
+    path = f"{hands_shim_dir()}:{HANDS_PATH}" if platform.system() == "Darwin" else HANDS_PATH
     return {"HOME": hands.home, "PATH": path, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user,
             HANDS_NO_CLAUDEAI_CONNECTORS[0]: HANDS_NO_CLAUDEAI_CONNECTORS[1],

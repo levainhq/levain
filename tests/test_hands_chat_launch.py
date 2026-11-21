@@ -875,3 +875,24 @@ def test_the_other_refused_paths_keep_the_refusal_text_without_the_marketplaces_
     text = str(info.value)
     assert "known_marketplaces" not in text and text.endswith("hold; remove it; no chat was started"), text
     assert_released(rig)
+
+
+# --- levain#241 (L3 r1): a failed shim check is this chat's own refusal -----------------------------------------------
+
+@pytest.mark.parametrize("how", ["tampered", "missing"])
+def test_a_failed_security_shim_check_is_a_chat_refusal_in_the_chat_words_and_starts_nothing(rig, how):
+    rig.register("alpha", callback_port=49601)
+    shim = rig.shim_dir / hands_login.SECURITY_SHIM_NAME
+    if how == "tampered":
+        shim.write_text("#!/bin/sh\nexit 0\n")
+    else:
+        shim.unlink()
+    fake = FakeVendor(rig)
+    rig.events.clear()
+    with pytest.raises(hc.HandsChatRefused, match="sudo levain setup-isolation") as info:
+        launch(rig, "claude", spawn=fake)            # HandsChatRefused, never a bare HandsLoginError out of the launcher
+    assert str(info.value).endswith("no chat was started")
+    assert fake.started == [] and rig.events == []   # nothing was swept, prepared or spawned
+    assert_released(rig)
+    assert not (rig.hands_home / ".levain-bin").exists()
+    assert launch(rig, "codex", spawn=FakeVendor(rig)) == 0       # Codex has no shim to check

@@ -51,9 +51,10 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from levain import hands_live
+from levain.firing import confinement
 from levain.firing.confinement import (
     HANDS_PYTHON, HANDS_ZSH, ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_for, hands_prefix,
-    hands_shim_dir, load_confinement_config,
+    load_confinement_config,
 )
 from levain.launch import child_env
 
@@ -187,7 +188,6 @@ def vendor_missing(vendor: str) -> str | None:
     (a ``/usr/local/bin`` link into the operator's 0700 home) passes here and ends in the vendor launch's own error; one
     only the hands uid can run (not a path the product makes) is refused."""
     import shutil
-    from levain.firing import confinement
     if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
         return None
     return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}); install {vendor} where the "
@@ -753,44 +753,117 @@ def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path |
 # ``add-generic-password -U``, ``find-generic-password``, ``delete-generic-password``) and takes exit 36 and 44 as "use
 # the 0600 file". A write to a locked keychain inside a GUI login session HANGS (the Terminal -> sudo -u hands shape of
 # the real Mac), so the lock alone cannot decide where the credential goes. This shim sits first on the hands PATH
-# (macOS only, :func:`~levain.firing.confinement._hands_env`): ``-i`` drains stdin to /dev/null (it carries the
-# credential: never logged, never stored) and exits 36; the three item verbs exit 36; every other verb runs
+# (macOS only, :func:`~levain.firing.confinement._hands_env`): when ANY argument is ``-i`` it drains stdin to /dev/null
+# (it carries the credential: never logged, never stored) and exits 36; when ANY argument is one of the three item verbs
+# it exits 36 (a global flag before the verb, ``-q find-generic-password``, no longer bypasses it); every other call runs
 # ``/usr/bin/security`` with the same arguments. So Claude's login, refresh, read and logout all take the file, in any
 # session. Measured 11-21 with real claude 2.1.330 in the GUI shape (vmkc3): ``claude auth status`` is fast with the shim.
 # The shim covers every Claude service name by verb, which is why orphan matching (``claude_credential_services``) stays
 # the two names a login can leave. Levain's own calls use the absolute ``/usr/bin/security`` and never meet it.
+#
+# WHERE IT LIVES: in a ROOT-OWNED system directory (:data:`~levain.firing.confinement.HANDS_SHIM_SYSTEM_DIR`), installed
+# by ``sudo levain setup-isolation``, never under the hands home: a hands-writable directory first on the PATH would let
+# the hands user plant ``claude`` or ``cat`` there and have it run, with the login, on the next start (L3 r1, codex and
+# gemini HIGH). Levain only CHECKS it (:func:`security_shim_problem`), before every Claude hands start. The shim calls
+# ``/bin/cat`` by absolute path.
+#
+# What it reaches: only the three generic-password verbs and ``-i``. On the hands account those can touch only Levain's
+# sealed, locked keychain (no other keychain is on its search list, measured vmkc 11-21), so a non-Claude hands process
+# that asks for a generic password gets exit 36 too, and finds nothing it could have used. Codex is pinned to its file store.
+#
+# Known edges: ``-i`` drains stdin, which blocks on a TTY: only Claude calls ``security -i``, always with a pipe (binary
+# read 11-21), and a human running ``security -i`` as the hands user is not a path. An argument that merely equals ``-i``
+# or an item verb (a value, a name) also trips the scan; the shim errs toward the file.
 SECURITY_SHIM_NAME = "security"
 SECURITY_SHIM_TEXT = """#!/bin/sh
-# Levain: keeps Claude's login in its 0600 file. Written by levain; rewritten when it differs.
-case "$1" in
-  -i)
-    cat > /dev/null
-    exit 36 ;;
-  find-generic-password|add-generic-password|delete-generic-password)
-    exit 36 ;;
-esac
+# Levain: keeps Claude's login in its 0600 file. Installed by `sudo levain setup-isolation` (root-owned); never edit.
+for a in "$@"; do
+  case "$a" in
+    -i)
+      /bin/cat > /dev/null
+      exit 36 ;;
+    find-generic-password|add-generic-password|delete-generic-password)
+      exit 36 ;;
+  esac
+done
 exec /usr/bin/security "$@"
 """
 
+#: The shim's directory and file mode, exactly.
+SECURITY_SHIM_MODE = 0o755
+#: The uid that must own the shim directory and file (root). A test stands its own uid in.
+SECURITY_SHIM_OWNER_UID = 0
+#: The path component the walk starts from: each component from here down to the shim must be a real directory, never a
+#: link. A test stands a temporary directory in.
+SECURITY_SHIM_WALK_FROM = "/Library"
+SHIM_REPAIR = "run `sudo levain setup-isolation` (a repair run installs it)"
 
-def ensure_security_shim(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
-    """Under the caller's hands lock, as the hands user (the config-home helpers): the shim directory is a real 700
-    directory of the hands user and ``security`` in it is byte-for-byte :data:`SECURITY_SHIM_TEXT`, owned by the hands
-    user, mode 755; missing or different is rewritten (staged and renamed). Anything that cannot be made so raises
-    :class:`HandsLoginError`: a refusal before the vendor runs. Only for a vendor that needs it (Claude on macOS)."""
+
+def security_shim_problem() -> str | None:
+    """None when Levain's ``security`` shim is installed exactly: every path component from :data:`SECURITY_SHIM_WALK_FROM`
+    down to the shim is a real directory (never a link, by ``lstat``); the shim's directory and the shim are owned by
+    :data:`SECURITY_SHIM_OWNER_UID` with mode exactly 0755 (:data:`SECURITY_SHIM_MODE`, special bits included); the shim
+    is a regular file whose bytes equal :data:`SECURITY_SHIM_TEXT`. Else the reason, ending with the repair. Reads only:
+    Levain never writes it from here (``sudo levain setup-isolation`` does). Not gated on the platform."""
+    d = os.path.normpath(confinement.hands_shim_dir())
+    start = os.path.normpath(SECURITY_SHIM_WALK_FROM)
+    if d != start and not d.startswith(start.rstrip("/") + "/"):
+        return f"the hands security shim directory {d} is not under {start}; {SHIM_REPAIR}"
+    parts = [start] + [c for c in os.path.relpath(d, start).split("/") if c and c != "."] if d != start else [start]
+    cur = ""
+    st: os.stat_result | None = None
+    for i, comp in enumerate(parts):
+        cur = comp if i == 0 else os.path.join(cur, comp)
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return f"the hands security shim is not installed ({cur} is missing); {SHIM_REPAIR}"
+        except OSError as exc:
+            return f"the hands security shim cannot be checked ({cur}: {exc.strerror or exc}); {SHIM_REPAIR}"
+        if stat.S_ISLNK(st.st_mode):
+            return f"{cur} is a symlink, so the hands security shim is refused; {SHIM_REPAIR}"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{cur} is not a directory, so the hands security shim is refused; {SHIM_REPAIR}"
+    assert st is not None
+    if st.st_uid != SECURITY_SHIM_OWNER_UID or stat.S_IMODE(st.st_mode) != SECURITY_SHIM_MODE:
+        return (f"{d} is owned by uid {st.st_uid} with mode {stat.S_IMODE(st.st_mode):o}, not uid "
+                f"{SECURITY_SHIM_OWNER_UID} with mode {SECURITY_SHIM_MODE:o}; {SHIM_REPAIR}")
+    f = os.path.join(d, SECURITY_SHIM_NAME)
+    try:
+        fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return f"the hands security shim is not installed ({f} is missing); {SHIM_REPAIR}"
+    except OSError as exc:
+        return f"the hands security shim {f} cannot be opened ({exc.strerror or exc}; a symlink is refused); {SHIM_REPAIR}"
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return f"{f} is not a regular file; {SHIM_REPAIR}"
+        if fst.st_uid != SECURITY_SHIM_OWNER_UID or stat.S_IMODE(fst.st_mode) != SECURITY_SHIM_MODE:
+            return (f"{f} is owned by uid {fst.st_uid} with mode {stat.S_IMODE(fst.st_mode):o}, not uid "
+                    f"{SECURITY_SHIM_OWNER_UID} with mode {SECURITY_SHIM_MODE:o}; {SHIM_REPAIR}")
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    if b"".join(chunks) != SECURITY_SHIM_TEXT.encode("utf-8"):
+        return f"{f} is not the shim Levain installs; {SHIM_REPAIR}"
+    return None
+
+
+def check_security_shim(vendor: str) -> None:
+    """Raise :class:`HandsLoginError` when ``vendor`` needs the shim (Claude on macOS) and :func:`security_shim_problem`
+    finds a miss. Called before EVERY Claude invocation as the hands user (login, status, logout, the MCP verbs, the
+    chat): a refusal that changed nothing. Checks, never writes."""
     if not keychain_needed(vendor):
         return
-    d = hands_shim_dir(hands)
-    _ensure_dir(hands, vendor, d, entity_dir)
-    got = conf_read(hands, vendor, d, SECURITY_SHIM_NAME, entity_dir=entity_dir)
-    if got is not None and got[0] == hands.uid and got[1].endswith("755") and got[2] == SECURITY_SHIM_TEXT:
-        return
-    staged = conf_stage(hands, vendor, d, SECURITY_SHIM_NAME, SECURITY_SHIM_TEXT, entity_dir=entity_dir, mode="755")
-    try:
-        conf_commit(hands, vendor, d, SECURITY_SHIM_NAME, staged, entity_dir=entity_dir)
-    except HandsLoginError:
-        conf_drop(hands, vendor, d, SECURITY_SHIM_NAME, staged, entity_dir=entity_dir)
-        raise
+    problem = security_shim_problem()
+    if problem is not None:
+        raise HandsLoginError(problem)
 
 
 def claude_credential_services(hands: HandsIdentity) -> tuple[str, str]:
@@ -804,7 +877,9 @@ def claude_credential_services(hands: HandsIdentity) -> tuple[str, str]:
 def _sealed_keychain_file(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str | None:
     """The sealed keychain's path when it exists as a regular file of the hands user, None when it is not there; any
     other thing at that path raises (the check :func:`ensure_hands_keychain` makes, so a link or a directory is never
-    handed to ``security``)."""
+    handed to ``security``). Only the last component is checked on purpose: every path under the hands home is the hands
+    user's own, and ``security`` runs against it AS the hands user, so a symlinked parent reaches nothing the hands user
+    cannot already reach."""
     ours = keychain_path(hands)
     st = _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True)
     if st is None:
@@ -1032,6 +1107,7 @@ def run_status(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, hel
         except OSError as exc:
             return Status(vendor, UNKNOWN, "", "", None, f"the hands lock could not be taken ({exc})")
     try:
+        check_security_shim(vendor)     # levain#241: Claude never runs before the root-installed shim is checked
         r = run_as_hands_bounded(hands, status_argv(hands, vendor), entity_dir=entity_dir, held=held,
                                  what=f"{vendor} status")
     except HandsLoginError as exc:
@@ -1061,9 +1137,9 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     say = emit or _write_out
     with hands_lock(entity_dir, "a login"):
         try:
+            check_security_shim(vendor)         # levain#241: root-installed; a miss refuses before anything is made
             ensure_config_home(hands, vendor, entity_dir=entity_dir)
             if keychain_needed(vendor):
-                ensure_security_shim(hands, vendor, entity_dir=entity_dir)
                 note = keychain_note(ensure_hands_keychain(hands, vendor, entity_dir=entity_dir), hands)
                 if note:
                     say(note)
@@ -1271,6 +1347,10 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
     when nothing was changed (the state could not be read, the lock is held, processes were left) and
     :class:`HandsLoginError` when the logout ran but could not be confirmed."""
     _check_vendor(vendor)
+    try:
+        check_security_shim(vendor)     # levain#241: before ANY claude run; a miss changes nothing
+    except HandsLoginError as exc:
+        raise HandsRefused(f"{exc}; nothing was logged out") from None
     with hands_lock(entity_dir, "logout"):
         st = run_status(hands, vendor, entity_dir=entity_dir, held=True)
         if st.state == UNKNOWN:
@@ -1297,9 +1377,14 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
                 raise HandsLoginError(f"the credential file {credential_path(hands, vendor)} is still there "
                                       f"({_brief(_text(r2)) or said})")
             how = "file-removed"
-        if orphan is not None and keychain_orphan(hands, vendor, entity_dir=entity_dir) is not None:
-            remove_hands_keychain(hands, vendor, entity_dir=entity_dir)
-            how = "keychain-removed" if pure_orphan else f"{how}+keychain-removed"
+        if orphan is not None:
+            try:
+                still = keychain_orphan(hands, vendor, entity_dir=entity_dir) is not None
+            except HandsLoginError as exc:      # advisory like the first look: reported as unchecked below
+                still, unchecked = False, str(exc)
+            if still:
+                remove_hands_keychain(hands, vendor, entity_dir=entity_dir)
+                how = "keychain-removed" if pure_orphan else f"{how}+keychain-removed"
         after = run_status(hands, vendor, entity_dir=entity_dir, held=True)
         if after.state != OUT or after.credential is not None:
             why = after.error if after.state == UNKNOWN else f"it says {after.state}{': ' + after.account if after.account else ''}"

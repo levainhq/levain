@@ -350,16 +350,23 @@ def test_an_mcp_signin_whose_lock_fails_refuses_before_any_add_or_login(rig, cap
     assert rig.mutating() == [] and not rig.cred.exists() and "linear" not in hml.read_record(rig.entity)
 
 
-def test_an_mcp_signin_writes_the_security_shim_and_refuses_when_it_cannot(rig, capsys):
+def test_an_mcp_signin_and_remove_check_the_root_installed_shim_before_any_claude_run(rig, capsys):
     from levain.firing import hands_login as hl
     rig.register()
-    assert signin(rig) == 0
-    shim = rig.hands_home / ".levain-bin" / "security"
-    assert shim.read_text() == hl.SECURITY_SHIM_TEXT
-    shim.unlink()
-    (rig.hands_home / ".levain-bin").rmdir()
-    (rig.hands_home / ".levain-bin").write_text("a file where the directory goes")
+    assert signin(rig) == 0                                     # the shim is in place: the sign-in runs
+    shim = rig.shim_dir / hl.SECURITY_SHIM_NAME
+    shim.write_text("#!/bin/sh\nexit 0\n")                       # tampered: neither verb runs claude
     rig.log.write_text("")
     rig.register("notion")
     assert signin(rig, "notion") == 1
-    assert "the sign-in was not started" in capsys.readouterr().out and rig.mutating() == []
+    out = capsys.readouterr().out
+    assert "the sign-in was not started" in out and "sudo levain setup-isolation" in out
+    assert rig.calls() == [] and rig.mutating() == [] and "notion" not in hml.read_record(rig.entity)
+    assert hml.cmd_remove(rig.entity, "linear") == 1
+    out = capsys.readouterr().out
+    assert "sudo levain setup-isolation" in out and "nothing was changed" in out
+    assert rig.calls() == [] and "linear" in hml.read_record(rig.entity)
+    shim.unlink()                                               # missing: the same
+    assert signin(rig, "notion") == 1 and rig.calls() == []
+    # nothing wrote the shim: the hands home has no shim directory of any name
+    assert not (rig.hands_home / ".levain-bin").exists() and not shim.exists()

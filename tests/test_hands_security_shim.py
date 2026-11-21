@@ -1,4 +1,4 @@
-"""levain#241 (ruling d241_v2): the `security` shim on the hands PATH. The shim text is written to tmp_path and RUN for
+"""levain#241 (ruling d241_v2): the `security` shim on the hands PATH, root-installed (L3 r1 fixes: where it lives, who checks it). The shim text is written to tmp_path and RUN for
 real, but only with verbs it answers itself (no keychain is reached) and with `list-keychains -d user`, which passes
 through to /usr/bin/security and only reads the search list. Never a verb that could reach a keychain item."""
 from __future__ import annotations
@@ -12,7 +12,7 @@ import pytest
 
 from levain.firing import confinement, hands_login
 from levain.firing.confinement import HANDS_PATH, HandsIdentity
-from tests.test_hands_login import Rig, rig  # noqa: F401
+from tests.test_hands_login import Rig, install_test_shim, rig  # noqa: F401
 
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
@@ -64,64 +64,186 @@ def test_any_other_verb_passes_through_to_the_real_program(shim, tmp_path):
     assert r.stdout == real.stdout
 
 
-def test_the_shim_text_has_no_logging_and_execs_the_absolute_program():
+@pytest.mark.parametrize("args", [("-q", "-i"), ("-v", "-q", "-i"), ("-q", "-i", "-s")])
+def test_dash_i_anywhere_in_the_arguments_is_intercepted(shim, tmp_path, args):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = _run(shim, work, *args, stdin=b"add-generic-password -U -s s -a a -w secret\n" * 1000)
+    assert r.returncode == 36 and r.stdout == b"" and r.stderr == b"" and list(work.iterdir()) == []
+
+
+@pytest.mark.parametrize("verb", ["find-generic-password", "add-generic-password", "delete-generic-password"])
+@pytest.mark.parametrize("lead", [("-q",), ("-q", "-v")])
+def test_an_item_verb_after_global_flags_is_intercepted(shim, tmp_path, verb, lead):
+    work = tmp_path / "work"
+    work.mkdir()
+    r = _run(shim, work, *lead, verb, "-s", "Claude Code-credentials")
+    assert r.returncode == 36 and r.stdout == b"" and r.stderr == b"" and list(work.iterdir()) == []
+
+
+def test_the_shim_text_has_no_logging_scans_every_argument_and_uses_absolute_paths():
     t = hands_login.SECURITY_SHIM_TEXT
-    assert t.startswith("#!/bin/sh\n") and 'exec /usr/bin/security "$@"' in t
+    assert t.startswith("#!/bin/sh\n") and 'exec /usr/bin/security "$@"' in t and 'for a in "$@"' in t
     assert ">>" not in t and "tee" not in t and "logger" not in t          # the credential on stdin is never kept
+    assert "/bin/cat > /dev/null" in t and "\n      cat " not in t and " cat " not in t.replace("/bin/cat", "")
 
 
 # --- the PATH -------------------------------------------------------------------------------------------------------
 
-def test_the_hands_path_starts_with_the_shim_dir_on_macos_and_is_unchanged_on_linux(monkeypatch):
+def test_the_hands_path_starts_with_the_root_owned_shim_dir_on_macos_and_is_unchanged_on_linux(monkeypatch):
     h = HandsIdentity("levain-hands", 4_000_018, "/Users/levain-hands", Path("/srv/ws"))
     monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
-    assert confinement._hands_env(h)["PATH"] == f"/Users/levain-hands/.levain-bin:{HANDS_PATH}"
-    assert confinement._hands_env(h)["PATH"].split(":")[0] == confinement.hands_shim_dir(h)
+    assert confinement.HANDS_SHIM_SYSTEM_DIR == "/Library/Application Support/Levain/hands-bin"
+    assert confinement._hands_env(h)["PATH"] == f"/Library/Application Support/Levain/hands-bin:{HANDS_PATH}"
+    assert not confinement._hands_env(h)["PATH"].startswith(h.home)        # never under the hands home
     monkeypatch.setattr(confinement.platform, "system", lambda: "Linux")
     assert confinement._hands_env(h)["PATH"] == HANDS_PATH
 
 
-# --- ensure_security_shim (the as-hands staging helpers, the rig's hands home) ---------------------------------------
+# --- the check (security_shim_problem): reads only, refuses anything but the exact root-installed shim ----------------
 
-def _shim_file(r: Rig) -> Path:
-    return r.hands_home / ".levain-bin" / "security"
+@pytest.fixture
+def sys_shim(tmp_path, monkeypatch) -> Path:
+    return install_test_shim(tmp_path, monkeypatch)
 
 
-def test_a_login_writes_the_shim_before_the_vendor_runs(rig):
+def test_the_exact_shim_passes(sys_shim):
+    assert hands_login.security_shim_problem() is None
+
+
+def test_a_missing_directory_or_file_is_refused_naming_the_repair(sys_shim):
+    (sys_shim / "security").unlink()
+    assert "not installed" in hands_login.security_shim_problem()
+    assert "sudo levain setup-isolation" in hands_login.security_shim_problem()
+    sys_shim.rmdir()
+    assert "not installed" in hands_login.security_shim_problem()
+
+
+def test_the_wrong_owner_is_refused_on_the_directory_and_the_file(sys_shim, monkeypatch):
+    monkeypatch.setattr(hands_login, "SECURITY_SHIM_OWNER_UID", os.getuid() + 1)
+    p = hands_login.security_shim_problem()
+    assert p and "owned by uid" in p and "sudo levain setup-isolation" in p
+
+
+@pytest.mark.parametrize("mode", [0o1755, 0o2755, 0o4755, 0o775, 0o757, 0o700, 0o644, 0o777])
+def test_the_file_mode_must_be_exactly_0755(sys_shim, mode):
+    f = sys_shim / "security"
+    f.chmod(mode)
+    if f.stat().st_mode & 0o7777 != mode:
+        pytest.skip("this user cannot set that bit on a file here (the OS drops it)")
+    p = hands_login.security_shim_problem()
+    assert p and "mode" in p
+    assert f"{mode:o}" in p
+
+
+@pytest.mark.parametrize("mode", [0o1755, 0o2755, 0o775, 0o757, 0o700])
+def test_the_directory_mode_must_be_exactly_0755(sys_shim, mode):
+    sys_shim.chmod(mode)
+    if sys_shim.stat().st_mode & 0o7777 != mode:
+        sys_shim.chmod(0o755)
+        pytest.skip("this user cannot set that bit on a directory here (the OS drops it)")
+    try:
+        p = hands_login.security_shim_problem()
+    finally:
+        sys_shim.chmod(0o755)
+    assert p and "mode" in p
+
+
+def test_different_bytes_are_refused(sys_shim):
+    f = sys_shim / "security"
+    f.write_text(hands_login.SECURITY_SHIM_TEXT + "# extra\n")
+    assert "not the shim Levain installs" in hands_login.security_shim_problem()
+    f.write_text("#!/bin/sh\nexit 0\n")
+    assert "not the shim Levain installs" in hands_login.security_shim_problem()
+
+
+def test_a_symlinked_file_is_refused(sys_shim, tmp_path):
+    real = tmp_path / "real-security"
+    real.write_text(hands_login.SECURITY_SHIM_TEXT)
+    real.chmod(0o755)
+    (sys_shim / "security").unlink()
+    (sys_shim / "security").symlink_to(real)
+    assert hands_login.security_shim_problem() is not None
+
+
+@pytest.mark.parametrize("which", ["hands-bin", "Levain", "Application Support", "Library"])
+def test_a_symlink_at_any_path_component_is_refused(sys_shim, tmp_path, which):
+    """Every component from the walk root down is lstat'd, so a link anywhere in the chain is refused."""
+    comps = {"hands-bin": sys_shim, "Levain": sys_shim.parent, "Application Support": sys_shim.parent.parent,
+             "Library": sys_shim.parent.parent.parent}
+    target = comps[which]
+    moved = tmp_path / f"moved-{which.replace(' ', '_')}"
+    target.rename(moved)
+    target.symlink_to(moved)
+    p = hands_login.security_shim_problem()
+    assert p and "symlink" in p and which in p
+
+
+def test_a_directory_where_the_file_goes_is_refused(sys_shim):
+    (sys_shim / "security").unlink()
+    (sys_shim / "security").mkdir()
+    assert hands_login.security_shim_problem() is not None
+
+
+def test_check_security_shim_is_for_claude_on_macos_only(sys_shim, monkeypatch):
+    monkeypatch.setattr(hands_login.platform, "system", lambda: "Darwin")
+    (sys_shim / "security").unlink()
+    with pytest.raises(hands_login.HandsLoginError, match="sudo levain setup-isolation"):
+        hands_login.check_security_shim("claude")
+    hands_login.check_security_shim("codex")                               # Codex has no shim
+    monkeypatch.setattr(hands_login.platform, "system", lambda: "Linux")
+    hands_login.check_security_shim("claude")                              # nor does Linux
+
+
+# --- login, status, logout refuse on a miss and run nothing; nothing writes the shim ---------------------------------
+
+def _tamper(rig):
+    (rig.shim_dir / "security").write_text("#!/bin/sh\nexit 0\n")
+
+
+def test_a_login_refuses_before_the_vendor_runs_when_the_shim_is_not_exact(rig):
+    _tamper(rig)
+    with pytest.raises(hands_login.HandsRefused, match="sudo levain setup-isolation"):
+        hands_login.login(rig.h, "claude", rig.entity, emit=lambda s: None)
+    assert rig.calls() == [] and not (rig.hands_home / ".claude").exists()
+    assert (rig.shim_dir / "security").read_text() == "#!/bin/sh\nexit 0\n"   # never repaired from here
+    (rig.shim_dir / "security").unlink()
+    with pytest.raises(hands_login.HandsRefused, match="the login was not started"):
+        hands_login.login(rig.h, "claude", rig.entity, emit=lambda s: None)
+    assert rig.calls() == [] and not (rig.shim_dir / "security").exists()
+    assert not (rig.hands_home / ".levain-bin").exists()
+
+
+def test_a_login_with_the_exact_shim_runs_and_never_rewrites_it(rig):
+    f = rig.shim_dir / "security"
+    ino, mtime = f.stat().st_ino, f.stat().st_mtime_ns
     hands_login.login(rig.h, "claude", rig.entity, emit=lambda s: None)
-    assert _shim_file(rig).read_text() == hands_login.SECURITY_SHIM_TEXT
-    assert os.stat(_shim_file(rig)).st_mode & 0o777 == 0o755 and os.stat(_shim_file(rig).parent).st_mode & 0o777 == 0o700
+    assert f.stat().st_ino == ino and f.stat().st_mtime_ns == mtime and f.read_text() == hands_login.SECURITY_SHIM_TEXT
 
 
-def test_a_missing_or_different_shim_is_rewritten_and_a_right_one_is_left_alone(rig):
-    hands_login.ensure_security_shim(rig.h, "claude", entity_dir=rig.entity)
-    ino = _shim_file(rig).stat().st_ino
-    hands_login.ensure_security_shim(rig.h, "claude", entity_dir=rig.entity)
-    assert _shim_file(rig).stat().st_ino == ino                            # byte-for-byte equal: not rewritten
-    _shim_file(rig).write_text("#!/bin/sh\nexit 0\n")                        # tampered
-    hands_login.ensure_security_shim(rig.h, "claude", entity_dir=rig.entity)
-    assert _shim_file(rig).read_text() == hands_login.SECURITY_SHIM_TEXT
-    _shim_file(rig).chmod(0o644)                                           # not executable: rewritten with 755
-    hands_login.ensure_security_shim(rig.h, "claude", entity_dir=rig.entity)
-    assert os.stat(_shim_file(rig)).st_mode & 0o777 == 0o755
-    _shim_file(rig).unlink()
-    hands_login.ensure_security_shim(rig.h, "claude", entity_dir=rig.entity)
-    assert _shim_file(rig).read_text() == hands_login.SECURITY_SHIM_TEXT
-
-
-def test_an_unwritable_shim_refuses_the_login_before_the_vendor_runs(rig):
-    (rig.hands_home / ".levain-bin").write_text("a file where the directory goes")
-    with pytest.raises(hands_login.HandsRefused, match="the login was not started"):
-        hands_login.login(rig.h, "claude", rig.entity, emit=lambda s: None)
+def test_status_refuses_before_claude_runs_when_the_shim_is_not_exact(rig):
+    _tamper(rig)
+    st = hands_login.run_status(rig.h, "claude", entity_dir=rig.entity)
+    assert st.state == hands_login.UNKNOWN and "sudo levain setup-isolation" in st.error
     assert rig.calls() == []
-    (rig.hands_home / ".levain-bin").unlink()
-    (rig.hands_home / ".levain-bin").mkdir()
-    (rig.hands_home / ".levain-bin" / "security").symlink_to(rig.hands_home / "elsewhere")   # a link is refused, not followed
-    with pytest.raises(hands_login.HandsRefused, match="the login was not started"):
-        hands_login.login(rig.h, "claude", rig.entity, emit=lambda s: None)
+    ok = hands_login.run_status(rig.h, "codex", entity_dir=rig.entity)      # codex has no shim to check
+    assert "sudo levain" not in ok.error
+
+
+def test_logout_refuses_before_any_claude_run_when_the_shim_is_not_exact(rig):
+    _tamper(rig)
+    with pytest.raises(hands_login.HandsRefused, match="sudo levain setup-isolation"):
+        hands_login.run_logout(rig.h, "claude", rig.entity)
     assert rig.calls() == []
+    assert hands_login.cmd_hands_logout(rig.entity, "claude") == 1
 
 
-def test_codex_has_no_shim(rig):
+def test_codex_has_no_shim_check(rig):
+    (rig.shim_dir / "security").unlink()
     hands_login.login(rig.h, "codex", rig.entity, emit=lambda s: None)
     assert not (rig.hands_home / ".levain-bin").exists()
+
+
+def test_the_hands_home_shim_directory_and_its_as_hands_writer_are_gone():
+    assert not hasattr(hands_login, "ensure_security_shim")
+    assert not hasattr(confinement, "HANDS_SHIM_DIRNAME")

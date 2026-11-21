@@ -896,6 +896,8 @@ def plan_setup(
     ]
     for gkey, value in sorted((git_identity or {}).items()):
         steps.append(Step(f"give the hands user your git {gkey}", (*as_hands, git, "config", "--global", gkey, value)))
+    if host == "darwin":
+        steps.append(shim_install_step())
     steps.append(Step(
         "allow you to run commands as the hands user, and nothing else (sudoers drop-in)",
         write=(sudoers_path(hands), sudoers_text(operator, hands, hands_net_group(hands) if host == "linux" else None),
@@ -1068,7 +1070,144 @@ def plan_undo(
           for deny in _CRON_DENY[host]],
         Step("remove the workspace if it is empty", call=lambda: _remove_if_empty(ws)),
     ]
+    if host == "darwin":
+        steps.append(Step("remove the hands security shim, when no other hands account remains",
+                          call=lambda: remove_hands_shim(except_user=hands_user)))
     return Plan(host, operator, hands_user, hands_id if hands_id is not None else -1, ed, ws, tuple(steps))
+
+
+# --- the root-owned ``security`` shim (macOS, levain#241) ---------------------------------------------------------------
+#
+# Installed here, as root (``sudo levain setup-isolation`` runs as root), into :data:`~levain.firing.confinement.
+# HANDS_SHIM_SYSTEM_DIR`, root:wheel, directory and file 0755. The hands user cannot write there, so nothing it plants
+# reaches the first place on its PATH. Levain's own runs only CHECK it (:func:`levain.firing.hands_login.
+# security_shim_problem`); this is the one writer, and ``--undo`` the one remover.
+
+
+def _real_dir_for_root(path: str, owner: tuple[int, int]) -> str | None:
+    """Make ``path`` a real directory owned by ``owner`` with mode 0755 (created when absent); a link or a non-directory
+    there is a reason string, never followed or replaced. Root's own work in root's own directories."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            os.mkdir(path, 0o755)
+        except OSError as exc:
+            return f"{path} could not be created: {exc.strerror or exc}"
+    except OSError as exc:
+        return f"{path} could not be checked: {exc.strerror or exc}"
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            return f"{path} is a symlink; refusing to install the hands security shim through it"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{path} is not a directory; refusing to install the hands security shim there"
+    try:
+        os.chown(path, *owner)
+        os.chmod(path, 0o755)
+    except OSError as exc:
+        return f"{path} could not be made root's (owner and mode 0755): {exc.strerror or exc}"
+    return None
+
+
+def install_hands_shim(*, owner: tuple[int, int] = (0, 0)) -> tuple[bool, str]:
+    """Install (or repair, idempotently) the hands ``security`` shim in its root-owned system directory: the directory
+    and file ``owner`` (root:wheel; a test stands its own ids in), mode 0755, the file exactly
+    :data:`~levain.firing.hands_login.SECURITY_SHIM_TEXT`, replaced by an atomic rename. Already exact: nothing is
+    written. The system directory's parent, ``/Library/Application Support``, is macOS's own and must already exist."""
+    from levain.firing import confinement, hands_login
+
+    d = os.path.normpath(confinement.hands_shim_dir())
+    if hands_login.security_shim_problem() is None:
+        return True, "already installed"
+    parent = os.path.dirname(d)
+    if not os.path.isdir(os.path.dirname(parent)) or os.path.islink(os.path.dirname(parent)):
+        return False, f"{os.path.dirname(parent)} is not a real directory; cannot install the hands security shim"
+    for part in (parent, d):
+        why = _real_dir_for_root(part, owner)
+        if why is not None:
+            return False, why
+    ok, why = _install_file(Path(d) / hands_login.SECURITY_SHIM_NAME, hands_login.SECURITY_SHIM_TEXT,
+                            hands_login.SECURITY_SHIM_MODE, validate=(), owner=owner)
+    if not ok:
+        return False, why
+    problem = hands_login.security_shim_problem()
+    return (problem is None), (f"installed {d}/{hands_login.SECURITY_SHIM_NAME}" if problem is None else problem)
+
+
+def shim_install_step() -> Step:
+    """The plan step that installs the shim (macOS)."""
+    return Step("install the security shim Claude's login uses (root-owned, outside the hands home)",
+                call=install_hands_shim)
+
+
+def other_hands_accounts(host: HostOS, except_user: str) -> list[str]:
+    """The live (not retired) Levain hands accounts other than ``except_user``."""
+    out = []
+    for entry in pwd.getpwall():
+        n = entry.pw_name
+        if n != except_user and HANDS_USER_RE.match(n) and user_record_is_ours(n, host) and not user_is_retired(n, host):
+            out.append(n)
+    return out
+
+
+def remove_hands_shim(*, except_user: str) -> tuple[bool, str]:
+    """``--undo``: remove the shim and its directories, but only when no hands account remains besides ``except_user``
+    (which this undo is retiring): another entity's hands user still needs it. Removes only what it finds as a regular
+    file or link of that name; a directory that is not empty (other things of Levain's) stays."""
+    from levain.firing import confinement, hands_login
+
+    others = other_hands_accounts("darwin", except_user)
+    if others:
+        return True, "kept: another hands account still uses it (" + ", ".join(sorted(others)) + ")"
+    d = os.path.normpath(confinement.hands_shim_dir())
+    f = os.path.join(d, hands_login.SECURITY_SHIM_NAME)
+    try:
+        if os.path.islink(d):
+            return False, f"{d} is a symlink; refusing to remove through it"
+        try:
+            os.unlink(f)
+        except FileNotFoundError:
+            pass
+        for path in (d, os.path.dirname(d)):
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    break                          # something else of Levain's lives there: it stays
+                return False, f"{path} could not be removed: {exc.strerror or exc}"
+    except OSError as exc:
+        return False, f"{f} could not be removed: {exc.strerror or exc}"
+    return True, "removed"
+
+
+def _repair_darwin(entity_dir: Path, cfg, operator: str, *, dry_run: bool) -> int | None:
+    """``setup-isolation`` on a macOS entity already set up whose shim is missing or not exact: install it (a repair
+    run). None when the shim is already exact (the caller keeps its "already set up" answer)."""
+    from levain.firing import hands_login
+
+    if hands_login.security_shim_problem() is None:
+        return None
+    hands = cfg.hands_user
+    if hands != hands_user_name(entity_dir) or not user_record_is_ours(hands, "darwin"):
+        print(f"setup-isolation: refusing to repair {hands}: it is not the hands user setup made for {entity_dir}. "
+              "Run with --undo, then set it up again.")
+        return 1
+    try:
+        hands_id = pwd.getpwnam(hands).pw_uid
+    except KeyError:
+        print(f"setup-isolation: the recorded hands user {hands} does not exist. Run with --undo, then again.")
+        return 1
+    if hands_id != cfg.hands_uid:
+        print(f"setup-isolation: {hands} has id {hands_id}, but confinement.json records {cfg.hands_uid}; refusing.")
+        return 1
+    plan = Plan("darwin", operator, hands, hands_id, entity_dir, cfg.hands_workspace, (shim_install_step(),))
+    print(f"Repairing the setup recorded in {entity_dir} (user {hands}): the security shim Claude's login uses.")
+    rc = run_plan(plan, dry_run=dry_run)
+    if rc == 0 and not dry_run:
+        print("setup-isolation: the security shim is installed; `levain doctor` checks the rest of the setup.")
+    return rc
 
 
 # --- step bodies that are not a single command ----------------------------------------------------
@@ -1632,7 +1771,8 @@ def _sync_dir(path: str | Path) -> None:
 
 
 def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, ...],
-                  check: Callable[[], tuple[bool, str]] | None = None) -> tuple[bool, str]:
+                  check: Callable[[], tuple[bool, str]] | None = None,
+                  owner: tuple[int, int] = (0, 0)) -> tuple[bool, str]:
     """Write ``content`` to a temp file beside ``path``, validate it, then move it into place with
     ``mode``, owned by root. ``check`` runs after the move (for a config whose validator reads the
     installed tree, like ``sshd -t``); if it fails the file is removed again. A drop-in that fails
@@ -1654,7 +1794,7 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
             r = subprocess.run([*validate, tmp], capture_output=True, text=True, env=child_env())
             if r.returncode != 0:
                 return False, (r.stderr or r.stdout).strip()
-        os.chown(tmp, 0, 0)
+        os.chown(tmp, *owner)
         # Synced after its mode and owner are set, so the new file arrives whole with both.
         try:
             _sync_file(tmp)
@@ -2065,6 +2205,10 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
     if cfg.hands_user is not None:
         if host == "linux":
             return _repair_linux(entity_dir, cfg, operator, op, ports, dry_run=dry_run)
+        if host == "darwin":
+            repaired = _repair_darwin(entity_dir, cfg, operator, dry_run=dry_run)
+            if repaired is not None:
+                return repaired
         print(f"setup-isolation: {entity_dir} is already set up (user {cfg.hands_user}). "
               "Run with --undo first to set it up again.")
         return 1

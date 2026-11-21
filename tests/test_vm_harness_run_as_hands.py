@@ -19,7 +19,8 @@ def test_argv_is_the_products_sudo_env_i_shape_with_the_hands_path(monkeypatch):
     monkeypatch.setattr(confinement.platform, "system", lambda: "Darwin")
     argv = rah.build_argv(H, [], ["codex", "mcp", "list"])
     assert argv[:7] == [confinement.SUDO, "-n", "-u", H.user, "/usr/bin/env", "-i", f"HOME={H.home}"]
-    assert f"PATH={confinement.hands_shim_dir(H)}:{HANDS_PATH}" in argv  # Darwin (patched above): the shim dir first and f"USER={H.user}" in argv and f"LOGNAME={H.user}" in argv
+    assert f"PATH={confinement.hands_shim_dir()}:{HANDS_PATH}" in argv  # Darwin (patched above): the root-owned shim dir first
+    assert f"USER={H.user}" in argv and f"LOGNAME={H.user}" in argv
     assert argv[-3:] == ["codex", "mcp", "list"]
     assert argv.index("codex") > max(i for i, a in enumerate(argv) if "=" in a and a.split("=")[0].isupper())
 

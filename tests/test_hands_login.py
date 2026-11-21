@@ -156,8 +156,27 @@ exit 2
 BROKEN_PREFIX = ["/bin/sh", "-c", 'echo "sudo: a password is required" >&2; exit 1', "sudo"]
 
 
+def install_test_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """levain#241: stand a temporary directory in for ``/Library/Application Support/Levain/hands-bin`` (nothing is ever
+    written under /Library): the exact shim in it, directory and file 0755 and owned by THIS user, which the check is told
+    to expect as the owner; the link walk starts at the temporary root. Returns the shim's directory."""
+    root = tmp_path / "sysroot"
+    d = root / "Library" / "Application Support" / "Levain" / "hands-bin"
+    d.mkdir(parents=True)
+    for q in (d, d.parent, d.parent.parent, d.parent.parent.parent, root):
+        q.chmod(0o755)
+    f = d / hands_login.SECURITY_SHIM_NAME
+    f.write_text(hands_login.SECURITY_SHIM_TEXT)
+    f.chmod(0o755)
+    monkeypatch.setattr(confinement, "HANDS_SHIM_SYSTEM_DIR", str(d))
+    monkeypatch.setattr(hands_login, "SECURITY_SHIM_OWNER_UID", os.getuid())
+    monkeypatch.setattr(hands_login, "SECURITY_SHIM_WALK_FROM", str(root))
+    return d
+
+
 class Rig:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        self.shim_dir = install_test_shim(tmp_path, monkeypatch)
         self.bindir = tmp_path / "bin"
         self.bindir.mkdir()
         for name, body in (("claude", CLAUDE_SHIM), ("codex", CODEX_SHIM), ("security", SECURITY_SHIM)):
@@ -241,7 +260,7 @@ def test_login_argv_runs_as_hands_with_pinned_home_and_fixed_path(monkeypatch, s
     assigned = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in argv[6:] if "=" in a and a.split("=", 1)[0].isupper()}
     assert assigned[var] == f"/Users/levain-hands/{sub}"
     assert assigned["HOME"] == "/Users/levain-hands"
-    assert assigned["PATH"] == (f"/Users/levain-hands/.levain-bin:{HANDS_PATH}" if system == "Darwin" else HANDS_PATH)
+    assert assigned["PATH"] == (f"{confinement.hands_shim_dir()}:{HANDS_PATH}" if system == "Darwin" else HANDS_PATH)
     assert set(assigned) == {"HOME", "PATH", "LANG", "TERM", "USER", "LOGNAME", "ENABLE_CLAUDEAI_MCP_SERVERS",
                          "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", var}
     assert argv[-len(hands_login._VENDOR[vendor]["login"]):] == list(hands_login._VENDOR[vendor]["login"])
