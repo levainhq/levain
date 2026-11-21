@@ -191,7 +191,7 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
     # what a question reports after a cue and a colon is not its own: the permission and confirmation forms are read
     # from the rest
     own = {q: _asked(q) for q in questions}
-    to_him = [q for q in questions if _ADDRESS.search(q) or _PERMISSION.search(own[q]) or _CONFIRM_FORM.search(own[q])]
+    to_him = [q for q in questions if _ADDRESS.search(own[q]) or _PERMISSION.search(own[q]) or _CONFIRM_FORM.search(own[q])]
     told = any(_IMPERATIVE.search(_asked(s)) for s in sentences)
     letters = {m.group(1).lower() for rx in (_LETTER_PAREN, _LETTER_LINE, _LETTER_OPTION) for m in rx.finditer(text)}
     if {"a", "b"} <= letters and (questions or told):
@@ -205,7 +205,7 @@ def _shapes_of(text: str, sentences: list[str]) -> tuple[str, ...]:
         found.append("which_do_you")
     if any(_CONFIRM_ANY.search(_asked(s)) for s in sentences) or any(_AMOUNT.search(own[q]) or (q in to_him and _CONFIRM_Q.search(own[q])) for q in questions):
         found.append("confirm_pick")
-    if any(_ADDRESS.search(q) for q in questions):
+    if any(_ADDRESS.search(own[q]) for q in questions):
         found.append("q_to_you")
     return tuple(found)
 

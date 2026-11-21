@@ -477,6 +477,7 @@ def test_a_band_view_with_nothing_open_still_drops_the_closed_notices_it_carries
 def test_a_reported_confirmation_question_is_no_ask():
     assert operator_ask.detect("The UI now displays: Should I deploy now?") is None
     assert operator_ask.detect("The dialog says: Is $150 OK?") is None
+    assert operator_ask.detect("The dialog says: Do you want to continue?") is None
     assert shapes("Should I deploy now?") == "operator"
 
 
