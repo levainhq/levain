@@ -74,3 +74,14 @@ def test_226_linux_export_stage_enters_mount_root_after_the_drop(role, monkeypat
     bad = FakeOS({"chdir": "raise"}, linux=True, files={}, fds=(0, 1, 2, 3, 4), spec_bytes=sp.to_json())
     assert wall.stage_main(os_calls=bad.calls) == wall.STAGE_EXIT
     assert "execve" not in bad.names()
+
+
+@pytest.mark.parametrize("role", sorted(ROLES))
+def test_226_linux_export_launch_pairs_the_view_chdir_with_the_mount_root_spec_cwd(role):
+    """The launch argv carries bwrap's ``--chdir /`` and the spec the stage reads carries the mount root: the two
+    halves of the fix in one launch (a view that entered the mount root again would fail EPERM for the capless root)."""
+    sp = _spec("linux", role)
+    launch = wall.export_linux_launch_argv(sp, host_links=LINKS)
+    argv = list(launch.argv)
+    assert argv[argv.index("--chdir") + 1] == "/"
+    assert sp.cwd == f"/var/levain/export/{ROLES[role][1]}"
