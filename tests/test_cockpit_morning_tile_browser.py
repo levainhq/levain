@@ -10,7 +10,7 @@ import levain.cockpit.desk_panels as dp
 from levain.cockpit.results import Read, RowIn
 from levain.desk import morning
 from levain.desk.store import CoordStore
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
 pytestmark = [needs_browser]
@@ -62,6 +62,7 @@ def _drive_tile(tmp_path, monkeypatch, note):
     steps = [
         {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
         {"until": f"!!{TILE}", "ms": 25000},
+        BOARD_SETTLED,                # a fresh install's first hello may draw the board again, which would replace the tile and the modal the steps below hold
         {"eval": f"(() => {{ const t = {TILE}; const subs = [...t.querySelectorAll('.sub')]; "
                  "return {h: Math.round(t.getBoundingClientRect().height), text: t.textContent, subs: subs.map(x => x.textContent)}; })()"},
         {"tap": TILE, "ms": 8000},
