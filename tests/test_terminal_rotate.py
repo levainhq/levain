@@ -455,3 +455,14 @@ def test_a_fresh_start_check_that_raises_is_a_refusal_not_a_stop(rig, monkeypatc
 def test_the_ctk_step_docstring_says_an_exception_stops_the_run():
     doc = tr._step_ctk.__doc__ or ""
     assert "never fatal" not in doc and "stops the run" in doc and "resumable" in doc
+
+
+@pytest.mark.parametrize("fail", ["write", "fsync", "replace"])
+def test_a_journal_write_that_fails_leaves_no_temporary_file(tmp_path, monkeypatch, fail):
+    import os
+    def boom(*a, **k):
+        raise OSError(5, "stub")
+    monkeypatch.setattr(os, {"write": "write", "fsync": "fsync", "replace": "replace"}[fail], boom)
+    with pytest.raises(OSError):
+        tr._write_journal(tmp_path, {"a": 1})
+    assert list(tmp_path.iterdir()) == []

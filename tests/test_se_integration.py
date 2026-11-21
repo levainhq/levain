@@ -325,7 +325,7 @@ def test_one_sheet_per_sign_no_python_retry(tmp_path, stub_helper):
 def test_helper_failures_keep_the_classifier_working(tmp_path, stub_helper):
     d = _keydir(tmp_path)
     key = _soft_key(d)
-    _fp, sign = _signer(key, stub_helper, timeout=4.0)     # about 2 s for the helper after the two verify reserves
+    _fp, sign = _signer(key, stub_helper, timeout=6.0)     # about 4 s for the helper after the two verify reserves: over the floor
     _set(key, ".sleep", "6")
     with pytest.raises(KeyError_) as ei:
         sign(b"m")
@@ -1014,3 +1014,47 @@ def test_the_helper_cache_dir_with_no_passwd_entry_is_a_signer_error(monkeypatch
     assert ei.value.code == "no_home"
     with pytest.raises(ses.SeSignerError):
         ses.require_helper()
+
+
+# --- levain#191 L3 r2 (serot-fix3) -----------------------------------------------------------------------
+
+def test_a_sign_budget_under_the_helper_floor_is_refused_before_the_helper_runs(tmp_path, stub_helper):
+    # 4.5 s less two 1 s verify reserves is 2.5 s: over a second, under WALL_FLOOR_S + WALL_MARGIN_S, so no helper run
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _fp, sign = _signer(key, stub_helper, timeout=4.5)
+    with pytest.raises(KeyError_, match="no time left to sign"):
+        sign(b"m")
+    assert _stub_log(key) == [] and _log(d)[-1]["outcome"] == "no-time"
+
+
+def test_a_create_key_that_finds_another_creators_files_removes_none_of_them(tmp_path, monkeypatch):
+    from levain.consent import se_signer as ses
+    d = _keydir(tmp_path)
+
+    def create(key, **kw):     # another creator's files appear after the leftover check, then the helper says "exists"
+        key.write_text("theirs")
+        key.with_name(key.name + ".meta.json").write_text("theirs")
+        raise ses.SeSignerError("stub: key exists", "exists")
+    monkeypatch.setattr(ses, "create_key", create)
+    with pytest.raises(KeyError_, match="could not make the key"):
+        custody.create_levain_sign(d, "levain-terminal", helper=tmp_path / "never-run", platform="darwin")
+    assert (d / "levain-terminal").read_text() == "theirs"
+    assert (d / "levain-terminal.meta.json").read_text() == "theirs"
+
+
+def test_create_levain_sign_builds_the_helper_before_it_looks_for_leftovers(tmp_path, monkeypatch):
+    from levain.consent import se_signer as ses
+    d = _keydir(tmp_path)
+    order: list[str] = []
+
+    def build():
+        order.append("build")
+        return tmp_path / "never-run"
+    real = custody._destinations
+    monkeypatch.setattr(ses, "ensure_helper", build)
+    monkeypatch.setattr(custody, "_destinations", lambda *a, **k: (order.append("destinations"), real(*a, **k))[1])
+    (d / "levain-terminal.meta.json").write_text("leftover")
+    with pytest.raises(KeyError_, match="already exists"):
+        custody.create_levain_sign(d, "levain-terminal", platform="darwin")
+    assert order == ["build", "destinations"]

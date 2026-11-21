@@ -681,6 +681,10 @@ def create_levain_sign(key_dir: Path | None = None, label: str | None = None, *,
         raise KeyError_("the Secure Enclave helper is macOS only; on this machine use --custody passphrase")
     label = _check_label(label or f"levain-{(stamp or _stamp)()}")
     d = _key_dir(gate)
+    try:   # the (possibly minutes-long) build comes first, so the leftover check below is the last look before the helper
+        built = helper if helper is not None else se_signer.ensure_helper()
+    except se_signer.SeSignerError as exc:
+        raise KeyError_(f"the Secure Enclave helper could not make the key: {exc}") from None
     key, pub = _destinations(d, label)
     meta = key.with_name(key.name + ".meta.json")   # the helper's record of whether the key is presence-gated
     leftovers = [str(p) for p in (meta, key.with_name(key.name + ".counter")) if os.path.lexists(p)]
@@ -690,11 +694,15 @@ def create_levain_sign(key_dir: Path | None = None, label: str | None = None, *,
     made: list[Path] = []
     kept = False
     try:
-        built = helper if helper is not None else se_signer.ensure_helper()
         # listed BEFORE the helper runs, so any failure from here on removes whatever of them it left (neither existed)
         made.append(key)
         made.append(meta)
-        se_signer.create_key(key, presence=presence, helper=built)
+        try:
+            se_signer.create_key(key, presence=presence, helper=built)
+        except se_signer.SeSignerError as exc:
+            if exc.code == "exists":   # another creator's files are there: this call made none of them, so it removes none
+                made.clear()
+            raise
         normal = normalise_public_key(se_signer.public_key_line(key, helper=built))
         _write_new(pub, f"{normal} {label}\n".encode("ascii"), 0o644)
         made.append(pub)

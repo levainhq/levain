@@ -245,9 +245,13 @@ def sign_once(blob_path: Path, message: bytes, *, namespace: str, helper: Path,
     ``evaluations`` (at most 1), ``counter``. The signature is NOT checked here (see :func:`se_signer`). Raises
     :class:`SeSignerError`; its ``payload`` is the helper's error JSON when it gave one. Never retried here: the
     helper's silent same-context retries (named transient codes only) are the only ones. The helper's presence wall
-    (``--wall-ms``) is ``timeout`` less :data:`WALL_MARGIN_S` (never under :data:`WALL_FLOOR_S`), so its own
-    ``presence_timeout`` answer comes before this side's kill."""
-    wall_ms = int(max(timeout - WALL_MARGIN_S, WALL_FLOOR_S) * 1000)
+    (``--wall-ms``) is ``timeout`` less :data:`WALL_MARGIN_S`, so its own ``presence_timeout`` answer comes before
+    this side's kill; a ``timeout`` under :data:`WALL_FLOOR_S` + :data:`WALL_MARGIN_S` raises code ``no_time`` and
+    runs nothing."""
+    if not timeout >= WALL_FLOOR_S + WALL_MARGIN_S:   # also a NaN: no helper run without room for a wall under its kill
+        raise SeSignerError(f"no time to sign: {timeout!r}s is under the {WALL_FLOOR_S + WALL_MARGIN_S:g}s floor",
+                            "no_time")
+    wall_ms = int((timeout - WALL_MARGIN_S) * 1000)
     args = ["sign", "--key", str(blob_path), "--application", application, "--namespace", namespace,
             "--reason", reason, "--wall-ms", str(wall_ms)]
     return _run(helper, args, stdin=message, timeout=timeout)
@@ -371,8 +375,9 @@ def _prune_sign_log(path: Path) -> None:
         lines = b"".join(chunks).splitlines(keepends=True)
         if len(lines) <= SIGN_LOG_KEEP:
             return
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-        wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        candidate = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+        wfd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        tmp = candidate   # only now ours: a failed O_EXCL must not unlink a file this call did not make
         try:
             _write_all(wfd, b"".join(lines[-SIGN_LOG_KEEP:]))
         finally:

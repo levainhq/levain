@@ -243,8 +243,18 @@ def test_sign_once_passes_a_presence_wall_below_its_own_subprocess_timeout(tmp_p
         wall_ms = int(seen["cmd"][seen["cmd"].index("--wall-ms") + 1])
         assert seen["timeout"] == timeout
         assert wall_ms == int((timeout - ses.WALL_MARGIN_S) * 1000) and wall_ms / 1000 < timeout
-    ses.sign_once(tmp_path / "k", b"m", namespace=NS, helper=tmp_path / "h", timeout=2.5)
+    floor = ses.WALL_FLOOR_S + ses.WALL_MARGIN_S
+    ses.sign_once(tmp_path / "k", b"m", namespace=NS, helper=tmp_path / "h", timeout=floor)
     assert int(seen["cmd"][seen["cmd"].index("--wall-ms") + 1]) == int(ses.WALL_FLOOR_S * 1000)     # the floor
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, 1.0, 2.5, float("nan")])
+def test_a_sign_with_a_timeout_under_the_floor_runs_no_helper(tmp_path, monkeypatch, timeout):
+    ran = []
+    monkeypatch.setattr(ses.subprocess, "run", lambda *a, **k: ran.append(a))
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses.sign_once(tmp_path / "k", b"m", namespace=NS, helper=tmp_path / "h", timeout=timeout)
+    assert ei.value.code == "no_time" and ran == []
 
 
 def test_the_terminal_sign_bound_gives_the_levain_sign_helper_a_wall_inside_its_timeout(tmp_path, monkeypatch):
@@ -267,3 +277,17 @@ def test_the_terminal_sign_bound_gives_the_levain_sign_helper_a_wall_inside_its_
     wall = int(seen["args"][seen["args"].index("--wall-ms") + 1]) / 1000
     assert seen["timeout"] <= ts.SIGN_BOUND_S - 2 * ckeys._VERIFY_RESERVE_S
     assert wall < seen["timeout"] and wall <= seen["timeout"] - ses.WALL_MARGIN_S + 0.001
+
+
+def test_the_sign_log_prune_never_unlinks_a_temporary_it_failed_to_create(tmp_path, monkeypatch):
+    # an O_EXCL collision on the temporary name must leave the other file alone
+    import os
+    log = tmp_path / "sign.log"
+    log.write_bytes(b"x" * 40 + b"\n" * 0 + (b"line\n" * (ses.SIGN_LOG_KEEP * 2)))
+    theirs = tmp_path / "theirs.tmp"
+    theirs.write_text("theirs")
+    monkeypatch.setattr(ses.secrets, "token_hex", lambda n: "fixed")
+    clash = log.with_name(f"{log.name}.{os.getpid()}.fixed.tmp")
+    clash.write_text("theirs")
+    ses._prune_sign_log(log)
+    assert clash.read_text() == "theirs" and theirs.read_text() == "theirs"

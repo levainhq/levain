@@ -117,13 +117,20 @@ def _write_journal(d: Path, journal: dict[str, Any]) -> None:
         pass
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     try:
-        view = memoryview((json.dumps(journal, sort_keys=True, indent=1) + "\n").encode("utf-8"))
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, final)
+        try:
+            view = memoryview((json.dumps(journal, sort_keys=True, indent=1) + "\n").encode("utf-8"))
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, final)
+    except BaseException:   # the temporary file is this call's: a failed write, fsync or rename leaves none behind
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------------------------------

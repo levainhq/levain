@@ -1184,9 +1184,9 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
         except _se.SeSignerError as exc:
             record("helper-missing", exc.code or "build")
             raise KeyError_(f"the Secure Enclave helper is not available ({exc}), so nothing was signed") from None
-        # an exhausted deadline is never extended: under a second left for the helper and nothing is run
+        # an exhausted deadline is never extended: under the helper's floor (WALL_FLOOR_S + WALL_MARGIN_S) left for it and nothing is run
         helper_budget = deadline - time.monotonic() - _VERIFY_RESERVE_S * 2
-        if helper_budget < 1.0:
+        if helper_budget < _se.WALL_FLOOR_S + _se.WALL_MARGIN_S:
             record("no-time", "deadline")
             raise KeyError_(f"no time left to sign with {fp} ({max(helper_budget, 0.0):.1f}s of the {bound:g}s bound "
                             "after the verify reserve), so nothing was signed")
