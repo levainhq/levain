@@ -216,3 +216,22 @@ def test_a_dispatch_directory_that_cannot_be_named_keeps_the_panel_and_its_read_
     assert [s.id for s in specs] == [CALLS_ID]                         # not "no desk": the panel stays, so a retire does not drop it
     got = specs[0].read(None)
     assert "cannot be read" in str(got) and "OSError" in str(got)
+
+
+def test_the_windows_rank_and_the_rows_state_come_from_one_set_of_kinds_pinned_to_the_desks_own():
+    # behaviour (L3 r2): each known kind lands in the group the registry's ordering gives it, the set is the desk's own launch
+    # kinds (the store's CHECK refuses any other, so a kind the desk adds goes red HERE and is placed on purpose), and the
+    # window's rank is built from the same two tuples the row's state reads
+    from levain.cockpit import calls_panel
+    from levain.cockpit.registry import ORDERINGS
+    from levain.desk.lease import LAUNCH_KINDS
+
+    assert set(calls_panel._KNOWN_STATES) == set(LAUNCH_KINDS)
+    group = ORDERINGS["calls.state"].group
+    for kind in calls_panel._LIVE_KINDS:
+        assert group(calls_panel._row("l", "[]", "t", None, kind), None) == "live"
+    for kind in calls_panel._OVER_KINDS:
+        assert group(calls_panel._row("l", "[]", "t", None, kind), None) == "over"
+    for kind in calls_panel._LIVE_KINDS + calls_panel._OVER_KINDS:
+        assert f"'{kind}'" in calls_panel._SQL
+    assert calls_panel._one_line("abc", 0) == "" and calls_panel._one_line("abc", 1) == "\u2026"

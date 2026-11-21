@@ -30,17 +30,20 @@ CALL_ROW_PREFIX = "call:"
 CALLS_ORDER = "calls.state"
 CALL_FACETS = frozenset({"call_state"})
 CALLS_SHOWN = 40
-_KNOWN_STATES = ("pending", "active", "failed", "expired", "ended")      # the desk's launch event kinds; the registry's enum adds "unknown"
+_LIVE_KINDS = ("pending", "active")                          # the desk's launch event kinds; the registry's enum adds "unknown"
+_OVER_KINDS = ("failed", "expired", "ended")
+_KNOWN_STATES = _LIVE_KINDS + _OVER_KINDS
+_IN = lambda kinds: "(" + ", ".join(f"'{k}'" for k in kinds) + ")"   # noqa: E731 - constants of this module, never a caller's text
 
 _SQL = ("SELECT launch_id, threads, at, role_ref, kind FROM (SELECT l.launch_id, l.threads, l.at, l.role_ref, l.gseq, "
         "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) AS kind "
         "FROM launches l WHERE l.role = 'worker' AND l.role_ref IS NOT NULL) "
-        "ORDER BY CASE WHEN kind IN ('pending', 'active') THEN 0 WHEN kind IS NULL THEN 1 ELSE 2 END, gseq DESC LIMIT ?")
+        f"ORDER BY CASE WHEN kind IN {_IN(_LIVE_KINDS)} THEN 0 WHEN kind IN {_IN(_OVER_KINDS)} THEN 2 ELSE 1 END, gseq DESC LIMIT ?")
 
 
 def _one_line(text: object, limit: int = 300) -> str:
     line = " ".join(str(text or "").split())
-    return line if len(line) <= limit else ("…" if limit <= 1 else line[:limit - 1].rstrip() + "…")
+    return line if len(line) <= limit else ("" if limit <= 0 else "…" if limit == 1 else line[:limit - 1].rstrip() + "…")
 
 
 def _open(directory: Path) -> sqlite3.Connection | None:
