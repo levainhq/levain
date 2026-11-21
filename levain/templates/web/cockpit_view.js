@@ -2497,11 +2497,13 @@
   const JUMP_PLACES = ".ia-places [data-ia-place-btn]";
   const JUMP_BLOCKS = "#ck-hero [data-ck-panel], #ck-skycol, #ck-needs, #ck-notes, #ck-drop, #ck-widgets > [data-ck-panel], .dev-zone, .ck-thiscockpit";
   const placeName = (b) => { const p = String(b.dataset.iaPlaceBtn || ""); return p ? p[0].toUpperCase() + p.slice(1) : ""; };
-  // The visible heading of a block, tried in this order so the answer does not depend on where headings sit in the block.
+  // The visible heading of a block, tried in this order so the answer does not depend on where headings sit in the block. A panel keeps its
+  // own head first; a section that is not a panel is named by its own title before any panel head it holds (the section's panels are not it).
   const HEADINGS = [".phead h2", ".zone-title", ".k", "h2", "h3"];
-  function headingOf(n) {
+  const SECTION_HEADINGS = [".zone-title", ".phead h2", ".k", "h2", "h3"];
+  function headingOf(n, panel) {
     if (!n.querySelector) return "";
-    for (const sel of HEADINGS) {
+    for (const sel of panel ? HEADINGS : SECTION_HEADINGS) {
       const h = n.querySelector(sel);
       const t = h && String(h.textContent || "").trim();
       if (t) return t;
@@ -2514,9 +2516,15 @@
   function blockName(n) {
     const aria = (n.getAttribute && n.getAttribute("aria-label")) || "";
     const id = n.dataset && n.dataset.ckPanel;
-    const t = id ? headingOf(n) || aria : aria || headingOf(n);
+    const t = id ? headingOf(n, true) || aria : aria || headingOf(n, false);
     if (t) return t;
     return id ? id[0].toUpperCase() + id.slice(1).replace(/-/g, " ") : "";
+  }
+  // How a block with no panel id is found again when a redraw has replaced its node: by its own id, else by the zone it names.
+  function findAgain(n) {
+    if (n.id) return '[id="' + n.id + '"]';
+    const z = n.dataset && n.dataset.zone;
+    return z ? '[data-zone="' + z + '"]' : "";
   }
   const hiddenBlock = (n) => !!(n.closest ? n.closest("[hidden]") : n.hidden);
   const JUMP_ROOM = 14;
@@ -2531,7 +2539,7 @@
     for (const n of document.querySelectorAll(JUMP_BLOCKS)) {
       if (hiddenBlock(n) || NOT_DRAWN[n.dataset && n.dataset.ckPanel]) continue;
       const label = blockName(n);
-      if (label && (!terms.length || hits(fold(label), terms))) items.push({ kind: "block", label: label, node: n, scope: n.closest && n.closest("#ck-widgets") ? "#ck-widgets" : n.closest && n.closest("#ck-hero") ? "#ck-hero" : "" });
+      if (label && (!terms.length || hits(fold(label), terms))) items.push({ kind: "block", label: label, node: n, find: findAgain(n), scope: n.closest && n.closest("#ck-widgets") ? "#ck-widgets" : n.closest && n.closest("#ck-hero") ? "#ck-hero" : "" });
     }
     // the places come after the panels, so a panel of the same name is still the first line for that name
     for (const b of document.querySelectorAll(JUMP_PLACES)) {
@@ -2561,10 +2569,12 @@
     return items;
   }
   // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the panel with the same id in
-  // the region the node was listed from (a redraw replaces every panel node), else the node as given.
-  function livePanel(node, scope) {
+  // the region the node was listed from (a redraw replaces every panel node), else the node as given. A block with no panel id is looked
+  // up by the selector it was listed with.
+  function livePanel(node, scope, find) {
     const id = node.dataset ? node.dataset.ckPanel : "";
-    if (node.isConnected || !id) return node;
+    if (node.isConnected) return node;
+    if (!id) return (find && document.querySelector(find)) || node;
     return Array.from(document.querySelectorAll((scope || "#board") + " [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
   }
   // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
@@ -2600,11 +2610,12 @@
       if (handOff === me) handOff = null;
     } };
     handOff = me;
-    obs.observe(board, { childList: true });
+    obs.observe(board, { childList: true, subtree: true });   // a hero panel sits under slots of its own: the panel's parent is not the region
     for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
   }
   // Give focus back after the box closes without choosing. The opener is a node a redraw may have replaced while the box was open, so
-  // the order is: the opener if it is still on the page, else the Jump button, else the main region; never <body>.
+  // the order is: the opener if it is still on the page, else the Jump button, else the main region (the last resort: a page with none
+  // of the three has nowhere to give focus, and the box does not invent one).
   function restoreFocus(opener) {
     const main = document.querySelector("main");
     for (const t of [opener, document.getElementById("jumpbtn"), main]) {
@@ -2645,7 +2656,11 @@
     // where focus was when the box opened: leaving without choosing (Escape, a second Cmd-K) gives it back
     const opener = document.activeElement;
     let items = [], opts = [], sel = 0;
+    // One number per open box, moved on by every choice and every change of the query: a landing still waiting on the page belongs to the
+    // choice that started it, and gives way the moment a later choice or a new query exists.
+    let attempt = 0;
     const close = (restore) => {
+      document.removeEventListener("keydown", onKey);
       dlg.remove();
       palette = null;
       if (restore) restoreFocus(opener);
@@ -2654,33 +2669,40 @@
     palette = me;
     const say = (t) => { status.textContent = t; };
     const choose = (it) => {
-      // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
-      const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
+      const mine = ++attempt;
+      // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it; without
+      // animation frames the wait is a short timer, so the page still gets its turn
+      const later = (fn) => { if (typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else root.setTimeout(fn, 16); };
+      const after = (changed, fn) => { if (changed) later(fn); else fn(); };
       const places = root.LevainPlaces;
       if (it.kind === "place") {
+        // a place is gone to through the places bar's own wiring; a page without it, or one that refuses, is said in the box, which stays
+        let went = false;
+        try { if (places && typeof places.go === "function") { places.go(it.place); went = true; } } catch (e) { went = false; }
+        if (!went) { say(it.label + " cannot be opened here"); input.focus(); return; }
         close(false);
-        // a place is gone to through the places bar's own wiring; focus then rests on that place's button in the bar
-        if (places && typeof places.go === "function") places.go(it.place);
+        // focus then rests on that place's button in the bar
         after(true, () => { const b = document.querySelector('.ia-places [data-ia-place-btn="' + it.place + '"]'); if (b) b.focus({ preventScroll: true }); });
         return; }
       if (it.kind === "block") {
         // The box stays open until focus has landed: a block that cannot take focus is said so in the box instead of leaving focus nowhere.
         // A Settings section needs the Settings place; any other block needs Home. A place paints a frame after it changes, so the focus waits.
-        const node = livePanel(it.node, it.scope);
+        const node = livePanel(it.node, it.scope, it.find);
         const settings = !!(node.closest && node.closest(".dev-zone, .ck-thiscockpit"));
-        const raf = typeof root.requestAnimationFrame === "function" ? (f) => root.requestAnimationFrame(f) : null;
         const drawn = (n) => n.getClientRects().length > 0;
         let changed = false;
         if (settings) { if (document.body.dataset.iaPlace !== "settings" && places && places.go) { places.go("settings"); changed = true; } }
         else changed = revealTab(node);
         const land = (tries) => {
-          if (palette !== me) return;   // the box was left while the page settled: focus went where the reader sent it
-          const n = livePanel(it.node, it.scope);
-          if (!settings && !drawn(n) && tries === 0 && raf && places && places.go && document.body.dataset.iaPlace !== "home") { places.go("home"); raf(() => land(1)); return; }
-          if (!drawn(n) && tries < 20 && raf) { raf(() => land(tries + 1)); return; }
+          // the box was left while the page settled (focus went where the reader sent it), or a later choice or query replaced this one
+          if (palette !== me || attempt !== mine) return;
+          const n = livePanel(it.node, it.scope, it.find);
+          if (!settings && !drawn(n) && tries === 0 && places && places.go && document.body.dataset.iaPlace !== "home") { places.go("home"); later(() => land(1)); return; }
+          if (!drawn(n) && tries < 20) { later(() => land(tries + 1)); return; }
           if (drawn(n)) {
             landOnPanel(n, true, it.scope);
             if (n.contains(document.activeElement)) { close(false); return; }
+            if (handOff) handOff.stop();   // focus did not take: nothing is left waiting to take it back from the field
           }
           say(it.label + " is not shown here");
           input.focus();
@@ -2734,11 +2756,12 @@
       sel = 0;
       select(0);
     };
-    const refresh = () => { items = jumpItems(input.value); build(); };
+    const refresh = () => { attempt++; items = jumpItems(input.value); build(); };
     input.addEventListener("input", refresh);
-    // the box handles its keys itself, so Tab and Escape work from anywhere focus is inside it; a key that confirms an input-method
-    // composition is the composition's, not the box's
-    dlg.addEventListener("keydown", (ev) => {
+    // The box handles its keys at the document while it is open, so they work wherever focus is: a press on the box's padding, its scrollbar
+    // or its empty-state line moves focus off the field, and Tab and Escape must not leak to the page behind it. A key that confirms an
+    // input-method composition is the composition's, not the box's.
+    const onKey = (ev) => {
       if (ev.isComposing || ev.keyCode === 229) return;
       if (ev.key === "Escape") { ev.preventDefault(); close(true); }
       else if (ev.key === "ArrowDown") { ev.preventDefault(); if (items.length) select(Math.min(items.length - 1, sel + 1)); }
@@ -2747,8 +2770,10 @@
       else if (ev.key === "End" && ev.ctrlKey) { ev.preventDefault(); if (items.length) select(items.length - 1); }
       else if (ev.key === "Tab") { ev.preventDefault(); if (items.length) select((sel + (ev.shiftKey ? items.length - 1 : 1)) % items.length); }   // the box holds focus: Tab walks its list, never the page behind it
       else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
-    });
-    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(true); });
+    };
+    document.addEventListener("keydown", onKey);
+    // the press itself is cancelled, or the browser moves focus to the body right after it was given back
+    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) { ev.preventDefault(); close(true); } });
     refresh();
     input.focus();
   }

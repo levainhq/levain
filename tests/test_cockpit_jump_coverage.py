@@ -26,6 +26,8 @@ WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 FAKE = r"""
 const node = (o) => Object.assign(new N(o.tag || "section"), o.props || {}, { dataset: o.data || {} });
 const withHead = (n, tag, text) => { n.querySelector = () => Object.assign(new N(tag), { text }); return n; };
+// a block whose headings answer by selector (a descendant may carry a heading the block's own title is not): map = { selector: text }
+const withSel = (n, map) => { n.querySelector = (sel) => (map[sel] ? Object.assign(new N("div"), { text: map[sel] }) : null); return n; };
 const attrNode = (n, label) => { n.getAttribute = (k) => (k === "aria-label" ? label : null); return n; };
 // a glance tile that is openable carries an instruction as its aria-label; its visible title is the heading
 const tile = attrNode(withHead(node({ tag: "div", data: { ckPanel: "ops" } }), "div", "Ops"), "Open Ops in a focus view");
@@ -105,9 +107,17 @@ N.prototype.remove = function () {
   if (had) document.activeElement = document.body;
 };
 N.prototype.addEventListener = function (t, f) { ((this.h = this.h || {})[t] = this.h[t] || []).push(f); };
+// the page's own listeners on document: an event fired on a node in the page reaches them after its ancestors
+const docL = {};
+document.addEventListener = (t, f) => { (docL[t] = docL[t] || []).push(f); };
+document.removeEventListener = (t, f) => { docL[t] = (docL[t] || []).filter((g) => g !== f); };
+const docFire = (t, ev) => { ev = Object.assign({ target: document.body, preventDefault() { this.defaultPrevented = true; } }, ev); for (const f of (docL[t] || []).slice()) f(ev); return ev; };
 N.prototype.fire = function (t, ev) {
   ev = Object.assign({ target: this, preventDefault() { this.defaultPrevented = true; } }, ev);
-  for (let n = this; n; n = n.parent) for (const f of (n.h && n.h[t]) || []) f(ev);
+  const onDoc = (docL[t] || []).slice();   // a listener added while the event is on its way is not called for it
+  let top = this;
+  for (let n = this; n; n = n.parent) { top = n; for (const f of (n.h && n.h[t]) || []) f(ev); }
+  if (top === document.body) for (const f of onDoc) f(ev);
   return ev;
 };
 N.prototype.focus = function () { if (this.isConnected) document.activeElement = this; };
@@ -118,7 +128,8 @@ N.prototype.removeAttribute = function (k) { delete this.attrs[k]; };
 N.prototype.getClientRects = function () { return this.shown === false ? [] : [1]; };
 let modalUp = false;
 const mainRegion = new N("main"); mainRegion._conn = true;
-document.querySelector = (s) => (s === ".modal-overlay" && modalUp ? new N("div") : s === "main" ? mainRegion : null);
+const qs = {};   // what document.querySelector answers for a selector a test wants to resolve
+document.querySelector = (s) => (s === ".modal-overlay" && modalUp ? new N("div") : s === "main" ? mainRegion : qs[s] || null);
 const frames = [];
 globalThis.requestAnimationFrame = (f) => { frames.push(f); };
 const flush = (n) => { for (let i = 0; i < (n || 40) && frames.length; i++) frames.shift()(); };
@@ -259,6 +270,152 @@ out.open = !!boxOf();
     assert out == {"moved": "palette-opt-1", "held": True, "open": False}, out
 
 
+# a hand-off waits on the page's own observer and a timer: both are held by the test, and a redraw is delivered to the observers whose
+# target the changed parent is (or, for a subtree observer, sits under)
+HANDOFF = r"""
+const observers = [];
+globalThis.MutationObserver = class { constructor(cb) { this.cb = cb; this.target = null; } observe(t, o) { this.target = t; this.opts = o; observers.push(this); } disconnect() { this.target = null; } };
+const redrawn = (parent) => { for (const m of observers.slice()) if (m.target && (m.target === parent || (m.opts.subtree && m.target.contains(parent)))) m.cb([]); };
+const timers = [];
+globalThis.setTimeout = (f) => { timers.push(f); return timers.length; };
+globalThis.clearTimeout = () => {};
+const watching = () => observers.filter((m) => m.target).length;
+const pageListeners = () => (docL.pointerdown || []).length + (docL.keydown || []).length;
+"""
+
+
+def test_a_hero_panel_under_a_nested_slot_hands_focus_on_when_a_redraw_replaces_it(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + HANDOFF + r"""
+const hero = new N("section"); hero._conn = true; qs["#ck-hero"] = hero;
+const slot = new N("div"); hero.appendChild(slot);                      // the panel is not a child of the hero: a band slot holds it
+const inHero = (id, label) => { const b = block(id, label); b.closest = (s) => (s === "#ck-hero" ? hero : null); return b; };
+let panel = inHero("state", "State"); slot.appendChild(panel);
+lists[K.JUMP_BLOCKS] = [panel]; lists["#ck-hero [data-ck-panel]"] = [panel];
+const p = partsOf(openBox()); typeIn(p, "state"); p.input.fire("keydown", key("Enter")); flush();
+out.landed = document.activeElement === panel;
+panel._conn = false; slot.kids = [];                                  // a stream redraw replaces the node under the slot; focus falls to the body
+document.activeElement = document.body;
+const next = inHero("state", "State"); slot.appendChild(next); lists["#ck-hero [data-ck-panel]"] = [next];
+redrawn(slot);
+out.handedOn = document.activeElement === next;
+""", tmp_path)
+    assert out == {"landed": True, "handedOn": True}, out
+
+
+def test_a_second_choice_or_a_new_query_ends_the_first_choices_landing(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const a = block("alpha", "Alpha", { hidden: true }), b = block("beta", "Beta", { hidden: true });
+lists[K.JUMP_BLOCKS] = [a, b];
+const pick = (p, text) => { typeIn(p, text); p.input.fire("keydown", key("Enter")); };
+// two choices before either block is drawn: the page then draws the first one; the second is the one the reader meant
+let dlg = openBox(); let p = partsOf(dlg);
+pick(p, "alpha"); pick(p, "beta");
+a.shown = true; flush();
+out.second = { open: !!boxOf(), onFirst: document.activeElement === a, status: p.status.textContent };
+p.input.fire("keydown", key("Escape")); a.shown = false;
+// a new query while a choice is still looking for its block: the choice is dropped, the count stays and the box stays open
+dlg = openBox(); p = partsOf(dlg);
+pick(p, "alpha"); typeIn(p, "zzzz");
+a.shown = true; flush();
+out.typed = { open: !!boxOf(), onBlock: document.activeElement === a, status: p.status.textContent, focusInput: document.activeElement === p.input };
+""", tmp_path)
+    assert out["second"] == {"open": True, "onFirst": False, "status": "Beta is not shown here"}, out
+    assert out["typed"] == {"open": True, "onBlock": False, "status": "nothing matches", "focusInput": True}, out
+
+
+def test_a_section_is_named_by_its_own_title_and_a_panel_by_its_heading(tmp_path: Path) -> None:
+    out = run_node(FAKE + r"""
+const devices = withSel(node({ props: { className: "ck-zone dev-zone" } }), { ".zone-title": "Devices", ".phead h2": "Paired devices" });
+const presence = withSel(node({ props: { className: "ck-zone dev-zone pr-settings" } }), { ".zone-title": "Presence & notification settings", ".phead h2": "Tap tokens" });
+const ops = withSel(node({ tag: "div", data: { ckPanel: "ops" } }), { ".phead h2": "Ops", ".zone-title": "Elsewhere" });
+lists[K.JUMP_BLOCKS] = [devices, presence, ops];
+out.labels = K.jumpItems("").filter((i) => i.kind === "block").map((i) => i.label);
+out.found = K.jumpItems("devices").filter((i) => i.kind === "block").map((i) => i.label);
+""", tmp_path)
+    assert out["labels"] == ["Devices", "Presence & notification settings", "Ops"], out     # a section by its own title, a panel by its heading
+    assert out["found"] == ["Devices"], out
+
+
+def test_the_boxs_keys_work_wherever_focus_is_and_the_backdrop_does_not_move_focus(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const before = (docL.keydown || []).length;
+const opener = new N("input"); opener._conn = true; document.activeElement = opener;
+const dlg = openBox(); const p = partsOf(dlg);
+document.activeElement = document.body;                                  // a click on the box's padding, scrollbar or "nothing matches" row left the field
+const tab = docFire("keydown", key("Tab"));
+out.moved = p.input.attrs["aria-activedescendant"]; out.held = tab.defaultPrevented;
+docFire("keydown", key("ArrowDown"));
+out.down = p.input.attrs["aria-activedescendant"];
+docFire("keydown", key("Escape"));
+out.closed = !boxOf(); out.back = document.activeElement === opener; out.listenerGone = (docL.keydown || []).length === before;
+// the backdrop: pressing on it closes the box, and the press's own default (a move of focus to the body) is cancelled
+document.activeElement = opener;
+const dlg2 = boxOf() || openBox();
+const ev = dlg2.fire("mousedown", { target: dlg2 });
+out.backdrop = { closed: !boxOf(), prevented: !!ev.defaultPrevented, back: document.activeElement === opener };
+""", tmp_path)
+    assert out["moved"] == "palette-opt-1" and out["held"] and out["down"] == "palette-opt-2", out
+    assert out["closed"] and out["back"] and out["listenerGone"], out
+    assert out["backdrop"] == {"closed": True, "prevented": True, "back": True}, out
+
+
+def test_a_place_the_page_cannot_go_to_is_said_in_the_box_and_the_box_stays_open(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const attempt = (setup) => { setup(); const dlg = openBox(); const p = partsOf(dlg); typeIn(p, "memory"); p.input.fire("keydown", key("Enter")); flush();
+  const r = { open: !!boxOf(), status: p.status.textContent, onInput: document.activeElement === p.input }; if (boxOf()) p.input.fire("keydown", key("Escape")); return r; };
+const realPlaces = globalThis.LevainPlaces;
+out.missing = attempt(() => { globalThis.LevainPlaces = undefined; });
+out.throws = attempt(() => { globalThis.LevainPlaces = { go: () => { throw new Error("no"); } }; });
+out.works = attempt(() => { globalThis.LevainPlaces = realPlaces; });
+""", tmp_path)
+    assert out["missing"] == {"open": True, "status": "Memory cannot be opened here", "onInput": True}, out
+    assert out["throws"] == {"open": True, "status": "Memory cannot be opened here", "onInput": True}, out
+    assert out["works"]["open"] is False, out
+
+
+def test_a_block_that_cannot_take_focus_ends_its_hand_off(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + HANDOFF + r"""
+const stuck = block("stuck", "Stuck"); stuck.focus = () => {}; qs["#board"] = new N("div");   // an inert ancestor: focus does not move
+lists[K.JUMP_BLOCKS] = [stuck];
+const p = partsOf(openBox()); const base = pageListeners();             // the box's own key listener is not what is counted
+typeIn(p, "stuck"); p.input.fire("keydown", key("Enter")); flush();
+out.said = p.status.textContent; out.open = !!boxOf();
+out.watching = watching(); out.listeners = pageListeners() - base;       // no observer, no listener left to take focus back from the field
+""", tmp_path)
+    assert out == {"said": "Stuck is not shown here", "open": True, "watching": 0, "listeners": 0}, out
+
+
+def test_a_block_with_no_panel_id_is_found_again_after_a_redraw(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const mk = () => { const z = withSel(node({ props: { className: "ck-zone dev-zone" } }), { ".zone-title": "Devices" }); z.dataset.zone = "devices"; z._conn = true; z.closest = (s) => (s === ".dev-zone, .ck-thiscockpit" ? z : null); return z; };
+const old = mk(); lists[K.JUMP_BLOCKS] = [old];
+const p = partsOf(openBox()); typeIn(p, "devices");
+old._conn = false;                                                        // Settings drew its sections again while the box was open
+const fresh = mk(); qs['[data-zone="devices"]'] = fresh;
+p.input.fire("keydown", key("Enter")); flush();
+out.landed = document.activeElement === fresh; out.open = !!boxOf();
+""", tmp_path)
+    assert out == {"landed": True, "open": False}, out
+
+
+def test_without_animation_frames_a_place_is_still_given_time_to_paint(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const timed = [];
+globalThis.requestAnimationFrame = undefined;
+globalThis.setTimeout = (f) => { timed.push(f); return timed.length; };
+const late = block("late", "Late", { hidden: true });
+lists[K.JUMP_BLOCKS] = [late];
+document.body.dataset.iaPlace = "memory";
+const p = partsOf(openBox()); typeIn(p, "late"); p.input.fire("keydown", key("Enter"));
+out.early = { open: !!boxOf(), status: p.status.textContent };            // the place has not painted yet: nothing is said about the block
+late.shown = true;
+for (let i = 0; i < 40 && timed.length; i++) timed.shift()();
+out.late = { open: !!boxOf(), focus: document.activeElement === late };
+""", tmp_path)
+    assert out["early"]["open"] is True and "not shown" not in out["early"]["status"], out
+    assert out["late"] == {"open": False, "focus": True}, out
+
+
 def test_the_masthead_button_and_the_machine_block_carry_what_a_reader_needs() -> None:
     html = (WEB / "dashboard.html").read_text()
     m = re.search(r'<div class="skycol frame" id="ck-skycol"([^>]*)>', html)
@@ -268,15 +425,20 @@ def test_the_masthead_button_and_the_machine_block_carry_what_a_reader_needs() -
 
 
 # ── the live page (browser; written here, run on CI) ──
-# What the page holds, found by a structural query of the test's own: every node that carries a panel id, every section inside <main> that holds
-# no panel (a section of settings, not a zone of board panels, which the panels themselves stand for) and every labelled section (Needs, Notes,
-# Drop). None of it reads the selector list the box lists from, so a block the page has and the box misses is `missing`. Panels no place draws
-# are left out.
+# What the page holds, found by a structural query of the test's own. A block is: a node that carries a panel id; a top-level section of
+# <main> that holds no panel and has a title of its own (a section of settings; a zone of board panels is stood for by its panels);
+# a labelled section that is a direct child of the page column (Needs, Notes, Drop); the hero's labelled group (the Machine). Not a block:
+# a section nested inside one of those, a section with no title, and anything hidden. None of it reads the selector list the box lists
+# from, so a block the page has and the box misses is `missing`. Panels no place draws are left out.
 LIVE = """(() => {
   const K = window.LevainCockpitKinds;
   const items = K.jumpItems('');
   const listed = items.filter((i) => i.kind !== 'place').map((i) => i.node);
-  const there = [...document.querySelectorAll('[data-ck-panel], main section:not(:has([data-ck-panel])), section[aria-label]')]
+  const column = document.getElementById('ck-hero').parentElement;
+  const there = [...document.querySelectorAll('[data-ck-panel]'),
+                 ...document.querySelectorAll('main > section:not(:has([data-ck-panel])):has(.zone-title)'),
+                 ...column.querySelectorAll(':scope > section[aria-label]'),
+                 ...document.querySelectorAll('#ck-hero > [role="group"][aria-label]')]
     .filter((n) => !n.closest('[hidden]') && !['notifications', 'topology'].includes(n.dataset.ckPanel));
   const bar = [...document.querySelectorAll('.ia-places [data-ia-place-btn]')].map((b) => b.dataset.iaPlaceBtn);
   const name = (n) => n.id || n.dataset.ckPanel || n.className;
