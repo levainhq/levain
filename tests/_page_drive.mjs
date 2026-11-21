@@ -65,6 +65,7 @@
 // alert / confirm / prompt are answered by an in-page shim that records them (what a declined dialog returns to the page); any other dialog is declined once by CDP,
 // and a decline Chrome refuses fails the drive by name. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { accessSync, appendFileSync, constants, mkdtempSync, readdirSync, statSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
@@ -241,14 +242,21 @@ let evidence = null; let evidenceMod = null;
 try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMod.createEvidence({ now: Date.now, t0: T0 }); } catch { evidence = null; }
 // The page must never sit behind a native alert / confirm / prompt: Chrome can refuse the CDP decline of one that opened while a reload was in
 // flight, and a retry of the same command changes nothing. So the page is given a shim that answers them itself, exactly as a declined dialog would
-// (alert undefined, confirm false, prompt null) and reports each by one console.debug line that starts with a marker no page prints. The shim
-// is a constant of this file, not a sibling's, because the driver is sometimes copied alone and must still drive.
-const DIALOG_MARK = "\u0001levain-dialog ";
+// (alert undefined, confirm false, prompt null) and reports each by one console.debug line that starts with a marker. The marker carries a nonce
+// drawn per drive, so a page that never saw this source cannot forge a record or collide with one, and the shim keeps its own console.debug from
+// before any page script runs, so a page that replaces or silences console.debug cannot drop a record. The shim is a constant of this file,
+// not a sibling's, because the driver is sometimes copied alone and must still drive.
+const DIALOG_NONCE = randomBytes(6).toString("hex");
+const DIALOG_MARK = `\u0001levain-dialog ${DIALOG_NONCE} `;
 const DIALOG_SHIM = `(() => {
-  const note = (type, message) => { try { console.debug("\\u0001levain-dialog " + type + ": " + String(message)); } catch (e) {} };
-  window.alert = function alert(message) { note("alert", message); return undefined; };
-  window.confirm = function confirm(message) { note("confirm", message); return false; };
-  window.prompt = function prompt(message) { note("prompt", message); return null; };
+  const debug = console.debug.bind(console);
+  const note = (type, args) => {
+    let text; try { text = args.length ? String(args[0]) : ""; } catch (e) { text = "[unprintable]"; }
+    try { debug(${JSON.stringify(DIALOG_MARK)} + type + ": " + text); } catch (e) {}
+  };
+  window.alert = function alert() { note("alert", arguments); return undefined; };
+  window.confirm = function confirm() { note("confirm", arguments); return false; };
+  window.prompt = function prompt() { note("prompt", arguments); return null; };
 })();`;
 // A dialog the shim cannot catch (a beforeunload one) is declined once over CDP. If Chrome refuses that, the page is frozen behind the dialog:
 // the drive fails by name. frozenFailure is taken before anything is awaited so that the exit at the end of the drive, which may be running
@@ -308,10 +316,16 @@ const send = (method, params = {}) => new Promise((res, rej) => {
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
-for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable", ...(evidence ? ["ServiceWorker.enable"] : [])]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
+// send() resolves a protocol error as a reply object, so a failure is read from the reply (an undefined reply is the 3 s race lost), never from a catch
+const replyFault = (r) => !r ? "no reply within 3 s" : r.error ? String(r.error.message || JSON.stringify(r.error)).slice(0, 120) : null;
+const sendBounded = async (m, params) => { try { return await Promise.race([send(m, params), sleep(3000)]); } catch (e) { return { error: { message: String(e && e.message || e) } }; } };
+let runtimeEnableFault = null;
+for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable", ...(evidence ? ["ServiceWorker.enable"] : [])]) { const r = await sendBounded(m); if (m === "Runtime.enable") runtimeEnableFault = replyFault(r); }   // console capture is best-effort: only Runtime.enable, which carries the shim's reports, is a reason to fail a drive
 // a script or stylesheet that fails to load leaves its name in window.__loadErrors (read by the timeout dump); best-effort like the domains above
 if (evidence) { try { await Promise.race([send("Page.addScriptToEvaluateOnNewDocument", { source: evidenceMod.LOAD_ERRORS_SCRIPT }), sleep(3000)]); } catch {} }
-try { await Promise.race([send("Page.addScriptToEvaluateOnNewDocument", { source: DIALOG_SHIM }), sleep(3000)]); } catch {}   // not gated on `evidence`: a copy without the sibling still needs it
+const shimFault = replyFault(await sendBounded("Page.addScriptToEvaluateOnNewDocument", { source: DIALOG_SHIM, runImmediately: true }));   // not gated on `evidence`: a copy without the sibling still needs it
+if (shimFault) { console.error(`page-drive: the dialog shim could not be registered (${shimFault}): dialogs would go unanswered`); await giveUp(1); }
+if (runtimeEnableFault) { console.error(`page-drive: Runtime.enable failed (${runtimeEnableFault}): shim dialogs could not be reported`); await giveUp(1); }
 await send("Page.navigate", { url });
 const values = [], repressed = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
@@ -861,5 +875,10 @@ for (const s of steps) {
     values.push("error" in o ? { error: o.error } : o.value);
   }
 }
+// a decline counts from the moment it is sent, so one Chrome has not answered by the end of the drive could still turn out refused
+const declineBound = Date.now() + scaled(3000);
+while (declineIds.size && Date.now() < declineBound) await sleep(50);
+if (declineIds.size && !frozenFailure) await failFrozen("page-drive: a JavaScript dialog could not be declined (no answer to the decline): the page is frozen behind it");
+if (frozenFailure) await new Promise(() => {});   // failFrozen exits the process
 process.stdout.write(JSON.stringify({ values, posts, dialogs, repressed }));
 ws.close(); done(frozenFailure ? 1 : 0);
