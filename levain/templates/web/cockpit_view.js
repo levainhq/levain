@@ -2491,14 +2491,42 @@
 
   // ---- the jump box: one search path with the filters. A panel title, a loaded row, or "search the store" ----
   let palette = null;
+  // Where the jump box reads the page, besides the board's own panels: the places bar, and every block the page draws outside the board
+  // (the hero, the needs, notes and drop blocks, the glance tiles, the settings sections). Both are read from the page each time the box
+  // opens, so a block the page grows is listed without a change here.
+  const JUMP_PLACES = ".ia-places [data-ia-place-btn]";
+  const JUMP_BLOCKS = "#ck-hero [data-ck-panel], #ck-skycol, #ck-needs, #ck-notes, #ck-drop, #ck-widgets > [data-ck-panel], .dev-zone, .ck-thiscockpit";
+  const placeName = (b) => { const p = String(b.dataset.iaPlaceBtn || ""); return p ? p[0].toUpperCase() + p.slice(1) : ""; };
+  // A block is named by its own label, else its heading, else its panel id; a block with none of those is not offered (it could not be told apart).
+  function blockName(n) {
+    const aria = n.getAttribute && n.getAttribute("aria-label");
+    if (aria) return aria;
+    const h = n.querySelector && n.querySelector(".phead h2, .zone-title, .k, h2, h3");
+    const t = h && String(h.textContent || "").trim();
+    if (t) return t;
+    const id = n.dataset && n.dataset.ckPanel;
+    return id ? id[0].toUpperCase() + id.slice(1).replace(/-/g, " ") : "";
+  }
+  const hiddenBlock = (n) => !!(n.closest ? n.closest("[hidden]") : n.hidden);
   function jumpItems(q) {
     const terms = termsOf(q);
     const items = [];
     for (const h of document.querySelectorAll("#board .panel > .phead h2")) {
       const panel = h.closest(".panel");
       if (NOT_DRAWN[panel.dataset.ckPanel]) continue;
-      if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel });
+      if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel, scope: "#board" });
     }
+    for (const n of document.querySelectorAll(JUMP_BLOCKS)) {
+      if (hiddenBlock(n) || NOT_DRAWN[n.dataset && n.dataset.ckPanel]) continue;
+      const label = blockName(n);
+      if (label && (!terms.length || hits(fold(label), terms))) items.push({ kind: "block", label: label, node: n, scope: n.closest && n.closest("#ck-widgets") ? "#ck-widgets" : n.closest && n.closest("#ck-hero") ? "#ck-hero" : "" });
+    }
+    // the places come after the panels, so a panel of the same name is still the first line for that name
+    for (const b of document.querySelectorAll(JUMP_PLACES)) {
+      const label = placeName(b);
+      if (label && (!terms.length || hits(fold(label), terms))) items.push({ kind: "place", label: label, place: b.dataset.iaPlaceBtn });
+    }
+    const fixed = items.length;
     if (terms.length) {
       for (const s of states) {
         if (!onPage(s) || !s.searchable || NOT_DRAWN[s.pid]) continue;
@@ -2514,14 +2542,15 @@
         if ((d.search || {}).scope === "store") items.push({ kind: "store", label: "Search " + s.title + " for “" + q + "”", state: s, q: q });
       }
     }
-    return items.slice(0, 14);
+    // every place, panel and block that matches is kept (a long list scrolls); only the rows found inside panels are cut
+    return items.slice(0, Math.max(fixed, 14));
   }
-  // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the board's panel with the same
-  // id (a redraw replaces every panel node), else the node as given.
-  function livePanel(node) {
+  // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the panel with the same id in
+  // the region the node was listed from (a redraw replaces every panel node), else the node as given.
+  function livePanel(node, scope) {
     const id = node.dataset ? node.dataset.ckPanel : "";
     if (node.isConnected || !id) return node;
-    return Array.from(document.querySelectorAll("#board [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
+    return Array.from(document.querySelectorAll((scope || "#board") + " [data-ck-panel]")).find((p) => p.dataset.ckPanel === id) || node;
   }
   // The one hand-off waiting on a redraw: {stop}. A new jump replaces it.
   let handOff = null;
@@ -2529,18 +2558,19 @@
   // that removes the focused panel and drops focus to <body> hands it to the successor, once. The hand-off ends at the first of: that
   // hand-off, the 3 s, the next jump, or the reader's own press or key (they have answered where focus should be, so it never takes
   // focus back from where they went).
-  function landOnPanel(node, scroll) {
+  function landOnPanel(node, scroll, scope) {
     if (handOff) handOff.stop();
     handOff = null;
-    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
-    let held = livePanel(node);
+    // a block that is already a Tab stop (an openable glance tile) keeps its own tabindex; any other is made focusable without joining the Tab order
+    const focusIt = (n, scrollIt) => { if (scrollIt) n.scrollIntoView({ block: "start" }); if (!n.hasAttribute("tabindex")) n.setAttribute("tabindex", "-1"); n.focus({ preventScroll: true }); };
+    let held = livePanel(node, scope);
     focusIt(held, scroll);
-    const board = document.getElementById("board");
+    const board = document.querySelector(scope || "#board");
     if (!held.dataset || !held.dataset.ckPanel || !board || typeof root.MutationObserver !== "function") return;
     const obs = new root.MutationObserver(() => {
       const a = document.activeElement;
       if (held.isConnected || (a && a !== document.body)) return;
-      const next = livePanel(held);
+      const next = livePanel(held, scope);
       if (next === held) return;
       held = next;
       focusIt(held, false);   // focus only: a reader who scrolled on since the jump (a wheel is neither a press nor a key) keeps their place
@@ -2569,16 +2599,48 @@
     input.setAttribute("aria-label", "Jump to");
     const list = el("ul", "palette-list");
     list.setAttribute("role", "listbox");
+    list.id = "palette-list";
+    input.setAttribute("role", "combobox");
+    input.setAttribute("aria-expanded", "true");
+    input.setAttribute("aria-controls", "palette-list");
     box.append(input, list);
     dlg.appendChild(box);
     document.body.appendChild(dlg);
-    palette = { dlg: dlg, input: input };
+    // where focus was when the box opened: leaving without choosing (Escape, a second Cmd-K) gives it back, so the keyboard keeps its place
+    const opener = document.activeElement;
     let items = [], sel = 0;
-    const close = () => { dlg.remove(); palette = null; };
+    const close = (restore) => {
+      dlg.remove();
+      palette = null;
+      if (restore && opener && opener !== document.body && opener.isConnected && typeof opener.focus === "function") opener.focus({ preventScroll: true });
+    };
+    palette = { dlg: dlg, input: input, close: close };
     const choose = (it) => {
-      close();
+      close(false);
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
+      const places = root.LevainPlaces;
+      if (it.kind === "place") {
+        // a place is gone to through the places bar's own wiring; focus then rests on that place's button in the bar, from which Tab enters the page
+        if (places && typeof places.go === "function") places.go(it.place);
+        after(true, () => { const b = document.querySelector('.ia-places [data-ia-place-btn="' + it.place + '"]'); if (b) b.focus({ preventScroll: true }); });
+        return; }
+      if (it.kind === "block") {
+        // the Settings sections are drawn in the Settings place only; every other block is Home's, and Home is where a place that does not
+        // draw it (Memory) sends the jump. Each is drawn a frame after the place changes, so the focus waits for it.
+        const node = livePanel(it.node, it.scope);
+        const settings = !!(node.closest && node.closest(".dev-zone, .ck-thiscockpit"));
+        let changed = false;
+        if (settings) { if (document.body.dataset.iaPlace !== "settings" && places && places.go) { places.go("settings"); changed = true; } }
+        else changed = revealTab(node);
+        const land = (tries) => {
+          const n = livePanel(it.node, it.scope);
+          if (!settings && !n.getClientRects().length && tries === 0 && places && places.go && typeof root.requestAnimationFrame === "function") { places.go("home"); root.requestAnimationFrame(() => land(1)); return; }
+          if (!n.getClientRects().length && tries < 20 && typeof root.requestAnimationFrame === "function") { root.requestAnimationFrame(() => land(tries + 1)); return; }
+          landOnPanel(n, true, it.scope);
+        };
+        after(changed, () => land(0));
+        return; }
       if (it.kind === "panel") {
         // a panel the current tab hides is reached through the first tab that shows it
         // the panel as the page has it now: a redraw since the list was drawn has replaced the node the list holds
@@ -2601,23 +2663,30 @@
       items.forEach((it, i) => {
         const li = el("li");
         li.setAttribute("role", "option");
+        li.id = "palette-opt-" + i;
         li.setAttribute("aria-selected", i === sel ? "true" : "false");
-        li.append(el("span", "pk", it.kind === "panel" ? "panel" : it.kind === "store" ? "store" : "row"), el("span", "pl", it.label));
+        li.append(el("span", "pk", it.kind === "store" ? "store" : it.kind === "row" ? "row" : it.kind === "place" ? "place" : "panel"), el("span", "pl", it.label));
         if (it.where) li.appendChild(el("span", "pw", it.where));
         li.addEventListener("click", () => choose(it));
         list.appendChild(li);
+        // the highlighted line stays on screen as the arrow keys move down a list longer than the box
+        if (i === sel && typeof li.scrollIntoView === "function") li.scrollIntoView({ block: "nearest" });
       });
+      if (items.length) input.setAttribute("aria-activedescendant", "palette-opt-" + sel); else input.removeAttribute("aria-activedescendant");
       if (!items.length) list.appendChild(el("li", "pl-none", "nothing matches"));
     };
     const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); };
     input.addEventListener("input", refresh);
     input.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") { ev.preventDefault(); close(); }
+      if (ev.key === "Escape") { ev.preventDefault(); close(true); }
       else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); draw(); }
       else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); draw(); }
+      else if (ev.key === "Home" && ev.ctrlKey) { ev.preventDefault(); sel = 0; draw(); }
+      else if (ev.key === "End" && ev.ctrlKey) { ev.preventDefault(); sel = Math.max(0, items.length - 1); draw(); }
+      else if (ev.key === "Tab") { ev.preventDefault(); sel = items.length ? (sel + (ev.shiftKey ? items.length - 1 : 1)) % items.length : 0; draw(); }   // the box holds focus: Tab walks its list, never the page behind it
       else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
     });
-    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(); });
+    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(true); });
     refresh();
     input.focus();
   }
@@ -2655,7 +2724,7 @@
     document.addEventListener("mouseover", (ev) => { const p = ev.target && ev.target.closest ? ev.target.closest(".panel") : null; if (p) hoverPanel = p; });
     document.addEventListener("keydown", (ev) => {
       if (ev.defaultPrevented) return;
-      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.dlg.remove(), palette = null; else openJump(); return; }
+      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.close(true); else openJump(); return; }
       if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
       if (document.querySelector(".modal-overlay")) return;
       const sheet = document.getElementById("pr-sheet");
@@ -2680,7 +2749,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutCollapsed, hasLayout, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutCollapsed, hasLayout, setLayoutCollapsed, resetLayout, hashMode, revealTab, JUMP_BLOCKS, JUMP_PLACES });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
