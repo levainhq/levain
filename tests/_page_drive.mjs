@@ -241,7 +241,7 @@ try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMo
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (evidence) evidence.onMessage(d);
-  if (d.method) lastEventAt = Date.now();   // events only: the {id,result} replies to the driver's own commands (the timeout probe's included) are not the page speaking
+  if (evidenceMod ? evidenceMod.pageSpoke(d) : d.method) lastEventAt = Date.now();   // the page's events only: the {id,result} replies to the driver's own commands (the timeout probe's included) and the service worker's status events are not the page speaking
   if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${Date.now() - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
   if (d.method === "Inspector.targetCrashed") consoleLog.push("PAGE CRASHED: Inspector.targetCrashed (the renderer died)");
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
@@ -408,7 +408,7 @@ const readShellCache = async (json) => {
       const timer = setTimeout(() => rej(new Error("no answer from the service worker within 3000ms")), 3000);
       const gone = () => { clearTimeout(timer); rej(new Error("service worker closed")); };
       sws.addEventListener("close", gone); sws.addEventListener("error", gone);
-      sws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id === 1) { clearTimeout(timer); res(d); } });
+      sws.addEventListener("message", (m) => { const d = evidenceMod.parseFrame(m.data); if (d && d.id === 1) { clearTimeout(timer); res(d); } });   // a malformed frame is ignored
       sws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: evidenceMod.SHELL_CACHE_PROBE, awaitPromise: true, returnByValue: true } }));
     });
     if (answer.error || answer.result?.exceptionDetails) return { note: "the read failed: " + String(JSON.stringify(answer.error || answer.result.exceptionDetails.exception?.description || answer.result.exceptionDetails.text)).slice(0, 150) };
@@ -416,19 +416,25 @@ const readShellCache = async (json) => {
   } catch (e) { return { note: "the read failed: " + String(e && e.message || e).slice(0, 150) }; }
   finally { try { sws && sws.close(); } catch {} }
 };
+// The reads are independent (the shell cache needs only the target list's /json answer), so they run together and share one deadline
+// (evidenceMod.collectExtra): whatever finished is printed and the rest says it was not collected in time.
 const evidenceBlock = async () => {
   if (!evidence) return "";
   try {
-    const { targets, json } = await readTargets();
-    const pg = await evaluateOutcome("JSON.stringify({ loadErrors: window.__loadErrors || null })", 2000);
-    let page; if ("error" in pg) page = { error: pg.error }; else { try { page = JSON.parse(pg.value); } catch { page = { error: "unreadable answer" }; } }
-    return evidenceMod.renderEvidence(evidence, { targets, page, shell: await readShellCache(json) });
+    const targetsRead = readTargets();
+    const page = evaluateOutcome("JSON.stringify({ loadErrors: window.__loadErrors || null })", 2000).then((pg) => {
+      if ("error" in pg) return { error: pg.error };
+      try { return JSON.parse(pg.value); } catch { return { error: "unreadable answer" }; }
+    });
+    const extra = await evidenceMod.collectExtra({ targets: targetsRead.then((r) => r.targets), page, shell: targetsRead.then((r) => readShellCache(r.json)) }, evidenceMod.EVIDENCE_DEADLINE_MS);
+    return evidenceMod.renderEvidence(evidence, extra);
   } catch (e) { return "--- drive evidence ---\nunavailable: " + String(e && e.message || e).slice(0, 200) + `\nresend fired: ${evidence.resends()}\n--- end drive evidence ---`; }
 };
 const shotOnTimeout = async (n) => {
   let shotPath = null; let artifact = null; let block = "";
-  try { artifact = await stepArtifact(n); } catch {}
-  try { block = await evidenceBlock(); } catch {}
+  const [art, blk] = await Promise.allSettled([stepArtifact(n), evidenceBlock()]);   // both are bounded and independent: neither waits behind the other
+  if (art.status === "fulfilled") artifact = art.value;
+  if (blk.status === "fulfilled") block = blk.value;
   if (block) console.error(block);   // ahead of the page-state block, whose own length cut then never reaches it; the same text goes into the txt
   try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact, block); } catch {}
   await timeoutBlock(shotPath, artifact);
@@ -702,7 +708,7 @@ for (const s of steps) {
         const gone = () => { clearTimeout(timer); rej(new Error("service worker closed")); };
         sws.addEventListener("close", gone);
         sws.addEventListener("error", gone);
-        sws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id === 1) { clearTimeout(timer); res(d); } });
+        sws.addEventListener("message", (m) => { let d = null; try { d = JSON.parse(m.data); } catch {} if (d && d.id === 1) { clearTimeout(timer); res(d); } });   // a malformed frame is ignored
         sws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: s.sw, awaitPromise: true, returnByValue: true } }));
       });
       if (answer.error || answer.result?.exceptionDetails) {

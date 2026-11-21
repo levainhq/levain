@@ -4,6 +4,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { createEvidence, renderEvidence, LOAD_ERRORS_SCRIPT, SHELL_CACHE_PROBE, RING_MAX, EVIDENCE_MAX, DIALOG_MAX } from "./_drive_evidence.mjs";
+import * as mod from "./_drive_evidence.mjs";   // the names added with the L3 fixes are read off the namespace, so a missing one fails its own test
+const END_MARK = "--- end drive evidence ---";
 
 const rig = () => {
   let T = 0;
@@ -99,6 +101,7 @@ test("the block is bounded under a flood, and the ring keeps the newest requests
   assert.ok(text.includes("/4999/"), "the newest request is kept");
   assert.ok(!text.includes("/0/xxx"), "the oldest request is dropped");
   assert.ok(text.startsWith("--- drive evidence"));
+  assert.ok(text.endsWith(END_MARK), "the end marker survives the cut");
 });
 
 test("a malformed event never throws and never loses the others", () => {
@@ -125,13 +128,117 @@ test("the load-error listener is a capture-phase one, records script and link fa
   assert.ok(win.__loadErrors.every((s) => s.length <= 160));
 });
 
-test("the shell-cache probe lists status and byte length for each asset the cached '/' names, and says MISSING for one the cache lacks", async () => {
-  const html = '<link rel="stylesheet" href="/static/dashboard.css?v=aaa"><script src="/static/cockpit_view.js?v=bbb"></script><script src="/static/boot.js?v=ccc"></script><a href="/other">x</a>';
-  const store = new Map([["/", { status: 200, text: async () => html }], ["/static/cockpit_view.js?v=bbb", { status: 200, arrayBuffer: async () => new ArrayBuffer(321) }],
-    ["/static/dashboard.css?v=aaa", { status: 200, arrayBuffer: async () => new ArrayBuffer(77) }]]);
+// a cached Response stand-in that records every way a body could be read; `length` is what its content-length header says (null: no header)
+const touched = [];
+const headerOnly = (status, length) => ({
+  status,
+  headers: { get: (h) => (String(h).toLowerCase() === "content-length" ? length : null) },
+  get body() { touched.push("body"); return null; },
+  arrayBuffer: async () => { touched.push("arrayBuffer"); return new ArrayBuffer(1); },
+  blob: async () => { touched.push("blob"); return { size: 1 }; },
+  text: async () => { touched.push("text"); return ""; },
+  clone: () => { touched.push("clone"); return headerOnly(status, length); },
+});
+// the cached '/' markup as a body stream: `first` then endless padding, counting reads and whether the reader was cancelled
+const markup = (first, chunk = 1024) => {
+  const log = { reads: 0, cancelled: false, bytes: 0 };
+  const enc = new TextEncoder(); let sent = false;
+  const body = { getReader: () => ({
+    read: async () => { log.reads++; const v = sent ? new Uint8Array(chunk).fill(32) : (sent = true, enc.encode(first)); log.bytes += v.byteLength; return { done: false, value: v }; },
+    cancel: async () => { log.cancelled = true; },
+  }) };
+  return { log, res: { status: 200, headers: { get: () => null }, body } };
+};
+
+test("the shell-cache probe lists status and the header's size for each asset the cached '/' names, reads no asset body, and says MISSING for one the cache lacks", async () => {
+  touched.length = 0;
+  const long = "/static/" + "q".repeat(1000) + ".js";
+  const html = '<link rel="stylesheet" href="/static/dashboard.css?v=aaa"><script src="/static/cockpit_view.js?v=bbb"></script><script src="/static/boot.js?v=ccc"></script><script src="/static/nolength.js"></script><script src="' + long + '"></script><a href="/other">x</a>';
+  const root = markup(html);
+  const store = new Map([["/", root.res], ["/static/cockpit_view.js?v=bbb", headerOnly(200, "321")], ["/static/dashboard.css?v=aaa", headerOnly(200, "77")], ["/static/nolength.js", headerOnly(200, null)]]);
   const caches = { keys: async () => ["levain-open-v1", "levain-shell-v9"], open: async (n) => { assert.equal(n, "levain-shell-v9"); return { match: async (k) => store.get(k) }; } };
-  const out = JSON.parse(await vm.runInNewContext(SHELL_CACHE_PROBE, { caches }));
+  const out = JSON.parse(await vm.runInNewContext(SHELL_CACHE_PROBE, { caches, TextDecoder }));
   assert.equal(out.caches, 1);
-  assert.deepEqual(out.shell[0].entries, [["/static/dashboard.css?v=aaa", 200, 77], ["/static/cockpit_view.js?v=bbb", 200, 321], ["/static/boot.js?v=ccc", "MISSING"]]);
+  const e = out.shell[0].entries;
+  assert.deepEqual(e.slice(0, 4), [["/static/dashboard.css?v=aaa", 200, 77], ["/static/cockpit_view.js?v=bbb", 200, 321], ["/static/boot.js?v=ccc", "MISSING"], ["/static/nolength.js", 200, null]]);
+  assert.equal(e[4][1], "MISSING");
+  assert.ok(e[4][0].length <= 120, `a name is clipped: ${e[4][0].length}`);
   assert.equal(out.shell[0].root, 200);
+  assert.deepEqual(touched, [], "no asset body is touched (no body, arrayBuffer, blob, text or clone)");
+  assert.ok(root.log.cancelled, "the markup reader is cancelled once its cap is reached");
+  assert.ok(root.log.bytes <= mod.SHELL_HTML_BYTES + 2048, `the markup read stops near its cap: ${root.log.bytes} bytes`);
+});
+
+test("the shell-cache probe looks at the NEWEST shell caches when there are more than three", async () => {
+  const opened = [];
+  const caches = { keys: async () => ["levain-shell-v1", "other", "levain-shell-v2", "levain-shell-v3", "levain-shell-v4"], open: async (n) => { opened.push(n); return { match: async () => undefined }; } };
+  const out = JSON.parse(await vm.runInNewContext(SHELL_CACHE_PROBE, { caches, TextDecoder }));
+  assert.deepEqual(opened, ["levain-shell-v2", "levain-shell-v3", "levain-shell-v4"]);
+  assert.equal(out.caches, 3);
+});
+
+test("the shell-cache section has a budget of its own: at most about sixty lines, and the end marker survives", () => {
+  const r = rig();
+  const huge = "z".repeat(3000);
+  const shell = { caches: 3, shell: Array.from({ length: 3 }, (_, k) => ({ cache: huge + k, root: 200, entries: Array.from({ length: 40 }, (_, i) => [huge + i, 200, 1]) })) };
+  const text = renderEvidence(r.ev, { shell });
+  const section = text.slice(text.indexOf("SHELL CACHE"), text.indexOf(END_MARK)).split("\n").filter(Boolean);
+  assert.ok(section.length <= 62, `the section is ${section.length} lines`);
+  assert.ok(text.endsWith(END_MARK));
+  assert.match(renderEvidence(r.ev, { shell: { caches: 1, shell: [{ cache: "levain-shell-v9", root: 200, entries: [["/a.js", 200, null], ["/b.js", 200, 12]] }] } }), /\/a\.js 200 size not read\n\s+\/b\.js 200 12B/);
+});
+
+test("the evidence reads are collected under one deadline: a part that hangs is marked, the finished parts are kept, and nothing waits past the deadline", async () => {
+  const never = new Promise(() => {});
+  const t0 = Date.now();
+  const extra = await mod.collectExtra({ targets: Promise.resolve({ source: "/json", list: [] }), page: Promise.resolve({ loadErrors: null }), shell: never }, 60);
+  assert.ok(Date.now() - t0 < 1500, "returned near the deadline, not at the hung part");
+  assert.deepEqual(extra.targets, { source: "/json", list: [] });
+  assert.deepEqual(extra.page, { loadErrors: null });
+  assert.match(extra.shell.note, /not collected in time/);
+  const e2 = await mod.collectExtra({ targets: never, page: never, shell: Promise.reject(new Error("boom")) }, 40);
+  assert.match(e2.targets.error, /not collected in time/);
+  assert.match(e2.page.error, /not collected in time/);
+  assert.match(e2.shell.note, /boom/);
+  const t1 = Date.now();
+  const quick = await mod.collectExtra({ targets: Promise.resolve({ source: "x", list: [] }), page: Promise.resolve({}), shell: Promise.resolve({ caches: 0, shell: [] }) }, 5000);
+  assert.ok(Date.now() - t1 < 2500, "all parts done: no wait for the deadline");
+  assert.equal(quick.shell.caches, 0);
+});
+
+test("a malformed websocket frame is ignored, never thrown", () => {
+  assert.equal(mod.parseFrame("{not json"), null);
+  assert.equal(mod.parseFrame(""), null);
+  assert.equal(mod.parseFrame("null"), null);
+  assert.equal(mod.parseFrame('"a string"'), null);
+  assert.deepEqual(mod.parseFrame('{"id":1,"result":{}}'), { id: 1, result: {} });
+});
+
+test("a failed load survives a hundred later successes, and is printed ahead of the ordinary requests", () => {
+  const r = rig();
+  r.feed(1, req("bad", "Script", "http://h/static/cockpit_view.js?v=abc"));
+  r.feed(2, { method: "Network.loadingFailed", params: { requestId: "bad", type: "Script", errorText: "net::ERR_CONNECTION_RESET" } });
+  r.feed(3, req("gone", "Document", "http://h/"));
+  r.feed(4, { method: "Network.responseReceived", params: { requestId: "gone", type: "Document", response: { url: "http://h/", status: 503 } } });
+  for (let i = 0; i < 100; i++) {
+    r.feed(10 + i, req("ok" + i, "Script", `http://h/ok${i}.js`));
+    r.feed(10 + i, { method: "Network.responseReceived", params: { requestId: "ok" + i, type: "Script", response: { url: `http://h/ok${i}.js`, status: 200 } } });
+  }
+  assert.ok(!r.ev.ring.has("bad"), "the ordinary ring evicted it");
+  const text = renderEvidence(r.ev);
+  assert.match(text, /Script \/static\/cockpit_view\.js\?v=abc FAILED net::ERR_CONNECTION_RESET/);
+  assert.match(text, /Document \/ 503/);
+  assert.ok(text.indexOf("cockpit_view.js") < text.indexOf("/ok99.js"), "failed loads come first");
+  assert.equal(text.split("cockpit_view.js").length - 1, 1, "an entry is printed once");
+  for (let i = 0; i < 60; i++) r.feed(200 + i, { method: "Network.loadingFailed", params: { requestId: "f" + i, type: "Script", errorText: "e" } });
+  assert.equal(r.ev.failed.size, mod.FAILED_MAX);
+});
+
+test("service-worker events are not the page speaking; page events and replies-to-commands are judged as before", () => {
+  assert.equal(mod.pageSpoke({ method: "ServiceWorker.workerVersionUpdated", params: {} }), false);
+  assert.equal(mod.pageSpoke({ method: "ServiceWorker.workerErrorReported", params: {} }), false);
+  assert.equal(mod.pageSpoke({ method: "Network.requestWillBeSent", params: {} }), true);
+  assert.equal(mod.pageSpoke({ method: "Page.frameNavigated", params: {} }), true);
+  assert.equal(mod.pageSpoke({ id: 4, result: {} }), false);
+  assert.equal(mod.pageSpoke(null), false);
 });
