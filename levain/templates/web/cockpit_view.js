@@ -2491,23 +2491,35 @@
 
   // ---- the jump box: one search path with the filters. A panel title, a loaded row, or "search the store" ----
   let palette = null;
-  // Where the jump box reads the page, besides the board's own panels: the places bar, and every block the page draws outside the board
-  // (the hero, the needs, notes and drop blocks, the glance tiles, the settings sections). Both are read from the page each time the box
-  // opens, so a block the page grows is listed without a change here.
+  // Where the jump box reads the page besides the board's own panels: the places bar, and the blocks the page draws outside the board.
+  // The blocks are read from the live page each time the box opens, by this named set of selectors; a new kind of block is listed once its
+  // selector is added here (the live-page test enumerates the page's blocks on its own, so a block missed here fails it).
   const JUMP_PLACES = ".ia-places [data-ia-place-btn]";
   const JUMP_BLOCKS = "#ck-hero [data-ck-panel], #ck-skycol, #ck-needs, #ck-notes, #ck-drop, #ck-widgets > [data-ck-panel], .dev-zone, .ck-thiscockpit";
   const placeName = (b) => { const p = String(b.dataset.iaPlaceBtn || ""); return p ? p[0].toUpperCase() + p.slice(1) : ""; };
-  // A block is named by its own label, else its heading, else its panel id; a block with none of those is not offered (it could not be told apart).
+  // The visible heading of a block, tried in this order so the answer does not depend on where headings sit in the block.
+  const HEADINGS = [".phead h2", ".zone-title", ".k", "h2", "h3"];
+  function headingOf(n) {
+    if (!n.querySelector) return "";
+    for (const sel of HEADINGS) {
+      const h = n.querySelector(sel);
+      const t = h && String(h.textContent || "").trim();
+      if (t) return t;
+    }
+    return "";
+  }
+  // A panel (a glance tile, a hero block) is named by its visible title, the same string whether or not it opens a focus view: an openable
+  // tile's aria-label is an instruction, not its name. A block that is not a panel is named by its own label, then its heading. The last
+  // resort is the panel id; a block with none of these is not offered (it could not be told apart).
   function blockName(n) {
-    const aria = n.getAttribute && n.getAttribute("aria-label");
-    if (aria) return aria;
-    const h = n.querySelector && n.querySelector(".phead h2, .zone-title, .k, h2, h3");
-    const t = h && String(h.textContent || "").trim();
-    if (t) return t;
+    const aria = (n.getAttribute && n.getAttribute("aria-label")) || "";
     const id = n.dataset && n.dataset.ckPanel;
+    const t = id ? headingOf(n) || aria : aria || headingOf(n);
+    if (t) return t;
     return id ? id[0].toUpperCase() + id.slice(1).replace(/-/g, " ") : "";
   }
   const hiddenBlock = (n) => !!(n.closest ? n.closest("[hidden]") : n.hidden);
+  const JUMP_ROOM = 14;
   function jumpItems(q) {
     const terms = termsOf(q);
     const items = [];
@@ -2526,7 +2538,9 @@
       const label = placeName(b);
       if (label && (!terms.length || hits(fold(label), terms))) items.push({ kind: "place", label: label, place: b.dataset.iaPlaceBtn });
     }
-    const fixed = items.length;
+    // every place, panel and block that matches is kept (a long list scrolls); the rows found inside panels share what is left of a
+    // fixed room, and a panel's "Search the store" line is always kept
+    let room = Math.max(0, JUMP_ROOM - items.length);
     if (terms.length) {
       for (const s of states) {
         if (!onPage(s) || !s.searchable || NOT_DRAWN[s.pid]) continue;
@@ -2535,6 +2549,8 @@
         its.forEach((it, i) => {
           if (n < 5 && hits(hays[i] || "", terms)) {
             n++;
+            if (room <= 0) return;
+            room--;
             const text = d.kind === "roster" ? it.name : d.kind === "log" ? logLine(it) : it.text;
             items.push({ kind: "row", label: String(text), where: s.title, state: s, q: q });
           }
@@ -2542,8 +2558,7 @@
         if ((d.search || {}).scope === "store") items.push({ kind: "store", label: "Search " + s.title + " for “" + q + "”", state: s, q: q });
       }
     }
-    // every place, panel and block that matches is kept (a long list scrolls); only the rows found inside panels are cut
-    return items.slice(0, Math.max(fixed, 14));
+    return items;
   }
   // The panel the page holds now for a node the jump listed: the node itself while it is on the page, else the panel with the same id in
   // the region the node was listed from (a redraw replaces every panel node), else the node as given.
@@ -2588,6 +2603,17 @@
     obs.observe(board, { childList: true });
     for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, answered, true);
   }
+  // Give focus back after the box closes without choosing. The opener is a node a redraw may have replaced while the box was open, so
+  // the order is: the opener if it is still on the page, else the Jump button, else the main region; never <body>.
+  function restoreFocus(opener) {
+    const main = document.querySelector("main");
+    for (const t of [opener, document.getElementById("jumpbtn"), main]) {
+      if (!t || t === document.body || !t.isConnected || typeof t.focus !== "function") continue;
+      if (t === main && !t.hasAttribute("tabindex")) t.setAttribute("tabindex", "-1");
+      t.focus({ preventScroll: true });
+      if (document.activeElement === t) return;
+    }
+  }
   function openJump() {
     if (palette) return;
     const dlg = el("div", "palette");
@@ -2595,52 +2621,73 @@
     dlg.setAttribute("aria-label", "Jump");
     const box = el("div", "palette-box");
     const input = el("input", "palette-input");
-    input.placeholder = "Jump to a panel or a row";
+    input.placeholder = "Jump to a panel, a place or a row";
     input.setAttribute("aria-label", "Jump to");
     const list = el("ul", "palette-list");
     list.setAttribute("role", "listbox");
+    list.setAttribute("aria-label", "Jump targets");
     list.id = "palette-list";
     input.setAttribute("role", "combobox");
+    input.setAttribute("aria-autocomplete", "list");
     input.setAttribute("aria-expanded", "true");
     input.setAttribute("aria-controls", "palette-list");
-    box.append(input, list);
+    // the empty state is a note beside the list (a listbox holds options only); the live region says it, and the result count, aloud
+    const none = el("div", "pl-none", "nothing matches");
+    none.setAttribute("aria-hidden", "true");
+    none.hidden = true;
+    const status = el("div", "palette-status");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    box.append(input, list, none, status);
     dlg.appendChild(box);
     document.body.appendChild(dlg);
-    // where focus was when the box opened: leaving without choosing (Escape, a second Cmd-K) gives it back, so the keyboard keeps its place
+    // where focus was when the box opened: leaving without choosing (Escape, a second Cmd-K) gives it back
     const opener = document.activeElement;
-    let items = [], sel = 0;
+    let items = [], opts = [], sel = 0;
     const close = (restore) => {
       dlg.remove();
       palette = null;
-      if (restore && opener && opener !== document.body && opener.isConnected && typeof opener.focus === "function") opener.focus({ preventScroll: true });
+      if (restore) restoreFocus(opener);
     };
-    palette = { dlg: dlg, input: input, close: close };
+    const me = { dlg: dlg, input: input, close: close };
+    palette = me;
+    const say = (t) => { status.textContent = t; };
     const choose = (it) => {
-      close(false);
       // a changed tab is drawn a frame later (the place paints after the attribute), so the scroll and the focus wait for it
       const after = (changed, fn) => { if (changed && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(fn); else fn(); };
       const places = root.LevainPlaces;
       if (it.kind === "place") {
-        // a place is gone to through the places bar's own wiring; focus then rests on that place's button in the bar, from which Tab enters the page
+        close(false);
+        // a place is gone to through the places bar's own wiring; focus then rests on that place's button in the bar
         if (places && typeof places.go === "function") places.go(it.place);
         after(true, () => { const b = document.querySelector('.ia-places [data-ia-place-btn="' + it.place + '"]'); if (b) b.focus({ preventScroll: true }); });
         return; }
       if (it.kind === "block") {
-        // the Settings sections are drawn in the Settings place only; every other block is Home's, and Home is where a place that does not
-        // draw it (Memory) sends the jump. Each is drawn a frame after the place changes, so the focus waits for it.
+        // The box stays open until focus has landed: a block that cannot take focus is said so in the box instead of leaving focus nowhere.
+        // A Settings section needs the Settings place; any other block needs Home. A place paints a frame after it changes, so the focus waits.
         const node = livePanel(it.node, it.scope);
         const settings = !!(node.closest && node.closest(".dev-zone, .ck-thiscockpit"));
+        const raf = typeof root.requestAnimationFrame === "function" ? (f) => root.requestAnimationFrame(f) : null;
+        const drawn = (n) => n.getClientRects().length > 0;
         let changed = false;
         if (settings) { if (document.body.dataset.iaPlace !== "settings" && places && places.go) { places.go("settings"); changed = true; } }
         else changed = revealTab(node);
         const land = (tries) => {
+          if (palette !== me) return;   // the box was left while the page settled: focus went where the reader sent it
           const n = livePanel(it.node, it.scope);
-          if (!settings && !n.getClientRects().length && tries === 0 && places && places.go && typeof root.requestAnimationFrame === "function") { places.go("home"); root.requestAnimationFrame(() => land(1)); return; }
-          if (!n.getClientRects().length && tries < 20 && typeof root.requestAnimationFrame === "function") { root.requestAnimationFrame(() => land(tries + 1)); return; }
-          landOnPanel(n, true, it.scope);
+          if (!settings && !drawn(n) && tries === 0 && raf && places && places.go && document.body.dataset.iaPlace !== "home") { places.go("home"); raf(() => land(1)); return; }
+          if (!drawn(n) && tries < 20 && raf) { raf(() => land(tries + 1)); return; }
+          if (drawn(n)) {
+            landOnPanel(n, true, it.scope);
+            if (n.contains(document.activeElement)) { close(false); return; }
+          }
+          say(it.label + " is not shown here");
+          input.focus();
         };
         after(changed, () => land(0));
         return; }
+      close(false);
       if (it.kind === "panel") {
         // a panel the current tab hides is reached through the first tab that shows it
         // the panel as the page has it now: a redraw since the list was drawn has replaced the node the list holds
@@ -2658,32 +2705,47 @@
         if (it.state.filterInput) it.state.filterInput.focus();
       });
     };
-    const draw = () => {
-      list.replaceChildren();
-      items.forEach((it, i) => {
+    // The highlight moves on the options already there: an option the active-descendant names is never replaced under the reader, and the
+    // list scrolls only as far as the highlighted option needs.
+    const select = (i) => {
+      if (opts[sel]) opts[sel].setAttribute("aria-selected", "false");
+      sel = i;
+      const o = opts[sel];
+      if (!o) { input.removeAttribute("aria-activedescendant"); return; }
+      o.setAttribute("aria-selected", "true");
+      input.setAttribute("aria-activedescendant", o.id);
+      if (typeof o.scrollIntoView === "function") o.scrollIntoView({ block: "nearest" });
+    };
+    const build = () => {
+      opts = items.map((it, i) => {
         const li = el("li");
         li.setAttribute("role", "option");
         li.id = "palette-opt-" + i;
-        li.setAttribute("aria-selected", i === sel ? "true" : "false");
+        li.setAttribute("aria-selected", "false");
         li.append(el("span", "pk", it.kind === "store" ? "store" : it.kind === "row" ? "row" : it.kind === "place" ? "place" : "panel"), el("span", "pl", it.label));
         if (it.where) li.appendChild(el("span", "pw", it.where));
         li.addEventListener("click", () => choose(it));
-        list.appendChild(li);
-        // the highlighted line stays on screen as the arrow keys move down a list longer than the box
-        if (i === sel && typeof li.scrollIntoView === "function") li.scrollIntoView({ block: "nearest" });
+        return li;
       });
-      if (items.length) input.setAttribute("aria-activedescendant", "palette-opt-" + sel); else input.removeAttribute("aria-activedescendant");
-      if (!items.length) list.appendChild(el("li", "pl-none", "nothing matches"));
+      list.replaceChildren(...opts);
+      none.hidden = items.length > 0;
+      input.setAttribute("aria-expanded", items.length ? "true" : "false");
+      say(items.length ? items.length + (items.length === 1 ? " result" : " results") : "nothing matches");
+      sel = 0;
+      select(0);
     };
-    const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); };
+    const refresh = () => { items = jumpItems(input.value); build(); };
     input.addEventListener("input", refresh);
-    input.addEventListener("keydown", (ev) => {
+    // the box handles its keys itself, so Tab and Escape work from anywhere focus is inside it; a key that confirms an input-method
+    // composition is the composition's, not the box's
+    dlg.addEventListener("keydown", (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
       if (ev.key === "Escape") { ev.preventDefault(); close(true); }
-      else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); draw(); }
-      else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); draw(); }
-      else if (ev.key === "Home" && ev.ctrlKey) { ev.preventDefault(); sel = 0; draw(); }
-      else if (ev.key === "End" && ev.ctrlKey) { ev.preventDefault(); sel = Math.max(0, items.length - 1); draw(); }
-      else if (ev.key === "Tab") { ev.preventDefault(); sel = items.length ? (sel + (ev.shiftKey ? items.length - 1 : 1)) % items.length : 0; draw(); }   // the box holds focus: Tab walks its list, never the page behind it
+      else if (ev.key === "ArrowDown") { ev.preventDefault(); if (items.length) select(Math.min(items.length - 1, sel + 1)); }
+      else if (ev.key === "ArrowUp") { ev.preventDefault(); if (items.length) select(Math.max(0, sel - 1)); }
+      else if (ev.key === "Home" && ev.ctrlKey) { ev.preventDefault(); if (items.length) select(0); }
+      else if (ev.key === "End" && ev.ctrlKey) { ev.preventDefault(); if (items.length) select(items.length - 1); }
+      else if (ev.key === "Tab") { ev.preventDefault(); if (items.length) select((sel + (ev.shiftKey ? items.length - 1 : 1)) % items.length); }   // the box holds focus: Tab walks its list, never the page behind it
       else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
     });
     dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(true); });
@@ -2691,6 +2753,37 @@
     input.focus();
   }
 
+  // a dialog is up (the focus view, the presence sheet): its keys are its own
+  function dialogOpen() {
+    if (document.querySelector(".modal-overlay")) return true;
+    const sheet = document.getElementById("pr-sheet");
+    return !!(sheet && sheet.getClientRects().length);
+  }
+  function onPageKey(ev) {
+    if (ev.defaultPrevented) return;
+    if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") {
+      if (palette) { ev.preventDefault(); palette.close(true); return; }
+      if (dialogOpen()) return;   // the box would open under the dialog, with focus in a field nobody can see
+      ev.preventDefault();
+      openJump();
+      return;
+    }
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
+    if (dialogOpen()) return;
+    if (ev.key === "/") {
+      const all = visibleFilters();
+      if (!all.length) return;
+      const hovered = hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i));
+      const near = hovered || all[0];
+      ev.preventDefault();
+      // a box already on screen takes focus where it is; one off screen (the page's first box, or a hovered panel the
+      // keyboard scrolled away from) is scrolled to, so the reader sees what they type
+      const r = near.getBoundingClientRect();
+      const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
+      near.focus(onScreen ? { preventScroll: true } : undefined);
+      near.select();
+    } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)], true);
+  }
   function install() {
     // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
     applyMode(hashMode() || saved(MODE_KEY) || "board");
@@ -2722,34 +2815,14 @@
     // a filter keeps focus through a re-render until the operator goes somewhere else
     document.addEventListener("mousedown", (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest(".xfilter"))) focusKeep = null; });
     document.addEventListener("mouseover", (ev) => { const p = ev.target && ev.target.closest ? ev.target.closest(".panel") : null; if (p) hoverPanel = p; });
-    document.addEventListener("keydown", (ev) => {
-      if (ev.defaultPrevented) return;
-      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.close(true); else openJump(); return; }
-      if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
-      if (document.querySelector(".modal-overlay")) return;
-      const sheet = document.getElementById("pr-sheet");
-      if (sheet && sheet.getClientRects().length) return;   // the presence sheet is a dialog too: its keys are its own
-      if (ev.key === "/") {
-        const all = visibleFilters();
-        if (!all.length) return;
-        const hovered = hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i));
-        const near = hovered || all[0];
-        ev.preventDefault();
-        // a box already on screen takes focus where it is; one off screen (the page's first box, or a hovered panel the
-        // keyboard scrolled away from) is scrolled to, so the reader sees what they type
-        const r = near.getBoundingClientRect();
-        const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
-        near.focus(onScreen ? { preventScroll: true } : undefined);
-        near.select();
-      } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)], true);
-    });
+    document.addEventListener("keydown", onPageKey);
   }
   if (typeof document !== "undefined") {
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install); else install();
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutCollapsed, hasLayout, setLayoutCollapsed, resetLayout, hashMode, revealTab, JUMP_BLOCKS, JUMP_PLACES });
+  Object.assign(K, { freshHeads, bandAgeText, armAges, paintHeaderLens, paintLegend, skyCounts, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutCollapsed, hasLayout, setLayoutCollapsed, resetLayout, hashMode, revealTab, JUMP_BLOCKS, JUMP_PLACES, pageKey: onPageKey });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
