@@ -9,11 +9,11 @@
 
 // ONE-SHOT GUARD for a missing cockpit_view.js. A script answered with an error leaves `window.LevainCockpitView` undefined, and nothing
 // else asks for it again, so the page would stay dead until a person reloaded it. This runs first, before the boot below, and does not
-// wait for anything: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and when that
+// block the boot: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and when that
 // lands the page goes on. When it does not, the page reloads ONCE: the marker is written to sessionStorage BEFORE the reload, so a second
 // failure finds it and stops. The marker is the time it was written, and one older than MARK_TTL_MS counts as absent. A healthy boot clears
 // the marker, so a later incident may heal again. Storage that cannot be read or written never reloads (no marker could be kept, so a loop
-// could not be ruled out). Nothing is shown: the one trace is a console line.
+// could not be ruled out). Nothing is shown; a console line is written when it gives up.
 (function () {
   // MARK_TTL_MS: a reload loop repeats within seconds, so a marker only has to outlive that; one left by a dead load long ago must not
   // suppress a later recovery for the rest of the tab's session

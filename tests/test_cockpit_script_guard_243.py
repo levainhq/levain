@@ -1,15 +1,16 @@
 """The page's one-shot guard for a missing cockpit_view.js (levain#243), in real headless Chrome over a served scratch install.
 
-A fast reload on a loaded device can answer the head script `/cockpit_view.js?v=<digest>` with an error. Nothing then asks for it
-again, `window.LevainCockpitView` stays undefined and the page stays dead until a person reloads it. The guard (dashboard_boot.js):
+These cases prove the guard's mechanism: when the page's script for the view is answered with an error, the guard asks for it again once,
+else reloads the page once with a marker bounding it. They do NOT prove the cause reported in levain#243: the rig has no service
+worker, and the injected 503 is a server answer, not the network failure that issue's worker hypothesis names. What the guard does:
 - re-requests the script once, from the very `src` the page named it by, and goes on when that lands;
 - else reloads the page once, a marker in sessionStorage written first, so a second failure cannot reload again;
-- clears the marker when the global is there at boot (a healthy boot), so a later incident may heal again;
-- shows nothing, and reloads nothing when it could not write its marker.
+- clears the marker when the global is there at boot (a healthy boot), so a later incident may heal again.
+The storage cases (storage that throws, a marker of a given age) are in test_cockpit_script_guard_243_node.py.
 
 The server here is the real one with its handler wrapped: a GET for the script is answered 503 for the first N requests the PAGE makes
 for it, and every other request is the real server's. A request counts as the page's by `Sec-Fetch-Dest` (`script` for a script
-element, `document` for a navigation): the service worker's own precache fetches carry neither, so they never move a count.
+element, `document` for a navigation).
 """
 
 from __future__ import annotations
@@ -18,8 +19,6 @@ import json
 import threading
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
@@ -41,6 +40,9 @@ _WAIT_RELOADED_AND_FAILED = {
     "until": ("(performance.getEntriesByType('navigation')[0] || {}).type === 'reload' && sessionStorage.getItem('" + KEY + "') !== null"
               " && (window.__loadErrors || []).filter((e) => e.indexOf('/cockpit_view.js') >= 0).length >= 2 && 1"),
     "ms": 30000, "partial": True}
+# a quiet stretch in that second document, longer than the guard's own 4000 ms timer, so a reload the guard should not make has time to
+# happen before anything is read (a document's performance.now() counts from its own navigation start)
+_SETTLE = {"until": "performance.now() > 6000 && 1", "ms": 30000, "partial": True}
 
 
 def _scenario(tmp_path: Path, fail_first: int, steps: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, int]]:
@@ -83,13 +85,13 @@ def test_a_failed_script_is_asked_for_again_once_and_the_page_goes_on_without_a_
 
 
 def test_a_script_that_never_comes_reloads_the_page_once_and_never_again(tmp_path: Path) -> None:
-    out, counts = _scenario(tmp_path, ALWAYS, [_WAIT_RELOADED_AND_FAILED, {"eval": _STATE, "partial": True}])
+    out, counts = _scenario(tmp_path, ALWAYS, [_WAIT_RELOADED_AND_FAILED, _SETTLE, {"eval": _STATE, "partial": True}])
     state = json.loads(out["values"][-1])
     assert counts["docs"] == 2, counts               # the opened document and the one reload, never a third
     assert state["nav"] == "reload", state
     assert state["marker"] is not None, state        # written before the reload, still there: a second failure cannot reload again
     assert state["view"] == "undefined", state       # nothing was invented in its place
-    assert 2 <= counts["scripts"] <= 4, counts       # asked for again in each document at most, never in a loop
+    assert counts["scripts"] == 4, counts            # the head script and the one re-request, in each of the two documents
 
 
 def test_a_healthy_boot_asks_for_nothing_again_reloads_nothing_and_leaves_no_marker(tmp_path: Path) -> None:
