@@ -3842,6 +3842,9 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { height: 720px !important; }
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
 }
+/* a folded card is its header: the fixed heights above (every width, the phone's included) are for an open card. Same specificity as
+   those, so this stays below the last of them. */
+body.ia[data-ia-place="home"] .panel.ck-collapsed { height: auto !important; min-height: 0; }
 
 /* (after the phone block, whose 38 px it overrides) a finger is the pointer: the masthead's three actions and the places are the page's touch targets at any width, not only on a phone */
 @media (pointer: coarse) {
