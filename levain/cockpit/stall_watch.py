@@ -1,4 +1,4 @@
-"""A stall watchdog for the cockpit process: it names who held the interpreter when this thread's wake came late.
+"""A stall watchdog for the cockpit process: it reports when this thread's wake came late, and what the threads were in.
 
 One daemon thread sleeps :data:`INTERVAL_S` and measures how late each wake is against a monotonic clock. A wake later
 than :data:`LATE_S` is reported as "watch late": every thread in the process waits on the same interpreter, so a late
@@ -9,10 +9,11 @@ The dump is the Python stack of every thread taken after the wake. That mostly m
 interpreter by then; it shows what the other threads were waiting in.
 
 There is no live capture: an earlier version armed ``faulthandler.dump_traceback_later`` every tick so a C thread could
-write the stacks during the stall. That dump reads every thread's frames without the interpreter lock while they run;
-on 2026-11-21 it read a mutating frame in a process of about 100 threads, spun one core for hours, and the
-``cancel_dump_traceback_later`` that follows joins that thread, so the cockpit's own process froze (levain#238). Nothing
-in this module calls faulthandler's timed dump or cancels it.
+write the stacks during the stall. That dump reads every thread's frames without the interpreter lock while they run.
+On 2026-11-21, in a process of about 100 threads, flow's bridge (which starts this watch) sat on one core for hours
+with that thread spinning in the interpreter's thread-state check (``tstate_is_freed``) after a frame it printed as
+``<invalid frame>``, and the ``cancel_dump_traceback_later`` the next tick makes waits for that thread (levain#238).
+Nothing in this module calls faulthandler's timed dump or cancels it.
 
 The loop does nothing but sleep, compare and, on a late wake, report. Below the threshold it walks no stack.
 The module still keeps a dead process's scratch file as a dump (an earlier version's), so a process that was killed
@@ -59,8 +60,8 @@ _SCRATCH_GONE_ERRNOS = frozenset({errno.ENOENT, errno.ELOOP, errno.EMLINK})
 
 DUMP_PREFIX = "stall-"
 DUMP_SUFFIX = ".txt"
-SCRATCH_PREFIX = "live-stacks."        # the scratch is SCRATCH_PREFIX + pid + SCRATCH_SUFFIX: one file per process, so
-SCRATCH_SUFFIX = ".scratch"            # two cockpits on one data root never share one; outside DUMP_PREFIX on purpose
+SCRATCH_PREFIX = "live-stacks."        # an earlier version wrote SCRATCH_PREFIX + pid + SCRATCH_SUFFIX, one file per process;
+SCRATCH_SUFFIX = ".scratch"            # outside DUMP_PREFIX on purpose; only the harvest of such leftovers reads the name
 
 
 def scratch_name(pid: int) -> str:

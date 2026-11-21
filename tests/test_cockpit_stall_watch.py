@@ -849,6 +849,35 @@ def test_a_late_wake_still_writes_the_stacks_taken_after_the_wake_and_leaves_no_
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(stall_watch.SCRATCH_PREFIX)] == []
 
 
+def test_the_module_imports_faulthandler_nowhere(tmp_path):
+    """The pin the recorder test cannot give: a ``from faulthandler import dump_traceback_later`` taken at import time
+    would escape a patch of the module's attributes. No import of faulthandler, anywhere in the module, in any form."""
+    import ast
+    from pathlib import Path as _Path
+    tree = ast.parse(_Path(stall_watch.__file__).read_text(encoding="utf-8"))
+    imported = [n for n in ast.walk(tree)
+                if (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "faulthandler" for a in n.names))
+                or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "faulthandler")]
+    assert imported == []
+
+
+def test_the_pid_a_watch_is_given_names_the_scratch_file_it_treats_as_its_own_leftover(tmp_path):
+    """``pid=`` stands for a second process: a leftover under THAT pid is kept as a dump, and one under another live pid is not."""
+    mine = os.getpid() + 100_000_000                     # a pid no running process has
+    (tmp_path / stall_watch.scratch_name(mine)).write_bytes(STACK_TEXT)
+    live_child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        alive = tmp_path / stall_watch.scratch_name(live_child.pid)
+        alive.write_bytes(b"a running process's file")
+        StallWatch(tmp_path, pid=mine)._prepare()
+        assert alive.read_bytes() == b"a running process's file"
+        kept = killed_dumps(tmp_path)
+        assert len(kept) == 1 and str(mine) in kept[0].name
+    finally:
+        live_child.kill()
+        live_child.wait()
+
+
 # ---- the lifecycle ----------------------------------------------------------------------------------------------
 
 def test_start_and_stop_are_idempotent_and_stop_is_prompt(tmp_path):
