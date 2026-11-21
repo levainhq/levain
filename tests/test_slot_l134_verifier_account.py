@@ -7,7 +7,8 @@ setup never creates it on macOS (``ids.provisioned_singletons`` does not list it
 (5g) is built, and provisions the account only then. So the fix is the precondition named, early, on both sides:
 
 * root: ``adopt-verify`` checks the account right after binding the caller, before any lock, root fact or wait, and
-  its detail is :data:`wall.VERIFIER_UNPROVISIONED` (the wire name stays ``account-missing``);
+  its detail is by host (macOS :data:`wall.VERIFIER_UNPROVISIONED`, Linux :data:`wall.VERIFIER_MISSING`; the wire
+  name stays ``account-missing``; ``j06_adopt_linux_ruling.md`` is why Linux differs);
 The CLI has no pre-check of its own: root allows the report-only ``adopt-nothing-new`` path (it exits before any
 adopt-verify call), and a CLI-side lookup would refuse it.
 
