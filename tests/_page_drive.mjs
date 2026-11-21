@@ -377,7 +377,8 @@ const timeoutBlock = async (shotPath, artifact) => {
 const stepArtifact = async (n) => {
   const src = steps[n] && steps[n].artifact;
   if (src === undefined) return null;
-  const o = await evaluateOutcome(`(() => { try { return JSON.stringify(${src}\n); } catch (e) { return "artifact error: " + String(e); } })()`, 3000);
+  const o = await evaluateOutcome(`(() => { try { return JSON.stringify(${src}\n); } catch (e) { return "artifact error: " + String(e); } })()`, 3000)
+    .catch((e) => ({ error: String(e && e.message || e).slice(0, 120) }));   // a closed page connection rejects the send: the line says the read failed instead of vanishing
   return "STEP ARTIFACT: " + ("error" in o ? "evaluation error: " + o.error : String(o.value));
 };
 // What the evidence record (tests/_drive_evidence.mjs) cannot hold, read once here and only ever by asking the browser or the page, never
