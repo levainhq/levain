@@ -1169,12 +1169,26 @@
   }
   // the kernel's sentence, else the verb and the target when the row has one
   function logLine(r) { return typeof r.sentence === "string" && r.sentence ? r.sentence : typeof r.target === "string" && r.target ? r.verb + " · " + r.target : r.verb; }
-  function paintLog(host, rows) {
+  // The lines just drawn are measured at once when the body is on the page (a typed filter draws them with no board draw after it): each
+  // cut line gets its caret (a searched one opens), and the card folds again around what the lines now take
+  function measureLog(s) {
+    const core = root.LevainDashboard;
+    if (!core || !s.body.isConnected) return;
+    if (core.measureClauses) core.measureClauses(s.body);
+    const pb = s.body.closest(".pbody.clamped");
+    if (pb && core.measureOverflow) core.measureOverflow(pb);
+  }
+  // `searched`: the rows are what a query matched, so a line the card's clamp cuts opens whole (the match may be past the cut)
+  function paintLog(host, rows, searched) {
+    const core = root.LevainDashboard;
     for (const r of rows) {
       const row = el("div", "lrow");
+      row.dataset.keepKey = [r.at, r.actor, logLine(r).length].join("|");   // an opened line stays open across a redraw (captureKept)
+      if (searched) row.dataset.searchHit = "1";
       row.appendChild(el("span", "lsent", logLine(r)));
       row.appendChild(el("span", "lactor", r.actor));
       row.appendChild(el("span", "lage", ago(r.at) || r.at));
+      if (core && core.rowToggle) core.rowToggle(row);   // the row's own caret: shown only when the clamp cuts this line
       host.appendChild(row);
     }
   }
@@ -1819,7 +1833,7 @@
     const cap = s.searchable && !nq && !s.showAll && pool.length > (sr.visible || 10) ? (sr.visible || 10) : pool.length;
     const shown = pool.slice(0, cap);
     if (d.kind === "roster") paintRoster(s.body, shown, d);
-    else if (d.kind === "log") paintLog(s.body, shown);
+    else if (d.kind === "log") { paintLog(s.body, shown, terms.length > 0 || !!store); measureLog(s); }
     else if (s.ctx.rows) s.ctx.rows(s.body, shown, tabbed ? { dt: pg.dt, tags: pg.tags.slice(0, cap), onTab: () => paint(s) } : null);
     if (cap < pool.length) {
       const more = el("button", "xmore", "show all " + pool.length);

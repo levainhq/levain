@@ -145,3 +145,170 @@ def test_the_clamp_is_on_the_card_only_the_focus_view_holds_the_whole_entry(tmp_
     assert card["firstText"] == len("wrap · " + long_text), card     # the card holds the whole entry, clamped by style only
     modal = json.loads(out["values"][-1])
     assert modal["clamp"] in ("none", "", None) and not modal["cut"], modal              # the focus view shows all of it
+
+
+# ---- fix round 1: the clamp is guarded, a cut entry has its own caret, an ordinary entry is not cut, the "Read all 50" foot, a search hit ----
+CLAMP_LINES = 8     # the card's per-entry clamp (dashboard.css): the tests below fail when the rule is gone, loses its scope, or changes depth
+
+WORDS = ("the seat wrote its account of what changed and why the first attempt was refused so the second one waited for the "
+         "review lane to finish and the desk then closed the board row with a note for the morning").split()
+
+
+def _words(n: int) -> str:
+    """Ordinary prose of exactly n characters."""
+    out, i = "", 0
+    while len(out) < n:
+        out += (" " if out else "") + WORDS[i % len(WORDS)]
+        i += 1
+    return out[:n].rstrip()
+
+
+def _log(texts: list[str], actor: str = "desk") -> list[dict]:
+    return [{"verb": "wrap", "target": t, "actor": actor, "at": f"2026-11-20T11:{59 - i:02d}:00Z"} for i, t in enumerate(texts)]
+
+
+STATE = ("(() => { const p = " + PANEL + "; if (!p) return null; const rows = [...p.querySelectorAll('.lrow')]; if (!rows.length) return null;"
+         " return JSON.stringify(rows.map(r => { const s = r.querySelector('.lsent'), t = r.querySelector(':scope > .clause-toggle');"
+         " const sr = s.getBoundingClientRect(), lh = parseFloat(getComputedStyle(s).lineHeight);"
+         " return {folded: !!r.dataset.folded, open: r.classList.contains('row-expanded'), hasMore: r.classList.contains('has-more'),"
+         " lines: lh ? Math.round(sr.height / lh * 10) / 10 : 0, h: sr.height, lh: lh, cut: s.scrollHeight > s.clientHeight, len: s.textContent.length,"
+         " toggle: t ? {tag: t.tagName, shown: getComputedStyle(t).display !== 'none' && t.getBoundingClientRect().height > 0,"
+         " expanded: t.getAttribute('aria-expanded'), label: t.getAttribute('aria-label')} : null}; })); })()")
+ENTER = {"key": "Enter", "vk": 13, "text": "\r"}
+ROW0_TOGGLE = PANEL + ".querySelector('.lrow > .clause-toggle')"
+
+
+def _state(out: dict, at: int = -1) -> list[dict]:
+    return json.loads(out["values"][at])
+
+
+@needs_browser
+@pytest.mark.parametrize("vp", ["phone390x800", "desk1280x1000"])
+def test_the_card_clamp_bounds_a_long_entry_and_the_focus_view_does_not(vp, tmp_path: Path) -> None:
+    """Guards the stylesheet rule itself: an entry's rendered height on the card is at most CLAMP_LINES of its line height, and
+    in the focus view the same entry is not bounded. Deleting the rule, scoping it past #board, or changing its depth fails this."""
+    long_text = SHAPES["one_long_paragraph"]
+    modal_probe = ("(() => { const m = document.querySelector('#levain-modal'); if (!m) return null; const s = m.querySelector('.lrow .lsent');"
+                   " if (!s) return null; return JSON.stringify({h: s.getBoundingClientRect().height, lh: parseFloat(getComputedStyle(s).lineHeight)}); })()")
+    with _serve(tmp_path, _episodes(long_text)) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS[vp]},
+            {"until": STATE},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": f"{PANEL}.querySelector('.pexpand').click(); 1"},
+            {"until": modal_probe},
+            {"eval": modal_probe},
+        ])
+    first = _state(out, -4)[0]
+    assert first["lh"] > 0 and first["h"] <= CLAMP_LINES * first["lh"] + 1, first         # bounded on the card
+    assert first["h"] >= (CLAMP_LINES - 1) * first["lh"], first                            # and it is the clamp holding it, not an empty row
+    modal = json.loads(out["values"][-1])
+    assert modal["h"] > 2 * CLAMP_LINES * modal["lh"], modal                               # the focus view shows the entry, not its first lines
+
+
+@needs_browser
+@pytest.mark.parametrize("chars", [120, 160, 200])
+def test_an_ordinary_entry_is_not_cut_on_a_phone(chars, tmp_path: Path) -> None:
+    """The card is narrow, so the clamp is sized for a phone: an ordinary entry (120 to 200 characters of target) fills at most the clamp.
+    A line that is cut shows its caret and a line that is whole shows none."""
+    with _serve(tmp_path, _log([_words(chars)] + [f"an ordinary earlier entry number {i}" for i in range(4)])) as url:
+        out = _drive(tmp_path, f"{url}/", [{"emulate": VIEWPORTS["phone390x800"]}, {"until": STATE}, SETTLE, {"eval": STATE}])
+    first = _state(out)[0]
+    print(f"ordinary entry of {chars} target characters (+ verb): {first['lines']} lines at 390 px, clamp {CLAMP_LINES}")
+    assert first["toggle"] and first["toggle"]["shown"] == first["cut"], first             # a caret exactly when the text is cut
+    if chars <= 160:
+        assert not first["cut"] and first["lines"] <= CLAMP_LINES, first
+
+
+@needs_browser
+def test_a_cut_entry_has_its_own_caret_that_opens_and_closes_that_one_row(tmp_path: Path) -> None:
+    long_text = _words(450)
+    with _serve(tmp_path, _log([long_text] + [f"an ordinary earlier entry number {i}" for i in range(4)])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.lrow.has-more') && 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": f"{ROW0_TOGGLE}.focus(); document.activeElement === {ROW0_TOGGLE} && 1"},     # reachable by the keyboard
+            ENTER,
+            {"until": f"{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": STATE},
+            ENTER,
+            {"until": f"!{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": STATE},
+        ])
+    closed, opened, again = _state(out, -6), _state(out, -3), _state(out, -1)
+    assert closed[0]["toggle"]["tag"] == "BUTTON" and closed[0]["toggle"]["shown"], closed[0]
+    assert closed[0]["toggle"]["expanded"] == "false" and closed[0]["cut"], closed[0]
+    assert all(not r["toggle"]["shown"] for r in closed[1:] if not r["folded"]), closed       # an entry that fits shows none
+    assert opened[0]["open"] and opened[0]["toggle"]["expanded"] == "true" and not opened[0]["cut"], opened[0]
+    assert opened[0]["len"] == len("wrap · " + long_text), opened[0]                            # the whole entry is on the row
+    assert not any(r["open"] for r in opened[1:]), opened                                      # only that one row opened
+    assert not again[0]["open"] and again[0]["toggle"]["expanded"] == "false" and again[0]["cut"], again[0]
+    assert again[0]["h"] <= CLAMP_LINES * again[0]["lh"] + 1, again[0]
+
+
+@needs_browser
+def test_an_opened_entry_stays_open_when_the_panel_is_read_again(tmp_path: Path) -> None:
+    mark = f"window.__old = {PANEL}.querySelector('.lrow'); 1"
+    again = ("new Promise(r => window.LevainCockpitView.refetchPanel('stream').then(x => r(x === 'applied' && window.__old.isConnected === false"
+             " ? 'repainted' : String(x) + ' old row still on the page: ' + window.__old.isConnected)))")
+    with _serve(tmp_path, _log([_words(450)] + [f"an ordinary earlier entry number {i}" for i in range(4)])) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.lrow.has-more') && 1"},
+            SETTLE,
+            {"eval": f"{ROW0_TOGGLE}.click(); 1"},
+            {"until": f"{PANEL}.querySelector('.lrow.row-expanded') && 1"},
+            {"eval": mark},
+            {"eval": again},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    assert out["values"][-3] == "repainted", out["values"][-3]
+    assert _state(out)[0]["open"] and _state(out)[0]["toggle"]["expanded"] == "true", _state(out)[0]
+
+
+@needs_browser
+@pytest.mark.parametrize("vp", ["phone390x800", "desk1280x1000"])
+def test_fifty_rows_and_a_long_first_entry_read_read_all_50_with_the_first_entry_on_the_card(vp, tmp_path: Path) -> None:
+    """The foot Phill saw: a list with its own "show all 50" link, folded, ends in "Read all 50"; the newest entry's top is on the card."""
+    texts = [SHAPES["one_long_paragraph"]] + [f"an ordinary earlier entry number {i}" for i in range(49)]
+    with _serve(tmp_path, _log(texts)) as url:
+        out = _drive(tmp_path, f"{url}/", [{"emulate": VIEWPORTS[vp]}, {"until": READ}, SETTLE, {"eval": READ}])
+    g = json.loads(out["values"][-1])
+    assert g["foot"] == "Read all 50", g
+    assert not _top_visible(g), (vp, _top_visible(g), g)
+
+
+@needs_browser
+def test_a_search_hit_past_the_clamp_opens_its_row(tmp_path: Path) -> None:
+    """A row the card's filter matches, and the clamp would cut, opens whole (twelve rows: the card draws a filter box for them)."""
+    texts = [f"an ordinary earlier entry number {i}" for i in range(12)]
+    texts[1] = _words(450) + " quokka"
+    typed = (f"(() => {{ const i = {PANEL}.querySelector('.xfilter-input'); i.value = 'quokka'; i.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()")
+    with _serve(tmp_path, _log(texts)) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.xfilter-input') && {PANEL}.querySelector('.lrow') && 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": typed},
+            {"until": f"{PANEL}.querySelectorAll('.lrow').length === 1 && 1"},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    before, after = _state(out, -5), _state(out)
+    assert not before[1]["open"], before                                                       # closed before the search
+    assert len(after) == 1 and after[0]["open"] and not after[0]["cut"], after                 # the search opened the row: its end is on the card
+
+
+@needs_browser
+def test_a_cut_entry_the_fold_hides_is_still_measured_for_its_caret(tmp_path: Path) -> None:
+    """The fold hides a row that does not fit; a row is measured before that, so it has its caret when a later fold shows it again."""
+    texts = ["an ordinary earlier entry", _words(450)] + [f"an ordinary later entry number {i}" for i in range(4)]
+    with _serve(tmp_path, _log(texts)) as url:
+        out = _drive(tmp_path, f"{url}/", [{"emulate": VIEWPORTS["phone390x800"]}, {"until": STATE}, SETTLE, {"eval": STATE}])
+    rows = _state(out)
+    assert rows[1]["folded"] and rows[1]["hasMore"], rows[1]

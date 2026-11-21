@@ -1091,9 +1091,12 @@
   .lrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--hair); font-size: var(--fs-body); }
   .lrow:first-child { border-top: 0; }
   .lsent { overflow-wrap: anywhere; }
-  /* on the page a log entry shows its first lines and no more, so one long entry cannot take the card over (levain#227); the
-     focus view (outside #board) keeps the whole entry, and the card's foot opens it */
-  #board .lrow .lsent { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; }
+  /* on the page a log entry shows its first lines and no more, so one long entry cannot take the card over (levain#227). The card
+     is narrow, so the clamp is deep enough that an ordinary entry is not cut on a phone. A cut entry has the row caret (.has-more, set
+     by measureClauses) that opens it whole; the focus view (outside #board) is never clamped */
+  #board .lrow:not(.row-expanded) .lsent { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 8; line-clamp: 8; overflow: hidden; }
+  .lrow > .clause-toggle { grid-column: 1 / -1; justify-self: start; }
+  .lrow.has-more .clause-toggle { display: inline-block; }
   .lactor, .lage { font: var(--fw-regular) var(--fs-meta) var(--mono); color: var(--label); white-space: nowrap; }
 
   .cq { display: flex; align-items: baseline; gap: var(--sp-3); padding: 0 0 var(--sp-5); }

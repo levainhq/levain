@@ -519,6 +519,9 @@
     const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) { const held = document.activeElement === old && !!old.dataset.listMore && panel.dataset.ckPanel === "tray"; old.remove(); if (held) askTileFocus("tray"); }   // a fold that replaces the List card's control (not another panel's "N more" foot) that held focus asks for the new one to be given it (the ask acts only while focus is on the body); the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
     const apartNow = listApart(panel);
     if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
+    // every row is showing here: measure the clamped ones now, so a row this fold hides still has its caret when it is shown again
+    // (measureClauses leaves a hidden row as it was and would never have read it)
+    measureClauses(body);
     const top = body.getBoundingClientRect().top;
     const limit = body.clientHeight - 34;   // room kept for the link
     const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
@@ -538,7 +541,7 @@
       list.forEach((n, i) => { if (n.classList.contains("row-expanded")) pin = i; });
       // the first row of a list always stays, however tall: the fold takes rows that do not fit AFTER it, never the one the card
       // opens on. Without this a first row taller than the body folded itself and every row after it, and the card drew blank
-      // (levain#227, the Stream card with one long newest entry); the body clips that row under its fade and the foot opens the rest
+      // (levain#227, the Stream card with one long newest entry); that row stays and the foot opens the rest
       pin = Math.max(pin, list.findIndex(isRow));
       for (const [i, n] of list.entries()) {
         const r = n.getBoundingClientRect();
@@ -609,15 +612,19 @@
   // the same reason measureOverflow is — the rows are live in #board / the modal). Skips a
   // row the user already expanded (leave its toggle as "less"). RE-RUNNABLE.
   function measureClauses(root) {
-    for (const clause of root.querySelectorAll(".clause.clampable")) {
-      const row = clause.closest(".row");
+    // a log line (the Stream card) is measured the same way: its sentence is the clause, its row takes the toggle
+    for (const clause of root.querySelectorAll(".clause.clampable, .lrow > .lsent")) {
+      const row = clause.closest(".row, .lrow");
       if (!row || row.classList.contains("row-expanded")) continue;
       if (row.dataset.folded) continue;   // display:none reads 0 high: leave a folded row's toggle as it was measured
       // No +1 tolerance: the harm is asymmetric — a false NEGATIVE hides the tail with no
       // toggle (the bug this slice fixes), a false positive is a harmless toggle on a 2-line
       // row. Line-clamp overflow is full-line-granular + heights are integers, so an exactly-
       // 2-line clause measures equal (no spurious toggle) [kimi L3]. .clampable only.
-      row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
+      const cut = clause.scrollHeight > clause.clientHeight;
+      row.classList.toggle("has-more", cut);
+      // a line the search matched (paintLog marks it) that the clamp cuts opens whole, so the match is not hidden behind the cut
+      if (cut && row.dataset.searchHit) setExpanded(row, true);
     }
   }
 
@@ -1964,7 +1971,7 @@
   function captureKept(root) {
     const kept = { open: new Set(), scroll: new Map() };
     if (!root || !root.querySelectorAll) return kept;
-    for (const row of root.querySelectorAll(".row.row-expanded")) {
+    for (const row of root.querySelectorAll(".row.row-expanded, .lrow.row-expanded")) {
       const k = keptKey(row);
       if (k) kept.open.add(JSON.stringify([keptScope(row), k]));
     }
@@ -1975,7 +1982,7 @@
   // to close it with, so it stays closed. Run measureClauses first, on closed rows.
   function restoreKeptRows(root, kept) {
     if (!kept || !root || !root.querySelectorAll || !kept.open.size) return;
-    for (const row of root.querySelectorAll(".row.has-more")) {
+    for (const row of root.querySelectorAll(".row.has-more, .lrow.has-more")) {
       const k = keptKey(row);
       if (k && kept.open.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, true);
     }
@@ -2048,6 +2055,12 @@
       });
     }
     row.appendChild(clause);
+    rowToggle(row);
+    return clause;
+  }
+  // The caret a clamped row carries: hidden until measureClauses finds the row's text cut, and it flips the row between clamped and
+  // .row-expanded. Shared by the rows appendClause draws and the Stream's log lines.
+  function rowToggle(row) {
     const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
     toggle.type = "button";
     toggle.setAttribute("aria-expanded", "false");
@@ -2061,7 +2074,7 @@
       if (body && body.classList.contains("pbody")) { measureOverflow(body); if (body.scrollTop !== place) body.scrollTop = place; }
     });
     row.appendChild(toggle);
-    return clause;
+    return toggle;
   }
 
   // One intention row, shared by the two projections (the Tray, which is the List). The
@@ -11538,5 +11551,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
   function setRichText(node, text) { node.textContent = ""; codeSpansInto(node, String(text != null ? text : "")); }
-  window.LevainDashboard = { setRichText, dayYearWords, releaseLoading, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { setRichText, dayYearWords, releaseLoading, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, rowToggle, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
