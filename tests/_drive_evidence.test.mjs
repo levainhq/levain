@@ -46,6 +46,36 @@ test("requests: a script that failed to load is in the ring with its errorText, 
   assert.match(text, /Fetch\s+FAILED net::ERR_ABORTED canceled/);
 });
 
+test("a reload's canceled loads never push a real failure out of the failed ring", () => {
+  const r = rig();
+  r.feed(10, req("real", "Script", "http://127.0.0.1:5000/static/cockpit_view.js?v=abc123"));
+  r.feed(20, { method: "Network.loadingFailed", params: { requestId: "real", type: "Script", errorText: "net::ERR_CONNECTION_RESET", canceled: false } });
+  for (let i = 0; i < 60; i++) {
+    r.feed(100 + i, req("c" + i, "Script", `http://127.0.0.1:5000/static/old${i}.js`));
+    r.feed(200 + i, { method: "Network.loadingFailed", params: { requestId: "c" + i, type: "Script", errorText: "net::ERR_ABORTED", canceled: true } });
+  }
+  assert.ok(r.ev.failed.has("real"), "the genuine failure is still in the failed ring after 60 canceled loads");
+  assert.equal(r.ev.failed.size, 1, "a canceled load is not kept in the failed ring");
+  assert.match(renderEvidence(r.ev), /cockpit_view\.js\?v=abc123 FAILED net::ERR_CONNECTION_RESET/);
+});
+
+test("the shell-cache probe checks the scripts first and reports how many names it saw against how many it checked", async () => {
+  const css = Array.from({ length: 20 }, (_, i) => `<link href="/static/s${i}.css?v=1">`).join("");
+  const js = Array.from({ length: 3 }, (_, i) => `<script src="/static/j${i}.js?v=1"></script>`).join("");
+  const html = css + js;
+  const enc = new TextEncoder().encode(html);
+  const entry = { status: 200, headers: { get: () => "5" } };
+  const cache = { match: async (k) => (k === "/" ? { status: 200, body: { getReader: () => { let done = false; return { read: async () => (done ? { done: true } : ((done = true), { done: false, value: enc })), cancel: async () => {} }; } } } : entry) };
+  globalThis.caches = { keys: async () => ["levain-shell-v1"], open: async () => cache };
+  try {
+    const out = JSON.parse(await (0, eval)(mod.SHELL_CACHE_PROBE));
+    const c = out.shell[0];
+    assert.equal(c.total, 23, "every name the markup holds is counted");
+    assert.equal(c.entries.length, mod.SHELL_NAMES_MAX, "the checks stay bounded");
+    assert.deepEqual(c.entries.slice(0, 3).map((e) => e[0].replace(/\?.*/, "")), ["/static/j0.js", "/static/j1.js", "/static/j2.js"], "scripts are checked before stylesheets");
+  } finally { delete globalThis.caches; }
+});
+
 test("service worker status events are kept with their running status and status", () => {
   const r = rig();
   r.feed(300, { method: "ServiceWorker.workerVersionUpdated", params: { versions: [{ versionId: "12", runningStatus: "starting", status: "installing", scriptURL: "http://127.0.0.1:5000/sw.js" }] } });
@@ -73,7 +103,7 @@ test("what the driver reads at the timeout is printed: every target, window.__lo
   assert.match(text, /page attached=true url="" title="Levain · substrate control"/);
   assert.match(text, /service_worker attached=false url="http:\/\/127\.0\.0\.1:5000\/sw\.js"/);
   assert.match(text, /window\.__loadErrors: \["SCRIPT http:\/\/127\.0\.0\.1:5000\/static\/cockpit_view\.js\?v=abc123"\]/);
-  assert.match(text, /levain-shell-v9 '\/' status=200 names 2/);
+  assert.match(text, /levain-shell-v9 '\/' status=200 names 2 of 2/);
   assert.match(text, /\/static\/cockpit_view\.js\?v=abc123 200 91234B/);
   assert.match(text, /\/static\/dashboard\.css\?v=def MISSING/);
   assert.match(renderEvidence(r.ev, { page: { error: "no answer from the page within 2000ms" } }), /window\.__loadErrors: page did not answer: no answer/);
@@ -160,9 +190,10 @@ test("the shell-cache probe lists status and the header's size for each asset th
   const out = JSON.parse(await vm.runInNewContext(SHELL_CACHE_PROBE, { caches, TextDecoder }));
   assert.equal(out.caches, 1);
   const e = out.shell[0].entries;
-  assert.deepEqual(e.slice(0, 4), [["/static/dashboard.css?v=aaa", 200, 77], ["/static/cockpit_view.js?v=bbb", 200, 321], ["/static/boot.js?v=ccc", "MISSING"], ["/static/nolength.js", 200, null]]);
-  assert.equal(e[4][1], "MISSING");
-  assert.ok(e[4][0].length <= 120, `a name is clipped: ${e[4][0].length}`);
+  assert.deepEqual(e.slice(0, 3), [["/static/cockpit_view.js?v=bbb", 200, 321], ["/static/boot.js?v=ccc", "MISSING"], ["/static/nolength.js", 200, null]]);   // scripts first, in markup order
+  assert.ok(e.some((x) => x[0] === "/static/dashboard.css?v=aaa" && x[1] === 200 && x[2] === 77), "the stylesheet is still checked, after the scripts");
+  assert.equal(e[3][1], "MISSING");
+  assert.ok(e[3][0].length <= 120, `a name is clipped: ${e[3][0].length}`);
   assert.equal(out.shell[0].root, 200);
   assert.deepEqual(touched, [], "no asset body is touched (no body, arrayBuffer, blob, text or clone)");
   assert.ok(root.log.cancelled, "the markup reader is cancelled once its cap is reached");

@@ -54,10 +54,11 @@ export const SHELL_CACHE_PROBE = "(async () => { const out = []; const names = (
   + ` const capped = async (r) => { if (!r || !r.body || !r.body.getReader) return ''; const rd = r.body.getReader(); const dec = new TextDecoder(); let s = '', n = 0;`
   + ` try { while (n < ${SHELL_HTML_BYTES}) { const x = await rd.read(); if (x.done) break; n += x.value.byteLength; s += dec.decode(x.value, { stream: true }); } } finally { try { await rd.cancel(); } catch (_) {} } return s; };`
   + " for (const n of names) { const c = await caches.open(n); const page = await c.match('/'); const html = await capped(page);"
-  + ` const re = /(?:src|href)=["']([^"']+\\.(?:js|css)[^"']*)["']/g; const named = []; let m; while ((m = re.exec(html)) && named.length < ${SHELL_NAMES_MAX}) named.push(m[1]);`
+  + ` const re = /(?:src|href)=["']([^"']+\\.(?:js|css)[^"']*)["']/g; const all = []; let m; while ((m = re.exec(html)) && all.length < 400) all.push(m[1]);`
+  + ` const named = all.filter((k) => /\\.js(?:[?#]|$)/.test(k)).concat(all.filter((k) => !/\\.js(?:[?#]|$)/.test(k))).slice(0, ${SHELL_NAMES_MAX});`
   + " const entries = []; for (const k of named) { const h = await c.match(k); const cl = h && h.headers && h.headers.get ? h.headers.get('content-length') : null;"
   + " entries.push(h ? [k.slice(0, 120), h.status, cl !== null && cl !== undefined && /^[0-9]+$/.test(String(cl)) ? Number(cl) : null] : [k.slice(0, 120), 'MISSING']); }"
-  + " out.push({ cache: n.slice(0, 60), root: page ? page.status : 'none', entries }); } return JSON.stringify({ caches: names.length, shell: out }); })()";
+  + " out.push({ cache: n.slice(0, 60), root: page ? page.status : 'none', total: all.length, entries }); } return JSON.stringify({ caches: names.length, shell: out }); })()";
 
 export function createEvidence({ now = Date.now, t0 = now() } = {}) {
   const rel = () => `+${Math.max(0, now() - t0)}ms`;
@@ -111,7 +112,7 @@ export function createEvidence({ now = Date.now, t0 = now() } = {}) {
         case "Network.loadingFailed": {
           const e = entryFor(p.requestId, p.type, null);
           e.err = clip(p.errorText || "failed", 60); e.canceled = !!p.canceled; e.blocked = p.blockedReason ? clip(p.blockedReason, 30) : null;
-          markFailed(p.requestId, e);
+          if (!p.canceled) markFailed(p.requestId, e);   // a reload cancels the old document's loads as a matter of course: those stay in the ordinary ring and never push out a real failure
           break;
         }
         case "ServiceWorker.workerVersionUpdated":
@@ -173,7 +174,7 @@ export function renderEvidence(ev, extra = {}) {
   else {
     const lines = [`SHELL CACHE (${sh.caches} shell caches; entries the cache's own '/' names; commit in flight: not read):`];
     for (const c of (sh.shell || []).slice(0, 3)) {
-      lines.push("  " + clip(`${c.cache} '/' status=${c.root} names ${(c.entries || []).length}`, LINE_MAX));
+      lines.push("  " + clip(`${c.cache} '/' status=${c.root} names ${(c.entries || []).length} of ${Number.isFinite(c.total) ? c.total : (c.entries || []).length}`, LINE_MAX));
       for (const [name, status, bytes] of (c.entries || []).slice(0, SHELL_NAMES_MAX)) {
         lines.push("    " + clip(`${path(name)} ${status}${status === "MISSING" ? "" : typeof bytes === "number" ? " " + bytes + "B" : " size not read"}`, LINE_MAX));
       }
