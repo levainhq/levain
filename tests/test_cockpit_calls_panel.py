@@ -156,3 +156,63 @@ def test_a_call_with_no_events_is_state_unknown_and_counted_and_a_live_call_is_n
 
     group = ORDERINGS["calls.state"].group
     assert group(row, None) == "unknown" and "unknown" not in ORDERINGS["calls.state"].uncounted
+
+
+def test_one_bad_record_is_one_row_never_a_fault_of_the_whole_panel(desk, registry, tmp_path):  # noqa: F811
+    # behaviour (L3 r1): a nested record, a NULL thread list, a kind the panel does not know and a record whose role was altered
+    # without its hash are each ONE row that says so; the good call beside them is still drawn
+    import json
+
+    from levain.cockpit.calls_panel import _row
+
+    store, token = desk
+    ln = _spawn(store, token, registry, tmp_path, "scribe")
+    conn = sqlite3.connect(store.path)
+    try:
+        good_ref = conn.execute("SELECT role_ref FROM launches WHERE launch_id = ?", (ln.launch_id,)).fetchone()[0]
+    finally:
+        conn.close()
+    forged = json.loads(good_ref)
+    forged["role"]["name"] = "admin"                                  # the hash and the spawn name still say "scribe"
+    for ref in ("[" * 100_000, json.dumps(forged), None):
+        row = _row("l-1", '["t"]', "2026-11-20T00:00:00Z", ref, "active")
+        assert row.title == "unreadable spawn record" and "record unreadable" in row.body, (str(ref)[:30], row.body)
+    assert _row("l-2", None, "2026-11-20T00:00:00Z", good_ref, "active").title == "scribe"          # a NULL thread list
+    assert _row("l-3", '["t"]', "2026-11-20T00:00:00Z", good_ref, "cancelled").facets == {"call_state": "unknown"}
+    assert _row("l-4", '["t"]', "2026-11-20T00:00:00Z", good_ref, "ended").facets == {"call_state": "ended"}
+
+
+def test_a_call_with_no_event_is_cut_after_the_live_ones_and_before_the_over_ones(desk, registry, tmp_path, monkeypatch):  # noqa: F811
+    # behaviour (L3 r1): the window's order is the ordering's (live, unknown, over), so a counted unknown call is not cut behind
+    # history. A launch with no event cannot be made through the store (its triggers), so the scratch store's own two
+    # triggers that keep events are dropped to lose one, which is the damaged store the panel must not read as finished
+    from levain.cockpit import calls_panel
+
+    store, token = desk
+    lost = _spawn(store, token, registry, tmp_path, "lost")        # the OLDEST: only its rank keeps it ahead of the newer history
+    over = _spawn(store, token, registry, tmp_path, "over1")
+    live = _spawn(store, token, registry, tmp_path, "live")
+    conn = sqlite3.connect(store.path)
+    try:
+        conn.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, 2, "
+                     "(SELECT MAX(gseq) + 1 FROM launch_events), 'failed', 'test', '2026-11-20T00:00:00Z')", (over.launch_id,))
+        for trigger in ("launch_events_frozen", "launch_events_kept"):
+            conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute("DELETE FROM launch_events WHERE launch_id = ?", (lost.launch_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(calls_panel, "CALLS_SHOWN", 2)
+    rows, note = calls_panel.read_calls(store.path.parent)
+    assert [r.id for r in rows] == ["call:" + live.launch_id, "call:" + lost.launch_id] and note, [r.id for r in rows]   # over1 is cut
+    assert rows[1].facets == {"call_state": "unknown"}
+
+
+def test_a_dispatch_directory_that_cannot_be_named_keeps_the_panel_and_its_read_says_so(tmp_path):
+    def boom():
+        raise OSError("the consent directory cannot be resolved")
+
+    specs = calls_discoverer(boom)(None)
+    assert [s.id for s in specs] == [CALLS_ID]                         # not "no desk": the panel stays, so a retire does not drop it
+    got = specs[0].read(None)
+    assert "cannot be read" in str(got) and "OSError" in str(got)

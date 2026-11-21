@@ -30,17 +30,17 @@ CALL_ROW_PREFIX = "call:"
 CALLS_ORDER = "calls.state"
 CALL_FACETS = frozenset({"call_state"})
 CALLS_SHOWN = 40
-_LIVE = ("pending", "active")
+_KNOWN_STATES = ("pending", "active", "failed", "expired", "ended")      # the desk's launch event kinds; the registry's enum adds "unknown"
 
 _SQL = ("SELECT launch_id, threads, at, role_ref, kind FROM (SELECT l.launch_id, l.threads, l.at, l.role_ref, l.gseq, "
         "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) AS kind "
         "FROM launches l WHERE l.role = 'worker' AND l.role_ref IS NOT NULL) "
-        "ORDER BY CASE WHEN kind IN ('pending', 'active') THEN 0 ELSE 1 END, gseq DESC LIMIT ?")
+        "ORDER BY CASE WHEN kind IN ('pending', 'active') THEN 0 WHEN kind IS NULL THEN 1 ELSE 2 END, gseq DESC LIMIT ?")
 
 
 def _one_line(text: object, limit: int = 300) -> str:
     line = " ".join(str(text or "").split())
-    return line if len(line) <= limit else line[:limit - 1].rstrip() + "…"
+    return line if len(line) <= limit else ("…" if limit <= 1 else line[:limit - 1].rstrip() + "…")
 
 
 def _open(directory: Path) -> sqlite3.Connection | None:
@@ -50,23 +50,23 @@ def _open(directory: Path) -> sqlite3.Connection | None:
     return sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=2.0, isolation_level=None)
 
 
-def _role_name(role_ref: str) -> tuple[str, str]:
-    """``(role name, "")`` of a launch's spawn record, or ``("", why)`` when the record cannot be read."""
-    from levain.desk.lease import LeaseRefused, spawn_record
+def _role_name(role_ref: object) -> tuple[str, str]:
+    """``(role name, "")`` of a launch's spawn record, or ``("", why)`` when the record cannot be read. The record is held to
+    the check the worker's own start holds it to (:func:`levain.agents.instantiate.verified_record`: its role re-hashed), so
+    a record that start would refuse is never drawn as a healthy name. Any failure is this ROW's, never the panel's."""
+    from levain.agents.instantiate import verified_record
 
     try:
-        rec = spawn_record(role_ref)
-        name = rec["role"]["name"]
-    except (LeaseRefused, KeyError, TypeError) as exc:
-        return "", _one_line(exc, 100) if isinstance(exc, LeaseRefused) else f"the spawn record has no role name ({type(exc).__name__})"
-    return str(name), ""
+        return str(verified_record(role_ref)["role"]["name"]), ""
+    except Exception as exc:  # noqa: BLE001 - a record that cannot be read (a RecursionError of a nested one too) is one row
+        return "", _one_line(exc, 100) or type(exc).__name__
 
 
-def _row(launch_id: str, threads: str, at: str, role_ref: str, kind: str | None) -> RowIn:
-    state = kind if kind else "unknown"
+def _row(launch_id: str, threads: object, at: object, role_ref: object, kind: str | None) -> RowIn:
+    state = kind if kind in _KNOWN_STATES else "unknown"       # a kind this panel does not know is never drawn as a state it is not
     name, why = _role_name(role_ref)
     shown = name or "unreadable spawn record"
-    thread = _one_line(threads.strip("[]").replace('"', ""), 80)
+    thread = _one_line(str(threads or "").strip("[]").replace('"', ""), 80)
     tail = f" · record unreadable: {why}" if why else ""
     body = _one_line(f"{shown} · {thread} · {state} · asked {at}", 300 - len(tail)) + tail
     return RowIn(id=CALL_ROW_PREFIX + launch_id, title=_one_line(shown, 120), body=body,
@@ -106,8 +106,8 @@ def calls_discoverer(dispatch_dir: Callable[[], Any] | None) -> Callable[[ReadCo
             directory = dispatch_dir()
             if directory is None or not (Path(directory) / "dispatch.db").is_file():
                 return []
-        except Exception:  # noqa: BLE001 - a directory that cannot be named draws no panel
-            return []
+        except Exception:  # noqa: BLE001 - a directory that cannot be named is not "no desk": the panel stays and its read says so
+            pass
 
         def calls_read(ctx: ReadContext) -> Result:
             try:
