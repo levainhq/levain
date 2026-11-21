@@ -352,7 +352,8 @@ const targetState = async () => {
 const timeoutBlock = async (shotPath, artifact) => {
   const quietMs = Date.now() - lastEventAt;   // taken before any await: the probe's own wait must not read as the page having spoken or being silent
   try {
-    const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
+    const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000)
+      .catch((e) => ({ error: String(e && e.message || e).slice(0, 120) }));   // a closed page connection rejects the send: it is a value here, or the whole page-state block is swallowed by the catch below
     let o = {}; try { o = JSON.parse(probe.value); } catch { o = { probe_error: probe.error || "no answer" }; }
     // What the page's evaluation cannot say when the page does not answer: how the service-worker waits before reloads ended, how many
     // navigation / load events this connection saw, and (targetState) what the BROWSER holds for this page's target.
