@@ -61,6 +61,7 @@ def test_every_verb_parses_for_the_operator():
         "adopt-verify": ["adopt-verify", S, "--bundle-digest", "sha256:" + "0" * 64],
         "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S], "probe": ["probe", S],
         "read-allow": ["read-allow", S],
+        "read-report": ["read-report", S],
         "egress-grant": ["egress-grant", S], "egress-grant-revoke": ["egress-grant-revoke", S, "all"],
         "egress-refusals": ["egress-refusals", S, "0"], "egress-grants-list": ["egress-grants-list", S],
         "egress-grants-all": ["egress-grants-all"],

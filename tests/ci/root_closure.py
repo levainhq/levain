@@ -570,6 +570,8 @@ LAZY_SITES = {
     'levain/agents/accounting.py::count_span::from levain.agents import schedule': 'root',
     # root: ``read_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
     'levain/slot/runtime_helper.py::read_allow::from levain.slot import store_verbs as SV': 'root',
+    # root: ``read_report`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/runtime_helper.py::read_report::from levain.slot import store_verbs as SV': 'root',
     # operator: ``Supervisor._allow_file`` <- ``_with_slot_allow`` / ``_file_allow_rows``, the interactive supervisor's own code (``Supervisor.run`` refuses uid 0, ``supervisor-is-root``), the operator uid's process; the dispatch run server imports the module for its names and never builds a ``Supervisor``
     'levain/slot/supervisor.py::Supervisor._allow_file::from levain.slot import slot_allow': 'operator',
     # operator: ``Supervisor._file_allow_rows`` <- ``Supervisor._teardown`` <- ``Supervisor.run``, the interactive supervisor's own code, the operator uid's process (it calls root only through ``self.helper("read-allow")``, i.e. sudo)

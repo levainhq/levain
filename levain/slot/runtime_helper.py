@@ -58,7 +58,7 @@ from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
 from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, repair_line, store_dir_row
-from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, STDIN_VERBS, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
+from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, REPORT_CAP, REPORT_REL, STDIN_VERBS, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
 PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
@@ -4207,13 +4207,14 @@ def _allow_record(obj: object) -> Optional[Tuple[int, str]]:
     return size, digest
 
 
-def _allow_dir(store_fd: int, session: str) -> Optional[int]:
-    """An fd on ``retained/<session>/tree/repo/.claude`` reached one component at a time, none followed; ``None`` when a
-    component is absent. A component that is a link or not a directory is ``allow-unreadable``: the walk is of
-    slot-written names, so nothing on it is trusted and nothing is written."""
+def _allow_dir(store_fd: int, session: str, path: Tuple[str, ...] = ALLOW_PATH,
+               refusal: str = "allow-unreadable") -> Optional[int]:
+    """An fd on ``retained/<session>/<path>`` (by default ``tree/repo/.claude``) reached one component at a time, none
+    followed; ``None`` when a component is absent. A component that is a link or not a directory is ``refusal``: the
+    walk is of slot-written names, so nothing on it is trusted and nothing is written."""
     cur = os.dup(store_fd)
     try:
-        for part in ("retained", session, *ALLOW_PATH):
+        for part in ("retained", session, *path):
             try:
                 nxt = os.open(part, _O_DIR, dir_fd=cur)
             except FileNotFoundError:
@@ -4222,7 +4223,7 @@ def _allow_dir(store_fd: int, session: str) -> Optional[int]:
                 return None
             except OSError as e:
                 if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
-                    raise Refused("allow-unreadable", f"{part} is not a directory") from None
+                    raise Refused(refusal, f"{part} is not a directory") from None
                 raise
             prev, cur = cur, nxt      # ``cur`` names the open fd before ``prev`` closes: a failing close leaks none
             os.close(prev)
@@ -4326,6 +4327,94 @@ def _read_allow_locked(ctx: Ctx, a: R.Alloc, SV) -> Dict[str, object]:
     return {"present": True, "b64": base64.b64encode(bytes(out)).decode("ascii")}
 
 
+#: ``read-report``: the directory (below ``tree``) and the name of the one report file, from
+#: :data:`runtime_grammar.REPORT_REL`.
+REPORT_PATH = ("tree", *(os.fsdecode(p) for p in REPORT_REL[:-1]))
+REPORT_NAME = os.fsdecode(REPORT_REL[-1])
+
+
+def read_report(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``read-report <session>`` (``_levain_dispatch`` or the operator, bound by :func:`read_alloc`): the bytes of
+    ``repo/.levain-report.md`` from the caller's OWN RETAINED session's tree, bounded by :data:`REPORT_CAP`. No path
+    and no name come from the caller; the walk and the state gates are :func:`read_allow`'s. The bytes are UNTRUSTED
+    DATA end to end: nothing here records who wrote them or trusts them, only that they are a regular one-link
+    root-owned file of bounded, non-empty, NUL-free, strict UTF-8 content. A link at any component, a non-regular
+    file, more than one link, a file not root's (END's chown) or one unreadable is ``report-unreadable``; past the cap
+    ``report-oversize``; empty, with a NUL or not UTF-8 ``report-malformed``. Answers ``{present: false}`` when the
+    file or a directory above it is absent, else ``{present: true, b64}``."""
+    from levain.slot import store_verbs as SV
+
+    assert req.session is not None
+    try:
+        a = read_alloc(ctx, req.session)
+    except ContractError as e:
+        raise Refused("no-session", req.session) from e
+    with session_lock(ctx, a.session):
+        return _read_report_locked(ctx, a, SV)
+
+
+def _read_report_locked(ctx: Ctx, a: R.Alloc, SV) -> Dict[str, object]:
+    """:func:`read_report`'s body; the caller holds the session lock."""
+    facts = SV.facts_from_alloc(a, ctx.seams.L)
+    sv = SV.StoreSeams(cas=lambda target, fields: None, owner_ok=ctx.seams.trusted)
+    if os.path.lexists(facts.intent):
+        raise Refused("intent-in-flight", a.session)
+    if os.path.lexists(facts.trash):
+        raise Refused("not-retained:trash", a.session)
+    if not SV.retained_whole(facts, sv):
+        raise Refused("not-retained:absent", a.session)
+    root = ctx.seams.chowned_uid(0)
+    dfd = _allow_dir(ctx.store.fd, a.session, REPORT_PATH, "report-unreadable")
+    if dfd is None:
+        return {"present": False}
+    try:
+        try:
+            before = os.stat(REPORT_NAME, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"present": False}
+        if not stat.S_ISREG(before.st_mode):
+            raise Refused("report-unreadable", f"{REPORT_NAME} is not a regular file")
+        try:
+            fd = os.open(REPORT_NAME, _O_READ, dir_fd=dfd)
+        except OSError as e:
+            raise Refused("report-unreadable", f"{REPORT_NAME} cannot be opened (errno {e.errno})") from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino):
+                raise Refused("report-unreadable", f"{REPORT_NAME} changed while opening")
+            if st.st_nlink != 1:
+                raise Refused("report-unreadable", f"{REPORT_NAME} has {st.st_nlink} links")
+            if st.st_uid != root:
+                raise Refused("report-unreadable", f"{REPORT_NAME} is owned by uid {st.st_uid}, not END's root")
+            if st.st_size > REPORT_CAP:
+                raise Refused("report-oversize", f"{REPORT_NAME} is over {REPORT_CAP} bytes")
+            out = bytearray()
+            try:
+                while len(out) <= REPORT_CAP:
+                    chunk = os.read(fd, min(65536, REPORT_CAP + 1 - len(out)))
+                    if not chunk:
+                        break
+                    out += chunk
+            except OSError as e:
+                raise Refused("report-unreadable", f"{REPORT_NAME} cannot be read (errno {e.errno})") from None
+            if len(out) > REPORT_CAP:
+                raise Refused("report-oversize", f"{REPORT_NAME} is over {REPORT_CAP} bytes")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    data = bytes(out)
+    if not data:
+        raise Refused("report-malformed", f"{REPORT_NAME} is empty")
+    if b"\x00" in data:
+        raise Refused("report-malformed", f"{REPORT_NAME} holds a NUL")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("report-malformed", f"{REPORT_NAME} is not UTF-8") from None
+    return {"present": True, "b64": base64.b64encode(data).decode("ascii")}
+
+
 def _egress_grant(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
     from levain.slot import egress_verbs as EV
 
@@ -4360,7 +4449,7 @@ VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, objec
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
     "discard": discard, "restore": restore, "probe": _probe, "confirm-identity": _confirm_identity,
-    "read-allow": read_allow,
+    "read-allow": read_allow, "read-report": read_report,
     "egress-grant": _egress_grant, "egress-grant-revoke": _egress_grant_revoke,
     "egress-refusals": _egress_refusals, "egress-grants-list": _egress_grants_list,
     "egress-grants-all": _egress_grants_all,

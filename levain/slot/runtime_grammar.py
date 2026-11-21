@@ -36,8 +36,13 @@ from levain.slot.grammar import INDEX_SPACE, SESSION_RE, SLOT_CLASSES
 # --- §5.1 verbs and enums -------------------------------------------------------------------------
 
 VERBS = ("prepare", "render", "start", "resume", "teardown", "confirm-identity",
-         "adopt-open", "adopt-verify", "discard", "restore", "status", "probe", "read-allow",
+         "adopt-open", "adopt-verify", "discard", "restore", "status", "probe", "read-allow", "read-report",
          "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list", "egress-grants-all")
+
+#: ``read-report``: the one file a dispatch session writes for its report, below the retained ``tree``, as path
+#: components (bytes), and the most of it root hands back. The file is untrusted data end to end.
+REPORT_REL = (b"repo", b".levain-report.md")
+REPORT_CAP = 32 * 1024
 
 KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 prepare
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
@@ -339,7 +344,7 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         if not _EGRESS_CURSOR_RE.fullmatch(rest[1]):
             raise Refused("bad-token", f"cursor: {rest[1][:64]!r}")
         return RuntimeRequest(verb, caller, session=session, cursor=rest[1])
-    # render, start, resume, teardown, adopt-open, discard, restore, probe, read-allow, egress-grant,
+    # render, start, resume, teardown, adopt-open, discard, restore, probe, read-allow, read-report, egress-grant,
     # egress-grants-list: exactly <session>.
     # DECISION: §5.1's "`discard` / `restore <session>`" row reads as both taking <session>.
     _arity(verb, rest, 1, 1)
