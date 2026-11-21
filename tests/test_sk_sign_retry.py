@@ -141,6 +141,9 @@ class FakeKeygenSign:
         return self.real_run(argv, **kw)
 
 
+_SHIPPED_KEEP = keys._SIGN_FAILURE_KEEP         # read at import, before any fixture patches it
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     key = SoftSk(tmp_path / "keys")
@@ -148,6 +151,7 @@ def rig(tmp_path, monkeypatch):
     fake = FakeKeygenSign(key, [], subprocess.run, clock)
     monkeypatch.setattr(keys.subprocess, "run", fake)
     monkeypatch.setattr(keys, "time", clock)
+    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", 20)     # the bound tests fill the directory: a small bound keeps them fast
     fp, sign = ssh_signer(key.path, namespace=NS)
 
     class R:
@@ -248,6 +252,27 @@ def test_two_failures_raise_with_both_flags_and_both_evidence_paths(rig):
     files = sorted(rig.dir.iterdir())
     assert len(files) == 2 and all(str(f) in text for f in files)
     assert text.startswith(f"ssh-keygen returned a signature that does not verify as {rig.fp}")
+
+
+def test_the_shipped_keep_is_far_above_the_old_twenty():
+    # 2026-11-20: the directory sat at its 20-file cap, so the next failing sign would delete the oldest record of the cause hunt
+    assert keys._SIGN_FAILURE_KEEP >= 100
+
+
+def test_the_prune_holds_the_shipped_keep_not_the_rig_s_small_one(rig, monkeypatch):
+    # the rig runs the bound tests at 20 to stay fast; this one plants files straight into the directory and runs the real keep once
+    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", _SHIPPED_KEEP)
+    rig.dir.mkdir(mode=0o700)
+    planted = [f"sigfail-20200101T000000{i:06d}-0000000001-1.json" for i in range(_SHIPPED_KEEP + 5)]
+    for name in planted:
+        (rig.dir / name).write_text("{}")
+    rig.fake.plan = [0x21, 0x21]
+    with pytest.raises(KeyError_):
+        rig.sign(MESSAGE)
+    names = sorted(p.name for p in rig.dir.iterdir())
+    assert len(names) == _SHIPPED_KEEP              # each of the two writes prunes back to the keep
+    assert planted[0] not in names and planted[5 + 1] not in names and planted[-1] in names
+    assert sum(1 for n in names if not n.startswith("sigfail-2020")) == 2     # both of the sign's own files survived
 
 
 def test_the_evidence_directory_is_bounded(rig):

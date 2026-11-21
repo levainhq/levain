@@ -36,11 +36,14 @@ concurrency:
 env:
   # The one place the shard count is written. The `plan` job emits the matrix's shard list from it, and each
   # shard job partitions its own collection with it.
-  # 4 shards: the 3.12 job ran ~55-67 min unsharded, so four shards of ~15-17 min leave headroom under the cap
-  # while the per-job install (~1 min) stays small. Rebalance from the per-shard durations in a run's job list.
-  # 6 shards (11-03): on the bundle7 sha two of four shards ran past the 45-minute cap (shards 0 and 3 took 18-19
-  # minutes), because the weight is a count of `def test_` lines and the new files hold few, slow tests.
-  TEST_SHARDS: "6"
+  # History: the 3.12 job outgrew its cap unsharded (so it was split), then two shards outgrew the cap at 4 shards (11-03,
+  # because the weight was a count of `def test_` lines and new files held few, slow tests). 11-20 (np-b454f2f6): a full run
+  # took ~17 min wall at 6 shards while the laptop's cores carried the seats' own suites; a public repo's Linux minutes
+  # cost nothing, so the count was raised so CI, not the laptop, runs the full suite fast. The org's plan allows 60
+  # concurrent jobs (Team; docs.github.com/actions/reference/limits, read 11-20): one full run fits, two overlapping runs
+  # queue in creation order, and the `hold` job below keeps only a seat dispatch from overlapping a land/** run. Re-cut the count and the static list below together; rebalance from the per-shard
+  # durations in a run's job list (tests/ci/shard.py `weights`), and read a new run's wall time before moving it again.
+  TEST_SHARDS: "14"
 
 jobs:
   gate:
@@ -201,13 +204,21 @@ jobs:
     # cancelled at the cap at 96% with no failure), so it was split into shards. A hang still ends at this cap.
     timeout-minutes: 45
     strategy:
-      fail-fast: false
+      # A land/** run stops its other shards at the first red one (11-20, Phill np-358c7b13 (a), cut 3 of the CI economy
+      # report); every other ref keeps `false`, so a branch, PR, main, tag or nightly run still shows every red shard.
+      # Native key on purpose, measured on a scratch run of a stub (11-20, run 44836014010 on scratch/cut3-probe-2, deleted):
+      # the failing shard stays `failure` and its siblings end `cancelled` within ~15 s, a shard still queued is cancelled with
+      # no steps, and the job-level `always() && !cancelled()` guard above does not stop the cancel. A workflow-wide cancel
+      # from a failing step (`gh run cancel`, run 44835699478) was measured too and rejected: it turned the failing job
+      # itself `cancelled`, so the land waiter (it reads each job's conclusion) would lose which job was red. The matrix is
+      # the only scope the key has: the run's other jobs still run to their end.
+      fail-fast: ${{ startsWith(github.ref, 'refs/heads/land/') }}
       matrix:
         # main, land/** and every other event run both Pythons. A workflow_dispatch on any other branch (a seat branch; a tag dispatch runs both) runs
         # 3.12 only: the landing candidate on land/** and main still run the full set.
         python-version: ${{ fromJSON(github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') && '["3.12"]' || '["3.12", "3.13"]') }}
         # The static shard list: keep equal to TEST_SHARDS (the `plan` job fails when it is not). Re-cut both together.
-        shard: [0, 1, 2, 3, 4, 5]  # static shard list
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # static shard list
     steps:
       - uses: actions/checkout@v6
 
@@ -433,7 +444,7 @@ jobs:
     # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
     # over it once the sign-attempt tests joined), so the files are split into shards, and `shard.py browser` balances
     # them by measured seconds (tests/ci/browser_weights.json; it was a round-robin over three, 960-990 s a shard, which
-    # made this job the slowest of the run, so the matrix holds four): each shard keeps the same rules (selection by
+    # made this job the slowest of the run, so the matrix grew; 11-20 np-b454f2f6 raised it again with the pytest shards): each shard keeps the same rules (selection by
     # file, nothing collected fails, any skip fails). The shard count is the matrix's own length (strategy.job-total).
     # Python 3.13 everywhere but a workflow_dispatch on a ref that is neither main nor land/**; that runs 3.12 only.
     name: cockpit browser tests (Python ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && !startsWith(github.ref, 'refs/heads/land/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
@@ -445,9 +456,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
-      fail-fast: false
+      # fail-fast on land/** only, as in the `test` job above (same 11-20 measurement); every other ref keeps `false`
+      fail-fast: ${{ startsWith(github.ref, 'refs/heads/land/') }}
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v6
 

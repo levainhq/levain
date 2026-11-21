@@ -15,7 +15,8 @@
  * On a phone-width screen the age is written in its short form (STRINGS.ageShort) so its number survives beside the state words.
  *
  * Speech. The state words sit alone in the role="status" span; the age and the "updating" cue sit in a sibling span outside it, so a
- * ticking age is never announced. The words are written only when the state changes. A worse state, and any entry into "down" (whatever
+ * ticking age is never announced. The words are written only when the state changes, or when the same state names other words (a
+ * different panel is the stale one, a different count), which is then spoken too. A worse state, and any entry into "down" (whatever
  * state it comes from), is held HOLD_MS before it is written (a stream reconnect flap does not speak); a hold pending when the tab hides
  * is dropped and judged afresh when it is seen. A recovery to live is spoken only if the worse state was; the first connecting-to-live
  * is silent. */

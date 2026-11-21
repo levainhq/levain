@@ -25,8 +25,10 @@ from tests.test_hands_mcp_verbs import McpRig
 
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
+_FLAG_SETTINGS_JSON = json.dumps(hml.HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
 _REAL_HOST_REFUSAL = getattr(hc, "host_refusal", None)
 _REAL_VENDOR_MISSING = getattr(hc, "vendor_missing", None)
+_REAL_HL_VENDOR_MISSING = getattr(hc.hl, "vendor_missing", None)
 
 
 @pytest.fixture
@@ -116,7 +118,8 @@ def test_a_server_revoked_after_an_earlier_prepare_is_absent_from_both_files_at_
     [seen] = fake.started
     assert set(seen["claude"]) == {"beta"} and set(seen["codex"]) == {"beta"}
     if vendor == "claude":
-        assert seen["argv"][-4:] == ["claude", "--strict-mcp-config", "--mcp-config", hml.claude_launch_path(rig.h)]
+        assert seen["argv"][-6:] == ["claude", "--strict-mcp-config", "--mcp-config", hml.claude_launch_path(rig.h),
+                                     "--settings", _FLAG_SETTINGS_JSON]
     else:
         assert seen["argv"][-11:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin", "--disable", "apps", "--disable", "skill_mcp_dependency_install", "--disable", "hooks"]
         assert f"CODEX_HOME={rig.hands_home}/.codex" in seen["argv"]
@@ -311,6 +314,7 @@ def test_a_vendor_not_on_the_hands_path_is_refused_by_name_before_any_lock(rig, 
     empty.mkdir()
     monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
     monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(hc.hl, "vendor_missing", _REAL_HL_VENDOR_MISSING)       # the login shares it; the shared rig stubs it
     rig.register("alpha", callback_port=49601)
     fake = FakeVendor(rig)
     with pytest.raises(hc.HandsChatRefused) as info:
@@ -433,14 +437,17 @@ def _codex_agents_link(ws):
 _CODEX_ONLY += [_codex_agents_skills, _codex_agents_link]
 
 
-@pytest.mark.parametrize("plant", _CLAUDE_ONLY)
-def test_a_claude_project_layer_does_not_refuse_a_codex_chat(rig, plant):
+# A vendor's project layer refuses only a chat of that vendor: the other vendor never reads it. The Codex layers
+# (L3 r2, codex MED) must not block a Claude launch; the Claude layers must not block a Codex one.
+@pytest.mark.parametrize("vendor, plant", [("codex", p) for p in _CLAUDE_ONLY] + [("claude", p) for p in _CODEX_ONLY],
+                         ids=lambda v: v.__name__ if callable(v) else v)
+def test_the_other_vendors_project_layer_does_not_refuse_a_chat(rig, vendor, plant):
     rig.register("alpha", callback_port=49601)
     ws = rig.h.workspace
     ws.mkdir(parents=True, exist_ok=True)
     plant(ws)
     fake = FakeVendor(rig)
-    assert launch(rig, "codex", spawn=fake) == 0 and len(fake.started) == 1
+    assert launch(rig, vendor, spawn=fake) == 0 and len(fake.started) == 1
     assert_released(rig)
 
 
@@ -466,18 +473,6 @@ def test_a_project_layer_in_the_hands_workspace_refuses_and_starts_no_vendor(rig
         launch(rig, vendor, spawn=fake)
     assert str(ws / named) in str(info.value) and str(info.value).endswith("no chat was started")
     assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
-    assert_released(rig)
-
-
-@pytest.mark.parametrize("plant", _CODEX_ONLY)
-def test_a_codex_project_layer_does_not_refuse_a_claude_chat(rig, plant):
-    # L3 r2 (codex MED): Claude does not read .codex/, so a repository's Codex config must not block a Claude launch
-    rig.register("alpha", callback_port=49601)
-    ws = rig.h.workspace
-    ws.mkdir(parents=True, exist_ok=True)
-    plant(ws)
-    fake = FakeVendor(rig)
-    assert launch(rig, "claude", spawn=fake) == 0 and len(fake.started) == 1
     assert_released(rig)
 
 
@@ -848,4 +843,35 @@ def test_a_ctrl_c_before_the_start_is_a_line_and_exit_130_with_the_locks_release
     out = capsys.readouterr().out
     assert rc == 130 and fake.started == []
     assert out == "hands chat: interrupted (Ctrl-C) before the start; no chat was started\n"
+    assert_released(rig)
+
+
+CLAUSE = " and `plugins/known_marketplaces.json` beside it (whether leaving that file brings the tree back is not measured)"
+
+
+def test_a_marketplaces_refusal_names_the_known_marketplaces_file_beside_it_and_says_it_is_not_measured(rig):
+    """levain#139 fix r1: a home an earlier chat poisoned also holds plugins/known_marketplaces.json; whether leaving it
+    brings the tree back is not measured, and the refusal says both."""
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    named = _user_marketplace(home)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+        launch(rig, "claude", spawn=fake)
+    text = str(info.value)
+    assert named in text and CLAUSE in text and hc.MARKETPLACES_REMOVE_CLAUSE == CLAUSE
+    assert text.endswith("no chat was started") and fake.started == []
+    assert_released(rig)
+
+
+@pytest.mark.parametrize("plant", [_user_agent, _user_plugin, _user_settings])
+def test_the_other_refused_paths_keep_the_refusal_text_without_the_marketplaces_clause(rig, plant):
+    rig.register("alpha", callback_port=49601)
+    home = rig.hands_home / ".claude"
+    plant(home)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="user-level") as info:
+        launch(rig, "claude", spawn=fake)
+    text = str(info.value)
+    assert "known_marketplaces" not in text and text.endswith("hold; remove it; no chat was started"), text
     assert_released(rig)

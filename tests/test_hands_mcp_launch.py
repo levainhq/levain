@@ -273,8 +273,10 @@ def test_render_launch_with_no_entry_is_an_empty_server_table():
 def test_the_claude_chat_argv_reads_only_the_launch_file_under_the_hands_prefix(rig, monkeypatch):
     monkeypatch.setattr(hands_login, "_launch_prefix", _REAL_PREFIX)
     argv = hml.claude_chat_argv(rig.h, "-p")
-    assert argv[-5:] == ["claude", "--strict-mcp-config", "--mcp-config", str(rig.claude_file), "-p"] or \
-        argv[-5:] == ["claude", "--strict-mcp-config", "--mcp-config", f"{rig.hands_home}/.claude/{hml.CLAUDE_LAUNCH_FILE}", "-p"]
+    settings = ["--settings", json.dumps(hml.HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))]
+    assert argv[-7:] == ["claude", "--strict-mcp-config", "--mcp-config", str(rig.claude_file), *settings, "-p"] or \
+        argv[-7:] == ["claude", "--strict-mcp-config", "--mcp-config",
+                      f"{rig.hands_home}/.claude/{hml.CLAUDE_LAUNCH_FILE}", *settings, "-p"]
     assert f"CLAUDE_CONFIG_DIR={rig.hands_home}/.claude" in argv
     cargv = hml.codex_chat_argv(rig.h)
     assert f"CODEX_HOME={rig.hands_home}/.codex" in cargv

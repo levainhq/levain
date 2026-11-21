@@ -5,6 +5,7 @@ recording one added to the built-in panels."""
 
 from __future__ import annotations
 
+import functools
 import http.client
 import json
 import threading
@@ -12,14 +13,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
 
 from levain.cockpit import providers
+from levain.cockpit import derive as derive_module
+from levain.cockpit import snapshot_host as snapshot_host_module
+from levain.cockpit.derive import _UNSET, DeriveLoop, PanelState
 from levain.cockpit.engine import Cockpit, Read, RowIn
 from levain.cockpit.snapshot_host import DERIVE_THREAD_PREFIX, ServerProbe, SnapshotHost
 from levain.cockpit.snapshots import SnapshotWriter
+from levain.cockpit.stream import Watcher
 from levain.web_server import COCKPIT_SNAPSHOTS_ENV, make_server
 
 from tests.test_cockpit_k1 import _install, _simple
@@ -92,26 +98,20 @@ def _get(port: int, path: str) -> "tuple[int, Any]":
         c.close()
 
 
-def _until(pred: Callable[[], Any], timeout: float = 60.0) -> Any:
+def _until(pred: Callable[[], Any], timeout: float = 60.0, why: "Callable[[], Any] | None" = None) -> Any:
+    """``pred``'s first truthy answer. A timeout fails with ``why()`` (what the test had seen) in its message."""
     deadline = time.monotonic() + timeout
     while True:
         got = pred()
         if got:
             return got
         if time.monotonic() > deadline:
-            raise AssertionError("condition not met in time")
+            raise AssertionError("condition not met in time" + (f": {why()}" if why is not None else ""))
         time.sleep(0.05)
 
 
 def _derive_threads() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name.startswith(DERIVE_THREAD_PREFIX)]
-
-
-def _settle(resp: Any, quiet_s: float = 1.0, timeout: float = 60.0) -> None:
-    """Read the stream until it has been quiet for ``quiet_s``: the host's first derives of every panel are announced."""
-    deadline = time.monotonic() + timeout
-    while _events_for(resp, quiet_s):
-        assert time.monotonic() < deadline, "the stream never went quiet"
 
 
 def _collect(resp: Any, done: Callable[[list], bool], timeout: float = 30.0) -> "list[tuple[str, Any]]":
@@ -127,13 +127,62 @@ def _every_plan_has_a_row(host: SnapshotHost) -> bool:
     return all(host.reader.read(p.id) is not None for p in host._plans())
 
 
+def _loop_token(loop: Any) -> Any:
+    """The token the loop's next poll would compare against, computed as the poll computes it: no token function, or one
+    that raises, is ``_UNSET`` (no derive is owed to it); an unknown token (None) is a time bucket of ``unknown_token_s``."""
+    if loop._token_fn is None:
+        return _UNSET
+    try:
+        token = loop._token_fn()
+    except Exception:  # noqa: BLE001 - the loop treats a token it cannot read as none: so does this
+        return _UNSET
+    return (None, int(loop._clock() // loop._unknown_token_s)) if token is None else token
+
+
+def _loop_at_rest(loop: Any) -> bool:
+    """One coherent look at the loop, under ONE acquisition of its lock: no panel is busy or owed a dirty, and every plan
+    of the loop that derives on the token and has a row was derived at the token as it stands (a first derive that touches a
+    store the token names moves the token under its own wave, and the next poll derives every such panel again: a host that
+    is idle between the two waves is not at rest). The token is sampled just before the lock, so a token that moves after
+    it is caught by the repeat ``_derived_and_idle`` makes after its quiet interval."""
+    token = _loop_token(loop)
+    with loop._lock:
+        if any(st.busy or st.dirty_gen is not None for st in loop._states.values()):
+            return False
+        if token is _UNSET:
+            return True
+        return all(
+            loop._states[pid].token == token
+            for pid, plan in loop._plans.items()
+            if plan.on_token and pid in loop._states and loop._states[pid].derived_at is not None
+        )
+
+
 def _derived_and_idle(host: SnapshotHost) -> bool:
-    """Every plan has a row, discovery has added the panels it will, and no derive is queued or running."""
+    """Every plan has a row, discovery has added the panels it will, and the loop is at rest (``_loop_at_rest``), now and
+    again after a quiet interval. A host whose token is unknown re-derives on a time bucket of ``unknown_token_s``, and every
+    panel re-derives on the loop's ``backstop_s`` (a derive that touches the store moves the token, so a second wave
+    follows); both are pinned large here so neither turns inside a test."""
+    host.loop._unknown_token_s = 1e9
+    host.loop._backstop_s = 1e9
+    assert all(p.backstop_s is None for p in host.loop._plans.values()), "a panel with its own backstop bypasses the pin"
     plans = {p.id for p in host._plans()}
-    if not _every_plan_has_a_row(host) or host.loop.deriving():
+    if not _every_plan_has_a_row(host) or not _loop_at_rest(host.loop):
         return False
     time.sleep(0.3)
-    return {p.id for p in host._plans()} == plans and not host.loop.deriving()
+    return {p.id for p in host._plans()} == plans and _every_plan_has_a_row(host) and _loop_at_rest(host.loop)
+
+
+def _watcher_adopted(watcher: Any) -> "tuple[int] | None":
+    """``(seq,)`` once the stream watcher's adopted state (panel etags and set version) equals what the probe sees now, where
+    ``seq`` is the last event it has published; None until then. A change made after this is diffed against that state, so
+    its first announcement is its own panel-changed (a watcher that had not caught up would coalesce it with the change it
+    still owed into one manifest-changed)."""
+    etags, version = watcher._observe()
+    with watcher._lock:
+        if watcher._etags == etags and watcher._set_version == version:
+            return (watcher._seq,)
+    return None
 
 
 def _provider_reads_during(reads: Reads, run: Callable[[], None], tries: int = 5) -> list[str]:
@@ -297,6 +346,64 @@ def _spied(real: Callable[..., Cockpit], reads: Reads) -> Callable[..., Cockpit]
     return build
 
 
+# ---------------------------------------------------------------------------------------------- the at-rest helpers
+
+
+def _fake_loop(token: Any, states: "dict[str, PanelState]", plans: "dict[str, Any] | None" = None, now: float = 100.0) -> Any:
+    def token_fn() -> Any:
+        if isinstance(token, BaseException):
+            raise token
+        return token
+
+    plans = plans if plans is not None else {pid: SimpleNamespace(on_token=True) for pid in states}
+    return SimpleNamespace(
+        _token_fn=token_fn, _clock=lambda: now, _unknown_token_s=10.0, _lock=threading.Lock(), _states=states, _plans=plans,
+    )
+
+
+def _derived_at(token: Any, **kw: Any) -> PanelState:
+    return PanelState(derived_at=1.0, token=token, **kw)
+
+
+class TestAtRestHelpers:
+    def test_a_loop_whose_panels_were_derived_at_the_token_is_at_rest(self) -> None:
+        assert _loop_at_rest(_fake_loop(("t", 1), {"a": _derived_at(("t", 1)), "b": _derived_at(("t", 1))}))
+
+    def test_a_moved_token_busy_or_dirty_panel_is_not_at_rest(self) -> None:
+        assert not _loop_at_rest(_fake_loop(("t", 2), {"a": _derived_at(("t", 1))}))
+        assert not _loop_at_rest(_fake_loop(("t", 1), {"a": _derived_at(("t", 1), busy=True)}))
+        assert not _loop_at_rest(_fake_loop(("t", 1), {"a": _derived_at(("t", 1), dirty_gen=3)}))
+
+    def test_only_the_current_token_panels_with_a_row_are_judged(self) -> None:
+        states = {"a": _derived_at(("t", 1)), "gone": _derived_at("old"), "plain": _derived_at("old"), "unpublished": PanelState()}
+        plans = {"a": SimpleNamespace(on_token=True), "plain": SimpleNamespace(on_token=False),
+                 "unpublished": SimpleNamespace(on_token=True)}
+        assert _loop_at_rest(_fake_loop(("t", 1), states, plans))      # a retired state, an off-token plan and one never published owe nothing
+
+    def test_a_token_that_raises_or_is_absent_owes_nothing_as_in_the_loop(self) -> None:
+        assert _loop_at_rest(_fake_loop(OSError("gone"), {"a": _derived_at("old")}))
+        no_fn = _fake_loop(None, {"a": _derived_at("old")})
+        no_fn._token_fn = None
+        assert _loop_at_rest(no_fn)
+
+    def test_an_unknown_token_is_the_time_bucket_the_loop_substitutes(self) -> None:
+        assert _loop_token(_fake_loop(None, {}, now=105.0)) == (None, 10)
+        assert _loop_at_rest(_fake_loop(None, {"a": _derived_at((None, 10))}, now=105.0))
+        assert not _loop_at_rest(_fake_loop(None, {"a": _derived_at((None, 9))}, now=105.0))      # the bucket turned: a derive is owed
+
+    def test_the_watcher_is_adopted_when_its_state_is_what_the_probe_sees(self) -> None:
+        w = Watcher(lambda: {"panels": {"od": {"etag": "e1"}}}, epoch="x")
+        assert _watcher_adopted(w) is None          # no baseline yet
+        w._etags, w._set_version, w._seq = {"od": "e0"}, None, 4
+        assert _watcher_adopted(w) is None          # behind: it has still to see the change
+        w._etags = {"od": "e1"}
+        assert _watcher_adopted(w) == (4,)
+
+    def test_a_timeout_carries_what_the_test_had_seen(self) -> None:
+        with pytest.raises(AssertionError, match="saw \\['x'\\]"):
+            _until(lambda: False, timeout=0.1, why=lambda: "saw ['x']")
+
+
 # ---------------------------------------------------------------------------------------------- (j) the stream
 
 
@@ -306,12 +413,11 @@ class TestStream:
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
             assert _get(port, "/cockpit/manifest.json")[0] == 200
             host = httpd._snapshot_host
-            _until(lambda: _every_plan_has_a_row(host))
+            _until(lambda: _derived_and_idle(host))     # the stream's baseline is then taken with every first derive already made
             httpd.stream_watcher.token_s = 0.05
             c, r = _open(port)
             try:
                 _read_frame(r)
-                _settle(r)
                 reads.rows = [_row(1), _row(2)]         # the source changed; the next derive of "od" publishes it
                 host.loop.dirty(["od"], 1)
                 got = _await_events(r)
@@ -343,12 +449,11 @@ class TestStream:
         with _serving(src, cockpit=ck, watch_paths=[watched]) as (port, httpd):
             host = httpd._snapshot_host
             assert host is not None
-            _until(lambda: _every_plan_has_a_row(host))
+            _until(lambda: _derived_and_idle(host))
             httpd.stream_watcher.token_s = 0.05
             c, r = _open(port)
             try:
                 _read_frame(r)
-                _settle(r)
                 store["rows"] = [_row(1), _row(2)]
                 before = [(e[0], e[2].get("id")) for e in _events_for(r, 0.8)]
                 assert ("panel-changed", "mine") not in before, before   # the store moved but nothing the serve watches did
@@ -361,6 +466,37 @@ class TestStream:
     def test_a_subscribe_that_is_the_first_call_builds_the_cockpit_and_the_stream_still_runs(
         self, tmp_path: Path, monkeypatch
     ) -> None:
+        self._first_subscribe_then_a_change_to_od(tmp_path, monkeypatch)
+
+    def test_a_host_seen_at_rest_stays_at_rest_past_the_loops_backstop(self, tmp_path: Path, monkeypatch) -> None:
+        # levain#229: with the loop's backstop at 1 s, the host the stream tests wait on is derived again every second unless
+        # ``_derived_and_idle`` pins it: a stream test then had waves of derives, and of announcements, inside its window.
+        # What is counted is the loop deciding a panel is due for its backstop AFTER the pin (a job it had already decided
+        # on before the pin may still run, and is not counted): such a decision cannot be made once the pin holds.
+        monkeypatch.setattr(snapshot_host_module, "DeriveLoop", functools.partial(DeriveLoop, backstop_s=1.0))
+        decided: "list[tuple[float, str]]" = []
+        real_due_reason = derive_module.due_reason
+
+        def spy(plan, st, view, token, now, backstop_s):
+            reason = real_due_reason(plan, st, view, token, now, backstop_s)
+            if reason == "backstop":
+                decided.append((time.monotonic(), plan.id))
+            return reason
+
+        monkeypatch.setattr(derive_module, "due_reason", spy)
+        reads = Reads()
+        with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
+            assert _get(port, "/cockpit/manifest.json")[0] == 200       # builds the cockpit, attaches and starts its host
+            host = httpd._snapshot_host
+            _until(lambda: _derived_and_idle(host))     # the pin is set by this call, before it returns
+            assert host.loop._poll_s <= 1.0, "the window below must hold several polls"
+            pinned_at = time.monotonic()
+            time.sleep(3.0)
+            late = [d for d in decided if d[0] > pinned_at]
+            assert late == [], f"the loop decided a panel was due for its backstop after the pin: {late}"
+
+    @staticmethod
+    def _first_subscribe_then_a_change_to_od(tmp_path: Path, monkeypatch) -> None:
         # the watcher builds the cockpit under its own lock on the first subscribe: attaching must not need that lock
         reads = Reads()
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
@@ -370,13 +506,24 @@ class TestStream:
                 name, _eid, _data = _parse_first(r)
                 assert name == "hello"
                 assert httpd._snapshot_host is not None and httpd.get_cockpit().attached
-                _until(lambda: _every_plan_has_a_row(httpd._snapshot_host))
-                httpd.stream_watcher.token_s = 0.05
-                _settle(r)
+                host = httpd._snapshot_host
+                _until(lambda: _derived_and_idle(host))
+                watcher = httpd.stream_watcher
+                watcher.token_s = 0.05
+                # the host is at rest; the stream's WATCHER has still to adopt that state: a change made before it has would be
+                # coalesced with the change it owes into one manifest-changed. After this, the first thing announced for od is its own.
+                (seq0,) = _until(lambda: _watcher_adopted(watcher))
+                etag_before = _get(port, "/cockpit/manifest.json")[1]["panels"]["od"]["etag"]
                 reads.rows = [_row(1), _row(2)]
-                httpd._snapshot_host.loop.dirty(["od"], 1)
-                got = _collect(r, lambda evs: ("panel-changed", "od") in evs)
-                assert ("panel-changed", "od") in got, got
+                host.loop.dirty(["od"], 1)
+                _until(lambda: len(_get(port, "/cockpit/panel/od.json")[1]["rows"]) == 2 and not host.loop.deriving())
+                etag = _get(port, "/cockpit/manifest.json")[1]["panels"]["od"]["etag"]
+                assert etag != etag_before
+                got: list = []      # what the stream announced after seq0: the panel-changed that carries the new rows' etag is od's own
+                changed = lambda: [e for e in got if e[0] == "panel-changed" and e[2].get("etag") == etag]
+                _until(lambda: got.extend(e for e in _events_for(r, 0.25) if int(e[1].rpartition(":")[2]) > seq0) or changed(),
+                       why=lambda: f"wanted panel-changed with etag {etag} after event {seq0}, saw {got}")
+                assert {e[2].get("id") for e in changed()} == {"od"}, got
             finally:
                 c.close()
 

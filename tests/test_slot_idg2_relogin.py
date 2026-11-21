@@ -292,30 +292,6 @@ end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
 """
 
 
-@pytest.mark.parametrize("point", ["park:replace:renamed", "park:replace:aside", "park:before:commit"])
-def test_a_sigkilled_end_converges(tmp_path, point):
-    """The crash as a real process death (SIGKILL, no unwinding) between and after the two renames, then a fresh END
-    in this process from the record the child left (DEAD, the park journal at ``move``)."""
-    child = tmp_path / "child.py"
-    child.write_text(_KILL_CHILD)
-    wt = Path(__file__).resolve().parents[1]
-    r = subprocess.run([sys.executable, str(child), str(tmp_path / "w"), point], capture_output=True, timeout=120,
-                       cwd=wt, env={**os.environ, "PYTHONPATH": str(wt)})
-    assert r.returncode == -signal.SIGKILL, r.stderr.decode()[-2000:]
-    w = World.__new__(World)
-    w.tmp, w.L, w.vf = tmp_path / "w", tmp_path / "w" / "L", None
-    w.S = w.L / "live" / SESSION
-    w.facts = replace(end_mod.EndFacts(SESSION, SlotId("egress", 3), UID, GID, w.L, None, lease_seq=LEASE_SEQ,
-                                       vendor="claude", auth="passthrough"), kind="login")
-    assert where(w) == CRASH_POINTS[point]
-    assert read_root_intent(w.facts.intent, owner_ok=mine).phase == "move"
-    ctl = Control(state=DEAD)
-    seams = w.seams(ctl)
-    reconcile_session(w.facts, seams)
-    assert end_session(w.facts, seams, record_state=ctl.state, failed_step=ctl.failed_step) == RETAINED
-    assert where(w) == {"keep": "new", "replaced": "old"}
-
-
 # --- the replaced credential follows THIS session's retention ----------------------------------------------------------
 
 
@@ -548,12 +524,22 @@ end_session(w.facts, w.seams(ctl, fault=fault), record_state=REVOKED)
 """
 
 
-@pytest.mark.parametrize("point", ["park:unconfirmed:dirs", "park:unconfirmed:renamed", "park:unconfirmed:aside"])
-def test_a_sigkilled_unconfirmed_end_converges(tmp_path, point):
-    """A real process death before and after the set-aside's rename, then a fresh END in this process from the record
-    the child left (DEAD, the park journal at ``move``)."""
+#: The real-process-death cases of both parks: (child script, points table, where each credential ends). The D1 child
+#: (:data:`_KILL_CHILD_D1`, above) is the same run without ``confirm``.
+def _sigkill_cases() -> list:
+    return ([pytest.param(_KILL_CHILD, CRASH_POINTS, {"keep": "new", "replaced": "old"}, p, id="confirmed-" + p)
+             for p in ("park:replace:renamed", "park:replace:aside", "park:before:commit")]
+            + [pytest.param(_KILL_CHILD_D1, D1_POINTS, {"keep": "old", "unconfirmed": "new"}, p, id="unconfirmed-" + p)
+               for p in ("park:unconfirmed:dirs", "park:unconfirmed:renamed", "park:unconfirmed:aside")])
+
+
+@pytest.mark.parametrize("child_src,table,final,point", _sigkill_cases())
+def test_a_sigkilled_end_converges(tmp_path, child_src, table, final, point):
+    """The crash as a real process death (SIGKILL, no unwinding) between and after the two renames of a confirmed
+    re-login's park, and before and after the set-aside's rename of an unconfirmed login's, then a fresh END in this
+    process from the record the child left (DEAD, the park journal at ``move``)."""
     child = tmp_path / "child.py"
-    child.write_text(_KILL_CHILD_D1)
+    child.write_text(child_src)
     wt = Path(__file__).resolve().parents[1]
     r = subprocess.run([sys.executable, str(child), str(tmp_path / "w"), point], capture_output=True, timeout=120,
                        cwd=wt, env={**os.environ, "PYTHONPATH": str(wt)})
@@ -563,13 +549,13 @@ def test_a_sigkilled_unconfirmed_end_converges(tmp_path, point):
     w.S = w.L / "live" / SESSION
     w.facts = replace(end_mod.EndFacts(SESSION, SlotId("egress", 3), UID, GID, w.L, None, lease_seq=LEASE_SEQ,
                                        vendor="claude", auth="passthrough"), kind="login")
-    assert where(w) == D1_POINTS[point]
+    assert where(w) == table[point]
     assert read_root_intent(w.facts.intent, owner_ok=mine).phase == "move"
     ctl = Control(state=DEAD)
     seams = w.seams(ctl)
     reconcile_session(w.facts, seams)
     assert end_session(w.facts, seams, record_state=ctl.state, failed_step=ctl.failed_step) == RETAINED
-    assert where(w) == {"keep": "old", "unconfirmed": "new"}
+    assert where(w) == final
 
 
 def test_the_unconfirmed_credential_follows_discard_restore_and_purge(tmp_path):
