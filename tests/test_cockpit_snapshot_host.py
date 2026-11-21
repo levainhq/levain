@@ -516,7 +516,16 @@ class TestLifecycle:
             # loaded box can leave the last beat older than the window for an instant. The test waits, bounded by
             # ``_until``, for a beat that reads live instead of asserting at one instant; a host that never reads live
             # still fails it.
-            _until(lambda: ck.worker_health()["worker"] == "live")
+            seen: list[dict] = []
+
+            def _live() -> bool:
+                seen[:] = [ck.worker_health()]
+                return seen[0]["worker"] == "live"
+
+            try:
+                _until(_live)
+            except AssertionError:
+                raise AssertionError(f"the host never read live: last worker_health() {seen}") from None
         finally:
             host.stop(timeout=10)
 
