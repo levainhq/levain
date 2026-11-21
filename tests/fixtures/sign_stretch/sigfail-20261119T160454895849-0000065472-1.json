@@ -1,0 +1,15 @@
+{
+ "format": "levain-sign-failure/1",
+ "time": "2026-11-19T16:04:54.895849+00:00",
+ "fingerprint": "SHA256:Pg3i8ZAZf+pOLypyoORCKxCkhAFAYmImnDXhr02fP2w",
+ "namespace": "levain-terminal-answer",
+ "algorithm": "sk-ecdsa-sha2-nistp256@openssh.com",
+ "flags": "0x21",
+ "counter": 1,
+ "attempt": 1,
+ "message_sha256": "30bb4053bfb8c61f97519cea76b7de420ff83397abb3c45d700675c063270fcf",
+ "message_bytes": 856,
+ "ssh_keygen": "verify: Signature verification failed: error in libcrypto (exit 255); check-novalidate: Signature verification failed: error in libcrypto (exit 255); message 856 bytes",
+ "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAH8AAAAic2stZWNkc2Etc2hhMi1uaXN0cDI1NkBvcGVuc3NoLmNvbQ\nAAAAhuaXN0cDI1NgAAAEEEi2ZjCBmtXEGT20tLO5gpIZUeCTZC55d93v5s03hyPSwYa5S4\niIfXRMj9cC+6KDnKBN5KAd5x01vHOYql1e3BbQAAAARzc2g6AAAAFmxldmFpbi10ZXJtaW\n5hbC1hbnN3ZXIAAAAAAAAABnNoYTUxMgAAADcAAAAic2stZWNkc2Etc2hhMi1uaXN0cDI1\nNkBvcGVuc3NoLmNvbQAAAAgAAAAAAAAAACEAAAAB\n-----END SSH SIGNATURE-----\n",
+ "reason": "empty ECDSA signature (r and s have zero length)"
+}

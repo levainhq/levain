@@ -1,180 +1,94 @@
-"""levain#208: the sign-failure counter's output shape, from real sigfail records (levain#191, copied from the key's
-sign-failures directory) plus a record that carries a good signature (the 11-18 one from sk_empty_signatures_1119.json).
-Nothing here touches ~/.levain: the directory is tmp_path."""
-from __future__ import annotations
-
+"""scripts/sign_stretch.py (levain#208): the per-day tally replayed over the real sigfail records of levain#191
+(tests/fixtures/sign_stretch, copied from project_memory/1120-58_l191) plus one good signature. Always a tmp key dir."""
+import datetime
+import importlib.util
 import json
-from datetime import datetime, timezone
+import shutil
+import time
 from pathlib import Path
 
-from levain import cli
-from levain import sign_stretch
+import pytest
 
-FIX = Path(__file__).parent / "fixtures"
+_SPEC = importlib.util.spec_from_file_location(
+    "sign_stretch_script", Path(__file__).resolve().parent.parent / "scripts" / "sign_stretch.py")
+ss = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(ss)
 
-
-def _dir(tmp_path: Path) -> Path:
-    d = tmp_path / "keys" / "sign-failures"
-    d.mkdir(parents=True)
-    for f in sorted((FIX / "sign_failures_1120").glob("sigfail-*.json")):
-        (d / f.name).write_bytes(f.read_bytes())
-    good = json.loads((FIX / "sk_empty_signatures_1119.json").read_text())["good"]
-    rec = json.loads(next((FIX / "sign_failures_1120").glob("*-1.json")).read_text())
-    rec.update(time="2026-11-20T10:00:00+00:00", signature=good, reason=None)
-    (d / "sigfail-20261120T100000000000-0000000001-1.json").write_text(json.dumps(rec))
-    (d / "sigdiag-last.txt").write_text("not a record")
-    return d
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sign_stretch"
 
 
-def test_table_from_real_records_and_a_good_signature(tmp_path, capsys):
-    d = _dir(tmp_path)
-    before = sorted((p.name, p.stat().st_mtime_ns) for p in d.iterdir())
-    rep = sign_stretch.read(d)
-    days = rep.days
-    assert rep.unreadable == 0
-    assert [(x.day, x.empty_failures, x.failed_signs, x.other_failures) for x in days] == [
-        ("2026-11-19", 2, 1, 0),      # one sign, empty at attempts 1 and 2
-        ("2026-11-20", 1, 2, 1),      # the 00:19Z empty one, and the good-signature record
-    ]
-    out = sign_stretch.render(rep)
-    na = sign_stretch.NO_SUCCESS_LEDGER
-    assert out.splitlines() == [
-        f"2026-11-19  signs={na} empty_failures=2 failed_signs=1 other_failures=0",
-        f"2026-11-20  signs={na} empty_failures=1 failed_signs=2 other_failures=1",
-        f"clean_run={na}",
-    ]
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys")]) == 0
-    assert capsys.readouterr().out.strip() == out
-    assert before == sorted((p.name, p.stat().st_mtime_ns) for p in d.iterdir())    # read-only
+@pytest.fixture(autouse=True)
+def _utc(monkeypatch):
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
 
 
-def test_missing_directory_is_no_days(tmp_path):
-    assert sign_stretch.render(sign_stretch.read(tmp_path / "none")).splitlines() == [
-        "no sign-failure records", f"clean_run={sign_stretch.NO_SUCCESS_LEDGER}"]
+def _key_dir(tmp_path):
+    kd = tmp_path / "keys"
+    shutil.copytree(FIXTURES, kd / "sign-failures")
+    return kd
 
 
-def test_statement_ledger_gives_signs_and_clean_run(tmp_path, capsys):
-    _dir(tmp_path)
-    ts = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
-    ledger = tmp_path / "statements.jsonl"
-    good = lambda t: json.dumps({"event": "statement", "ts": ts(t), "signed": {"sig": "x"}})
-    ledger.write_text("\n".join([
-        good("2026-11-19T16:30:00"),                                 # before the last empty failure
-        good("2026-11-20T00:30:00"),                                 # after it (00:19Z)
-        json.dumps({"event": "countersign", "ts": ts("2026-11-20T01:00:00")}),   # not a statement: ignored
-    ]) + "\n")
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 0
-    assert capsys.readouterr().out.splitlines() == [
-        "2026-11-19  signs=1 empty_failures=2 failed_signs=1 other_failures=0",
-        "2026-11-20  signs=1 empty_failures=1 failed_signs=2 other_failures=1",
-        "clean_run=1",
-    ]
-
-
-def test_bad_ledger_lines_are_skipped_and_counted(tmp_path, capsys):
-    _dir(tmp_path)
-    ledger = tmp_path / "statements.jsonl"
-    line = lambda ts: '{"event": "statement", "signed": {"sig": "x"}, "ts": %s}' % ts
-    ledger.write_text("\n".join([line("1e20"), line('"1795000000"'), line("true"), line("NaN"), line("Infinity"),
-                                 line("1795000000")]) + "\n")      # the last is a 2026-11-18 sign
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 0
-    out = capsys.readouterr().out.splitlines()
-    assert "2026-11-18  signs=1 empty_failures=0 failed_signs=0 other_failures=0" in out
-    assert "note: 5 unreadable record(s) skipped" in out
-    assert out[-1] == "clean_run=0"       # that good sign is before the latest empty failure
-
-
-def test_non_utf8_ledger_is_refused(tmp_path, capsys):
-    _dir(tmp_path)
-    ledger = tmp_path / "statements.jsonl"
-    ledger.write_bytes(b"\xff\xfe\x00bad\n")
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), "--statements", str(ledger)]) == 1
-    assert "sign-stretch: cannot read" in capsys.readouterr().err
-
-
-def test_missing_dir_is_refused_but_no_subdirectory_is_clean(tmp_path, capsys):
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "nope")]) == 1
-    assert "sign-stretch: no such directory" in capsys.readouterr().err
-    (tmp_path / "keys").mkdir()
-    assert cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys")]) == 0
-    assert capsys.readouterr().out.splitlines()[0] == "no sign-failure records"
-
-
-def _ledger(tmp_path, *stamps):
-    ts = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
+def _ledger(tmp_path, *isos):
     p = tmp_path / "statements.jsonl"
-    p.write_text("\n".join(json.dumps({"event": "statement", "ts": ts(t), "signed": {"sig": "x"}}) for t in stamps) + "\n")
+    p.write_text("".join(json.dumps({"event": "statement", "id": None, "signed": {"format": "x"},
+                                     "ts": datetime.datetime.fromisoformat(i).timestamp()}) + "\n" for i in isos))
     return p
 
 
-def _run(tmp_path, *extra):
-    return cli.main(["cockpit", "sign-stretch", "--dir", str(tmp_path / "keys"), *extra])
+def _run(capsys, *argv):
+    rc = ss.main(list(argv))
+    return rc, capsys.readouterr().out
 
 
-def test_unlistable_evidence_dir_is_refused(tmp_path, capsys):
-    (tmp_path / "keys").mkdir()
-    (tmp_path / "keys" / "sign-failures").write_text("a file, not a directory")
-    assert _run(tmp_path) == 1
-    err = capsys.readouterr().err
-    assert f"cannot read {tmp_path / 'keys' / 'sign-failures'}" in err and "None" not in err
+def test_real_sigfail_records_plus_a_good_sign(tmp_path, capsys):
+    kd = _key_dir(tmp_path)
+    ledger = _ledger(tmp_path, "2026-11-20T17:30:00+00:00")
+    before = sorted(p.name for p in kd.rglob("*"))
+    rc, out = _run(capsys, "--key-dir", str(kd), "--ledger", str(ledger), "--days", "3", "--until", "2026-11-21")
+    assert rc == 0
+    assert out.splitlines()[:6] == [
+        "2026-11-19 signs=0 empty_failures=5 other_failures=1",
+        "2026-11-20 signs=1 empty_failures=6 other_failures=0",
+        "2026-11-21 signs=0 empty_failures=0 other_failures=0",
+        "clean_run=1",
+        "other_outcomes: bad-signature=1",
+        "source sign-failures: 12 failed signs from 20 attempt files (attempts grouped by pid; 0 skipped)",
+    ]
+    assert sorted(p.name for p in kd.rglob("*")) == before       # nothing written under the key dir
 
 
-def test_unreadable_failure_record_makes_clean_run_unverified(tmp_path, capsys):
-    d = _dir(tmp_path)
-    (d / "sigfail-20261120T120000000000-0000000002-1.json").write_text("{not json")
-    (d / "sigfail-20261120T120100000000-0000000003-1.json").write_text(json.dumps({"time": "2026-11-20T12:01:00+00:00"}))
-    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
-    out = capsys.readouterr().out.splitlines()
-    assert out[-1] == "clean_run=1 (unverified: 2 unreadable failure records)"
+def test_clean_run_is_signs_since_the_last_empty_failure(tmp_path):
+    kd = _key_dir(tmp_path)
+    ledger = _ledger(tmp_path, "2026-11-20T16:00:00+00:00", "2026-11-20T18:00:00+00:00", "2026-11-20T19:00:00+00:00")
+    res = ss.tally(kd, ledger, 2, datetime.date(2026, 11, 20))
+    assert res["clean_run"] == 2                                  # the 16:00 one precedes the later empty failures
+    assert [d["signs"] for d in res["days"]] == [0, 3]
 
 
-def test_directory_at_its_cap_makes_clean_run_an_upper_bound(tmp_path, capsys, monkeypatch):
-    import levain.cockpit.keys as keys
-    d = _dir(tmp_path)
-    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", len(list(d.glob("sigfail-*.json"))))
-    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
-    assert capsys.readouterr().out.splitlines()[-1] == "clean_run=1 (at most: the evidence directory is at its cap)"
+def test_sign_log_outcomes_counted_by_name(tmp_path, capsys):
+    kd = tmp_path / "keys"
+    kd.mkdir()
+    lines = [{"time": "2026-11-21T10:0%d:00+00:00" % i, "outcome": o}
+             for i, o in enumerate(("signed", "no-signature", "wat-new", "wat-new"))]
+    (kd / "sign-log.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    rc, out = _run(capsys, "--key-dir", str(kd), "--ledger", str(tmp_path / "none.jsonl"), "--days", "1",
+                   "--until", "2026-11-21")
+    assert rc == 0
+    assert out.splitlines()[0] == "2026-11-21 signs=1 empty_failures=1 other_failures=2"
+    assert "other_outcomes: wat-new=2" in out
+    assert "clean_run=0" in out                                   # the empty failure came after the one sign
+    assert "source ledger: no data" in out
 
 
-def test_naive_time_is_read_as_utc(tmp_path, capsys):
-    d = tmp_path / "keys" / "sign-failures"
-    d.mkdir(parents=True)
-    rec = json.loads(next((FIX / "sign_failures_1120").glob("*-1.json")).read_text())
-    rec["time"] = "2026-11-20T23:30:00"
-    (d / "sigfail-20261120T233000000000-0000000004-1.json").write_text(json.dumps(rec))
-    _run(tmp_path)
-    assert capsys.readouterr().out.splitlines()[0].startswith("2026-11-20  ")
-
-
-def test_signed_must_be_a_non_empty_object(tmp_path, capsys):
-    _dir(tmp_path)
-    p = tmp_path / "statements.jsonl"
-    p.write_text("\n".join(json.dumps({"event": "statement", "ts": 1795000000, "signed": s})
-                           for s in ("yes", [1], {}, None, {"sig": "x"})) + "\n")
-    _run(tmp_path, "--statements", str(p))
-    assert "2026-11-18  signs=1 empty_failures=0 failed_signs=0 other_failures=0" in capsys.readouterr().out
-
-
-def test_missing_default_key_dir_is_refused(tmp_path, capsys, monkeypatch):
-    import levain.cockpit.custody as custody
-    monkeypatch.setattr(custody, "default_key_dir", lambda: tmp_path / "fresh" / "keys")
-    assert cli.main(["cockpit", "sign-stretch"]) == 1
-    assert "sign-stretch: no such directory" in capsys.readouterr().err
-
-
-def test_unverified_and_at_cap_are_both_said(tmp_path, capsys, monkeypatch):
-    import levain.cockpit.keys as keys
-    d = _dir(tmp_path)
-    (d / "sigfail-20261120T120000000000-0000000002-1.json").write_text("{not json")
-    monkeypatch.setattr(keys, "_SIGN_FAILURE_KEEP", 1)
-    _run(tmp_path, "--statements", str(_ledger(tmp_path, "2026-11-20T01:00:00")))
-    assert capsys.readouterr().out.splitlines()[-1] == (
-        "clean_run=1 (at most: the evidence directory is at its cap; unverified: 1 unreadable failure records)")
-
-
-def test_default_key_dir_that_is_a_file_is_not_a_directory(tmp_path, capsys, monkeypatch):
-    import levain.cockpit.custody as custody
-    (tmp_path / "keys").write_text("in the way")
-    monkeypatch.setattr(custody, "default_key_dir", lambda: tmp_path / "keys")
-    assert cli.main(["cockpit", "sign-stretch"]) == 1
-    assert f"sign-stretch: not a directory: {tmp_path / 'keys'}" in capsys.readouterr().err
+def test_missing_key_dir_is_no_data_exit_zero(tmp_path, capsys):
+    rc, out = _run(capsys, "--key-dir", str(tmp_path / "absent"), "--ledger", str(tmp_path / "none.jsonl"),
+                   "--days", "1", "--until", "2026-11-21")
+    assert rc == 0
+    assert out.splitlines()[0] == "2026-11-21 signs=? empty_failures=0 other_failures=0"
+    assert "clean_run=?" in out
+    assert "source sign-failures: no data" in out
+    assert not (tmp_path / "absent").exists()
