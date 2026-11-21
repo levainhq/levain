@@ -71,6 +71,9 @@ DYNAMIC_SITES = {
     # ``_LAZY_FIRING_MODULES`` / ``_LAZY_PRESENCE_MODULES`` for the operator's daemon (a variable, not a root target);
     # the cockpit one is the operator's panel, importing ``levain.consent.limits`` (not a root-run module)
     "levain/cockpit/providers.py::_limit_lines::" 'mod = importlib.import_module("levain.consent.limits")': (),
+    # the derive child imports the downstream's cockpit factory by the name its launcher passes (flow's ``flow_cockpit``, not a
+    # levain module); no levain module is seeded, and no root process starts the child
+    "levain/cockpit/derive_child.py::_load_factory::target: Any = importlib.import_module(module)": (),
     # the 1.x old-name shim: its loader imports the real ``levain.desk.<x>`` a ``levain.coordinator.<x>`` import
     # names (the same module object); no levain module imports ``levain.coordinator``, so no root process reaches it
     "levain/coordinator/__init__.py::_AliasLoader.create_module::return importlib.import_module(self._real)": (),
