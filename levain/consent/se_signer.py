@@ -29,7 +29,7 @@ SOURCE = Path(__file__).resolve().parent.parent / "native" / "levain_sign.swift"
 APPLICATION = "ssh:"
 BUILD_TIMEOUT = 300.0
 CREATE_TIMEOUT = 30.0
-SIGN_TIMEOUT = 120.0   # a presence sheet waits on a person (the helper's own evaluate wall is 60 s)
+SIGN_TIMEOUT = 120.0   # a presence sheet waits on a person; outlasts the helper's PRESENCE_WALL_SECONDS (pinned by a test)
 VERIFY_TIMEOUT = 15.0
 BUILD_COMMAND = "levain doctor --fix"
 # an explicit child environment (tests/test_launch.py): the tool paths and the home the helper and swiftc need, nothing else
@@ -101,8 +101,8 @@ def ensure_helper(cache_dir: Path | None = None) -> Path:
 
 
 def require_helper(cache_dir: Path | None = None) -> Path:
-    """The compiled helper for this source, NEVER built here (the sign and status paths call this: a compile of up to
-    300 s must not run inside a bounded step). Absent or stale (the source changed since it was built) is a
+    """The compiled helper for this source, NEVER built here (the sign and status paths call this: a compile bounded by
+    :data:`BUILD_TIMEOUT` must not run inside a bounded step). Absent or stale (the source changed since it was built) is a
     :class:`SeSignerError` naming the command that builds it."""
     binary = helper_path(cache_dir if cache_dir is not None else default_cache_dir())
     if binary.is_file() and os.access(binary, os.X_OK):
@@ -271,7 +271,7 @@ def append_sign_log(key_dir: Path, record: dict) -> str | None:
 
 def _prune_sign_log(path: Path) -> None:
     try:
-        if path.stat().st_size < SIGN_LOG_KEEP * 40:     # fewer bytes than 500 shortest lines: nothing to prune
+        if path.stat().st_size < SIGN_LOG_KEEP * 40:     # fewer bytes than SIGN_LOG_KEEP shortest lines: nothing to prune
             return
         lines = path.read_bytes().splitlines(keepends=True)
         if len(lines) <= SIGN_LOG_KEEP:

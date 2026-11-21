@@ -252,7 +252,8 @@ def test_the_swift_helper_evaluates_once_and_then_forbids_interaction():
     ev, off, load = sign.index("evaluateAccessControl("), sign.index("interactionNotAllowed = true"), sign.index("loadKey(")
     assert ev < off < load                                  # no key use, and so no sign, before the context is closed
     assert sign.count("c.invalidate()") == 1 and "presence_timeout" in sign
-    assert "sem.wait(timeout: .now() + 60) == .timedOut" in sign        # the 60 s wall, invalidated on expiry
+    assert "sem.wait(timeout: .now() + .seconds(PRESENCE_WALL_SECONDS)) == .timedOut" in sign   # the wall, invalidated on expiry
+    assert re.search(r"^let PRESENCE_WALL_SECONDS = 60\b", src, re.M) is not None
     assert "evaluations += 1" in sign and sign.count("evaluations += 1") == 1
     # no loop around the evaluate
     assert re.search(r"(while|for|repeat)\b[^\n]*\n(?:[^\n]*\n){0,12}?[^\n]*evaluateAccessControl", sign) is None
@@ -274,7 +275,8 @@ def test_the_swift_helper_has_one_access_control_builder_biometry_only_and_reads
 def test_the_swift_retry_is_on_named_transient_codes_only_at_most_twice_more():
     sign = _sign_case(ses.SOURCE.read_text())
     assert "let transient: Set<Int> = [-36, -108, -2070]" in sign
-    assert "attempts < 3" in sign and sign.count("try key.signature(for: u2fData)") == 1
+    assert re.search(r"^let SIGN_MAX_ATTEMPTS = 3\b", ses.SOURCE.read_text(), re.M) is not None
+    assert sign.count("attempts < SIGN_MAX_ATTEMPTS") == 2 and sign.count("try key.signature(for: u2fData)") == 1
     assert "transient.contains(c)" in sign
     assert "evaluateAccessControl" not in sign[sign.index("while attempts"):]      # no new evaluate inside the retry
 

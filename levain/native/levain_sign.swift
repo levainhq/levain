@@ -111,6 +111,9 @@ func loadKey(_ path: String, context: LAContext?) -> SecureEnclave.P256.Signing.
     } catch { fail("key_load", "\(error)") }
 }
 
+let PRESENCE_WALL_SECONDS = 60      // how long one presence sheet waits for a touch
+let SIGN_MAX_ATTEMPTS = 3          // the first sign plus the transient-code retries
+
 // ---- counter sidecar: <blob>.counter, 0600, a decimal uint32, incremented per sign under an exclusive flock ----
 func nextCounter(_ blobPath: String) -> UInt32 {
     let p = blobPath + ".counter"
@@ -168,7 +171,7 @@ case "sign":
     let presence = readPresence(keyPath)             // from <blob>.meta.json, never from a flag
     let message = FileHandle.standardInput.readDataToEndOfFile()
 
-    // ONE evaluate per sign (counted in "evaluations"), with a 60 s wall; afterwards the context allows no interaction,
+    // ONE evaluate per sign (counted in "evaluations"), with a PRESENCE_WALL_SECONDS wall; afterwards the context allows no interaction,
     // so nothing later in this sign, a retry included, can show a sheet: it fails instead.
     var ctx: LAContext? = nil
     var evaluations = 0
@@ -179,9 +182,9 @@ case "sign":
         var ok = false; var err: Error? = nil
         evaluations += 1
         c.evaluateAccessControl(ac, operation: .useKeySign, localizedReason: reason) { r, e in ok = r; err = e; sem.signal() }
-        if sem.wait(timeout: .now() + 60) == .timedOut {
+        if sem.wait(timeout: .now() + .seconds(PRESENCE_WALL_SECONDS)) == .timedOut {
             c.invalidate()
-            fail("presence_timeout", "not touched in time (60 s)", ["evaluations": evaluations, "evaluated": false])
+            fail("presence_timeout", "not touched in time (\(PRESENCE_WALL_SECONDS) s)", ["evaluations": evaluations, "evaluated": false])
         }
         if !ok {
             var extra: [String: Any] = ["evaluations": evaluations, "evaluated": false]
@@ -209,18 +212,18 @@ case "sign":
     let counter = nextCounter(keyPath)
     let u2fData = sha(Data(app.utf8)) + Data([flagsByte]) + u32(counter) + sha(signedBlob)
 
-    // Retry the sign only on a named transient OSStatus (same context, never a new evaluate), at most 2 more times:
+    // Retry the sign only on a named transient OSStatus (same context, never a new evaluate), up to SIGN_MAX_ATTEMPTS attempts in all:
     // errSecIO -36, errSecAllocate -108, errSecInternalComponent -2070 (Security framework result codes). Any other
     // error, an LAError and errSecInteractionNotAllowed -25308 included, is final.
     let transient: Set<Int> = [-36, -108, -2070]
     var attempts = 0
     var sig: P256.Signing.ECDSASignature? = nil
     var lastErr: Error? = nil
-    while attempts < 3 && sig == nil {
+    while attempts < SIGN_MAX_ATTEMPTS && sig == nil {
         attempts += 1
         do { sig = try key.signature(for: u2fData) } catch {
             lastErr = error
-            guard let c = errorParts(error).1, transient.contains(c), attempts < 3 else { break }
+            guard let c = errorParts(error).1, transient.contains(c), attempts < SIGN_MAX_ATTEMPTS else { break }
             usleep(150_000)
         }
     }

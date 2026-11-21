@@ -370,7 +370,7 @@ def _levain_sign_status(public_key: str, key_dir: Path | None, helper: Path | No
         if sidecar is None or sidecar.provider != LEVAIN_SIGN:
             continue
         try:
-            # never compiled on a status path (a build is up to 300 s): a missing helper is said in words
+            # never compiled on a status path (a build is bounded by se_signer.BUILD_TIMEOUT): a missing helper is said in words
             built = helper if helper is not None else se_signer.require_helper()
         except se_signer.SeSignerError as exc:
             return None, f"the levain-sign helper is not available ({exc}): custody as recorded"

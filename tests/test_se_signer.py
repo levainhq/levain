@@ -217,3 +217,12 @@ def test_require_helper_finds_what_ensure_helper_built(tmp_path, helper):
     cache = tmp_path / "cache"
     built = ses.ensure_helper(cache)
     assert ses.require_helper(cache) == built and ses.helper_path(cache) == built
+
+
+def test_sign_timeout_outlasts_the_helpers_presence_wall():
+    # The Python bound on a sign must outlast the helper's own wait for a touch, or a slow touch is killed mid-sheet.
+    import re
+    src = (Path(ses.__file__).resolve().parent.parent / "native" / "levain_sign.swift").read_text()
+    m = re.search(r"^let PRESENCE_WALL_SECONDS = (\d+)\b", src, re.M)
+    assert m is not None
+    assert ses.SIGN_TIMEOUT > int(m.group(1))
