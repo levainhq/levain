@@ -198,3 +198,23 @@ def test_no_ledger_named_means_no_ledger_part_never_a_guessed_path(tmp_path, mon
     assert ss.default_ledger() is None
     result = ss.tally(tmp_path / "keys", None, 3)
     assert "ledger" not in result["sources"] and all("ledger_statements_at_least" not in r for r in result["days"])
+
+
+def test_unreadable_sign_log_lines_mark_the_helper_clean_run_unverified(tmp_path):
+    kd = tmp_path / "keys"
+    kd.mkdir()
+    (kd / "sign-log.jsonl").write_text(
+        '{"time": "2026-11-21T10:00:00Z", "outcome": "signed"}\n{"time": broken\n', encoding="utf-8")
+    out = ss.render(ss.tally(kd, None, 3, until=__import__("datetime").date(2026, 11, 21)))
+    assert "unverified: 1 unreadable sign-log lines" in out
+
+
+def test_an_unreadable_key_dir_is_said_not_read_as_no_data(tmp_path):
+    kd = tmp_path / "keys"
+    kd.mkdir()
+    kd.chmod(0)
+    try:
+        result = ss.tally(kd, None, 3)
+    finally:
+        kd.chmod(0o700)
+    assert "cannot be read" in result["sources"]["sign-failures"]

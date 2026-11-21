@@ -211,6 +211,12 @@ def _iso_local(t: float) -> str:
 def _sign_failures_state(key_dir: Path) -> str | None:
     """None when sign-failures is absent or a readable directory, else why it is not."""
     d = key_dir / "sign-failures"
+    try:
+        os.listdir(key_dir)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"the key directory {key_dir} cannot be read ({e.strerror or type(e).__name__})"
     if not os.path.lexists(d):
         return None
     try:
@@ -293,6 +299,7 @@ def tally(key_dir: Path, ledger: Path | None, days: int, until: datetime.date | 
                 break
     last_empty = max((t for t, k in fails if k == "empty"), default=None)
     return {"days": rows, "helper_present": sl["present"], "helper_clean_run": run, "helper_run_ended_by": ender,
+            "helper_unreadable_lines": sl["bad"] if sl["present"] else 0,
             "apple_last_empty": _iso_local(last_empty) if last_empty is not None else None, "sources": sources}
 
 
@@ -314,7 +321,9 @@ def render(result: dict) -> str:
     else:
         e = result["helper_run_ended_by"]
         lines.append(f"helper_clean_run={result['helper_clean_run']} " +
-                     (f"(the run ended at a {e['outcome']} line, {e['time']})" if e else "(no failure line in the retained log)"))
+                     (f"(the run ended at a {e['outcome']} line, {e['time']})" if e else "(no failure line in the retained log)") +
+                     (f" (unverified: {result['helper_unreadable_lines']} unreadable sign-log lines)"
+                      if result["helper_unreadable_lines"] else ""))
     lines.append(f"apple_last_empty={result['apple_last_empty'] or 'none'}")
     lines += [f"source {k}: {v}" for k, v in result["sources"].items()]
     return "\n".join(lines)
