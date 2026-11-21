@@ -412,8 +412,10 @@ def test_two_entries_of_one_second_actor_and_length_open_one_at_a_time(tmp_path:
 def test_a_tall_card_with_one_long_entry_has_its_caret(tmp_path: Path) -> None:
     """The body is taller than its content (nothing overflows): the long entry is still cut by the clamp and still has its caret."""
     body = (f"(() => {{ const b = {PANEL}.querySelector(':scope > .pbody'); return JSON.stringify({{over: b.scrollHeight > b.clientHeight + 1,"
-            " h: b.clientHeight, sh: b.scrollHeight}); })()")
-    with _serve(tmp_path, _log([_words(450), "a short entry"])) as url:
+            " h: b.clientHeight, sh: b.scrollHeight, folded: [...b.querySelectorAll('.lrow')].filter(r => r.style.display === 'none').length}); })()")
+    # the second entry is one word, so it takes one line in any typeface: a wider face wraps "a short entry" to three lines, which does
+    # not fit under the cut one, and the card then folds it behind its foot (the `folded` check below)
+    with _serve(tmp_path, _log([_words(450), "ok"])) as url:
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 2400, "dpr": 1}},
             {"until": STATE},
@@ -423,6 +425,7 @@ def test_a_tall_card_with_one_long_entry_has_its_caret(tmp_path: Path) -> None:
         ])
     geo = json.loads(out["values"][-2])
     rows = _state(out)
+    assert geo["folded"] == 0, geo                                                  # both entries are on the card: the fold did not engage
     assert not geo["over"], geo                                                     # the geometry under test: the body does not overflow
     assert rows[0]["cut"] and rows[0]["hasMore"] and rows[0]["toggle"]["shown"], rows[0]
     assert not rows[1]["cut"] and not rows[1]["toggle"]["shown"], rows[1]
