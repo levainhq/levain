@@ -298,6 +298,20 @@ def _iso_not_before(value: Any, now: datetime | None) -> bool:
     return at.tzinfo is not None and at >= now
 
 
+# the keys the engine's manifest freshness block carries (``Cockpit._manifest_compute``); a block with more, fewer or
+# malformed members is a change to what a page reads, so it is not approved by its two headline members
+FRESH_BLOCK_KEYS = frozenset({"worker", "heartbeat_age_s", "deriving", "stream"})
+
+
+def _fresh_block_at_rest(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != FRESH_BLOCK_KEYS:
+        return False
+    age, stream = value["heartbeat_age_s"], value["stream"]
+    return (value["worker"] == "live" and value["deriving"] == []
+            and isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age >= 0
+            and isinstance(stream, dict) and isinstance(stream.get("state"), str))
+
+
 def _fresh_at_rest(t: "Triple", now: datetime | None) -> bool:
     """The value of a freshness key the subject adds, for a corpus read at rest (every row derived at the run's clock, the
     worker alive, nothing in flight): a panel is not stale and not pending, its bound is absent or not before the clock, and
@@ -308,7 +322,7 @@ def _fresh_at_rest(t: "Triple", now: datetime | None) -> bool:
     if key == "valid_until":
         return _iso_not_before(value, now)
     if key == "freshness":
-        return isinstance(value, dict) and value.get("worker") == "live" and value.get("deriving") == []
+        return _fresh_block_at_rest(value)
     return False
 
 

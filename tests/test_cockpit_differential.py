@@ -264,7 +264,10 @@ def test_the_subject_carries_each_freshness_key_and_says_fresh_at_rest(pairs, na
             assert rig._iso_not_before(head["valid_until"], now), (name, pid, where, head["valid_until"])
     for pid in p.derived:
         assert fresh_map[pid]["stale"] is False, (name, pid)
-    assert manifest["freshness"]["worker"] == "live" and manifest["freshness"]["deriving"] == [], name
+    assert rig._fresh_block_at_rest(manifest["freshness"]), (name, manifest["freshness"])
+
+
+_BLOCK = {"worker": "live", "heartbeat_age_s": 0.5, "deriving": [], "stream": {"state": "up"}}
 
 
 @pytest.mark.parametrize("path,kind,value,ok", [
@@ -282,9 +285,19 @@ def test_the_subject_carries_each_freshness_key_and_says_fresh_at_rest(pairs, na
     (("payload", "x", "compact", "pending"), "extra_key_in_subject", True, False),
     (("freshness", "x", "stale"), "extra_key_in_subject", True, False),
     (("freshness", "x", "stale"), "extra_key_in_subject", False, True),
-    (("manifest", "freshness"), "extra_key_in_subject", {"worker": "live", "deriving": []}, True),
-    (("manifest", "freshness"), "extra_key_in_subject", {"worker": "down", "deriving": []}, False),
-    (("manifest", "freshness"), "extra_key_in_subject", {"worker": "live", "deriving": ["x"]}, False),
+    (("manifest", "freshness"), "extra_key_in_subject", _BLOCK, True),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, worker="down"), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, deriving=["x"]), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, unexpected=1), False),
+    (("manifest", "freshness"), "extra_key_in_subject", {k: v for k, v in _BLOCK.items() if k != "stream"}, False),
+    (("manifest", "freshness"), "extra_key_in_subject", {k: v for k, v in _BLOCK.items() if k != "heartbeat_age_s"}, False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s="garbage"), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s=-1), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s=True), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s=None), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream="up"), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={}), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={"state": 1}), False),
     (("manifest", "freshness"), "extra_key_in_subject", None, False),
     # a freshness key whose value DIFFERS (both sides had it) is a value triple, never explained by an extra-key entry
     (("manifest", "panels", "x", "stale"), "value", False, False),
