@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,7 +23,8 @@ from levain.cockpit.firejournal import revoke_digest
 
 from levain import web_server
 from levain.cockpit.broker import Broker, Lifecycle
-from levain.cockpit.firejournal import PAIRED_PREFIX
+from levain.cockpit import firejournal
+from levain.cockpit.firejournal import PAIRED_PREFIX, CockpitDB, revision_identity
 from levain.dashboard import SubstrateSource
 from levain.web_server import make_server
 from tests._waits import scaled
@@ -396,6 +401,294 @@ def test_rt2_a_revoke_made_by_another_process_ends_the_stream_within_one_heartbe
         pump.join(5)
         s.close()
         assert "at" in done and done["at"] - t0 < 0.4 + 0.6, done
+
+
+# --- levain#231: a paired stream sees another process's revoke on its next pass ---------------------------------------
+# Every test here sets ``stream_heartbeat_s = 30.0``, so the heartbeat re-check cannot be what ends the stream: the
+# bounds below are the revision read on each pass, not the heartbeat.
+
+def _revoke_journal(httpd: Any, ids: "list[str] | None") -> None:
+    """A revoke written straight to the journal (no epoch of this server moves), as the box-side CLI writes it."""
+    CockpitDB(httpd.broker.data_root).revoke_devices(ids, by="box", now=datetime.now(timezone.utc))
+
+
+def _stream_up(httpd: Any, port: int, tok: str) -> tuple[socket.socket, list[tuple[float, bytes]], threading.Thread, dict]:
+    s, chunks, pump, done = _open_stream(port, tok)
+    w = httpd.stream_watcher
+    deadline = time.monotonic() + 5
+    while w.stream_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert w.stream_count == 1, "the stream did not open"
+    return s, chunks, pump, done
+
+
+def _flow(httpd: Any) -> tuple[threading.Event, threading.Thread]:
+    """Events published faster than any check cadence, until the returned event is set."""
+    w = httpd.stream_watcher
+    stop = threading.Event()
+
+    def publish() -> None:
+        while not stop.is_set():
+            with w._lock:
+                w._publish_locked("panel-changed", {"id": "tray", "etag": str(time.monotonic())})
+            time.sleep(0.02)
+
+    pub = threading.Thread(target=publish, daemon=True)
+    pub.start()
+    return stop, pub
+
+
+def _ends_within(pump: threading.Thread, done: dict, t0: float, bound: float) -> None:
+    pump.join(5)
+    assert "at" in done, "the stream did not end"
+    assert done["at"] - t0 < bound, done["at"] - t0
+
+
+@contextmanager
+def _revokes_seen_clean_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A revoke made inside this block is read by a stream's revision pass either before it or after its clean write,
+    never between the revoke's dirty marker and its clean one (a pass in that window reads None and would add a check
+    a test counting checks cannot tell apart)."""
+    gate = threading.Lock()
+    real_bump = firejournal.bump_revision
+    real_read = web_server._pair_revision
+
+    def bump(root: Any, *, dirty: bool) -> None:
+        if dirty:
+            gate.acquire()
+        try:
+            real_bump(root, dirty=dirty)
+        except BaseException:
+            if dirty:
+                gate.release()
+            raise
+        if not dirty:
+            gate.release()
+
+    def read(root: Any) -> "str | None":
+        with gate:
+            return real_read(root)
+
+    with monkeypatch.context() as m:
+        m.setattr(firejournal, "bump_revision", bump)
+        m.setattr(web_server, "_pair_revision", read)
+        yield
+
+
+def _spy_device_live(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    real = CockpitDB.device_live
+
+    def spy(self: Any, device_id: str) -> bool:
+        calls.append(device_id)
+        return real(self, device_id)
+
+    monkeypatch.setattr(CockpitDB, "device_live", spy)
+    return calls
+
+
+def test_231_a_revoke_by_the_terminal_cli_ends_an_open_stream_on_its_next_pass(src) -> None:
+    """The box-side ``levain cockpit pair --revoke`` writes the journal directly, so no epoch of this server moves."""
+    from levain.cli import main
+
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            assert main(["cockpit", "pair", "--data-root", str(httpd.broker.data_root), "--revoke", device]) == 0
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_by_another_os_process_ends_an_open_stream_on_its_next_pass(src) -> None:
+    repo_root = str(Path(__file__).resolve().parents[1])
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            subprocess.run([sys.executable, "-m", "levain", "cockpit", "pair", "--data-root",
+                            str(httpd.broker.data_root), "--revoke", device],
+                           check=True, timeout=60, env={**os.environ, "PYTHONPATH": repo_root},
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_whose_clean_write_fails_still_ends_the_open_stream(src, monkeypatch) -> None:
+    """The revoke commits and its marker stays dirty (the clean write cannot be made): a stream that cannot compare
+    the revision checks its device instead."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            real = firejournal.bump_revision
+            calls: list[int] = []
+
+            def only_the_first(*a: Any, **kw: Any) -> None:
+                calls.append(1)
+                if len(calls) > 1:
+                    raise OSError(28, "No space left on device")
+                real(*a, **kw)
+
+            monkeypatch.setattr(firejournal, "bump_revision", only_the_first)
+            monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0, raising=False)
+            _revoke_journal(httpd, [device])
+            t0 = time.monotonic()
+            assert revision_identity(httpd.broker.data_root) is None, "the marker stayed dirty"
+            _ends_within(pump, done, t0, 0.5 + 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_an_unreadable_revision_neither_ends_a_good_stream_nor_hides_a_revoke(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, chunks, pump, done = _stream_up(httpd, port, tok)
+        stop, pub = _flow(httpd)
+        try:
+            def denied(_root: Any) -> Any:
+                raise PermissionError(13, "Permission denied")
+
+            calls = _spy_device_live(monkeypatch)
+            monkeypatch.setattr(web_server, "revision_identity", denied)
+            before = len(_ids(chunks))
+            time.sleep(1.5)
+            assert "at" not in done, "a revision that cannot be read ended a good stream"
+            assert len(_ids(chunks)) > before, "the stream still got frames"
+            assert len(calls) <= 1.5 / 0.5 + 2, f"the uncomparable checks are rate limited, not {len(calls)}"
+            _revoke_journal(httpd, [device])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.5 + 0.6)
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_revoke_landing_between_the_credential_check_and_the_stream_is_seen_by_the_first_check(
+        src, monkeypatch) -> None:
+    """The baseline is the revision read BEFORE the lookup that admitted the request: a revoke committing after
+    ``verify_device`` returned moves it, so the first check (before the hello frame) sees the device gone."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        armed = threading.Event()
+        real = CockpitDB.verify_device
+
+        def verify_then_revoke(self: Any, *a: Any, **kw: Any) -> Any:
+            out = real(self, *a, **kw)
+            if armed.is_set():
+                armed.clear()
+                _revoke_journal(httpd, [device])
+            return out
+
+        monkeypatch.setattr(CockpitDB, "verify_device", verify_then_revoke)
+        armed.set()
+        s, chunks, pump, done = _open_stream(port, tok)
+        try:
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the revoke landed between the credential check and the stream"
+            assert b"event: hello" not in b"".join(c for _t, c in chunks), "no hello frame was written"
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_landing_between_a_cache_hit_and_the_stream_is_seen_by_the_first_check(src, monkeypatch) -> None:
+    """The hit path of the credential check: the stream's baseline is the revision that hit was compared with."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200   # primes the cache
+        armed = threading.Event()
+        real = web_server._pair_revision
+
+        def read_then_revoke(root: Any) -> "str | None":
+            value = real(root)
+            if armed.is_set():
+                armed.clear()
+                _revoke_journal(httpd, [device])
+            return value
+
+        monkeypatch.setattr(web_server, "_pair_revision", read_then_revoke)
+        armed.set()
+        s, chunks, pump, done = _open_stream(port, tok)
+        try:
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the revoke landed after the hit's revision read"
+            assert b"event: hello" not in b"".join(c for _t, c in chunks), "no hello frame was written"
+        finally:
+            s.close()
+
+
+def test_231_an_unrelated_devices_revoke_by_another_process_keeps_the_stream_and_checks_once(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, chunks, pump, done = _stream_up(httpd, port, tok_a)
+        calls = _spy_device_live(monkeypatch)
+        stop, pub = _flow(httpd)
+        try:
+            time.sleep(0.2)
+            calls.clear()
+            with _revokes_seen_clean_only(monkeypatch):
+                _revoke_journal(httpd, [b])
+            before = len(_ids(chunks))
+            time.sleep(1.5)
+            assert "at" not in done, "another device's revoke ended this stream"
+            assert len(_ids(chunks)) > before, "the stream still got frames"
+            assert calls.count(a) == 1, f"one check for the one new revision, not {calls}"
+            _revoke_journal(httpd, [a])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_revoke_landing_during_the_streams_own_recheck_is_seen_by_the_next_pass(src, monkeypatch) -> None:
+    """A check reads the revision BEFORE the journal and adopts it only when the check passed: a revoke landing
+    inside the check leaves a newer revision than the one adopted."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, _chunks, pump, done = _stream_up(httpd, port, tok_a)
+        armed = threading.Event()
+        real = CockpitDB.device_live
+
+        def live_then_revoke(self: Any, device_id: str) -> bool:
+            out = real(self, device_id)
+            if armed.is_set() and device_id == a:
+                armed.clear()
+                _revoke_journal(httpd, [a])
+                return True
+            return out
+
+        monkeypatch.setattr(CockpitDB, "device_live", live_then_revoke)
+        stop, pub = _flow(httpd)    # a pass per frame: the two checks are not each an idle poll apart
+        try:
+            armed.set()
+            with _revokes_seen_clean_only(monkeypatch):
+                _revoke_journal(httpd, [b])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the stream's check ran and the revoke landed inside it"
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
 
 
 # --- RQ-6 and the box-side CLI ---------------------------------------------------------------------------------------

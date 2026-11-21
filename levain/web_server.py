@@ -218,6 +218,7 @@ _PAIR_FOLLOWERS_MAX = 64          # requests that may wait on one token's lookup
 _PAIR_SLOW_LOOKUP_MS = 250        # a lookup that held its verify slot this long is logged (hold time, not refusals)
 _PAIR_SLOW_LOG_EVERY_S = 1.0      # ...as a warning at most this often; the others go to debug
 _PAIR_FOLLOW_GRACE_S = 2.0        # a follower waits the broker's own wait plus this for its leader's lookup
+_STREAM_UNCOMPARED_RECHECK_S = 0.5  # a paired stream with no clean revision to compare re-checks its device at most this often
 _PAIR_TOKEN_LEN = (16, 128)       # a header outside this length (or the header-safe shape) is never looked up (RT-3)
 _UNSET: Any = object()            # the per-request credential cache's empty mark (RS-1)
 # A browser paired by its own Turn on is labelled from its User-Agent by these words only (first match wins, so the
@@ -2324,7 +2325,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 self._engine_change_probe, self._watch_token, self._bare_watch_snapshot,
                 slow_s=self.stream_watcher.watch_s))
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
-        # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
+        # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3), as it
+        # does the journal's revocation revision, which a revoke by any process moves (levain#231)
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
         self.pair_claim_gate = threading.BoundedSemaphore(_PAIR_CLAIM_SLOTS)
         self.receipt_gate = threading.BoundedSemaphore(_RECEIPT_SLOTS)
@@ -2684,7 +2686,9 @@ class _Handler(GuardedHandler):
     _post_received_at: "str | None" = None
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
-    _pair_rev_seen: "str | None" = None     # the clean revision read just before it, None when there was none to compare
+    # the clean revision read just before it, None when there was none to compare; also the baseline a stream of this
+    # request compares against (levain#231)
+    _pair_rev_seen: "str | None" = None
     _pair_looked_at = 0.0      # the monotonic time of that read
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
     _frame_headers: "tuple[str, str] | None" = None
@@ -3077,6 +3081,7 @@ class _Handler(GuardedHandler):
                 if hit is not None:
                     if hit[1] == epoch and hit[3] == rev and time.monotonic() - hit[2] < _PAIR_VERIFIED_TTL_S:
                         self._pair_epoch_seen = hit[1]  # RU-3: a stream of this request compares against the entry's epoch
+                        self._pair_rev_seen = rev       # levain#231: ...and against the revision this hit was compared with
                         return hit[0]
                     srv.pair_verified.pop(key, None)
                 flight = srv.pair_flights.get(key)
@@ -3107,6 +3112,7 @@ class _Handler(GuardedHandler):
             now_rev = _pair_revision(srv.broker.data_root)
             if flight.seq > arrived or (flight.rev is not None and now_rev == flight.rev):
                 self._pair_epoch_seen = flight.epoch
+                self._pair_rev_seen = flight.rev    # levain#231: the revision the leader read before its lookup, or None
                 return flight.device
             if flight.rev is not None and now_rev is not None:
                 # a revoke landed after the leader read its answer and before this request: the answer is no longer
@@ -5285,30 +5291,51 @@ class _Handler(GuardedHandler):
             return False
 
     def _stream_allowed(self) -> "Callable[[bool], bool] | None":
-        """The change stream's per-pass check for a PAIRED principal (RU-3, RT-2 as amended): the revocation epoch is
-        compared on every pass (an int read); a changed one re-runs the device check, as does every pass once a
-        heartbeat interval has passed since the last full check, the data path included (G2; so a revoke made by
-        another process, ``levain cockpit pair --revoke-all``, ends the stream within one heartbeat even under a
-        steady event flow). At most the one frame already past its check when the revoke commits is written (G3).
-        Any other principal: None (a surface token is never revoked from the panel)."""
+        """The change stream's per-pass check for a PAIRED principal (RU-3, RT-2 as amended; levain#231): on every
+        pass the revocation epoch (an int read) and the journal's revocation revision (the file levain#228 reads, one
+        small read, no sqlite) are compared with the ones this stream holds. A moved epoch or revision re-runs the
+        device check, so a revoke made by another process (``levain cockpit pair --revoke``) is seen on the next
+        pass; a revision that cannot be compared (dirty, malformed or unreadable) is never adopted and never ends
+        the stream by itself: it re-runs the device check, at most once per ``_STREAM_UNCOMPARED_RECHECK_S``.
+        The baseline is the revision read before the lookup that admitted this request (``_pair_rev_seen``), never
+        one read here, after the credential check. In every check the epoch is read, then the revision, then the
+        device; the revision is adopted only when the device check passed. The heartbeat re-check stays: every pass
+        once a heartbeat interval has passed since the last full check runs the device check, the data path
+        included (G2), which covers a revoke that moves no revision. Only the device check answering False, or not
+        running, ends the stream. At most the one frame already past its check when the revoke commits is written
+        (G3). Any other principal: None (a surface token is never revoked from the panel)."""
         cred = self._credential()
         name = cred.get("name") if cred.get("class") == "token" else None
         if not isinstance(name, str) or not name.startswith(PAIRED_PREFIX):
             return None
         srv, device = self.server, name[len(PAIRED_PREFIX):]
-        seen = [self._pair_epoch_seen]
+        seen_epoch, seen_rev = [self._pair_epoch_seen], [self._pair_rev_seen]
+        last_full = [float("-inf")]
 
         def allowed(recheck: bool) -> bool:
-            epoch = srv.pair_epoch
-            if epoch == seen[0] and not recheck:
-                return True
-            seen[0] = epoch
+            epoch = srv.pair_epoch                                  # 1st
             broker = srv.broker
+            try:
+                # 2nd, BEFORE the journal read
+                rev = _pair_revision(broker.data_root) if broker is not None else None
+            except Exception:  # noqa: BLE001 - an identity that cannot be read is no identity: a recheck, never "unchanged"
+                rev = None
+            if not recheck and epoch == seen_epoch[0]:
+                if rev is not None and rev == seen_rev[0]:
+                    return True
+                if rev is None and time.monotonic() - last_full[0] < _STREAM_UNCOMPARED_RECHECK_S:
+                    return True
+            last_full[0] = time.monotonic()
             db = broker.active_db() if broker is not None else None
             try:
-                return db is not None and db.device_live(device)
+                ok = db is not None and db.device_live(device)      # 3rd
             except Exception:  # noqa: BLE001 - a check that cannot run ends the stream; the page reconnects
                 return False
+            if ok:
+                seen_epoch[0] = epoch
+                if rev is not None:
+                    seen_rev[0] = rev       # adopted only after a passing check; None never
+            return ok
 
         return allowed
 
