@@ -186,7 +186,12 @@ def live_marked_here() -> bool:
     pid, both read from the process's own environment. The real key's gate reads this, not :func:`live_marked`: a
     child that merely inherited a marked parent's environment, or a fork of it, has another pid and is not marked here
     until its own entry calls :func:`mark_live`. It stops a stray process, not a hostile one: a process that sets both
-    variables itself (or calls :func:`mark_live`) passes."""
+    variables itself (or calls :func:`mark_live`) passes.
+
+    Limits of the own-pid test: an exec of a marked process keeps its pid and its environment, so the new image
+    passes as marked whatever it is; and a process that inherited the markers could, by pid reuse, get the very pid
+    they name. And a marked parent's forked workers are not marked: each must call :func:`mark_live` itself before it
+    reaches the real key, or its sign is refused."""
     return os.environ.get(LIVE_ENV) == "1" and os.environ.get(LIVE_PID_ENV) == str(os.getpid())
 
 

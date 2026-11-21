@@ -148,13 +148,20 @@ def _is_real_key_dir_by_identity(target: Path, real: Path) -> bool:
     spelling: every EXISTING one of ``target`` and its ancestors, up to the root, is compared with the real directory
     (a path not made yet, the evidence directory, is judged by the ancestors that exist), and a regular file with more
     than one link is compared with the real key files (a hard link of the key). A stat that fails other than "not
-    there" is True (fail closed). A real directory that does not exist has no identity to alias."""
+    there" is True (fail closed). ``target`` is stat'ed once: the hard-link check reuses that answer.
+
+    A real directory that does not exist yet has no device and inode to compare, so there the two resolved spellings
+    are compared with case folded, and a match is True (fail closed): on a case-folding volume a case-different
+    spelling, made now, would be the directory the key later lands in. On a case-sensitive volume this also refuses a
+    distinct directory whose spelling differs from the real one only by case, to a process not marked."""
     try:
         real_st = os.stat(real)
     except (FileNotFoundError, NotADirectoryError):
-        return False
+        folded, real_folded = str(target).casefold(), str(real).casefold()
+        return folded == real_folded or folded.startswith(real_folded.rstrip(os.sep) + os.sep)
     except OSError:
         return True
+    target_st = None
     for a in (target, *target.parents):
         try:
             st = os.stat(a)
@@ -162,13 +169,12 @@ def _is_real_key_dir_by_identity(target: Path, real: Path) -> bool:
             continue
         except OSError:
             return True
+        if a is target:
+            target_st = st
         if os.path.samestat(st, real_st):
             return True
-    try:
-        st = os.stat(target)
-    except OSError:
-        return False
-    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+    st = target_st
+    if st is not None and stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
         for name in _REAL_KEY_FILES:
             try:
                 if os.path.samestat(st, os.stat(real / name)):
@@ -233,6 +239,17 @@ def refuse_real_key_unless_live(path: Path | str, what: str = "the key") -> Path
             "Fix: start it through `levain`, or call levain.home_guard.mark_live() first thing in your own launcher "
             "(a test or scratch run cannot reach it at all).")
     return target
+
+
+def refuse_real_key_dir_unless_live(path: Path | str, what: str = "the key directory") -> Path:
+    """:func:`refuse_real_key_unless_live` for a directory a caller will create, or write under, and refuses as a link:
+    the parent is judged and the resolved parent it returns is joined with ``path``'s last name, which is judged too,
+    and that joined path is returned for every later act. The last name is kept as given, not resolved, so the caller's
+    own refusal of a link there (an ``lstat``, an ``O_NOFOLLOW`` open) still sees the link rather than where it points."""
+    p = Path(path).expanduser()
+    joined = refuse_real_key_unless_live(p.parent, what) / p.name
+    refuse_real_key_unless_live(joined, what)
+    return joined
 
 
 @dataclass(frozen=True)
@@ -1035,11 +1052,10 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
     guess offline. Returns the path, or ``evidence not written (why)``: a diagnostic never fails a sign and never
     replaces the refusal's own text. The one raise is :class:`RealKeyUnmarked`, for a directory inside the real key
     directory when this process did not mark itself live, or is a test or scratch run (:func:`refuse_real_key_unless_live`),
-    before anything is made."""
-    refuse_real_key_unless_live(Path(key_path).parent / _SIGN_FAILURE_DIR, "the sign-failures directory")
+    before anything is made; every later act uses the directory that gate returned, never ``key_path`` rebuilt."""
+    directory = refuse_real_key_dir_unless_live(Path(key_path).parent / _SIGN_FAILURE_DIR, "the sign-failures directory")
     dfd = None
     try:
-        directory = Path(key_path).parent / _SIGN_FAILURE_DIR
         try:
             os.mkdir(directory, 0o700)
         except FileExistsError:

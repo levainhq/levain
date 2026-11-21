@@ -28,6 +28,9 @@ from levain.cockpit.custody import APPLE_PROVIDER, SIDECAR_FORMAT, SIDECAR_SUFFI
 from levain.consent import terminal_sign as ts
 
 LEVAIN_ROOT = Path(levain.__file__).resolve().parent.parent      # the tree the test run imported, which the child imports
+#: The module's own default-directory function, taken at import, before the conftest's autouse fixture replaces it for
+#: each test; a test that calls it replaces ``K.pwd_key_dir`` first, so it never names the operator's directory.
+_REAL_KEY_DIR = ts._real_key_dir
 
 CHILD = '''
 import pwd
@@ -88,6 +91,13 @@ if mode == "factory":
 if mode == "sign-failure":
     K._write_sign_failure(Path(account) / ".levain" / "keys" / ts.KEY_LABEL, fp="SHA256:x", message=b"x", signature="",
                           sig_type="x", flags=0, counter=1, detail="d", namespace="n", attempt=1, elapsed=0.0)
+    sys.exit(0)
+if mode == "create-real":           # terminal-key create with the real key directory named explicitly
+    made = []
+    rep = ts.create(key_dir=Path(account) / ".levain" / "keys", creator=lambda d, label: made.append(str(d)),
+                    in_agent_session=lambda: False)
+    print("made" if made else "not-made")
+    sys.stderr.write(rep.text + "\\n")
     sys.exit(0)
 out = ts.sign(b"x", key_dir=Path(sys.argv[4])) if mode == "sign-keydir" else ts.sign(b"x")
 print(out.state, out.reason)
@@ -339,23 +349,31 @@ def real(tmp_path, monkeypatch):
     return r
 
 
-def test_the_gate_judges_identity_not_spelling(real, tmp_path):
-    """A case-different spelling (this volume folds case), a link-made spelling (a firmlink's shape, made with a symlink
-    here) and a hard link of the key file are the real key; a COPY is another file and is out of scope (L1 F1, L2 MED 1)."""
-    import os
-
-    key = real / ts.KEY_LABEL
-    key.write_text("stub, not a key")
+def test_the_gate_judges_a_case_different_spelling_by_identity(real, tmp_path):
+    """A case-different spelling (on a volume that folds case) is the real key directory (L1 F1). Skipped where the
+    volume does not fold case: there no such spelling names the directory."""
+    (real / ts.KEY_LABEL).write_text("stub, not a key")
     folded = tmp_path / "ACCT" / ".LEVAIN" / "KEYS"
     if not folded.exists():
         pytest.skip("a case-sensitive volume: no case-different spelling of the directory exists")
     assert str(folded.resolve()) != str(real.resolve())     # resolve() does not fold case: the spelling check alone passes it
-    firm = tmp_path / "firm"
-    firm.symlink_to(tmp_path)
-    for path in (folded, folded / ts.KEY_LABEL, folded / "sign-failures",     # the evidence directory, not made yet
-                 firm / "acct" / ".levain" / "keys" / ts.KEY_LABEL):
+    for path in (folded, folded / ts.KEY_LABEL, folded / "sign-failures"):     # the evidence directory, not made yet
         with pytest.raises(K.RealKeyUnmarked, match="real key directory"):
             K.refuse_real_key_unless_live(path)
+
+
+def test_the_gate_judges_identity_not_spelling(real, tmp_path):
+    """A link-made spelling (a firmlink's shape, made with a symlink here) and a hard link of the key file are the real
+    key; a COPY is another file and is out of scope (L1 F1, L2 MED 1). Runs on any volume (L3 r1: the case-folded
+    check, which needs a folding volume, is its own test above)."""
+    import os
+
+    key = real / ts.KEY_LABEL
+    key.write_text("stub, not a key")
+    firm = tmp_path / "firm"
+    firm.symlink_to(tmp_path)
+    with pytest.raises(K.RealKeyUnmarked, match="real key directory"):
+        K.refuse_real_key_unless_live(firm / "acct" / ".levain" / "keys" / ts.KEY_LABEL)
     other = tmp_path / "other"
     other.mkdir()
     hard = other / "renamed"
@@ -516,3 +534,106 @@ def test_a_real_band_hook_a_test_starts_with_its_own_environment_cannot_sign_wit
     assert rows == [("unsigned", "signer-error")], (rows, answered.stdout, answered.stderr)
     assert not marker.exists() or "-Y sign" not in marker.read_text(), marker.read_text()
     assert not (keys / "sign-failures").exists()
+
+
+# --- levain#237 L3 round 1 --------------------------------------------------------------------------------------------
+
+def _clear_keys(d: Path) -> None:
+    """The stand-in's key directory, emptied (scratch files under tmp_path): nothing enrolled, so create would make one."""
+    for p in d.iterdir():
+        p.unlink()
+
+
+def test_create_with_the_real_key_directory_named_explicitly_is_refused_before_anything_is_made(real, monkeypatch):
+    """L3 r1 F1 (codex, gemini): the gate sat only on the default branch, so ``create(key_dir=<the real dir>)`` reached
+    the creator. In process this is a test run, which the gate refuses inside the real directory whatever the markers;
+    the in-test allowlist is stepped aside (outside a test run it returns the path unchanged), so the refusal is the
+    gate's."""
+    monkeypatch.setattr(K, "refuse_real_key_in_tests", lambda path, what="the key": None if path is None else Path(path))
+    made = []
+    rep = ts.create(key_dir=real, creator=lambda d, label: made.append(d), in_agent_session=lambda: False)
+    assert made == [], rep.text
+    assert not rep.created and "real key directory" in rep.text and "nothing was created" in rep.text, rep.text
+
+
+def test_an_unmarked_production_child_naming_the_real_key_directory_cannot_create_a_key(rig):
+    """The same in a bare child that is not a test run and not a scratch run, and did not mark itself live."""
+    _clear_keys(rig.keys)
+    done = rig.run("create-real")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["not-made"], (done.stdout, done.stderr)
+    assert "real key directory" in done.stderr and "mark_live" in done.stderr, done.stderr
+    assert list(rig.keys.iterdir()) == []
+
+
+def test_a_child_marked_live_naming_the_real_key_directory_reaches_the_creator(rig):
+    _clear_keys(rig.keys)
+    done = rig.run("mark-create-real")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["made"], (done.stdout, done.stderr)
+
+
+def _relocating_gate(given: Path, judged: Path):
+    """A stand-in for ``refuse_real_key_unless_live`` that answers every path under ``given`` with the same place under
+    ``judged``: whatever is written or returned under ``judged`` came from the gate's answer, never the caller's path."""
+    def gate(path, what="the key"):
+        p = Path(path)
+        try:
+            return judged / p.relative_to(given)
+        except ValueError:
+            return p
+    return gate
+
+
+def test_write_sign_failure_writes_only_under_the_path_the_gate_returned(tmp_path, monkeypatch):
+    """L3 r1 F2 (codex, gemini): the writer discarded the gate's answer and rebuilt the path it was given, so a link
+    retargeted between the gate and the mkdir was followed. A real retarget between the two is a race; the gate's
+    answer is replaced by another directory instead, which shows the write lands where the gate said."""
+    given = tmp_path / "given-keys"
+    given.mkdir(mode=0o700)
+    judged = tmp_path / "judged-keys"
+    judged.mkdir(mode=0o700)
+    monkeypatch.setattr(K, "refuse_real_key_unless_live", _relocating_gate(given, judged))
+    written = _write(given / ts.KEY_LABEL)
+    assert Path(written).parent == judged / "sign-failures", written
+    assert not (given / "sign-failures").exists()
+
+
+def test_the_default_key_directory_is_the_path_the_gate_returned(tmp_path, monkeypatch):
+    """L3 r1 F2: ``_real_key_dir`` discarded the gate's answer too."""
+    real = tmp_path / "acct" / ".levain" / "keys"
+    judged = tmp_path / "judged"
+    monkeypatch.setattr(K, "pwd_key_dir", lambda: real)
+    monkeypatch.setattr(K, "refuse_real_key_unless_live", _relocating_gate(real.parent, judged))
+    assert _REAL_KEY_DIR() == judged / "keys"
+
+
+def test_no_password_entry_is_a_key_error_of_levains_family_not_a_bare_key_error(monkeypatch):
+    """L3 r1 F3 (deepseek, gemini): ``_real_key_dir`` asked the password database before the gate, so a uid with no
+    entry raised a bare ``KeyError`` out of ``find_key``, past every caller that handles ``KeyError_``; ``sign`` turned
+    it into a signer-error naming only the bare error."""
+    def unnamed():
+        raise KeyError("getpwuid(): uid not found")
+
+    monkeypatch.setattr(K, "pwd_key_dir", unnamed)
+    monkeypatch.setattr(ts, "_real_key_dir", _REAL_KEY_DIR)     # the module's own, not the conftest's stand-in
+    with pytest.raises(K.KeyError_, match="cannot be named"):
+        ts.find_key()
+    out = ts.sign(b"x", signer_factory=lambda path, timeout=None: pytest.fail("a signer was made"))
+    assert (out.state, out.reason) == ("unsigned", "signer-error"), out
+    assert "cannot be named" in out.detail, out.detail
+
+
+def test_the_gate_folds_case_for_a_real_key_directory_not_made_yet(tmp_path, monkeypatch):
+    """L3 r1 F4 (deepseek, gemini): with the real directory not made yet there is no inode to compare, and the identity
+    check returned False, so a case-different spelling passed and could make the directory the key later lands in.
+    Fail closed: a case-folded spelling is refused, on any volume."""
+    real = tmp_path / "acct" / ".levain" / "keys"
+    real.parent.mkdir(parents=True)
+    monkeypatch.setattr(K, "pwd_key_dir", lambda: real)
+    for path in (tmp_path / "ACCT" / ".LEVAIN" / "KEYS", tmp_path / "acct" / ".levain" / "Keys" / "sign-failures"):
+        with pytest.raises(K.RealKeyUnmarked, match="real key directory"):
+            K.refuse_real_key_unless_live(path)
+    assert not real.exists()
+    sibling = tmp_path / "acct" / ".levain" / "keys-other" / ts.KEY_LABEL
+    assert K.refuse_real_key_unless_live(sibling) == sibling.resolve()

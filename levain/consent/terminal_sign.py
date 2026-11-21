@@ -444,13 +444,17 @@ class TerminalKey:
 def _real_key_dir() -> Path:
     """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``. Only a
     process that marked itself live, and is not a test or scratch run, gets it (``keys.refuse_real_key_unless_live``);
-    any other raises ``RealKeyUnmarked`` here. That includes the READ-only callers (``find_key``, ``status``,
-    ``_create``), on purpose: no unmarked read-only caller was found in levain or in flow's scripts (levain#237 L1 Q4),
-    so such a process gets a refusal (``status`` a warning row, ``sign`` an unsigned ``signer-error``) rather than a
-    look at the real key directory."""
-    real = _keys.pwd_key_dir()
-    _keys.refuse_real_key_unless_live(real, "the real key directory")
-    return real
+    any other raises ``RealKeyUnmarked`` here. That includes the READ-only callers (``find_key``, ``status``), on
+    purpose: no unmarked read-only caller was found in levain or in flow's scripts (levain#237 L1 Q4), so such a
+    process gets a refusal (``status`` a warning row, ``sign`` an unsigned ``signer-error``) rather than a look at the
+    real key directory. A uid with no password entry raises ``KeyError_`` (a bare ``KeyError`` would pass every caller
+    that handles ``KeyError_``). Returns the path the gate judged (``keys.refuse_real_key_dir_unless_live``)."""
+    try:
+        real = _keys.pwd_key_dir()
+    except (OSError, RuntimeError, KeyError) as exc:
+        raise KeyError_(f"the operator's real key directory cannot be named ({type(exc).__name__}: {exc}); "
+                        "refused") from None
+    return _keys.refuse_real_key_dir_unless_live(real, "the real key directory")
 
 
 def _own_regular_file(path: Path) -> bool:
@@ -475,6 +479,9 @@ def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     whatever the environment says, and only a process that marked itself live gets it: any other (and a test or
     scratch run) raises ``keys.RealKeyUnmarked``, a ``KeyError_``, before the directory is looked at
     (:func:`_real_key_dir`)."""
+    # An explicit key_dir is read WITHOUT the live gate, on purpose: this is a read-only look (status rows, the hooks'
+    # "is there a key" checks) and the levain#237 L2 ruling kept those working in an unmarked process; nothing is
+    # signed here, and sign() gates key.path before any signer is made. create() gates its directory itself.
     d = Path(key_dir) if key_dir is not None else _real_key_dir()
     _keys.refuse_real_key_in_tests(d, "the key directory")
     try:
@@ -555,7 +562,9 @@ def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = 
     """``terminal-key create``: one Secure Enclave key labelled :data:`KEY_LABEL` whose every signature needs Touch
     ID, in the real levain home's key directory. Refuses (nothing created) inside any agent session, judged by
     ``in_agent_session`` (default ``levain.consent.band.agent_session_caller``, the band's one detector) before the
-    key directory is touched, and when a terminal key is already enrolled. ``creator`` is
+    key directory is touched, when a terminal key is already enrolled, and when the key directory, whether ``key_dir``
+    names it or it is the default, is the real one in a process that did not mark itself live, or in a test or scratch
+    run (``keys.refuse_real_key_dir_unless_live``). ``creator`` is
     ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
     Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report. ``created`` is
     True once ``creator`` has returned a key, even when printing the instructions then fails; an interrupt at the
@@ -656,6 +665,8 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
     try:
         d = Path(key_dir) if key_dir is not None else _real_key_dir()
         _keys.refuse_real_key_in_tests(d, "the key directory")
+        # create WRITES here, so every directory, named or default, passes the live gate and only its answer is used
+        d = _keys.refuse_real_key_dir_unless_live(d, "the key directory")
         if find_key(d) is not None:
             return CreateReport(False, "refused: a terminal key is already enrolled; `levain band terminal-key "
                                        "status` shows it (nothing was created)")
