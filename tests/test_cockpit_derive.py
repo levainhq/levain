@@ -961,7 +961,7 @@ def test_unknown_input_detail_carries_the_failure_type(tmp_path, monkeypatch):
     loop.stop()
 
 
-def test_a_panel_whose_only_input_cannot_be_fingerprinted_derives_by_the_timers_and_the_backstop_only():
+def test_a_panel_whose_only_input_cannot_be_fingerprinted_is_not_derived_by_that_input_but_by_the_backstop():
     @dataclass(frozen=True)
     class Unknown:       # a kind fingerprint() does not know
         name: str = "x"
