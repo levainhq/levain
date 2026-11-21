@@ -52,7 +52,7 @@ from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.keys import KeyError_, normalise_public_key, refuse_real_key_in_tests
 from levain.launch import child_env
 
-__all__ = ["APPLE_PROVIDER", "BIOUTIL", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar",
+__all__ = ["APPLE_PROVIDER", "BIOUTIL", "LEVAIN_SIGN", "SIGNER_FORMAT", "create_levain_sign", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar",
            "create_passphrase", "create_touch_id", "ctk_status", "custody_note", "declared_custody", "default_custody",
            "default_key_dir", "is_encrypted_file", "list_identities", "passphrase_problem", "point_sha1", "read_sidecar",
            "sidecar_path"]
@@ -62,6 +62,10 @@ SC_AUTH = Path("/usr/sbin/sc_auth")
 SIDECAR_SUFFIX = ".levain-key.json"
 SIDECAR_FORMAT = "levain-key/1"
 TOUCH_ID, PASSPHRASE = "touch-id", "passphrase"
+# levain#191 R1: a key the Secure Enclave helper (levain/native/levain_sign.swift) made is custody touch-id with this
+# "provider" (a name, never a library ssh-keychain loads: it is not in _PROVIDERS) and this signer format, no ctk_hash
+LEVAIN_SIGN = "levain-sign"
+SIGNER_FORMAT = "levain-sign/1"
 # the only library a sidecar may name for ssh-keygen to load
 _PROVIDERS = frozenset({APPLE_PROVIDER})
 _LABEL = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -80,6 +84,7 @@ class Sidecar:
     provider: str | None = None
     ctk_hash: str | None = None
     label: str | None = None
+    signer: str | None = None        # "levain-sign/1" for a helper key, None for every other
 
 
 @dataclass(frozen=True)
@@ -132,21 +137,29 @@ def read_sidecar(key_path: Path) -> Sidecar | None:
         data = None
     if not isinstance(data, dict) or data.get("format") != SIDECAR_FORMAT:
         raise KeyError_(f"{path} is not a {SIDECAR_FORMAT} sidecar")
-    custody, provider, ctk_hash, label = (data.get("custody"), data.get("provider"), data.get("ctk_hash"),
-                                          data.get("label"))
+    custody, provider, ctk_hash, label, signer = (data.get("custody"), data.get("provider"), data.get("ctk_hash"),
+                                                  data.get("label"), data.get("signer"))
     if custody not in (TOUCH_ID, PASSPHRASE):
         raise KeyError_(f"{path} names custody {str(custody)[:40]!r}; a sidecar names touch-id or passphrase")
-    if provider is not None and provider not in _PROVIDERS:
+    helper_key = provider == LEVAIN_SIGN
+    if provider is not None and provider not in _PROVIDERS and not helper_key:
         raise KeyError_(f"{path} names provider {str(provider)[:80]!r}, which levain does not load "
-                        f"(only {', '.join(sorted(_PROVIDERS))})")
-    if custody == TOUCH_ID and (provider is None or not isinstance(ctk_hash, str)
-                                or not _SHA1_HEX.fullmatch(ctk_hash)):
-        raise KeyError_(f"{path}: a touch-id sidecar names its provider and its CTK identity hash")
-    if custody == PASSPHRASE and (provider is not None or ctk_hash is not None):
-        raise KeyError_(f"{path}: a passphrase sidecar names no provider or identity")
+                        f"(only {', '.join(sorted(_PROVIDERS))}, or its own {LEVAIN_SIGN})")
+    # exactly three shapes (levain#191 R1): touch-id + the Apple provider + a CTK hash (old), touch-id + levain-sign +
+    # signer levain-sign/1 + no CTK hash (new), passphrase; anything else is refused
+    if custody == TOUCH_ID and helper_key:
+        if ctk_hash is not None or signer != SIGNER_FORMAT:
+            raise KeyError_(f"{path}: a {LEVAIN_SIGN} sidecar names signer {SIGNER_FORMAT!r} and no CTK identity hash")
+    elif custody == TOUCH_ID:
+        if provider is None or not isinstance(ctk_hash, str) or not _SHA1_HEX.fullmatch(ctk_hash):
+            raise KeyError_(f"{path}: a touch-id sidecar names its provider and its CTK identity hash")
+        if signer is not None:
+            raise KeyError_(f"{path}: only a {LEVAIN_SIGN} sidecar names a signer")
+    if custody == PASSPHRASE and (provider is not None or ctk_hash is not None or signer is not None):
+        raise KeyError_(f"{path}: a passphrase sidecar names no provider, identity or signer")
     if label is not None and not isinstance(label, str):
         raise KeyError_(f"{path}: the label is not text")
-    return Sidecar(custody, provider, ctk_hash, label)
+    return Sidecar(custody, provider, ctk_hash, label, signer)
 
 
 def _write_new(path: Path, data: bytes, mode: int) -> None:
@@ -171,7 +184,7 @@ def _write_new(path: Path, data: bytes, mode: int) -> None:
 
 def _write_sidecar(key_path: Path, sidecar: Sidecar, made: list[Path]) -> None:
     body: dict[str, Any] = {"format": SIDECAR_FORMAT, "custody": sidecar.custody}
-    for name in ("provider", "ctk_hash", "label"):
+    for name in ("provider", "ctk_hash", "label", "signer"):
         if getattr(sidecar, name) is not None:
             body[name] = getattr(sidecar, name)
     _write_new(sidecar_path(key_path), (json.dumps(body, sort_keys=True, indent=1) + "\n").encode(), 0o600)
@@ -193,9 +206,26 @@ def _strings(blob: bytes, count: int) -> tuple[list[bytes], bytes]:
     return out, blob
 
 
+def _is_helper_key(private: Path) -> bool:
+    """Whether the sidecar beside ``private`` names the levain-sign helper (provider or signer). Judged on the
+    sidecar's text alone, bounded, never raising: a malformed sidecar is not a helper key here (``read_sidecar`` is the
+    one that refuses it), and the blob itself is never opened."""
+    try:
+        with sidecar_path(private).open("rb") as fh:
+            raw = fh.read(_FILE_MAX + 1)
+        data = json.loads(raw.decode("utf-8")) if len(raw) <= _FILE_MAX else None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(data, dict) and (data.get("provider") == LEVAIN_SIGN
+                                       or (isinstance(data.get("signer"), str) and data["signer"].startswith("levain-sign")))
+
+
 def _private_header(private: Path) -> tuple[str, bytes] | None:
     """``(cipher name, public key blob)`` of an OpenSSH-format private key file, None when the file is
-    not one (or cannot be read)."""
+    not one (or cannot be read). A key whose sidecar says it is a levain-sign key is decided by that, first: its file
+    is a Secure Enclave blob, never parsed here (levain#191 R2)."""
+    if _is_helper_key(private):
+        return None
     try:
         with private.open("rb") as fh:
             raw = fh.read(_FILE_MAX + 1)
@@ -313,11 +343,49 @@ def _delete_identity(digest: str, sc_auth: Path | str) -> str | None:
     return None
 
 
+def _levain_sign_status(public_key: str, key_dir: Path | None, helper: Path | None) -> tuple[bool | None, str] | None:
+    """The helper's live answer (levain#191 R5) for a levain-sign key whose ``.pub`` is ``public_key``, found in
+    ``key_dir`` (default the real key directory, which a test or scratch run cannot name: None there), or None when no
+    such key is there. Zero UI: the helper's ``status`` allows no interaction."""
+    from levain.consent import se_signer
+    try:
+        d = Path(key_dir) if key_dir is not None else default_key_dir()
+        pubs = sorted(d.glob("*.pub"))[:64] if d.is_dir() else []
+    except Exception:  # noqa: BLE001 - no key directory to look in is "no helper key", never a failure
+        return None
+    want = public_key.split()[:2]
+    for pub in pubs:
+        try:
+            with pub.open("rb") as fh:
+                words = fh.read(16 * 1024).decode("ascii").split()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if words[:2] != want:
+            continue
+        private = pub.with_name(pub.name[:-4])
+        try:
+            sidecar = read_sidecar(private)
+        except KeyError_:
+            continue
+        if sidecar is None or sidecar.provider != LEVAIN_SIGN:
+            continue
+        try:
+            built = helper if helper is not None else se_signer.ensure_helper()
+        except se_signer.SeSignerError as exc:
+            return None, f"the levain-sign helper is not available ({exc}): custody as recorded"
+        return se_signer.key_status(private, helper=built)
+    return None
+
+
 def ctk_status(public_key: str, *, sc_auth: Path | str = SC_AUTH, identities: list[Identity] | None = None,
-               platform: str | None = None) -> tuple[bool | None, str]:
+               platform: str | None = None, key_dir: Path | None = None,
+               helper: Path | None = None) -> tuple[bool | None, str]:
     """A touch-id key's CTK identity on THIS Mac: ``(True, ...)`` present with protection ``bio``,
     ``(False, ...)`` present with any other protection, ``(None, ...)`` not on this Mac (or not a Mac),
-    where only the recorded custody can be shown."""
+    where only the recorded custody can be shown. When no CTK identity matches and a levain-sign key in the key
+    directory (``key_dir``, default the real one) has this public key, the answer is the helper's ``status``
+    (:func:`levain.consent.se_signer.key_status`): ``(True, ...)`` it needs interaction to sign, ``(False, ...)`` it
+    signed with none, ``(None, ...)`` its blob is not this Mac's. ``helper`` is for tests (default the cached build)."""
     if (platform or sys.platform) != "darwin":
         return None, "not a Mac: custody as recorded"
     digest = point_sha1(public_key)
@@ -327,6 +395,9 @@ def ctk_status(public_key: str, *, sc_auth: Path | str = SC_AUTH, identities: li
         identities = list_identities(sc_auth=sc_auth)
     found = [i for i in identities if i.hash == digest]
     if not found:
+        via_helper = _levain_sign_status(public_key, key_dir, helper)
+        if via_helper is not None:
+            return via_helper
         return None, "no CTK identity for it on this Mac: custody as recorded"
     if all(i.prot == "bio" for i in found):
         return True, "CTK identity on this Mac, protection bio"
@@ -581,6 +652,41 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
     return CreatedKey(key, pub, normal, TOUCH_ID, label, ident.hash)
+
+
+def create_levain_sign(key_dir: Path | None = None, label: str | None = None, *, helper: Path | None = None,
+                       presence: bool = True, platform: str | None = None,
+                       stamp: Callable[[], str] | None = None) -> CreatedKey:
+    """A Secure Enclave key made by the levain-sign helper (levain#191 R1, R2): custody ``touch-id``, sidecar provider
+    ``levain-sign`` and signer ``levain-sign/1``, no CTK identity. ``<label>`` is the helper's blob (0600, not an
+    OpenSSH private key), ``<label>.pub`` the ``sk-ecdsa ... ssh:`` line, ``<label>.levain-key.json`` the sidecar.
+    ``presence`` (the default, and the only value the product uses) adds the user-presence access control: a Touch ID
+    sheet at each sign; ``False`` is for tests, which must show no sheet. ``helper`` is the compiled binary (default
+    the per-user cache build). Any failure removes the files this call made."""
+    from levain.consent import se_signer
+    if (platform or sys.platform) != "darwin":
+        raise KeyError_("the Secure Enclave helper is macOS only; on this machine use --custody passphrase")
+    label = _check_label(label or f"levain-{(stamp or _stamp)()}")
+    d = _key_dir(key_dir)
+    key, pub = _destinations(d, label)
+    made: list[Path] = []
+    kept = False
+    try:
+        built = helper if helper is not None else se_signer.ensure_helper()
+        se_signer.create_key(key, presence=presence, helper=built)
+        made.append(key)
+        normal = normalise_public_key(se_signer.public_key_line(key, helper=built))
+        _write_new(pub, f"{normal} {label}\n".encode("ascii"), 0o644)
+        made.append(pub)
+        _write_sidecar(key, Sidecar(TOUCH_ID, LEVAIN_SIGN, None, label, SIGNER_FORMAT), made)
+        kept = True
+    except se_signer.SeSignerError as exc:
+        raise KeyError_(f"the Secure Enclave helper could not make the key: {exc}") from None
+    finally:
+        if not kept:
+            for path in made:
+                path.unlink(missing_ok=True)
+    return CreatedKey(key, pub, normal, TOUCH_ID, label, None)
 
 
 def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> list[tuple[Path, str]]:

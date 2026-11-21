@@ -522,7 +522,8 @@ def status(key_dir: Path | None = None, *, sc_auth: Path | str = SC_AUTH, identi
         return StatusReport("not enrolled", "not enrolled: answers at the terminal are recorded unsigned")
     try:
         fp = _keys.fingerprint_of(key.public_key)
-        ok, note = ctk_status(key.public_key, sc_auth=sc_auth, identities=identities, platform=platform)
+        ok, note = ctk_status(key.public_key, sc_auth=sc_auth, identities=identities, platform=platform,
+                              key_dir=key_dir)
     except Exception as exc:  # noqa: BLE001 - as above (sc_auth missing is an OSError, a hang a TimeoutExpired)
         return StatusReport("warning", f"WARNING: the terminal key's identity cannot be checked: {_one_line(exc)}",
                             key.public_key)
@@ -557,6 +558,28 @@ def enroll_command(public_path: Path | str) -> str:
                        "--custody", TOUCH_ID, "--signing-key", KEY_WORD])
 
 
+def default_creator(*, platform: str | None = None, swiftc: Path | str | None = None,
+                    machine: str | None = None) -> tuple[Callable[..., Any], str | None]:
+    """``(creator, why)`` for ``terminal-key create`` when none is injected (levain#191 R6): the levain-sign helper
+    (``custody.create_levain_sign``, a presence-gated Secure Enclave key) on a Mac with ``/usr/bin/swiftc`` and a Secure
+    Enclave (Apple silicon: ``arm64``), else the Apple CTK path (``custody.create_touch_id``) with ``why`` saying in one
+    line why the helper was not used. ``why`` is None when the helper is used."""
+    import platform as _platform
+    from levain.cockpit.custody import create_levain_sign, create_touch_id
+    from levain.consent import se_signer as _se
+    plat = platform or sys.platform
+    if plat != "darwin":
+        return create_touch_id, "the levain-sign helper is macOS only, so this key came from the Apple CTK path"
+    compiler = Path(swiftc if swiftc is not None else _se.SWIFTC)
+    if not compiler.exists():
+        return create_touch_id, (f"{compiler} is missing (xcode-select --install adds it), so this key came "
+                                          "from the Apple CTK path, not the levain-sign helper")
+    if (machine or _platform.machine()) != "arm64":
+        return create_touch_id, ("no Secure Enclave found for the levain-sign helper (not Apple silicon), so "
+                                          "this key came from the Apple CTK path")
+    return create_levain_sign, None
+
+
 def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = None,
            in_agent_session: Callable[[], bool] | None = None) -> CreateReport:
     """``terminal-key create``: one Secure Enclave key labelled :data:`KEY_LABEL` whose every signature needs Touch
@@ -565,7 +588,8 @@ def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = 
     key directory is touched, when a terminal key is already enrolled, and when the key directory, whether ``key_dir``
     names it or it is the default, is the real one in a process that did not mark itself live, or in a test or scratch
     run (``keys.refuse_real_key_dir_unless_live``). ``creator`` is
-    ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
+    the door to a real key (default :func:`default_creator`: the levain-sign helper, else ``custody.create_touch_id``);
+    tests inject theirs.
     Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report. ``created`` is
     True once ``creator`` has returned a key, even when printing the instructions then fails; an interrupt at the
     moment ``creator`` returns is told apart by looking for the key again."""
@@ -673,8 +697,9 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
     except Exception as exc:  # noqa: BLE001 - a key directory that cannot be read is a refusal, never a creation
         return CreateReport(False, f"refused: the key directory cannot be read: {_one_line(exc)} "
                                    "(nothing was created)")
+    why_old: str | None = None
     if creator is None:
-        from levain.cockpit.custody import create_touch_id as creator
+        creator, why_old = default_creator()
     progress.key_dir, progress.started = d, True
     try:
         progress.made = creator(d, KEY_LABEL)
@@ -683,7 +708,7 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
     except Exception as exc:  # noqa: BLE001 - as above
         return CreateReport(False, f"not created: {_one_line(exc)}")
     m = progress.made
-    return _created_report(m.path, m.public_path, m.public_key)
+    return _created_report(m.path, m.public_path, m.public_key, why_old)
 
 
 # ---------------------------------------------------------------------------------------------------

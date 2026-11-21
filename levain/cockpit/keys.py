@@ -1122,8 +1122,94 @@ def _prune_sign_failures(dfd: int, *, just_written: str) -> None:
             pass
 
 
+def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str, bound: float,
+                        ssh_keygen: Path | str, helper: Path | None) -> Signer:
+    """The ``sign`` of a levain-sign key (levain#191 R3, R4): ONE helper call per signature, with the user-presence
+    sheet on, in ``namespace``, bounded by ``bound`` seconds for the helper and its check together. No retry loop
+    here: the helper's silent same-context retries are the only ones, so there is never a second sheet. The signature
+    the helper returns is verified against the key's public half (:func:`levain.authority_sig.verify_link_sig`, which
+    also needs the presence flag) BEFORE it is returned, so an empty or unverifiable one can never leave this function.
+    Every attempt, whatever its outcome, appends one line to ``<key dir>/sign-log.jsonl``
+    (:func:`levain.consent.se_signer.sign_log_record`). A failure raises :class:`KeyError_` in the words
+    ``terminal_sign``'s classifier reads (``Touch ID was cancelled``, ``TimeoutExpired``)."""
+    from levain.consent import se_signer as _se
+    key_dir = key_path.parent
+
+    def sign(message: bytes) -> str:
+        started = time.monotonic()
+        deadline = started + bound
+        seen: dict[str, Any] = {"attempts": None, "evaluated": None}
+
+        def record(outcome: str, code: str = "") -> None:
+            _se.append_sign_log(key_dir, _se.sign_log_record(outcome=outcome, attempts=seen["attempts"],
+                                                             evaluated=seen["evaluated"],
+                                                             elapsed_s=time.monotonic() - started, code=code))
+
+        try:
+            built = helper if helper is not None else _se.ensure_helper()
+        except _se.SeSignerError as exc:
+            record("helper-missing", "build")
+            raise KeyError_(f"the Secure Enclave helper is not available ({exc}), so nothing was signed") from None
+        try:
+            out = _se.sign_once(key_path, message, presence=True, namespace=namespace, helper=built,
+                                timeout=max(bound - _VERIFY_RESERVE_S * 2, 1.0))
+        except _se.SeSignerError as exc:
+            seen["attempts"] = exc.payload.get("attempts")
+            seen["evaluated"] = exc.payload.get("evaluated")
+            ran = time.monotonic() - started
+            code = exc.code or "error"
+            if code == "timeout":
+                record("timeout", code)
+                raise KeyError_(f"the Secure Enclave helper timed out (TimeoutExpired): Touch ID was not touched in "
+                                f"time for {fp} ({ran:.1f}s of {bound:g}s), so nothing was signed") from None
+            if code == "presence_denied" or (code == "sign_failed" and "cancel" in str(exc).lower()):
+                record("cancelled", code)
+                raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
+                                f"(the Secure Enclave helper ran {ran:.1f}s), so nothing was signed") from None
+            if code == "key_load":
+                record("key-not-here", code)
+                raise KeyError_(f"the signing key {key_path} does not load on this Mac: its Secure Enclave blob is "
+                                "not this Mac's (made on another Mac, or damaged), so nothing was signed") from None
+            record("helper-error", code)
+            raise KeyError_(f"the Secure Enclave helper could not sign with {fp} ({code}: {str(exc)[:160]}), "
+                            "so nothing was signed") from None
+        seen["attempts"], seen["evaluated"] = out.get("attempts"), out.get("evaluated")
+        signature = out.get("signature")
+        if not isinstance(signature, str) or not signature.strip():
+            record("no-signature", "empty")
+            raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
+                            f"(the Secure Enclave helper answered with none), so nothing was signed")
+        try:
+            verified = _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
+                                                  namespace=namespace, ssh_keygen=ssh_keygen,
+                                                  timeout=max(deadline - time.monotonic(), 1.0))
+        except _authority.VerifierUnavailable:
+            record("verifier-unavailable", "verify")
+            raise
+        if not verified:
+            try:
+                empty = _authority_sig.sk_ecdsa_signature_empty(signature)
+            except Exception:  # noqa: BLE001 - the classification is words only
+                empty = False
+            if empty:
+                record("no-signature", "empty-signature")
+                raise KeyError_(f"{_empty_sig_words(True)} for {fp} ({_EMPTY_SIG_REASON}), so nothing was signed")
+            if _authority.presence_missing(signature, public_key):
+                record("unverified", "no-presence-flag")
+                raise KeyError_(f"the Secure Enclave helper returned a signature for {fp} without the user-presence "
+                                "flag, so nothing was signed")
+            record("unverified", "verify")
+            raise KeyError_(f"the Secure Enclave helper returned a signature that does not verify as {fp}, "
+                            "so nothing was signed")
+        record("signed", "ok")
+        return signature
+
+    return sign
+
+
 def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-               namespace: str = NAMESPACE, timeout: float | None = None) -> tuple[str, Signer]:
+               namespace: str = NAMESPACE, timeout: float | None = None,
+               helper: Path | None = None) -> tuple[str, Signer]:
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
     key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
     (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in
@@ -1146,12 +1232,18 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     Before anything is read or spawned it raises :class:`RealKeyUnmarked` (:func:`refuse_real_key_unless_live`) for
     the operator's real key in a process that did not mark itself live, or in a test or scratch run; from then on it
     uses the resolved path that gate judged."""
-    from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
+    from levain.cockpit.custody import APPLE_PROVIDER, LEVAIN_SIGN, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")
     key_path = refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     sidecar = read_sidecar(key_path)
+    if sidecar is not None and sidecar.provider == LEVAIN_SIGN:
+        # a levain-sign key (levain#191): its file is a Secure Enclave blob ssh-keygen cannot read, so it signs
+        # through the helper; the gate above has already judged the path, and the dispatch uses that path
+        private = key_path.with_name(key_path.name[:-4]) if key_path.suffix == ".pub" else key_path
+        return fp, _levain_sign_signer(private, public_key, fp, namespace,
+                                       _SIGN_TIMEOUT if timeout is None else timeout, ssh_keygen, helper)
     touch_id = sidecar is not None and sidecar.custody == TOUCH_ID
     no_agent = is_encrypted_file(key_path) or (sidecar is not None and sidecar.custody == PASSPHRASE)
 

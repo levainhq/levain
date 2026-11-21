@@ -3,6 +3,7 @@
 //   create --out <blob> [--presence]
 //   sign   --key <blob> --application ssh: --namespace <ns> [--presence] --reason <text>   (message on stdin)
 //   pubkey --key <blob> --application ssh:
+//   status --key <blob>      (zero UI: is the key presence-gated on this Mac?)
 import Foundation
 import CryptoKit
 import LocalAuthentication
@@ -34,7 +35,7 @@ func sha(_ d: Data) -> Data { Data(SHA256.hash(data: d)) }
 
 // ---- args ----
 let argv = Array(CommandLine.arguments.dropFirst())
-guard let sub = argv.first else { fail("usage", "subcommand required: create | sign | pubkey") }
+guard let sub = argv.first else { fail("usage", "subcommand required: create | sign | pubkey | status") }
 func opt(_ name: String) -> String? {
     guard let i = argv.firstIndex(of: name), i + 1 < argv.count else { return nil }
     return argv[i + 1]
@@ -160,6 +161,33 @@ case "sign":
     let armored = "-----BEGIN SSH SIGNATURE-----\n" + wrap76(b64(blob)) + "\n-----END SSH SIGNATURE-----\n"
     emit(["ok": true, "signature": armored, "counter": Int(counter), "flags": Int(flagsByte), "attempts": attempts,
           "evaluated": evaluated, "presence": presence])
+
+case "status":
+    // levain#191 R5: ask, with no interface allowed, whether this blob's key needs interaction to sign. A refusal that
+    // needs interaction means presence-gated; a signature without any means it is not; a blob this Mac cannot load is
+    // "key_load" (not this Mac's). LAContext.interactionNotAllowed: no sheet can appear whatever the key's access control.
+    let keyPath = need("--key")
+    let ctx = LAContext()
+    ctx.interactionNotAllowed = true
+    func needsInteraction(_ e: Error) -> Bool {
+        let ns = e as NSError
+        if ns.code == -25308 || (ns.domain == LAError.errorDomain && ns.code == LAError.notInteractive.rawValue) { return true }
+        let d = "\(e)"
+        return d.contains("-25308") || d.contains("notInteractive") || d.contains("interaction")
+    }
+    guard let blob = FileManager.default.contents(atPath: keyPath) else { fail("key_load", "cannot read key blob \(keyPath)") }
+    let key: SecureEnclave.P256.Signing.PrivateKey
+    do { key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: blob, authenticationContext: ctx) }
+    catch {
+        if needsInteraction(error) { emit(["ok": true, "presence_gated": true, "stage": "load"]); exit(0) }
+        fail("key_load", "\(error)")
+    }
+    let probe = Data("levain-sign status probe".utf8)
+    do { _ = try key.signature(for: probe); emit(["ok": true, "presence_gated": false]) }
+    catch {
+        if needsInteraction(error) { emit(["ok": true, "presence_gated": true, "stage": "sign"]) }
+        else { fail("sign_failed", "\(error)") }
+    }
 
 default:
     fail("usage", "unknown subcommand \(sub)")
