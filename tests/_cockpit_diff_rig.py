@@ -401,8 +401,12 @@ def entry_problems(entries: Any) -> list:
             problems.append(f"{who}: path has no literal segment, so it would match everything in its scope")
         if e.get("kind") not in KINDS:
             problems.append(f"{who}: kind not in {KINDS}")
-        elif e["kind"] in VALUE_KINDS and e.get("rule") not in RULES:
-            problems.append(f"{who}: rule {e.get('rule')!r} is not in the registry")
+        elif e["kind"] in VALUE_KINDS:
+            rule = e.get("rule")
+            if not isinstance(rule, str) or rule not in RULES:      # a list or dict is not hashable: text first
+                problems.append(f"{who}: rule {rule!r} is not in the registry")
+        elif "rule" in e:      # matching ignores it, so it would read as a check that never runs
+            problems.append(f"{who}: kind {e['kind']!r} does not take a rule")
         if not isinstance(e.get("owner"), str) or not e["owner"].strip():
             problems.append(f"{who}: owner is a non-empty text")
         dates = {}
