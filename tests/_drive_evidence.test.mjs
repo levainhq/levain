@@ -59,6 +59,25 @@ test("a reload's canceled loads never push a real failure out of the failed ring
   assert.match(renderEvidence(r.ev), /cockpit_view\.js\?v=abc123 FAILED net::ERR_CONNECTION_RESET/);
 });
 
+test("a canceled load that was blocked (a CSP or mixed-content block) is a real failure and is kept", () => {
+  const r = rig();
+  r.feed(10, req("b", "Script", "http://127.0.0.1:5000/static/cockpit_view.js?v=abc123"));
+  r.feed(20, { method: "Network.loadingFailed", params: { requestId: "b", type: "Script", errorText: "net::ERR_BLOCKED_BY_CSP", canceled: true, blockedReason: "csp" } });
+  assert.ok(r.ev.failed.has("b"), "a blocked load enters the failed ring even when Chrome also marks it canceled");
+});
+
+test("the shell-cache probe counts every name the markup holds, however many, and checks the scripts first", async () => {
+  const css = Array.from({ length: 450 }, (_, i) => `<link href="/static/s${i}.css?v=1">`).join("");
+  const enc = new TextEncoder().encode(css + `<script src="/static/late.js?v=1"></script>`);
+  const cache = { match: async (k) => (k === "/" ? { status: 200, body: { getReader: () => { let done = false; return { read: async () => (done ? { done: true } : ((done = true), { done: false, value: enc })), cancel: async () => {} }; } } } : undefined) };
+  globalThis.caches = { keys: async () => ["levain-shell-v1"], open: async () => cache };
+  try {
+    const c = JSON.parse(await (0, eval)(mod.SHELL_CACHE_PROBE)).shell[0];
+    assert.equal(c.total, 451, "the count is every name, not a cap");
+    assert.equal(c.entries[0][0].replace(/\?.*/, ""), "/static/late.js", "a script after hundreds of stylesheets is still checked first");
+  } finally { delete globalThis.caches; }
+});
+
 test("the shell-cache probe checks the scripts first and reports how many names it saw against how many it checked", async () => {
   const css = Array.from({ length: 20 }, (_, i) => `<link href="/static/s${i}.css?v=1">`).join("");
   const js = Array.from({ length: 3 }, (_, i) => `<script src="/static/j${i}.js?v=1"></script>`).join("");
