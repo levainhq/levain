@@ -175,6 +175,25 @@ def login_refusal() -> str | None:
     return LINUX_LOGIN_EDGE if platform.system() == "Linux" else None
 
 
+def vendor_missing(vendor: str) -> str | None:
+    """Why ``vendor`` cannot start as the hands account, or None (leg 6 fix, L2 MED 4; the login shares it since levain#139):
+    the hands prefix runs it as a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one
+    installed only in the operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare
+    ``env: claude: No such file or directory`` (exit 127) after the locks, the sweep and the prepare. Looked up as the
+    operator, on that PATH and nothing else, because the product's rule is a vendor the operator installed under
+    ``/usr/local/bin`` or ``/opt/homebrew/bin`` where the hands account can run it. KNOWN EDGES (L3 r2 and r3, kept, board
+    row): ownership oddities are not judged in either direction. A binary the operator can run but the hands uid cannot
+    (a ``/usr/local/bin`` link into the operator's 0700 home) passes here and ends in the vendor launch's own error; one
+    only the hands uid can run (not a path the product makes) is refused."""
+    import shutil
+    from levain.firing import confinement
+    if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
+        return None
+    return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}); install {vendor} where the "
+            "hands account can run it, under /usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors "
+            "puts claude and codex there)")
+
+
 _URL = re.compile(r"https://[^\s\"'<>]+")
 _CODE = re.compile(r"\b[A-Z0-9]{4,5}-[A-Z0-9]{4,5}\b")
 _OFF = re.compile(r"not\s+logged\s+in|logged\s+out", re.I)
@@ -611,8 +630,12 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
 SECURITY = "/usr/bin/security"
 HANDS_KEYCHAIN = "levain-hands.keychain-db"
 #: ``security``'s answer when the user domain has no default, run with LC_ALL=C: exit 1, nothing on stdout, one stderr
-#: line from SecKeychainCopy(Domain)Default naming errSecNoDefaultKeychain (its text, or its OSStatus -25307).
-_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Domain)?Default: "
+#: line from SecKeychainCopy(Domain)Default naming errSecNoDefaultKeychain (its text, or its OSStatus -25307). The domain
+#: form names the domain before the colon: measured on a fresh macOS 15.7.7 hands account 11-20 (levain#139, line in
+#: project_memory/1118-vm/leg6_fresh_evidence/l139_defkc.txt): ``SecKeychainCopyDomainDefault user: A default keychain ...``.
+#: Only the domain this module queries (``-d user``) is accepted, and only with the ``Domain`` call that names it: another
+#: domain's "no default" says nothing about the user domain, so it is an error here, never an absent default.
+_NO_DEFAULT = re.compile(r"security: SecKeychainCopy(?:Default|DomainDefault user): "
                          r"(?:A default keychain could not be found\.?|.*\(-25307\)\.?)")
 
 
@@ -723,6 +746,11 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
     if current is None:                      # none, or the printed one (ours included) does not exist
         _ensure_dir(hands, vendor, f"{home}/Library", entity_dir)
         _ensure_dir(hands, vendor, f"{home}/Library/Keychains", entity_dir)
+    # ``security default-keychain -s`` and ``list-keychains -s`` answer rc 0 and persist NOTHING while the account has no
+    # ``Library/Preferences`` (measured on a fresh macOS 15.7.7 hands account 11-20, levain#139,
+    # project_memory/1118-vm/leg6_fresh_evidence/l139_prefsdir_probe2.txt); with it they persist. Made on every path that can
+    # reach a set (a default of ours that exists, with the directory since removed, included): ``Library`` is there then.
+    _ensure_dir(hands, vendor, f"{home}/Library/Preferences", entity_dir)
     st = _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True)
     if st is None:
         # The password is used here once and never stored: nothing ever unlocks this keychain.
@@ -896,6 +924,9 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     refusal = login_refusal()
     if refusal:
         raise HandsRefused(refusal)
+    missing = vendor_missing(vendor)
+    if missing is not None:
+        raise HandsRefused(f"{missing}; the login was not started")
     say = emit or _write_out
     with hands_lock(entity_dir, "a login"):
         try:

@@ -3378,45 +3378,220 @@ def _check_runtime(install: Path) -> list[CheckResult]:
         CheckResult("python interpreter", True, f"{py} ({py_version})")
     )
 
-    from levain.manifest import resolve_anneal_bin
+    from levain.manifest import pip_invocation, resolve_anneal_bin
 
     # intention-751: report the ONE anneal levain's interpreter resolves, which is the one init
     # wires, instead of whatever PATH finds first.
     am_cli = resolve_anneal_bin()
     script_failure = ""
+    script_version: str | None = None
     if os.path.isfile(am_cli):
         ok, out = _probe([am_cli, "--version"])
         if ok:
-            version = (out.strip().splitlines() or ["present"])[0]
-            results.append(
-                CheckResult("anneal-memory CLI", True, f"{am_cli} ({version})")
-            )
-            return results
-        # A script that exists but cannot run (a moved venv's stale shebang) is not the
-        # end of the question: every consumer falls back to the module form, so doctor
-        # does too before declaring anneal unavailable (codex L3 LOW).
-        script_failure = f"; the script {am_cli} failed: {out}"
+            script_version = (out.strip().splitlines() or ["present"])[0]
+        else:
+            # A script that exists but cannot run (a moved venv's stale shebang) is not the
+            # end of the question: every consumer falls back to the module form, so doctor
+            # does too before declaring anneal unavailable (codex L3 LOW).
+            script_failure = f"; the script {am_cli} failed: {out}"
 
+    # ALWAYS probe the module under sys.executable: that is what `levain` itself imports. The
+    # script runs under ITS shebang interpreter, which a moved venv can leave pointing at another
+    # environment, so a good script must not stand in for the module (codex L3 HIGH).
     ok, out = _probe([sys.executable, "-P", "-m", "anneal_memory", "--version"])
-    if ok:
-        version = (out.strip().splitlines() or ["present"])[0]
+    module_version = (out.strip().splitlines() or ["present"])[0] if ok else None
+
+    disagree = ""
+    if script_version is not None and module_version is not None:
+        script_token, module_token = _anneal_version_token(script_version), _anneal_version_token(module_version)
+        if script_token != module_token:
+            disagree = (
+                f"; the anneal-memory script reports {script_token or script_version!r} but the module under "
+                f"{sys.executable} reports {module_token or module_version!r}: they DISAGREE"
+            )
+
+    if script_version is not None:
         results.append(
-            CheckResult(
-                "anneal-memory module",
-                True,
-                f"importable via {sys.executable} ({version}){script_failure}",
+            _anneal_version_result("anneal-memory CLI", am_cli, script_version, disagree, script_scope=True)
+        )
+    if module_version is not None:
+        results.append(
+            _anneal_version_result(
+                "anneal-memory module", f"importable via {sys.executable}", module_version, script_failure + disagree
             )
         )
     else:
+        # No module under sys.executable is a FAILURE whatever the script says: `levain` imports
+        # anneal_memory under THIS interpreter and anneal-memory is a hard dependency (L3 r2 MED).
         results.append(
             CheckResult(
                 "anneal-memory",
                 False,
                 f"not installed for levain's interpreter ({sys.executable})",
-                f"Install with: {sys.executable} -m pip install anneal-memory",
+                f"Install with: {pip_invocation()} install anneal-memory",
             )
         )
     return results
+
+
+def _script_shebang(path: str) -> str:
+    """The interpreter named on the script's first line ("" when unreadable or not a shebang)."""
+    try:
+        with open(path, "rb") as handle:
+            first = handle.readline(512).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+    return first[2:].strip() if first.startswith("#!") else ""
+
+
+def _script_remedy(where: str, requirement: str) -> str:
+    """The remedy for a CLI-SCRIPT row. The script runs under its own shebang interpreter, which need
+    not be `sys.executable`, so no pip command is aimed at an interpreter here: it names the script
+    (and its shebang interpreter when the first line gives one) and leaves the install to that env."""
+    shebang = _script_shebang(where)
+    text = f"Reinstall anneal-memory in the environment of the script {where}"
+    if shebang:
+        text += f" (its shebang interpreter: {shebang})"
+    if requirement:
+        text += f", at {shlex.quote(requirement)}"
+    return text
+
+
+def _anneal_version_result(
+    name: str, where: str, version: str | None, tail: str = "", *, script_scope: bool = False
+) -> CheckResult:
+    """The ONE judgement of a runnable anneal's version, shared by the script and module rows.
+
+    In range: ok, the plain "<where> (<version>)" detail. Out of range: not ok, with the declared
+    requirement, the scope it was judged for and a pip hint. Not checked (see
+    `_anneal_range_verdict`): ok WITH `warn`, so the badge is `[WARN]` and the hint prints; it is
+    neither a pass nor a fail, and the run's last line still says "All checks passed." with the
+    "(N warning(s) above.)" count. `script_scope` is the CLI-script row: that script runs under its
+    own shebang interpreter, so it never claims `sys.executable` was judged.
+    """
+    from levain.manifest import pip_invocation
+
+    version = version or "present"
+
+    verdict, requirement, why = _anneal_range_verdict(version)
+    if verdict is False:
+        if script_scope:
+            scope = (
+                "Judged for the anneal-memory script's own interpreter (its shebang), which need not be "
+                "the one doctor runs under."
+            )
+            hint = _script_remedy(where, requirement)
+        else:
+            scope = (
+                f"Judged for the interpreter doctor runs under ({sys.executable}); a `levain serve` "
+                "under another venv is not judged here."
+            )
+            hint = f"{pip_invocation()} install -U {shlex.quote(requirement)}"
+        return CheckResult(
+            name, False, f"{where} ({version}), but levain requires {requirement}{tail}. {scope}", hint
+        )
+    if verdict is None:
+        if script_scope:
+            remedy = _script_remedy(where, requirement)
+            fix = f"; or {remedy[0].lower()}{remedy[1:]}"
+        else:
+            fix = f"; or install the declared range: {pip_invocation()} install -U {shlex.quote(requirement)}"
+        return CheckResult(
+            name,
+            True,
+            f"{where} ({version}){tail}; levain's anneal-memory range was NOT checked ({why})",
+            "Compare the version above with levain's anneal-memory requirement by hand"
+            + (fix if requirement or script_scope else ""),
+            warn=True,
+        )
+    return CheckResult(name, True, f"{where} ({version}){tail}")
+
+
+# One comparison clause against a plain release. `~=`, `===` and a wildcard are not modelled.
+_CLAUSE_RE = re.compile(r"(==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)")
+_PLAIN_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+# `anneal-memory 2.0.1` (what `anneal-memory --version` prints) or `anneal-memory v2.0.1`; the
+# WHOLE line must fit, so a line with more after the version is unknown, never a guessed token.
+_VERSION_LINE_RE = re.compile(r"(?:anneal[-_]memory\s+)?[vV]?(\S+)")
+
+
+# What the helpers can raise: a malformed requirement or a numeric run beyond Python's
+# int-conversion limit (ValueError), an unexpected shape (TypeError, AttributeError, IndexError).
+_RANGE_HELPER_ERRORS = (ValueError, TypeError, AttributeError, IndexError)
+
+
+def _anneal_version_token(version_line: str | None) -> str:
+    """The one version token `anneal-memory --version` prints (empty when the line is not that form)."""
+    line = (version_line or "").strip().splitlines()[0:1]
+    match = _VERSION_LINE_RE.fullmatch(line[0]) if line else None
+    return match.group(1) if match else ""
+
+
+def _anneal_range_verdict(version_line: str | None) -> tuple[bool | None, str, str]:
+    """(True in range | False out of range | None not checked, the requirement, why not checked).
+
+    The range is judged with manifest's own machinery (`_levain_requires`: repo pyproject first,
+    installed metadata only when there is no source tree; `_anneal_spec_clauses`; `version_tuple`),
+    so doctor's pip-pin row and this row read ONE source. EVERY unconditional anneal-memory entry
+    must hold. An entry behind ANY environment marker is unmodelled (never dropped, never passed
+    silently). A definite failure on a modelled clause wins over anything not modelled, in either
+    order; with no failure, any clause, marker entry or version this helper cannot model is None.
+    A helper that raises on a form it cannot parse is also "not modelled", never an exception.
+    """
+    from levain import manifest
+
+    try:
+        entries = [e for e in manifest._levain_requires() if isinstance(e, str)]
+    except Exception:  # noqa: BLE001 - trouble reading the requirement is an unknown
+        entries = []
+    clauses: list[str] = []
+    unmodelled = False  # a marker entry, or a form a helper could not parse
+    for entry in entries:
+        try:
+            found = manifest._anneal_spec_clauses(entry)
+        except _RANGE_HELPER_ERRORS:
+            unmodelled = True
+            continue
+        if not found:
+            continue
+        if ";" in entry:
+            unmodelled = True  # any marker (extra, python_version, platform...): not evaluated here
+        else:
+            clauses.extend(found)
+    requirement = "anneal-memory" + ",".join(clauses) if clauses else ""
+
+    token = _anneal_version_token(version_line)
+    try:
+        have = manifest.version_tuple(token) if _PLAIN_RELEASE_RE.fullmatch(token) else None
+    except _RANGE_HELPER_ERRORS:
+        have = None
+
+    failed = False
+    for clause in clauses:
+        parsed = _CLAUSE_RE.fullmatch(clause)  # its value group is `\d+(?:\.\d+)*`: a plain release
+        if parsed is None:
+            unmodelled = True
+            continue
+        if have is None:
+            continue
+        try:
+            want = manifest.version_tuple(parsed.group(2))
+        except _RANGE_HELPER_ERRORS:
+            unmodelled = True
+            continue
+        width = max(len(have), len(want))
+        a, b = have + (0,) * (width - len(have)), want + (0,) * (width - len(want))
+        holds = {">=": a >= b, ">": a > b, "<=": a <= b, "<": a < b, "==": a == b, "!=": a != b}[parsed.group(1)]
+        failed = failed or not holds
+    if failed:
+        return False, requirement, ""
+    if unmodelled:
+        return None, requirement, "part of the requirement uses a form this check does not model"
+    if not clauses:
+        return None, requirement, "levain's anneal-memory requirement could not be read"
+    if have is None:
+        return None, requirement, "the installed version is not a plain release, e.g. a pre, post, local or epoch form"
+    return True, requirement, ""
 
 
 def _anneal_invocation(*args: str) -> str:

@@ -17,7 +17,7 @@ import pytest
 
 from levain.consent import host_grants as HG
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _serve
 from tests.test_host_grants_surface import G1, G2, G3, S1, S2, FakeRoot, _slot
@@ -64,7 +64,9 @@ def _direct(session: str, target: str) -> dict[str, Any]:
 
 def _open(tmp_path: Path, port: int, *steps: Any, token: str = T, view: Any = NARROW) -> list[Any]:
     out = _drive(tmp_path, f"http://127.0.0.1:{port}/#write_token={token}", [
-        view, {"until": TILE}, {"eval": OPEN_DECISIONS}, {"until": FILLED}, {"eval": "'__start__'"}, *steps])
+        view, {"until": TILE},
+        BOARD_SETTLED,                # a fresh install's first hello may draw the board again, which would replace the open Decisions view and its slot
+        {"eval": OPEN_DECISIONS}, {"until": FILLED}, {"eval": "'__start__'"}, *steps])
     vals = out["values"]
     vals = vals[vals.index("__start__") + 1:]
     return [v for v in vals if not (isinstance(v, dict) and "shot" in v)]
