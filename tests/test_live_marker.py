@@ -23,6 +23,9 @@ from levain.home_guard import RealHomeReached
 REPO = Path(__file__).resolve().parent.parent
 
 RESOLVE = "from levain.consent.queue import default_queue_dir\nprint(default_queue_dir())\n"
+# The children here are PRODUCTION runs on purpose (the unmarked warning, the marked silence): named, since otherwise
+# the keyguard marks every child of the test run a scratch run (tests/spawn_keyguard.py scratch_env).
+PRODUCTION = {home_guard.SCRATCH_ENV: "0"}
 
 
 def _spawn(tmp_path: Path, script: str, *, live: bool = False, levain_home: str | None = None, home_exists: bool = True):
@@ -32,7 +35,7 @@ def _spawn(tmp_path: Path, script: str, *, live: bool = False, levain_home: str 
         (fake_home / ".levain").mkdir()
     path = tmp_path / "bare_script.py"
     path.write_text(script, encoding="utf-8")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO)}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO), **PRODUCTION}
     if live:
         env[home_guard.LIVE_ENV] = "1"
     if levain_home is not None:
@@ -93,7 +96,7 @@ def test_the_log_never_blocks_and_never_follows_a_link(tmp_path, kind):
         log.mkdir()
     path = tmp_path / "bare_script.py"
     path.write_text(RESOLVE, encoding="utf-8")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO)}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO), **PRODUCTION}
     done = subprocess.run([sys.executable, str(path)], env=env, capture_output=True, text=True, timeout=20, cwd=str(tmp_path))
     assert done.returncode == 0 and "LEVAIN_LIVE" in done.stderr, done.stderr     # still warned, still resolved
     assert Path(done.stdout.strip()) == (fake_home / ".levain" / "consent").resolve()
@@ -163,7 +166,7 @@ def test_a_terminal_that_is_both_stdout_and_stderr_still_gets_the_warning(tmp_pa
     (fake_home / ".levain").mkdir(parents=True)
     script = tmp_path / "bare_script.py"
     script.write_text(RESOLVE, encoding="utf-8")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO)}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO), **PRODUCTION}
     master, slave = pty.openpty()
     try:
         proc = subprocess.Popen([sys.executable, str(script)], env=env, stdout=slave, stderr=slave, cwd=str(tmp_path))
@@ -546,7 +549,7 @@ def test_a_hook_script_is_marked_run_directly_or_through_hookrun(tmp_path, scrip
     probe = ("import sys, levain\nassert levain.__file__.startswith(%r), levain.__file__\n" % str(REPO))
     argv = ([sys.executable, str(REPO / script)] if shape == "direct"
             else [sys.executable, "-P", "-c", drive, str(REPO / script)])
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO)}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO), **PRODUCTION}
     ev = json.dumps({"hook_event_name": "Stop", "session_id": "s", "cwd": str(tmp_path), "prompt": "hi",
                      "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}, "source": "startup"})
     if shape == "direct":     # the script's own process imports levain from PYTHONPATH: prove that is this tree
@@ -577,6 +580,13 @@ def test_the_marker_never_crosses_an_exec(monkeypatch):
     assert home_guard.LIVE_ENV not in launch.child_env(seat="attended")                 # the desk session
     assert home_guard.LIVE_ENV not in launch.child_env(*delivery._AGENT_AUTH, *launch.NETWORK, seat="attended")
     assert home_guard.LIVE_ENV not in launch.child_env(home_guard.LIVE_ENV, prefixes=("LEVAIN_",))   # not even by name
+    # the pid beside it, which the real key's gate reads (levain#237): the same refusal everywhere
+    monkeypatch.setenv(home_guard.LIVE_PID_ENV, str(os.getpid()))
+    assert launch.LIVE_PID_ENV == home_guard.LIVE_PID_ENV
+    assert not launch.allowed(home_guard.LIVE_PID_ENV)
+    assert home_guard.LIVE_PID_ENV not in launch.allowed_env(os.environ)
+    assert home_guard.LIVE_PID_ENV not in launch.child_env(home_guard.LIVE_PID_ENV, prefixes=("LEVAIN_",))
+    assert home_guard.LIVE_PID_ENV not in home_guard.unmarked_env()
 
 
 def test_the_marker_does_not_ride_the_re_exec_carry(tmp_path):
@@ -585,16 +595,16 @@ def test_the_marker_does_not_ride_the_re_exec_carry(tmp_path):
     (L3 r2 codex L148, run 2026-11-14: the bare child printed '1')."""
     probe = ("import os, subprocess, sys\nfrom levain import launch\nlaunch.set_not_dumpable = lambda: False\n"
              "launch.reexec_if_needed()\nprint('REEXEC', launch.reexecuted)\nprint('FOO', os.environ.get('FOO_CARRIED'))\n"
-             "print('LIVE', os.environ.get('LEVAIN_LIVE'))\n"
-             "c = subprocess.run([sys.executable, '-I', '-c', \"import os; print(os.environ.get('LEVAIN_LIVE'))\"],"
-             " capture_output=True, text=True)\nprint('CHILD', c.stdout.strip())\n")
+             "print('LIVE', os.environ.get('LEVAIN_LIVE'))\nprint('PID', os.environ.get('LEVAIN_LIVE_PID'))\n"
+             "c = subprocess.run([sys.executable, '-I', '-c', \"import os; print(os.environ.get('LEVAIN_LIVE'), "
+             "os.environ.get('LEVAIN_LIVE_PID'))\"], capture_output=True, text=True)\nprint('CHILD', c.stdout.strip())\n")
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "PYTHONPATH": str(REPO),
-           "FOO_CARRIED": "x", home_guard.LIVE_ENV: "1"}
+           "FOO_CARRIED": "x", home_guard.LIVE_ENV: "1", home_guard.LIVE_PID_ENV: "1", **PRODUCTION}
     done = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     out = dict(line.split(" ", 1) for line in done.stdout.splitlines())
     assert out["REEXEC"] == "True" and out["FOO"] == "x"                 # the carry ran and restored the rest
-    assert out["LIVE"] == "None" and out["CHILD"] == "None", out
+    assert out["LIVE"] == "None" and out["PID"] == "None" and out["CHILD"] == "None None", out
 
 
 def test_no_model_driven_child_environment_carries_the_marker(monkeypatch):

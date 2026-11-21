@@ -52,6 +52,10 @@ SCRATCH_ENV = "LEVAIN_SCRATCH_RUN"
 HOME_ENV = "LEVAIN_HOME"
 TEST_SCRATCH_ROOT_ENV = "LEVAIN_TEST_SCRATCH_ROOT"
 LIVE_ENV = "LEVAIN_LIVE"
+#: The pid :func:`mark_live` marked, beside :data:`LIVE_ENV`: read only by the real key's gate
+#: (:func:`live_marked_here`), so a child that inherits the environment of a marked process (a spawn without ``env=``,
+#: or a fork: same environment, new pid) does not hold the gate's mark until its own entry calls :func:`mark_live`.
+LIVE_PID_ENV = "LEVAIN_LIVE_PID"
 LOG_NAME = "home_guard.log"
 #: The log's size past which a row is skipped (the warning still prints): a per-call unmarked script or a crash-looping
 #: unit cannot grow it forever, and the first rows, the evidence the refuse flip waits on, are kept.
@@ -145,22 +149,27 @@ def refuse_real_home_fallback(what: str, environ: Mapping[str, str] | None = Non
 
 
 def unmarked_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """``env`` (the process's own when None) without :data:`LIVE_ENV`: the environment for a child a levain entry
-    starts with no env of its own to give. The marker is a property of ONE process and crosses no exec levain makes
-    (Diogenes 11-15: a spawn that passed ``env=None`` handed it to the dream's ``claude -p``)."""
-    return {k: v for k, v in (os.environ if env is None else env).items() if k != LIVE_ENV}
+    """``env`` (the process's own when None) without :data:`LIVE_ENV` or :data:`LIVE_PID_ENV`: the environment for a
+    child a levain entry starts with no env of its own to give. The marker is a property of ONE process and crosses no
+    exec levain makes (Diogenes 11-15: a spawn that passed ``env=None`` handed it to the dream's ``claude -p``)."""
+    return {k: v for k, v in (os.environ if env is None else env).items() if k not in (LIVE_ENV, LIVE_PID_ENV)}
 
 
 def mark_live() -> None:
     """Called first thing by every levain launcher (each ``__main__`` block, the console entry): this process is a real
-    levain run, so resolving the real ``~/.levain`` is expected. Sets :data:`LIVE_ENV` in the process environment;
-    ``levain.launch.allowed`` refuses the name, so it crosses no exec levain makes and each entry marks itself (a
-    model levain starts must not hand it to a script it writes). A no-op in a test run, whatever calls it: the suite never takes the real home, and an
+    levain run, so resolving the real ``~/.levain`` is expected. Sets :data:`LIVE_ENV` in the process environment, and
+    :data:`LIVE_PID_ENV` to this process's pid (the real key's gate reads both, :func:`live_marked_here`);
+    ``levain.launch.allowed`` refuses both names, so they cross no exec levain makes and each entry marks itself (a
+    model levain starts must not hand them to a script it writes). A spawn that does not pass its own ``env=`` still
+    hands both to its child: :data:`LIVE_ENV` there counts for the home resolvers (:func:`live_marked`), the pid does
+    not match, so the child is not marked for the real key. A no-op in a test run or a scratch run
+    (:func:`guarded_run`), whatever calls it: the suite never takes the real home, a scratch run is not the product, and an
     in-process ``main()`` call must not leak the marker into the next test. Never raises."""
     global _MARK_FAILED
     try:
-        if not under_test_run():
+        if guarded_run() is None:
             os.environ[LIVE_ENV] = "1"
+            os.environ[LIVE_PID_ENV] = str(os.getpid())
     except Exception as exc:  # noqa: BLE001 — marking must never stop a launcher, but a failed mark is recorded:
         _MARK_FAILED = f"{type(exc).__name__}: {exc}"[:200]   # one line now, and in every unmarked row after
         _warn(f"levain: warning: could not mark this process live ({_MARK_FAILED}); it runs as unmarked.")
@@ -170,6 +179,20 @@ def live_marked(environ: Mapping[str, str] | None = None) -> bool:
     """True when a launcher marked this process live (read from ``environ`` and from the process's own)."""
     env = os.environ if environ is None else environ
     return env.get(LIVE_ENV) == "1" or os.environ.get(LIVE_ENV) == "1"
+
+
+def live_marked_here() -> bool:
+    """True when THIS process marked itself live: :data:`LIVE_ENV` is ``1`` and :data:`LIVE_PID_ENV` is this process's
+    pid, both read from the process's own environment. The real key's gate reads this, not :func:`live_marked`: a
+    child that merely inherited a marked parent's environment, or a fork of it, has another pid and is not marked here
+    until its own entry calls :func:`mark_live`. It stops a stray process, not a hostile one: a process that sets both
+    variables itself (or calls :func:`mark_live`) passes.
+
+    Limits of the own-pid test: an exec of a marked process keeps its pid and its environment, so the new image
+    passes as marked whatever it is; and a process that inherited the markers could, by pid reuse, get the very pid
+    they name. And a marked parent's forked workers are not marked: each must call :func:`mark_live` itself before it
+    reaches the real key, or its sign is refused."""
+    return os.environ.get(LIVE_ENV) == "1" and os.environ.get(LIVE_PID_ENV) == str(os.getpid())
 
 
 def _log_unmarked(what: str, env: Mapping[str, str]) -> None:

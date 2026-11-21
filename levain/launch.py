@@ -74,8 +74,10 @@ _TOKEN_SHAPED = re.compile(r"(^|_)(KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD
 # property of ONE process, which every levain entry sets on itself. Never inherited: a child that held it would hand
 # it to a model, and a script the model writes would resolve the real home with no warning.
 LIVE_ENV = "LEVAIN_LIVE"
+# The pid beside it (levain.home_guard.LIVE_PID_ENV), which the real key's gate reads: never inherited either.
+LIVE_PID_ENV = "LEVAIN_LIVE_PID"
 # Names in an allowed namespace that are secrets or plumbing, never allowed.
-_NEVER = frozenset({API_KEY_ENV, CARRY_FD_ENV, LIVE_ENV})
+_NEVER = frozenset({API_KEY_ENV, CARRY_FD_ENV, LIVE_ENV, LIVE_PID_ENV})
 # Where the macOS carry file is made: a directory under the floor's own crown jewel
 # (``~/.levain-runtime/floor``, denied to every entity), so no confined shell can open it by name.
 CARRY_DIR = Path("~/.levain-runtime/floor/carry")
@@ -143,7 +145,7 @@ def child_env(*names: str, prefixes: tuple[str, ...] = (), seat: str | None = No
     ``LEVAIN_SEAT`` (the NEEDS YOU band's D4 marker); None leaves any marker the operator set on this process."""
     env = allowed_env(os.environ)
     env.update({k: v for k, v in os.environ.items()
-                if k != LIVE_ENV and (k in names or (prefixes and k.startswith(prefixes)))})
+                if k not in (LIVE_ENV, LIVE_PID_ENV) and (k in names or (prefixes and k.startswith(prefixes)))})
     if seat is not None:
         if seat not in SEATS:
             raise ValueError(f"seat is one of {', '.join(SEATS)}")
@@ -275,6 +277,7 @@ def reexec_if_needed() -> None:
     keep = allowed_env(os.environb)
     carry = {k: v for k, v in os.environb.items() if k not in keep}
     carry.pop(os.fsencode(LIVE_ENV), None)     # the marker is this image's own: the re-executed image marks itself
+    carry.pop(os.fsencode(LIVE_PID_ENV), None)
     if not carry and key is None:
         return
     head = sys.orig_argv[: len(sys.orig_argv) - len(sys.argv) + 1]

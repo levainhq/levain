@@ -442,8 +442,19 @@ class TerminalKey:
 
 
 def _real_key_dir() -> Path:
-    """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
-    return _keys.pwd_key_dir()
+    """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``. Only a
+    process that marked itself live, and is not a test or scratch run, gets it (``keys.refuse_real_key_unless_live``);
+    any other raises ``RealKeyUnmarked`` here. That includes the READ-only callers (``find_key``, ``status``), on
+    purpose: no unmarked read-only caller was found in levain or in flow's scripts (levain#237 L1 Q4), so such a
+    process gets a refusal (``status`` a warning row, ``sign`` an unsigned ``signer-error``) rather than a look at the
+    real key directory. A uid with no password entry raises ``KeyError_`` (a bare ``KeyError`` would pass every caller
+    that handles ``KeyError_``). Returns the path the gate judged (``keys.refuse_real_key_dir_unless_live``)."""
+    try:
+        real = _keys.pwd_key_dir()
+    except (OSError, RuntimeError, KeyError) as exc:
+        raise KeyError_(f"the operator's real key directory cannot be named ({type(exc).__name__}: {exc}); "
+                        "refused") from None
+    return _keys.refuse_real_key_dir_unless_live(real, "the real key directory")
 
 
 def _own_regular_file(path: Path) -> bool:
@@ -465,7 +476,12 @@ def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     there is none with a ``touch-id`` sidecar. Read-only: nothing is created. A directory open to other users or
     owned by someone else, a key, ``.pub`` or sidecar that is a link or not this user's regular file, or a sidecar
     that is there but malformed, raises ``KeyError_``. ``key_dir`` is for tests; the default is the real home's,
-    whatever the environment says."""
+    whatever the environment says, and only a process that marked itself live gets it: any other (and a test or
+    scratch run) raises ``keys.RealKeyUnmarked``, a ``KeyError_``, before the directory is looked at
+    (:func:`_real_key_dir`)."""
+    # An explicit key_dir is read WITHOUT the live gate, on purpose: this is a read-only look (status rows, the hooks'
+    # "is there a key" checks) and the levain#237 L2 ruling kept those working in an unmarked process; nothing is
+    # signed here, and sign() gates key.path before any signer is made. create() gates its directory itself.
     d = Path(key_dir) if key_dir is not None else _real_key_dir()
     _keys.refuse_real_key_in_tests(d, "the key directory")
     try:
@@ -546,7 +562,9 @@ def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = 
     """``terminal-key create``: one Secure Enclave key labelled :data:`KEY_LABEL` whose every signature needs Touch
     ID, in the real levain home's key directory. Refuses (nothing created) inside any agent session, judged by
     ``in_agent_session`` (default ``levain.consent.band.agent_session_caller``, the band's one detector) before the
-    key directory is touched, and when a terminal key is already enrolled. ``creator`` is
+    key directory is touched, when a terminal key is already enrolled, and when the key directory, whether ``key_dir``
+    names it or it is the default, is the real one in a process that did not mark itself live, or in a test or scratch
+    run (``keys.refuse_real_key_dir_unless_live``). ``creator`` is
     ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
     Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report. ``created`` is
     True once ``creator`` has returned a key, even when printing the instructions then fails; an interrupt at the
@@ -647,6 +665,8 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
     try:
         d = Path(key_dir) if key_dir is not None else _real_key_dir()
         _keys.refuse_real_key_in_tests(d, "the key directory")
+        # create WRITES here, so every directory, named or default, passes the live gate and only its answer is used
+        d = _keys.refuse_real_key_dir_unless_live(d, "the key directory")
         if find_key(d) is not None:
             return CreateReport(False, "refused: a terminal key is already enrolled; `levain band terminal-key "
                                        "status` shows it (nothing was created)")
@@ -684,8 +704,10 @@ SignerFactory = Callable[[Path, float], tuple[str, Signer]]    # (key path, the 
 
 def default_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
-    Calling the ``Signer`` it returns raises the Touch ID prompt."""
+    Calling the ``Signer`` it returns raises the Touch ID prompt. Raises ``keys.RealKeyUnmarked`` for the real key in
+    a process that did not mark itself live (``keys.refuse_real_key_unless_live``) and signs the path that gate judged."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
@@ -693,6 +715,7 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
     """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
     other door to the real key."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 
@@ -999,8 +1022,9 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
         if key is None:
             return SignOutcome("unsigned", "no-key", "no terminal key with a touch-id sidecar")
         _keys.refuse_real_key_in_tests(key.path, "the signing key")
+        judged = _keys.refuse_real_key_unless_live(key.path, "the signing key")    # the factory signs the path judged
         factory = signer_factory or default_signer_factory
-        fp, signer = factory(key.path, bound_s)
+        fp, signer = factory(judged, bound_s)
         signature = signer(bytes(message))
     except KeyError_ as exc:
         reason, detail = _classify(exc)
