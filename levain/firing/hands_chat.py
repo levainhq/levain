@@ -778,6 +778,8 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                                        f"plugin setting ({user}), which can bring MCP servers the registry does not "
                                        "hold; remove it" + (MARKETPLACES_REMOVE_CLAUSE
                                                             if user.endswith("plugins/marketplaces") else ""))
+            if vendor == "claude":
+                hl.ensure_security_shim(hands, vendor, entity_dir=entity_dir)    # levain#241: a refresh lands in the file
             argv = chat_argv(hands, vendor)
             moved = hml.launch_still_live(res)          # L3 r3 G5: a revoke takes no hands lock; the last read
             if moved is not None:

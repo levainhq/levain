@@ -102,10 +102,11 @@ exit 2
 #: fails), SEC_LIST_FAIL (setting the search list fails), SEC_CREATE_FAIL (create-keychain fails, echoing its
 #: arguments, the password included), SEC_CREATE_HANG (create-keychain hangs, its sleeper's pid in SHIM_PIDS).
 #: levain#241: a made keychain is UNLOCKED (its file says so; lock-keychain rewrites it), as the real one is measured to
-#: be; show-keychain-info answers rc 36 "User interaction is not allowed" only on a locked one. Knobs: SEC_LOCK_FAIL
-#: (lock-keychain fails), SEC_LOCK_NOOP (it is accepted and the keychain stays unlocked), SEC_LOCKED_TEXT (the words a
-#: locked keychain's info answers with), SEC_FIND_FAIL (find-generic-password fails with that text, rc 1),
-#: SEC_DELETE_NOOP (delete-keychain is accepted and the file stays). The items are the lines of .fake-security-items;
+#: be. The rig has no lock-state read: the product never makes one (it hangs in a GUI session, vmkc3). Knobs:
+#: SEC_LOCK_FAIL (lock-keychain fails), SEC_LOCK_NOOP (it is accepted and the keychain stays unlocked), SEC_FIND_FAIL
+#: (find-generic-password fails with that text, rc 1), SEC_DELETE_NOOP (delete-keychain is accepted and the file stays).
+#: delete-keychain models what vmkc3 MEASURED: the file goes, the user domain then has NO default keychain ("A default
+#: keychain could not be found.", rc 1) and an empty search list. The items are the lines of .fake-security-items;
 #: find-generic-password answers only the attributes-only form ``-s <name> <keychain>`` and the rig exits 97 on any
 #: other (a ``-w`` or ``-g`` is the product reading a secret).
 SECURITY_SHIM = """#!/bin/sh
@@ -138,11 +139,6 @@ case "$1" in
     if [ -n "$SEC_LOCK_FAIL" ]; then echo "security: SecKeychainLock: $SEC_LOCK_FAIL" >&2; exit 1; fi
     [ -f "$2" ] || { echo "security: SecKeychainLock: The specified keychain could not be found." >&2; exit 1; }
     [ -n "$SEC_LOCK_NOOP" ] || echo "fake keychain locked" > "$2"; exit 0;;
-  show-keychain-info)
-    [ "$#" = 2 ] || { echo "rig: show-keychain-info takes exactly the keychain path" >&2; exit 97; }
-    [ -f "$2" ] || { echo "security: SecKeychainCopySettings: The specified keychain could not be found." >&2; exit 1; }
-    if grep -q "fake keychain locked" "$2"; then echo "security: SecKeychainCopySettings $2: ${SEC_LOCKED_TEXT:-User interaction is not allowed.}" >&2; exit 36; fi
-    echo "Keychain \"$2\" no-timeout" >&2; exit 0;;
   find-generic-password)
     [ "$#" = 4 ] && [ "$2" = "-s" ] || { echo "rig: find-generic-password is the attributes-only -s <name> <keychain> form" >&2; exit 97; }
     if [ -n "$SEC_FIND_FAIL" ]; then echo "security: SecKeychainSearchCopyNext: $SEC_FIND_FAIL" >&2; exit 1; fi
@@ -151,7 +147,7 @@ case "$1" in
   delete-keychain)
     [ "$#" = 2 ] || { echo "rig: delete-keychain takes exactly the keychain path" >&2; exit 97; }
     [ -f "$2" ] || { echo "security: SecKeychainDelete: The specified keychain could not be found." >&2; exit 1; }
-    [ -n "$SEC_DELETE_NOOP" ] || { rm -f "$2" "$HOME/.fake-security-items"; }; exit 0;;
+    [ -n "$SEC_DELETE_NOOP" ] || { rm -f "$2" "$HOME/.fake-security-items" "$D" "$L"; }; exit 0;;
 esac
 exit 2
 """
@@ -245,7 +241,7 @@ def test_login_argv_runs_as_hands_with_pinned_home_and_fixed_path(monkeypatch, s
     assigned = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in argv[6:] if "=" in a and a.split("=", 1)[0].isupper()}
     assert assigned[var] == f"/Users/levain-hands/{sub}"
     assert assigned["HOME"] == "/Users/levain-hands"
-    assert assigned["PATH"] == HANDS_PATH
+    assert assigned["PATH"] == (f"/Users/levain-hands/.levain-bin:{HANDS_PATH}" if system == "Darwin" else HANDS_PATH)
     assert set(assigned) == {"HOME", "PATH", "LANG", "TERM", "USER", "LOGNAME", "ENABLE_CLAUDEAI_MCP_SERVERS",
                          "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", var}
     assert argv[-len(hands_login._VENDOR[vendor]["login"]):] == list(hands_login._VENDOR[vendor]["login"])
@@ -707,7 +703,7 @@ def _kc(r: Rig) -> Path:
 
 
 def _FIND_CALLS(r: Rig) -> list[str]:
-    """The attributes-only look for a Claude item that follows every confirmed lock: the suffixed name, then the bare one."""
+    """The attributes-only look for a Claude item that follows every lock: the suffixed name, then the bare one."""
     return [f"find-generic-password -s {n} {_kc(r)}" for n in hands_login.claude_credential_services(r.h)]
 
 
@@ -720,9 +716,9 @@ def test_keychain_needed_is_claude_on_macos_only(monkeypatch):
 
 
 #: Every ``security`` verb the product may run; anything else (unlock-keychain, set-keychain-settings,
-#: dump-keychain ...) failing this set is a change of the custody design, not a refactor. levain#241 added exactly
-#: lock-keychain, show-keychain-info, find-generic-password (attributes only) and delete-keychain.
-_ALLOWED_VERBS = {"default-keychain", "list-keychains", "create-keychain", "lock-keychain", "show-keychain-info",
+#: dump-keychain ...) failing this set is a change of the custody design, not a refactor. levain#241
+#: added exactly lock-keychain, find-generic-password (attributes only) and delete-keychain.
+_ALLOWED_VERBS = {"default-keychain", "list-keychains", "create-keychain", "lock-keychain",
                   "find-generic-password", "delete-keychain"}
 
 
@@ -755,8 +751,7 @@ def test_claude_login_first_makes_the_hands_keychain_then_the_login_lands_in_the
     calls = _sec_calls(rig)
     assert calls == ["default-keychain -d user", calls[1], f"lock-keychain {kc}", f"default-keychain -d user -s {kc}",
                      "list-keychains -d user", f"list-keychains -d user -s {kc}", "list-keychains -d user",
-                     "default-keychain -d user", f"lock-keychain {kc}", f"show-keychain-info {kc}",
-                     *_FIND_CALLS(rig)]
+                     "default-keychain -d user", f"lock-keychain {kc}", *_FIND_CALLS(rig)]
     create = calls[1].split(" ")
     assert create[0] == "create-keychain" and create[1] == "-p" and len(create[2]) >= 40 and create[3] == str(kc)
     # the keychain is the hands account's, inside its home, in a 700 directory; the password is kept nowhere
@@ -788,7 +783,7 @@ def test_a_second_login_finds_the_keychain_and_makes_nothing(rig):
     assert res.returncode == 0 and st.logged_in
     kc = _kc(rig)
     assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"lock-keychain {kc}",
-                               f"show-keychain-info {kc}", *_FIND_CALLS(rig)]
+                               *_FIND_CALLS(rig)]
     assert not any("Made the hands account" in s or "again" in s for s in said)
 
 
@@ -954,7 +949,7 @@ def test_a_failed_search_list_refuses_then_the_next_login_finishes_it(rig):
     assert res.returncode == 0 and st.logged_in
     assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"list-keychains -d user -s {_kc(rig)}",
                                "list-keychains -d user", "default-keychain -d user", f"lock-keychain {_kc(rig)}",
-                               f"show-keychain-info {_kc(rig)}", *_FIND_CALLS(rig)]
+                               *_FIND_CALLS(rig)]
     assert (rig.hands_home / ".fake-security-list").read_text().strip() == str(_kc(rig))
     assert any(hands_login.KEYCHAIN_REPAIRED_NOTE.format(path=_kc(rig)) in s for s in said)
 
@@ -1027,7 +1022,7 @@ def test_our_keychain_spelled_another_way_is_still_ours(rig):
     assert res.returncode == 0 and st.logged_in
     kc = hands_login.keychain_path(rig.h)
     assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"lock-keychain {kc}",
-                               f"show-keychain-info {kc}", *_FIND_CALLS(rig)]
+                               *_FIND_CALLS(rig)]
     assert hands_login.keychain_path(rig.h) == str(_kc(rig))
 
 
@@ -1128,7 +1123,8 @@ def test_a_keychain_that_takes_a_write_while_unlocked_is_locked_before_the_vendo
     assert _items(rig) == [] and (rig.hands_home / ".claude" / ".credentials.json").is_file()
     assert res.returncode == 0 and st.logged_in
     calls = _sec_calls(rig)
-    assert calls.index(f"show-keychain-info {_kc(rig)}") > calls.index(f"lock-keychain {_kc(rig)}")
+    assert calls.index(f"lock-keychain {_kc(rig)}") < calls.index(_FIND_CALLS(rig)[0])
+    assert not any(c.startswith("show-keychain-info") for c in calls)      # no lock-state read is made (it hangs in a GUI session)
 
 
 def test_the_rig_models_the_failure_the_vm_measured(rig):
@@ -1140,36 +1136,20 @@ def test_the_rig_models_the_failure_the_vm_measured(rig):
     assert not hands_login.run_status(rig.h, "claude", entity_dir=rig.entity).logged_in
 
 
-@pytest.mark.parametrize("knob,value,match", [
-    ("SEC_LOCK_NOOP", "1", "could not be confirmed locked.*unlocked"),
-    ("SEC_LOCK_FAIL", "denied", "could not lock .*denied"),
-    ("SEC_LOCKED_TEXT", "Some other failure.", "could not be confirmed locked.*Some other failure"),
-])
-def test_a_lock_that_is_not_confirmed_refuses_before_the_vendor_runs(rig, knob, value, match):
-    rig.knobs[knob] = value
-    with pytest.raises(hands_login.HandsRefused, match=f"{match}.*the login was not started"):
+def test_a_lock_that_fails_refuses_before_the_vendor_runs(rig):
+    rig.knobs["SEC_LOCK_FAIL"] = "denied"
+    with pytest.raises(hands_login.HandsRefused, match="could not lock .*denied.*the login was not started"):
         _login(rig, "claude")
     assert rig.calls() == [] and not (rig.hands_home / ".claude" / ".credentials.json").exists()
     with pytest.raises(hands_login.HandsRefused, match="the login was not started"):
         _login(rig, "claude")
 
 
-def test_rc_36_alone_does_not_confirm_a_lock_and_the_text_alone_does_not_either(rig, monkeypatch):
-    hands_login.ensure_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
-    real = hands_login._security
-
-    def fake(rc, err):
-        def run(hands, vendor, *args, **kw):
-            if args[0] == "show-keychain-info":
-                return hands_login.subprocess.CompletedProcess(args, rc, b"", err)
-            return real(hands, vendor, *args, **kw)
-        return run
-    for rc, err in ((36, b"security: something else\n"), (1, b"security: User interaction is not allowed.\n")):
-        monkeypatch.setattr(hands_login, "_security", fake(rc, err))
-        with pytest.raises(HandsLoginError, match="could not be confirmed locked"):
-            hands_login.lock_and_confirm_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
-    monkeypatch.setattr(hands_login, "_security", fake(36, b"security: x: User interaction is not allowed.\n"))
-    hands_login.lock_and_confirm_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+def test_every_login_locks_again_even_when_the_keychain_is_already_there(rig):
+    _login(rig, "claude")
+    rig.seclog.unlink()
+    _login(rig, "claude")
+    assert f"lock-keychain {_kc(rig)}" in _sec_calls(rig)
 
 
 def test_a_failed_lock_after_create_refuses(rig):
@@ -1223,7 +1203,7 @@ def test_a_signed_in_file_and_an_orphan_both_go(rig):
 
 def test_logout_with_nothing_anywhere_still_runs_nothing(rig):
     assert hands_login.run_logout(rig.h, "claude", rig.entity) == "nothing"
-    assert rig.calls() == [] or all("auth status" in c for c in rig.calls())
+    assert all("auth status" in c for c in rig.calls())
     assert not any(c.startswith("delete-keychain") for c in _sec_calls(rig))
     # a sealed keychain that holds no item is not touched either
     _login(rig, "claude")
@@ -1249,12 +1229,73 @@ def test_a_keychain_that_will_not_delete_is_an_error_not_a_success(rig):
     assert _kc(rig).exists()
 
 
-def test_a_keychain_look_that_cannot_be_read_refuses_the_logout_with_nothing_changed(rig):
+def test_a_keychain_look_that_cannot_be_read_does_not_stop_the_logout_and_is_reported_unconfirmed_after(rig, capsys):
     _orphan(rig)
+    (rig.hands_home / ".claude").mkdir(exist_ok=True)
+    (rig.hands_home / ".claude" / ".credentials.json").write_text("{}")
     rig.knobs["SEC_FIND_FAIL"] = "The user canceled the operation."
-    with pytest.raises(hands_login.HandsRefused, match="nothing was changed"):
+    with pytest.raises(HandsLoginError, match=r"signed out \(logged-out\).*could not be confirmed.*The user canceled"):
         hands_login.run_logout(rig.h, "claude", rig.entity)
-    assert not any("auth logout" in c for c in rig.calls()) and _kc(rig).exists()   # only the read-only status ran
+    assert any("auth logout" in c for c in rig.calls())                  # the vendor logout ran
+    assert not (rig.hands_home / ".claude" / ".credentials.json").exists()   # and the file went
+    assert _kc(rig).exists()                                              # the keychain was not guessed at
+    assert hands_login.cmd_hands_logout(rig.entity, "claude") == 1
+    assert "could not be confirmed" in capsys.readouterr().out
+
+
+def test_a_keychain_look_that_cannot_be_read_with_nothing_else_to_do_is_still_unconfirmed(rig):
+    _orphan(rig)
+    rig.knobs["SEC_FIND_FAIL"] = "boom"
+    with pytest.raises(HandsLoginError, match="could not be confirmed"):
+        hands_login.run_logout(rig.h, "claude", rig.entity)
+
+
+def test_the_logout_that_leaves_a_file_and_an_orphan_says_file_removed_and_keychain_removed(rig):
+    _login(rig, "claude")
+    (rig.hands_home / ".fake-security-items").write_text(hands_login.claude_credential_services(rig.h)[0] + "\n")
+    rig.knobs["SHIM_LEAVE"] = "1"                                         # the vendor's logout leaves the file: levain removes it
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "file-removed+keychain-removed"
+    assert not _kc(rig).exists() and not (rig.hands_home / ".claude" / ".credentials.json").exists()
+
+
+def test_a_delete_leaves_no_default_and_the_next_login_makes_the_keychain_again_locked(rig):
+    # vmkc3 measured: after delete-keychain the default is "none" (rc 1) and the search list is empty
+    _orphan(rig)
+    hands_login.run_logout(rig.h, "claude", rig.entity)
+    assert not (rig.hands_home / ".fake-security-default").exists() and not (rig.hands_home / ".fake-security-list").exists()
+    assert hands_login._default_keychain(rig.h, "claude", rig.entity) is None
+    said: list[str] = []
+    res, st = _login(rig, "claude", emit=said.append)
+    assert res.returncode == 0 and st.logged_in
+    assert any("Made the hands account's own keychain" in s for s in said)
+    assert (rig.hands_home / ".fake-security-default").read_text() == str(_kc(rig))
+    assert (rig.hands_home / ".fake-login-kcstate").read_text() == "fake keychain locked\n"
+
+
+@pytest.mark.parametrize("shape", ["symlink", "directory"])
+def test_the_orphan_lookup_and_the_delete_check_the_file_first(rig, tmp_path, shape):
+    kc = _kc(rig)
+    kc.parent.mkdir(parents=True)
+    if shape == "symlink":
+        target = tmp_path / "elsewhere.keychain-db"
+        target.write_text("someone else's")
+        kc.symlink_to(target)
+    else:
+        kc.mkdir()
+    with pytest.raises(HandsLoginError, match="not a keychain file"):
+        hands_login.keychain_orphan(rig.h, "claude", entity_dir=rig.entity)
+    with pytest.raises(HandsLoginError, match="not a keychain file"):
+        hands_login.remove_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+    assert _sec_calls(rig) == []                                          # `security` never saw it
+
+
+def test_a_login_whose_orphan_lookup_fails_still_runs_and_only_skips_the_note(rig):
+    name = _orphan(rig)
+    rig.knobs["SEC_FIND_FAIL"] = "The user canceled the operation."
+    said: list[str] = []
+    res, st = _login(rig, "claude", emit=said.append)
+    assert res.returncode == 0 and st.logged_in
+    assert name not in "".join(said) and (rig.hands_home / ".claude" / ".credentials.json").is_file()
 
 
 def test_a_login_with_an_orphan_is_not_refused_keeps_the_file_and_names_the_logout(rig):

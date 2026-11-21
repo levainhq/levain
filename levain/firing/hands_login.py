@@ -53,7 +53,7 @@ from typing import Callable, Iterator
 from levain import hands_live
 from levain.firing.confinement import (
     HANDS_PYTHON, HANDS_ZSH, ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_for, hands_prefix,
-    load_confinement_config,
+    hands_shim_dir, load_confinement_config,
 )
 from levain.launch import child_env
 
@@ -629,8 +629,10 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
 # create-keychain`` leaves the new keychain UNLOCKED in the creating session, and a login made then writes its item into
 # it (``Claude Code-credentials-<suffix>``) instead of falling back to the file, so the first login read "not signed
 # in". On the keychain once it was locked, the next login fell back to the 0600 file and read signed in. So the keychain
-# is locked right after it is made and again, with the lock confirmed, before every Claude login: the design intent
-# ("nothing ever unlocks it") is only true if the keychain starts locked (levain#241).
+# is locked right after it is made and before every Claude login (levain#241). The lock alone is not the whole answer:
+# a read of the lock state HANGS inside a GUI login session (vmkc2, vmkc3 on the VM 11-21), so it is never made.
+# What decides where Claude writes is the ``security`` shim below, which answers Claude's own
+# keychain calls with the file-fallback code; the lock is the second, quiet layer.
 # Every read and set here is the ``-d user`` form (``security default-keychain -d user`` measured 11-18 on macOS:
 # exit 0, prints the default; the "illegal option -d" claim of an L3 seat was measured false).
 SECURITY = "/usr/bin/security"
@@ -731,29 +733,64 @@ def _search_list(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> l
 
 
 def _lock_keychain(hands: HandsIdentity, vendor: str, ours: str, entity_dir: Path | str) -> None:
+    """``security lock-keychain`` on Levain's sealed keychain as the hands user (idempotent; measured fast in a GUI
+    session, vmkc3). A failure raises."""
     r = _security(hands, vendor, "lock-keychain", ours, entity_dir=entity_dir)
     if r.returncode != 0:
         raise HandsLoginError(f"could not lock {ours} as {hands.user}: {_brief(_text(r)) or f'exit {r.returncode}'}")
 
 
-#: ``security``'s answer to a read of a locked keychain's settings, run with LC_ALL=C (the VM measurement of 11-21,
-#: vm_phase_c2a_return.md): exit 36 (errSecInteractionNotAllowed) and this text. Both are required, never the code alone.
-_LOCKED_RC = 36
-_LOCKED_TEXT = "User interaction is not allowed"
+def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
+    """Under the caller's hands lock, as the hands user: lock Levain's sealed keychain (idempotent), before a Claude
+    login or MCP sign-in. The lock is not read back (the call that reads it hangs in a GUI session); a failed lock
+    call raises, which is a refusal before the vendor runs. Never unlocks, never reads an item."""
+    _lock_keychain(hands, vendor, keychain_path(hands), entity_dir)
 
 
-def lock_and_confirm_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
-    """Under the caller's hands lock, as the hands user: lock Levain's sealed keychain (idempotent) and confirm it is
-    locked (``show-keychain-info`` fails with errSecInteractionNotAllowed on a locked keychain and succeeds on an
-    unlocked one). Anything but that answer raises: an unconfirmed lock is a refusal before the vendor login runs.
-    Never unlocks, never reads an item."""
-    ours = keychain_path(hands)
-    _lock_keychain(hands, vendor, ours, entity_dir)
-    r = _security(hands, vendor, "show-keychain-info", ours, entity_dir=entity_dir)
-    if r.returncode == _LOCKED_RC and _LOCKED_TEXT in _text(r):
+# --- the ``security`` shim on the hands PATH (levain#241, ruling d241_v2) ----------------------------------------------
+#
+# Claude Code stores its login by spawning ``security`` BY NAME (``-i`` with a stdin script that does
+# ``add-generic-password -U``, ``find-generic-password``, ``delete-generic-password``) and takes exit 36 and 44 as "use
+# the 0600 file". A write to a locked keychain inside a GUI login session HANGS (the Terminal -> sudo -u hands shape of
+# the real Mac), so the lock alone cannot decide where the credential goes. This shim sits first on the hands PATH
+# (macOS only, :func:`~levain.firing.confinement._hands_env`): ``-i`` drains stdin to /dev/null (it carries the
+# credential: never logged, never stored) and exits 36; the three item verbs exit 36; every other verb runs
+# ``/usr/bin/security`` with the same arguments. So Claude's login, refresh, read and logout all take the file, in any
+# session. Measured with real claude 2.1.330 in the GUI shape (vmkc3): ``claude auth status`` is fast with the shim.
+# The shim covers every Claude service name by verb, which is why orphan matching (``claude_credential_services``) stays
+# the two names a login can leave. Levain's own calls use the absolute ``/usr/bin/security`` and never meet it.
+SECURITY_SHIM_NAME = "security"
+SECURITY_SHIM_TEXT = """#!/bin/sh
+# Levain: keeps Claude's login in its 0600 file. Written by levain; rewritten when it differs.
+case "$1" in
+  -i)
+    cat > /dev/null
+    exit 36 ;;
+  find-generic-password|add-generic-password|delete-generic-password)
+    exit 36 ;;
+esac
+exec /usr/bin/security "$@"
+"""
+
+
+def ensure_security_shim(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
+    """Under the caller's hands lock, as the hands user (the config-home helpers): the shim directory is a real 700
+    directory of the hands user and ``security`` in it is byte-for-byte :data:`SECURITY_SHIM_TEXT`, owned by the hands
+    user, mode 755; missing or different is rewritten (staged and renamed). Anything that cannot be made so raises
+    :class:`HandsLoginError`: a refusal before the vendor runs. Only for a vendor that needs it (Claude on macOS)."""
+    if not keychain_needed(vendor):
         return
-    raise HandsLoginError("the hands keychain could not be confirmed locked "
-                          f"({'it answered as unlocked' if r.returncode == 0 else _brief(_text(r)) or f'exit {r.returncode}'})")
+    d = hands_shim_dir(hands)
+    _ensure_dir(hands, vendor, d, entity_dir)
+    got = conf_read(hands, vendor, d, SECURITY_SHIM_NAME, entity_dir=entity_dir)
+    if got is not None and got[0] == hands.uid and got[1].endswith("755") and got[2] == SECURITY_SHIM_TEXT:
+        return
+    staged = conf_stage(hands, vendor, d, SECURITY_SHIM_NAME, SECURITY_SHIM_TEXT, entity_dir=entity_dir, mode="755")
+    try:
+        conf_commit(hands, vendor, d, SECURITY_SHIM_NAME, staged, entity_dir=entity_dir)
+    except HandsLoginError:
+        conf_drop(hands, vendor, d, SECURITY_SHIM_NAME, staged, entity_dir=entity_dir)
+        raise
 
 
 def claude_credential_services(hands: HandsIdentity) -> tuple[str, str]:
@@ -764,15 +801,31 @@ def claude_credential_services(hands: HandsIdentity) -> tuple[str, str]:
     return f"{base}-{hashlib.sha256(config_home(hands, 'claude').encode()).hexdigest()[:8]}", base
 
 
+def _sealed_keychain_file(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str | None:
+    """The sealed keychain's path when it exists as a regular file of the hands user, None when it is not there; any
+    other thing at that path raises (the check :func:`ensure_hands_keychain` makes, so a link or a directory is never
+    handed to ``security``)."""
+    ours = keychain_path(hands)
+    st = _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True)
+    if st is None:
+        return None
+    if not st[0].startswith("regular") or st[1] != hands.uid:
+        raise HandsLoginError(f"{ours} is a {st[0]} of {st[2]}, not a keychain file of {hands.user}; remove it by hand")
+    return ours
+
+
 def keychain_orphan(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> str | None:
     """The service name of a Claude item sitting in Levain's sealed keychain, or None (also None when the keychain file
-    is not there, or the vendor keeps nothing in it). Attributes only (``find-generic-password -s <name> <keychain>``,
-    never ``-w`` or ``-g``), which answers on a locked keychain. Found: exit 0; absent: exit 44 (errSecItemNotFound).
-    Any other answer raises: an unreadable state is never taken for an empty one."""
+    is not there). Attributes only (``find-generic-password -s <name> <keychain>``, never ``-w`` or ``-g``), which
+    answers on a locked keychain. Found: exit 0; absent: exit 44 (errSecItemNotFound). Any other answer, or a keychain
+    path that is not a regular file of the hands user, raises: an unreadable state is never taken for an empty one.
+    The callers treat a raise as ADVISORY (a login only skips its note; a logout reports the keychain as unconfirmed
+    after the rest ran). Two service names only: the shim covers every Claude service by verb, so orphans of other
+    names are a pre-shim leftover this does not chase."""
     if not keychain_needed(vendor):
         return None
-    ours = keychain_path(hands)
-    if _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True) is None:
+    ours = _sealed_keychain_file(hands, vendor, entity_dir)
+    if ours is None:
         return None
     for name in claude_credential_services(hands):
         r = _security(hands, vendor, "find-generic-password", "-s", name, ours, entity_dir=entity_dir)
@@ -785,8 +838,12 @@ def keychain_orphan(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str
 
 def remove_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
     """Delete Levain's sealed keychain as the hands user (its password was never kept, so no item in it can be removed
-    singly) and confirm the file is gone. The next login makes it again, locked."""
-    ours = keychain_path(hands)
+    singly) and confirm the file is gone. The next login makes it again, locked. MEASURED (vmkc3): afterwards the user
+    domain has no default keychain and an empty search list, which :func:`ensure_hands_keychain` re-makes and sets
+    again. A path that is not a regular file of the hands user raises before ``security`` is run."""
+    ours = _sealed_keychain_file(hands, vendor, entity_dir)
+    if ours is None:
+        return
     r = _security(hands, vendor, "delete-keychain", ours, entity_dir=entity_dir)
     if r.returncode != 0 or _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True) is not None:
         raise HandsLoginError(f"the hands keychain {ours} is still there after `delete-keychain` "
@@ -797,10 +854,11 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
     """Under the caller's hands lock, as the hands user: the hands account's default keychain is Levain's sealed one,
     its file exists, and the search list holds it. Returns ``"made"`` (the keychain was created), ``"repaired"`` (it
     was there, and the default or the search list was set again: a run stopped half-way is finished, never taken as
-    done), or ``"present"`` (nothing to do). A default keychain that is not Levain's is refused, never adopted or
-    replaced (its password is someone's: adopting it would make Levain its holder). Never unlocks a keychain, never
-    stores the password, never puts it in an error, never touches the operator's keychain (every call runs as hands
-    with HOME = the hands home).
+    done), or ``"present"`` (nothing to do). A keychain it makes is locked at once (``create-keychain`` leaves it
+    unlocked; a failed lock raises with the keychain made, and the next login locks it again). A default keychain that
+    is not Levain's is refused, never adopted or replaced (its password is someone's: adopting it would make Levain its
+    holder). Never unlocks a keychain, never stores the password, never puts it in an error, never touches the
+    operator's keychain (every call runs as hands with HOME = the hands home).
 
     KNOWN EDGE: the one-time password rides argv (``create-keychain -p``, which needs it), so for that one call it is
     visible to ``ps`` (to the hands uid at least; other readers of the process table are unmeasured) and is in sudo's
@@ -859,7 +917,8 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
 
 
 KEYCHAIN_MADE_NOTE = ("Made the hands account's own keychain ({path}). It holds nothing and Levain did not store its "
-                      "password. It is kept locked so that Claude keeps this login in its 0600 file in the hands home.")
+                      "password. It is kept locked, and Claude's own keychain calls are answered by Levain's shim, so Claude keeps this "
+                      "login in its 0600 file in the hands home.")
 KEYCHAIN_ORPHAN_NOTE = ("The hands account's own keychain ({path}) holds a Claude item ({name!r}) from an earlier login. "
                         "It stays locked, so this login is kept in the 0600 file; `levain hands logout {vendor}` "
                         "removes the keychain.")
@@ -1004,13 +1063,16 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
         try:
             ensure_config_home(hands, vendor, entity_dir=entity_dir)
             if keychain_needed(vendor):
+                ensure_security_shim(hands, vendor, entity_dir=entity_dir)
                 note = keychain_note(ensure_hands_keychain(hands, vendor, entity_dir=entity_dir), hands)
                 if note:
                     say(note)
-                # Every Claude login, whatever ensure said: a keychain that is not confirmed locked takes the vendor's
-                # write and the login then reads "not signed in" (levain#241).
-                lock_and_confirm_hands_keychain(hands, vendor, entity_dir=entity_dir)
-                orphan = keychain_orphan(hands, vendor, entity_dir=entity_dir)
+                # Every Claude login, whatever ensure said (levain#241).
+                lock_hands_keychain(hands, vendor, entity_dir=entity_dir)
+                try:
+                    orphan = keychain_orphan(hands, vendor, entity_dir=entity_dir)
+                except HandsLoginError:
+                    orphan = None          # advisory: a lookup that fails only skips the note
                 if orphan:
                     say(KEYCHAIN_ORPHAN_NOTE.format(path=keychain_path(hands), name=orphan, vendor=vendor) + "\n")
         except HandsRefused:
@@ -1204,19 +1266,21 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
     the vendor again. Returns ``nothing`` (confirmed signed out, no file, no Claude item in the sealed keychain: nothing
     run), else ``logged-out`` or ``file-removed`` (alone when only the vendor or the file changed) and, when the sealed
     keychain was deleted, ``keychain-removed`` (alone when it was all that was left, else joined with ``+``), only when
-    the vendor then says signed out and the file and the item are gone. Raises :class:`HandsRefused` when nothing was changed (the state could not be read, the lock is held,
-    processes were left) and :class:`HandsLoginError` when the logout ran but could not be confirmed."""
+    the vendor then says signed out and the file and the item are gone. A keychain look that fails does not stop the
+    file and vendor logout: they run, and the failure is raised after them as unconfirmed. Raises :class:`HandsRefused`
+    when nothing was changed (the state could not be read, the lock is held, processes were left) and
+    :class:`HandsLoginError` when the logout ran but could not be confirmed."""
     _check_vendor(vendor)
     with hands_lock(entity_dir, "logout"):
         st = run_status(hands, vendor, entity_dir=entity_dir, held=True)
         if st.state == UNKNOWN:
             raise HandsRefused(f"cannot tell whether hands {vendor} is signed in, so nothing was changed: {st.error}")
+        unchecked: str | None = None
         try:
             orphan = keychain_orphan(hands, vendor, entity_dir=entity_dir)
         except HandsLoginError as exc:
-            raise HandsRefused(f"cannot tell whether the hands keychain holds a {vendor} login, so nothing was changed: "
-                               f"{exc}") from None
-        if st.state == OUT and st.credential is None and orphan is None:
+            orphan, unchecked = None, str(exc)      # advisory: the file and the vendor logout still run (d241_v2 5)
+        if st.state == OUT and st.credential is None and orphan is None and unchecked is None:
             return "nothing"
         left = hands_live.sweep_hands_user(hands.user, uid=hands.uid)
         if left:
@@ -1241,6 +1305,10 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
             why = after.error if after.state == UNKNOWN else f"it says {after.state}{': ' + after.account if after.account else ''}"
             raise HandsLoginError(f"hands {vendor} is not confirmed signed out after the logout ({why}); "
                                   f"the vendor logout said: {said}")
+        if unchecked is not None:
+            raise HandsLoginError(f"hands {vendor} is signed out ({how}), but whether the sealed keychain holds a Claude item "
+                                  f"could not be confirmed ({unchecked}); run the logout again, or remove "
+                                  f"{keychain_path(hands)} by hand")
         return how
 
 

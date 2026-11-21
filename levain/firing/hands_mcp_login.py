@@ -365,11 +365,13 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
             # add/login mutation.
             try:
                 if hl.keychain_needed(VENDOR):
+                    # levain#241: the security shim (checked before the vendor runs) and the lock keep the token's save
+                    # in the 0600 file; an unwritable shim or a failed lock refuses before anything is added.
+                    hl.ensure_security_shim(hands, VENDOR, entity_dir=entity_dir)
                     note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
                     if note:
                         (emit or hl._write_out)(note)
-                    # levain#241: an unlocked sealed keychain takes the token's save and the sign-in then reads absent.
-                    hl.lock_and_confirm_hands_keychain(hands, VENDOR, entity_dir=entity_dir)
+                    hl.lock_hands_keychain(hands, VENDOR, entity_dir=entity_dir)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
             if name not in held:

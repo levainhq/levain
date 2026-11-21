@@ -3876,6 +3876,15 @@ builtin exit "$__levain_done"
 # directory under the operator's home (which the hands user cannot enter anyway).
 HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+#: macOS: the directory (under the hands home) that holds Levain's ``security`` shim and is FIRST on the hands PATH
+#: (levain#241; the shim text and its checks live in :mod:`levain.firing.hands_login`). The macOS sandbox profile is
+#: ``(allow default)`` with denies only for the crown jewels, so it does not block executing the shim.
+HANDS_SHIM_DIRNAME = ".levain-bin"
+
+
+def hands_shim_dir(hands: "HandsIdentity") -> str:
+    return f"{hands.home}/{HANDS_SHIM_DIRNAME}"
+
 
 @dataclass(frozen=True)
 class HandsIdentity:
@@ -3969,8 +3978,10 @@ HANDS_NO_MARKETPLACE_AUTOINSTALL = ("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AU
 def _hands_env(hands: HandsIdentity) -> dict[str, str]:
     """The whole environment a hands-user bash starts with (``env -i`` drops everything else, sudo's
     own variables included): every hands start, the vendors' login, status, logout, ``claude mcp`` verbs and chat
-    included, takes it from here."""
-    return {"HOME": hands.home, "PATH": HANDS_PATH, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+    included, takes it from here. On macOS the PATH starts with the directory of Levain's ``security`` shim
+    (:func:`hands_shim_dir`); elsewhere it is :data:`HANDS_PATH` unchanged."""
+    path = f"{hands_shim_dir(hands)}:{HANDS_PATH}" if platform.system() == "Darwin" else HANDS_PATH
+    return {"HOME": hands.home, "PATH": path, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user,
             HANDS_NO_CLAUDEAI_CONNECTORS[0]: HANDS_NO_CLAUDEAI_CONNECTORS[1],
             HANDS_NO_MARKETPLACE_AUTOINSTALL[0]: HANDS_NO_MARKETPLACE_AUTOINSTALL[1]}

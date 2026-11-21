@@ -322,3 +322,44 @@ def test_a_corrupted_log_is_a_clean_refusal_through_register_and_revoke(ck, caps
     assert main(argv(ck, verb, *rest)) == 1
     err = capsys.readouterr().err
     assert f"{verb} refused:" in err and "Traceback" not in err
+
+
+# --- levain#241: the MCP sign-in locks the sealed keychain and checks the security shim before the vendor runs ---------
+# (the sign-in rig is the one of tests/test_hands_mcp_verbs.py; only its fixture and helper are borrowed)
+from tests.test_hands_login import _sec_calls  # noqa: E402
+from tests.test_hands_mcp_verbs import rig, signin  # noqa: E402,F401
+
+
+def test_every_mcp_signin_locks_the_sealed_keychain_before_the_vendor_adds_anything(rig):
+    # the keychain is already there at the second sign-in, so the only `lock-keychain` it can see is the sign-in's own
+    # call: deleting that call from hands_mcp_login.signin fails this test
+    rig.register()
+    assert signin(rig) == 0
+    rig.seclog.unlink()
+    rig.register("notion")
+    assert signin(rig, "notion") == 0
+    assert [c for c in _sec_calls(rig) if c.startswith("lock-keychain")] != []
+
+
+def test_an_mcp_signin_whose_lock_fails_refuses_before_any_add_or_login(rig, capsys):
+    rig.register()
+    rig.knobs["SEC_LOCK_FAIL"] = "denied"
+    assert signin(rig) == 1
+    out = capsys.readouterr().out
+    assert "could not lock" in out and "the sign-in was not started" in out
+    assert rig.mutating() == [] and not rig.cred.exists() and "linear" not in hml.read_record(rig.entity)
+
+
+def test_an_mcp_signin_writes_the_security_shim_and_refuses_when_it_cannot(rig, capsys):
+    from levain.firing import hands_login as hl
+    rig.register()
+    assert signin(rig) == 0
+    shim = rig.hands_home / ".levain-bin" / "security"
+    assert shim.read_text() == hl.SECURITY_SHIM_TEXT
+    shim.unlink()
+    (rig.hands_home / ".levain-bin").rmdir()
+    (rig.hands_home / ".levain-bin").write_text("a file where the directory goes")
+    rig.log.write_text("")
+    rig.register("notion")
+    assert signin(rig, "notion") == 1
+    assert "the sign-in was not started" in capsys.readouterr().out and rig.mutating() == []
