@@ -156,7 +156,8 @@ def test_fix1_ctrl_c_during_creation_is_cancelled(tmp_path, outside):
 def test_fix1_cli_ctrl_c_prints_no_traceback(tmp_path, monkeypatch, capsys, outside):
     from levain.consent.band import EXIT_REFUSED
     monkeypatch.setattr(ts, "_real_key_dir", lambda: tmp_path / "keys")
-    monkeypatch.setattr("levain.cockpit.custody.create_touch_id", _creator([], KeyboardInterrupt()))
+    # the default door is the levain-sign helper on a Mac with swiftc (levain#191): pin the door, not the host
+    monkeypatch.setattr(ts, "default_creator", lambda: (_creator([], KeyboardInterrupt()), None))
     assert _no_raise(lambda: _cli("terminal-key", "create")) == EXIT_REFUSED
     assert capsys.readouterr().err.strip() == "not created: cancelled"
 

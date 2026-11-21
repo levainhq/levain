@@ -1024,7 +1024,17 @@ def _check_the_appenders(root: Path) -> None:
         _check_handed_append(_parsed((root / rel).read_text(encoding="utf-8")), name, param)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                if _key_act_callers(_parsed(path.read_text(encoding="utf-8")))]
-    assert callers == ["cli.py"]
+    # terminal_rotate (levain#191) enrols and revokes the terminal key as `levain band terminal-key rotate`, a short-lived
+    # CLI act like cli.py's; held to it: band_view.py, whose CLI handler runs it, is its only importer in the package
+    assert callers == ["cli.py", "consent/terminal_rotate.py"]
+    rotate_importers = sorted(
+        str(p.relative_to(root)) for p in root.rglob("*.py") if p != root / "consent" / "terminal_rotate.py"
+        and any(isinstance(n, ast.alias) and n.name in ("terminal_rotate", "levain.consent.terminal_rotate")
+                or isinstance(n, ast.ImportFrom) and n.module is not None
+                and n.module in ("levain.consent.terminal_rotate", "terminal_rotate")
+                or isinstance(n, ast.ImportFrom) and (n.module or "").endswith(".terminal_rotate")
+                for n in ast.walk(_parsed(p.read_text(encoding="utf-8")))))
+    assert rotate_importers == ["band_view.py"], rotate_importers
     # the egress key acts are reached only from the CLI's commands, like the cockpit key acts
     setup_callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                      if _key_setup_callers(_parsed(path.read_text(encoding="utf-8")))]
@@ -1088,6 +1098,22 @@ def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
         planted = root / "cockpit" / f"planted_{i}.py"
         planted.write_text(source, encoding="utf-8")
         with pytest.raises(AssertionError, match=f"planted_{i}"):
+            _check_the_appenders(root)
+        planted.unlink()
+
+
+@pytest.mark.static_guard
+def test_the_appender_guard_sees_a_planted_from_import_of_terminal_rotate(tmp_path):
+    # rotate_importers is not vacuous for `from ... import`: a planted one, absolute or relative, fails the guard
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    _check_the_appenders(root)
+    for i, source in enumerate(("from levain.consent.terminal_rotate import run\n",
+                                "from .terminal_rotate import run\n",
+                                "from terminal_rotate import run\n")):
+        planted = root / "cockpit" / f"planted_rot_{i}.py"
+        planted.write_text(source, encoding="utf-8")
+        with pytest.raises(AssertionError, match=f"planted_rot_{i}"):
             _check_the_appenders(root)
         planted.unlink()
 
