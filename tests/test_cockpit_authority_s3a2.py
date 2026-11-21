@@ -1024,7 +1024,14 @@ def _check_the_appenders(root: Path) -> None:
         _check_handed_append(_parsed((root / rel).read_text(encoding="utf-8")), name, param)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                if _key_act_callers(_parsed(path.read_text(encoding="utf-8")))]
-    assert callers == ["cli.py"]
+    # terminal_rotate (levain#191) enrols and revokes the terminal key as `levain band terminal-key rotate`, a short-lived
+    # CLI act like cli.py's; held to it: band_view.py, whose CLI handler runs it, is its only importer in the package
+    assert callers == ["cli.py", "consent/terminal_rotate.py"]
+    rotate_importers = sorted(
+        str(p.relative_to(root)) for p in root.rglob("*.py") if p != root / "consent" / "terminal_rotate.py"
+        and any(isinstance(n, ast.alias) and n.name in ("terminal_rotate", "levain.consent.terminal_rotate")
+                for n in ast.walk(_parsed(p.read_text(encoding="utf-8")))))
+    assert rotate_importers == ["band_view.py"], rotate_importers
     # the egress key acts are reached only from the CLI's commands, like the cockpit key acts
     setup_callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                      if _key_setup_callers(_parsed(path.read_text(encoding="utf-8")))]
