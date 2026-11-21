@@ -282,6 +282,25 @@ out.insideClosed = !boxOf();
     assert out == {"outsideOpen": True, "outsidePrevented": False, "insideClosed": True}, out
 
 
+def test_a_press_that_drops_focus_to_the_body_inside_the_box_gives_it_back_to_the_field_while_the_box_is_open(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const dlg = openBox(); const p = partsOf(dlg);
+// the refocus is a microtask: it runs after the driver's own synchronous print, so the answer is printed again at the end of the chain
+// (the runner reads the last line)
+const tick = () => Promise.resolve().then(() => Promise.resolve());
+document.activeElement = document.body;
+p.box.fire("focusout", { relatedTarget: null });
+tick().then(() => {
+  out.refocused = document.activeElement === p.input;
+  p.box.fire("keydown", key("Escape"));
+  document.activeElement = document.body;
+  p.box.fire("focusout", { relatedTarget: null });
+  return tick();
+}).then(() => { out.afterClose = document.activeElement === p.input; console.log(JSON.stringify(out)); });
+""", tmp_path)
+    assert out == {"refocused": True, "afterClose": False}, out
+
+
 # a hand-off waits on the page's own observer and a timer: both are held by the test, and a redraw is delivered to the observers whose
 # target the changed parent is (or, for a subtree observer, sits under)
 HANDOFF = r"""
