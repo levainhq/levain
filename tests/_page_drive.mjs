@@ -238,6 +238,9 @@ const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEvent
 // Loaded here, once, and tolerated absent: a copy of this file made without its sibling still drives, and just dumps without the block.
 let evidence = null; let evidenceMod = null;
 try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMod.createEvidence({ now: Date.now, t0: T0 }); } catch { evidence = null; }
+// The dialog decline's retry decision (tests/_dialog_decline.mjs): same tolerance, a copy without the sibling declines once and never retries.
+let declineMod = null;
+try { declineMod = await import("./_dialog_decline.mjs"); } catch { declineMod = null; }
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (evidence) evidence.onMessage(d);
@@ -263,8 +266,18 @@ ws.addEventListener("message", (m) => {
   }
   // a prompt (the write-token ask) is declined, as an operator who has no token would
   if (d.method === "Page.javascriptDialogOpening") {
-    const i = ++id; if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
-    ws.send(JSON.stringify({ id: i, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+    if (declineMod) {
+      // A decline refused only because the page target is not attached yet is sent again after a pause, within a bound (tests/_dialog_decline.mjs):
+      // an open dialog freezes the page and nothing else would close it. Each send is recorded by the evidence under its own command id, and
+      // the reply is read through the same pending map as every other command; it is never awaited inside this listener.
+      declineMod.declineDialog({
+        send: (method, params) => { if (evidence) evidence.dialogReplySent(id + 1); return send(method, params); },   // send takes the next id synchronously: the evidence record matches the reply to this command by it
+        now: Date.now, sleep, boundMs: scaled(5000), pauseMs: 200,
+      }).then((out) => { if (!out.declined) trail.push(`dialog decline not done (${out.why}) after ${out.sends} sends: ${out.last.slice(0, 80)}`); }).catch(() => {});
+    } else {
+      const i = ++id; if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
+      ws.send(JSON.stringify({ id: i, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+    }
   }
   if (d.id && pend.has(d.id)) { const e = pend.get(d.id); pend.delete(d.id); e.res(d); }
 });

@@ -88,7 +88,7 @@ export function createEvidence({ now = Date.now, t0 = now() } = {}) {
       const p = d.params || {};
       switch (d.method) {
         case "Page.javascriptDialogOpening":
-          dialogs.push({ type: String(p.type), message: clip(p.message, 60), opened: rel(), closed: null, accepted: null, sent: null, reply: null });
+          dialogs.push({ type: String(p.type), message: clip(p.message, 60), opened: rel(), closed: null, accepted: null, sent: null, reply: null, tries: 1, firstReply: null });
           if (dialogs.length > DIALOG_MAX) dialogs.shift();
           break;
         case "Page.javascriptDialogClosed": {
@@ -132,7 +132,10 @@ export function createEvidence({ now = Date.now, t0 = now() } = {}) {
   const dialogReplySent = (id) => {
     const dialog = dialogs[dialogs.length - 1];
     if (!dialog) return;
-    dialog.sent = rel(); replyOf.set(id, { dialog, sent: now() });
+    // a decline sent again keeps the first send's time and the first reply, so the record shows both the first refusal and the final outcome
+    if (dialog.sent === null) dialog.sent = rel();
+    else { dialog.tries++; if (dialog.firstReply === null) dialog.firstReply = dialog.reply; }
+    replyOf.set(id, { dialog, sent: now() });
     if (replyOf.size > DIALOG_MAX * 2) replyOf.delete(replyOf.keys().next().value);
   };
   const resendFired = () => { resends++; return resends; };
@@ -150,7 +153,7 @@ const ringLine = (e) => clip(`${e.at} ${e.type} ${e.url} `
 export function renderEvidence(ev, extra = {}) {
   const out = ["--- drive evidence ---", `resend fired: ${ev.resends()}`];
   out.push(`DIALOGS (${ev.dialogs.length}, newest kept):`);
-  for (const d of ev.dialogs) out.push(clip(`  ${d.opened} ${d.type} "${d.message}" closed ${d.closed ?? "never"}${d.accepted === null ? "" : ` accepted=${d.accepted}`}; handleJavaScriptDialog sent ${d.sent ?? "never"}, reply ${d.reply ?? "none"}`, 200));
+  for (const d of ev.dialogs) out.push(clip(`  ${d.opened} ${d.type} "${d.message}" closed ${d.closed ?? "never"}${d.accepted === null ? "" : ` accepted=${d.accepted}`}; handleJavaScriptDialog sent ${d.sent ?? "never"}, reply ${d.reply ?? "none"}${d.tries > 1 ? `; sent ${d.tries} times, first reply ${d.firstReply ?? "none"}` : ""}`, 200));
   out.push(`FAILED LOADS (${ev.failed.size} kept, newest ${FAILED_MAX}; a status of 400 and up counts):`);
   for (const e of ev.failed.values()) out.push("  " + ringLine(e));
   const ordinary = [...ev.ring.entries()].filter(([rid]) => !ev.failed.has(rid)).map(([, e]) => e);
