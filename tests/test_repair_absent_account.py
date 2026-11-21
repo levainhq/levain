@@ -19,7 +19,7 @@ from levain.slot import install_helper as IH
 from levain.slot import units
 from levain.slot.accounts import Account, membership_pairs, supplementary_groups
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId
+from levain.slot.ids import RANGES, provisioned_shared_groups, provisioned_singletons, SlotId
 
 OP, OP_UID = "phill", 501
 TXN_A = "a" * 32
@@ -52,10 +52,10 @@ def _host(tmp: Path, host: str, *, egress=(0, 1), verifier=(0,), gone=(), out_of
     accounts tombstoned, so not live; their records stay in the shape). ``ungrouped``: name -> the gid its same-named
     group now has (None: the group is gone; the user stays)."""
     r = RANGES[host]
-    ids = {n: u for n, u in zip(SINGLETONS, r.singletons)}
+    ids = {n: u for n, u in zip(provisioned_singletons(host), r.singletons)}
     slots = [SlotId("egress", i) for i in egress] + [SlotId("none", i) for i in verifier]
     ids.update((n, u) for n, u in zip([n for s in slots for n in s.accounts], r.slots))
-    groups = {g: gid for g, gid in zip(SHARED_GROUPS, r.shared)}
+    groups = {g: gid for g, gid in zip(provisioned_shared_groups(host), r.shared)}
     services = [s.name for s in units.services_for(host)]
     managed = IH.desired_managed(host, accounts=ids, shared=groups, operator=OP, services=services, slots=slots)
     shape = G.InstallShape("gen-" + "0" * 16, "0.9.0", "0.16.0", TXN_A, {}, tuple(managed))

@@ -23,7 +23,7 @@ from levain.slot import records as R
 from levain.slot import render
 from levain.slot.accounts import Account, account_steps, supplementary_groups, tombstone_steps, vendor_home_steps
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import SINGLETONS, SlotId
+from levain.slot.ids import provisioned_singletons, SlotId
 from levain.slot.install_helper import HostFacts, operator_record, plan_setup, plan_undo
 
 HOME = "/private/var/levain/vendorhome"
@@ -52,7 +52,7 @@ def _homes(host: str, names) -> dict[str, str]:
 
 
 def test_vendor_accounts_get_the_vendor_home_on_macos_only():
-    names = ["_levain_s0", "_levain_s12", "_levain_c0", "_levain_c3", "_levain_gw0", "_levain_v0", *SINGLETONS]
+    names = ["_levain_s0", "_levain_s12", "_levain_c0", "_levain_c3", "_levain_gw0", "_levain_v0", *provisioned_singletons("darwin")]
     vendor = {"_levain_s0", "_levain_s12", "_levain_c0", "_levain_c3"}
     assert _homes("darwin", names) == {n: HOME if n in vendor else "/var/empty" for n in names}
     assert _homes("linux", names) == {n: "/nonexistent" for n in names}
@@ -320,13 +320,13 @@ def test_vendor_home_is_outside_every_slot_writable_path():
 
 
 def test_undo_leaves_the_vendor_home_and_tombstones_to_var_empty():
-    from levain.slot.ids import RANGES, SHARED_GROUPS
+    from levain.slot.ids import RANGES, provisioned_shared_groups
 
-    accounts = {"_levain_s0": 3999, "_levain_gw0": 3998, **{n: 3799 - i for i, n in enumerate(SINGLETONS)}}
+    accounts = {"_levain_s0": 3999, "_levain_gw0": 3998, **{n: 3799 - i for i, n in enumerate(provisioned_singletons("darwin"))}}
     facts = HostFacts("darwin", caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID, tool_present=lambda p: True,
                       xcode_ready=lambda: True, operator_record=operator_record(OP, OP_UID))
     plan = plan_undo(parse_install_argv(["undo"]), facts, accounts=accounts,
-                     shared_groups={g: RANGES["darwin"].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES["darwin"].shared[i] for i, g in enumerate(provisioned_shared_groups("darwin"))})
     whys = [s.why for s in plan.steps]
     assert "tombstone _levain_s0: no home" in whys
     assert not [w for w in whys if "vendorhome" in w or "vendor home" in w]

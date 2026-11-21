@@ -129,7 +129,7 @@ def intent_text(intent: Intent) -> str:
     return canon.canonical(intent_record(intent))
 
 
-#: §1.1 rule f: a shared group's name by the bound (``group/1``'s), never by membership of ``SHARED_GROUPS``.
+#: §1.1 rule f: a shared group's name by the bound (``group/1``'s), never by membership of ``KNOWN_SHARED_GROUPS``.
 GROUP_RE = re.compile(r"levain-[a-z0-9-]{1,24}")
 
 
@@ -140,7 +140,7 @@ def _is_id(x: object) -> bool:
 def parse_intent(data: bytes, host: HostOS) -> Intent:
     """Strict: exactly the record's keys, a journaling verb, an operator name, Levain account names at
     ids in their §1.1 range, shared-group names at ids in the shared range, no id twice. A group is judged by
-    the BOUND (a ``levain-`` name at a gid in the shared range), never by this code's own ``SHARED_GROUPS``, so a
+    the BOUND (a ``levain-`` name at a gid in the shared range), never by this code's own ``KNOWN_SHARED_GROUPS``, so a
     package can read a journal naming a group it does not know (DESIGN 1022-8/upgrade §1.1 rule f)."""
     try:
         obj = canon.parse(data)

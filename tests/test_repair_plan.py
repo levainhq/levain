@@ -26,12 +26,12 @@ from levain.slot import install_helper as IH
 from levain.slot import intent as I
 from levain.slot import root_tree, units
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, loopback_alias
+from levain.slot.ids import KNOWN_SHARED_GROUPS, RANGES, loopback_alias, provisioned_shared_groups
 from levain.slot.intent import Intent, parse_intent, intent_text
 
 OP, OP_UID = "phill", 501
 HOST = "darwin"
-OLD_GROUPS = SHARED_GROUPS[:8]                     # setup at 32939b5e: no levain-keysadmin
+OLD_GROUPS = KNOWN_SHARED_GROUPS[:8]                     # setup at 32939b5e: no levain-keysadmin
 SINGLETON_UIDS = {"_levain_keys": 3799, "_levain_export": 3798, "_levain_control": 3797, "_levain_qbroker": 3796,
                   "_levain_dispatch": 3795}
 SLOT_UIDS = {"_levain_s0": 3999, "_levain_gw0": 3998, "_levain_v0": 3997, "_levain_c0": 3996}
@@ -468,7 +468,7 @@ def test_every_mutating_verb_checks_the_records(tmp_path: Path) -> None:
 def test_replenish_extends_the_install_shape(tmp_path: Path, monkeypatch) -> None:
     """U16 (codex MED 7): what replenish made is in install-shape.managed before its journal goes, the rest kept."""
     shared = list(RANGES[HOST].shared)
-    groups = {g: shared[i] for i, g in enumerate(SHARED_GROUPS)}
+    groups = {g: shared[i] for i, g in enumerate(provisioned_shared_groups(HOST))}
     old = _shape("gen-" + "c" * 16, TXN_A, managed=[("group/1", (g, i)) for g, i in groups.items()])
     old = replace(old, started_after={"keys": 5})
     f, _ = _pre_change(tmp_path, shape=old)

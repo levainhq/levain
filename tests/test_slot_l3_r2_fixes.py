@@ -13,7 +13,7 @@ import pytest
 from levain.firing import hands
 from levain.slot import Refused, intent as intent_mod, pf, root_tree, units
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import SHARED_GROUPS, SINGLETONS
+from levain.slot.ids import provisioned_shared_groups, provisioned_singletons
 from levain.slot.install_helper import HostFacts, operator_record, plan_setup, plan_undo
 from levain.slot.intent import INTENT_PATH, Intent
 from levain.slot.layout import operator_record_path
@@ -269,7 +269,7 @@ def _abandoned(host):
     first = plan_setup(parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]),
                        _facts(host), read_sysctl=lambda p: "1", program_exists=lambda p: True)
     j = first.intent
-    made = {**{g: j.groups[g] for g in SHARED_GROUPS}, **{n: j.accounts[n] for n in SINGLETONS},
+    made = {**{g: j.groups[g] for g in provisioned_shared_groups(host)}, **{n: j.accounts[n] for n in provisioned_singletons(host)},
             "_levain_s0": j.accounts["_levain_s0"]}
     return j, made
 
@@ -292,11 +292,11 @@ def test_undo_clears_abandoned_setup_intent(host):
                          accounts={}, shared_groups={}).value.name == "not-set-up"
     undo = plan_undo(undo_cmd, _facts(host, intent=j, host_ids=present), accounts={}, shared_groups={})
     tombed = {s.why.split(":")[0].removeprefix("tombstone ") for s in undo.steps if s.why.startswith("tombstone ")}
-    assert tombed == {n for n in made if n not in SHARED_GROUPS}
+    assert tombed == {n for n in made if n not in provisioned_shared_groups(host)}
     assert j.accounts["_levain_gw0"] not in undo.retired_after
     assert {j.accounts[n] for n in tombed} <= undo.retired_after
     deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
-    assert sorted(deleted) == sorted(SHARED_GROUPS)
+    assert sorted(deleted) == sorted(provisioned_shared_groups(host))
     # the journal goes last of the removals (then FIX1 M1's sudoers check); there is no record to remove
     assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
     assert undo.steps[-2].argv[1:] == ("-f", str(INTENT_PATH[host]))

@@ -555,9 +555,9 @@ def run_dir_undo_steps(host: HostOS) -> list[Step]:
 
 def shared_group_rows(host: HostOS, operator: str) -> list[Row]:
     """Every store and run dir whose row names a shared group (§1.2)."""
-    from levain.slot.ids import SHARED_GROUPS
+    from levain.slot.ids import KNOWN_SHARED_GROUPS
 
-    return [r for r in base_store_rows(host, operator) + base_run_rows(host, operator) if r.group in SHARED_GROUPS]
+    return [r for r in base_store_rows(host, operator) + base_run_rows(host, operator) if r.group in KNOWN_SHARED_GROUPS]
 
 
 def ungroup_steps(host: HostOS, operator: str) -> list[Step]:

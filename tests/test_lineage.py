@@ -23,7 +23,7 @@ from levain.slot import accounts as A
 from levain.slot import control as C
 from levain.slot import layout
 from levain.slot import lineage as LN
-from levain.slot.ids import SHARED_GROUPS
+from levain.slot.ids import KNOWN_SHARED_GROUPS
 from tests.test_slot_s2a_control import OP_UID
 
 KEYS_UID = OP_UID + 3000
@@ -495,7 +495,7 @@ def test_lineage_unreadable_to_slot_and_gw(host, tmp):
     rows = {r.path: r for r in layout.base_store_rows(host, "op")}
     row = rows[layout.STORE[host] / "lineage"]
     assert (row.owner, row.group, row.mode) == ("_levain_control", "levain-lineage", 0o2750)
-    assert "levain-lineage" in SHARED_GROUPS
+    assert "levain-lineage" in KNOWN_SHARED_GROUPS
     members = {n for n in ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch",
                            "_levain_s0", "_levain_s1", "_levain_v0", "_levain_c0", "_levain_gw0", "_levain_gw1")
                if "levain-lineage" in A.supplementary_groups(n)}

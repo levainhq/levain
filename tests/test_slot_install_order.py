@@ -14,7 +14,7 @@ import pytest
 from levain.firing import hands
 from levain.slot import Refused, bwrap, root_tree, units
 from levain.slot.grammar import MAX_ROOTS, check_roots, parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId
+from levain.slot.ids import RANGES, provisioned_shared_groups, provisioned_singletons, SlotId
 from levain.slot.install_helper import (HostFacts, check_tools, operator_record, plan_replenish, plan_setup,
                                         plan_tools, plan_undo)
 from levain.slot.layout import (RESERVE_BYTES, RUN, STORE, TMPFILES_CONF, base_run_rows, roots_path,
@@ -57,10 +57,11 @@ def _plan(host, n=8, m=2, **kw):
 
 def _gids(host, names):
     """Shared group names -> the gids setup gives them (undo takes each group at its live gid)."""
-    return {g: RANGES[host].shared[SHARED_GROUPS.index(g)] for g in names}
+    return {g: RANGES[host].shared[provisioned_shared_groups(host).index(g)] for g in names}
 
 
-def _undo(host, accounts, shared=SHARED_GROUPS, **kw):
+def _undo(host, accounts, shared=None, **kw):
+    shared = provisioned_shared_groups(host) if shared is None else shared
     return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts,
                      shared_groups=_gids(host, shared))
 
@@ -222,7 +223,7 @@ def test_undo_reruns_after_failure(host):
         if s.why.startswith(("delete the group ", "unload the AppArmor ", "delete the network namespace ")):
             assert isinstance(s, RemoveStep) and s.call is not None and not s.argv, s.why
     # the re-run after a failure past the tombstones: no live accounts left, half the groups gone
-    again = _undo(host, {}, shared=SHARED_GROUPS[:3], retired=undo.retired_after)
+    again = _undo(host, {}, shared=provisioned_shared_groups(host)[:3], retired=undo.retired_after)
     assert again.steps[2].why.startswith(f"remove {RUNTIME_SUDOERS} ") and install_rule_at(again)
     assert again.retired_after == undo.retired_after
 
@@ -245,7 +246,7 @@ def test_undo_leaves_no_shared_gid_on_store(host):
     """Before a shared group is deleted, every store (and run) dir whose row names one is chgrp'd to
     the host's gid-0 group, so no deleted gid is left on a dir for a later group to inherit."""
     plan = _plan(host, 3, 1)
-    named = {r.path for r in plan.rows if r.group in SHARED_GROUPS}
+    named = {r.path for r in plan.rows if r.group in provisioned_shared_groups(host)}
     L = STORE[host]
     assert {L / "export/operator", L / "export/dispatch", L / "queue/requests",
             L / "contracts", L / "lineage"} <= named
@@ -534,4 +535,4 @@ def test_singletons_shared_and_slots_reused_ids_disjoint():
     tombs = {"_levain_keys": r.singletons[0]}
     assert _refusal(_plan, "linux", existing_names=frozenset(live) | frozenset(tombs), levain_live=live,
                     levain_tombstones=tombs) == "tombstone-id-conflict"
-    assert SINGLETONS and SlotId("egress", 0).primary == "_levain_s0"
+    assert provisioned_singletons("linux") and SlotId("egress", 0).primary == "_levain_s0"

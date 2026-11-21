@@ -139,10 +139,10 @@ class Principal:
 
 
 def principal(host: str, name: str, ids: Mapping[str, int], shared: Mapping[str, int]) -> Principal:
-    from levain.slot.ids import RANGES, SINGLETONS, in_own_range
+    from levain.slot.ids import KNOWN_SINGLETONS, RANGES, in_own_range
 
     uid = ids.get(name)
-    if name in SINGLETONS or not in_own_range(host, name, uid):
+    if name in KNOWN_SINGLETONS or not in_own_range(host, name, uid):
         raise Refused("bad-token", f"{name}: uid {uid!r} is not a session account in its §1.1 range")
     assert isinstance(uid, int)
     grp = "levain-gwfronts" if name.startswith("_levain_gw") else "levain-slots"

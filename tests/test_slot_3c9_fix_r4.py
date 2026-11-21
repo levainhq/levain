@@ -9,7 +9,7 @@ KEYS = "levain-keys.service"
 def _plan(monkeypatch, *, create_gw: bool):
     from levain.firing import hands
     from levain.slot.grammar import parse_install_argv
-    from levain.slot.ids import SINGLETONS
+    from levain.slot.ids import provisioned_singletons
     from tests.test_slot_install_plan import _facts, _set_up, _setup
     real = hands.shutil.which
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
@@ -21,7 +21,7 @@ def _plan(monkeypatch, *, create_gw: bool):
         parse_install_argv(["replenish"]),
         _set_up("linux", used_ids=frozenset(accounts.values()), existing_names=frozenset(accounts)),
         slots=8, verifier_slots=2, live=live,
-        accounts={k: v for k, v in accounts.items() if k not in gone and k not in SINGLETONS})
+        accounts={k: v for k, v in accounts.items() if k not in gone and k not in provisioned_singletons("linux")})
 
 
 def _whys(plan):

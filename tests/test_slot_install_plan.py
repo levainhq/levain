@@ -11,7 +11,7 @@ from levain.firing.hands import Step
 from levain.slot import Refused
 from levain.slot.accounts import OPERATOR_GROUPS, SLOT_MARKER, supplementary_groups
 from levain.slot.grammar import LEASE_EXEMPT, VERBS, parse_install_argv
-from levain.slot.ids import (RANGES, SHARED_GROUPS, SINGLETONS, SlotId, read_retired_ids, retired_ids_text,
+from levain.slot.ids import (RANGES, provisioned_shared_groups, provisioned_singletons, SlotId, read_retired_ids, retired_ids_text,
                              write_retired_ids)
 from levain.slot.install_helper import (HostFacts, operator_record, operator_record_text, parse_operator_record,
                                         plan_replenish, plan_setup, plan_undo, preflight)
@@ -80,8 +80,8 @@ def test_default_setup_fits_gid_range(host, n, m):
     assert len(slot_names) == 2 * n + 2 * m
     assert all(alloc.ids[x] in r.slots for x in slot_names)
     assert [alloc.ids[x] for x in slot_names] == list(r.slots)[:len(slot_names)]   # top-down
-    assert all(alloc.ids[x] in r.singletons for x in SINGLETONS)
-    assert set(alloc.shared) == set(SHARED_GROUPS) and len(SHARED_GROUPS) <= len(r.shared)
+    assert all(alloc.ids[x] in r.singletons for x in provisioned_singletons(host))
+    assert set(alloc.shared) == set(provisioned_shared_groups(host)) and len(provisioned_shared_groups(host)) <= len(r.shared)
     assert all(g in r.shared for g in alloc.shared.values())
     every = list(alloc.ids.values()) + list(alloc.shared.values())
     assert len(every) == len(set(every))
@@ -126,7 +126,7 @@ def test_retired_id_never_reissued(host, tmp_path):
     # undo retires every account id it tombstones, keeping the old ones
     accounts = dict(plan.allocation.ids)
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host, retired=retired), accounts=accounts,
-                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(provisioned_shared_groups(host))})
     assert undo.retired_after == retired | set(accounts.values())
     write = [s.write for s in undo.steps if s.write and s.write[0].name == "retired-session-ids"]
     assert write and write[0][1] == retired_ids_text(undo.retired_after) and write[0][2] == 0o644
@@ -137,7 +137,7 @@ def test_retired_id_never_reissued(host, tmp_path):
                                  existing_names=frozenset(accounts)),
                          slots=8, verifier_slots=2, live={"egress": range(1, 8), "none": range(2)},
                          accounts={k: v for k, v in accounts.items() if k not in ("_levain_s0", "_levain_gw0")
-                                   and k not in SINGLETONS})
+                                   and k not in provisioned_singletons(host)})
     assert [s.tag for s in rep.allocation.slots] == ["e8"]
     assert not set(rep.allocation.ids.values()) & (retired | gone | set(accounts.values()))
 
@@ -180,7 +180,7 @@ def test_operator_record_written_last_and_removed_last(host):
         assert _refusal(parse_operator_record, bad) == "operator-record-malformed"
     uid = RANGES[host].slots[0]
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts={"_levain_s0": uid},
-                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(provisioned_shared_groups(host))})
     # FIX1 M1: the check after the install rule's removal is the LAST step, after the operator record
     assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")
     assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
@@ -220,7 +220,10 @@ TABLE = {
 def test_slot_groups_exact(host):
     plan = plan_setup(_setup(3, 2), _facts(host))
     members = {g.name: set(g.members) for g in plan.groups}
-    assert set(members) == set(TABLE) == set(SHARED_GROUPS)
+    assert set(members) == set(provisioned_shared_groups(host))
+    # levain-verify (Linux only) is a group with no members: the wall adds it at launch
+    assert set(members) - set(TABLE) == ({"levain-verify"} if host == "linux" else set())
+    assert set(TABLE) <= set(members) and members.get("levain-verify", set()) == set()
     slots = {f"_levain_{p}{i}" for p in "s" for i in range(3)} | {f"_levain_{p}{i}" for p in "vc" for i in range(2)}
     assert members["levain-slots"] == slots
     assert members["levain-gwfronts"] == {f"_levain_gw{i}" for i in range(3)} | {"_levain_keys"}
@@ -286,8 +289,8 @@ def test_slot_account_shape(host):
     plan = plan_setup(_setup(3, 1), _facts(host))
     # §1.1's char bound is on the slot names (widest index); every name stays inside Linux's limit
     assert all(len(n) <= 15 for n in SlotId("egress", 63).accounts + SlotId("none", 63).accounts)
-    assert all(len(n) <= 32 for n in SINGLETONS)
-    for name in ("_levain_s0", "_levain_gw0", "_levain_v0", "_levain_c0", *SINGLETONS):
+    assert all(len(n) <= 32 for n in provisioned_singletons(host))
+    for name in ("_levain_s0", "_levain_gw0", "_levain_v0", "_levain_c0", *provisioned_singletons(host)):
         uid = plan.allocation.ids[name]
         argvs = _argvs(plan)
         if host == "darwin":

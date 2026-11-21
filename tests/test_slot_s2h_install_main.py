@@ -17,7 +17,7 @@ import pytest
 from levain.firing import hands
 from levain.slot import Refused, install_helper as IH, records as R, runtime_helper as RH, units
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SlotId, allocate
+from levain.slot.ids import RANGES, RETIRED_IDS_PATH, provisioned_shared_groups, SlotId, allocate
 from levain.slot.install_helper import (Gathered, HostFacts, Seams, gather_facts, main, operator_record,
                                         operator_record_text, plan_for, plan_replenish, plan_setup, plan_undo)
 from levain.slot.intent import Intent, install_lock, intent_text
@@ -340,7 +340,7 @@ def test_replenish_marks_its_new_slots_after_confinement_just_before_the_journal
 def _undo_plan(host):
     al = allocate(host, egress=(SlotId("egress", 0),), verifier=(SlotId("none", 0),), used=(), retired=())
     return plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=dict(al.ids),
-                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(provisioned_shared_groups(host))})
 
 
 @pytest.mark.parametrize("host", HOSTS)

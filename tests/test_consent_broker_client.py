@@ -456,9 +456,9 @@ def no_account(monkeypatch):
 
 
 def test_the_broker_account_is_a_slot_singleton():
-    from levain.slot.ids import SINGLETONS
+    from levain.slot.ids import KNOWN_SINGLETONS
 
-    assert broker_client.BROKER_ACCOUNT in SINGLETONS
+    assert broker_client.BROKER_ACCOUNT in KNOWN_SINGLETONS
 
 
 @pytest.mark.parametrize("adapter", ["cc", "codex"])

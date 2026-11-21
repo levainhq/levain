@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
 from levain.firing.hands import HostOS, Step, _abs, _absent, _darwin_leave_groups, _nologin
 from levain.slot import Refused
-from levain.slot.ids import SINGLETONS, SLOT_NAME_RE, Allocation, SlotId, is_levain_account
+from levain.slot.ids import KNOWN_SINGLETONS, SLOT_NAME_RE, Allocation, SlotId, is_levain_account
 from levain.slot.layout import vendor_home
 
 if TYPE_CHECKING:
@@ -56,6 +56,8 @@ _SINGLETON_GROUPS: Mapping[str, tuple[str, ...]] = {
     "_levain_control": ("levain-keysadmin", "levain-wake"),
     "_levain_qbroker": ("levain-control", "levain-queue"),
     "_levain_dispatch": ("levain-control", "levain-dispatch-export", "levain-lineage", "levain-queue"),
+    # No persistent supplementary group (levain#223).
+    "_levain_verify": (),
 }
 #: CONTRACT §1.2: the operator's shared groups.
 OPERATOR_GROUPS = ("levain-control", "levain-export", "levain-queue")
@@ -195,7 +197,7 @@ def revive_steps(host: HostOS, accounts: Sequence[Account]) -> list[Step]:
     :func:`membership_steps`, as for a fresh account."""
     steps: list[Step] = []
     for a in accounts:
-        if a.name not in SINGLETONS:
+        if a.name not in KNOWN_SINGLETONS:
             raise Refused("not-levain-name", f"{a.name!r} is not a singleton; slot tombstones are never revived")
         if host == "darwin":
             # Every dscl -create sets the attribute whether or not the record exists: the same steps as a
@@ -279,7 +281,7 @@ def tombstone_steps(host: HostOS, name: str) -> list[Step]:
     ]
 
 
-__all__ = ["Account", "Group", "LeaveGroupsStep", "OPERATOR_GROUPS", "SINGLETONS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
+__all__ = ["Account", "Group", "LeaveGroupsStep", "KNOWN_SINGLETONS", "OPERATOR_GROUPS", "SLOT_MARKER", "SLOT_RETIRED_MARKER",
            "VENDOR_PREFIXES", "accounts_of", "account_steps", "group_members", "home_of", "membership_pairs",
            "membership_steps", "revive_steps", "shared_group_steps", "shared_groups_of", "supplementary_groups",
            "tombstone_steps", "vendor_home_of", "vendor_home_steps", "vendor_runs_as"]

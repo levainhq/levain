@@ -282,10 +282,10 @@ def test_admin_socket_group_admits_keys_and_control():
     one admitted peer, must reach the socket through it. It is a shared group the install makes, never an
     account's own primary group, and nobody else is in it."""
     from levain.slot.accounts import OPERATOR_GROUPS, supplementary_groups
-    from levain.slot.ids import SHARED_GROUPS, SINGLETONS
-    assert K.ADMIN_GROUP == "levain-keysadmin" and K.ADMIN_GROUP in SHARED_GROUPS
+    from levain.slot.ids import KNOWN_SHARED_GROUPS, KNOWN_SINGLETONS
+    assert K.ADMIN_GROUP == "levain-keysadmin" and K.ADMIN_GROUP in KNOWN_SHARED_GROUPS
     assert K.FRONTS_GROUP in supplementary_groups(K.KEYS_ACCOUNT)
-    everyone = (*SINGLETONS, *(f"_levain_{p}{i}" for p in ("s", "gw", "v", "c") for i in (0, 1)))
+    everyone = (*KNOWN_SINGLETONS, *(f"_levain_{p}{i}" for p in ("s", "gw", "v", "c") for i in (0, 1)))
     assert {n for n in everyone if K.ADMIN_GROUP in supplementary_groups(n)} == {K.KEYS_ACCOUNT, K.CONTROL_ACCOUNT}
     assert K.ADMIN_GROUP not in OPERATOR_GROUPS
 

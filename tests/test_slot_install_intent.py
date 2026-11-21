@@ -14,7 +14,7 @@ import levain
 from levain.firing import hands
 from levain.slot import Refused, intent as intent_mod
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS
+from levain.slot.ids import RANGES, provisioned_shared_groups, provisioned_singletons
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.intent import (INSTALL_LOCK, INTENT_PATH, Intent, install_lock, intent_text, parse_intent,
                                 read_intent, write_intent_atomically)
@@ -218,7 +218,7 @@ def _interrupted_setup(host):
     others = frozenset(list(r.slots)[:3])
     first = _plan(host, used_ids=others)
     j = first.intent
-    made = {**{g: j.groups[g] for g in SHARED_GROUPS}, **{n: j.accounts[n] for n in SINGLETONS}}
+    made = {**{g: j.groups[g] for g in provisioned_shared_groups(host)}, **{n: j.accounts[n] for n in provisioned_singletons(host)}}
     return first, j, made
 
 
@@ -288,8 +288,8 @@ def test_undo_over_an_account_with_its_group_and_no_user(host):
     its group is not deleted. (Whether a tombstone act runs is decided at run time from the live user: none exists.)"""
     first, j, made = _interrupted_setup(host)
     s0 = j.accounts["_levain_s0"]
-    labelled = {n: made[n] for n in SINGLETONS}
-    shared = {} if host == "linux" else {g: made[g] for g in SHARED_GROUPS}
+    labelled = {n: made[n] for n in provisioned_singletons(host)}
+    shared = {} if host == "linux" else {g: made[g] for g in provisioned_shared_groups(host)}
     names = frozenset(made) | {"_levain_s0"}
     undo = plan_undo(parse_install_argv(["undo"]),
                      _set_up(host, intent=j, host_ids=made, existing_names=names, account_group_ids={"_levain_s0": s0}),
@@ -352,15 +352,15 @@ def test_undo_reads_intent(host):
     s0 = j.accounts["_levain_s0"]
     present = {**made, "_levain_s0": s0, "_levain_gw0": j.accounts["_levain_gw0"] - 1}   # gw0 is not ours
     # the directory service reports only the labelled accounts; Linux reports no shared group
-    labelled = {n: made[n] for n in SINGLETONS}
-    shared = {} if host == "linux" else {g: made[g] for g in SHARED_GROUPS}
+    labelled = {n: made[n] for n in provisioned_singletons(host)}
+    shared = {} if host == "linux" else {g: made[g] for g in provisioned_shared_groups(host)}
     undo = plan_undo(parse_install_argv(["undo"]), _set_up(host, intent=j, host_ids=present),
                      accounts=labelled, shared_groups=shared)
     tombed = {s.why.split(":")[0].removeprefix("tombstone ") for s in undo.steps if s.why.startswith("tombstone ")}
-    assert "_levain_s0" in tombed and "_levain_gw0" not in tombed and set(SINGLETONS) <= tombed
+    assert "_levain_s0" in tombed and "_levain_gw0" not in tombed and set(provisioned_singletons(host)) <= tombed
     assert s0 in undo.retired_after and j.accounts["_levain_gw0"] not in undo.retired_after
     deleted = [s.why.removeprefix("delete the group ") for s in undo.steps if s.why.startswith("delete the group ")]
-    assert sorted(deleted) == sorted(SHARED_GROUPS)
+    assert sorted(deleted) == sorted(provisioned_shared_groups(host))
     assert undo.steps[-3].argv[1:] == ("-f", str(INTENT_PATH[host]))
     assert undo.steps[-2].argv[1:] == ("-f", str(operator_record_path(host)))
     assert undo.steps[-1].why.startswith("check the sudoers config with visudo -c (after ")                         # FIX1 M1

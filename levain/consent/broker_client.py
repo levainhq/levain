@@ -77,7 +77,7 @@ __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
-# the account the queue broker runs as (CONTRACT c3 §1.3; one of levain.slot.ids.SINGLETONS, which holds no
+# the account the queue broker runs as (CONTRACT c3 §1.3; one of levain.slot.ids.KNOWN_SINGLETONS, which holds no
 # separate constant for it): the only peer uid this client accepts
 BROKER_ACCOUNT = "_levain_qbroker"
 # the longest any one socket operation may take (the connect, the send, the whole answer frame). The broker answers

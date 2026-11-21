@@ -16,7 +16,7 @@ import pytest
 from levain.slot import removal as RM
 from levain.slot.layout import HELPER_DIR, IMPORT_TREE, STORE
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS
+from levain.slot.ids import RANGES, provisioned_shared_groups
 from levain.slot.install_helper import INTENT_PATH, plan_undo
 from tests.test_slot_confinement_plan import HOSTS, _plan, _set_up, _tools_resolve  # noqa: F401  (the autouse fixture rides along)
 
@@ -59,7 +59,7 @@ def _run_undo(host, tmp_path, monkeypatch):
     live = RM.Live(run=fake_run, root=root)
     ids = dict(_plan(host).allocation.ids)
     plan = plan_undo(parse_install_argv(["undo"]), _set_up(host), accounts=ids, live=live, end=lambda uid, name: (True, ""),
-                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(provisioned_shared_groups(host))})
     before = _tree(root)
     for s in plan.steps:
         if s.argv:

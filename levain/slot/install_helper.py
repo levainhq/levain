@@ -36,7 +36,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
+from typing import Callable, ClassVar, Collection, ContextManager, Iterable, Iterator, Mapping, Optional, Sequence, TextIO, Tuple
 
 from levain.authority_sig import NAMESPACE as AUTHORITY_NAMESPACE, _Wire
 from levain.contracts import canon
@@ -61,9 +61,11 @@ from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Gro
                                   vendor_home_steps)
 from levain.slot.grammar import (EGRESS_RESERVE, MIN_SETUP_SLOTS, KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
                                  InstallCommand, check_roots, parse_install_argv)
-from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
-                             SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
-                             is_levain_account, loopback_alias, read_retired_ids, retired_ids_text, spent_indices)
+from levain.slot.ids import (KNOWN_SHARED_GROUPS, KNOWN_SINGLETONS, RANGES, RETIRED_IDS_PATH, SLOT_NAME_RE,
+                             VERIFIER_ACCOUNT, VERIFIER_GROUP, Allocation, SlotClass, SlotId, allocate,
+                             check_capacity, choose_indices, in_own_range, is_levain_account, loopback_alias,
+                             provisioned_shared_groups, provisioned_singletons, read_retired_ids, retired_ids_text,
+                             spent_indices)
 from levain.slot import limits_doc as LD
 from levain.slot import vendor_routes as VR
 from levain.broker import policy as broker_policy
@@ -513,7 +515,7 @@ def _reuse(facts: HostFacts, slots: int, verifier_slots: int) -> _Reuse:
         for name, i in ours.items():
             if name not in facts.levain_tombstones:
                 live.setdefault(name, i)
-    for name in SINGLETONS:
+    for name in provisioned_singletons(facts.host):
         cur, tomb = live.get(name), facts.levain_tombstones.get(name)
         if cur is not None and in_own_range(facts.host, name, cur):
             keep[name] = cur
@@ -523,7 +525,7 @@ def _reuse(facts: HostFacts, slots: int, verifier_slots: int) -> _Reuse:
             revive[name] = tomb
         elif tomb is not None or name in facts.existing_names:
             taken.append(name)
-    for g in SHARED_GROUPS:
+    for g in provisioned_shared_groups(facts.host):
         cur = live.get(g)
         if cur is not None and isinstance(cur, int) and cur in r.shared:
             keep_shared[g] = cur
@@ -579,12 +581,21 @@ def _journal_presence(facts: HostFacts) -> tuple[dict[str, int], list[str]]:
     return ours, foreign
 
 
+def _journal_names_what_setup_makes(host: HostOS, journal: Intent) -> bool:
+    """Whether a setup journal names what this host's setup makes. The verifier's account and group are the two names
+    a setup journal written before levain#223 lacks (a Linux host provisions them now): either shape is whole, and the
+    resume makes the missing pair fresh. Every other singleton and shared group must be named."""
+    singletons = set(provisioned_singletons(host)) - {VERIFIER_ACCOUNT}
+    groups = set(provisioned_shared_groups(host))
+    return singletons <= set(journal.accounts) and set(journal.groups) in (groups, groups - {VERIFIER_GROUP})
+
+
 def _journal_slots(intent: Intent) -> dict[SlotClass, tuple[SlotId, ...]]:
     """The slots a journal allocated, by class. Every account of each is journaled and nothing else
     but singletons, or the journal is not one a plan wrote."""
     slots = slots_of(intent.accounts)
     names = {n for s in slots for n in s.accounts}
-    odd = (set(intent.accounts) ^ names) - set(SINGLETONS)
+    odd = (set(intent.accounts) ^ names) - set(KNOWN_SINGLETONS)
     if odd:
         raise Refused("intent-malformed", f"the journal's accounts are not whole slots: {', '.join(sorted(odd))}")
     return {cls: tuple(s for s in slots if s.slot_class == cls) for cls in ("egress", "none")}  # type: ignore[misc]
@@ -635,7 +646,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         if asked != was:
             raise Refused("install-interrupted", f"setup: re-run it as setup --slots {was[1]} "
                                                  f"--verifier-slots {was[2]} --operator {was[0]}")
-        if not set(SINGLETONS) <= set(journal.accounts) or set(journal.groups) != set(SHARED_GROUPS):
+        if not _journal_names_what_setup_makes(host, journal):
             raise Refused("intent-malformed", "a setup journal names every singleton and shared group")
         unjournaled = sorted((set(keep) - set(journal.accounts)) | (set(keep_shared) - set(journal.groups)))
         if unjournaled:
@@ -902,7 +913,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
-    groups = {g: i for g, i in shared_groups.items() if g in SHARED_GROUPS}
+    groups = {g: i for g, i in shared_groups.items() if g in KNOWN_SHARED_GROUPS}
     if facts.intent is not None:
         # §25: whatever an interrupted run made at its journaled ids goes with the rest, a Linux shared
         # group with no label included. A journaled name present at another id is not ours: left alone.
@@ -910,7 +921,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         for name, i in ours.items():
             if name in facts.intent.accounts:
                 accounts.setdefault(name, i)
-            elif name in SHARED_GROUPS:
+            elif name in KNOWN_SHARED_GROUPS:
                 groups.setdefault(name, i)
         check_account_ids(host, accounts)
     desired = desired_managed(host, accounts=accounts, shared=groups, operator=operator,
@@ -1472,7 +1483,7 @@ def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journale
     recorded = {i for k, i in (shape.managed if shape else ()) if k == "group/1"}
     ours: dict[str, int] = {}
     foreign: list[str] = []
-    for g in SHARED_GROUPS:
+    for g in provisioned_shared_groups(host):
         gid = rf.groups.get(g)
         if gid is None:
             continue
@@ -1518,20 +1529,47 @@ def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
     return journal, finished, operator, run_txn
 
 
-def _check_rendered_accounts(rf: RepairFacts, slots: Sequence[SlotId]) -> None:
+#: The singletons repair may CREATE, because an install made before this code provisioned them lacks them (levain#223:
+#: the verifier's account, on a host that provisions it). Every other singleton missing still refuses ``account-missing``.
+_REPAIR_MAKES = frozenset({VERIFIER_ACCOUNT})
+
+
+def _repair_creates(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: Mapping[str, int]) -> dict[str, int]:
+    """levain#223, repair's one bounded exception: name -> uid of the singletons this repair makes, which
+    :func:`_check_rendered_accounts` then does not refuse as missing. One the interrupted run journaled stays at its
+    journaled uid, live or not, and its steps are planned again (a kill between its group and its user, or after its
+    user, resumes). A fresh one takes the allocator's next singleton uid, past
+    every id in use (as a uid or a gid) and every retired id, and is refused ``account-exists`` when its name is
+    already on the host, unlabelled or under another label: it is not ours to claim."""
+    wanted = [n for n in provisioned_singletons(host) if n in _REPAIR_MAKES]
+    made = {n: journaled[n] for n in wanted if n in journaled}
+    fresh = [n for n in wanted if n not in rf.accounts and n not in made]
+    if fresh:
+        taken = [n for n in fresh if n in facts.existing_names]
+        if taken:
+            raise Refused("account-exists", ", ".join(taken))
+        alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids, retired=facts.retired,
+                         only_singletons=fresh)
+        made.update((n, alloc.ids[n]) for n in fresh)
+    return made
+
+
+def _check_rendered_accounts(host: HostOS, rf: RepairFacts, slots: Sequence[SlotId],
+                             creating: Collection[str] = ()) -> None:
     """R2 entry (1022+20 Linux VM, `userdel _levain_s7`): desired holds only the LIVE accounts, so a recorded one that
     is gone is removed at R7 while R8 still renders its slot's rows for it. §2.4: repair never creates or removes a
     slot, so it can neither re-create the account nor drop the slot. Every account the rendered plan names (the
     singletons, every in-service slot's pair) must be live, else refused before any act."""
-    missing = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts)) if n not in rf.accounts]
+    missing = [n for n in (*provisioned_singletons(host), *(n for s in slots for n in s.accounts))
+               if n not in rf.accounts and n not in creating]
     if missing:
         raise Refused("account-missing", f"{', '.join(missing)}: no live Levain account by that name, and repair "
                                          "never creates one (it never creates or removes a slot). Run undo, then "
                                          "setup")
     # L3 r1 (codex): R8 renders `chown <owner>:<account>` against each account's same-named primary group, so a
     # group deleted (or moved, or relabelled on macOS) by hand while its user stays is the same gap; refused here.
-    ungrouped = [n for n in (*SINGLETONS, *(n for s in slots for n in s.accounts))
-                 if rf.account_groups.get(n) != rf.accounts[n]]
+    ungrouped = [n for n in (*provisioned_singletons(host), *(n for s in slots for n in s.accounts))
+                 if n not in creating and rf.account_groups.get(n) != rf.accounts[n]]
     if ungrouped:
         raise Refused("group-missing", f"{', '.join(ungrouped)}: no Levain group of that name at the account's id, "
                                        "and repair never creates one (it never creates or removes a slot). Run undo, "
@@ -1558,9 +1596,10 @@ def plan_repair_stage(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         raise Refused("bad-source", "no h11 beside the levain package" if rf.source is not None else "no --source")
     root_tree.check_sources(rf.source, rf.h11)
     check_account_ids(host, rf.accounts)
-    _check_rendered_accounts(rf, _repair_slots(rf))
+    jaccts = dict(journal.accounts) if journal else {}
+    _check_rendered_accounts(host, rf, _repair_slots(rf), _repair_creates(host, facts, rf, jaccts))
     pinned = journal.generation if journal is not None else None
-    first = Intent("repair", operator, {}, dict(journal.groups) if journal else {}, run_txn, pinned,
+    first = Intent("repair", operator, jaccts, dict(journal.groups) if journal else {}, run_txn, pinned,
                    tuple(journal.managed) if journal else ())
     cell = root_tree.Staged()
 
@@ -1606,7 +1645,7 @@ def plan_repair_resume(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *
     journal, _finished, _operator, _txn = _repair_journal(cmd, facts, rf, gen_mod.new_txn, journal_kinds=False)
     assert journal is not None and journal.generation is not None
     check_account_ids(host, rf.accounts)
-    _check_rendered_accounts(rf, _repair_slots(rf))
+    _check_rendered_accounts(host, rf, _repair_slots(rf), _repair_creates(host, facts, rf, dict(journal.accounts)))
     target = journal.generation
     gen_dir = (tree if tree is not None else root_tree.current_path(host).parent) / target
     if not os.path.isdir(gen_dir) or os.path.islink(gen_dir):
@@ -1693,20 +1732,23 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     # R4b: the shared groups, kept at the gids they hold (or were journaled at); only the missing ones allocated.
     jgroups = dict(journal.groups) if journal is not None else {}
     present = _recognised_groups(host, facts, rf, jgroups)
-    keep_shared = {**{g: i for g, i in jgroups.items() if g in SHARED_GROUPS}, **present}
+    keep_shared = {**{g: i for g, i in jgroups.items() if g in KNOWN_SHARED_GROUPS}, **present}
     # R1b: a recorded or journaled group this code no longer names is on its way out, and its gid is retired at R7
     # (§1.1 g); R6 runs first, so that gid must never be handed to a new group here, even when no group holds it now.
-    leaving = {i[1] for k, i in previous | journaled if k == "group/1" and i[0] not in SHARED_GROUPS}
+    leaving = {i[1] for k, i in previous | journaled if k == "group/1" and i[0] not in provisioned_shared_groups(host)}
     alloc = allocate(host, egress=(), verifier=(), used=facts.used_ids | leaving, retired=facts.retired, shared=True,
                      keep_shared=keep_shared)
     check_account_ids(host, rf.accounts)
     slots = _repair_slots(rf)
-    _check_rendered_accounts(rf, slots)
+    jaccts = dict(journal.accounts) if journal is not None else {}
+    creates = _repair_creates(host, facts, rf, jaccts)
+    _check_rendered_accounts(host, rf, slots, creates)
+    ids_now = {**rf.accounts, **creates}
     services, skipped = units.built_services(host, package, exists=program_exists)
     restricted = False
     if host == "linux":
         restricted = bwrap.userns_restricted() if read_sysctl is None else bwrap.userns_restricted(read_sysctl)
-    desired = desired_managed(host, accounts=rf.accounts, shared=alloc.shared, operator=operator,
+    desired = desired_managed(host, accounts=ids_now, shared=alloc.shared, operator=operator,
                               services=[s.name for s in services], slots=slots, apparmor=restricted)
     reconcile = previous | journaled | desired
     remove = reconcile - desired
@@ -1716,16 +1758,18 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
         # one Live per phase only for its fault hook: ``skips`` is the same set, so R14 still writes every skip
         at = replace(live, fault=lambda pt: fault(phase, pt)) if fault is not None else live
         return removal_steps(host, remove, phase, live=at, held=previous, end=end)
-    accts = accounts_of(Allocation(host, (), (), dict(rf.accounts), {}))
+    accts = accounts_of(Allocation(host, (), (), dict(ids_now), {}))
+    making = tuple(a for a in accts if a.name in creates)
     missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
     missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
     changed = {a for a, _ in missing_pairs}
     stop = list(services) if gen_change else [s for s in services if s.user in changed]
 
-    first = Intent("repair", operator, {}, jgroups, run_txn, journal.generation if journal else None,
+    first = Intent("repair", operator, jaccts, jgroups, run_txn, journal.generation if journal else None,
                    tuple(journal.managed) if journal else ())
     staged = replace(first, generation=target)
-    final = replace(staged, groups=dict(alloc.shared), managed=_shape_of(reconcile))
+    # R4b is write-ahead for the accounts this run makes (R6 below), as for the groups: journaled before the first act.
+    final = replace(staged, accounts={**jaccts, **creates}, groups=dict(alloc.shared), managed=_shape_of(reconcile))
     noted: dict[str, int] = {}
     carried = dict(shape.started_after) if shape is not None else {}
     keep = {target} | ({shape.generation} if shape is not None else set())
@@ -1762,7 +1806,8 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                                            "txn)", final)])                                       # R4b
     steps += F("R5", [*_stop_steps(host, stop, noted, clock, live=live),                          # R5
                       *removals("R5")])             # R1b: recorded units stopped by name, then sudoers (grants first)
-    steps += F("R6", shared_group_steps(host, missing_groups))                                    # R6
+    # R6: the shared groups, then the singletons repair makes (levain#223), before R7's memberships and R8's rows.
+    steps += F("R6", [*shared_group_steps(host, missing_groups), *account_steps(host, making)])   # R6
     steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
@@ -2176,7 +2221,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
             live[name] = accounts[name] = uid
         elif label == SLOT_RETIRED_MARKER[host]:
             tombs[name] = uid
-    shared = tuple(sorted(g for g in d.groups if g in SHARED_GROUPS))
+    shared = tuple(sorted(g for g in d.groups if g in KNOWN_SHARED_GROUPS))
     if host == "darwin":
         live.update((g, d.groups[g]) for g in shared if d.group_labels.get(g) == SLOT_MARKER)
     host_ids: dict[str, int] = {}

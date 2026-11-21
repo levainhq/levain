@@ -37,11 +37,34 @@ RETIRED_IDS_PATH: Mapping[str, Path] = {   # CONTRACT §1.1
     "linux": Path("/var/lib/levain/retired-session-ids"),
 }
 
-SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch")
+#: The account the confined verifier runs as, and its group (levain#204, levain#223): Linux provisions both, macOS none
+#: (see :func:`provisioned_singletons`).
+VERIFIER_ACCOUNT = "_levain_verify"
+VERIFIER_GROUP = "levain-verify"
 
-#: Allocation takes these in order, top-down from the shared range: a new group goes LAST, so no group's id moves.
-SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
-                 "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin")   # CONTRACT §1.2
+#: EVERY singleton name Levain recognises, whether or not a host's setup makes it. A new one goes LAST, so no
+#: singleton's id moves. What a host MAKES is :func:`provisioned_singletons`.
+KNOWN_SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch",
+                    VERIFIER_ACCOUNT)
+
+#: Every shared-group name Levain recognises. Allocation takes the provisioned ones in this order, top-down from the
+#: shared range: a new group goes LAST, so no group's id moves.
+KNOWN_SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
+                       "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin",
+                       VERIFIER_GROUP)   # CONTRACT §1.2
+
+#: Names only some hosts make: the host is the key.
+_HOST_ONLY: Mapping[str, tuple[str, ...]] = {VERIFIER_ACCOUNT: ("linux",), VERIFIER_GROUP: ("linux",)}
+
+
+def provisioned_singletons(host: HostOS) -> tuple[str, ...]:
+    """The singletons setup and repair make on ``host``, in allocation order."""
+    return tuple(n for n in KNOWN_SINGLETONS if host in _HOST_ONLY.get(n, (host,)))
+
+
+def provisioned_shared_groups(host: HostOS) -> tuple[str, ...]:
+    """The shared groups setup and repair make on ``host``, in allocation order."""
+    return tuple(g for g in KNOWN_SHARED_GROUPS if host in _HOST_ONLY.get(g, (host,)))
 
 _PREFIXES: Mapping[str, tuple[str, str]] = {"egress": ("s", "gw"), "none": ("v", "c")}
 _TAG = {"egress": "e", "none": "v"}
@@ -101,7 +124,7 @@ def loopback_alias(slot: SlotId) -> str:
 
 def is_levain_account(name: str) -> bool:
     m = SLOT_NAME_RE.fullmatch(name)
-    return name in SINGLETONS or (m is not None and int(m.group(2)) < INDEX_SPACE)
+    return name in KNOWN_SINGLETONS or (m is not None and int(m.group(2)) < INDEX_SPACE)
 
 
 def read_retired_ids(path: Path) -> frozenset[int]:
@@ -190,6 +213,7 @@ def _take(pool: range, n: int, blocked: set[int], what: str) -> list[int]:
 def allocate(host: HostOS, *, egress: Iterable[SlotId], verifier: Iterable[SlotId],
              used: Iterable[int], retired: Iterable[int],
              singletons: bool = False, shared: bool = False,
+             only_singletons: Iterable[str] | None = None,
              revive: Mapping[str, int] | None = None,
              keep: Mapping[str, int] | None = None,
              keep_shared: Mapping[str, int] | None = None) -> Allocation:
@@ -197,18 +221,19 @@ def allocate(host: HostOS, *, egress: Iterable[SlotId], verifier: Iterable[SlotI
     first, skipping every id in use (as a uid or a gid) and every retired id. ``revive``: singletons
     that come back at their recorded id (§20); ``keep`` / ``keep_shared``: accounts / shared groups an
     interrupted setup already made, kept at the id they hold (§23). Neither takes a fresh id; each
-    must sit in its own class's range."""
+    must sit in its own class's range. ``singletons`` makes every singleton of ``host`` (:func:`provisioned_singletons`);
+    ``only_singletons`` makes just those named instead (repair's bounded creation)."""
     egress, verifier = tuple(egress), tuple(verifier)
     revive, keep, keep_shared = dict(revive or {}), dict(keep or {}), dict(keep_shared or {})
     r = RANGES[host]
     for name, uid in revive.items():
-        if name not in SINGLETONS or uid not in r.singletons:
+        if name not in KNOWN_SINGLETONS or uid not in r.singletons:
             raise Refused("account-exists", f"{name} at {uid} is not a singleton tombstone in range")
     for name, uid in keep.items():
-        if uid not in (r.singletons if name in SINGLETONS else r.slots) or not is_levain_account(name):
+        if uid not in (r.singletons if name in KNOWN_SINGLETONS else r.slots) or not is_levain_account(name):
             raise Refused("account-exists", f"{name} at {uid} is outside its range")
     for name, gid in keep_shared.items():
-        if name not in SHARED_GROUPS or gid not in r.shared:
+        if name not in KNOWN_SHARED_GROUPS or gid not in r.shared:
             raise Refused("account-exists", f"group {name} at {gid} is outside the shared range")
     if len(set(revive.values())) != len(revive):
         raise Refused("tombstone-id-conflict", "two tombstones record one id")
@@ -220,15 +245,17 @@ def allocate(host: HostOS, *, egress: Iterable[SlotId], verifier: Iterable[SlotI
     fresh_slots = [n for n in names if n not in fixed]
     got = dict(zip(fresh_slots, _take(r.slots, len(fresh_slots), blocked, "slot accounts")))
     ids = {n: fixed[n] if n in fixed else got[n] for n in names}
-    if singletons:
-        fresh = [n for n in SINGLETONS if n not in fixed]
+    make = provisioned_singletons(host) if singletons else tuple(only_singletons or ())
+    if make:
+        fresh = [n for n in make if n not in fixed]
         got = dict(zip(fresh, _take(r.singletons, len(fresh), blocked, "singletons")))
-        ids.update((n, fixed[n] if n in fixed else got[n]) for n in SINGLETONS)
+        ids.update((n, fixed[n] if n in fixed else got[n]) for n in make)
     gids: dict[str, int] = {}
     if shared:
-        fresh_g = [g for g in SHARED_GROUPS if g not in keep_shared]
+        every = provisioned_shared_groups(host)
+        fresh_g = [g for g in every if g not in keep_shared]
         got_g = dict(zip(fresh_g, _take(r.shared, len(fresh_g), blocked, "shared groups")))
-        gids = {g: keep_shared[g] if g in keep_shared else got_g[g] for g in SHARED_GROUPS}
+        gids = {g: keep_shared[g] if g in keep_shared else got_g[g] for g in every}
     return Allocation(host, egress, verifier, ids, gids)
 
 
@@ -237,7 +264,7 @@ def in_own_range(host: HostOS, name: str, uid: object) -> bool:
     if not isinstance(uid, int) or isinstance(uid, bool) or not is_levain_account(name):
         return False
     r = RANGES[host]
-    return uid in (r.singletons if name in SINGLETONS else r.slots)
+    return uid in (r.singletons if name in KNOWN_SINGLETONS else r.slots)
 
 
 def retire_ids_durably(path: Path, ids: Iterable[int], *, fsync=None) -> None:

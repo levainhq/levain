@@ -253,7 +253,7 @@ def test_repair_starts_keys_after_its_membership_steps(tmp_path):
 def _replenish_plan(host, monkeypatch):
     from levain.firing import hands
     from levain.slot.grammar import parse_install_argv
-    from levain.slot.ids import SINGLETONS
+    from levain.slot.ids import provisioned_singletons
     from tests.test_slot_install_plan import _facts, _set_up, _setup
     real = hands.shutil.which
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
@@ -264,7 +264,7 @@ def _replenish_plan(host, monkeypatch):
         parse_install_argv(["replenish"]),
         _set_up(host, used_ids=frozenset(accounts.values()), existing_names=frozenset(accounts)),
         slots=8, verifier_slots=2, live={"egress": range(1, 8), "none": range(2)},
-        accounts={k: v for k, v in accounts.items() if k not in gone and k not in SINGLETONS})
+        accounts={k: v for k, v in accounts.items() if k not in gone and k not in provisioned_singletons(host)})
 
 
 def test_linux_replenish_starts_keys_after_its_account_steps(monkeypatch):

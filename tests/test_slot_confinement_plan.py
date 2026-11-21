@@ -20,7 +20,7 @@ from levain.firing import hands
 from levain.slot import Refused, bwrap, netns, pf, root_tree, service_boot, units
 from levain.slot.accounts import SLOT_MARKER
 from levain.slot.grammar import parse_install_argv
-from levain.slot.ids import RANGES, SHARED_GROUPS, SINGLETONS, SlotId, loopback_alias
+from levain.slot.ids import KNOWN_SINGLETONS, RANGES, provisioned_shared_groups, provisioned_singletons, SlotId, loopback_alias
 from levain.slot.install_helper import HostFacts, operator_record, plan_replenish, plan_setup, plan_undo
 from levain.slot.layout import IMPORT_TREE, RUN, install_helper_path, runtime_helper_path, service_entry_path
 from levain.slot.sudoers import RUNTIME_SUDOERS
@@ -66,7 +66,7 @@ def _refusal(fn, *a, **kw) -> str:
 
 def _undo(host, accounts, **kw):
     return plan_undo(parse_install_argv(["undo"]), _set_up(host, **kw), accounts=accounts,
-                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(SHARED_GROUPS)})
+                     shared_groups={g: RANGES[host].shared[i] for i, g in enumerate(provisioned_shared_groups(host))})
 
 
 # --- §20 re-setup after undo ------------------------------------------------------------------------
@@ -82,19 +82,19 @@ def test_setup_after_undo_revives_singletons(host):
                    existing_names=frozenset(ids), levain_tombstones=ids)
     again = plan_setup(_setup(), after, read_sysctl=lambda p: "0")
     got = again.allocation.ids
-    assert set(again.revived) == set(SINGLETONS)
-    assert all(got[s] == ids[s] for s in SINGLETONS)                          # same role, same id
+    assert set(again.revived) == set(provisioned_singletons(host))
+    assert all(got[s] == ids[s] for s in provisioned_singletons(host))                          # same role, same id
     # slot, front and verifier-pair tombstones are never revived: fresh indices, fresh ids
     assert [s.tag for s in again.allocation.egress] == [f"e{i}" for i in range(8, 16)]
     assert [s.tag for s in again.allocation.verifier] == ["v2", "v3"]
     slot_ids = {got[n] for s in again.allocation.slots for n in s.accounts}
     assert not slot_ids & set(ids.values()) and slot_ids <= set(RANGES[host].slots)
     # shared groups re-created at range ids
-    assert set(again.allocation.shared) == set(SHARED_GROUPS)
+    assert set(again.allocation.shared) == set(provisioned_shared_groups(host))
     assert all(g in RANGES[host].shared for g in again.allocation.shared.values())
     # a revived singleton is relabelled, never created afresh (Linux: no useradd for it)
     argvs = [s.argv for s in again.steps if s.argv]
-    for name in SINGLETONS:
+    for name in provisioned_singletons(host):
         if host == "linux":
             assert not [a for a in argvs if a[0].endswith("useradd") and a[-1] == name]
             assert any(a[0].endswith("usermod") and a[-1] == name and SLOT_MARKER in a for a in argvs)
@@ -119,15 +119,15 @@ def test_foreign_singleton_name_refused(host):
     plan = _plan(host, existing_names=frozenset({"_levain_keys"}), used_ids=frozenset({uid}),
                  levain_tombstones={"_levain_keys": uid})
     assert plan.revived == ("_levain_keys",) and plan.allocation.ids["_levain_keys"] == uid
-    others = {plan.allocation.ids[s] for s in SINGLETONS if s != "_levain_keys"}
-    assert uid not in others and len(others) == len(SINGLETONS) - 1
+    others = {plan.allocation.ids[s] for s in provisioned_singletons(host) if s != "_levain_keys"}
+    assert uid not in others and len(others) == len(provisioned_singletons(host)) - 1
 
 
 def test_slot_names_fit():
     """§20 reading of §1.1: per-slot names <= 15 chars at the widest index; singletons <= Linux's 32."""
     widest = SlotId("egress", 63).accounts + SlotId("none", 63).accounts
     assert max(len(n) for n in widest) <= 15
-    assert all(len(n) <= 32 for n in SINGLETONS) and max(len(n) for n in SINGLETONS) == 16
+    assert all(len(n) <= 32 for n in KNOWN_SINGLETONS) and max(len(n) for n in KNOWN_SINGLETONS) == 16
     for s in (SlotId("egress", 63), SlotId("none", 63)):
         assert len(s.netns) <= 15            # a Linux interface-name-sized bound holds for the netns too
 

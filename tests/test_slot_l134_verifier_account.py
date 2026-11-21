@@ -2,7 +2,7 @@
 after the whole import had run, with no word of why (``project_memory/1118-vm/j06_by_hand.txt``).
 
 Root cause: adopt-verify runs its confined verifier as ``_levain_verify`` (``wall.EXPORT_ACCOUNT["verifier"]``), and
-setup never creates it (``ids.SINGLETONS`` does not list it). That is RULED, not an oversight: PREL3_RULINGS 2a-12
+setup never creates it on macOS (``ids.provisioned_singletons`` does not list it there). That is RULED, not an oversight: PREL3_RULINGS 2a-12
 (levain 74, 11-08) keeps adopt-verify GATED, failing closed on ``account-missing``, until the macOS pf verifier check
 (5g) is built, and provisions the account only then. So the fix is the precondition named, early, on both sides:
 
@@ -60,7 +60,9 @@ def test_the_gate_and_the_provisioning_move_together():
     # Ruling 2a-12: the account is provisioned only when 5g (the live pf check) is built. While the pf default still
     # refuses, setup must not create _levain_verify; whoever builds 5g changes both, and this precondition text.
     assert RH.VerifySeams().pf_live is RH._pf_unbuilt
-    assert "_levain_verify" not in ids.SINGLETONS and "levain-verify" not in ids.SHARED_GROUPS
+    # macOS only (levain#223: Linux provisions both, `test_macos_provisions_no_verifier_account`).
+    assert "_levain_verify" not in ids.provisioned_singletons("darwin")
+    assert "levain-verify" not in ids.provisioned_shared_groups("darwin")
 
 
 # --- root: verifier_uid --------------------------------------------------------------------------------------------
