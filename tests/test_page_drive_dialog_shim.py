@@ -1,5 +1,7 @@
-"""The page driver answers alert / confirm / prompt in the page itself (the DIALOG_SHIM in tests/_page_drive.mjs), so a page can never sit
-behind a native dialog: each returns what a declined dialog returns, and the driver lists each one in "dialogs", across reloads."""
+"""The page driver answers alert / confirm / prompt in the page itself (the DIALOG_SHIM in tests/_page_drive.mjs): each returns what a declined
+dialog returns, and the driver lists each one in "dialogs". These browser cases cover a shim that is installed and working in the main document,
+across one reload. They do not cover a failed shim registration, a failed Runtime.enable, the CDP decline of a dialog the shim cannot catch
+(beforeunload), or the wait at the end of the drive for a decline still in flight."""
 from __future__ import annotations
 
 import contextlib
@@ -49,8 +51,9 @@ def _drive(tmp_path: Path, html: str, steps: list):
 
 @needs_browser
 def test_a_prompt_returns_null_to_the_page_and_is_listed(tmp_path: Path) -> None:
-    """Red with the shim answering anything but null to a prompt (the title is not "null"), or with its marker line left in the console log
-    instead of "dialogs" (the list comes back empty)."""
+    """Red with the shim answering a prompt with anything but null (the title is not "null"), or with the shim's marker line not turned into a
+    "dialogs" entry (the list comes back empty or differs). Not red with the shim removed: a prompt Chrome's own handler declines also
+    returns null and is listed, so only the shim-specific outcomes above fail this case."""
     html = "<title>t</title><script>document.title = String(window.prompt('write token?'));</script>"
     r = _drive(tmp_path, html, [{"until": "document.title === 'null'", "ms": 15000}, {"eval": "document.title"}])
     assert r.returncode == 0, r.stderr
@@ -61,8 +64,9 @@ def test_a_prompt_returns_null_to_the_page_and_is_listed(tmp_path: Path) -> None
 
 @needs_browser
 def test_confirm_returns_false_and_alert_returns_undefined_and_each_is_listed(tmp_path: Path) -> None:
-    """Red with confirm left returning true or alert returning something else (the title differs), and with either not recorded (a name
-    is missing from "dialogs")."""
+    """Red with the shim's confirm returning anything but false or its alert returning anything but undefined (the title differs), and with
+    either not turned into a "dialogs" entry (one is missing). Not red with the shim removed: a declined confirm is false, a declined alert
+    undefined, and both are listed, so only the shim-specific outcomes above fail this case."""
     html = ("<title>t</title><script>document.title = String(window.confirm('sure?')) + ',' + String(window.alert('heads up'));</script>")
     r = _drive(tmp_path, html, [{"until": "document.title === 'false,undefined'", "ms": 15000}, {"eval": "document.title"}])
     assert r.returncode == 0, r.stderr
@@ -73,8 +77,10 @@ def test_confirm_returns_false_and_alert_returns_undefined_and_each_is_listed(tm
 
 @needs_browser
 def test_a_dialog_in_the_new_document_after_a_reload_is_answered_and_listed_too(tmp_path: Path) -> None:
-    """Red with the shim registered only for the first document (the reloaded document's window.prompt is Chrome's own: "[native code]"),
-    or with the record reset by a reload (only the second dialog is listed). The page prompts on every load."""
+    """The page prompts on every load. Red with the shim not in force in the reloaded document: its window.prompt is then Chrome's own and
+    reads "[native code]" (the last assertion). The "dialogs" assertion is not red with the shim removed (Chrome's declined prompt is
+    listed too, unless it refuses the decline mid-reload, which is the flake the shim exists to remove and which no run of this case can
+    be relied on to produce), so only the "[native code]" assertion is shim-specific here."""
     html = ("<title>t</title><script>const n = Number(sessionStorage.getItem('n') || 0) + 1; sessionStorage.setItem('n', String(n));"
             "window.prompt('prompt-' + n); document.title = 'loaded-' + n;</script>")
     r = _drive(tmp_path, html, [{"until": "document.title === 'loaded-1'", "ms": 15000}, {"eval": "location.reload(); 1"},
@@ -87,7 +93,8 @@ def test_a_dialog_in_the_new_document_after_a_reload_is_answered_and_listed_too(
 
 @needs_browser
 def test_the_shim_is_what_answers_the_dialog_not_the_browser(tmp_path: Path) -> None:
-    """Red with the shim script not registered: window.prompt is then Chrome's own function and its source reads "[native code]"."""
+    """Red with the shim script not registered at all: window.prompt, confirm and alert are then Chrome's own and read "[native code]". It
+    checks that the shim is installed, not what it answers or records."""
     r = _drive(tmp_path, "<title>t</title>", [{"eval": "String(window.prompt)"}, {"eval": "String(window.confirm)"}, {"eval": "String(window.alert)"}])
     assert r.returncode == 0, r.stderr
     values = json.loads(r.stdout)["values"]
