@@ -1026,3 +1026,99 @@ def test_g4_the_card_renderer_writes_no_tab_or_newline_of_its_own(world):
     card = lines.index("Card (store parts in the cut, queue parts read at the brief's time):")
     own = lines[card:]
     assert len(own) > 1 and not any("⟨U+0009⟩" in ln or "⟨U+000A⟩" in ln for ln in own)
+
+
+def _doc_of(**states):
+    from levain.desk.board_state import STATE_COLUMN
+    return {"schema": "ready-v3", "as_of": None, "audit": [], "problems": [], "reader": {}, "items": [
+        {"id": f"levain#{k[1:]}", "repo": "levain", "title": "t", "tier": None, "state": s, "column": STATE_COLUMN[s], "reason": "r",
+         "refs": [], "as_of": None, "kind": None} for k, s in states.items()]}
+
+
+def _hand_off(world, *names):
+    return seam_handoffs.close(world, kind="rotation", body={**HANDOFF, "in_flight": [{"item": n, "owner": "seat", "why": "w"} for n in names]},
+                               request_id="c1", prev_handoff_id=None, token=_token(world))
+
+
+def test_the_open_says_beside_the_in_flight_list_which_entry_the_board_reads_as_not_open(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "levain#1", "levain#2", "a lane with no id")
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (0, _doc_of(n1="done", n2="in_flight"), ""))
+    lines = _brief(world).text.splitlines()
+    at = lines.index("  in flight: levain#1 (owner seat): w")
+    assert lines[at + 1:at + 4] == ["  in flight: levain#2 (owner seat): w", "  in flight: a lane with no id (owner seat): w",
+                                    "  in_flight names levain#1, which the board reads as done: it is not open"]
+    assert not any("in_flight names levain#2" in ln for ln in lines)
+
+
+def test_an_unreadable_board_is_one_line_under_the_in_flight_list_and_the_handoff_section_stands(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "levain#1")
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (2, None, "no items store"))
+    b = _brief(world)
+    assert "  in_flight vs the board: cannot-derive (CoordError: no items store)" in b.text.splitlines()
+    assert "  next: open the queue" in b.text.splitlines() and not (b.degraded or "").startswith("Handoff section")
+
+
+def test_the_open_reads_no_board_for_an_in_flight_that_names_no_board_id(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "a lane with no id")
+    seen = []
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: seen.append(1) or (0, _doc_of(), ""))
+    text = _brief(world).text
+    assert "in_flight names" not in text and "in_flight vs the board" not in text
+    assert len(seen) == 1                                       # the one board block's read; the drift check made none
+
+
+def test_one_in_flight_item_naming_thousands_of_ids_adds_a_bounded_drift_and_the_brief_still_opens(world, monkeypatch):
+    from levain.desk import board_cli
+
+    n = 2000
+    doc = _doc_of()
+    doc["items"] = [{**_doc_of(n1="done")["items"][0], "id": f"a#{k}"} for k in range(1, n + 1)]
+    _hand_off(world, " ".join(f"a#{k}" for k in range(1, n + 1)))
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (0, doc, ""))
+    text = _brief(world).text
+    lines = text.splitlines()
+    assert sum(1 for ln in lines if ln.startswith("  in_flight names a#")) == board_cli.MAX_DRIFT_LINES
+    assert f"  +{n - board_cli.MAX_DRIFT_LINES} more in_flight ids the board reads as not open (read them with levain board state)" in lines
+
+
+def test_the_open_reads_the_board_once_when_in_flight_names_an_id_and_both_sections_agree(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "levain#1")
+    docs = [_doc_of(n1="done"), _doc_of(n1="ready")]          # a second read would see the item open again
+    seen = []
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: seen.append(1) or (0, docs[len(seen) - 1], ""))
+    lines = _brief(world).text.splitlines()
+    assert len(seen) == 1
+    assert "  in_flight names levain#1, which the board reads as done: it is not open" in lines
+    assert any(ln.startswith("Board: 0 open of 1 item(s)") for ln in lines)               # the Board block drew the same snapshot
+
+
+def test_an_unreadable_board_is_one_failure_for_both_sections_from_one_read(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "levain#1")
+    seen = []
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: seen.append(1) or (2, None, "no items store"))
+    lines = _brief(world).text.splitlines()
+    assert len(seen) == 1
+    assert "  in_flight vs the board: cannot-derive (CoordError: no items store)" in lines
+    assert any(ln.startswith("Board: cannot-derive (CoordError: no items store") for ln in lines)
+
+
+def test_a_board_that_read_no_item_and_says_why_is_not_no_drift_in_the_in_flight_section(world, monkeypatch):
+    from levain.desk import board_cli
+
+    _hand_off(world, "levain#1")
+    doc = _doc_of()
+    doc["problems"] = ["line 1: not json"]
+    monkeypatch.setattr(board_cli, "read_board", lambda items=None, **kw: (3, doc, ""))
+    lines = _brief(world).text.splitlines()
+    assert "  in_flight vs the board: cannot-derive (CoordError: the board read no item: problem: line 1: not json)" in lines
+    assert not any("which the board reads as" in ln for ln in lines)

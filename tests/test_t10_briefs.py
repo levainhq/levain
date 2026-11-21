@@ -203,7 +203,7 @@ def test_the_desks_door_opens_the_named_board_and_charter_verbs_and_no_other(des
     opened = {r.removeprefix(lv + " ") for r in rules if r.startswith(lv + " ")}
     assert opened == {*inst_.DESK_VERBS, *inst_.DESK_BOARD_VERBS}
     extra = {v for v in opened if v.split()[0] in ("board", "charter")}
-    assert extra == set(inst_.DESK_BOARD_VERBS) and len(extra) == 15
+    assert extra == set(inst_.DESK_BOARD_VERBS) and len(extra) == 16      # the door grows only on purpose: 16 with the read verb `board open` (levain#179)
     text = "\n".join(cl._board_modes_section(lv))
     named = {c.removeprefix(lv + " ") for c in re.findall(r"`([^`]+)`", text) if c.startswith(lv + " ")}
     for c in named:                                                    # each verb the brief names is opened
