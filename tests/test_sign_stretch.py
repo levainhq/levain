@@ -210,6 +210,8 @@ def test_unreadable_sign_log_lines_mark_the_helper_clean_run_unverified(tmp_path
 
 
 def test_an_unreadable_key_dir_is_said_not_read_as_no_data(tmp_path):
+    if __import__("os").geteuid() == 0:
+        pytest.skip("root reads a mode-0 directory; the refusal needs a non-root user")
     kd = tmp_path / "keys"
     kd.mkdir()
     kd.chmod(0)
