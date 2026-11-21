@@ -109,6 +109,7 @@ def test_keep_asks_once_in_words_then_posts_confirm_true_and_the_row_leaves(tmp_
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && 1"},
+            BOARD_SETTLED,
             # a person opens the row's overflow menu and picks keep: a form asks, in words, and nothing is sent yet
             {"eval": f"{row}.querySelector('.verb-more').click(); {keep_btn}.click(); 1"},
             {"until": f"{row}.querySelector('.verb-form .verb-confirm') && 1"},
@@ -142,6 +143,7 @@ def test_a_row_the_cockpit_does_not_offer_keep_on_has_no_keep_button(tmp_path: P
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             {"eval": f"JSON.stringify({{keep: {ROWS}.filter(r => r.querySelector('[data-verb=intention_keep]')).map(r => r.dataset.surface), "
                      f"foreign: {ROWS}.filter(r => ['board'].includes(r.dataset.surface) && r.querySelector('.verb-btn')).length, "
                      f"all: {ROWS}.map(r => r.dataset.surface)}})"},
@@ -163,6 +165,7 @@ def test_a_query_with_kept_hits_draws_the_kept_group_expanded_and_read_only(tmp_
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             # no query: no kept group, and no kept row anywhere in the List
             {"eval": f"JSON.stringify({{group: !!({KEPT} && !{KEPT}.hidden && {KEPT}.children.length), kept: {ROWS}.filter(r => r.dataset.surface === 'kept').length}})"},
             *_set_query("noticed Z"),
@@ -217,6 +220,7 @@ def test_a_plain_band_row_makes_an_agenda_through_a_day_form_and_the_server_judg
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && {btn} && 1"},
+            BOARD_SETTLED,
             {"eval": f"JSON.stringify({{label: {btn}.textContent, time: !!{row}.querySelector('.verb-time')}})"},
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{day} && 1"},
@@ -280,6 +284,7 @@ def test_only_the_plain_band_row_offers_an_agenda_button(tmp_path: Path, monkeyp
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             {"eval": f"JSON.stringify({{agenda: {ROWS}.filter(r => r.querySelector('[data-verb=band_agenda]')).map(r => r.dataset.surface)}})"},
         ])
     assert json.loads(out["values"][-1]) == {"agenda": ["band"]}, out["values"]      # the one plain band row, and nothing else
@@ -384,6 +389,7 @@ def test_a_store_fault_after_the_agenda_is_planted_does_not_say_nothing_was_adde
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && {btn} && 1"},
+            BOARD_SETTLED,
             _day_words_step(past_day),
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{_day_input(row)} && 1"},
@@ -428,6 +434,7 @@ def test_the_refusal_codes_with_no_line_of_their_own_each_get_a_fixed_line(
         {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
         *_reload(),
         {"until": f"{TRAY} && {row} && {btn} && {seed} && 1"},
+        BOARD_SETTLED,
         {"eval": f"{btn}.click(); 1"},
         {"until": f"{_day_input(row)} && 1"},
         _pick(row, past)]
@@ -463,6 +470,7 @@ def test_the_agenda_forms_preview_and_done_line_name_the_year(tmp_path: Path, mo
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && {btn} && 1"},
+            BOARD_SETTLED,
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{_day_input(row)} && 1"},
             {"eval": "window.LevainCockpitTransport.rowVerb = async () => ({ok: true, data: {}}); 1"},
@@ -500,6 +508,7 @@ def test_the_kept_group_shows_a_fixed_line_never_the_servers_or_transports_text(
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             *_set_query("tray seed"),
             {"until": f"{KEPT} && !{KEPT}.hidden && {KEPT}.textContent"},
             # the box is cleared (the group goes), then a transport that fails with a path in its message (the page's own catch
@@ -532,7 +541,7 @@ def test_the_keep_form_with_a_long_line_stays_inside_the_card_at_phone_width(
     probe = ("JSON.stringify({sw: document.documentElement.scrollWidth, iw: window.innerWidth, "
              "ask: %s.querySelector('.keep-ask').textContent.length})")
     steps: list[dict[str, Any]] = [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, *_reload(),
-                                   {"until": f"{TRAY} && {first} && {second} && 1"}]
+                                   {"until": f"{TRAY} && {first} && {second} && 1"}, BOARD_SETTLED]
     for n, row in enumerate((first, second)):
         steps += [
             {"eval": f"{row}.querySelector('.verb-more').click(); {row}.querySelector('[data-verb=intention_keep]').click(); 1"},
@@ -584,7 +593,7 @@ def test_a_snooze_and_a_when_form_still_lay_out_at_both_widths(tmp_path: Path, m
                         ".filter(n => { const r = n.getBoundingClientRect(); return r.width > 0 && (r.right > card.right + 0.5 || r.left < card.left - 0.5); })"
                         ".map(n => n.className || n.tagName); return JSON.stringify({over: bad, sw: document.documentElement.scrollWidth <= window.innerWidth + 1}); })()")
     steps: list[dict[str, Any]] = [{"emulate": {"w": 1280, "h": 1100, "dpr": 1}}, *_reload(),
-                                   {"until": f"{TRAY} && {TRAY}.querySelector('.pexpand') && 1"}, *_open_focus(),
+                                   {"until": f"{TRAY} && {TRAY}.querySelector('.pexpand') && 1"}, BOARD_SETTLED, *_open_focus(),
                                    {"until": f"{ringing} && {water} && 1"}]
     for label, size in (("1280", {"w": 1280, "h": 1100, "dpr": 1}), ("390", {"w": 390, "h": 844, "dpr": 2, "mobile": True})):
         steps += [
@@ -681,6 +690,7 @@ def test_a_list_with_no_live_rows_still_searches_memory(tmp_path: Path, monkeypa
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && 1"},
+            BOARD_SETTLED,
             {"eval": f"JSON.stringify({{rows: {ROWS}.length, search: !!{SEARCH}, empty: !!{TRAY}.querySelector('.empty'), host: !!{KEPT}}})"},
             *_set_query("keep note"),
             {"until": f"{KEPT} && !{KEPT}.hidden && {KEPT}.querySelectorAll('.row').length && 1"},
@@ -706,7 +716,7 @@ def test_the_lists_live_rows_match_a_query_the_way_the_servers_memory_search_doe
     _seed_texts(root, "alpha one beta two", "Café Crème brûlée", "SHOUTING words")
     asks = ["alpha beta", "BETA   alpha", "alpha gamma", "cafe creme", "CAFÉ", "brulee", "shouting WORDS", "intention-"]
     steps: list[dict[str, Any]] = [{"emulate": {"w": 1280, "h": 1100, "dpr": 1}}, *_reload(),
-                                   {"until": f"{TRAY} && {ROWS}.length > 2 && 1"}]
+                                   {"until": f"{TRAY} && {ROWS}.length > 2 && 1"}, BOARD_SETTLED]
     for q in asks:
         steps += [*_set_query(q), {"eval": _LIST_WORDS}]
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
@@ -737,6 +747,7 @@ def test_the_list_search_takes_at_most_200_characters_and_both_halves_read_the_s
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             {"eval": f"JSON.stringify({{max: {SEARCH}.maxLength}})"},
             *_set_query(long_query),
             {"eval": _LIST_WORDS},
@@ -802,6 +813,7 @@ def test_a_panel_redraw_leaves_no_read_from_its_old_search_box_and_a_newer_key_a
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             {"eval": _COUNT_READS},
             # a control: a query is read once its debounce has run
             *_set_query("keep note"),
@@ -846,6 +858,7 @@ def test_a_refused_memory_read_prompts_no_token_and_drops_none(tmp_path: Path, m
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            BOARD_SETTLED,
             {"eval": refuse},
             *_set_query("tray seed"),
             {"until": f"{KEPT} && !{KEPT}.hidden && {KEPT}.textContent"},
@@ -869,6 +882,7 @@ def test_the_keep_form_cuts_its_quoted_line_on_a_whole_character(tmp_path: Path,
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && 1"},
+            BOARD_SETTLED,
             {"eval": f"{row}.querySelector('.verb-more').click(); {row}.querySelector('[data-verb=intention_keep]').click(); 1"},
             {"until": f"{row}.querySelector('.verb-form .keep-ask') && 1"},
             {"eval": f"(() => {{ const t = {row}.querySelector('.keep-ask').textContent; "
@@ -945,6 +959,7 @@ def test_the_real_servers_new_codes_each_read_their_own_line_with_the_extras_it_
             {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
             *_reload(),
             {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+            BOARD_SETTLED,
             _day_words_step(past_day),
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{_day_input(row)} && 1"},
