@@ -11,8 +11,9 @@
 // else asks for it again, so the page would stay dead until a person reloaded it. This runs first, before the boot below, and does not
 // block the boot: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and when that
 // lands the page goes on. When it does not, the page reloads ONCE: the marker is written to sessionStorage BEFORE the reload, so a second
-// failure finds it and stops. The marker is the time it was written, and one older than MARK_TTL_MS counts as absent. A healthy boot clears
-// the marker, so a later incident may heal again. Storage that cannot be read or written never reloads (no marker could be kept, so a loop
+// failure finds it and stops. The marker is the time it was written, and it holds only while its age is a finite span, not negative, and no longer than
+// MARK_TTL_MS: an older one, a future one (a clock set back) and a non-time all count as absent, so none can silence the guard for good. A
+// healthy boot, and a late re-request that lands after the guard has decided, clear the marker, so a later incident may heal again. Storage that cannot be read or written never reloads (no marker could be kept, so a loop
 // could not be ruled out). Nothing is shown; a console line is written when it gives up.
 (function () {
   // MARK_TTL_MS: a reload loop repeats within seconds, so a marker only has to outlive that; one left by a dead load long ago must not
@@ -33,15 +34,18 @@
         if (window.LevainCockpitView) { clearMark(); return; }
         let mayReload = false;
         try {
-          const ss = window.sessionStorage, now = Date.now(), held = ss.getItem(KEY);
-          if (held === null || !(now - Number(held) <= MARK_TTL_MS)) { const stamp = String(now); ss.setItem(KEY, stamp); mayReload = ss.getItem(KEY) === stamp; }
+          const ss = window.sessionStorage, now = Date.now(), held = ss.getItem(KEY), age = now - Number(held);
+          // a future or non-numeric stamp must not hold the reload back for as long as it lasts, so only a finite, non-negative age is fresh
+          const fresh = held !== null && Number.isFinite(age) && age >= 0 && age <= MARK_TTL_MS;
+          if (!fresh) { const stamp = String(now); ss.setItem(KEY, stamp); mayReload = ss.getItem(KEY) === stamp; }
         } catch (_) { mayReload = false; }
         if (mayReload) { window.location.reload(); return; }
-        console.error("levain: cockpit_view.js did not load, and the page has already reloaded once (or cannot remember that it did)");
+        console.error("levain: cockpit_view.js did not load (a reload was already tried, or the page cannot remember one)");
       } catch (_) { /* the guard never throws into the page */ }
     };
     const el = document.createElement("script");
-    el.onload = decide;
+    // a re-request that lands after the decision (the timer ran first, or a fresh marker held the reload back) still ends the incident
+    el.onload = function () { if (window.LevainCockpitView) clearMark(); decide(); };
     el.onerror = decide;
     el.src = src;
     timer = setTimeout(decide, WAIT_MS);
