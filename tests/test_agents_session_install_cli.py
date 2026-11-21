@@ -385,3 +385,42 @@ def test_a_too_deep_values_is_said_not_raised(world, capsys):
 def test_an_unknown_launcher_error_reads_as_a_list(world, capsys):
     _, _, err = _run(world[0], capsys, "--cockpit-root", str(world[1]), "--launcher", "nope")
     assert "registered launchers: stub" in err and " are " not in err
+
+
+# --- levain#225: --coord-dir ---------------------------------------------------------------------------------------
+
+def test_a_coord_dir_is_written_read_back_and_named(world, capsys):
+    store, cockpit, tmp_path = world
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", str(coord))
+    assert code == 0 and err == ""
+    assert W.read_install(store.directory).coord_dir == coord
+    assert f"coord_dir: {coord}" in out.splitlines()
+
+
+def test_a_tilde_coord_dir_is_expanded(world, capsys, monkeypatch):
+    store, cockpit, tmp_path = world
+    (tmp_path / "coord").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", "~/coord")
+    assert code == 0, err
+    assert W.read_install(store.directory).coord_dir == tmp_path / "coord"
+
+
+@pytest.mark.parametrize("kind", ["missing", "relative", "file"])
+def test_a_bad_coord_dir_is_refused_and_nothing_is_written(world, capsys, kind):
+    store, cockpit, tmp_path = world
+    bad = {"missing": str(tmp_path / "nope"), "relative": "rel/coord", "file": str(_episodic(tmp_path))}[kind]
+    before, litter = _good(world, capsys)
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", bad)
+    assert code == 1 and out == "" and "coord_dir" in err and "(nothing written)" in err
+    assert _file(store).read_bytes() == before and _litter(store) == litter
+
+
+def test_an_omitted_coord_dir_is_not_in_the_file(world, capsys):
+    store, cockpit, _ = world
+    code, out, _ = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert code == 0 and "coord_dir: (none)" in out.splitlines()
+    assert "coord_dir" not in json.loads(_file(store).read_text())
+    assert W.read_install(store.directory).coord_dir is None

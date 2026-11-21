@@ -667,7 +667,7 @@ def run_attach(args: argparse.Namespace) -> int:
 
 def _add_session_install_parsers(verbs: argparse._SubParsersAction) -> None:
     si = verbs.add_parser(
-        "session-install", help="Write the store's session install facts (launcher, episodic store, workspaces, cockpit root).",
+        "session-install", help="Write the store's session install facts (launcher, episodic store, workspaces, cockpit root, coord dir).",
         allow_abbrev=False,
         description="Write <store dir>/session_install.json, the one source of the launcher and the paths a session "
                     "agent may use, through session_wire.write_install. The file is replaced whole by what "
@@ -680,6 +680,10 @@ def _add_session_install_parsers(verbs: argparse._SubParsersAction) -> None:
     si.add_argument("--launcher", default=None, help="The registered launcher's name (default: none named).")
     si.add_argument("--episodic-path", dest="episodic_path", type=Path, default=None,
                     help="The episodic store file the agents' episodes are read from and written to (absolute).")
+    si.add_argument("--coord-dir", dest="coord_dir", type=Path, default=None,
+                    help="The review queue's coordination directory, where a session agent's report card is filed "
+                         "(an absolute path to an existing directory; `~` is expanded). Without it a session "
+                         "agent's night cannot end done once the report channel exists.")
     si.add_argument("--values", default=None, metavar="JSON",
                     help="A JSON object: the values handed to the role's slots.")
     si.add_argument("--workspace", dest="workspace", action="append", nargs="+", default=None,
@@ -741,7 +745,8 @@ def run_session_install(args: argparse.Namespace) -> int:
         previous_root = None
     try:
         path = session_wire.write_install(store.directory, cockpit_root=root, launcher=args.launcher,
-                                          episodic_path=args.episodic_path, values=values, workspaces=workspaces)
+                                          episodic_path=args.episodic_path, values=values, workspaces=workspaces,
+                                          coord_dir=None if args.coord_dir is None else args.coord_dir.expanduser())
     except session_wire.InstallRefused as exc:
         return _fail("session-install", f"{exc} (nothing written)")
     except OSError as exc:
@@ -756,6 +761,7 @@ def run_session_install(args: argparse.Namespace) -> int:
     print(f"cockpit_root: {install.cockpit_root}")
     print(f"launcher: {install.launcher if install.launcher is not None else '(none)'}")
     print(f"episodic_path: {install.episodic_path if install.episodic_path is not None else '(none)'}")
+    print(f"coord_dir: {install.coord_dir if install.coord_dir is not None else '(none)'}")
     print(f"values: {json.dumps(dict(install.values), sort_keys=True, ensure_ascii=False)}")
     for agent, ws in sorted(install.workspaces.items()):
         print(f"workspace {agent}: {ws.repo}" + (f" @ {ws.branch}" if ws.branch is not None else ""))

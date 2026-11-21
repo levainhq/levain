@@ -209,3 +209,18 @@ def test_a_bad_rewrite_leaves_the_working_install(rig, tmp_path):
 def test_an_episodic_path_that_is_a_directory_is_refused(rig, tmp_path):
     with pytest.raises(W.InstallRefused, match="is a directory"):
         _install(rig, episodic_path=tmp_path)
+
+
+# --- levain#225: the install's coord_dir -------------------------------------------------------------------------------
+
+def test_the_install_round_trips_a_coord_dir_and_refuses_a_relative_one(rig, tmp_path):
+    coord = tmp_path / "coord"
+    coord.mkdir()
+    path = W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir=coord)
+    assert W.read_install(rig.store.directory).coord_dir == coord and path.exists()
+    with pytest.raises(W.InstallRefused):
+        W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir="relative/coord")
+    with pytest.raises(W.InstallRefused):           # an absolute path that is no directory
+        W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir=coord / "missing")
+    W.write_install(rig.store.directory, cockpit_root=rig.world.root)
+    assert W.read_install(rig.store.directory).coord_dir is None

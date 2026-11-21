@@ -89,6 +89,7 @@ class SessionInstall:
     episodic_path: Path | None
     values: Mapping[str, Any]
     workspaces: Mapping[str, WorkspaceSetting] = field(default_factory=dict)
+    coord_dir: Path | None = None
 
 
 def _abs(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
@@ -121,7 +122,7 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
         raise InstallRefused(f"{path} is not a JSON object")
     if doc.get("schema") != INSTALL_SCHEMA:
         raise InstallRefused(f"{path} has schema {doc.get('schema')!r}, not {INSTALL_SCHEMA}")
-    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values", "workspaces"}
+    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values", "workspaces", "coord_dir"}
     if unknown:
         raise InstallRefused(f"{path}: unknown key {sorted(unknown)[0]!r}")
     root = _abs(doc, "cockpit_root", path, kind="dir")
@@ -132,7 +133,8 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
     values = doc.get("values", {})
     if not isinstance(values, dict):
         raise InstallRefused(f"{path}: values is not an object")
-    return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path))
+    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="dir")
+    return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path), coord)
 
 
 def _parse_workspaces(raw: Any, path: Path) -> Mapping[str, WorkspaceSetting]:
@@ -158,7 +160,8 @@ def _parse_workspaces(raw: Any, path: Path) -> Mapping[str, WorkspaceSetting]:
 
 def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: str | None = None,
                   episodic_path: Path | str | None = None, values: Mapping[str, Any] | None = None,
-                  workspaces: Mapping[str, Mapping[str, str]] | None = None) -> Path:
+                  workspaces: Mapping[str, Mapping[str, str]] | None = None,
+                  coord_dir: Path | str | None = None) -> Path:
     """Write the install file atomically: the new document is checked FIRST (as :func:`read_install` would read it
     back), then written to a temp in the directory (fsync, mode 0600) and renamed over the old one. A document that
     fails the check raises :class:`InstallRefused` and leaves the working install as it was."""
@@ -168,6 +171,8 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
         doc["launcher"] = launcher
     if episodic_path is not None:
         doc["episodic_path"] = str(Path(episodic_path).expanduser())
+    if coord_dir is not None:
+        doc["coord_dir"] = str(Path(coord_dir).expanduser())
     if values:
         doc["values"] = dict(values)
     if workspaces:
