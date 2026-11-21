@@ -8,16 +8,17 @@ counts as a long enough stretch is the operator's to accept.
 Inputs, every one opened read-only (nothing is created, locked, chmodded or deleted; a missing one is "no data"):
   * ``<key dir>/sign-failures/sigfail-*.json``: the evidence the Apple CTK path writes for a refused sk signature
     (``levain.cockpit.keys._write_sign_failure``: ``time``, ``attempt``, ``reason``, ``signature``). A failed SIGN is
-    counted, not a failed attempt: attempts share one pid and one 120 s deadline (``_SIGN_TIMEOUT``), so a run of files
-    with one pid is one sign (a new sign starts when ``attempt`` does not rise or the gap passes 120 s). It is an EMPTY
+    counted, not a failed attempt: attempts share one pid and one deadline (``keys._SIGN_TIMEOUT``), so a run of files
+    with one pid is one sign (a new sign starts when ``attempt`` does not rise or the gap passes that deadline). It is an EMPTY
     failure when any attempt's ``reason`` says empty, or its armored body is empty; otherwise an other failure. A record
     from the levain-sign helper (``signer`` "levain-sign") is skipped: that sign is already one line of the sign log.
   * ``<key dir>/sign-log.jsonl``: one JSON line per sign from the Secure Enclave helper
     (``levain.consent.se_signer.sign_log_record``: ``time``, ``outcome``). ``signed`` / ``ok`` is a sign, ``no-signature``
     / ``empty`` an empty failure, any other outcome an other failure counted under its own name.
-  * the statement ledger (flow's ``needs_phill_statements.jsonl``, flow ``termsign_statements.py``): one line per terminal
+  * the statement ledger, read only when named (``--ledger`` or ``NEEDS_PHILL_STATEMENTS``; flow keeps one as
+    ``needs_phill_statements.jsonl``, written by its ``termsign_statements.py``): one line per terminal
     `sign:` statement signed with Touch ID, ``ts`` epoch seconds. It is the only record of a SUCCESSFUL Apple-path sign
-    that exists today, and it holds statements only: a terminal option answer is not in it. If it cannot be read the
+    that exists today, and it holds statements only: a terminal option answer is not in it. If it is not named or cannot be read the
     Apple-path signs print as ``signs=?``, never a guess.
 """
 from __future__ import annotations
@@ -33,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-SIGN_GAP_S = 120.0                # keys._SIGN_TIMEOUT: one sign's attempts all fall inside it
+from levain.cockpit.keys import _SIGN_TIMEOUT as SIGN_GAP_S   # noqa: E402  one sign's attempts all fall inside it
 SIGNED_OUTCOMES = {"signed", "ok"}
 EMPTY_OUTCOMES = {"no-signature", "empty"}
 
