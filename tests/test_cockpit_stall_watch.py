@@ -110,18 +110,31 @@ def test_the_new_dump_is_never_trimmed_by_its_own_call_even_when_a_backwards_clo
     assert path in watch.dumps() and len(watch.dumps()) == KEEP_DUMPS
 
 
-def test_the_dump_names_a_thread_blocked_in_a_known_function(tmp_path):
-    entered, release = threading.Event(), threading.Event()
+def test_the_dump_names_a_thread_blocked_in_a_known_function(tmp_path, monkeypatch):
+    # The fallback dump keeps threads in name order up to MAX_THREADS (that cap has its own test). Threads left alive by
+    # other tests in the same process, and extra ones started here, sort ahead of "probe-worker" and would push it out
+    # of the listing, so the cap is lifted past the live thread count for this case.
+    entered, release, crowd_release = threading.Event(), threading.Event(), threading.Event()
+    crowd = [threading.Thread(target=crowd_release.wait, args=(30,), name=f"Thread-crowd-{i}", daemon=True)
+             for i in range(stall_watch.MAX_THREADS + 6)]
     worker = threading.Thread(target=blocked_in_stall_probe_helper, args=(entered, release), name="probe-worker",
                               daemon=True)
+    for thread in crowd:
+        thread.start()
     worker.start()
     try:
         assert entered.wait(10)
+        monkeypatch.setattr(stall_watch, "MAX_THREADS", len(sys._current_frames()) + 64)
         watch = drive(tmp_path, [LATE_S + 1.0])
     finally:
         release.set()
+        crowd_release.set()
         worker.join(10)
+        for thread in crowd:
+            thread.join(10)
     text = watch.dumps()[0].read_text()
+    assert "--- fallback stacks" in text
+    assert "--- thread probe-worker" in text
     assert "blocked_in_stall_probe_helper" in text
     assert "probe-worker" in text
 
