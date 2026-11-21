@@ -7,33 +7,40 @@ arguments. The wire form of a value is what a page can see (``json.loads(json.du
 order never counts and a list's order always does."""
 from __future__ import annotations
 
+import dataclasses
+import importlib
 import json
 import math
+import os
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from levain.cockpit import snapshot_host as sh
 from levain.cockpit.providers import build_default_cockpit
 
-# The one clock of a run. A host opens its store with the wall clock for the instant its worker started, and a row derived
-# before that instant reads stale (a cold start), so a clock set in the past would make every row stale for a reason that
-# is the rig's, not the layer's. T0 is therefore fixed once, an hour past the wall clock at import: every row is derived
-# after the worker started, and nothing in a run depends on the time passing.
-T0 = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(second=0, microsecond=0)
+# The clock of a run is fixed once per pair, an hour past the wall clock when the pair is built (``fixed_clock``). A host's
+# writer opens its store on the WALL clock and a row derived before that instant reads stale (a cold start), so a clock
+# set in the past would make every row stale for a reason that is the rig's, not the layer's. Past the wall clock, every
+# row is derived after the writer opened, and nothing inside a run depends on time passing.
 CRED = {"class": "none", "device_class": None}
 APPROVED_PATH = Path(__file__).resolve().parent / "cockpit_diff_approved.json"
 
 SCOPES = ("derive", "manifest", "payload", "freshness", "probe")
-KINDS = ("extra_key_in_subject", "missing_key_in_subject", "value_rule")
-OWNERS = ("levain-cockpit", "levain-speed", "flow-bridge")
+KINDS = ("extra_key_in_subject", "missing_key_in_subject", "value_rule", "extra_key_with_rule")
 MAX_CYCLES = 6
+HEALTHY = ("ok", "partial", "empty")      # a derive status that is a read, not a failure
 MIN_REASON = 40
 BANNED_REASONS = frozenset({"todo", "known", "tbd", "flaky", "fixme", "wip"})
 
 
 # ------------------------------------------------------------------------------------------------------------ the two cockpits
+
+
+def fixed_clock() -> datetime:
+    return (datetime.now(timezone.utc) + timedelta(hours=1)).replace(second=0, microsecond=0)
 
 
 @dataclass(frozen=True)
@@ -43,7 +50,7 @@ class RigConfig:
 
     name: str
     install: Callable[[Path], Any]
-    now: datetime = T0
+    now: datetime | None = None      # None: ``fixed_clock()`` at build time
     exclude: tuple = ()
 
 
@@ -54,6 +61,7 @@ class Pair:
     attached: Any
     host: Any
     derived: list
+    levain_home: str | None = None      # LEVAIN_HOME as the pair was built under
 
     @property
     def reader(self) -> Any:
@@ -74,22 +82,27 @@ def _cockpit(config: RigConfig, src: Any) -> Any:
 
 def build_pair(config: RigConfig, tmp_path: Path) -> Pair:
     """The oracle (bare) and the subject (attached to a real host's reader), over ONE install. The host runs on this thread:
-    its first cycle does discovery and the entity, and the cycles after it derive what discovery found, until a cycle has
-    nothing left to publish. Nothing runs on a thread of its own, so the clock is the only time there is."""
+    each cycle publishes what the one before it discovered, until a cycle has nothing left to publish. The host is stopped
+    on every way out that does not return the pair."""
+    if config.now is None:
+        config = dataclasses.replace(config, now=fixed_clock())
     src = config.install(tmp_path)
     bare, ck = _cockpit(config, src), _cockpit(config, src)
     root = tmp_path / "host"
     root.mkdir()
     host = sh.SnapshotHost(ck, root, clock=config.now.timestamp)
-    host.attach()
-    for _ in range(MAX_CYCLES):
-        if not host.run_once(config.now.timestamp()) and host.wait_first_discovery(0):
-            break
-    else:
+    try:
+        host.attach()
+        for _ in range(MAX_CYCLES):
+            if not host.run_once(config.now.timestamp()) and host.wait_first_discovery(0):
+                break
+        else:
+            raise AssertionError(f"the subject's host still publishing after {MAX_CYCLES} cycles")
+        derived = [pid for pid in ck.panel_ids if not ck.serve_composed(pid)]
+        return Pair(config, bare, ck, host, derived, os.environ.get("LEVAIN_HOME"))
+    except BaseException:
         host.stop(timeout=10)
-        raise AssertionError(f"the subject's host still publishing after {MAX_CYCLES} cycles")
-    derived = [pid for pid in ck.panel_ids if not ck.serve_composed(pid)]
-    return Pair(config, bare, ck, host, derived)
+        raise
 
 
 # ----------------------------------------------------------------------------------------------------------------- wire form
@@ -234,7 +247,7 @@ def compare(pair: Pair) -> list:
     subject = observe_request(pair.attached, pair.derived, oracle["_rows_asked"])
     order = Triple(("manifest", "panels", "#order"), "value", oracle.pop("_panel_order"), subject.pop("_panel_order"))
     oracle.pop("_rows_asked"), subject.pop("_rows_asked")
-    # the probe is the subject's own surface (a bare cockpit has none): its etags are held against the oracle's manifest etags
+    # the probe is the subject's own surface (a bare cockpit has none): its etags are held against the subject's own manifest etags (the oracle's differ by design)
     probe = subject.pop("probe", None)
     out.extend(diff(oracle, subject))
     if order.old != order.new:
@@ -245,25 +258,81 @@ def compare(pair: Pair) -> list:
     return out
 
 
-def self_diff(pair: Pair) -> list:
-    """The ORACLE against itself: the same cockpit read twice. A path that differs here is an input the harness has not
-    fixed, never a difference to approve."""
-    a = {"derive": observe_derive_oracle(pair), **{k: v for k, v in observe_request(pair.bare, pair.derived).items()}}
-    b = {"derive": observe_derive_oracle(pair), **{k: v for k, v in observe_request(pair.bare, pair.derived).items()}}
-    return diff(a, b)
+def self_diff(pair: Pair, side: str = "bare") -> list:
+    """One side against itself: the same cockpit read twice (``side`` is "bare", the oracle, or "attached", the subject). A
+    path that differs here is an input the harness has not fixed, never a difference to approve."""
+    ck = pair.bare if side == "bare" else pair.attached
+    derive = observe_derive_oracle if side == "bare" else observe_derive_subject
+
+    def read() -> dict:
+        return {"derive": derive(pair), **observe_request(ck, pair.derived)}
+
+    return diff(read(), read())
 
 
 # ---------------------------------------------------------------------------------------------------------- the approved list
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 def _is_etag(old: Any, new: Any) -> bool:
-    """Both sides are an etag: a non-empty text. They differ by construction (the attached one hashes the row's body hash
-    and its freshness, the bare one the content), so equality is not the rule; two panels of different content must still
-    not share one, which the test file holds separately."""
-    return isinstance(old, str) and isinstance(new, str) and bool(old) and bool(new)
+    """Both sides are an etag (a sha256 hex digest). They differ between a row-built and a content-built head by design, so
+    equality is not the rule for the panels an entry covers."""
+    return isinstance(old, str) and isinstance(new, str) and bool(_HEX64.fullmatch(old)) and bool(_HEX64.fullmatch(new))
 
 
-RULES: dict = {"etag_is_a_tag": _is_etag}
+def _etag_rule(t: "Triple", now: datetime | None) -> bool:
+    return _is_etag(t.old, t.new)
+
+
+def _iso_not_before(value: Any, now: datetime | None) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str) or now is None:
+        return False
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return at.tzinfo is not None and at >= now
+
+
+def _fresh_at_rest(t: "Triple", now: datetime | None) -> bool:
+    """The value of a freshness key the subject adds, for a corpus read at rest (every row derived at the run's clock, the
+    worker alive, nothing in flight): a panel is not stale and not pending, its bound is absent or not before the clock, and
+    the layer behind the page reports a live worker with nothing deriving."""
+    key, value = t.path[-1], t.new
+    if key in ("stale", "pending"):
+        return value is False
+    if key == "valid_until":
+        return _iso_not_before(value, now)
+    if key == "freshness":
+        return isinstance(value, dict) and value.get("worker") == "live" and value.get("deriving") == []
+    return False
+
+
+RULES: dict = {"etag_is_a_tag": _etag_rule, "fresh_at_rest": _fresh_at_rest}
+VALUE_KINDS = ("value_rule", "extra_key_with_rule")
+
+
+def resolve_symbol(dotted: str) -> Any:
+    """The object a ``module.Class.attr`` name points at; raises when any part is gone."""
+    parts = dotted.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        try:
+            obj = importlib.import_module(".".join(parts[:i]))
+        except ImportError:
+            continue
+        for name in parts[i:]:
+            obj = getattr(obj, name)
+        return obj
+    raise ImportError(dotted)
+
+
+def source_symbols(source: str) -> list:
+    """The dotted names in an entry's ``source``: comma separated, any parenthetical words dropped."""
+    return [n.strip() for n in re.sub(r"\([^)]*\)", "", source).split(",") if n.strip()]
 
 
 def load_approved(path: Path = APPROVED_PATH) -> list:
@@ -297,17 +366,22 @@ def entry_problems(entries: Any) -> list:
             problems.append(f"{who}: scope not in {SCOPES}")
         if not isinstance(e.get("path"), str) or not e["path"]:
             problems.append(f"{who}: path is missing")
+        elif not any(seg not in ("*", "**") for seg in e["path"].split(".")):
+            problems.append(f"{who}: path has no literal segment, so it would match everything in its scope")
         if e.get("kind") not in KINDS:
             problems.append(f"{who}: kind not in {KINDS}")
-        elif e["kind"] == "value_rule" and e.get("rule") not in RULES:
+        elif e["kind"] in VALUE_KINDS and e.get("rule") not in RULES:
             problems.append(f"{who}: rule {e.get('rule')!r} is not in the registry")
-        if e.get("owner") not in OWNERS:
-            problems.append(f"{who}: owner not in {OWNERS}")
+        if not isinstance(e.get("owner"), str) or not e["owner"].strip():
+            problems.append(f"{who}: owner is a non-empty text")
+        dates = {}
         for f in ("added", "review_by"):
             try:
-                datetime.strptime(str(e.get(f)), "%Y-%m-%d")
+                dates[f] = date.fromisoformat(str(e.get(f)))
             except ValueError:
                 problems.append(f"{who}: {f} is a YYYY-MM-DD date")
+        if len(dates) == 2 and dates["review_by"] <= dates["added"]:
+            problems.append(f"{who}: review_by is later than added")
     return problems
 
 
@@ -327,11 +401,13 @@ def glob_match(pattern: str, path: tuple) -> bool:
     return go(0, 0)
 
 
-def entry_matches(entry: dict, t: Triple) -> bool:
+def entry_matches(entry: dict, t: Triple, now: datetime | None = None) -> bool:
     if entry["scope"] != t.scope or not glob_match(entry["path"], t.path[1:]):
         return False
     if entry["kind"] == "value_rule":
-        return t.kind == "value" and bool(RULES[entry["rule"]](t.old, t.new))
+        return t.kind == "value" and bool(RULES[entry["rule"]](t, now))
+    if entry["kind"] == "extra_key_with_rule":
+        return t.kind == "extra_key_in_subject" and bool(RULES[entry["rule"]](t, now))
     return entry["kind"] == t.kind
 
 
@@ -341,10 +417,11 @@ class Verdict:
     matched: dict = field(default_factory=dict)      # entry id -> how many triples it explained
 
 
-def classify(triples: list, entries: list) -> Verdict:
+def classify(triples: list, entries: list, now: datetime | None = None) -> Verdict:
+    """``now`` is the run's clock, for the rules that compare a value with it."""
     v = Verdict()
     for t in triples:
-        hit = next((e for e in entries if entry_matches(e, t)), None)
+        hit = next((e for e in entries if entry_matches(e, t, now)), None)
         if hit is None:
             v.unmatched.append(t)
         else:
