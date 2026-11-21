@@ -308,17 +308,18 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     if repaint_between:
         # the repaint the page does on its own at an arbitrary moment, made certain: both first reads are spoiled, then the modal is
         # opened again (the page's own rebuild of the open modal), and the rows the test pressed are new nodes
+        # a row node of the old paint is held and the modal opened again in ONE evaluation (the open rebuilds synchronously inside
+        # the click), so only that open can have replaced the held node
         steps += [{"do": press, "until": spoiled_both},
-                  {"eval": f"window.__zqMark = {decided}[0]; 1"},       # a row node of the old paint: the repaint below must replace it
-                  {"eval": OPEN_DECISIONS}]
-    steps += [{"do": press, "until": shown},
-              {"eval": "Object.assign({}, window.__zq, { repainted: window.__zqMark ? !window.__zqMark.isConnected : null })"}]
+                  {"until": f"{decided}.length === {len(gone)}"},
+                  {"eval": f"(async () => {{ const held = {decided}[0]; if (!held) return null; await {OPEN_DECISIONS}; window.__zq.repainted = !held.isConnected; return 1; }})()"}]
+    steps += [{"do": press, "until": shown}, {"eval": "window.__zq"}]
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
     texts, rec = out[-2], out[-1]
     assert rec["before"] is not None and rec["before"] == [False, False], rec      # before the first press neither decided row had a body
     if repaint_between:
-        assert rec["repainted"] is True, rec         # the second open really replaced the rows, so this case is not vacuous
+        assert rec.get("repainted") is True, rec        # the second open really replaced the rows, so this case is not vacuous
     for i in gone:
         mine = [w for (n, w) in rec["log"] if n == i]
         # the first read of each id was the spoiled one, and a later read was issued: the spoiled read released its slot
