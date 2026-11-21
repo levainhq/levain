@@ -1,0 +1,71 @@
+[
+  {
+    "id": "AD-fresh-keys-manifest",
+    "scope": "manifest",
+    "path": "panels.*.valid_until|stale|pending",
+    "kind": "extra_key_in_subject",
+    "reason": "An attached head carries the row's freshness (valid_until, stale, pending); a bare head has no row and so no such keys. The values are checked by the freshness tests, the diff only allows the keys to exist on the subject.",
+    "source": "levain.cockpit.engine.Cockpit._head (the fresh argument), Cockpit._stamp_fresh",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
+    "id": "AD-fresh-keys-payload",
+    "scope": "payload",
+    "path": "*.*.valid_until|stale|pending",
+    "kind": "extra_key_in_subject",
+    "reason": "An attached panel payload opens with the same head as the manifest, so it carries valid_until, stale and pending too; a bare payload has no row to take them from.",
+    "source": "levain.cockpit.engine.Cockpit._head (the fresh argument), Cockpit._stamp_fresh",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
+    "id": "AD-fresh-keys-freshness",
+    "scope": "freshness",
+    "path": "*.stale",
+    "kind": "extra_key_in_subject",
+    "reason": "The attached freshness map answers from the published row and adds the reader's stale verdict to each panel entry; a bare cockpit has no row and reports only as_of and status.",
+    "source": "levain.cockpit.engine.Cockpit.freshness (the attached branch)",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
+    "id": "AD-etag-manifest",
+    "scope": "manifest",
+    "path": "panels.*.etag",
+    "kind": "value_rule",
+    "rule": "etag_is_a_tag",
+    "reason": "An attached etag hashes the row's body hash with stale, pending and the row count; a bare one hashes the content fragments, so equal content gives different tags by design. Only that both sides are a tag is held here.",
+    "source": "levain.cockpit.engine.Cockpit._etag_of, Cockpit._head (stands_on)",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
+    "id": "AD-etag-payload",
+    "scope": "payload",
+    "path": "*.*.etag",
+    "kind": "value_rule",
+    "rule": "etag_is_a_tag",
+    "reason": "The payload's etag is the head's etag and differs by construction for the same reason as the manifest's: the attached one is built from the row's body hash and freshness, the bare one from the content.",
+    "source": "levain.cockpit.engine.Cockpit._etag_of, Cockpit._head (stands_on)",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
+    "id": "AD-etag-manifest-top",
+    "scope": "manifest",
+    "path": "etag",
+    "kind": "value_rule",
+    "rule": "etag_is_a_tag",
+    "reason": "The manifest etag hashes the panels' heads, whose etags differ by construction between a row-built head and a content-built one, so the manifest etag differs for the same reason.",
+    "source": "levain.cockpit.engine.Cockpit._etag_of, Cockpit._manifest_compute",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  }
+]
