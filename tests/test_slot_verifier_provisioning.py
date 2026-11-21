@@ -74,6 +74,9 @@ def test_known_and_provisioned_singletons_split() -> None:
 #: ``SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch")``).
 #: Never derive it from the package: it is what installed, older code recognises, whatever this tree says.
 PRE_223_SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch")
+#: FROZEN copy of cd884ce00's ``SHARED_GROUPS`` (same file), on the same rule.
+PRE_223_SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
+                         "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin")
 
 
 def test_the_original_sets_and_what_repair_may_make_derive_from_one_place() -> None:
@@ -81,14 +84,22 @@ def test_the_original_sets_and_what_repair_may_make_derive_from_one_place() -> N
     so a singleton added later is both made by repair and optional in an older setup journal with no third list. A
     singleton repair makes is made AFTER R7's memberships (``plan_repair``, levain#223 fix 1): it must be in no group."""
     assert ORIGINAL_SINGLETONS == PRE_223_SINGLETONS
-    assert ORIGINAL_SHARED_GROUPS == ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake",
-                                      "levain-lineage", "levain-export", "levain-dispatch-export", "levain-queue",
-                                      "levain-keysadmin")             # cd884ce00's SHARED_GROUPS, frozen
+    assert ORIGINAL_SHARED_GROUPS == PRE_223_SHARED_GROUPS
     assert IH._REPAIR_MAKES == frozenset({VERIFIER_ACCOUNT})
+    assert IH._REPAIR_MAKES_GROUPS == frozenset({VERIFIER_GROUP})
     for name in IH._REPAIR_MAKES:
         assert supplementary_groups(name) == (), name
         assert [p for p in membership_pairs([Account(name, LINUX_UID, supplementary_groups(name))], OP)
                 if p[0] == name] == []
+    # a shared group repair makes is made in R10 too (L3 r1): no account, the operator or a row may name it before
+    from levain.slot.layout import base_run_rows, base_store_rows, slot_rows
+    accts = [Account(n, LINUX_UID, supplementary_groups(n)) for n in (*KNOWN_SINGLETONS, *SlotId("egress", 0).accounts,
+                                                                       *SlotId("none", 0).accounts)]
+    rows = (base_store_rows("linux", OP) + base_run_rows("linux", OP)
+            + slot_rows("linux", (SlotId("egress", 0), SlotId("none", 0))))
+    for g in IH._REPAIR_MAKES_GROUPS:
+        assert [p for p in membership_pairs(accts, OP) if p[1] == g] == [], g
+        assert [r for r in rows if r.group == g] == [], g
 
 
 def test_the_wall_names_the_verifier_as_ids_does() -> None:
@@ -229,8 +240,9 @@ def test_the_journal_whole_slots_check_recognises_the_verifier() -> None:
 # --- undo -----------------------------------------------------------------------------------------------------------
 
 
-def _undo_plan(tmp_path: Path, monkeypatch, *, kill_at: str | None):
-    """Undo over a Linux host holding only the verifier's account, its own group and the shared ``levain-verify``."""
+def _undo_plan(tmp_path: Path, monkeypatch, *, kill_at: str | None, record_group: bool = True):
+    """Undo over a Linux host holding only the verifier's account, its own group and the shared ``levain-verify``
+    (``record_group`` False: the install record does not name that group, so it is a same-name foreign one)."""
     from levain.slot.layout import STORE
     from tests.test_undo_remove import _facts as undo_facts, _no_real_store, _shape
 
@@ -246,7 +258,8 @@ def _undo_plan(tmp_path: Path, monkeypatch, *, kill_at: str | None):
         if point == kill_at:
             raise Killed(point)
     live = RM.Live(run=h.run, root=live.root, fsync=h.fsync, fault=fault)
-    shape = _shape(("account/1", (VERIFIER_ACCOUNT, LINUX_UID)), ("group/1", (VERIFIER_GROUP, LINUX_GID)))
+    shape = _shape(("account/1", (VERIFIER_ACCOUNT, LINUX_UID)),
+                   *((("group/1", (VERIFIER_GROUP, LINUX_GID)),) if record_group else ()))
     plan = IH.plan_undo(parse_install_argv(["undo"]), undo_facts("linux", shape), accounts={VERIFIER_ACCOUNT: LINUX_UID},
                         shared_groups={VERIFIER_GROUP: LINUX_GID}, live=live, end=lambda u, n: (True, ""))
     return h, live, plan
@@ -282,6 +295,35 @@ def test_undo_removes_the_verifier_and_a_kill_part_way_is_finished_by_the_next_u
     # the tool's directory is the host's (``shutil.which``), so the pin is its name and its whole argument list
     assert ("chage", "--expiredate", "0", VERIFIER_ACCOUNT) in [(os.path.basename(a[0]), *a[1:]) for a in h.log]
     assert LINUX_UID in again.retired_after
+
+
+def test_undo_leaves_a_same_name_levain_verify_the_record_does_not_name(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 (codex HIGH 1): ``levain-verify`` came after the install record, so its NAME is no proof: a live group of
+    that name the record does not name (and no journal names) is not Levain's and undo leaves it, while every
+    original name still goes by name (the pre-record installs) and a recorded ``levain-verify`` goes (the test above)."""
+    h, live, plan = _undo_plan(tmp_path, monkeypatch, kill_at=None, record_group=False)
+    assert not [s.why for s in plan.steps if s.why.startswith(f"delete the group {VERIFIER_GROUP}")]
+    _walk(plan)
+    assert h.groups[VERIFIER_GROUP][0] == LINUX_GID
+    assert not [a for a in h.log if os.path.basename(a[0]) == "groupdel" and a[-1] == VERIFIER_GROUP]
+    from tests.test_undo_remove import _facts as undo_facts, _shape
+    legacy = IH.plan_undo(parse_install_argv(["undo"]), undo_facts("linux", _shape()), accounts={},
+                          shared_groups={"levain-slots": RANGES["linux"].shared[0]}, live=live,
+                          end=lambda u, n: (True, ""))
+    assert [s.why for s in legacy.steps if s.why.startswith("delete the group levain-slots")]
+
+
+def test_setup_records_the_verifier_group_so_undo_owns_it(tmp_path: Path, monkeypatch) -> None:
+    """The other half of the rule above: an install made by THIS setup names ``group/1 levain-verify`` in its install
+    record (the record step's own text, read back), so its undo still deletes the group."""
+    path = tmp_path / "install-shape"
+    monkeypatch.setattr(IH, "install_shape_path", lambda host: path)
+    plan = IH.plan_setup(_setup(3, 2), _facts("linux"), read_sysctl=lambda p: "1", program_exists=lambda p: True)
+    step = next(s for s in plan.steps if s.why.startswith("write the install record"))
+    assert step.call()[0]
+    shape = G.parse_shape(path.read_bytes())
+    assert ("group/1", (VERIFIER_GROUP, LINUX_GID)) in shape.managed
+    assert ("account/1", (VERIFIER_ACCOUNT, LINUX_UID)) in shape.managed
 
 
 # --- repair ---------------------------------------------------------------------------------------------------------
@@ -341,7 +383,7 @@ def _repair(facts, rf):
 
 
 R4B = "journal the shared-group gids"
-LATE = "journal the singletons this repair makes"
+LATE = "journal the singletons and groups this repair makes"
 FLIP = "flip "
 ENTRY = "write the install-helper entry script"
 
@@ -365,8 +407,11 @@ def _pre_223_objections(host: str, journal: Intent | None, users: dict) -> list[
     over :data:`PRE_223_SINGLETONS`; ``intent.parse_intent`` refusing ``intent-malformed`` on any journaled account that
     fails them (groups are judged by the bound, unchanged since); ``generation.KINDS`` ``account/1`` (``in_own_range``)
     and ``member/1`` (``is_levain_account`` or the operator), which ``check_records`` applies to the journal's
-    ``managed`` (``bad-record``); and ``check_account_ids`` over every live labelled account (``not-levain-name``, as
-    L2's run of that code printed for ``_levain_verify``). Empty: the old code reads this state."""
+    ``managed`` (``bad-record``); ``check_account_ids`` over every live labelled account (``not-levain-name``, as
+    L2's run of that code printed for ``_levain_verify``); and (L3 r1, complement MED 1) its repair's R1b over that
+    journal: ``leaving`` takes every journaled ``group/1`` whose name is not in its ``SHARED_GROUPS`` and ``remove =
+    reconcile - desired`` deletes it (its ``desired`` names only those groups), so any such record is one the old
+    resume removes. Empty: the old code reads this state and removes nothing of it."""
     def known(name: str) -> bool:
         m = SLOT_NAME_RE.fullmatch(name)
         return name in PRE_223_SINGLETONS or (m is not None and int(m.group(2)) < INDEX_SPACE)
@@ -385,6 +430,8 @@ def _pre_223_objections(host: str, journal: Intent | None, users: dict) -> list[
                 out.append(f"bad-record: {kind} {ident!r}")
             if kind == "member/1" and not (known(ident[0]) or ident[0] == OP):
                 out.append(f"bad-record: {kind} {ident!r}")
+            if kind == "group/1" and ident[0] not in PRE_223_SHARED_GROUPS:
+                out.append(f"R1b-removes: {kind} {ident!r}")
     out += [f"not-levain-name: {n}" for n, (u, label) in users.items() if label == SLOT_MARKER and not known(n)]
     return out
 
@@ -421,10 +468,10 @@ def test_repair_creates_the_verifier_on_an_install_made_before_it(tmp_path: Path
     lock = next(i for i, s in enumerate(plan.steps) if s.argv[:1] and s.argv[0].endswith("usermod")
                 and "--lock" in s.argv and s.argv[-1] == VERIFIER_ACCOUNT)
     first_member = next(i for i, s in enumerate(plan.steps) if s.why.startswith("put "))
-    # levain#223 fix 1: the shared group is made pre-flip (journaled at R4b, read by its bound by every generation);
-    # the account is journaled and made only after the flip AND the install-helper entry script, write-ahead: the
-    # journal that names it precedes its group, which precedes its user
-    assert ahead < shared < first_member < flip < entry < journal < group < user < lock
+    # levain#223 fix 1 and L3 r1: the shared group and the account are journaled and made only after the flip AND the
+    # install-helper entry script, write-ahead: the journal that names them precedes the shared group, then the
+    # account's own group, then its user
+    assert ahead < first_member < flip < entry < journal < shared < group < user < lock
     # so nothing before its creation may name it: no membership, row (chown), probe or written file
     assert not [s.why for s in plan.steps[:journal] if VERIFIER_ACCOUNT in _names(s)]
     uid = plan.steps[user].argv.index("--uid")
@@ -448,9 +495,10 @@ def test_repair_allocates_the_verifier_uid_past_used_and_retired_ids(tmp_path: P
 
 
 def test_repair_journals_the_account_in_the_late_write_ahead_record_only(tmp_path: Path, intent_path: Path) -> None:
-    """Run each journal step and read the file back with the reader's own rules. R4b's names the shared group at its
-    gid and NOTHING of the account (no ``accounts`` entry, no ``account/1``); the late one, after the flip, names the
-    account at the uid with its ``account/1`` record, and every other record R4b's had."""
+    """Run each journal step and read the file back with the reader's own rules. R4b's names NOTHING of the account
+    (no ``accounts`` entry, no ``account/1``) nor of the shared group ``levain-verify`` (no ``groups`` entry, no
+    ``group/1``: L3 r1); the late one, after the flip, names the account at the uid and the group at the gid with
+    their records, and every other record R4b's had."""
     users, groups = _before()
     facts, rf = _state(tmp_path, "linux", users, groups)
     plan = _repair(facts, rf)
@@ -458,13 +506,15 @@ def test_repair_journals_the_account_in_the_late_write_ahead_record_only(tmp_pat
     late = next(s for s in plan.steps if s.why.startswith(LATE))
     assert r4b.call()[0]
     a = read_intent("linux", path=intent_path)
-    assert a.verb == "repair" and a.accounts == {} and a.groups[VERIFIER_GROUP] == LINUX_GID
-    assert ("group/1", (VERIFIER_GROUP, LINUX_GID)) in a.managed
-    assert not [r for r in a.managed if VERIFIER_ACCOUNT in repr(r)]
+    assert a.verb == "repair" and a.accounts == {} and VERIFIER_GROUP not in a.groups
+    assert set(a.groups) == set(ORIGINAL_SHARED_GROUPS)
+    assert not [r for r in a.managed if VERIFIER_ACCOUNT in repr(r) or VERIFIER_GROUP in repr(r)]
     assert late.call()[0]
     b = read_intent("linux", path=intent_path)
-    assert b.accounts == {VERIFIER_ACCOUNT: LINUX_UID} and b.groups == a.groups and b.txn == a.txn
-    assert set(b.managed) - set(a.managed) == {("account/1", (VERIFIER_ACCOUNT, LINUX_UID))}
+    assert b.accounts == {VERIFIER_ACCOUNT: LINUX_UID} and b.txn == a.txn
+    assert b.groups == {**a.groups, VERIFIER_GROUP: LINUX_GID}
+    assert set(b.managed) - set(a.managed) == {("account/1", (VERIFIER_ACCOUNT, LINUX_UID)),
+                                               ("group/1", (VERIFIER_GROUP, LINUX_GID))}
     assert b == plan.intent                                         # the plan's intent is the whole final record
 
 
@@ -540,17 +590,20 @@ def _kill_at_every_point(tmp_path: Path, intent_path: Path):
 def test_a_repair_killed_before_the_flip_leaves_what_the_pre_223_code_reads(tmp_path: Path, intent_path: Path) -> None:
     """L1 HIGH-1 / L2 H1: until the flip (R9) and R10's entry scripts, the operator's next verb (bare repair's resume,
     ``repair --source``'s phase A, undo) runs the INSTALLED generation's code, which on this install is pre-#223. At
-    every kill point before both, the journal on disk and the live accounts pass that code's frozen rules
-    (:func:`_pre_223_objections`); a point after them is read by this code only. Every point is covered, including
-    the ones after the shared group ``levain-verify`` (journaled at R4b and made at R6, read by its bound)."""
-    checked = named_group = 0
+    every kill point before both, the journal on disk and the live accounts pass that code's frozen rules, its R1b
+    removal included (:func:`_pre_223_objections`), and NOTHING new is live: no user or group the install did not
+    already hold (L3 r1: the shared group ``levain-verify`` too is journaled and made only after them). A point after
+    them is read by this code only."""
+    base_users, base_groups = _before()
+    checked = 0
     for what, k, m, journaled, ran in _kill_at_every_point(tmp_path, intent_path):
         if what != "killed" or (m.flipped and m.entries):
             continue
         assert _pre_223_objections("linux", journaled, m.users) == [], (k, ran)
+        assert set(m.users) == set(base_users) and set(m.groups) == set(base_groups), (k, ran)
+        assert journaled is None or VERIFIER_GROUP not in journaled.groups, (k, ran)
         checked += 1
-        named_group += journaled is not None and VERIFIER_GROUP in journaled.groups and VERIFIER_GROUP in m.groups
-    assert checked >= 6 and named_group >= 1, (checked, named_group)
+    assert checked >= 5, checked                                    # 0, R1, R3, R4b, the flip (not the entry)
 
 
 def test_repair_resumes_at_the_journaled_uid_after_a_kill_at_every_point(tmp_path: Path, intent_path: Path) -> None:
@@ -564,14 +617,14 @@ def test_repair_resumes_at_the_journaled_uid_after_a_kill_at_every_point(tmp_pat
             late_ran = any(w.startswith(LATE) for w in ran)
             assert (journaled is not None and VERIFIER_ACCOUNT in journaled.accounts) == late_ran, (k, ran)
             if not late_ran:
-                assert VERIFIER_ACCOUNT not in m.users and VERIFIER_ACCOUNT not in m.groups, (k, ran)
+                assert VERIFIER_ACCOUNT not in m.users and not {VERIFIER_ACCOUNT, VERIFIER_GROUP} & set(m.groups), (k, ran)
             continue
         assert m.users[VERIFIER_ACCOUNT] == (LINUX_UID, SLOT_MARKER), k
         assert m.groups[VERIFIER_ACCOUNT] == LINUX_UID and m.groups[VERIFIER_GROUP] == LINUX_GID, k
         assert VERIFIER_ACCOUNT in m.locked, k
         assert [n for n, (u, _) in m.users.items() if u == LINUX_UID] == [VERIFIER_ACCOUNT], k
         assert journaled is not None and journaled.accounts == {VERIFIER_ACCOUNT: LINUX_UID}, k
-    # R1, R3, R4b, levain-verify, the flip, the entry script, the late journal, the account's group, user and lock
+    # R1, R3, R4b, the flip, the entry script, the late journal, levain-verify, the account's group, user and lock
     assert points == 10 + 1, points
 
 
@@ -688,3 +741,46 @@ def test_repair_phase_a_and_resume_do_not_refuse_the_missing_verifier(tmp_path: 
     (tree / jg.generation).mkdir(parents=True)
     resume = IH.plan_repair_resume(parse_install_argv(["repair"]), facts, rf, tree=tree)   # not account-missing
     assert resume.intent.accounts == {VERIFIER_ACCOUNT: LINUX_UID}
+
+
+def test_repair_of_a_pre_record_install_refuses_a_same_name_levain_verify(tmp_path: Path, intent_path: Path) -> None:
+    """L3 r1 (codex HIGH 2): with no install record (a pre-row-33 install) a shared group is claimed by name and a
+    shared-range gid only when an install of that age had it (``ORIGINAL_SHARED_GROUPS``). A ``levain-verify`` there
+    at a shared-range gid is not one Levain made: ``account-exists``, never recorded or handed to the verifier. The
+    same group journaled at its gid (a run killed after the late journal made it) is Levain's and resumed."""
+    users, groups = _before()
+    facts, rf = _state(tmp_path, "linux", users, groups)
+    plain = _repair(replace(facts, install_shape=None), rf)        # the nine original groups still claimed by name
+    assert plain.intent.groups[VERIFIER_GROUP] == LINUX_GID
+    groups[VERIFIER_GROUP] = LINUX_GID
+    facts, rf = _state(tmp_path / "f", "linux", users, groups)
+    with pytest.raises(Refused) as e:
+        _repair(replace(facts, install_shape=None), rf)
+    assert e.value.name == "account-exists" and VERIFIER_GROUP in e.value.detail
+    j = Intent("repair", OP, {VERIFIER_ACCOUNT: LINUX_UID}, {VERIFIER_GROUP: LINUX_GID}, TXN_B)
+    facts, rf = _state(tmp_path / "j", "linux", users, groups, journal=j)
+    plan = _repair(replace(facts, install_shape=None), rf)
+    assert ("group/1", (VERIFIER_GROUP, LINUX_GID)) in plan.intent.managed
+    assert not [s for s in plan.steps if s.argv[:1] and s.argv[-1] == VERIFIER_GROUP]   # present: not made again
+
+
+@pytest.mark.parametrize("case", ["retired", "live-elsewhere", "uid-held"])
+def test_a_journaled_verifier_uid_is_held_to_the_retired_and_used_ids(tmp_path: Path, intent_path: Path,
+                                                                      case) -> None:
+    """L3 r1 (deepseek MED 1, complement LOW 2): the journal names the account at a uid. That uid retired (§1.1 g: never
+    reissued) is refused in ``_repair_creates``; the name live at another uid, or absent with the uid held by another
+    account, is refused before it by ``_journal_presence`` (both pinned here). Each is ``account-exists``."""
+    users, groups = _before()
+    groups[VERIFIER_GROUP] = LINUX_GID
+    retired: frozenset = frozenset()
+    if case == "retired":
+        retired = frozenset({LINUX_UID})
+    elif case == "live-elsewhere":
+        users[VERIFIER_ACCOUNT] = (LINUX_UID - 3, SLOT_MARKER)
+        groups[VERIFIER_ACCOUNT] = LINUX_UID - 3
+    else:
+        users["someone"] = (LINUX_UID, "")
+    j = Intent("repair", OP, {VERIFIER_ACCOUNT: LINUX_UID}, {VERIFIER_GROUP: LINUX_GID}, TXN_B)
+    with pytest.raises(Refused) as e:
+        _repair(*_state(tmp_path, "linux", users, groups, journal=j, retired=retired))
+    assert e.value.name == "account-exists" and VERIFIER_ACCOUNT in e.value.detail

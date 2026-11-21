@@ -915,7 +915,12 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
     host = facts.host
     check_account_ids(host, accounts)
     accounts = dict(accounts)
-    groups = {g: i for g, i in shared_groups.items() if g in KNOWN_SHARED_GROUPS}
+    # L3 r1 (codex HIGH 1): a live group is undo's by its name alone only for the names an install made before the
+    # install record had (``ORIGINAL_SHARED_GROUPS``); a later one is undo's when the record names it at its live gid
+    # (or the journal does, below). A same-name group with neither is not Levain's: left alone.
+    recorded = {i for k, i in (facts.install_shape.managed if facts.install_shape else ()) if k == "group/1"}
+    groups = {g: i for g, i in shared_groups.items()
+              if g in ORIGINAL_SHARED_GROUPS or (g in KNOWN_SHARED_GROUPS and (g, i) in recorded)}
     if facts.intent is not None:
         # §25: whatever an interrupted run made at its journaled ids goes with the rest, a Linux shared
         # group with no label included. A journaled name present at another id is not ours: left alone.
@@ -1480,7 +1485,8 @@ def _stop_steps(host: HostOS, services: Sequence[units.Service], noted: dict[str
 def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: Mapping[str, int]) -> dict[str, int]:
     """§3: the shared groups present that are Levain's: macOS by the live label; any host by ``group/1`` in the record
     at its recorded gid, or journaled at its gid; with NO record (the pre-row-33 hosts, Q3), by name AND gid in the
-    shared range. A same-name group anywhere else refuses ``account-exists``, never claimed."""
+    shared range, for a name those hosts had (``ORIGINAL_SHARED_GROUPS``) only. A same-name group anywhere else
+    refuses ``account-exists``, never claimed."""
     shape = facts.install_shape
     recorded = {i for k, i in (shape.managed if shape else ()) if k == "group/1"}
     ours: dict[str, int] = {}
@@ -1489,8 +1495,11 @@ def _recognised_groups(host: HostOS, facts: HostFacts, rf: RepairFacts, journale
         gid = rf.groups.get(g)
         if gid is None:
             continue
+        # L3 r1 (codex HIGH 2): the no-record rule is for the pre-row-33 installs, so it can only speak for a group
+        # those installs had (``ORIGINAL_SHARED_GROUPS``); a later one needs its record or its journal entry.
         if ((host == "darwin" and facts.levain_live.get(g) == gid) or (g, gid) in recorded
-                or journaled.get(g) == gid or (shape is None and gid in RANGES[host].shared)):
+                or journaled.get(g) == gid
+                or (shape is None and g in ORIGINAL_SHARED_GROUPS and gid in RANGES[host].shared)):
             ours[g] = gid
         else:
             foreign.append(f"{g} (at {gid})")
@@ -1535,6 +1544,9 @@ def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
 #: every KNOWN singleton outside ``ORIGINAL_SINGLETONS``; :func:`_repair_creates` keeps the ones the host provisions).
 #: An original singleton missing still refuses ``account-missing``.
 _REPAIR_MAKES = frozenset(KNOWN_SINGLETONS) - frozenset(ORIGINAL_SINGLETONS)
+#: The shared groups the code before levain#223 does not name: made by repair only after the flip and the entry
+#: scripts (:func:`plan_repair`), as the pre-#223 repair removes a recorded or journaled group it does not name.
+_REPAIR_MAKES_GROUPS = frozenset(KNOWN_SHARED_GROUPS) - frozenset(ORIGINAL_SHARED_GROUPS)
 
 
 def _repair_creates(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: Mapping[str, int]) -> dict[str, int]:
@@ -1546,6 +1558,11 @@ def _repair_creates(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: 
     already on the host, unlabelled or under another label: it is not ours to claim."""
     wanted = [n for n in provisioned_singletons(host) if n in _REPAIR_MAKES]
     made = {n: journaled[n] for n in wanted if n in journaled}
+    # L3 r1 (deepseek MED 1): a journaled uid is held to the retired set too (§1.1 g); a journaled name live at another
+    # id, or absent with its id in use by something else, is refused before this by _journal_presence.
+    reissued = [f"{n} (journaled uid {u} is retired)" for n, u in made.items() if u in facts.retired]
+    if reissued:
+        raise Refused("account-exists", f"{', '.join(reissued)}: a retired id is never reissued. Run undo, then setup")
     fresh = [n for n in wanted if n not in rf.accounts and n not in made]
     if fresh:
         taken = [n for n in fresh if n in facts.existing_names]
@@ -1683,10 +1700,12 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     installed, every step idempotent, the levain + h11 pair staged as ONE generation behind one flip of ``current``.
     Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
     ``txn`` minted; an unfinished one is resumed at its ``txn``, gids and write-ahead ``managed``); the stage (R2-R3);
-    the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6);
-    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10), then the singletons repair
-    makes (levain#223, :func:`_repair_creates`: journaled write-ahead, then each one's group, user and lock, all after
-    the flip and the entry scripts, so no older generation's code reads a journal naming one); sudoers (R11); units and
+    the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6)
+    but the ones the pre-#223 code does not name (:data:`_REPAIR_MAKES_GROUPS`); the missing memberships (R7); rows and
+    confinement (R8); THE FLIP (R9); entries (R10), then the shared groups and singletons repair makes (levain#223,
+    :data:`_REPAIR_MAKES_GROUPS`, :func:`_repair_creates`: journaled write-ahead, then each group, then each account's
+    own group, user and lock, all after the flip and the entry scripts, so no older generation's code reads a journal
+    naming one or meets one live); sudoers (R11); units and
     every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
 
     The removal path (R1b): ``remove = (record.managed ∪ journal.managed ∪ desired) − desired``, each record through
@@ -1770,6 +1789,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     accts = accounts_of(Allocation(host, (), (), dict(ids_now), {}))
     making = tuple(a for a in accts if a.name in creates)
     missing_groups = [Group(g, gid, ()) for g, gid in alloc.shared.items() if g not in present]
+    # L3 r1 (complement MED 1): a missing group the pre-#223 code does not name is made in R10 with the accounts below
+    making_groups = [g for g in missing_groups if g.name in _REPAIR_MAKES_GROUPS]
+    early_groups = [g for g in missing_groups if g.name not in _REPAIR_MAKES_GROUPS]
     missing_pairs = [(a, g) for a, g in membership_pairs(accts, operator) if a not in rf.members.get(g, frozenset())]
     changed = {a for a, _ in missing_pairs}
     stop = list(services) if gen_change else [s for s in services if s.user in changed]
@@ -1777,15 +1799,19 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     first = Intent("repair", operator, jaccts, jgroups, run_txn, journal.generation if journal else None,
                    tuple(journal.managed) if journal else ())
     staged = replace(first, generation=target)
-    # levain#223 (L1 HIGH-1 / L2 H1): an account this run makes that no journal names yet is journaled and made only
-    # in R10, after the flip and the entry scripts, so that no code older than this generation's ever reads a journal
-    # naming it or meets it live. R4b's write-ahead record therefore leaves out the records it adds; R10's names them.
+    # levain#223 (L1 HIGH-1 / L2 H1; L3 r1 complement MED 1 for the group): an account or shared group this run makes
+    # that no journal names yet is journaled and made only in R10, after the flip and the entry scripts, so that no
+    # code older than this generation's ever reads a journal naming it (the pre-#223 repair removes a journaled group
+    # it does not name) or meets it live. R4b's write-ahead record therefore leaves out the records they add; R10's
+    # names them.
     late = {n: u for n, u in creates.items() if n not in jaccts}
-    early = desired_managed(host, accounts={n: u for n, u in ids_now.items() if n not in late}, shared=alloc.shared,
+    late_groups = {g.name: g.gid for g in making_groups if g.name not in jgroups}
+    early_shared = {g: i for g, i in alloc.shared.items() if g not in late_groups}
+    early = desired_managed(host, accounts={n: u for n, u in ids_now.items() if n not in late}, shared=early_shared,
                             operator=operator, services=[s.name for s in services], slots=slots,
-                            apparmor=restricted) if late else desired
-    ahead = replace(staged, groups=dict(alloc.shared), managed=_shape_of(previous | journaled | early))
-    final = replace(ahead, accounts={**jaccts, **creates}, managed=_shape_of(reconcile))
+                            apparmor=restricted) if late or late_groups else desired
+    ahead = replace(staged, groups=early_shared, managed=_shape_of(previous | journaled | early))
+    final = replace(ahead, accounts={**jaccts, **creates}, groups=dict(alloc.shared), managed=_shape_of(reconcile))
     noted: dict[str, int] = {}
     carried = dict(shape.started_after) if shape is not None else {}
     keep = {target} | ({shape.generation} if shape is not None else set())
@@ -1822,7 +1848,7 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                                            "txn)", ahead)])                                       # R4b
     steps += F("R5", [*_stop_steps(host, stop, noted, clock, live=live),                          # R5
                       *removals("R5")])             # R1b: recorded units stopped by name, then sudoers (grants first)
-    steps += F("R6", shared_group_steps(host, missing_groups))                                    # R6
+    steps += F("R6", shared_group_steps(host, early_groups))                                      # R6
     steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
@@ -1834,13 +1860,13 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if rf.current != target:
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
                                               fault=(lambda pt: fault("R9", pt)) if fault else None)])
-    # levain#223: the singletons repair makes (``late`` above), journaled write-ahead and then made, after the flip
-    # (R9) and the entry scripts just before them. Nothing earlier in this plan may need them live: R7's memberships
-    # and R8's rows must name none of them.
-    made_late = [_journal_step(host, "journal the singletons this repair makes, write-ahead (same txn)", final)
-                 ] if late else []
+    # levain#223: the singletons and shared groups repair makes (``late``, ``late_groups`` above), journaled
+    # write-ahead and then made, after the flip (R9) and the entry scripts just before them. Nothing earlier in this
+    # plan may need them live: R7's memberships and R8's rows must name none of them.
+    made_late = [_journal_step(host, "journal the singletons and groups this repair makes, write-ahead (same txn)",
+                               final)] if late or late_groups else []
     steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
-                       *made_late, *account_steps(host, making),
+                       *made_late, *shared_group_steps(host, making_groups), *account_steps(host, making),
                        *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
                        # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot;
                        # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)
