@@ -27,6 +27,7 @@ pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason=
 
 _REAL_HOST_REFUSAL = getattr(hc, "host_refusal", None)
 _REAL_VENDOR_MISSING = getattr(hc, "vendor_missing", None)
+_REAL_HL_VENDOR_MISSING = getattr(hc.hl, "vendor_missing", None)
 
 
 @pytest.fixture
@@ -311,6 +312,7 @@ def test_a_vendor_not_on_the_hands_path_is_refused_by_name_before_any_lock(rig, 
     empty.mkdir()
     monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
     monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(hc.hl, "vendor_missing", _REAL_HL_VENDOR_MISSING)       # the login shares it; the shared rig stubs it
     rig.register("alpha", callback_port=49601)
     fake = FakeVendor(rig)
     with pytest.raises(hc.HandsChatRefused) as info:
@@ -433,14 +435,17 @@ def _codex_agents_link(ws):
 _CODEX_ONLY += [_codex_agents_skills, _codex_agents_link]
 
 
-@pytest.mark.parametrize("plant", _CLAUDE_ONLY)
-def test_a_claude_project_layer_does_not_refuse_a_codex_chat(rig, plant):
+# A vendor's project layer refuses only a chat of that vendor: the other vendor never reads it. The Codex layers
+# (L3 r2, codex MED) must not block a Claude launch; the Claude layers must not block a Codex one.
+@pytest.mark.parametrize("vendor, plant", [("codex", p) for p in _CLAUDE_ONLY] + [("claude", p) for p in _CODEX_ONLY],
+                         ids=lambda v: v.__name__ if callable(v) else v)
+def test_the_other_vendors_project_layer_does_not_refuse_a_chat(rig, vendor, plant):
     rig.register("alpha", callback_port=49601)
     ws = rig.h.workspace
     ws.mkdir(parents=True, exist_ok=True)
     plant(ws)
     fake = FakeVendor(rig)
-    assert launch(rig, "codex", spawn=fake) == 0 and len(fake.started) == 1
+    assert launch(rig, vendor, spawn=fake) == 0 and len(fake.started) == 1
     assert_released(rig)
 
 
@@ -466,18 +471,6 @@ def test_a_project_layer_in_the_hands_workspace_refuses_and_starts_no_vendor(rig
         launch(rig, vendor, spawn=fake)
     assert str(ws / named) in str(info.value) and str(info.value).endswith("no chat was started")
     assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
-    assert_released(rig)
-
-
-@pytest.mark.parametrize("plant", _CODEX_ONLY)
-def test_a_codex_project_layer_does_not_refuse_a_claude_chat(rig, plant):
-    # L3 r2 (codex MED): Claude does not read .codex/, so a repository's Codex config must not block a Claude launch
-    rig.register("alpha", callback_port=49601)
-    ws = rig.h.workspace
-    ws.mkdir(parents=True, exist_ok=True)
-    plant(ws)
-    fake = FakeVendor(rig)
-    assert launch(rig, "claude", spawn=fake) == 0 and len(fake.started) == 1
     assert_released(rig)
 
 

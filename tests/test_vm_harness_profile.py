@@ -39,8 +39,10 @@ def test_darwin_profile_values_are_the_pre_profile_literals():
 
 def test_darwin_argv_prefixes_are_the_old_class_constants():
     assert VmAdapters.OPS == ("sudo", "-n", "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_ops.py")
-    assert VmAdapters.DISPATCH == ("sudo", "-n", "-u", "_levain_dispatch", "/usr/bin/env", "PATH=/usr/bin:/bin",
+    assert VmAdapters.DISPATCH == ("sudo", "-n", "-u", "_levain_dispatch", "/usr/bin/env",
+                                   "PATH=/usr/bin:/bin",
                                    "HOME=/private/var/levain/dispatch",
+                                   "/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", "/private/var/levain/dispatch",
                                    "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_dispatch.py")
 
 

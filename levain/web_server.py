@@ -1082,8 +1082,10 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # Bounded concurrency for the expensive routes (the per-request store read + writes).
 # ThreadingHTTPServer spawns a thread per connection; without a gate a burst could
 # pile up unbounded store reads / file writes. Static assets (cached bytes) bypass the gate.
-# Past the cap the writes (the POSTs), notify and the room tick get a clean instant 503; every GET read (below) waits
-# instead. The cap of 8 holds for every request_gate route together.
+# Past the cap the writes (the POSTs), notify and the room tick get a clean instant 503, except the ceremony POSTs (the ``waits``
+# set in ``do_POST``), which wait a moment for a slot; a GET read (below) waits instead, except the Desk view's poll
+# (``desk_gate``) and the change stream (``stream_gate``), which refuse at once on gates of their own. The cap
+# (``_MAX_INFLIGHT``) holds for every request_gate route together.
 _MAX_INFLIGHT = 8
 # The cockpit reads also share a smaller pool, so a read burst can never hold every slot:
 # this many stay free for the instant-503 routes (a write must not 503 for a whole burst).
@@ -1104,8 +1106,10 @@ _DESK_READS_INFLIGHT = 2
 # gate of their own (``page_gate``), never ``request_gate``: on ``request_gate`` they raced the panel burst for the
 # slots reserved past it and lost at once with an instant 503. They wait up to ``_PAGE_READ_WAIT_SECONDS`` for a slot,
 # and at most ``_MAX_PAGE_WAITERS`` wait at once, so a flood still cannot pile up threads without bound. The rule: a GET
-# read waits on the page gate. Only a write (a POST), notify and the room's per-tick read keep ``request_gate``'s instant
-# 503: a write is never retried by the page, notify is a service's call and the tick re-asks in a moment.
+# read waits on the page gate, bar the Desk poll (``desk_gate``) and the change stream (``stream_gate``), which refuse at once
+# on gates of their own. Only a write (a POST, bar the ceremony POSTs in ``do_POST``'s ``waits`` set, which wait a moment),
+# notify and the room's per-tick read keep ``request_gate``'s instant 503: a write is never retried by the page, notify is a
+# service's call and the tick re-asks in a moment.
 _PAGE_READS_INFLIGHT = 4
 _PAGE_READ_WAIT_SECONDS = 5.0
 _MAX_PAGE_WAITERS = 32
@@ -6796,7 +6800,8 @@ def make_server(
     httpd.proxied_hosts = proxied_hosts
     # Bound the expensive routes (store read + writes). The panel and manifest reads wait briefly for a read-pool slot
     # (see _acquire_read_slot) and leave _RESERVED_SLOTS free of a burst; the page's other GET reads wait on page_gate
-    # (see _acquire_page_slot); the writes, notify and the room tick answer 503 at once past request_gate's cap.
+    # (see _acquire_page_slot); the writes (bar the ceremony POSTs in ``do_POST``'s ``waits`` set), notify and the room tick
+    # answer 503 at once past request_gate's cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     # premium voice (V1-4): its own small gate, never request_gate; the real providers' HTTP; per-provider last reads
     httpd.desk_gate = threading.BoundedSemaphore(_DESK_READS_INFLIGHT)
