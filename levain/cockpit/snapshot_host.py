@@ -26,6 +26,18 @@ Why discovery publishes a row: the panels a discoverer registers appear and vani
 discovery row's body is the sorted set of discovered ids, so the stream's change counter moves exactly when the panel
 set does. The entity row works the same way for the entity's value.
 
+Heavy panels and the warm child. A host given a ``DeriveChild`` derives the panels in its heavy set (``HEAVY_PANELS``, plus
+any panel whose measured derive time passed ``PROMOTE_MS`` three times running) in that one long-lived child process, so
+their CPU leaves this process's interpreter lock and a hung one can be killed. The loop, its writer, discovery and the entity
+stay here. ``derive_panel_result`` is the one body of "how a panel is derived", called by the in-process path, by the
+fallback when the child cannot answer, and by the child itself.
+
+The child only serves the panels its own factory built, and the host knows which (the child's ready frame lists them): a panel
+the child does not hold (a discovered one, a custom one, one added after the factory ran) is never routed to it and never
+promoted. If the child says it does not hold a panel anyway, that is no verdict on the panel: this derive runs here, the panel
+is dropped from the routed set, and the loop is never told to retire it on the child's word. A panel that just hung in the
+child is not run in this process while the child is in its backoff: it gets the timeout row again.
+
 ``ServerProbe`` is what the change stream watches in a served cockpit: the engine probe's counter folded with the
 serve's own watch token, since the panels the serve composes itself read stores no derive publishes.
 """
@@ -37,15 +49,17 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from levain.cockpit.authority import LabelKey
-from levain.cockpit.derive import DeriveLoop, DeriveResult, PanelPlan
+from levain.cockpit.derive import DERIVE_TIMEOUT_S, DeriveLoop, DeriveResult, PanelPlan
 from levain.cockpit.snapshots import DB_FILENAME, KNOWN_STATUSES, SnapshotReader, SnapshotWriter
 
 if TYPE_CHECKING:
+    from levain.cockpit.derive_child_client import ChildAnswer, DeriveChild
     from levain.cockpit.engine import Cockpit, _Snap
 
 # The body schema's major version. A body carrying any other value is refused by ``decode_snap``.
@@ -257,6 +271,17 @@ def decode_snap(status: str, body: dict[str, Any] | None, *, as_of: str | None, 
 
 # Panels whose derive is expensive enough to be told apart from the rest (ids only; a panel absent from a cockpit is skipped).
 HEAVY_PANELS = frozenset({"board", "topology", "sky"})
+# Routing to the warm derive child (only when the host was given one). A panel in HEAVY_PANELS is always routed. Any other
+# panel whose last PROMOTE_WINDOW derives each took more than PROMOTE_MS is routed from its next derive; a promoted panel
+# whose last PROMOTE_WINDOW derives each took less than DEMOTE_MS goes back in-process. The demotion bound is half the
+# promotion bound, so a panel near the line does not flap between hosts.
+PROMOTE_MS = 250
+PROMOTE_WINDOW = 3
+DEMOTE_MS = PROMOTE_MS / 2
+# What a derive says when the host is stopping (a routed derive cut short by the child's close) and what the child says of a
+# panel its factory did not build. Both are the text of a result the loop must not take as a verdict on the panel.
+STOPPING_TEXT = "the snapshot host is stopping"
+UNREGISTERED_TEXT = "the panel is no longer registered"
 # The host's two pseudo-plans. An id with this prefix is never a panel's: ``SnapshotHost._plans`` skips any registered id that has it.
 PSEUDO_PREFIX = "_"
 DISCOVER_ID = PSEUDO_PREFIX + "discover"
@@ -270,6 +295,48 @@ FIRST_DISCOVERY_BOUND_S = 3.0
 
 def _one_line(exc: BaseException) -> str:
     return " ".join(f"{type(exc).__name__}: {exc}".split())
+
+
+def derive_panel_result(cockpit: "Cockpit", pid: str, retire: Callable[[str], None]) -> DeriveResult:
+    """How one panel is derived: the one body every host runs (the in-process loop, a fallback from the child, and the
+    child itself). ``retire`` is called with ``pid`` when the panel is no longer registered; the caller's plan set is the
+    caller's own. An exception out of here is the caller's to handle."""
+    try:
+        snap = cockpit.derive_panel(pid)
+    except KeyError:
+        if cockpit.spec(pid) is not None:
+            raise
+        retire(pid)      # unregistered since the plan was made: nothing is published for it again
+        return DeriveResult("error", None, error=UNREGISTERED_TEXT)
+    status, body = encode_snap(snap)
+    # a failed derive's row carries its message on the row (the store keeps no body for it)
+    try:
+        until = datetime.fromisoformat(snap.valid_until).timestamp() if snap.valid_until else None
+    except (ValueError, OverflowError, OSError):    # no bound, never an error row
+        until = None
+    return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None, valid_until=until)
+
+
+class HostStopping(Exception):
+    """Raised by the publish gate for a result that exists only because the host is stopping: it is never stored."""
+
+
+class _PublishGate:
+    """The loop's view of the writer. A routed derive that the host's own stop cut short returns an error result saying the
+    host is stopping; the loop would store it over the panel's last good row. The gate refuses to store that one result (the
+    loop then treats it as a publish that failed: no row, nothing changed), and passes everything else to the writer."""
+
+    def __init__(self, writer: SnapshotWriter, stopping: Callable[[], bool]) -> None:
+        self._writer = writer
+        self._stopping = stopping
+
+    def publish(self, panel_id: str, **kw: Any) -> int:
+        if kw.get("error") == STOPPING_TEXT and self._stopping():
+            raise HostStopping(STOPPING_TEXT)
+        return self._writer.publish(panel_id, **kw)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._writer, name)
 
 
 class SnapshotHost:
@@ -291,9 +358,24 @@ class SnapshotHost:
         clock: Callable[[], float] = time.time,
         poll_s: "float | None" = None,
         heavy: Iterable[str] = HEAVY_PANELS,
+        derive_child: "DeriveChild | None" = None,
+        timer: Callable[[], float] = time.monotonic,
     ) -> None:
         self._cockpit = cockpit
         self._heavy = frozenset(heavy)
+        # The warm child that heavy panels derive in (None: every panel derives here, as a host without one always did).
+        # The host owns it from here: ``stop()`` closes it.
+        self._child = derive_child
+        self._timer = timer
+        self._route_lock = threading.Lock()
+        # The four below hold only ids the child can serve (or the named heavy ones, which are not measured) and are pruned when
+        # an id leaves the plan set, so what a discoverer comes and goes with cannot grow them.
+        self._windows: "dict[str, deque[float]]" = {}   # per panel: its last PROMOTE_WINDOW derive durations (ms)
+        self._promoted: set[str] = set()                # panels routed to the child by measurement, beyond ``heavy``
+        self._child_lacks: set[str] = set()             # panels the child said it does not hold: not routed again
+        self._hung: set[str] = set()                    # panels whose last child derive hung (the child was killed for it)
+        self._child_fallbacks = 0
+        self._child_closed = False
         self._lock = threading.Lock()
         self._started = False
         self._closed = False
@@ -305,7 +387,7 @@ class SnapshotHost:
         try:
             reader = self._reader = SnapshotReader(path)
             self._loop = DeriveLoop(
-                self._writer, {plan.id: plan for plan in self._plans()}, self._derive,
+                _PublishGate(self._writer, lambda: self._child_closed), {plan.id: plan for plan in self._plans()}, self._derive,
                 poll_s=self._poll_s, token_fn=token_fn, clock=clock, on_publish=self._tell_cockpit_published,
                 thread_name_prefix=DERIVE_THREAD_PREFIX.removesuffix("derive"),
             )
@@ -367,26 +449,182 @@ class SnapshotHost:
             return self._derive_discovery()
         if pid == ENTITY_ID:
             return self._derive_entity()
+        if self._child is None:
+            return self._derive_here(pid)
+        if self._routed(pid):
+            res, ms = self._derive_via_child(pid)
+            if ms is not None:
+                self._note_duration(pid, ms)
+            return res
+        started = self._timer()
         try:
-            snap = self._cockpit.derive_panel(pid)
-        except KeyError:
-            if self._cockpit.spec(pid) is not None:
-                raise
-            self._loop.retire(pid)      # unregistered since the plan was made: nothing is published for it again
-            return DeriveResult("error", None, error="the panel is no longer registered")
-        status, body = encode_snap(snap)
-        # a failed derive's row carries its message on the row (the store keeps no body for it)
+            return self._derive_here(pid)
+        finally:
+            self._note_duration(pid, (self._timer() - started) * 1000.0)
+
+    def _derive_here(self, pid: str) -> DeriveResult:
+        """The panel derived in this process, on the calling thread."""
+        return derive_panel_result(self._cockpit, pid, self._retire)
+
+    def _retire(self, pid: str) -> None:
+        """The loop's retire for a panel this cockpit no longer has, and the host forgets what it measured of it."""
+        self._forget(pid)
+        self._loop.retire(pid)
+
+    # ---- routing to the child
+
+    def _servable(self, pid: str) -> bool:
+        """Whether the child could derive ``pid`` as the serve's own panel: it is registered here, the serve does not compose
+        it, no discoverer registered it (the child runs no discovery), the child has not said it lacks it, and the child's
+        factory built it. A pseudo id never is."""
+        if pid.startswith(PSEUDO_PREFIX) or self._cockpit.spec(pid) is None or self._cockpit.serve_composed(pid):
+            return False
+        if pid in getattr(self._cockpit, "_discovered", ()):
+            return False
+        with self._route_lock:
+            if pid in self._child_lacks:
+                return False
+        return bool(self._child is not None and self._child.knows(pid))
+
+    def _routed(self, pid: str) -> bool:
+        """Whether ``pid`` derives in the child now: it is in the heavy set or was promoted, AND the child holds it. A heavy
+        panel the child does not know yet (the child is still starting) derives here this time and starts it."""
+        with self._route_lock:
+            candidate = pid in self._heavy or pid in self._promoted
+        if not candidate:
+            return False
+        if self._servable(pid):
+            return True
+        if self._child is not None and not pid.startswith(PSEUDO_PREFIX):
+            try:
+                self._child.warm()          # idempotent: a child that is up (or backing off) is left as it is
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    def routed_panels(self) -> "frozenset[str]":
+        """The ids routed to the child now by name or by measurement (a panel the child does not hold is listed only until the
+        next prune of the plan set; ``_routed`` is the word on whether one goes)."""
+        with self._route_lock:
+            return self._heavy | self._promoted
+
+    @property
+    def child_fallbacks(self) -> int:
+        """How many derives the child could not answer (it died, refused, sent a malformed answer, or lacked the panel) and that ran here instead."""
+        return self._child_fallbacks
+
+    def _timeout_for(self, pid: str) -> float:
+        # the deadline the loop publishes this panel's timeout row at (``_plans`` hands the same spec value to the plan)
+        spec = self._cockpit.spec(pid)
+        return DERIVE_TIMEOUT_S if spec is None or spec.timeout_s is None else spec.timeout_s
+
+    @staticmethod
+    def _timeout_result(timeout_s: float) -> DeriveResult:
+        return DeriveResult("timeout", None, error=f"derive still running after {timeout_s:.0f} s")
+
+    def _derive_via_child(self, pid: str) -> "tuple[DeriveResult, int | None]":
+        """``(result, ms)``: ``pid`` derived in the warm child, and how long the child says the derive took (None when this was
+        not a derive to learn from). A timeout is the loop's own timeout row (the child is killed by then), and so is a
+        derive of a panel that just hung while the child is in its backoff: it is not run here. A child that died, sent
+        something malformed, or does not hold the panel leaves this derive to run here, counted; a host that is stopping gets
+        a result the loop does not store. Nothing in the child's answer retires a panel."""
+        child = self._child
+        assert child is not None
+        if self._child_closed:
+            return DeriveResult("error", None, error=STOPPING_TEXT), None
+        timeout_s = self._timeout_for(pid)
+        ans: "ChildAnswer | None" = None
         try:
-            until = datetime.fromisoformat(snap.valid_until).timestamp() if snap.valid_until else None
-        except (ValueError, OverflowError, OSError):    # no bound, never an error row
-            until = None
-        return DeriveResult(status, body, error=body["error"] if status in ("error", "timeout") else None,
-                            valid_until=until)
+            ans = child.derive(pid, timeout_s)
+        except Exception:  # noqa: BLE001 - the client never raises; one that does is a child that could not answer
+            pass
+        if self._child_closed:
+            return DeriveResult("error", None, error=STOPPING_TEXT), None
+        if ans is not None:
+            failure = ans.failure
+            if failure is None:
+                self._mark(self._hung, pid, False)
+                if ans.status == "error" and ans.error == UNREGISTERED_TEXT:
+                    self._drop_from_child(pid)      # the child does not hold it: this derive runs here, and the panel stays here
+                else:
+                    res = self._result_of(ans)
+                    if res is not None:
+                        # every healthy answer is a measure (an ``empty`` one too: a promoted panel that now answers fast and
+                        # empty must be able to go back); an error or a timeout the derive ended in says nothing of the panel's weight
+                        return res, (None if res.status in ("error", "timeout") else ans.duration_ms)
+            elif failure == "timeout":
+                if ans.hung:
+                    self._mark(self._hung, pid, True)
+                return self._timeout_result(timeout_s), None
+            elif failure == "refused":
+                with self._route_lock:
+                    hung = pid in self._hung
+                if hung:
+                    return self._timeout_result(timeout_s), None
+            else:
+                self._mark(self._hung, pid, False)
+        with self._route_lock:
+            self._child_fallbacks += 1
+        return self._derive_here(pid), None
+
+    def _mark(self, group: "set[str]", pid: str, present: bool) -> None:
+        with self._route_lock:
+            (group.add if present else group.discard)(pid)
+
+    def _drop_from_child(self, pid: str) -> None:
+        with self._route_lock:
+            self._child_lacks.add(pid)
+            self._promoted.discard(pid)
+            self._windows.pop(pid, None)
+
+    @staticmethod
+    def _result_of(ans: "ChildAnswer") -> "DeriveResult | None":
+        """The result the in-process derive would have made, from the child's answer; None for an answer that cannot be one
+        (an unknown status, a status that carries a body with none, or a body of another schema version)."""
+        if ans.status in ("error", "timeout"):
+            return DeriveResult(ans.status, ans.body, error=ans.error or f"no result: the derive ended in {ans.status}",
+                                valid_until=ans.valid_until)
+        if ans.status not in KNOWN_STATUSES or not isinstance(ans.body, dict) or ans.body.get("v") != BODY_VERSION:
+            return None
+        return DeriveResult(ans.status, ans.body, error=None, valid_until=ans.valid_until)
+
+    def _note_duration(self, pid: str, ms: float) -> None:
+        """Remember one derive's duration and move ``pid`` into or out of the promoted set by the rule above. Only a panel the
+        child could serve is measured, and a named heavy panel is never (it is routed always)."""
+        if pid in self._heavy or not self._servable(pid):
+            return
+        with self._route_lock:
+            window = self._windows.setdefault(pid, deque(maxlen=PROMOTE_WINDOW))
+            window.append(ms)
+            if len(window) < PROMOTE_WINDOW:
+                return
+            if pid in self._promoted:
+                if all(d < DEMOTE_MS for d in window):
+                    self._promoted.discard(pid)
+            elif all(d > PROMOTE_MS for d in window):
+                self._promoted.add(pid)
+
+    def _forget(self, pid: str) -> None:
+        with self._route_lock:
+            self._windows.pop(pid, None)
+            self._promoted.discard(pid)
+            self._child_lacks.discard(pid)
+            self._hung.discard(pid)
+
+    def _prune(self, keep: "set[str]") -> None:
+        """Drop everything remembered about an id that is no longer in the plan set."""
+        with self._route_lock:
+            for pid in [p for p in self._windows if p not in keep]:
+                del self._windows[pid]
+            for group in (self._promoted, self._child_lacks, self._hung):
+                group.intersection_update(keep)
 
     def _derive_discovery(self) -> DeriveResult:
         try:
             ids = self._cockpit.run_discovery()
-            self._loop.set_plans(self._plans())     # the panel set may have changed: new plans in, retired ones out
+            plans = self._plans()
+            self._loop.set_plans(plans)             # the panel set may have changed: new plans in, retired ones out
+            self._prune({plan.id for plan in plans})
             return DeriveResult("ok", {"v": BODY_VERSION, "panels": sorted(ids)})
         finally:
             self._first_discovery.set()             # the first run's end, success or failure, is what opening waits for
@@ -439,6 +677,11 @@ class SnapshotHost:
             if self._started or self._closed:
                 raise RuntimeError("a SnapshotHost starts once and does not restart after stop(): make a new one")
             self._started = True
+        if self._child is not None:
+            try:
+                self._child.warm()                  # so the child's panel list is known by the time a heavy panel is due
+            except Exception:  # noqa: BLE001 - the child is an optimization: a host that cannot warm it derives here
+                pass
         self._loop.start()
 
     def run_once(self, now: "float | None" = None) -> list[str]:
@@ -448,6 +691,15 @@ class SnapshotHost:
     def stop(self, timeout: "float | None" = None) -> "list[threading.Thread]":
         """End the loop and release the store. Idempotent. Returns the threads still alive when ``timeout`` ran out; the
         store is then left open for them and a later ``stop()`` finishes the job."""
+        child = self._child
+        if child is not None:
+            # first: a derive waiting on the child is cut short and answers "the host is stopping" (which the publish gate
+            # refuses to store, so the panel's last good row stays), and the loop's threads can end
+            self._child_closed = True
+            try:
+                child.close()
+            except Exception:  # noqa: BLE001 - closing the child must never keep the loop from stopping
+                pass
         alive = self._loop.stop(timeout)
         if alive:
             return alive

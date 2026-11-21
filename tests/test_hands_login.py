@@ -27,6 +27,7 @@ from levain.firing.hands_login import HandsLoginError
 
 #: The module's own refusal, kept before any rig replaces it (None on a build without one).
 _REAL_LOGIN_REFUSAL = getattr(hands_login, "login_refusal", None)
+_REAL_VENDOR_MISSING = hands_login.vendor_missing
 _REAL_KEYCHAIN_NEEDED = hands_login.keychain_needed
 _REAL_SECURITY = hands_login.SECURITY
 
@@ -108,15 +109,15 @@ case "$1" in
   default-keychain)
     if [ "$4" = "-s" ]; then
       if [ -n "$SEC_SET_FAIL" ]; then echo "security: SecKeychainSetDomainDefault: $SEC_SET_FAIL" >&2; exit 1; fi
-      [ -n "$SEC_SET_NOOP" ] || printf '%s' "$5" > "$D"; exit 0
+      [ -n "$SEC_SET_NOOP" ] || [ ! -d "$HOME/Library/Preferences" ] || printf '%s' "$5" > "$D"; exit 0   # macOS: rc 0 and no write without ~/Library/Preferences (levain#139, l139_prefsdir_probe*.txt)
     fi
-    if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDefault: $SEC_READ_FAIL" >&2; exit 1; fi
+    if [ -n "$SEC_READ_FAIL" ]; then echo "security: SecKeychainCopyDomainDefault user: $SEC_READ_FAIL" >&2; exit 1; fi
     if [ -f "$D" ]; then printf '    "%s"\\n' "$(cat "$D")"; exit 0; fi
-    echo "security: SecKeychainCopyDefault: ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
+    echo "security: ${SEC_NONE_PREFIX:-SecKeychainCopyDomainDefault user:} ${SEC_NONE_TEXT:-A default keychain could not be found.}" >&2; exit 1;;
   list-keychains)
     if [ "$4" = "-s" ]; then
       if [ -n "$SEC_LIST_FAIL" ]; then echo "security: SecKeychainSetDomainSearchList: $SEC_LIST_FAIL" >&2; exit 1; fi
-      printf '%s\\n' "$5" > "$L"; exit 0
+      [ -d "$HOME/Library/Preferences" ] && printf '%s\\n' "$5" > "$L"; exit 0
     fi
     if [ -f "$L" ]; then while read -r k; do printf '    "%s"\\n' "$k"; done < "$L"; fi
     exit 0;;
@@ -163,6 +164,7 @@ class Rig:
         monkeypatch.setattr(hands_live, "sweep_hands_user", self.sweep)
         monkeypatch.setattr(hands_login, "load_hands_identity", lambda e, cfg=None: self.h)
         monkeypatch.setattr(hands_login, "login_refusal", lambda: None, raising=False)
+        monkeypatch.setattr(hands_login, "vendor_missing", lambda vendor: None)       # a test host has no vendor on HANDS_PATH
 
     def prefix(self, hands, vendor):
         if self.broken:
@@ -353,6 +355,52 @@ def test_linux_login_is_refused_up_front_and_launches_nothing(rig, capsys, monke
     assert "Linux: the hands account has no egress path for a vendor login yet" in out
     assert rig.calls() == [] and not (rig.hands_home / ".claude").exists()
     assert "claude" not in hands_login.read_outcomes(rig.entity)       # a refusal, not an outcome
+
+
+def test_a_vendor_that_is_not_on_the_hands_path_is_refused_before_anything_runs(rig, monkeypatch, tmp_path, capsys):
+    """levain#139 (leg 6): ``claude`` only in the operator's ~/.local/bin ended in a bare ``env: claude: No such file or
+    directory`` (exit 127) after the locks and the keychain: now a refusal naming the PATH, before any call."""
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+    monkeypatch.setattr(hands_login, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
+    with pytest.raises(hands_login.HandsRefused, match=r"claude is not on the hands account's PATH .*the login was not started"):
+        _login(rig, "claude")
+    assert rig.calls() == [] and not (rig.hands_home / "Library").exists()
+    assert hands_login.cmd_hands_login(rig.entity, "claude") == 1
+    assert "the login was not started" in capsys.readouterr().out
+
+
+def test_a_vendor_on_the_hands_path_is_not_refused(rig, monkeypatch):
+    monkeypatch.setattr(hands_login, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(confinement, "HANDS_PATH", f"{rig.bindir}:/usr/bin:/bin")    # the rig's bindir holds the claude shim
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+
+
+def test_the_hands_keychain_step_makes_library_preferences_without_which_security_persists_nothing(rig):
+    """levain#139 (leg 6): on a bare hands home ``default-keychain -s`` and ``list-keychains -s`` answered rc 0 and wrote
+    nothing; the rig's fake ``security`` now does the same, so this fails the product's own after-set check without the dir."""
+    prefs = rig.hands_home / "Library" / "Preferences"
+    assert not prefs.exists()
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+    assert prefs.is_dir() and _mode(prefs) == 0o700
+    assert (rig.hands_home / ".fake-security-default").read_text() == str(_kc(rig))
+
+
+def test_a_default_of_ours_with_library_preferences_since_removed_is_healed_not_refused_for_ever(rig):
+    """L3 r2 (complement LOW, deepseek MED): the directory is made on every path that can reach a set, not only when no
+    default exists: with ours the default, the directory gone and the search list lost, the set is a silent no-op
+    without it and every later login would refuse the same way."""
+    import shutil
+    _login(rig, "claude")
+    shutil.rmtree(rig.hands_home / "Library" / "Preferences")
+    (rig.hands_home / ".fake-security-list").unlink()                 # the search list drifted: a set is owed
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in
+    assert (rig.hands_home / "Library" / "Preferences").is_dir()
+    assert str(_kc(rig)) in (rig.hands_home / ".fake-security-list").read_text()
 
 
 def test_a_login_that_outlives_its_deadline_is_killed_and_swept(rig, monkeypatch):
@@ -794,6 +842,45 @@ def test_the_no_default_answer_is_matched_on_its_structure(rig, text):
     rig.knobs["SEC_NONE_TEXT"] = text
     res, st = _login(rig, "claude")
     assert res.returncode == 0 and st.logged_in and _kc(rig).is_file()
+
+
+@pytest.mark.parametrize("line", [
+    # the line measured on a fresh macOS 15.7.7 hands account (levain#139, l139_defkc.txt), verbatim
+    "security: SecKeychainCopyDomainDefault user: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault user: Unknown error: (-25307)",
+    "security: SecKeychainCopyDefault: A default keychain could not be found.",       # the form the code first assumed
+])
+def test_the_no_default_line_matches_the_measured_shape_and_its_older_form(line):
+    assert hands_login._NO_DEFAULT.fullmatch(line)
+
+
+@pytest.mark.parametrize("line", [
+    "security: SecKeychainCopyDomainDefault bogus: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault user : A default keychain could not be found.",
+    "security: SecKeychainSetDomainDefault user: A default keychain could not be found.",
+    # a domain this module never queries (-d user): another domain's "no default" is not an absent user default
+    "security: SecKeychainCopyDomainDefault system: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault common: A default keychain could not be found.",
+    "security: SecKeychainCopyDomainDefault dynamic: A default keychain could not be found.",
+    # a domain word belongs to the Domain call only
+    "security: SecKeychainCopyDefault user: A default keychain could not be found.",
+])
+def test_only_the_queried_domain_on_the_domain_call_is_no_default(line):
+    assert not hands_login._NO_DEFAULT.fullmatch(line)
+
+
+@pytest.mark.parametrize("prefix", ["SecKeychainCopyDefault:", "SecKeychainCopyDomainDefault user:"])
+def test_both_printed_forms_of_no_default_make_the_keychain_through_the_rig(rig, prefix):
+    rig.knobs["SEC_NONE_PREFIX"] = prefix
+    res, st = _login(rig, "claude")
+    assert res.returncode == 0 and st.logged_in and _kc(rig).is_file()
+
+
+def test_a_system_domain_no_default_line_is_an_error_not_an_absent_default(rig):
+    rig.knobs["SEC_NONE_PREFIX"] = "SecKeychainCopyDomainDefault system:"
+    with pytest.raises(hands_login.HandsRefused, match="could not read .*default keychain"):
+        _login(rig, "claude")
+    assert not _kc(rig).exists() and rig.calls() == []
 
 
 @pytest.mark.parametrize("text", ["The specified item could not be found in the keychain.",

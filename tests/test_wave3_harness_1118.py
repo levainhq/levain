@@ -69,6 +69,11 @@ def _home_before_interpreter(a):
     assert home in a, a
     i = a.index(home)
     assert i > 4, a
+    # the cwd is the dispatch dir too: sudo keeps the caller's cwd and the dispatch account cannot read admin's 0700 home
+    # (the recorded failure: os.getcwd() raised PermissionError on a fresh image, levain#133 leg 6)
+    j = a.index("/bin/sh")
+    assert tuple(a[j:j + 5]) == ("/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", STOP_DIR), a
+    assert i < j, a                                                        # the env assignments come before the cd words
     return i
 
 
@@ -240,3 +245,6 @@ def test_profile_dispatch_argv_sets_home_to_the_dispatch_dir_before_the_interpre
     assert a[:5] == ("sudo", "-n", "-u", profile.dispatch_user, "/usr/bin/env")
     assert f"HOME={profile.store}/dispatch" in a
     assert a.index(f"HOME={profile.store}/dispatch") < a.index(profile.python)
+    j = a.index("/bin/sh")                                      # the cwd is readable by the dispatch account (levain#133 leg 6)
+    assert a[j:j + 5] == ("/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", f"{profile.store}/dispatch")
+    assert a.index(f"HOME={profile.store}/dispatch") < j < a.index(profile.python)

@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason=
 _FLAG_SETTINGS_JSON = json.dumps(hml.HANDS_CLAUDE_FLAG_SETTINGS, sort_keys=True, separators=(",", ":"))
 _REAL_HOST_REFUSAL = getattr(hc, "host_refusal", None)
 _REAL_VENDOR_MISSING = getattr(hc, "vendor_missing", None)
+_REAL_HL_VENDOR_MISSING = getattr(hc.hl, "vendor_missing", None)
 
 
 @pytest.fixture
@@ -313,6 +314,7 @@ def test_a_vendor_not_on_the_hands_path_is_refused_by_name_before_any_lock(rig, 
     empty.mkdir()
     monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
     monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(hc.hl, "vendor_missing", _REAL_HL_VENDOR_MISSING)       # the login shares it; the shared rig stubs it
     asked = []
     monkeypatch.setattr(hands_login, "vendor_probe", lambda hands, v, **kw: asked.append(v) or False)
     rig.register("alpha", callback_port=49601)
