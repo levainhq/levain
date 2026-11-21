@@ -512,9 +512,9 @@ class TestLifecycle:
             _until(lambda: host.reader.meta().get("heartbeat_at"))
             first = host.reader.meta()["heartbeat_at"]
             _until(lambda: host.reader.meta().get("heartbeat_at") != first)
-            # A 50 ms host is judged live for 3 beats, 150 ms: a loaded box can leave one beat older than that for an
-            # instant (the stamp is the poll's start, and the test thread wakes up to 20 ms after the beat landed). So the
-            # test waits, bounded, for the next beat to read live rather than asserting at one instant.
+            # The live window is a few poll periods (see ``Cockpit._worker_health``), so a loaded box can leave the last
+            # beat older than the window for an instant. The test waits, bounded by ``_until``, for a beat that reads live
+            # instead of asserting at one instant; a host that never reads live still fails it.
             _until(lambda: ck.worker_health()["worker"] == "live")
         finally:
             host.stop(timeout=10)
