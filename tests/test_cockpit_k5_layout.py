@@ -41,6 +41,18 @@ def _seed(value: str) -> list:
     return [{"eval": f"localStorage.setItem('{KEY}', {value}); {RELOAD}"}, {"until": FRESH}, SETTLE]
 
 
+# a reload whose fresh page never drew: CI (levain#236, shard 0) kept a page whose scripts and styles had not loaded ("Cannot read properties of
+# undefined (reading 'fromManifest')", the board never drawn a .pbody) and waited out the whole 40 s on it. A load that is fine draws in ~2 s, so
+# a page still not fresh after 8 s (16 s at the CI scale) is reloaded ONCE and waited on for the usual bound; a fresh page is left alone.
+RETRY_IF_STALE = "(() => { if (" + FRESH + ") return 'fresh'; window.__old = 1; location.reload(); return 'reloaded'; })()"
+
+
+def _seed_once_more(value: str) -> list:
+    """`_seed`, with the one bounded reload for a fresh page that never drew: five steps, the first three as `_seed`'s read."""
+    return [{"eval": f"localStorage.setItem('{KEY}', {value}); {RELOAD}"}, {"until": FRESH, "ms": 8000, "may_timeout": True},
+            {"eval": RETRY_IF_STALE}, {"until": FRESH}, SETTLE]
+
+
 @needs_browser
 def test_the_default_board_is_the_kernel_order_with_controls_on_cards_and_none_on_the_f7_line(tmp_path: Path) -> None:
     out = _run(tmp_path, [
@@ -62,11 +74,12 @@ def test_garbage_in_storage_is_ignored_and_the_board_draws_the_kernel_order(tmp_
             "JSON.stringify({v: 1, zones: {operate: {order: 'now'}}, collapsed: 5})",
             "JSON.stringify({v: 1, zones: {operate: {order: [1, null, {}]}}, collapsed: [3]})"]
     steps: list = []
+    per = len(_seed_once_more("0")) + 2                 # one junk's values: the seed's, then the stacks, then the collapsed/controls read
     for j in junk:
-        steps += _seed(j) + [{"eval": STACKS}, {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('.ck-lay-btn').length > 0]"}]
+        steps += _seed_once_more(j) + [{"eval": STACKS}, {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('.ck-lay-btn').length > 0]"}]
     out = _run(tmp_path, steps)
     for i in range(len(junk)):
-        stacks, (collapsed, has_controls) = out[i * 5 + 3], out[i * 5 + 4]
+        stacks, (collapsed, has_controls) = out[i * per + per - 2], out[i * per + per - 1]
         assert stacks["left"] == ["tray"] and stacks["right"] == [], (junk[i], stacks)
         assert collapsed is False and has_controls, (junk[i], collapsed, has_controls)
 

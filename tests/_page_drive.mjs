@@ -485,10 +485,17 @@ for (const s of steps) {
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) await initFails("init: the reload was refused: " + JSON.stringify(reloaded.error));
-    // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document
-    for (const end = Date.now() + scaled(15000);;) {
-      if (await evaluate("document.readyState === 'complete' && window.__driveOldDocument === undefined") === true) break;
+    // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document.
+    // Every probe is raced against the time left (never the 60 s evaluate default: a reload that never committed answered nothing, and the
+    // wait then ran to ~66 s, not to this bound), and a reload that has committed nothing by the middle of the bound is sent ONCE more: the
+    // measured hang is a reload whose navigation never commits (NAV TRAIL ends at frameStartedLoading, no frameNavigated, every evaluate
+    // unanswered), which the worker wait above does not always prevent. A reload that was only slow costs one more load, inside the same bound.
+    let resent = false;
+    for (const end = Date.now() + scaled(15000), resendAt = Date.now() + scaled(7000);;) {
+      const o = await evaluateOutcome("document.readyState === 'complete' && window.__driveOldDocument === undefined", Math.min(Math.max(end - Date.now(), 250), 3000));
+      if (!("error" in o) && o.value === true) break;
       if (Date.now() >= end) await initFails("init: the reload did not complete");
+      if (!resent && Date.now() >= resendAt) { resent = true; await sendWithin(3000, "Page.reload", {}); }
       await sleep(100);
     }
   } else if (s.emulate !== undefined) {
