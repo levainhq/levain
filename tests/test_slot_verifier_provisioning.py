@@ -411,7 +411,9 @@ def _pre_223_objections(host: str, journal: Intent | None, users: dict) -> list[
     L2's run of that code printed for ``_levain_verify``); and (L3 r1, complement MED 1) its repair's R1b over that
     journal: ``leaving`` takes every journaled ``group/1`` whose name is not in its ``SHARED_GROUPS`` and ``remove =
     reconcile - desired`` deletes it (its ``desired`` names only those groups), so any such record is one the old
-    resume removes. Empty: the old code reads this state and removes nothing of it."""
+    resume removes. (L3 r2, codex MED) A SETUP journal is also held to that code's ``plan_setup`` check, ``if not
+    set(SINGLETONS) <= set(journal.accounts) or set(journal.groups) != set(SHARED_GROUPS)`` (``intent-malformed``).
+    Empty: the old code reads this state and removes nothing of it."""
     def known(name: str) -> bool:
         m = SLOT_NAME_RE.fullmatch(name)
         return name in PRE_223_SINGLETONS or (m is not None and int(m.group(2)) < INDEX_SPACE)
@@ -432,6 +434,9 @@ def _pre_223_objections(host: str, journal: Intent | None, users: dict) -> list[
                 out.append(f"bad-record: {kind} {ident!r}")
             if kind == "group/1" and ident[0] not in PRE_223_SHARED_GROUPS:
                 out.append(f"R1b-removes: {kind} {ident!r}")
+        if journal.verb == "setup" and (not set(PRE_223_SINGLETONS) <= set(journal.accounts)
+                                        or set(journal.groups) != set(PRE_223_SHARED_GROUPS)):
+            out.append(f"intent-malformed: setup journal {sorted(journal.accounts)} {sorted(journal.groups)}")
     out += [f"not-levain-name: {n}" for n, (u, label) in users.items() if label == SLOT_MARKER and not known(n)]
     return out
 
@@ -784,3 +789,104 @@ def test_a_journaled_verifier_uid_is_held_to_the_retired_and_used_ids(tmp_path: 
     with pytest.raises(Refused) as e:
         _repair(*_state(tmp_path, "linux", users, groups, journal=j, retired=retired))
     assert e.value.name == "account-exists" and VERIFIER_ACCOUNT in e.value.detail
+
+
+# --- setup killed part way (L3 r2, codex MED) ----------------------------------------------------------------------
+
+
+SETUP_LATE = "journal the singletons and groups this setup makes"
+
+
+def _setup_on(users: dict, groups: dict, journal: Intent | None):
+    """``setup --slots 3 --verifier-slots 2`` planned by THIS code over a host holding ``users`` (name -> (uid, label))
+    and ``groups`` (name -> gid), with ``journal`` on disk, as the gather reads them."""
+    names = {**{n: u for n, (u, _) in users.items()}, **groups}
+    host_ids = {n: names[n] for n in journal.names if n in names} if journal is not None else {}
+    group_only = ({n: groups[n] for n in journal.accounts if n not in users and n in groups}
+                  if journal is not None else {})
+    user_ids = {**{n: u for n, (u, _) in users.items()}, OP: OP_UID}
+    facts = _facts("linux", existing_names=frozenset(names), used_ids=frozenset(names.values()), intent=journal,
+                   host_ids=host_ids, account_group_ids=group_only, user_ids=user_ids,
+                   levain_live={n: u for n, (u, label) in users.items() if label == SLOT_MARKER})
+    return IH.plan_setup(_setup(3, 2), facts, read_sysctl=lambda p: "1", program_exists=lambda p: True)
+
+
+def _old_setup_host():
+    """A host a setup of the code BEFORE levain#223 left part way, its helper installed: its journal (five
+    singletons, nine groups) and everything that journal names made, each account with its own group."""
+    j = _old_setup_journal("linux")
+    users = {n: (u, SLOT_MARKER) for n, u in j.accounts.items()}
+    groups = {**j.groups, **{n: u for n, u in j.accounts.items()}}
+    return j, users, groups
+
+
+def _setup_kill_at_every_point(intent_path: Path, start):
+    """Kill a setup by THIS code after k of its :func:`_kill_steps` (k = 0 .. all), from ``start`` = (journal on disk
+    or None, users, groups). Yields per k the model as the kill left it, the journal on disk and the steps run; then
+    re-plans from that under THIS code, replays the new plan's kill steps and yields the finished model."""
+    j0, base_users, base_groups = start
+    first = _setup_on(base_users, base_groups, j0)
+    whys = [s.why.split(" (")[0] for s in _kill_steps(first)]
+    assert whys.count(next(w for w in whys if w.startswith(FLIP))) == 1 and sum(w.startswith(ENTRY) for w in whys) == 1
+    for k in range(len(whys) + 1):
+        if intent_path.exists():
+            intent_path.unlink()
+        m = _Model(base_users, base_groups)
+        plan = _setup_on(m.users, m.groups, j0)
+        assert [s.why.split(" (")[0] for s in _kill_steps(plan)] == whys
+        for s in _kill_steps(plan)[:k]:
+            m.apply(s)
+        journaled = _read_journal(intent_path) if k else j0
+        yield "killed", k, m, journaled, whys[:k]
+        again = _setup_on(m.users, m.groups, journaled)
+        for s in _kill_steps(again):
+            m.apply(s)
+        yield "finished", k, m, _read_journal(intent_path), whys[:k]
+
+
+@pytest.mark.parametrize("start", ["old-setup-journal", "fresh-after-undo"])
+def test_a_setup_killed_before_the_flip_leaves_what_the_pre_223_code_reads(intent_path: Path, start) -> None:
+    """L3 r2 (codex MED): until ``tree_steps``' flip and entry scripts, the installed helper may be the code BEFORE
+    levain#223: the one whose setup wrote the journal being resumed, or (fresh) the one an undo left, since undo keeps
+    the entry scripts (``plan_undo``: ``entry/1`` records are not undo's). At every kill point before both, the journal
+    on disk and the live accounts pass that code's frozen rules (:func:`_pre_223_objections`, its setup check included)
+    and nothing it does not know is live. A kill after them resumes under this code and ends with the verifier made at
+    its uid, its own group, the shared group, locked."""
+    begin = _old_setup_host() if start == "old-setup-journal" else (None, {}, {})
+    checked = finished = 0
+    for what, k, m, journaled, ran in _setup_kill_at_every_point(intent_path, begin):
+        if what == "finished":
+            finished += 1
+            assert m.users[VERIFIER_ACCOUNT] == (LINUX_UID, SLOT_MARKER), (k, ran)
+            assert m.groups[VERIFIER_ACCOUNT] == LINUX_UID and m.groups[VERIFIER_GROUP] == LINUX_GID, (k, ran)
+            assert VERIFIER_ACCOUNT in m.locked, (k, ran)
+            assert journaled is not None and journaled.accounts[VERIFIER_ACCOUNT] == LINUX_UID, (k, ran)
+            continue
+        if not (m.flipped and m.entries):
+            assert _pre_223_objections("linux", journaled, m.users) == [], (k, ran)
+            assert VERIFIER_ACCOUNT not in m.users and not {VERIFIER_ACCOUNT, VERIFIER_GROUP} & set(m.groups), (k, ran)
+            checked += 1
+        late_ran = any(w.startswith(SETUP_LATE) for w in ran)
+        assert (journaled is not None and VERIFIER_ACCOUNT in journaled.accounts) == late_ran, (k, ran)
+    assert checked >= 3, checked            # none, the first journal, the flip (not the entry script)
+    assert finished >= 8, finished          # ... the entry, the late journal, levain-verify, own group, user, lock
+
+
+def test_setup_journals_the_verifier_in_the_late_write_ahead_record_only(intent_path: Path) -> None:
+    """Run each journal step of a fresh setup and read the file back: the first names neither the account nor the
+    shared group; the late one, after the flip and the entry scripts, is the plan's whole intent (same txn)."""
+    plan = _setup_on({}, {}, None)
+    whys = [s.why for s in plan.steps]
+    first = next(s for s in plan.steps if s.why.startswith("journal what this setup will create"))
+    late = next(i for i, w in enumerate(whys) if w.startswith(SETUP_LATE))
+    entry = next(i for i, w in enumerate(whys) if w.startswith(ENTRY))
+    flip = next(i for i, w in enumerate(whys) if w.startswith(FLIP))
+    assert flip < entry < late
+    assert not [s.why for s in plan.steps[:late] if VERIFIER_ACCOUNT in _names(s) or VERIFIER_GROUP in s.argv]
+    assert first.call()[0]
+    a = read_intent("linux", path=intent_path)
+    assert VERIFIER_ACCOUNT not in a.accounts and set(a.groups) == set(ORIGINAL_SHARED_GROUPS)
+    assert plan.steps[late].call()[0]
+    b = read_intent("linux", path=intent_path)
+    assert b == plan.intent and b.txn == a.txn
+    assert set(b.accounts) - set(a.accounts) == {VERIFIER_ACCOUNT} and set(b.groups) - set(a.groups) == {VERIFIER_GROUP}

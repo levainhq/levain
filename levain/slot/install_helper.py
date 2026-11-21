@@ -685,6 +685,18 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         boot_dirs = []
     txn = journal.txn if journal is not None and journal.txn else gen_mod.new_txn()
     intent = Intent("setup", cmd.operator, dict(alloc.ids), dict(alloc.shared), txn)
+    # levain#223 (L3 r2, codex MED): until root_tree.tree_steps has run, the installed helper may be older code (the
+    # one whose setup wrote the journal resumed here, or, on a fresh setup, the one an undo left: plan_undo keeps the
+    # ``entry/1`` records). A name that code does not know (``_REPAIR_MAKES``, ``_REPAIR_MAKES_GROUPS``) and the journal
+    # does not name yet is journaled and made only after tree_steps, as plan_repair's R10 does; the first journal
+    # leaves it out.
+    late = {n for n in alloc.ids if n in _REPAIR_MAKES and (journal is None or n not in journal.accounts)}
+    late_groups = {g for g in alloc.shared
+                   if g in _REPAIR_MAKES_GROUPS and (journal is None or g not in journal.groups)}
+    first = replace(intent, accounts={n: i for n, i in intent.accounts.items() if n not in late},
+                    groups={g: i for g, i in intent.groups.items() if g not in late_groups})
+    pairs = membership_pairs(accounts, cmd.operator)
+    late_pairs = [(a, g) for a, g in pairs if a in late or g in late_groups]
     h11_dir = root_tree.h11_source() if h11 is None else h11
     root_tree.check_sources(package, h11_dir)
     target = gen_mod.generation_id(package, h11_dir)
@@ -717,12 +729,12 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
     vendor_failed: list[str] = []
     steps: list[Step] = [
         # FIRST (§25): the exact allocation, before anything is made, so an interrupted run re-plans it.
-        intent_write_step(host, intent),
+        intent_write_step(host, first),
         *row_steps(host, early),
-        *shared_group_steps(host, groups),
-        *account_steps(host, fresh),
-        *revive_steps(host, revived),
-        *membership_steps(host, membership_pairs(accounts, cmd.operator)),
+        *shared_group_steps(host, [g for g in groups if g.name not in late_groups]),
+        *account_steps(host, [a for a in fresh if a.name not in late]),
+        *revive_steps(host, [a for a in revived if a.name not in late]),
+        *membership_steps(host, [p for p in pairs if p not in late_pairs]),
         *row_steps(host, rows),
         *boot_dirs,
         *reserve_steps(host),
@@ -733,6 +745,14 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         *pool_config_steps(host, cmd.slots, cmd.verifier_slots),
         *restart,
         *root_tree.tree_steps(host, package, h11_dir=h11_dir, generation=target, current=current),
+        # levain#223 (``late`` above): the whole journal write-ahead, then the groups, accounts, revives and memberships
+        # naming what it adds.
+        *([_journal_step(host, "journal the singletons and groups this setup makes, write-ahead (same txn)", intent)]
+          if late or late_groups else []),
+        *shared_group_steps(host, [g for g in groups if g.name in late_groups]),
+        *account_steps(host, [a for a in fresh if a.name in late]),
+        *revive_steps(host, [a for a in revived if a.name in late]),
+        *membership_steps(host, late_pairs),
         # The vendor CLIs a session execs, COPIED into the prefix tree_steps made (head ruling 1026+8). A failed copy
         # does not stop setup here: the report step after the units prints it as skipped (ruling V23).
         *root_tree.vendor_steps(host, cmd.operator, failed=vendor_failed),

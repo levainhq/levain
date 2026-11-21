@@ -89,8 +89,10 @@ def test_tmpfiles_conf_matches_run_dirs():
     i = plan.steps.index(w[0])
     assert plan.steps[i + 1].argv[1:] == ("--create", "levain.conf")
     assert plan.steps[i + 1].argv[0].endswith("systemd-tmpfiles")
-    # after every account it names exists
-    last_acct = max(j for j, s in enumerate(plan.steps) if s.argv and s.argv[0].endswith("useradd"))
+    # after every account it names exists (levain#223: an account it does not name, the verifier's, may come later)
+    named = {r.owner for r in rows} | {r.group for r in rows}
+    last_acct = max(j for j, s in enumerate(plan.steps) if s.argv and s.argv[0].endswith("useradd")
+                    and s.argv[-1] in named)
     assert last_acct < i
     # replenish re-writes it for every slot in service plus the new ones; undo removes it
     ids = dict(plan.allocation.ids)
@@ -158,9 +160,16 @@ def test_partial_setup_reruns(host):
     assert first.intent.txn != again.intent.txn
     assert [txn.sub("txn T", s.why) for s in again.steps] == [txn.sub("txn T", s.why) for s in first.steps]
     assert sum(1 for s in first.steps if txn.search(s.why)) == 2          # the journal write and the install record
-    # re-planned FROM ITS JOURNAL (what a real re-run reads) the steps are identical, txn included
-    resumed = _plan(host, 3, 2, existing_names=names, used_ids=frozenset(live.values()), levain_live=live,
-                    intent=first.intent, host_ids=live)
+    # re-planned FROM ITS JOURNAL (what a real re-run reads) the steps are identical, txn included. levain#223 (L3 r2):
+    # the journal the first step writes leaves out the verifier's pair (a later step journals it)
+    from levain.slot.ids import VERIFIER_ACCOUNT, VERIFIER_GROUP
+    from dataclasses import replace
+    on_disk = replace(first.intent, accounts={n: i for n, i in first.intent.accounts.items() if n != VERIFIER_ACCOUNT},
+                      groups={g: i for g, i in first.intent.groups.items() if g != VERIFIER_GROUP})
+    # and nothing it does not name is made before that journal: the host a kill there leaves
+    made = {n: i for n, i in live.items() if n not in (VERIFIER_ACCOUNT, VERIFIER_GROUP)}
+    resumed = _plan(host, 3, 2, existing_names=frozenset(made), used_ids=frozenset(made.values()), levain_live=made,
+                    intent=on_disk, host_ids=made)
     assert resumed.intent == first.intent
     assert [s.why for s in resumed.steps] == [s.why for s in first.steps]
     for prev, s in zip((None, *again.steps), again.steps):

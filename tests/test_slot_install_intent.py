@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -188,7 +189,16 @@ def test_intent_written_first_removed_last(host, tmp_path, monkeypatch):
     first, last = plan.steps[0], plan.steps[-1]
     assert first.call and not first.argv and not first.write and "journal" in first.why
     assert first.call() == (True, "")
-    assert read_intent(host, path=tmp_path / "install-intent") == plan.intent
+    # levain#223 (L3 r2): the first journal is the whole allocation but the verifier's pair (names older code does not
+    # know); on Linux one later step journals the whole allocation, write-ahead
+    from levain.slot.ids import VERIFIER_ACCOUNT, VERIFIER_GROUP
+    assert read_intent(host, path=tmp_path / "install-intent") == replace(
+        plan.intent, accounts={n: i for n, i in plan.intent.accounts.items() if n != VERIFIER_ACCOUNT},
+        groups={g: i for g, i in plan.intent.groups.items() if g != VERIFIER_GROUP})
+    late = [s for s in plan.steps if s.why.startswith("journal the singletons and groups this setup makes")]
+    assert len(late) == (host == "linux")
+    for s in late:
+        assert s.call() == (True, "") and read_intent(host, path=tmp_path / "install-intent") == plan.intent
     assert last.argv[1:] == ("-f", str(tmp_path / "install-intent"))
     assert plan.steps[-2].write and plan.steps[-2].write[0] == operator_record_path(host)
     assert sum(1 for s in plan.steps if s.why.startswith("journal what")) == 1
