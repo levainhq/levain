@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fnmatch
+import functools
+import inspect
 import json
 import os
 import shutil
@@ -525,10 +528,72 @@ def _no_real_process_table(monkeypatch):
 _INVARIANT_LIST = Path(__file__).resolve().parent / "ci" / "invariant_tests.txt"
 
 
+@functools.lru_cache(maxsize=1)
 def invariant_node_ids():
-    """The whole-tree invariant tests, one `file::Class::function` per line (see the header of that file)."""
+    """The whole-tree invariant tests, one `file::Class::function` per line (see the header of that file). The file
+    is static for a pytest process, so it is read once."""
     lines = _INVARIANT_LIST.read_text(encoding="utf-8").splitlines()
-    return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+    return frozenset(ln.strip() for ln in lines if ln.strip() and not ln.startswith("#"))
+
+
+@functools.lru_cache(maxsize=1)
+def invariant_modules():
+    """The repo-relative test files that hold a listed invariant test."""
+    return frozenset(i.split("::", 1)[0] for i in invariant_node_ids())
+
+
+def _is_a_test_module(path, config):
+    """pytest's own test-file patterns (`python_files`), so a `*_test.py` file is recognised as one too."""
+    return path.suffix == ".py" and any(fnmatch.fnmatch(path.name, pat) for pat in config.getini("python_files"))
+
+
+def _bare_invariant_tier(config):
+    """The run that selects the invariant tier alone, with no node id named on the command line (a person who names
+    `file::test` asked for that test, and gets it, deselected or not, as before)."""
+    if (config.getoption("markexpr", default="") or "").strip() != "invariant":
+        return False
+    return not any("::" in str(a) for a in config.args)
+
+
+def skipped_by_the_invariant_tier(path, config):
+    """True for a test module the bare `-m invariant` run need not import. Only the listed ids carry the marker, so
+    a module holding none of them contributes nothing to that tier, and importing every module of the tree to find
+    that out is what made the tier's collection outgrow the conductor's cap (levain-signing 3, 11-21: the collect
+    of all test modules, measured at 768 of them in 560 s under load). Any other marker expression, a node id
+    named on the command line, and a path named explicitly (pytest never offers those to this hook) collect as
+    before."""
+    if not _bare_invariant_tier(config):
+        return False
+    path = Path(path)
+    if not _is_a_test_module(path, config):
+        return False
+    try:
+        rel = path.resolve().relative_to(Path(__file__).resolve().parent.parent).as_posix()
+    except ValueError:
+        return False
+    return rel not in invariant_modules()
+
+
+def pytest_ignore_collect(collection_path, config):
+    if skipped_by_the_invariant_tier(collection_path, config):
+        return True
+    return None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pycollect_makeitem(collector, name, obj):
+    """In the bare invariant tier a test function that is not listed is never built: building each one computes its
+    fixture closure, which is where that tier's collection spent its time (a listed module holds many unlisted tests).
+    Classes and everything else collect as before. A listed id names its function bare: the marker below compares
+    the base id, so a parametrized listed test is kept whole, and an id written with `[` is refused by
+    tests/test_ci_invariant_marker.py."""
+    if not _bare_invariant_tier(collector.config):
+        return None
+    if not (inspect.isfunction(obj) and name.startswith("test")):
+        return None
+    if collector.nodeid.split("::", 1)[0] not in invariant_modules():
+        return None
+    return None if f"{collector.nodeid}::{name}" in invariant_node_ids() else []
 
 
 def pytest_collection_modifyitems(config, items):
