@@ -370,7 +370,8 @@ def _levain_sign_status(public_key: str, key_dir: Path | None, helper: Path | No
         if sidecar is None or sidecar.provider != LEVAIN_SIGN:
             continue
         try:
-            built = helper if helper is not None else se_signer.ensure_helper()
+            # never compiled on a status path (a build is up to 300 s): a missing helper is said in words
+            built = helper if helper is not None else se_signer.require_helper()
         except se_signer.SeSignerError as exc:
             return None, f"the levain-sign helper is not available ({exc}): custody as recorded"
         return se_signer.key_status(private, helper=built)
@@ -404,10 +405,13 @@ def ctk_status(public_key: str, *, sc_auth: Path | str = SC_AUTH, identities: li
     return False, f"its CTK identity on this Mac has protection {', '.join(sorted({i.prot for i in found}))}, not bio"
 
 
-def custody_note(rows: Any, *, sc_auth: Path | str = SC_AUTH, platform: str | None = None) -> dict[str, str]:
+def custody_note(rows: Any, *, sc_auth: Path | str = SC_AUTH, platform: str | None = None,
+                 key_dir: Path | None = None) -> dict[str, str]:
     """For each ``touch-id`` row of a key listing, the re-check of its CTK identity on this Mac (DESIGN
     §3.2 rev 6 item 4): ``{fingerprint: note}``. Elsewhere (not a Mac, no sc_auth) nothing: the listing
-    shows the recorded custody only. sc_auth failing is a note, never a failed listing."""
+    shows the recorded custody only. sc_auth failing is a note, never a failed listing. ``key_dir`` is the directory
+    a levain-sign key's blob is looked for in (default the real key directory), so a helper key is judged by the
+    helper's status, never by the CTK sentence."""
     touch = [r for r in rows if r.custody == TOUCH_ID and r.public_key]
     if not touch or (platform or sys.platform) != "darwin" or not Path(sc_auth).exists():
         return {}
@@ -417,7 +421,7 @@ def custody_note(rows: Any, *, sc_auth: Path | str = SC_AUTH, platform: str | No
         return {r.fingerprint: f"CTK identity not re-checked ({exc})" for r in touch}
     out = {}
     for r in touch:
-        ok, why = ctk_status(r.public_key, identities=identities, platform=platform)
+        ok, why = ctk_status(r.public_key, identities=identities, platform=platform, key_dir=key_dir)
         out[r.fingerprint] = ("WARNING: " if ok is False else "") + why
     return out
 
@@ -456,7 +460,8 @@ def declared_custody(key_file: Path, given: str | None, key_class: str, public_k
         if problem is not None:
             raise KeyError_(problem)
     if custody == TOUCH_ID and (platform or sys.platform) == "darwin" and Path(sc_auth).exists():
-        ok, why = ctk_status(normal, sc_auth=sc_auth, platform=platform)
+        # the key's own directory: a levain-sign key is judged by the helper's status wherever its blob lives
+        ok, why = ctk_status(normal, sc_auth=sc_auth, platform=platform, key_dir=Path(key_file).parent)
         if ok is False or (ok is None and sidecar is not None):
             raise KeyError_(f"touch-id custody refused: {why}")
     return custody
@@ -675,6 +680,7 @@ def create_levain_sign(key_dir: Path | None = None, label: str | None = None, *,
         built = helper if helper is not None else se_signer.ensure_helper()
         se_signer.create_key(key, presence=presence, helper=built)
         made.append(key)
+        made.append(key.with_name(key.name + ".meta.json"))   # the helper's record of whether the key is presence-gated
         normal = normalise_public_key(se_signer.public_key_line(key, helper=built))
         _write_new(pub, f"{normal} {label}\n".encode("ascii"), 0o644)
         made.append(pub)

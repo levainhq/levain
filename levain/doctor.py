@@ -107,10 +107,34 @@ def _emit(r: CheckResult) -> None:
         print(f"      → {r.hint}")
 
 
-def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
+def build_signing_helper() -> str:
+    """The one build point for the Secure Enclave helper outside a sign (``levain doctor --fix``; ``terminal-key
+    create`` / ``rotate`` build it themselves). Compiles it into the per-user cache when it is not there for this
+    source (a compile takes up to a few minutes), and says what it did; a Mac without swiftc is a plain sentence."""
+    import sys
+
+    from levain.consent import se_signer
+
+    if sys.platform != "darwin":
+        return "signing helper: not a Mac, nothing to build"
+    try:
+        se_signer.require_helper()
+        return "signing helper: already built"
+    except se_signer.SeSignerError:
+        pass
+    try:
+        built = se_signer.ensure_helper()
+    except se_signer.SeSignerError as exc:
+        return f"signing helper: NOT built ({exc})"
+    return f"signing helper: built ({built})"
+
+
+def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False, fix: bool = False) -> int:
     # one `claude --version` per run, however many rows ask for the version
     from levain.consent.canary import versions_read_once
 
+    if fix:
+        print(build_signing_helper() + "\n")
     with versions_read_once():
         return _run_doctor(path, invoke=invoke, repin_hooks=repin_hooks)
 

@@ -65,8 +65,12 @@ pt = priv.public_key().public_numbers()
 x963 = b"\x04" + pt.x.to_bytes(32, "big") + pt.y.to_bytes(32, "big")
 KT = b"sk-ecdsa-sha2-nistp256@openssh.com"
 app, ns = opt("--application").encode(), opt("--namespace").encode()
-flags = 1 if "--presence" in argv else 0
-counter = 1
+meta = side(key, ".meta.json")
+if meta is None:
+    out({"ok": False, "code": "meta_missing", "error": "stub: no meta"}, 1)
+presence = bool(json.loads(meta)["presence"])
+flags = 1 if presence else 0
+counter = int(side(key, ".counter-value") or 1)
 signed = b"SSHSIG" + s(ns) + s(b"") + s(b"sha512") + s(hashlib.sha512(msg).digest())
 u2f = sha(app) + bytes([flags]) + struct.pack(">I", counter) + sha(signed)
 r, sv = decode_dss_signature(priv.sign(u2f, ec.ECDSA(hashes.SHA256())))
@@ -78,7 +82,8 @@ import base64
 b64 = base64.b64encode(blob).decode()
 armored = "-----BEGIN SSH SIGNATURE-----\n" + "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)) + "\n-----END SSH SIGNATURE-----\n"
 out({"ok": True, "signature": armored, "counter": counter, "flags": flags, "attempts": int(side(key, ".attempts") or 1),
-     "evaluated": True, "presence": "--presence" in argv})
+     "evaluated": presence, "evaluations": int(side(key, ".evaluations") or (1 if presence else 0)),
+     "presence": presence})
 '''
 
 # One of the 11-20 field records (sigfail-20261119T155850636576-0000030967-1.json, reason "empty ECDSA signature"):
@@ -134,7 +139,8 @@ def stub_helper(tmp_path_factory) -> Path:
     return p
 
 
-def _soft_key(d: Path, stub_helper_unused=None, label: str = "levain-terminal", **sidecar_over) -> Path:
+def _soft_key(d: Path, stub_helper_unused=None, label: str = "levain-terminal", presence: bool = True,
+              **sidecar_over) -> Path:
     """A software P-256 key standing in for the helper's blob: the PEM is the blob, the .pub the sk-ecdsa line."""
     import base64
     import struct
@@ -155,6 +161,9 @@ def _soft_key(d: Path, stub_helper_unused=None, label: str = "levain-terminal", 
     line = f"{kt} {base64.b64encode(s(kt.encode()) + s(b'nistp256') + s(x963) + s(b'ssh:')).decode()} {label}\n"
     (d / (label + ".pub")).write_text(line)
     _write_sidecar(key, **sidecar_over)
+    if sidecar_over.get("provider", custody.LEVAIN_SIGN) == custody.LEVAIN_SIGN:     # an Apple key has no meta file
+        Path(str(key) + ".meta.json").write_text(json.dumps({"format": "levain-sign-key/1", "presence": presence,
+                                                             "created": "2026-11-21T00:00:00Z"}))
     return key
 
 
@@ -278,7 +287,7 @@ def test_a_levain_sign_key_signs_through_ssh_signer_and_verify_accepts_it(tmp_pa
     res = ts.verify(msg, sig, _signers(key), "phill", ctk=lambda pk: (True, "stub"))
     assert res.ok and res.fingerprint == fp and res.user_present is True
     calls = _stub_log(key)
-    assert len(calls) == 1 and "--presence" in calls[0] and f"--namespace {NS}" in calls[0]
+    assert len(calls) == 1 and "--presence" not in calls[0] and f"--namespace {NS}" in calls[0]
 
 
 def test_the_desk_namespace_is_passed_as_given(tmp_path, stub_helper):
@@ -344,7 +353,8 @@ def test_the_sign_log_line_shape(tmp_path, stub_helper):
     rows = _log(d)
     assert len(rows) == 1
     row = rows[0]
-    assert set(row) == {"time", "outcome", "attempts", "silent_retries", "elapsed_s", "evaluated", "code", "pid"}
+    assert set(row) == {"time", "outcome", "attempts", "silent_retries", "elapsed_s", "evaluated", "evaluations", "code",
+                      "pid"}
     assert (row["outcome"], row["attempts"], row["silent_retries"], row["evaluated"], row["code"], row["pid"]) \
         == ("signed", 3, 2, True, "ok", os.getpid())
     assert row["elapsed_s"] >= 0 and row["time"].endswith("+00:00")
@@ -423,16 +433,6 @@ def real_helper(tmp_path_factory) -> Path:
     return h
 
 
-def _strip_presence_wrapper(real: Path, where: Path) -> Path:
-    """A helper that runs the real one without ``--presence``, so no Touch ID sheet can come up."""
-    w = where / "no-presence-helper"
-    w.write_text(f"#!{sys.executable}\nimport os, sys\n"
-                 f"args = [a for a in sys.argv[1:] if a != '--presence']\n"
-                 f"os.execv({str(real)!r}, [{str(real)!r}] + args)\n")
-    w.chmod(0o755)
-    return w
-
-
 def test_creating_a_levain_sign_key_writes_the_three_files(tmp_path, real_helper):
     d = _keydir(tmp_path)
     made = custody.create_levain_sign(d, "levain-terminal", helper=real_helper, presence=False)
@@ -450,8 +450,7 @@ def test_creating_a_levain_sign_key_writes_the_three_files(tmp_path, real_helper
 def test_a_real_helper_key_signs_through_ssh_signer_to_the_presence_check(tmp_path, real_helper):
     d = _keydir(tmp_path)
     made = custody.create_levain_sign(d, "levain-terminal", helper=real_helper, presence=False)
-    wrapper = _strip_presence_wrapper(real_helper, tmp_path)
-    fp, sign = ckeys.ssh_signer(made.path, namespace=NS, helper=wrapper)
+    fp, sign = ckeys.ssh_signer(made.path, namespace=NS, helper=real_helper)
     # the no-presence key signs (the dispatch, the blob and the namespace all work), but its signature carries flags 0x00,
     # and the verify-before-return refuses it for lacking the user-presence flag: it is not returned
     with pytest.raises(KeyError_, match="without the user-presence flag"):
@@ -529,7 +528,7 @@ def test_without_a_key_dir_a_test_run_never_looks_in_the_real_one(tmp_path, stub
 def test_terminal_status_with_the_stub(tmp_path, stub_helper, monkeypatch):
     d = _keydir(tmp_path)
     key = _soft_key(d)
-    monkeypatch.setattr(ses, "ensure_helper", lambda cache_dir=None: stub_helper)
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: stub_helper)
     _set(key, ".status", "gated")
     assert ts.status(d, identities=[], platform="darwin").state == "enrolled"
     _set(key, ".status", "open")
@@ -613,3 +612,154 @@ def test_the_helper_cache_is_the_users_not_the_key_directory():
     assert cache.parts[-3:] == ("Library", "Caches", "levain") or cache.parts[-4:] == ("Library", "Caches", "levain",
                                                                                       "native")
     assert ".levain" not in cache.parts
+
+
+# ---------------------------------------------------------------------------------------------------
+# levain#191 review round 1 (se-fix1): M2 no compile in a sign, M4 custody by the key's own dir, the signing.py refusal,
+# the failure evidence record, the build point
+
+
+def _fake_sc_auth(tmp_path: Path, monkeypatch) -> Path:
+    """A path that exists (never run: the spawn keyguard denies sc_auth) and no CTK identities listed."""
+    p = tmp_path / "sc_auth"
+    p.write_text("")
+    monkeypatch.setattr(custody, "list_identities", lambda sc_auth=None: [])
+    return p
+
+
+def _pub_of(key: Path) -> str:
+    return " ".join(Path(str(key) + ".pub").read_text().split()[:2])
+
+
+@pytest.mark.parametrize("mode,ok", [("gated", True), ("open", False)])
+def test_declared_custody_judges_a_levain_sign_key_by_the_helper_status_in_its_own_directory(tmp_path, stub_helper,
+                                                                                           monkeypatch, mode, ok):
+    d = _keydir(tmp_path, "not-the-default-key-dir")
+    key = _soft_key(d)
+    _set(key, ".status", mode)
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: stub_helper)
+    args = (key, None, "laptop-presence", _pub_of(key))
+    kw = dict(sc_auth=_fake_sc_auth(tmp_path, monkeypatch), platform="darwin")
+    if ok:
+        assert custody.declared_custody(*args, **kw) == "touch-id"
+    else:
+        with pytest.raises(KeyError_, match="not presence-gated"):
+            custody.declared_custody(*args, **kw)
+    assert _stub_log(key) == [f"status --key {key}"]                      # the helper was asked, in the key's own directory
+
+
+def test_custody_note_uses_the_helper_status_for_a_levain_sign_key(tmp_path, stub_helper, monkeypatch):
+    from types import SimpleNamespace
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _set(key, ".status", "gated")
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: stub_helper)
+    pub = _pub_of(key)
+    row = SimpleNamespace(custody="touch-id", public_key=pub, fingerprint="SHA256:x")
+    notes = custody.custody_note([row], sc_auth=_fake_sc_auth(tmp_path, monkeypatch), platform="darwin", key_dir=d)
+    assert notes == {"SHA256:x": "presence-gated Secure Enclave key on this Mac"}          # not the CTK sentence
+
+
+def test_a_sign_never_compiles_a_missing_helper_is_a_plain_refusal(tmp_path, monkeypatch):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+
+    def boom(*a, **k):
+        raise AssertionError("the sign path built the helper")
+    monkeypatch.setattr(ses, "build_helper", boom)
+    monkeypatch.setattr(ses, "ensure_helper", boom)
+    monkeypatch.setattr(ses, "default_cache_dir", lambda: tmp_path / "empty-cache")
+    _fp, sign = ckeys.ssh_signer(key, namespace=NS)                     # no helper= : the default lookup
+    with pytest.raises(KeyError_, match=r"levain doctor --fix") as ei:
+        sign(b"m")
+    assert "nothing was signed" in str(ei.value)
+    assert _log(d)[-1]["outcome"] == "helper-missing"
+    # and the status path says it in words instead of compiling
+    ok, note = custody._levain_sign_status(_pub_of(key), d, None)
+    assert ok is None and "levain doctor --fix" in note
+
+
+def test_the_build_point_builds_once_and_says_so(tmp_path, monkeypatch):
+    from levain import doctor
+    built = []
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: (_ for _ in ()).throw(ses.SeSignerError("no")))
+    monkeypatch.setattr(ses, "ensure_helper", lambda cache_dir=None: built.append(1) or tmp_path / "h")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert doctor.build_signing_helper() == f"signing helper: built ({tmp_path / 'h'})" and built == [1]
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: tmp_path / "h")
+    assert doctor.build_signing_helper() == "signing helper: already built" and built == [1]
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: (_ for _ in ()).throw(ses.SeSignerError("no")))
+    monkeypatch.setattr(ses, "ensure_helper", lambda cache_dir=None: (_ for _ in ()).throw(
+        ses.SeSignerError("missing swiftc (xcode-select --install)")))
+    assert "NOT built" in doctor.build_signing_helper()
+
+
+def test_doctor_has_a_fix_flag_that_reaches_the_build():
+    from levain import cli
+    p = cli.build_parser() if hasattr(cli, "build_parser") else None
+    if p is None:
+        pytest.skip("no parser factory")
+    assert p.parse_args(["doctor", "--fix"]).fix is True and p.parse_args(["doctor"]).fix is False
+
+
+def test_signing_env_and_prove_can_sign_refuse_a_levain_sign_key_in_plain_words(tmp_path):
+    from levain.team import signing as S
+    key = _soft_key(_keydir(tmp_path))
+    words = "this key signs through Levain's Touch ID helper and cannot sign git commits; use a cockpit key"
+    with pytest.raises(S.SigningError) as ei:
+        S.signing_env(str(key))
+    assert str(ei.value) == words
+    with pytest.raises(S.SigningError, match="cannot sign git commits"):
+        S.prove_can_sign(str(key), Path(str(key) + ".pub").read_text().strip())
+    # the pub path names the same key; a key with no sidecar, an Apple key and a literal are unchanged
+    with pytest.raises(S.SigningError):
+        S.signing_env(str(key) + ".pub")
+    apple = _soft_key(_keydir(tmp_path, "apple"), provider=APPLE, signer=None, ctk_hash="A" * 40)
+    assert S.signing_env(str(apple))["SSH_SK_PROVIDER"] == APPLE
+    assert "SSH_SK_PROVIDER" not in S.signing_env("key::sk-ecdsa-sha2-nistp256@openssh.com AAAA")
+    assert S.signing_env() and S.signing_env(str(tmp_path / "no-such-key"))
+
+
+def _evidence(d: Path) -> list[dict]:
+    f = sorted((d / "sign-failures").glob("sigfail-*.json")) if (d / "sign-failures").is_dir() else []
+    return [json.loads(p.read_text()) for p in f]
+
+
+def test_a_failed_helper_sign_writes_the_sign_failures_record_with_the_helper_fields(tmp_path, stub_helper):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    other = _soft_key(d, label="other")
+    _fp, osign = _signer(other, stub_helper)
+    foreign = osign(b"m")
+    _set(key, ".replay", json.dumps({"ok": True, "signature": foreign, "attempts": 2, "evaluated": True,
+                                     "evaluations": 1, "flags": 1, "counter": 9}))
+    _fp, sign = _signer(key, stub_helper)
+    with pytest.raises(KeyError_):
+        sign(b"secret message bytes")
+    (rec,) = _evidence(d)
+    assert rec["format"] == "levain-sign-failure/1" and rec["signer"] == "levain-sign"
+    assert rec["helper_code"] == "verify" and rec["helper_attempts"] == 2 and rec["flags"] == "0x01" and rec["counter"] == 9
+    assert rec["message_sha256"] and "secret message bytes" not in json.dumps(rec)
+    # a helper error code is carried the same way
+    Path(str(key) + ".replay").unlink()
+    _set(key, ".fail", "key_load")
+    with pytest.raises(KeyError_):
+        sign(b"m")
+    assert [r["helper_code"] for r in _evidence(d)].count("key_load") == 1
+    # a person cancelling is not a failure to keep evidence of
+    Path(str(key) + ".fail").unlink()
+    before = len(_evidence(d))
+    _set(key, ".fail", "presence_denied")
+    with pytest.raises(KeyError_):
+        sign(b"m")
+    assert len(_evidence(d)) == before
+
+
+def test_the_signer_refuses_an_answer_that_reports_two_presence_evaluations(tmp_path, stub_helper):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _set(key, ".evaluations", "2")
+    _fp, sign = _signer(key, stub_helper)
+    with pytest.raises(KeyError_, match="evaluated presence"):
+        sign(b"m")
+    assert _log(d)[-1]["outcome"] == "unverified" and _log(d)[-1]["code"] == "too-many-evaluations"

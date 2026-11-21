@@ -59,6 +59,9 @@ class Rig:
         self.root.mkdir()
         CockpitDB(self.root).set_install_class("reported")
         self.old = _soft_key(self.d, label="levain-terminal", provider=APPLE, ctk_hash=CTK, signer=None)
+        # the stub helper stands in for the Apple provider when it signs the enrolment as the old key, and it wants a meta file;
+        # a real Apple key has none, so the rotate move must cope with both (this one travels to retired-<stamp>/)
+        Path(str(self.old) + ".meta.json").write_text(json.dumps({"format": "levain-sign-key/1", "presence": True}))
         self.old_pub = self._pub(self.old)
         self.old_fp = ckeys.fingerprint_of(self.old_pub)
         self.signs: list[str] = []          # the key file name of every signature asked for
@@ -139,10 +142,13 @@ def _assert_rotated(rig: Rig, rep: tr.RotateReport) -> None:
     d = rig.d
     assert ckeys.fingerprint_of(rig._pub(d / "levain-terminal")) == new_fp
     retired = d / f"retired-{STAMP}"
+    # (the rig's old key has a meta file because its stub signs through the helper's door; a real Apple key has none)
     assert sorted(p.name for p in retired.iterdir()) == ["levain-terminal", "levain-terminal.levain-key.json",
-                                                         "levain-terminal.pub"]
+                                                         "levain-terminal.meta.json", "levain-terminal.pub"]
     assert ckeys.fingerprint_of(rig._pub(retired / "levain-terminal")) == rig.old_fp
     assert not [p for p in d.iterdir() if p.name.startswith("levain-terminal-next") and not p.name.endswith(".calls")]
+    # the new key's meta file (the helper reads presence from it) and its counter travelled with its blob: it can sign
+    assert json.loads((d / "levain-terminal.meta.json").read_text())["presence"] is True
     assert rig.deleted == [CTK]
     assert stat.S_IMODE(os.lstat(d / tr.JOURNAL).st_mode) == 0o600
     assert rig.journal()["complete"] is True
@@ -400,3 +406,26 @@ def test_the_cli_verb_is_registered_and_a_test_run_never_reaches_the_real_key_di
     assert args.tk_verb == "rotate" and args.data_root == tmp_path and args.func is band_view.run_band_terminal_key
     assert args.func(args) == 2                       # refused (an agent session or the real-key gate), nothing touched
     assert "refused" in capsys.readouterr().err
+
+
+def test_the_new_keys_counter_and_meta_travel_and_the_old_keys_counter_is_retired(rig):
+    Path(str(rig.old) + ".counter").write_text("41\n")                  # a helper-era old key's counter, retired with it
+    inner = rig.creator
+
+    def creator(d, label):
+        made = inner(d, label)
+        Path(str(made.path) + ".counter").write_text("1\n")             # the first sign made one
+        return made
+    rep = rig.run(creator=creator)
+    assert rep.state == "done", rep.text
+    d, retired = rig.d, rig.d / f"retired-{STAMP}"
+    assert (d / "levain-terminal.counter").read_text() == "1\n" and (d / "levain-terminal.meta.json").is_file()
+    assert (retired / "levain-terminal.counter").read_text() == "41\n"
+    assert not (d / "levain-terminal-next.counter").exists() and not (d / "levain-terminal-next.meta.json").exists()
+
+
+def test_a_whole_next_key_without_its_meta_file_is_half_a_key(rig):
+    key = _soft_key(rig.d, label=tr.NEXT_LABEL, signer=custody.SIGNER_FORMAT)
+    Path(str(key) + ".meta.json").unlink()
+    rep = rig.run()
+    assert rep.state == "stopped" and "half there" in rep.text

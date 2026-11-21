@@ -40,6 +40,7 @@ def helper(tmp_path_factory) -> Path:
 def key(tmp_path, helper):
     blob = tmp_path / "k.blob"
     ses.create_key(blob, presence=False, helper=helper)
+    Path(str(blob) + ".pub").write_text(ses.public_key_line(blob, helper=helper) + "\n")   # se_signer verifies against it
     return blob
 
 
@@ -90,7 +91,7 @@ def test_imports_from_this_checkout():
 
 def test_signature_verifies(tmp_path, helper, key):
     msg = b"levain consent answer \x00\xff bytes"
-    sig = ses.se_signer(key, presence=False, namespace=NS, helper=helper)(msg)
+    sig = ses.se_signer(key, namespace=NS, helper=helper)(msg)
     assert sig.startswith("-----BEGIN SSH SIGNATURE-----\n") and sig.endswith("-----END SSH SIGNATURE-----\n")
     line = ses.public_key_line(key, helper=helper)
     assert line.startswith("sk-ecdsa-sha2-nistp256@openssh.com ")
@@ -99,20 +100,20 @@ def test_signature_verifies(tmp_path, helper, key):
 
 
 def test_tampered_message_fails(tmp_path, helper, key):
-    sig = ses.se_signer(key, presence=False, namespace=NS, helper=helper)(b"original")
+    sig = ses.se_signer(key, namespace=NS, helper=helper)(b"original")
     line = ses.public_key_line(key, helper=helper)
     assert _verify(tmp_path, line, sig, b"original") == 0
     assert _verify(tmp_path, line, sig, b"0riginal") != 0
 
 
 def test_wrong_namespace_fails(tmp_path, helper, key):
-    sig = ses.se_signer(key, presence=False, namespace=NS, helper=helper)(b"m")
+    sig = ses.se_signer(key, namespace=NS, helper=helper)(b"m")
     line = ses.public_key_line(key, helper=helper)
     assert _verify(tmp_path, line, sig, b"m", namespace="levain-other") != 0
 
 
 def test_counter_increments(helper, key):
-    sign = ses.se_signer(key, presence=False, namespace=NS, helper=helper)
+    sign = ses.se_signer(key, namespace=NS, helper=helper)
     c1 = _parse(sign(b"a"))[1]
     c2 = _parse(sign(b"a"))[1]
     assert c2 == c1 + 1
@@ -123,7 +124,7 @@ def test_counter_increments(helper, key):
 def test_presence_flag_is_not_enforced_by_ssh_keygen_verify(tmp_path, helper, key):
     """The brief expected ssh-keygen to REJECT a flags-0x00 signature without no-touch-required. Measured: it does not
     (and it has no option that would). The flag is only honest if the Levain verifier reads it; this pins the finding."""
-    sig = ses.se_signer(key, presence=False, namespace=NS, helper=helper)(b"m")
+    sig = ses.se_signer(key, namespace=NS, helper=helper)(b"m")
     line = ses.public_key_line(key, helper=helper)
     assert _parse(sig)[0] == 0x00
     assert _verify(tmp_path, line, sig, b"m", touch_optional=False) == 0
@@ -136,3 +137,83 @@ def test_create_refuses_overwrite_and_is_0600(helper, key):
         ses.create_key(key, presence=False, helper=helper)
     assert ei.value.code == "exists"
     assert key.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------------------------------
+# levain#191 review round 1: the key's presence comes from <blob>.meta.json, never from a flag; status is matched on the
+# one measured error; the helper is built outside any sign
+
+
+def test_create_writes_the_meta_file_the_helper_reads_the_presence_from(tmp_path, helper, key):
+    import json
+    meta = Path(str(key) + ".meta.json")
+    body = json.loads(meta.read_text())
+    assert body["format"] == "levain-sign-key/1" and body["presence"] is False and body["created"].endswith("Z")
+    assert meta.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_sign_with_no_meta_file_is_refused_not_guessed(tmp_path, helper, key):
+    Path(str(key) + ".meta.json").unlink()
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses.sign_once(key, b"m", namespace=NS, helper=helper)
+    assert ei.value.code == "meta_missing"
+    Path(str(key) + ".meta.json").write_text('{"format": "other", "presence": true}')
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses.sign_once(key, b"m", namespace=NS, helper=helper)
+    assert ei.value.code == "meta_bad"
+
+
+def test_a_presence_flag_on_the_command_line_of_a_sign_is_ignored(tmp_path, helper, key):
+    """The old CLI took ``--presence`` on sign; the helper now reads the key's meta. A no-presence key stays flags 0x00,
+    evaluations 0, whatever the command line says (so no sheet can be asked for by a caller's argument)."""
+    out = ses._run(helper, ["sign", "--key", str(key), "--application", "ssh:", "--namespace", NS, "--reason", "r",
+                            "--presence"], stdin=b"m", timeout=30)
+    assert out["flags"] == 0 and out["evaluations"] == 0 and out["evaluated"] is False and out["presence"] is False
+    assert _parse(out["signature"])[0] == 0x00
+
+
+def test_the_helper_says_how_many_presence_evaluations_it_made(tmp_path, helper, key):
+    out = ses.sign_once(key, b"m", namespace=NS, helper=helper)
+    assert out["evaluations"] == 0 and out["attempts"] == 1
+
+
+def test_status_of_a_presence_key_is_true_on_the_measured_error_and_shows_no_sheet(tmp_path, helper):
+    """MEASURED 2026-11-21 (macOS 27): `create --out K --presence` shows no sheet; `status --key K` (interactionNotAllowed)
+    shows none and the sign raises NSError domain com.apple.LocalAuthentication code -1004 (LAError.notInteractive).
+    A no-presence key signs, so it is False. The helper matches that (domain, code) as numbers."""
+    k = tmp_path / "gated.blob"
+    try:
+        ses.create_key(k, presence=True, helper=helper)
+    except ses.SeSignerError as exc:
+        pytest.skip(f"this Mac cannot make a biometry key here: {exc}")
+    assert Path(str(k) + ".meta.json").read_text().count('"presence":true') == 1
+    assert ses.key_status(k, helper=helper, timeout=20) == (True, "presence-gated Secure Enclave key on this Mac")
+
+
+def test_the_status_match_is_on_the_exact_measured_code_not_a_string_search():
+    src = ses.SOURCE.read_text()
+    start = src.index("func needsInteraction")
+    body = src[start:src.index("guard let blob = FileManager", start)]
+    assert "LAError.errorDomain" in body and "LAError.notInteractive.rawValue" in body
+    assert "contains(" not in body and "-25308" not in body
+    assert "MEASURED 2026-11-21" in src and "-1004" in src
+
+
+def test_require_helper_never_compiles_and_names_the_command_that_builds_it(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("a compile was started")
+    monkeypatch.setattr(subprocess, "run", boom)
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses.require_helper(tmp_path / "empty-cache")
+    assert ei.value.code == "helper_not_built" and "levain doctor --fix" in str(ei.value)
+    (tmp_path / "stale").mkdir()
+    (tmp_path / "stale" / "levain-sign-0000000000000000").write_text("#!/bin/sh\n")
+    (tmp_path / "stale" / "levain-sign-0000000000000000").chmod(0o755)       # built from some other source: stale
+    with pytest.raises(ses.SeSignerError):
+        ses.require_helper(tmp_path / "stale")
+
+
+def test_require_helper_finds_what_ensure_helper_built(tmp_path, helper):
+    cache = tmp_path / "cache"
+    built = ses.ensure_helper(cache)
+    assert ses.require_helper(cache) == built and ses.helper_path(cache) == built

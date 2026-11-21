@@ -482,12 +482,33 @@ def sign_config(key: str) -> list[str]:
 
 _PROOF_NONCE = b"levain signing-key proof\n"
 
+LEVAIN_SIGN_REFUSAL = ("this key signs through Levain's Touch ID helper and cannot sign git commits; "
+                       "use a cockpit key")
+
+
+def _refuse_levain_sign(key: str | None) -> None:
+    """Raise :class:`SigningError` when ``key`` (a key file path; never a ``key::`` literal) is a levain-sign key
+    (levain#191): its file is a Secure Enclave blob only Levain's helper can use, so git's ssh-keygen cannot sign
+    with it, and it would fail late and obscurely (or, via an SSH_SK_PROVIDER, the wrong way). Judged on the key's
+    sidecar; a malformed sidecar is the cockpit's to refuse and names no helper here."""
+    if not key or key.startswith("key::"):
+        return
+    from levain.cockpit.custody import LEVAIN_SIGN, read_sidecar
+    from levain.cockpit.keys import KeyError_
+    try:
+        sidecar = read_sidecar(Path(os.path.expanduser(key)))
+    except KeyError_:
+        return
+    if sidecar is not None and sidecar.provider == LEVAIN_SIGN:
+        raise SigningError(LEVAIN_SIGN_REFUSAL)
+
 
 def prove_can_sign(key: str, pubkey_line: str, *, timeout: float = 15.0) -> None:
     """Sign a fixed nonce with ``key`` the way git does (``ssh-keygen -Y sign -n git``: a ``key::`` literal through the
     agent, else the key file as given) and verify it: the signature must be good and made by ``pubkey_line``'s key.
     Raises SigningError otherwise. Run before a key is saved, so a key that cannot sign is never persisted."""
     sign_config(key)
+    _refuse_levain_sign(key)
     want = fingerprint(pubkey_line)
     with tempfile.TemporaryDirectory(prefix="levain-proof-") as d:
         msg = Path(d) / "nonce"
@@ -527,6 +548,7 @@ def signing_env(key: str | None = None) -> dict[str, str]:
     (:func:`levain.cockpit.keys.ssh_signer`): ``SSH_SK_PROVIDER`` from the environment wins, else the one the key's
     sidecar names (a Touch ID key made by ``levain cockpit key create`` signs through the Secure Enclave provider).
     The launch allowlist drops ``SSH_SK_PROVIDER``, so without this a Touch ID key could not sign a ledger commit."""
+    _refuse_levain_sign(key)
     env = {"SSH_ASKPASS_REQUIRE": "force", "SSH_ASKPASS": shutil.which("false") or "/usr/bin/false"}
     provider = child_env("SSH_SK_PROVIDER").get("SSH_SK_PROVIDER")
     if provider is None and key and not key.startswith("key::"):

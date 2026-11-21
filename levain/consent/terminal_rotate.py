@@ -36,6 +36,11 @@ JOURNAL = "rotate.json"
 JOURNAL_FORMAT = "levain-rotate/1"
 KEY_CLASS = "laptop-presence"
 _SUFFIXES = ("", ".pub", SIDECAR_SUFFIX)
+# a helper key's two more files (levain#191 review): ``<blob>.meta.json`` (written at create: whether the key is
+# presence-gated, which the helper reads at every sign) must travel with the new key's blob or the renamed key could not
+# sign; ``<blob>.counter`` (made at the first sign) travels when it is there. The old Apple key has neither.
+_META = ".meta.json"
+_COUNTER = ".counter"
 _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 EXIT_OK, EXIT_STOPPED, EXIT_REFUSED = 0, 1, 2
 
@@ -150,8 +155,8 @@ def _stamp(clock: Callable[[], datetime]) -> str:
     return clock().astimezone(timezone.utc).strftime(_STAMP_FORMAT)
 
 
-def _files_exist(d: Path, label: str) -> list[bool]:
-    return [os.path.lexists(d / (label + s)) for s in _SUFFIXES]
+def _files_exist(d: Path, label: str, *, meta: bool = False) -> list[bool]:
+    return [os.path.lexists(d / (label + s)) for s in _SUFFIXES + ((_META,) if meta else ())]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -285,7 +290,7 @@ def _step_made(d: Path, journal: dict[str, Any], make: Callable[..., Any], log: 
     steps = journal["steps"]
     if steps.get("made"):
         return
-    present = _files_exist(d, NEXT_LABEL)
+    present = _files_exist(d, NEXT_LABEL, meta=True)
     if any(present) and not all(present):
         raise _Stop(f"{NEXT_LABEL} files are half there (a leftover); remove the {NEXT_LABEL} files in {d}, then run "
                     "rotate again")
@@ -414,10 +419,17 @@ def _step_move(d: Path, journal: dict[str, Any], log: list[str]) -> None:
         if s == ".pub" and _keys.fingerprint_of(src.read_text(encoding="ascii")) != journal["old_fp"]:
             raise _Stop(f"{src} is not the old key; nothing was moved")
         _rename(src, dst)
-    for s in _SUFFIXES:
+    # the old key's optional files (an Apple key has none; a helper key's meta and counter): only while the new key
+    # has not begun to be renamed, else a file at the terminal label is the NEW key's
+    if os.path.lexists(d / (NEXT_LABEL + ".pub")):
+        for s in (_META, _COUNTER):
+            src, dst = d / (ts.KEY_LABEL + s), retired / (ts.KEY_LABEL + s)
+            if os.path.lexists(src) and not os.path.lexists(dst):
+                _rename(src, dst)
+    for s in _SUFFIXES + (_META, _COUNTER):
         src, dst = d / (NEXT_LABEL + s), d / (ts.KEY_LABEL + s)
         if not os.path.lexists(src):
-            if os.path.lexists(dst):
+            if os.path.lexists(dst) or s == _COUNTER:       # already renamed (a resume), or no sign has made a counter yet
                 continue
             raise _Stop(f"{src} is missing; the new key's files are not all in {d}")
         _rename(src, dst)

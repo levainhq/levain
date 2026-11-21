@@ -293,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
             "changed them on purpose. Doctor reports a changed pin until you do."
         ),
     )
+    doc_p.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Build what a signing step must not build for itself: the Secure Enclave helper the terminal key "
+            "signs through (nothing is compiled while signing; a missing helper is refused with this command)."
+        ),
+    )
     doc_p.set_defaults(func=_cmd_doctor)
 
     vh_p = subparsers.add_parser(
@@ -1890,7 +1898,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from levain.doctor import run_doctor
 
-    return run_doctor(path=args.path, invoke=args.invoke, repin_hooks=args.repin_hooks)
+    return run_doctor(path=args.path, invoke=args.invoke, repin_hooks=args.repin_hooks, fix=args.fix)
 
 
 def _add_consent_canary_parser(consent_sub: argparse._SubParsersAction) -> None:

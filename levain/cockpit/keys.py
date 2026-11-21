@@ -1030,7 +1030,8 @@ _EMPTY_SIG_NEXT = "try again, or answer from your phone instead (open the cockpi
 
 def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: str, sig_type: str, flags: int,
                         counter: int | None, detail: str, namespace: str, attempt: int,
-                        empty: bool = False, elapsed: float) -> str:
+                        empty: bool = False, elapsed: float, signer: str | None = None,
+                        helper_code: str | None = None, helper_attempts: int | None = None) -> str:
     """Keep what a refused sk signature was, for the next person to read: ``<key dir>/sign-failures/sigfail-*.json``
     (0600, in a 0700 directory), written beside the key and its sidecar, the one place the signer already reads from
     (it has no data root or diagnostics directory of its own). The newest :data:`_SIGN_FAILURE_KEEP` are kept; older
@@ -1075,6 +1076,10 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
                   "ssh_keygen": detail, "signature": signature,
                   "reason": _EMPTY_SIG_REASON if empty else None,
                   "elapsed_s": round(float(elapsed), 3)}
+        if signer is not None:       # the levain-sign helper path: which signer, and what the helper itself said
+            record["signer"] = str(signer)[:40]
+            record["helper_code"] = str(helper_code)[:80] if helper_code is not None else None
+            record["helper_attempts"] = helper_attempts if isinstance(helper_attempts, int) else None
         body = (json.dumps(record, indent=1) + "\n").encode("utf-8")
         # fixed width throughout (timestamp, pid, attempt) so name order is time, then process, then attempt
         name = f"{_SIGN_FAILURE_PREFIX}{now.strftime('%Y%m%dT%H%M%S%f')}-{os.getpid():010d}-{attempt}.json"
@@ -1124,42 +1129,61 @@ def _prune_sign_failures(dfd: int, *, just_written: str) -> None:
 
 def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str, bound: float,
                         ssh_keygen: Path | str, helper: Path | None) -> Signer:
-    """The ``sign`` of a levain-sign key (levain#191 R3, R4): ONE helper call per signature, with the user-presence
-    sheet on, in ``namespace``, bounded by ``bound`` seconds for the helper and its check together. No retry loop
-    here: the helper's silent same-context retries are the only ones, so there is never a second sheet. The signature
-    the helper returns is verified against the key's public half (:func:`levain.authority_sig.verify_link_sig`, which
-    also needs the presence flag) BEFORE it is returned, so an empty or unverifiable one can never leave this function.
-    Every attempt, whatever its outcome, appends one line to ``<key dir>/sign-log.jsonl``
-    (:func:`levain.consent.se_signer.sign_log_record`). A failure raises :class:`KeyError_` in the words
+    """The ``sign`` of a levain-sign key (levain#191 R3, R4): ONE helper call per signature, in ``namespace``, bounded
+    by ``bound`` seconds for the helper and its check together. Whether the key is presence-gated is the helper's
+    business (it reads the key's ``.meta.json``); this side never passes it. No retry loop here: the helper evaluates
+    presence once (a second sheet cannot appear: after the one evaluate its context allows no interaction) and retries
+    the sign only on named transient codes, so there is never a second sheet. The helper is the one
+    :func:`levain.consent.se_signer.require_helper` finds: it is NEVER compiled here, a missing or stale binary is a
+    plain refusal naming the build command. The signature the helper returns is verified against the key's public
+    half (:func:`levain.authority_sig.verify_link_sig`, which also needs the presence flag) BEFORE it is returned, so an
+    empty or unverifiable one can never leave this function, and an answer that reports more than one presence
+    evaluation is refused. Every attempt, whatever its outcome, appends one line to ``<key dir>/sign-log.jsonl``
+    (:func:`levain.consent.se_signer.sign_log_record`), and a failure other than the person cancelling also writes the
+    evidence file the old path writes (``<key dir>/sign-failures``, ``signer: levain-sign``, the helper's code and
+    attempts; the message's hash, never the message). A failure raises :class:`KeyError_` in the words
     ``terminal_sign``'s classifier reads (``Touch ID was cancelled``, ``TimeoutExpired``)."""
     from levain.consent import se_signer as _se
     key_dir = key_path.parent
+    sig_type = "sk-ecdsa-sha2-nistp256@openssh.com"
 
     def sign(message: bytes) -> str:
         started = time.monotonic()
         deadline = started + bound
-        seen: dict[str, Any] = {"attempts": None, "evaluated": None}
+        seen: dict[str, Any] = {"attempts": None, "evaluated": None, "evaluations": None, "flags": 0, "counter": None}
 
         def record(outcome: str, code: str = "") -> None:
             _se.append_sign_log(key_dir, _se.sign_log_record(outcome=outcome, attempts=seen["attempts"],
                                                              evaluated=seen["evaluated"],
+                                                             evaluations=seen["evaluations"],
                                                              elapsed_s=time.monotonic() - started, code=code))
 
+        def evidence(why: str, code: str, *, signature: str = "", empty: bool = False) -> None:
+            try:
+                _write_sign_failure(key_path, fp=fp, message=message, signature=signature, sig_type=sig_type,
+                                    flags=seen["flags"], counter=seen["counter"], detail=why, namespace=namespace,
+                                    attempt=1, empty=empty, elapsed=time.monotonic() - started, signer="levain-sign",
+                                    helper_code=code, helper_attempts=seen["attempts"])
+            except Exception:  # noqa: BLE001 - the evidence is a courtesy; the refusal is the point
+                pass
+
         try:
-            built = helper if helper is not None else _se.ensure_helper()
+            built = helper if helper is not None else _se.require_helper()
         except _se.SeSignerError as exc:
-            record("helper-missing", "build")
+            record("helper-missing", exc.code or "build")
             raise KeyError_(f"the Secure Enclave helper is not available ({exc}), so nothing was signed") from None
         try:
-            out = _se.sign_once(key_path, message, presence=True, namespace=namespace, helper=built,
+            out = _se.sign_once(key_path, message, namespace=namespace, helper=built,
                                 timeout=max(bound - _VERIFY_RESERVE_S * 2, 1.0))
         except _se.SeSignerError as exc:
             seen["attempts"] = exc.payload.get("attempts")
             seen["evaluated"] = exc.payload.get("evaluated")
+            seen["evaluations"] = exc.payload.get("evaluations")
             ran = time.monotonic() - started
             code = exc.code or "error"
-            if code == "timeout":
+            if code in ("timeout", "presence_timeout"):
                 record("timeout", code)
+                evidence(f"the helper did not answer in time ({code})", code)
                 raise KeyError_(f"the Secure Enclave helper timed out (TimeoutExpired): Touch ID was not touched in "
                                 f"time for {fp} ({ran:.1f}s of {bound:g}s), so nothing was signed") from None
             if code == "presence_denied" or (code == "sign_failed" and "cancel" in str(exc).lower()):
@@ -1168,15 +1192,29 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
                                 f"(the Secure Enclave helper ran {ran:.1f}s), so nothing was signed") from None
             if code == "key_load":
                 record("key-not-here", code)
+                evidence("the key blob does not load on this Mac", code)
                 raise KeyError_(f"the signing key {key_path} does not load on this Mac: its Secure Enclave blob is "
                                 "not this Mac's (made on another Mac, or damaged), so nothing was signed") from None
             record("helper-error", code)
+            evidence(f"helper error {code}: {str(exc)[:160]}", code)
             raise KeyError_(f"the Secure Enclave helper could not sign with {fp} ({code}: {str(exc)[:160]}), "
                             "so nothing was signed") from None
-        seen["attempts"], seen["evaluated"] = out.get("attempts"), out.get("evaluated")
+        seen["attempts"], seen["evaluated"], seen["evaluations"] = (out.get("attempts"), out.get("evaluated"),
+                                                                    out.get("evaluations"))
+        if isinstance(out.get("flags"), int):
+            seen["flags"] = out["flags"]
+        if isinstance(out.get("counter"), int):
+            seen["counter"] = out["counter"]
+        evals = out.get("evaluations", 0)
+        if not isinstance(evals, int) or isinstance(evals, bool) or evals > 1:
+            record("unverified", "too-many-evaluations")
+            evidence(f"the helper reported {evals!r} presence evaluations in one sign", "too-many-evaluations")
+            raise KeyError_(f"the Secure Enclave helper evaluated presence {evals!r} times in one sign for {fp}, so "
+                            "nothing was signed")
         signature = out.get("signature")
         if not isinstance(signature, str) or not signature.strip():
             record("no-signature", "empty")
+            evidence("the helper answered with no signature", "empty")
             raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
                             f"(the Secure Enclave helper answered with none), so nothing was signed")
         try:
@@ -1193,12 +1231,15 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
                 empty = False
             if empty:
                 record("no-signature", "empty-signature")
+                evidence(_EMPTY_SIG_REASON, "empty-signature", signature=signature, empty=True)
                 raise KeyError_(f"{_empty_sig_words(True)} for {fp} ({_EMPTY_SIG_REASON}), so nothing was signed")
             if _authority.presence_missing(signature, public_key):
                 record("unverified", "no-presence-flag")
+                evidence("the signature lacks the user-presence flag", "no-presence-flag", signature=signature)
                 raise KeyError_(f"the Secure Enclave helper returned a signature for {fp} without the user-presence "
                                 "flag, so nothing was signed")
             record("unverified", "verify")
+            evidence("the signature does not verify as the key", "verify", signature=signature)
             raise KeyError_(f"the Secure Enclave helper returned a signature that does not verify as {fp}, "
                             "so nothing was signed")
         record("signed", "ok")
@@ -1215,6 +1256,12 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in
     ``namespace`` (default: the authority log's; a consent answer passes its own) with the terminal's
     stderr, so a touch or passphrase prompt reaches the operator.
+
+    A key whose sidecar says ``levain-sign`` (levain#191) is NOT signed by ssh-keygen: its file is a Secure Enclave
+    blob, and its ``sign`` is :func:`_levain_sign_signer` (the helper, one call, no retry loop, no ssh-keygen sign,
+    the sign log and, on a failure, the ``sign-failures`` evidence record with ``signer: levain-sign``). ``helper``
+    is the compiled binary for tests (default :func:`levain.consent.se_signer.require_helper`, never a compile).
+    Everything below describes the OTHER keys.
 
     The key's sidecar (``levain.cockpit.custody``, written by ``levain cockpit key create``) names its
     provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
