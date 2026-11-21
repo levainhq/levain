@@ -2195,7 +2195,7 @@ body.ke .ck-mem-row > .panel .phead .src { margin-left: auto; }
 .ck-lay-btn:focus-visible { outline: 2px solid var(--hue-2); outline-offset: 1px; }
 .ck-lay-fold::before { content: ""; width: 6px; height: 6px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform var(--dur-micro) var(--ease-out); }
 .panel.ck-collapsed .ck-lay-fold::before { transform: translateX(-2px) rotate(-45deg); }
-.panel.ck-collapsed > :not(.phead) { display: none; }
+.panel.ck-collapsed > :not(.phead) { display: none !important; }   /* a folded card shows only its header, whatever a child's own display rule says */
 body.ke .panel.ck-collapsed, body.ke .ck-zgrid .panel.ck-collapsed { height: auto; min-height: 0; }
 .layoutreset { flex: none; border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--card); color: var(--label); cursor: pointer;
   font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-2) var(--sp-4); white-space: nowrap; }
@@ -3842,8 +3842,7 @@ body.ia[data-ia-place="home"] #ck-widgets :is(.num, .fig, .figure, .big) { font-
   body.ia[data-ia-place="home"] .panel[data-ck-panel="tray"] { height: 720px !important; }
   body.ia[data-ia-place="home"]:not(.ia-graph-open) #ck-hlens { padding-right: 0; padding-top: 44px; }
 }
-/* a folded card is its header: the fixed heights above (every width, the phone's included) are for an open card. Same specificity as
-   those, so this stays below the last of them. */
+/* the fixed heights above are for an open card: a folded card is its header. This must come after them. */
 body.ia[data-ia-place="home"] .panel.ck-collapsed { height: auto !important; min-height: 0; }
 
 /* (after the phone block, whose 38 px it overrides) a finger is the pointer: the masthead's three actions and the places are the page's touch targets at any width, not only on a phone */
