@@ -111,6 +111,12 @@ LAZY_SITES = {
     'levain/firing/hands.py::_readable_and_sanitised::from levain.firing.ws_git import CONFIG_ALLOWLIST': 'operator',
     # operator: ``_undo_lock`` <- ``cmd_setup_isolation`` (undo path) <- ``cli.py``
     'levain/firing/hands.py::_undo_lock::from levain.firing.ws_git import HANDS_LOCK': 'operator',
+    # operator: ``_repair_darwin`` <- ``cmd_setup_isolation`` <- ``cli.py``
+    'levain/firing/hands.py::_repair_darwin::from levain.firing import hands_login': 'operator',
+    # operator: ``install_hands_shim`` <- ``shim_install_step`` <- ``plan_setup`` / ``_repair_darwin`` <- ``cmd_setup_isolation`` <- ``cli.py``
+    'levain/firing/hands.py::install_hands_shim::from levain.firing import confinement, hands_login': 'operator',
+    # operator: ``remove_hands_shim`` <- ``plan_undo`` <- ``cmd_setup_isolation`` <- ``cli.py``
+    'levain/firing/hands.py::remove_hands_shim::from levain.firing import confinement, hands_login': 'operator',
     # operator: ``_repair_linux`` <- ``cmd_setup_isolation`` <- ``cli.py``
     'levain/firing/hands.py::_repair_linux::from levain.firing.confinement import ConfinementError, load_confinement_config': 'operator',
     # operator: ``cmd_setup_isolation`` <- ``cli.py`` (the one caller)
