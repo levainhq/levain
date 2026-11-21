@@ -9,7 +9,7 @@ import pytest
 from pathlib import Path
 
 from tests._cockpit_reread import REREAD_SETTLED
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, _pushes_value, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
 KEY = "levain_cockpit_layout_v1"
@@ -62,11 +62,14 @@ def test_garbage_in_storage_is_ignored_and_the_board_draws_the_kernel_order(tmp_
             "JSON.stringify({v: 1, zones: {operate: {order: 'now'}}, collapsed: 5})",
             "JSON.stringify({v: 1, zones: {operate: {order: [1, null, {}]}}, collapsed: [3]})"]
     steps: list = []
+    # one junk's entries: what its seed steps collect (counted by the driver's own rule, `_pushes_value`, not assumed), then the stacks, then the collapsed/controls read
+    per = sum(_pushes_value(s) for s in _seed("0")) + 2
     for j in junk:
         steps += _seed(j) + [{"eval": STACKS}, {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('.ck-lay-btn').length > 0]"}]
     out = _run(tmp_path, steps)
+    assert len(out) == per * len(junk), f"the driver collected {len(out)} entries for {len(junk)} junk values of {per} each: the stride is wrong"
     for i in range(len(junk)):
-        stacks, (collapsed, has_controls) = out[i * 5 + 3], out[i * 5 + 4]
+        stacks, (collapsed, has_controls) = out[i * per + per - 2], out[i * per + per - 1]
         assert stacks["left"] == ["tray"] and stacks["right"] == [], (junk[i], stacks)
         assert collapsed is False and has_controls, (junk[i], collapsed, has_controls)
 

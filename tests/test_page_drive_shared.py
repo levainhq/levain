@@ -691,7 +691,7 @@ def test_a_browser_connection_and_a_json_listing_that_both_fail_report_both(tmp_
     # The protocol failure is the word of last resort: when /json cannot answer either, the line names both, so a reader can tell a dead
     # browser from a dropped connection.
     proxy = _ChromeProxy(shared_port, "drop", refuse_http=True)
-    steps = [{"eval": "location.hash = '#shared-hang-marker'; setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500}]
+    steps = [{"eval": "location.hash = '#shared-hang-marker'; setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500, "artifact": "1"}]
     try:
         r = _drive(tmp_path, steps, {"LEVAIN_DRIVE_CDP_PORT": str(proxy.port), "LEVAIN_TEST_WAIT_SCALE": "1"}, timeout=90)
     finally:
@@ -700,3 +700,5 @@ def test_a_browser_connection_and_a_json_listing_that_both_fail_report_both(tmp_
     assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
     _, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert re.search(r"^TARGET: browser connection failed: .+; /json also failed \(browser unreachable: .+\)$", block, re.M), r.stderr
+    # a step's own artifact read goes down with the same dropped connection: the block still carries its line, saying the read failed
+    assert re.search(r"^STEP ARTIFACT: evaluation error: .+$", block, re.M), r.stderr
