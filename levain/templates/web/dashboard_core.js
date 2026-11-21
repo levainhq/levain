@@ -612,12 +612,22 @@
   // overflows that clamp, so short rows stay clean. Reads layout synchronously (valid for
   // the same reason measureOverflow is — the rows are live in #board / the modal). Skips a
   // row the user already expanded (leave its toggle as "less"). RE-RUNNABLE.
+  // While a set is held here, a clause read once is not read again by another measure run inside the same call.
+  let measuredNow = null;
+  function measuredOnce(fn) {
+    const outer = measuredNow;
+    measuredNow = outer || new Set();
+    try { fn(); } finally { measuredNow = outer; }
+  }
   function measureClauses(root) {
     // a log line (the Stream card) is measured the same way: its sentence is the clause, its row takes the toggle
     for (const clause of root.querySelectorAll(".clause.clampable, .lrow > .lsent")) {
       const row = clause.closest(".row, .lrow");
       if (!row || row.classList.contains("row-expanded")) continue;
       if (row.dataset.folded) continue;   // display:none reads 0 high: leave a folded row's toggle as it was measured
+      // a clause with no layout (a hidden tab, a detached body) has no height to read, which is no answer: the row keeps the caret it has
+      if (!clause.clientHeight) continue;
+      if (measuredNow) { if (measuredNow.has(clause)) continue; measuredNow.add(clause); }
       // No +1 tolerance: the harm is asymmetric — a false NEGATIVE hides the tail with no
       // toggle (the bug this slice fixes), a false positive is a harmless toggle on a 2-line
       // row. Line-clamp overflow is full-line-granular + heights are integers, so an exactly-
@@ -1384,10 +1394,15 @@
     // a new width changes how many lines each entry takes: the bounded bodies fold and measure their rows again
     window.addEventListener("resize", () => { window.clearTimeout(t); t = window.setTimeout(() => {
       for (const g of document.querySelectorAll(".ck-zgrid")) {
-        for (const b of g.querySelectorAll(".pbody.clamped")) measureOverflow(b);
-        measureClauses(g);
+        // each row is read once, whichever of the two measures reaches it first
+        measuredOnce(() => {
+          for (const b of g.querySelectorAll(".pbody.clamped")) measureOverflow(b);
+          measureClauses(g);
+        });
         memClips(g); balanceStacks(g);
       }
+      // an open focus view is outside the grid: its rows are read again at the new width too
+      for (const m of document.querySelectorAll(".modal-body")) measureClauses(m);
     }, 150); });
   }
   function memClips(grid) {
@@ -1617,6 +1632,13 @@
     const show = () => {
       nodes.forEach((n, i) => n.classList.toggle("ck-tab-off", i !== at));
       for (const group of buttons) group.forEach((b, i) => b.setAttribute("aria-selected", i === at ? "true" : "false"));
+      // the panel now showing could not be read while it was hidden: its rows and its bounded body are measured now
+      if (nodes[at].isConnected) {
+        measuredOnce(() => {
+          measureClauses(nodes[at]);
+          for (const b of nodes[at].querySelectorAll(".pbody.clamped")) measureOverflow(b);
+        });
+      }
       // the cards the grid shows changed: re-measure its last row
       const K = window.LevainCockpitKinds;
       if (K && typeof K.fillGrids === "function") K.fillGrids();
@@ -1978,11 +2000,16 @@
     return out.concat(Array.from(root.querySelectorAll(".pbody, .modal-body")));
   };
   function captureKept(root) {
-    const kept = { open: new Set(), scroll: new Map() };
+    const kept = { open: new Set(), closed: new Set(), scroll: new Map() };
     if (!root || !root.querySelectorAll) return kept;
     for (const row of root.querySelectorAll(".row.row-expanded, .lrow.row-expanded")) {
       const k = keptKey(row);
       if (k) kept.open.add(JSON.stringify([keptScope(row), k]));
+    }
+    // a search hit the search opened and the reader then closed
+    for (const row of root.querySelectorAll(".lrow[data-search-hit][data-hit-opened]:not(.row-expanded)")) {
+      const k = keptKey(row);
+      if (k) kept.closed.add(JSON.stringify([keptScope(row), k]));
     }
     for (const sc of scrollersOf(root)) if (sc.scrollTop > 0) kept.scroll.set(keptScope(sc), sc.scrollTop);
     return kept;
@@ -1990,10 +2017,19 @@
   // Only a row the clause measure marked can be opened again: a row whose text no longer overflows has no control
   // to close it with, so it stays closed. Run measureClauses first, on closed rows.
   function restoreKeptRows(root, kept) {
-    if (!kept || !root || !root.querySelectorAll || !kept.open.size) return;
-    for (const row of root.querySelectorAll(".row.has-more, .lrow.has-more")) {
-      const k = keptKey(row);
-      if (k && kept.open.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, true);
+    if (!kept || !root || !root.querySelectorAll) return;
+    if (kept.open.size) {
+      for (const row of root.querySelectorAll(".row.has-more, .lrow.has-more")) {
+        const k = keptKey(row);
+        if (k && kept.open.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, true);
+      }
+    }
+    // a search hit the reader closed is closed again
+    if (kept.closed && kept.closed.size) {
+      for (const row of root.querySelectorAll(".lrow.row-expanded[data-search-hit]")) {
+        const k = keptKey(row);
+        if (k && kept.closed.has(JSON.stringify([keptScope(row), k]))) setExpanded(row, false);
+      }
     }
   }
   function restoreKeptScroll(root, kept) {

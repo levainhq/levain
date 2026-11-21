@@ -1196,11 +1196,12 @@
     const twins = new Map();
     for (const r of rows) {
       const row = el("div", "lrow");
-      const id = [r.at, r.actor, lineHash(logLine(r))].join("|"), n = twins.get(id) || 0;
+      const line = logLine(r);
+      const id = [r.at, r.actor, lineHash(line)].join("|"), n = twins.get(id) || 0;
       twins.set(id, n + 1);
       row.dataset.keepKey = id + "|" + n;   // an opened line stays open across a redraw (captureKept)
       if (searched) row.dataset.searchHit = "1";
-      row.appendChild(el("span", "lsent", logLine(r)));
+      row.appendChild(el("span", "lsent", line));
       row.appendChild(el("span", "lactor", r.actor));
       row.appendChild(el("span", "lage", ago(r.at) || r.at));
       if (core && core.rowToggle) core.rowToggle(row);   // the row's own caret: shown only when the clamp cuts this line
@@ -1923,6 +1924,7 @@
     if (hadRows || (s.carry && Date.now() - s.born >= 15000)) s.carry = null;
     if (kept && s.carry) {
       for (const k of s.carry.open) kept.open.add(k);
+      if (s.carry.closed) for (const k of s.carry.closed) kept.closed.add(k);
       for (const [k, v] of s.carry.scroll) if (!kept.scroll.has(k)) kept.scroll.set(k, v);
     }
     const field = core && core.captureField ? core.captureField() : null;   // a focused field in a repainted body keeps its place, as in a board draw

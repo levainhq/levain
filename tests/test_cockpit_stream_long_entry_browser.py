@@ -43,14 +43,24 @@ def _episodes(long_text: str) -> list[dict]:
     return rows
 
 
-def _serve(tmp_path: Path, rows: list[dict]) -> _Served:
+def _serve(tmp_path: Path, rows: list[dict], *, tabbed: bool = False, seed: str = "") -> _Served:
+    """`tabbed`: the Stream shares one card with a second log panel (tabs "Feeds"). `seed`: one more intention in the tray, with this text."""
     from levain.cockpit import ProviderSpec, Read
     from levain.cockpit.providers import build_default_cockpit
 
     _root, src, _ids = _install(tmp_path)
+    if seed:
+        from anneal_memory.spores import IntentionStore
+        from tests.test_cockpit_k2a import TODAY
+        IntentionStore(_root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text=seed, disposition="seed", today=TODAY)
     ck = build_default_cockpit(src)
-    ck.register(ProviderSpec("stream", "log", "Stream", "feed", lambda c: Read(value={"rows": rows}), region="operate", rank=26,
+    tabs = "Feeds" if tabbed else ""
+    ck.register(ProviderSpec("stream", "log", "Stream", "feed", lambda c: Read(value={"rows": rows}), region="operate", rank=26, tabs=tabs,
                              search_fields=("verb", "target", "actor"), empty="no constellation episodes."))
+    if tabbed:
+        other = [{"verb": "note", "target": "a short line on the other tab", "actor": "flow", "at": "2026-11-20T11:00:00Z"}]
+        ck.register(ProviderSpec("sidefeed", "log", "Sidefeed", "feed", lambda c: Read(value={"rows": other}), region="operate", rank=27, tabs=tabs,
+                                 search_fields=("verb", "target", "actor"), empty="nothing."))
     return _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported")
 
 
@@ -485,3 +495,122 @@ def test_the_caret_follows_the_width_after_the_first_paint(tmp_path: Path) -> No
     assert not fits[0]["cut"] and not fits[0]["toggle"]["shown"], fits[0]           # fits at 1920: no caret
     assert cut[0]["cut"] and cut[0]["toggle"]["shown"], cut[0]                      # narrowed: cut, so the caret appears
     assert not fits_again[0]["cut"] and not fits_again[0]["toggle"]["shown"], fits_again[0]   # widened: the caret goes
+
+
+# ---- fix round 3: a tab that is not showing is left as it was; a closed search hit survives a repaint; the open focus view follows the width ----
+def _tab(name: str) -> str:
+    """Press the visible tab button of the card whose title is `name`."""
+    return (f"(() => {{ const b = [...document.querySelectorAll('.ck-tab')].find(x => x.textContent.startsWith('{name} ') && x.offsetParent); "
+            "if (!b) return 0; b.click(); return 1; })()")
+
+
+@needs_browser
+def test_a_long_entry_on_a_tab_keeps_its_caret_through_a_resize_made_while_another_tab_shows(tmp_path: Path) -> None:
+    """Resize with the Stream tab hidden, come back to it: the cut entry still has its caret (a hidden row has no height to read)."""
+    narrower = dict(VIEWPORTS["desk1280x1000"], w=1100)
+    with _serve(tmp_path, _log([_words(450)] + [f"an ordinary earlier entry number {i}" for i in range(4)]), tabbed=True) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["desk1280x1000"]},
+            {"until": STATE},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": _tab("Sidefeed")},
+            SETTLE,
+            {"eval": "getComputedStyle(" + PANEL + ").display"},
+            {"emulate": narrower},
+            SETTLE,
+            {"eval": _tab("Stream")},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    before, after = _state(out, -8), _state(out)
+    assert out["values"][-7] == 1 and out["values"][-5] == "none" and out["values"][-3] == 1, out["values"][-8:]   # the tab was switched, the Stream was hidden
+    assert before[0]["cut"] and before[0]["toggle"]["shown"], before[0]               # the case under test: cut, with its caret
+    assert after[0]["cut"] and after[0]["hasMore"] and after[0]["toggle"]["shown"], after[0]   # still, after the resize it missed
+
+
+@needs_browser
+def test_a_search_hit_the_reader_closed_stays_closed_when_the_panel_is_read_again(tmp_path: Path) -> None:
+    """A repaint draws fresh rows: the hit the reader closed is not opened again by it; a new query opens a hit once more."""
+    again = "new Promise(r => window.LevainCockpitView.refetchPanel('stream').then(x => r(String(x))))"
+    with _serve(tmp_path, _log(_hits(3))) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["phone390x800"]},
+            {"until": f"{PANEL} && {PANEL}.querySelector('.xfilter-input') && {PANEL}.querySelector('.lrow') && 1"},
+            SETTLE,
+            {"eval": _typed("quokka")},
+            {"until": f"{PANEL}.querySelectorAll('.lrow').length === 3 && 1"},
+            SETTLE,
+            {"eval": f"{ROW0_TOGGLE}.click(); 1"},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": again},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": _typed("quokk")},
+            SETTLE,
+            {"eval": STATE},
+            {"eval": again},
+            SETTLE,
+            {"eval": STATE},
+        ])
+    closed, repainted, newq, newq_read = _state(out, -10), _state(out, -7), _state(out, -4), _state(out)
+    assert not closed[0]["open"] and closed[1]["open"] and closed[2]["open"], closed               # the reader closed the first hit
+    assert not repainted[0]["open"] and repainted[0]["toggle"]["shown"], repainted[0]              # a repaint does not open it again
+    assert repainted[1]["open"] and repainted[2]["open"], repainted                                # the other hits are as they were
+    assert all(r["open"] for r in newq), newq                                                       # a new query opens every hit once more
+    assert all(r["open"] for r in newq_read), newq_read                                             # and a read of that query keeps them so
+
+
+MODAL = ("(() => { const m = document.querySelector('#levain-modal'); if (!m) return null; const rows = [...m.querySelectorAll('.row')]; "
+         "if (!rows.length) return null; return JSON.stringify(rows.map(r => { const c = r.querySelector('.clause.clampable'); "
+         "const t = r.querySelector(':scope > .clause-toggle'); return {cut: c ? c.scrollHeight > c.clientHeight : null, hasMore: r.classList.contains('has-more'), "
+         "toggle: t ? getComputedStyle(t).display !== 'none' : null, text: c ? c.textContent.length : 0}; })); })()")
+
+
+@needs_browser
+def test_an_open_focus_view_re_measures_its_rows_when_the_width_changes(tmp_path: Path) -> None:
+    """The focus view clamps a row of a typed list to three lines; a window change with it open decides each caret again."""
+    seed = _words(300)
+    wide, narrow = {"w": 1400, "h": 1000, "dpr": 1}, {"w": 520, "h": 1000, "dpr": 1}
+    tray = "document.querySelector('[data-ck-panel=\"tray\"] .pexpand')"
+    with _serve(tmp_path, _log(["x"]), seed=seed) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": wide},
+            {"until": f"{tray} && 1"},
+            SETTLE,
+            {"eval": f"{tray}.click(); 1"},
+            {"until": MODAL},
+            SETTLE,
+            {"eval": MODAL},
+            {"emulate": narrow},
+            SETTLE,
+            {"eval": MODAL},
+        ])
+    wide_rows, narrow_rows = json.loads(out["values"][-3]), json.loads(out["values"][-1])
+    long_w = [r for r in wide_rows if r["text"] >= 300][0]
+    long_n = [r for r in narrow_rows if r["text"] >= 300][0]
+    assert not long_w["cut"] and not long_w["hasMore"], long_w                       # fits three lines in the wide view: no caret
+    assert long_n["cut"] and long_n["hasMore"] and long_n["toggle"], long_n          # narrowed with the view open: cut, so the caret appears
+
+
+@needs_browser
+def test_a_resize_reads_each_row_once(tmp_path: Path) -> None:
+    """A width change measures every row of the card one time, not once by its bounded body and again by the grid."""
+    count = ("(() => { const d = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollHeight'); window.__reads = 0; "
+             "Object.defineProperty(Element.prototype, 'scrollHeight', {configurable: true, get() { "
+             "if (this.classList.contains('lsent')) window.__reads++; return d.get.call(this); }}); return 1; })()")
+    rows = _log([_words(450)] + [f"an ordinary earlier entry number {i}" for i in range(4)])
+    with _serve(tmp_path, rows) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": VIEWPORTS["desk1280x1000"]},
+            {"until": STATE},
+            SETTLE,
+            {"eval": count},
+            {"emulate": {"w": 1100, "h": 1000, "dpr": 1}},
+            SETTLE,
+            {"eval": "window.__reads"},
+            {"eval": f"{PANEL}.querySelectorAll('.lrow').length"},
+        ])
+    reads, rows_on_card = out["values"][-2], out["values"][-1]
+    assert 0 < reads <= rows_on_card, (reads, rows_on_card)
