@@ -1,4 +1,4 @@
-"""Tests for the cockpit snapshot store (levain/cockpit/snapshots.py; contract in docs/cockpit_snapshot_contract.md)."""
+"""Tests for the cockpit snapshot store (levain/cockpit/snapshots.py; the reasons behind it are in docs/cockpit_snapshot_contract.md)."""
 
 from __future__ import annotations
 

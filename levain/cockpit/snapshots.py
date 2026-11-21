@@ -2,9 +2,9 @@
 
 The worker derives each panel and publishes the result here; the serve (and any other reader, in any language) answers
 from the stored snapshot instead of deriving on the request path. The file is `snapshots.db` in the cockpit data root,
-WAL mode, one writer and many read-only readers. The language-neutral contract (tables, columns, the gen rule, the body
-encoding, the contract string, the freshness fields a reader derives) is docs/cockpit_snapshot_contract.md; this module
-is the Python implementation of it. Stdlib only.
+WAL mode, one writer and many read-only readers. This module and the symbols docs/cockpit_snapshot_contract.md points at
+are the contract; that document holds the reasons behind the design (single writer, the gen rule, the modes), not the
+field rules. Stdlib only.
 """
 
 from __future__ import annotations
