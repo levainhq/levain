@@ -32,6 +32,7 @@ malformed one raises (the occurrence stays ``launched`` for the reaper and lapse
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -89,6 +90,7 @@ class SessionInstall:
     episodic_path: Path | None
     values: Mapping[str, Any]
     workspaces: Mapping[str, WorkspaceSetting] = field(default_factory=dict)
+    coord_dir: Path | None = None
 
 
 def _abs(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
@@ -98,6 +100,8 @@ def _abs(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
     p = Path(v).expanduser()
     if kind == "dir" and not p.is_dir():
         raise InstallRefused(f"{path}: {key} {str(p)!r} is not a directory")
+    if kind == "none":
+        return p
     if kind == "file" and p.is_dir():       # a missing file is allowed (recall reads it as an empty memory)
         raise InstallRefused(f"{path}: {key} {str(p)!r} is a directory, not a file")
     return p
@@ -121,7 +125,7 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
         raise InstallRefused(f"{path} is not a JSON object")
     if doc.get("schema") != INSTALL_SCHEMA:
         raise InstallRefused(f"{path} has schema {doc.get('schema')!r}, not {INSTALL_SCHEMA}")
-    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values", "workspaces"}
+    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values", "workspaces", "coord_dir"}
     if unknown:
         raise InstallRefused(f"{path}: unknown key {sorted(unknown)[0]!r}")
     root = _abs(doc, "cockpit_root", path, kind="dir")
@@ -132,7 +136,8 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
     values = doc.get("values", {})
     if not isinstance(values, dict):
         raise InstallRefused(f"{path}: values is not an object")
-    return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path))
+    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="none")
+    return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path), coord)
 
 
 def _parse_workspaces(raw: Any, path: Path) -> Mapping[str, WorkspaceSetting]:
@@ -158,7 +163,8 @@ def _parse_workspaces(raw: Any, path: Path) -> Mapping[str, WorkspaceSetting]:
 
 def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: str | None = None,
                   episodic_path: Path | str | None = None, values: Mapping[str, Any] | None = None,
-                  workspaces: Mapping[str, Mapping[str, str]] | None = None) -> Path:
+                  workspaces: Mapping[str, Mapping[str, str]] | None = None,
+                  coord_dir: Path | str | None = None) -> Path:
     """Write the install file atomically: the new document is checked FIRST (as :func:`read_install` would read it
     back), then written to a temp in the directory (fsync, mode 0600) and renamed over the old one. A document that
     fails the check raises :class:`InstallRefused` and leaves the working install as it was."""
@@ -168,6 +174,8 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
         doc["launcher"] = launcher
     if episodic_path is not None:
         doc["episodic_path"] = str(Path(episodic_path).expanduser())
+    if coord_dir is not None:
+        doc["coord_dir"] = str(Path(coord_dir).expanduser())
     if values:
         doc["values"] = dict(values)
     if workspaces:
@@ -268,6 +276,122 @@ def _episode_hooks(store: AgentStore, install: SessionInstall, agent_id: str, ro
     return supervise.Hooks(verify=base.verify, on_end=chained)
 
 
+# -- the report channel (levain#225): no card, no ``done`` ----------------------------------------------------------------
+
+REPORT_MISSING, REPORT_OVERSIZE, REPORT_MALFORMED, CARD_NOT_FILED = (
+    "report_missing", "report_oversize", "report_malformed", "card_not_filed")
+_SUMMARY_MAX = 300
+_BODY_MAX = 8000          # the review store's bound on one item's canonical body (its ``_insert``), counted in characters
+
+
+def _collapse(text: str) -> str:
+    return " ".join(text.split())
+
+
+def report_card_body(agent_id: str, occurrence_id: str, data: bytes, text: str, usage: Mapping[str, Any]) -> dict[str, Any]:
+    """The card body for one report: canonical-JSON-able, whole under :data:`_BODY_MAX` characters. The report text is the
+    only part cut to fit (a visible ``[cut at N of M bytes]`` marker closes a cut text); every other key is bounded
+    by construction. ``usage`` is root-authored and rides beside the report, never inside it."""
+    from levain.contracts.canon import canonical
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    body: dict[str, Any] = {"kind": "session-report", "agent": agent_id, "occurrence": occurrence_id,
+                            "summary": _collapse(first)[:_SUMMARY_MAX], "report": text,
+                            "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "usage": dict(usage)}
+    if len(canonical(body)) <= _BODY_MAX:
+        return body
+    lo, hi = 0, len(text)          # the longest prefix whose body fits (the length is monotone in the prefix)
+
+    def cut(n: int) -> dict[str, Any]:
+        kept = text[:n]
+        mark = f"[cut at {len(kept.encode('utf-8'))} of {len(data)} bytes]"
+        return {**body, "report": kept + "\n" + mark}
+
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(canonical(cut(mid))) <= _BODY_MAX:
+            lo = mid
+        else:
+            hi = mid - 1
+    return cut(lo)
+
+
+def _usage_of(store: AgentStore, end: Any) -> dict[str, Any]:
+    """The card's ``usage`` block: the launcher's root-side readings from ``end.usage`` (None stays null) and the caps the
+    occurrence was reserved under. A cap that cannot be read is left out, never guessed."""
+    u = end.usage
+    out: dict[str, Any] = {"actions": u.actions, "tunnel_bytes": u.tunnel_bytes, "seconds": u.seconds, "basis": u.source}
+    try:
+        with store.read() as conn:
+            row = conn.execute("SELECT cap_actions, cap_tunnel_bytes, cap_seconds FROM agent_reservations"
+                               " WHERE occurrence_id = ?", (end.occurrence_id,)).fetchone()
+        caps = {} if row is None else {k: v for k, v in zip(("actions", "tunnel_bytes", "seconds"), row)
+                                       if type(v) is int}
+    except Exception:  # noqa: BLE001 - the caps are context; a store that will not answer leaves them out
+        caps = {}
+    out["caps"] = caps
+    return out
+
+
+def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, agent_id: str,
+                  role_hash: str | None, clock: Callable[[], datetime] | None):
+    """The session fire's Hooks: ONE verify that is the only place a card is filed, and the episode on_end when the
+    install names an episodic path. Order of ``verify``: a state other than ``done`` files nothing; the process-wide
+    ``base.verify`` when set, then the win verifier (a non-None ``Hooks.verify`` replaces the supervisor's own), the
+    first reason winning; then the report read through the launcher; then the card. Each miss is a reason that turns the ``done``
+    into ``failed``. The report is UNTRUSTED DATA: it is checked for size and text only, never obeyed."""
+    from levain.agents import gauges, supervise
+    from levain.slot.runtime_grammar import REPORT_CAP
+    base = supervise.HOOKS
+    win = gauges.win_verifier(store, clock=clock)
+    on_end = base.on_end if install.episodic_path is None else _episode_hooks(store, install, agent_id, role_hash).on_end
+
+    def verify(end: Any) -> str | None:
+        if end.state != "done":
+            return None
+        for judge in (base.verify, win):
+            verdict = None if judge is None else judge(end)
+            if verdict is not None:
+                return verdict
+        with store.read() as conn:
+            row = conn.execute("SELECT session_key FROM agent_occurrences WHERE occurrence_id = ?",
+                               (end.occurrence_id,)).fetchone()
+        reader = getattr(launcher, "report", None)
+        if row is None or row[0] is None or reader is None:
+            return REPORT_MISSING
+        try:
+            data = reader(row[0])
+        except Exception as exc:  # noqa: BLE001 - a refusal names its reason; any other fault is no report
+            name = getattr(exc, "name", "")
+            return REPORT_OVERSIZE if name == "report-oversize" else REPORT_MALFORMED if name == "report-malformed" \
+                else REPORT_MISSING
+        if data is None:
+            return REPORT_MISSING
+        if type(data) is not bytes:
+            return REPORT_MALFORMED
+        if len(data) > REPORT_CAP:
+            return REPORT_OVERSIZE
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return REPORT_MALFORMED
+        if not data or "\0" in text:
+            return REPORT_MALFORMED
+        if install.coord_dir is None:
+            return CARD_NOT_FILED
+        try:
+            from levain.desk import review
+            from levain.desk.store import CoordStore
+            body = report_card_body(agent_id, end.occurrence_id, data, text, _usage_of(store, end))
+            review.file_item(CoordStore(install.coord_dir), "agent", body, dedupe_key=f"session:{end.occurrence_id}",
+                             authority_relevant=False)      # new=False: filed by an earlier delivery, which counts
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("session report card for %s was not filed: %s", end.occurrence_id, type(exc).__name__)
+            return CARD_NOT_FILED
+        return None
+
+    return supervise.Hooks(verify=verify, on_end=on_end)
+
+
 def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
                  clock: Callable[[], datetime] | None = None) -> dict[str, Any]:
     """The keyword arguments of :func:`levain.agents.session.run_session` for a session occurrence (see the module
@@ -295,7 +419,7 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     journal = RunJournal(store.directory)   # the run was admitted at the launch (controller._admit_run_in), not here
     register_session_win_check()
     # the episode's agent id is the occurrence's own agent_id and the role the SIGNED spec pins, never agents.name
-    hooks = None if install.episodic_path is None else _episode_hooks(store, install, row[0], signed["role"]["role_hash"])
+    hooks = _report_hooks(store, install, launcher, row[0], signed["role"]["role_hash"], clock)
     authority = AgentAuthority(install.cockpit_root)
     supervise.prime_authority(authority)   # a fire is a fresh process: replay once, so the first fence read is not refused
     sup = supervise.Supervisor(store, authority=authority, clock=clock, journal=journal, hooks=hooks)

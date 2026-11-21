@@ -32,6 +32,8 @@ it there, ``bind_stdin``: ``ticket-required``), and into no log line, refusal de
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import collections
 import hashlib
 import logging
@@ -49,7 +51,7 @@ from levain.slot import Refused, layout
 from levain.slot.control_client import ControlClient
 from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
-from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
+from levain.slot.runtime_grammar import RENDER_FORMAT, REPORT_CAP, parse_stdin
 from levain.slot.supervisor import (HELPER_DEADLINE_DEFAULT_S, HELPER_DEADLINE_S, KILL_GRACE_S, SUDO, _host,
                                     parse_helper_line, pick_routes, prepare_answer, read_base_map, spawn)
 
@@ -62,7 +64,7 @@ PORT_OPS = frozenset({"RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS
 
 _HELPER_OUT_MAX = 1 << 20     # a helper answer past this is no single line (the supervisor's bound)
 _ERR_TAIL = 1 << 14           # DECISION: the helper's stderr and the vendor's stderr are kept to their last 16 KiB
-_ENDED_KEEP = 256             # DECISION: sessions this runtime proved ended, remembered so a repeat END is not a 2nd teardown
+_ENDED_KEEP = 256            # DECISION: sessions this runtime proved ended, remembered so a repeat END is not a 2nd teardown
 
 
 class DispatchControlPort:
@@ -231,6 +233,30 @@ class HelperSlotRuntime:
 
     def _teardown(self, session: str) -> "dict[str, object]":
         return self._run("teardown", session)
+
+    def read_report(self, session: str) -> "bytes | None":
+        """The session's report file as root read it from the retained tree (``read-report``), or None when the session
+        left none. The bytes are UNTRUSTED DATA: this checks only the wire (one base64 field, the byte cap), never what
+        the text says. A refusal of the helper (``report-unreadable``, ``report-oversize``, ``report-malformed``, a state
+        gate) is raised as :class:`~levain.slot.Refused` under its own name."""
+        if type(session) is not str or SESSION_RE.fullmatch(session) is None:
+            raise Refused("report-session-malformed", "the session id is off the grammar")
+        ans = self._run("read-report", session)
+        present = ans.get("present")
+        if present is False and set(ans) == {"present"}:
+            return None
+        b64 = ans.get("b64")
+        if present is not True or type(b64) is not str or set(ans) != {"present", "b64"}:
+            raise Refused("helper-output-malformed", "read-report: the answer is off its shape")
+        if len(b64) > 4 * ((REPORT_CAP + 2) // 3):
+            raise Refused("report-oversize", "read-report: the answer is over the report cap")
+        try:
+            data = base64.b64decode(b64.encode("ascii"), validate=True)
+        except (binascii.Error, ValueError):
+            raise Refused("helper-output-malformed", "read-report: the bytes are not base64") from None
+        if len(data) > REPORT_CAP:
+            raise Refused("report-oversize", "read-report: the answer is over the report cap")
+        return data
 
     def final_tunnel_bytes(self, session: str) -> "int | None":
         """The final tunnel total root's END published for ``session`` (CONTRACT §5.1 ``tunnel_bytes``), kept only

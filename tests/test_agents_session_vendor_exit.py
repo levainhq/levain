@@ -72,7 +72,7 @@ def _fire_once(rig, monkeypatch, tmp_path, vendor_code):
     from anneal_memory import Store
     Store(tmp_path / "episodes.db", audit=False).close()
     W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher="vendor",
-                    episodic_path=tmp_path / "episodes.db")
+                    episodic_path=tmp_path / "episodes.db", coord_dir=tmp_path / "coord")
     monkeypatch.setattr(delivery, "process_identity",
                         lambda pid: ("2026-11-04T00:00:00", f"levain agents _fire {oid}"))
     return ctl.fire(rig.store, oid, run=ctl.run_agent, clock=rig.now), oid

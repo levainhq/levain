@@ -84,6 +84,13 @@ class Stub:
     def usage(self, session_key):
         return self.used
 
+    report_bytes = b"# Night report\nthe stub did its work.\n"     # what ``report`` answers; None: no report; an exception raises
+
+    def report(self, session_key):
+        if isinstance(self.report_bytes, BaseException):
+            raise self.report_bytes
+        return self.report_bytes
+
 
 class ApiExec:
     def __init__(self, micros=100_000, exposure=None):

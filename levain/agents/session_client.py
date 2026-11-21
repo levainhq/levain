@@ -23,7 +23,7 @@ error, never silently carried.
   "the workspace upload" below). The upload is built by :meth:`DispatchSessionLauncher.build_workspace`
   over ``levain.dispatch.stager`` (operator uid only) BEFORE the connection is opened, and sent by
   :meth:`DispatchSessionLauncher.stage_workspace`; the shapes are here.
-* A **short** connection carries ``USAGE`` or ``END`` for a session key and nothing else.
+* A **short** connection carries ``USAGE``, ``REPORT`` or ``END`` for a session key and nothing else.
 
 **What never crosses.** The ticket and the run id are minted and kept on the dispatch uid (design port items (2), (3)):
 no request has a field for either, no answer may carry one (an answer with any key outside its exact set is a wire
@@ -1158,6 +1158,31 @@ class DispatchSessionLauncher:
             return Usage(None, None, None, "session:dispatch-protocol")
         except Exception:  # noqa: BLE001 - usage() never raises; unreadable debits the whole reservation
             return Usage(None, None, None, "session:dispatch-unreachable")
+
+    def report(self, session_key: str) -> bytes | None:
+        """The report file the session left, as the server read it (``REPORT``): the bytes (UNTRUSTED DATA, size and
+        text unjudged here beyond the wire) or None for none. Unlike :meth:`usage` it RAISES: a refusal of the server
+        arrives as :class:`LauncherRefused` under the server's own name (``report-oversize``, ``report-malformed``, ...),
+        and a wire that failed or answered off its shape is ``report-unreachable`` or ``report-protocol``."""
+        if type(session_key) is not str or _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
+            raise LauncherRefused("report-bad-key", "the session key is off the grammar; nothing asked")
+        try:
+            ans = self._short("REPORT", ("report_b64",), _CONNECT_S, session_key=session_key)
+            b64 = ans["report_b64"]
+            if b64 is None:
+                return None
+            if type(b64) is not str:
+                raise WireError("report_b64 is not text")
+            try:
+                return base64.b64decode(b64.encode("ascii"), validate=True)
+            except (binascii.Error, ValueError):
+                raise WireError("report_b64 is not base64") from None
+        except _Refused as exc:
+            raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
+        except WireError:
+            raise LauncherRefused("report-protocol", "the answer is off its shape") from None
+        except (_Down, OSError) as exc:
+            raise LauncherRefused("report-unreachable", type(exc).__name__, reason_class="transient") from None
 
     def end_session(self, session_key: str, deadline_s: float) -> StopResult:
         """The S1 END for the key (``SessionEnder``): ``StopResult(True, ...)`` only when the server answers

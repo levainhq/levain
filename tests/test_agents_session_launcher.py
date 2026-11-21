@@ -98,6 +98,13 @@ class FakeRuntime:
     def __init__(self, end=True, rc=0, fail=None):
         self.starts, self.ended, self.end_ok, self.rc, self.fail = [], [], end, rc, fail
         self.children = []
+        self.reports = {}              # session -> bytes | None | an exception to raise (the report channel's read)
+
+    def read_report(self, session):
+        v = self.reports.get(session)
+        if isinstance(v, BaseException):
+            raise v
+        return v
 
     def start(self, req):
         self.starts.append(req)

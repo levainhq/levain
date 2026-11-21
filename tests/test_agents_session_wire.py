@@ -41,7 +41,13 @@ def _fire(rig, oid, monkeypatch):
     return ctl.fire(rig.store, oid, run=ctl.run_agent, clock=rig.now)
 
 
+def _coord(rig):
+    """The review store directory a report card is filed into (beside the agent store, never inside it)."""
+    return rig.store.directory.parent / "coord"
+
+
 def _install(rig, **kw):
+    kw.setdefault("coord_dir", _coord(rig))
     return W.write_install(rig.store.directory, cockpit_root=rig.world.root, **kw)
 
 

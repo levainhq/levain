@@ -48,7 +48,7 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   same per-key lock. WAIT, TERM, ABORT map onto the launched child. On SIGTERM/SIGINT (:meth:`RunServer.shutdown`) new
   LAUNCHes are refused and every registered session (spawns in flight included) is ENDed on its own thread, returning
   by the absolute :data:`SHUTDOWN_BUDGET_S` deadline; one not proven by then is left to the root reaper by its record.
-* **USAGE / END** (short connections). USAGE is ``RealLauncher.usage`` by the recorded key. END is asynchronous and
+* **USAGE / REPORT / END** (short connections). REPORT is ``RealLauncher.report`` by the recorded key (the report bytes as base64, or null for none). USAGE is ``RealLauncher.usage`` by the recorded key. END is asynchronous and
   idempotent (T7): the first END for a key starts one ``RealLauncher.stop`` on a worker and answers within the
   caller's deadline with its result, else ``StopResult(False, "END in progress")``; a later END joins the same job, and a
   proven result is kept for the process's life and never run twice. [Deviation from design section 2: a thread per
@@ -86,6 +86,7 @@ that lands in that window is caught by ``start_run``'s release transaction, whic
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import errno
 import hashlib
@@ -759,6 +760,10 @@ class RunServer:
         if op == "USAGE":
             key = self._key(self._fields(req, "session_key")["session_key"])
             return C.ok_answer(rid, usage=C.usage_to_wire(self.launcher.usage(key))), mine
+        if op == "REPORT":
+            key = self._key(self._fields(req, "session_key")["session_key"])
+            data = self.launcher.report(key)
+            return C.ok_answer(rid, report_b64=None if data is None else base64.b64encode(data).decode("ascii")), mine
         if op == "END":
             f = self._fields(req, "session_key", "deadline_ms")
             got = self._end(self._key(f["session_key"]), C._int(f["deadline_ms"], "deadline_ms") / 1000.0)

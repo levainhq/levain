@@ -1059,6 +1059,35 @@ class RealLauncher:
                      actions=self._read(self.sources.calls, run_id), tunnel_bytes=self._read(self.sources.tunnel_bytes, session),
                      seconds=self._read(self.sources.seconds, session))
 
+    def report(self, session_key: str) -> bytes | None:
+        """The report file the session left, read under the RECORDED ``session_key`` and nothing else: the bytes (UNTRUSTED
+        DATA), or None when it left none. Read only once the record says ``ended`` (S1 END proved the group gone and
+        the tree is root's). Every other case raises :class:`LauncherRefused` under a name: ``report-unindexed``,
+        ``report-index-unreadable``, ``report-auth-mismatch``, ``report-end-unproven``, ``report-unsupported`` (a runtime
+        with no reader), or the root verb's own refusal (``report-unreadable``, ``report-oversize``,
+        ``report-malformed``, a state gate), kept under its name."""
+        try:
+            rec = self.index.get(session_key)
+        except Exception:  # noqa: BLE001
+            raise LauncherRefused("report-index-unreadable", "the session record does not read") from None
+        if rec is None:
+            raise LauncherRefused("report-unindexed", "no record under this key")
+        if rec.get("auth", "passthrough") != self.auth:
+            raise LauncherRefused("report-auth-mismatch", "launched under the other auth")
+        session = rec.get("session")
+        if rec["state"] != "ended" or type(session) is not str or not session:
+            raise LauncherRefused("report-end-unproven", "the run is not proven ended")
+        reader = getattr(self.runtime, "read_report", None)
+        if reader is None:
+            raise LauncherRefused("report-unsupported", "this runtime reads no report")
+        try:
+            data = reader(session)
+        except Refused as exc:
+            raise LauncherRefused(exc.name, exc.detail) from None
+        if data is not None and type(data) is not bytes:
+            raise LauncherRefused("report-malformed", "the runtime answered no bytes")
+        return data
+
     @staticmethod
     def _read(fn: Callable[[str], Any], arg: object) -> int | None:
         if type(arg) is not str or not arg:
