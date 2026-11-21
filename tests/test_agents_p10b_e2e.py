@@ -8,9 +8,9 @@ the fire child). The stub's vendor is a real process behind the product's own ``
 is a real exit status. What this proves is the STUB path on this machine: the real launcher, a real vendor and a real S1 END
 are the VM's and Gate 2's own nights.
 
-Every case was RUN by hand on a tmp install first and is pinned to what the run gave. A case that needs a launched row
-launches it in-process (see ``tests/_p10b_rig.py``); ``test_p10b_the_tick_claims_a_session_window_and_launches_nothing`` is
-the case that says why.
+Every case was RUN by hand on a tmp install first and is pinned to what the run gave. A SCHEDULED row is claimed and launched
+by the CLI's tick (levain#219), its fire's spawn recorded by the spawn gate and the fire then started by the case; a MANUAL
+row is claimed and launched in-process (``levain agents`` has no hand start; see ``tests/_p10b_rig.py``).
 """
 from __future__ import annotations
 
@@ -74,38 +74,95 @@ def test_p10b_a_fire_without_the_entry_cannot_reach_the_stub(s):
 
 # ---------------------------------------------------------------------------- register, sign, tick, fire, done
 
-def test_p10b_the_tick_claims_a_session_window_and_launches_nothing(s):
-    """The scheduled half of the path. The tick, run as a CLI process at two fixed instants either side of the agent's
-    :05 slot, claims the window once and only once (a second tick at the same instant claims nothing more), and leaves the
-    row ``admitted``: no launch, no fire, no vendor. A row nothing launches is the one gap the in-process launch of the other
-    cases stands in for."""
+RUN_FIGURE = 20_000_000      # the link's signed budget_run_usd_micros (``Session.link_doc``): what a tick launch reserves
+
+
+def _at(day, hh: int, mm: int) -> str:
+    return utc(day.year, day.month, day.day, hh, mm, 0)
+
+
+def _tick(s: Session, now: str, rc: int = 0):
+    got = s.cli("agents", "tick", now=now)
+    assert got.rc == rc, got.text
+    return got
+
+
+def _install(s: Session, launcher: str | None) -> None:
+    """Set-up: the install file naming ``launcher`` (None: no launcher, the unwired default)."""
+    from levain.agents import session_wire
+
+    session_wire.write_install(s.store_dir, cockpit_root=s.world.root, launcher=launcher, episodic_path=s.episodic)
+
+
+def _admitted_unlaunched(s: Session, day, *, launcher: str | None = None) -> str:
+    """The agent's 12:05 slot claimed by the tick with the install naming ``launcher`` (none, or one not registered), so
+    nothing could launch it: the row stays ``admitted``, holding nothing, the tick says so and exits 6 (np-4c157a8f (a)).
+    Its id."""
+    _install(s, launcher)
+    _tick(s, _at(day, 12, 4))
+    got = _tick(s, _at(day, 12, 6), rc=6)
+    (row,) = s.rows()
+    oid = row["occurrence_id"]
+    assert (row["kind"], row["state"], row["launched_at"]) == ("scheduled", "admitted", None)
+    assert s.held(oid) == ([], []) and s.spawned() == [] and s.started() == 0
+    assert "no usable session launcher, so nothing was launched" in got.err, got.text
+    return oid
+
+
+def test_p10b_the_tick_launches_a_session_window(s):
+    """The scheduled path (levain#219). The tick, run as a CLI process at two fixed instants either side of the agent's
+    :05 slot, claims the window and LAUNCHES it under the signed link: the row is ``launched``, its reservation open at
+    the link's whole signed per-run figure (np-fe3e2ebd (a)), one slot held, and the fire's spawn asked once for this
+    occurrence (recorded by the spawn gate). No vendor has run: only a fire starts one."""
     s.register()
     day = real_now() + timedelta(days=1)
-    first = s.cli("agents", "tick", now=utc(day.year, day.month, day.day, 12, 4, 0))
-    assert (first.rc, s.rows()) == (0, [])                  # the first pass only sets the agent's cursor
-    for _ in range(2):                                      # the same instant twice: one claim
-        got = s.cli("agents", "tick", now=utc(day.year, day.month, day.day, 12, 6, 0))
-        assert got.rc == 0, got.text
+    first = _tick(s, _at(day, 12, 4))
+    assert s.rows() == [], first.text                       # the first pass only sets the agent's cursor
+    _tick(s, _at(day, 12, 6))
     (row,) = s.rows()
+    oid = row["occurrence_id"]
     assert (row["kind"], row["state"], row["key"], row["launched_at"]) == (
-        "scheduled", "admitted", f"{day:%Y-%m-%d}T12:05:00Z", None)
-    assert (s.held(row["occurrence_id"]), s.started()) == (([], []), 0)
-    assert [(o["state"], o["launched_at"]) for o in s.occurrences()] == [("admitted", None)]
+        "scheduled", "launched", f"{day:%Y-%m-%d}T12:05:00Z", f"{day:%Y-%m-%d}T12:06:00Z")
+    assert row["link_id"] is not None and row["session_key"] is None
+    slots, reservations = s.held(oid)
+    assert len(slots) == 1 and reservations == [("open",)]
+    res = s.reservation(oid)
+    assert (res["reserved_usd_micros"], res["billing"]) == (RUN_FIGURE, None)    # an api_key reservation names no billing
+    assert (s.spawned(), s.started()) == ([oid], 0)
+    assert [(o["state"], o["launched_at"]) for o in s.occurrences()] == [("launched", f"{day:%Y-%m-%d}T12:06:00Z")]
+
+
+def test_p10b_a_second_tick_at_the_same_instant_launches_nothing_twice(s):
+    """A tick at the very instant of the tick that launched the row: nothing moves. The row keeps the launch columns the
+    first tick wrote, one reservation and one slot, and the fire's spawn was asked once, not twice."""
+    s.register()
+    day = real_now() + timedelta(days=1)
+    _tick(s, _at(day, 12, 4))
+    _tick(s, _at(day, 12, 6))
+    (before,) = s.rows()
+    oid = before["occurrence_id"]
+    assert before["state"] == "launched" and s.spawned() == [oid]
+    held = s.held(oid)
+    _tick(s, _at(day, 12, 6))
+    (after,) = s.rows()
+    assert after == {**before, "lease_until": after["lease_until"]}   # the reaper may renew the lease; nothing else
+    assert s.held(oid) == held and len(held[0]) == 1 and held[1] == [("open",)]
+    assert s.spawned() == [oid] and s.started() == 0
 
 
 def test_p10b_register_sign_tick_fire_done(s):
-    """invariant 7's whole path for a session agent. Registered and signed by the CLI, claimed by the CLI's tick, launched
-    (in-process), fired as a real detached process, ``done`` as ``levain agents show --json`` reads it, with the one episode
-    under the agent's id. The vendor was asked once, for this occurrence, on the brokered route with the reserved dollars.
-    The stub states the usage it read, zero dollars, so the reservation is settled on that actual and debits none of it."""
+    """invariant 7's whole path for a session agent. Registered and signed by the CLI, claimed and launched by the CLI's
+    tick, fired as a real detached process, ``done`` as ``levain agents show --json`` reads it, with the one episode
+    under the agent's id. The vendor was asked once, for this occurrence, on the brokered route with the reserved dollars
+    (the link's signed per-run figure). The stub states the usage it read, zero dollars, so the reservation is settled on
+    that actual and debits none of it."""
     s.register()
     day = real_now() + timedelta(days=1)
-    s.cli("agents", "tick", now=utc(day.year, day.month, day.day, 12, 4, 0))
-    s.cli("agents", "tick", now=utc(day.year, day.month, day.day, 12, 6, 0))
+    _tick(s, _at(day, 12, 4))
+    _tick(s, _at(day, 12, 6))
     (claimed,) = s.rows()
     oid = claimed["occurrence_id"]
-    assert s.launch(oid).outcome == "launched"
-    assert s.row(oid)["state"] == "launched" and s.started() == 0
+    assert s.row(oid)["state"] == "launched" and s.spawned() == [oid] and s.started() == 0
 
     assert s.fired(oid) == 0, s.fire_log(oid)
     shown = s.shown()
@@ -117,11 +174,109 @@ def test_p10b_register_sign_tick_fire_done(s):
     assert "ended done: completed" in ep["content"]
     (asked,) = s.start_records()
     assert (asked["occurrence_id"], asked["session_key"], asked["auth"], asked["usd_micros"]) == (
-        oid, s.row(oid)["session_key"], "brokered", EXPOSURE_USD_MICROS)
+        oid, s.row(oid)["session_key"], "brokered", RUN_FIGURE)
     _ended_clean(s, oid)
     res = s.reservation(oid)
     assert (res["reserved_usd_micros"], res["settled_reason"], res["debited_usd_micros"]) == (
-        EXPOSURE_USD_MICROS, "actual", STUB_USAGE_USD_MICROS)
+        RUN_FIGURE, "actual", STUB_USAGE_USD_MICROS)
+
+
+# ------------------------------------------------------------------------- what keeps the tick from launching
+
+@pytest.mark.parametrize("launcher", [None, "p10b-not-registered"])
+def test_p10b_no_usable_launcher_leaves_the_row_admitted_until_its_grace(s, launcher):
+    """np-4c157a8f (a): an install that names no launcher, or one this process has not registered, launches nothing. The
+    row stays ``admitted`` holding no slot and no reservation, the tick says so and exits 6, and it is retried each tick
+    until its grace is gone, when it ends ``missed`` / ``never_launched``."""
+    s.register()
+    day = real_now() + timedelta(days=1)
+    oid = _admitted_unlaunched(s, day, launcher=launcher)
+    named = "the install names no launcher" if launcher is None else f"launcher {launcher!r}, which is not registered"
+    again = _tick(s, _at(day, 12, 10), rc=6)
+    assert named in again.err, again.text
+    assert (s.row(oid)["state"], s.held(oid), s.spawned()) == ("admitted", ([], []), [])
+    _tick(s, _at(day, 12, 25))
+    row = s.row(oid)
+    assert (row["state"], row["reason"], row["launched_at"]) == ("missed", "never_launched", None)
+    assert s.held(oid) == ([], []) and s.spawned() == [] and s.started() == 0
+
+
+def test_p10b_a_paused_agent_s_admitted_row_ends_stopped_paused(s):
+    """An admitted row whose agent is paused (``agents pause``) before the tick that could launch it: the launch ends it
+    ``stopped`` / ``paused``, taking nothing, and no fire is asked for."""
+    s.register()
+    day = real_now() + timedelta(days=1)
+    oid = _admitted_unlaunched(s, day)
+    paused = s.cli("agents", "pause", "p10b-agent")
+    assert paused.rc == 0, paused.text
+    _install(s, STUB_LAUNCHER)
+    _tick(s, _at(day, 12, 7))
+    row = s.row(oid)
+    assert (row["state"], row["reason"], row["launched_at"]) == ("stopped", "paused", None)
+    assert s.held(oid) == ([], []) and s.spawned() == []
+
+
+def test_p10b_a_revoked_agent_s_admitted_row_ends_stopped_revoked(s):
+    """``levain agents revoke`` after the claim and before the tick that could launch it: the launch finds no live link
+    and ends the row ``stopped`` / ``revoked``, taking nothing; no fire is asked for."""
+    s.register()
+    day = real_now() + timedelta(days=1)
+    oid = _admitted_unlaunched(s, day)
+    revoked = s.cli("agents", "revoke", s.agent()["agent_id"], "--data-root", str(s.world.root), "--signing-key",
+                    str(s.key))
+    assert revoked.rc == 0, revoked.text
+    assert s.row(oid)["state"] == "admitted"
+    _install(s, STUB_LAUNCHER)
+    _tick(s, _at(day, 12, 7))
+    row = s.row(oid)
+    assert (row["state"], row["reason"], row["launched_at"]) == ("stopped", "revoked", None)
+    assert s.held(oid) == ([], []) and s.spawned() == []
+
+
+def test_p10b_an_admitted_row_whose_link_expired_ends_stopped_expired(s):
+    """A link that expires between the claim of a slot and the tick that could launch it (inside the slot's grace): the
+    launch ends the row ``stopped`` / ``expired``, taking nothing; no fire is asked for. The ticks are fixed instants
+    near the real clock, since a link is signed at the real clock."""
+    from levain.cockpit.consent import utc_stamp
+
+    slot = (real_now() + timedelta(minutes=3)).replace(second=0, microsecond=0)
+    while slot.minute != 5:
+        slot += timedelta(minutes=1)
+
+    def at(minutes: int) -> str:
+        return (slot + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    s.register(expires_at=utc_stamp(slot + timedelta(minutes=5)))
+    _install(s, None)
+    _tick(s, at(-1))
+    _tick(s, at(1), rc=6)
+    (row,) = s.rows()
+    oid = row["occurrence_id"]
+    assert row["state"] == "admitted"
+    _install(s, STUB_LAUNCHER)
+    _tick(s, at(7))
+    row = s.row(oid)
+    assert (row["state"], row["reason"], row["launched_at"]) == ("stopped", "expired", None)
+    assert s.held(oid) == ([], []) and s.spawned() == []
+
+
+def test_p10b_the_run_ceiling_refuses_the_next_tick_launch(s):
+    """With the link's signed ``run_ceiling`` at 1: the 12:05 slot is launched by the tick and run to ``done``; the 13:05
+    slot of the same day's window is refused by the CEILING at its launch, ``skipped-budget`` / ``ceiling``, taking no slot
+    and no reservation, and no fire is asked for it."""
+    s.register(run_ceiling=1)
+    day = real_now() + timedelta(days=1)
+    _tick(s, _at(day, 12, 4))
+    _tick(s, _at(day, 12, 6))
+    (first,) = s.rows()
+    assert s.fired(first["occurrence_id"]) == 0, s.fire_log(first["occurrence_id"])
+    assert s.row(first["occurrence_id"])["state"] == "done"
+    _tick(s, _at(day, 13, 6))
+    second = [r for r in s.rows() if r["occurrence_id"] != first["occurrence_id"]]
+    assert [(r["key"], r["state"], r["reason"], r["launched_at"]) for r in second] == [
+        (f"{day:%Y-%m-%d}T13:05:00Z", "skipped-budget", "ceiling", None)]
+    assert s.held(second[0]["occurrence_id"]) == ([], [])
+    assert s.spawned() == [first["occurrence_id"]] and s.started() == 1
 
 
 # ----------------------------------------------------------------------------------- a vendor exit that is not zero

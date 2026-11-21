@@ -6,12 +6,11 @@ levain process the case starts, the fire child included), the agent (a registere
 fire (``controller.spawn_fire`` itself, over the entry's argv, so a case runs the one door to a fire with the product's own
 detached, session-leading child).
 
-What a case sets up in-process, never the thing it asserts about: the install file (``session_wire.write_install``) and the
-LAUNCH of a claimed row (``controller.launch``): a CLI process claims a scheduled window but does not launch a session
-agent's row (``test_p10b_the_tick_claims_a_session_window_and_launches_nothing`` holds that, and goes red the day a pass
-launches it, which is the day the launch step here is to be replaced). Everything else is a subprocess of the CLI or of the
-fire: the zone, the role, the registration, the signature, the tick, the revoke, the fire and the reads of
-``agents show --json``.
+What a case sets up in-process, never the thing it asserts about: the install file (``session_wire.write_install``), the
+claim of a MANUAL row (``levain agents`` has no hand start) and its LAUNCH (``controller.launch``). A scheduled row is
+claimed and launched by the CLI's own tick (levain#219), whose fire spawn the spawn gate records instead of starting.
+Everything else is a subprocess of the CLI or of the fire: the zone, the role, the registration, the signature, the tick,
+the revoke, the fire and the reads of ``agents show --json``.
 """
 from __future__ import annotations
 
@@ -77,15 +76,17 @@ class Session(Install):
 
     # ------------------------------------------------------------------------------------------------- the CLI
     def env(self, now: str | None = None, spawn_gate: bool = False, kill: str | None = None) -> dict[str, str]:
-        env = super().env(now, False, kill)
+        env = super().env(now, spawn_gate, kill)
         env["P10B_STUB_DIR"] = str(self.stubdir)
         return env
 
-    def cli(self, *argv: str, now: str | None = None, spawn_gate: bool = False, kill: str | None = None,
+    def cli(self, *argv: str, now: str | None = None, spawn_gate: bool = True, kill: str | None = None,
             timeout: int = 180) -> Ran:
         """``levain <argv>`` as a subprocess behind ``_p10b_entry.py`` (the stub launcher registered; ``now`` and the
-        other P10a gates as named). ``spawn_gate`` is accepted for the P10a helpers that pass it and means nothing here."""
-        p = subprocess.run([sys.executable, str(ENTRY), *argv], cwd=self.tmp, env=self.env(now, kill=kill),
+        other P10a gates as named). ``spawn_gate`` (on unless a caller turns it off) is P10a's ``P10A_NO_SPAWN``: the
+        process's ``controller.spawn_fire`` records the occurrence in ``spawns.txt`` (``spawned()``) and starts nothing,
+        because a fire started the product's way cannot reach the stub; a case fires a recorded row itself (``fire``)."""
+        p = subprocess.run([sys.executable, str(ENTRY), *argv], cwd=self.tmp, env=self.env(now, spawn_gate, kill),
                            capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return Ran(p.returncode, p.stdout, p.stderr)
 

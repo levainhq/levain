@@ -651,3 +651,25 @@ def test_the_default_store_is_compared_resolved_on_both_sides(rig, tmp_path, mon
     monkeypatch.setattr(adb, "default_store_dir", lambda: link)
     monkeypatch.setattr(cq, "default_queue_dir", lambda: queue)
     assert T._coord_dir_for(rig.store, None, []) == queue
+
+
+# --- levain#219: the exposure a tick-launched session run states (np-fe3e2ebd (a)) --------------------------------
+
+def test_a_session_launch_states_the_link_s_whole_per_run_figure_or_nothing():
+    """The figure is the admitting link's whole signed per-run figure: dollars on an api_key link, the action caps and the
+    spec's stop_at seconds on a subscription one. Anything it cannot state from (no stop_at, a zero or non-int figure, an
+    unknown billing, a grant whose terms cannot be read) is None, and the tick then launches nothing."""
+    from levain.agents.accounting import ActionExposure
+
+    api = {"budget_run_usd_micros": 20_000_000}
+    sub = {"billing": "subscription", "budget_run_usd_micros": 0, "budget_run_calls": 40, "budget_run_tunnel_bytes": 9000}
+    assert T._session_exposure(api, 3600) == (20_000_000, None)
+    assert T._session_exposure(sub, 3600) == (0, ActionExposure(40, "tool_calls", 3600, 9000))
+    for stop_at in (None, 0, -1, 3600.0, True, "3600"):
+        assert T._session_exposure(api, stop_at) is None and T._session_exposure(sub, stop_at) is None
+    assert T._session_exposure({"budget_run_usd_micros": 0}, 3600) is None
+    assert T._session_exposure({"budget_run_usd_micros": 1.5}, 3600) is None
+    assert T._session_exposure({**sub, "budget_run_calls": 0}, 3600) is None
+    assert T._session_exposure({**sub, "budget_run_tunnel_bytes": 0}, 3600) is None
+    assert T._session_exposure({**sub, "billing": "other"}, 3600) is None
+    assert T._session_exposure({"billing": "subscription"}, 3600) is None      # its caps cannot be read

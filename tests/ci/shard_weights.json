@@ -103,6 +103,7 @@
   "tests/test_agents_launch.py": 3.0,
   "tests/test_agents_misses.py": 0.6,
   "tests/test_agents_operator.py": 0.5,
+  "tests/test_agents_p10b_e2e.py": 134.6,
   "tests/test_agents_p71s8c_brief.py": 0.1,
   "tests/test_agents_recall.py": 0.5,
   "tests/test_agents_refuse.py": 15.0,
