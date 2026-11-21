@@ -803,6 +803,7 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
     compare-and-set on ``state = 'admitted'``, which is why a row is launched at most once however many ticks see it.
     Each row is classified, picked and launched in its own guard and at its own clock reading: one row's failure is named
     and does not cost the others."""
+    from levain import authority as _auth
     from levain.agents import schedule as _sched
     from levain.agents import session as _session
     from levain.agents import session_wire as _wire
@@ -868,7 +869,11 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
             if picked is None:
                 executor: Any = _UnstatedExposure()
             else:
-                figure = _session_exposure(state.policy.grants[picked], signed.get("stop_at"))
+                # the figure arms the launch, so it reads the grants in force: a picked link that has left that view
+                # (revoked or expired since the pick) states nothing, the same fail-closed answer as any other cause
+                grant = _auth.grants_in_force(state).get(picked)
+                figure = (_session_exposure(grant, signed.get("stop_at")) if grant is not None
+                          else "the link is not in force (it was stopped or has expired since it was picked)")
                 if isinstance(figure, str):
                     notes.append(f"{oid} was not launched: its exposure cannot be stated from link {picked}: {figure}; "
                                  f"{retry}")

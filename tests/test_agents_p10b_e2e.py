@@ -498,6 +498,40 @@ def test_p10b_a_link_that_cannot_be_read_at_the_pick_leaves_the_row_admitted_for
     assert (s.row(oid)["state"], rc, here.spawned) == ("launched", 0, [oid]), err
 
 
+def test_p10b_a_picked_link_that_leaves_the_in_force_view_before_the_exposure_read_states_nothing(s, here, monkeypatch):
+    """The figure that sizes a launch's reservation arms it, so it is read from the grants IN FORCE, not the raw policy.
+    A link the pick found live that is no longer in force when the figure is read (revoked or expired in between) states
+    no exposure: nothing is launched, the row stays ``admitted`` holding nothing, no fire is asked for, and the tick
+    exits 6 naming the link and the cause."""
+    from types import MappingProxyType
+
+    from levain import authority as auth
+    from levain.agents import controller as ctl
+
+    s.register()
+    day = real_now() + timedelta(days=1)
+    assert here(_at(day, 12, 4))[0] == 0
+    picked: list[str] = []
+    real_pick = ctl._pick_link
+
+    def pick_and_note(*args, **kw):
+        got = real_pick(*args, **kw)
+        picked.append(got[0])
+        return got
+
+    monkeypatch.setattr(ctl, "_pick_link", pick_and_note)
+    monkeypatch.setattr(auth, "grants_in_force",
+                        lambda state: MappingProxyType({gid: g for gid, g in state.policy.grants.items()
+                                                        if gid not in picked}))
+    rc, err = here(_at(day, 12, 6))
+    (row,) = s.rows()
+    oid = row["occurrence_id"]
+    assert picked and (row["state"], rc) == ("admitted", 6) and s.held(oid) == ([], []) and here.spawned == [], err
+    assert s.started() == 0
+    assert f"{oid} was not launched: its exposure cannot be stated from link {picked[0]}: " in err
+    assert "is not in force" in err
+
+
 def test_p10b_a_fire_that_cannot_be_spawned_is_named_and_its_row_is_ended_once_its_lease_lapses(s, here):
     """A launched row whose fire cannot be spawned: the tick names it and exits 6, and the row (launched, no fire, no
     pid) holds its slot until its launch lease lapses, when the next tick ends it ``stopped`` / ``crash_recovered``, its
