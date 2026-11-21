@@ -222,6 +222,29 @@ def test_the_panels_that_are_compared_are_mostly_reads_not_failures(pairs, name)
 
 
 @pytest.mark.parametrize("name", IDS)
+def test_every_request_the_rig_makes_is_a_read_not_a_raise(pairs, name):
+    """The full, the compact and a by-row read of every panel, on each side: a request that raises on both sides compares
+    equal, so it is checked here that none does, and that the by-row read was asked for at all."""
+    p = pairs[name]
+    for side, ck in (("bare", p.bare), ("attached", p.attached)):
+        obs = rig.observe_request(ck, p.derived)
+        assert rig.raised_paths(obs) == [], (name, side)
+        assert set(obs["payload"]) == set(ck.panel_ids), (name, side)
+        for pid, per in obs["payload"].items():
+            assert {"full", "compact"} <= set(per), (name, side, pid)
+        assert obs["_rows_asked"], (name, side)
+        assert any(k.startswith("row:") for per in obs["payload"].values() for k in per), (name, side)
+
+
+def test_a_read_that_raised_is_found_wherever_it_sits():
+    assert rig.raised_paths({"a": {"raised": "X: y"}, "b": [1, {"raised": "Z: w"}], "c": {"raised": 1, "d": 2}}) == [
+        ("a",), ("b", 1)]
+    assert rig.raised_paths({"a": 1}) == []
+    assert rig.triple_raised(rig.Triple(("payload", "x", "full"), "value", {"raised": "E: e"}, {"rows": []}))
+    assert not rig.triple_raised(rig.Triple(("payload", "x", "full", "rows"), "value", [1], []))
+
+
+@pytest.mark.parametrize("name", IDS)
 @pytest.mark.parametrize("side", ["bare", "attached"])
 def test_a_side_read_twice_is_the_same_read(pairs, name, side):
     """A path that differs side-against-itself is an input the harness has not fixed, not a difference to approve."""
@@ -363,13 +386,17 @@ def fresh(tmp_path, scratch_home):
 def _break_decode(monkeypatch, mutate):
     real = sh.decode_snap
 
-    def broken(status, body, *, as_of, error=None):
-        snap = real(status, body, as_of=as_of, error=error)
+    ran: list = []      # one entry per decode the mutation completed on: a patch that raises (the engine turns that into an error panel, not a raise) leaves it empty
+
+    def broken(*args, **kwargs):
+        snap = real(*args, **kwargs)
         mutate(snap)
+        ran.append(1)
         return snap
 
     monkeypatch.setattr(sh, "decode_snap", broken)
     monkeypatch.setattr(engine_mod, "decode_snap", broken)
+    return ran
 
 
 def _unmatched_on(pair, approved):
@@ -380,6 +407,13 @@ def _request_layer_sees(unmatched):
     return {"payload", "manifest"} <= {t.scope for t in unmatched}
 
 
+def _sees_a_value_difference_at(got, field):
+    """The canary's difference is the one it made: no unmatched triple is a read that raised (a patch that cannot run
+    would raise on both sides' reads and look like a catch), and the field it changed is on a path."""
+    assert not [t for t in got if rig.triple_raised(t)], [rig.render(t) for t in got if rig.triple_raised(t)][:5]
+    assert any(field in t.path for t in got), field
+
+
 def test_canary_a_decode_that_drops_a_row_is_seen(fresh, pairs, approved, triples, monkeypatch):
     base = len(_verdict(pairs, triples, approved, "k2a").unmatched)
 
@@ -387,16 +421,20 @@ def test_canary_a_decode_that_drops_a_row_is_seen(fresh, pairs, approved, triple
         if snap.rows:
             snap.rows = snap.rows[1:]
 
-    _break_decode(monkeypatch, drop)
+    ran = _break_decode(monkeypatch, drop)
     got = _unmatched_on(fresh, approved)
+    assert ran, "the patched decode never completed"
     assert len(got) > base and _request_layer_sees(got)
+    _sees_a_value_difference_at(got, "rows")
 
 
 def test_canary_a_decode_that_changes_a_status_is_seen(fresh, pairs, approved, triples, monkeypatch):
     base = len(_verdict(pairs, triples, approved, "k2a").unmatched)
-    _break_decode(monkeypatch, lambda snap: setattr(snap, "status", "error"))
+    ran = _break_decode(monkeypatch, lambda snap: setattr(snap, "status", "error"))
     got = _unmatched_on(fresh, approved)
+    assert ran, "the patched decode never completed"
     assert len(got) > base and _request_layer_sees(got)
+    _sees_a_value_difference_at(got, "status")
 
 
 def test_canary_a_subject_that_reads_stale_pending_or_a_dead_worker_is_seen(fresh, approved):
