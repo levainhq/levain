@@ -520,6 +520,35 @@ class TestHttp:
                     box["conn"].close()
             assert "error" not in box and "event: hello" in box["hello"]
 
+    def test_a_subscribe_that_raises_ends_the_stream_after_the_status_line_and_is_logged(
+            self, tmp_path: Path, caplog: Any) -> None:
+        # the status line goes out before the subscribe, so a subscribe that fails can no longer answer a 500: the
+        # stream ends (the page reconnects), the failure is logged, and the server keeps answering.
+        _root, src = _install(tmp_path)
+        ck, _ = _cockpit(src, [_row(1)])
+        with _serving(src, cockpit=ck) as (port, httpd):
+            def boom(*a: Any, **kw: Any):
+                raise RuntimeError("watcher thread would not start")
+
+            httpd.stream_watcher.subscribe = boom      # type: ignore[method-assign]
+            with caplog.at_level("WARNING"):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+                try:
+                    c.request("GET", "/cockpit/events")
+                    r = c.getresponse()
+                    assert r.status == 200
+                    assert r.read() == b""          # the stream ended with no frame: no hello, no body
+                finally:
+                    c.close()
+            assert any("subscribe failed" in rec.getMessage() and "RuntimeError" in rec.getMessage()
+                       for rec in caplog.records)
+            c2 = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            try:
+                c2.request("GET", "/cockpit/events")
+                assert c2.getresponse().status == 200      # the server still answers
+            finally:
+                c2.close()
+
     def test_a_store_change_on_an_on_demand_panel_nobody_reads_is_exactly_one_panel_changed(self, tmp_path: Path) -> None:
         _root, src = _install(tmp_path)
         ck, state = _cockpit(src, [_row(1)])
