@@ -133,6 +133,18 @@ def test_an_entry_with_no_source_a_bad_rule_or_a_repeated_id_fails_the_entry_che
     assert any("repeated" in p for p in rig.entry_problems([_entry(), _entry()]))
 
 
+@pytest.mark.parametrize("kind", ["extra_key_in_subject", "missing_key_in_subject"])
+def test_a_rule_on_a_kind_that_takes_none_is_rejected(kind):
+    """Matching ignores the rule of such an entry, so it would approve any value while looking guarded."""
+    assert any("does not take a rule" in p for p in rig.entry_problems([_entry(kind=kind, rule="fresh_at_rest")]))
+
+
+@pytest.mark.parametrize("rule", [["fresh_at_rest"], {"a": 1}, 5, None, ""])
+@pytest.mark.parametrize("kind", ["value_rule", "extra_key_with_rule"])
+def test_a_rule_that_is_not_a_registered_name_is_a_problem_line_not_a_crash(kind, rule):
+    assert any("registry" in p for p in rig.entry_problems([_entry(kind=kind, rule=rule)]))
+
+
 @pytest.mark.parametrize("over,word", [
     ({"scope": "nowhere"}, "scope"),
     ({"kind": "swallow"}, "kind"),
