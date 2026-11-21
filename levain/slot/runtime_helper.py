@@ -56,7 +56,7 @@ from levain.slot import end as _E
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
-from levain.slot.ids import SlotId, in_own_range
+from levain.slot.ids import VERIFIER_ACCOUNT, SlotId, in_own_range, provisioned_singletons
 from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, repair_line, store_dir_row
 from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, STDIN_VERBS, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
@@ -3757,7 +3757,8 @@ def _pf_unbuilt(uid: int) -> bool:
 
 def verifier_uid(ctx: Ctx) -> int:
     """``_levain_verify``'s uid, the account the confined verifier runs as. Absent = ``account-missing`` with a
-    detail that names the precondition instead of the bare account name (levain#134), by host: Linux
+    detail that names the precondition instead of the bare account name (levain#134), by what the host
+    PROVISIONS (:func:`ids.provisioned_singletons`): a host that makes the account gets
     :data:`wall.VERIFIER_MISSING`, any other host :data:`wall.VERIFIER_UNPROVISIONED`. Why the two differ is ruled in
     ``j06_adopt_ruling.md`` (macOS) and ``j06_adopt_linux_ruling.md`` (Linux). The refusal NAME stays
     ``account-missing`` on both (the wire name the gate was ruled to fail closed with). Any other refusal from the
@@ -3768,7 +3769,7 @@ def verifier_uid(ctx: Ctx) -> int:
         if e.name != "account-missing":
             raise
         host = ctx.seams.host
-        if host == "linux":
+        if VERIFIER_ACCOUNT in provisioned_singletons(host):
             raise Refused("account-missing", wall.VERIFIER_MISSING.format(repair=repair_line(host))) from None
         raise Refused("account-missing", wall.VERIFIER_UNPROVISIONED) from None
 

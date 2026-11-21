@@ -161,8 +161,9 @@ EXPORT_ENTRY = {"importer": "export-importer", "verifier": "export-verifier"}
 
 #: levain#134 (VM sitting 11-18, J06): the precondition adopt's verify names when ``_levain_verify`` is absent. Why the
 #: account's absence differs by host is ruled on two pages, not restated here: ``j06_adopt_ruling.md`` (macOS) and
-#: ``j06_adopt_linux_ruling.md`` (Linux). ``VERIFIER_UNPROVISIONED`` is the macOS detail, ``VERIFIER_MISSING`` the Linux
-#: one (``{repair}`` is the host's repair command); ``runtime_helper.verifier_uid`` picks by host. ``--verifier-slots``
+#: ``j06_adopt_linux_ruling.md`` (Linux). ``VERIFIER_UNPROVISIONED`` is the detail for a host that does not provision the
+#: account, ``VERIFIER_MISSING`` for one that does (``{repair}`` is the host's repair command);
+#: ``runtime_helper.verifier_uid`` picks by ``ids.provisioned_singletons``. ``--verifier-slots``
 #: sizes the none-class session pairs ``_levain_v<n>`` / ``_levain_c<n>``, a different thing; both texts say so,
 #: because that flag's name is what made the J06 refusal read as a setup fault.
 VERIFIER_UNPROVISIONED = (
@@ -1752,8 +1753,8 @@ if __name__ == "__main__":
 
 __all__ = ["EXEC_FD", "EXEC_OK", "EXEC_REFUSED", "EXPORT_ACCOUNT", "EXPORT_CAPS", "EXPORT_DEVICES", "EXPORT_ENTRY",
            "EXPORT_GROUPS", "EXPORT_MACH_ALLOW", "EXPORT_NPROC", "EXPORT_READ_DENIED", "EXPORT_TARGETS",
-           "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFIER_MISSING", "VERIFIER_UNPROVISIONED",
-           "VERIFY_WRITABLE", "WallFacts",
+           "EXPORT_WRITABLE", "FORWARDER_PORT", "HASH_OBJECT_PREFIX", "RESULT_FD", "VERIFIER_MISSING",
+           "VERIFIER_UNPROVISIONED", "VERIFY_WRITABLE", "WallFacts",
            "LinuxLaunch", "NPROC", "OsCalls", "Principal", "READY_FD", "SPEC_FD", "SPEC_FORMAT", "STAGE_EXIT",
            "Spec", "TARGETS", "cgroup_dir", "check_egress_ready", "check_pf_enabled", "check_profile_text",
            "clone_argv",

@@ -7,7 +7,8 @@ setup never creates it on macOS (``ids.provisioned_singletons`` does not list it
 (5g) is built, and provisions the account only then. So the fix is the precondition named, early, on both sides:
 
 * root: ``adopt-verify`` checks the account right after binding the caller, before any lock, root fact or wait, and
-  its detail is by host (macOS :data:`wall.VERIFIER_UNPROVISIONED`, Linux :data:`wall.VERIFIER_MISSING`; the wire
+  its detail is by host (a host that does not provision the account :data:`wall.VERIFIER_UNPROVISIONED`, one that does
+  :data:`wall.VERIFIER_MISSING`; the wire
   name stays ``account-missing``; ``j06_adopt_linux_ruling.md`` is why Linux differs);
 The CLI has no pre-check of its own: root allows the report-only ``adopt-nothing-new`` path (it exits before any
 adopt-verify call), and a CLI-side lookup would refuse it.
@@ -109,9 +110,9 @@ def test_macos_detail_is_the_unprovisioned_text_and_linux_names_the_managed_acco
     assert d == wall.VERIFIER_MISSING.format(repair=repair_line("linux")) and d != wall.VERIFIER_UNPROVISIONED
     assert d.startswith("_levain_verify:") and "managed account" in d and "missing" in d
     assert "`" + repair_line("linux") + "`" in d and "creates it" in d
-    assert "setup does not create it" not in d and "5g" not in d and "yet" not in d
+    assert "setup does not create it" not in d and "5g" not in d and "cannot run on this install yet" not in d
     assert "Nothing was taken into your repo" in d and "--verifier-slots" in d
-    assert "\n" not in d and "\r" not in d and "{" not in d
+    assert "\n" not in d and "\r" not in d and "{repair}" not in d
 
 
 def test_linux_present_account_and_other_refusals_pass_through_as_on_macos():
@@ -231,3 +232,12 @@ def test_cli_has_no_account_precheck_and_a_report_only_adopt_exits_0_without_the
     assert rc == 0, (out.getvalue(), err.getvalue())
     assert calls == ["status", "adopt-open"] and "nothing new since its base" in out.getvalue()
     assert "account-missing" not in err.getvalue()
+
+
+def test_the_detail_follows_what_the_host_provisions_not_its_name():
+    assert ids.VERIFIER_ACCOUNT in ids.provisioned_singletons("linux")
+    for host in ("darwin", "plan9"):        # a real host that does not provision it, and a synthetic third one
+        assert ids.VERIFIER_ACCOUNT not in ids.provisioned_singletons(host)
+        with pytest.raises(Refused) as e:
+            RH.verifier_uid(_ctx(_absent, host))
+        assert e.value.name == "account-missing" and e.value.detail == wall.VERIFIER_UNPROVISIONED
