@@ -12,6 +12,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
+#: What the rev's archive carries. ``pyproject.toml`` rides beside ``levain/`` because ``levain doctor`` reads the
+#: anneal-memory range from the file next to the package (manifest's repo-pyproject lookup); without it a vend's doctor
+#: shows a WARN where the real requirement would FAIL on the image's anneal. Staging the file leaves doctor unchanged on
+#: a real install, which is why the rig carries it rather than doctor learning a second source.
+ARCHIVE_PATHS = ("levain", "pyproject.toml")
+
 #: Where setup's vendor copier puts the vendors, and where the hands account looks (its PATH names /usr/local/bin first,
 #: and ``hands login`` refuses by name when claude is not there).
 VENDOR_BIN = "/usr/local/lib/levain-vendor/bin"
@@ -59,6 +65,11 @@ def check_staged(dest: Path, canonical: bytes) -> None:
         raise RuntimeError(f"staged {FAKE_NAME} differs from the canonical {FAKE_REPO_PATH}")
     if not (Path(dest) / SEED_NAME).is_file():
         raise RuntimeError(f"staged rig has no {SEED_NAME}")
+
+
+def archive_argv(git: str, repo: Path, rev: str, out: Path) -> list[str]:
+    """The ``git archive`` command that tars ``rev``'s :data:`ARCHIVE_PATHS` for the guest."""
+    return [git, "-C", str(repo), "archive", "--format=tar.gz", "-o", str(out), rev, *ARCHIVE_PATHS]
 
 
 def vendor_link_argvs(vendor_bin: str = VENDOR_BIN, hands_bin: str = HANDS_BIN) -> list[list[str]]:
