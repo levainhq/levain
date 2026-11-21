@@ -740,13 +740,18 @@ def run_session_install(args: argparse.Namespace) -> int:
         return _fail("session-install", f"--cockpit-root {root} is not the cockpit root the dream "
                                         f"install names ({dream_root}): one store has one cockpit (nothing written)")
     try:
-        previous_root = session_wire.read_install(store.directory).cockpit_root
+        previous = session_wire.read_install(store.directory)
+        previous_root, previous_coord = previous.cockpit_root, previous.coord_dir
     except (ValueError, OSError):      # no previous root to name as replaced
-        previous_root = None
+        previous_root = previous_coord = None
+    try:
+        coord_dir = None if args.coord_dir is None else args.coord_dir.expanduser()
+    except RuntimeError as exc:        # `~nouser`: no home to expand to
+        return _fail("session-install", f"--coord-dir {str(args.coord_dir)!r} cannot be expanded: {exc} (nothing written)")
     try:
         path = session_wire.write_install(store.directory, cockpit_root=root, launcher=args.launcher,
                                           episodic_path=args.episodic_path, values=values, workspaces=workspaces,
-                                          coord_dir=None if args.coord_dir is None else args.coord_dir.expanduser())
+                                          coord_dir=coord_dir)
     except session_wire.InstallRefused as exc:
         return _fail("session-install", f"{exc} (nothing written)")
     except OSError as exc:
@@ -758,6 +763,8 @@ def run_session_install(args: argparse.Namespace) -> int:
     print(f"wrote {path}")
     if previous_root is not None and previous_root.resolve() != root.resolve():
         print(f"replaced cockpit_root {previous_root} -> {root}")
+    if previous_coord is not None and previous_coord != install.coord_dir:
+        print(f"replaced coord_dir {previous_coord} -> {install.coord_dir if install.coord_dir is not None else '(none)'}")
     print(f"cockpit_root: {install.cockpit_root}")
     print(f"launcher: {install.launcher if install.launcher is not None else '(none)'}")
     print(f"episodic_path: {install.episodic_path if install.episodic_path is not None else '(none)'}")

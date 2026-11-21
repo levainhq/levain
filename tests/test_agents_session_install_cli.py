@@ -408,6 +408,29 @@ def test_a_tilde_coord_dir_is_expanded(world, capsys, monkeypatch):
     assert W.read_install(store.directory).coord_dir == tmp_path / "coord"
 
 
+def test_a_tilde_user_coord_dir_is_a_clean_refusal(world, capsys):
+    store, cockpit, _ = world
+    before, litter = _good(world, capsys)
+    code, out, err = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", "~no-such-user-1120/x")
+    assert code == 1 and out == "" and "coord-dir" in err and "(nothing written)" in err
+    assert _file(store).read_bytes() == before and _litter(store) == litter
+
+
+def test_a_changed_or_dropped_coord_dir_is_named(world, capsys):
+    store, cockpit, tmp_path = world
+    one, two = tmp_path / "coord1", tmp_path / "coord2"
+    one.mkdir()
+    two.mkdir()
+    _, first, _ = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", str(one))
+    assert "replaced" not in first
+    _, second, _ = _run(store, capsys, "--cockpit-root", str(cockpit), "--coord-dir", str(two))
+    assert f"replaced coord_dir {one} -> {two}" in second.splitlines()
+    _, third, _ = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert f"replaced coord_dir {two} -> (none)" in third.splitlines()
+    _, fourth, _ = _run(store, capsys, "--cockpit-root", str(cockpit))
+    assert "replaced" not in fourth
+
+
 @pytest.mark.parametrize("kind", ["missing", "relative", "file"])
 def test_a_bad_coord_dir_is_refused_and_nothing_is_written(world, capsys, kind):
     store, cockpit, tmp_path = world
