@@ -756,7 +756,7 @@ def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path |
 # (macOS only, :func:`~levain.firing.confinement._hands_env`): ``-i`` drains stdin to /dev/null (it carries the
 # credential: never logged, never stored) and exits 36; the three item verbs exit 36; every other verb runs
 # ``/usr/bin/security`` with the same arguments. So Claude's login, refresh, read and logout all take the file, in any
-# session. Measured with real claude 2.1.330 in the GUI shape (vmkc3): ``claude auth status`` is fast with the shim.
+# session. Measured 11-21 with real claude 2.1.330 in the GUI shape (vmkc3): ``claude auth status`` is fast with the shim.
 # The shim covers every Claude service name by verb, which is why orphan matching (``claude_credential_services``) stays
 # the two names a login can leave. Levain's own calls use the absolute ``/usr/bin/security`` and never meet it.
 SECURITY_SHIM_NAME = "security"

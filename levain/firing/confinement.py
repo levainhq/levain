@@ -3877,8 +3877,7 @@ builtin exit "$__levain_done"
 HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 #: macOS: the directory (under the hands home) that holds Levain's ``security`` shim and is FIRST on the hands PATH
-#: (levain#241; the shim text and its checks live in :mod:`levain.firing.hands_login`). The macOS sandbox profile is
-#: ``(allow default)`` with denies only for the crown jewels, so it does not block executing the shim.
+#: (levain#241).
 HANDS_SHIM_DIRNAME = ".levain-bin"
 
 
