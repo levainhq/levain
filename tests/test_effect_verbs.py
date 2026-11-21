@@ -442,25 +442,6 @@ def test_the_order_lists_the_addresses_and_the_voice_the_disclosure_follows(worl
     assert "written automatically by flow, an AI assistant" in rig.sent[0].body
 
 
-@pytest.mark.parametrize("extra", [
-    "Reply-To: other@client.example.com\r\n",
-    "Reply-To: heather@client.example.com, other@client.example.com\r\n",
-    "Reply-To: a@x.example\r\nReply-To: heather@client.example.com\r\n",
-    "Auto-Submitted: auto-replied\r\n", "Auto-Submitted: auto-generated\r\n",
-    "Precedence: bulk\r\n", "Precedence: list\r\n", "Precedence: junk\r\n", "Precedence: auto_reply\r\n",
-    "List-Id: <x.example>\r\n", "List-Unsubscribe: <mailto:u@x.example>\r\n", "List-Post: NO\r\n",
-    "X-Autoreply: yes\r\n", "X-Autorespond: yes\r\n", "X-Auto-Response-Suppress: All\r\n",
-    "Return-Path: <>\r\n", "Content-Type: multipart/report; boundary=x\r\n",
-    "From: heather@client.example.com\r\n",                                    # a second From
-])
-def test_a_reply_to_that_differs_an_auto_reply_or_a_list_mail_is_never_answered(world, extra):
-    g = signed(world)
-    rig = Rig(world, raw_mail(extra=extra, rp=None if extra.startswith("Return-Path") else f"<{FROM}>"))
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
-
-
 def test_a_reply_to_that_equals_the_from_and_auto_submitted_no_are_fine(world):
     g = signed(world)
     rig = Rig(world, raw_mail(extra=f"Reply-To: Heather H <{FROM.upper()}>\r\nAuto-Submitted: no\r\n"))
@@ -745,20 +726,6 @@ def test_restart_service_replays_the_order_again_immediately_before_the_process(
     assert str(exc.value) == fx.R_ORDER and not rig.runs
 
 
-@pytest.mark.parametrize("extra", [
-    "Return-Path: <> (bounce)\r\n", "Return-Path: (mailer) <>\r\n", "Return-Path: <<>>\r\n", "Return-Path: \r\n",
-    "Return-Path: <a@>\r\n", "Return-Path: <@client.example.com>\r\n", "Return-Path: <\"\"@client.example.com>\r\n",
-    "Return-Path: <a@b.example>, <c@d.example>\r\n",
-    "Return-Path: <heather@client.example.com>\r\nReturn-Path: <>\r\n",
-])
-def test_a_null_or_unparseable_return_path_in_any_form_is_never_answered(world, extra):
-    g = signed(world)
-    rig = Rig(world, raw_mail(extra=extra, rp=None))
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
-
-
 @pytest.mark.parametrize("rp", ["<heather@client.example.com>", "<bounce+SRS0=ab=cd=client.example.com=h@fwd.example.net>",
                                 "<Heather.H@Client.Example.COM>", "<h@a-b.example>"])
 def test_a_real_return_path_is_fine(world, rp):
@@ -768,17 +735,32 @@ def test_a_real_return_path_is_fine(world, rp):
 
 
 # ---- L3 r2: no Return-Path, a malformed mailbox, an executor's own EffectRefused ----------------------------------
-def test_a_message_with_no_return_path_is_never_answered(world):
-    g = signed(world)
-    rig = Rig(world, raw_mail(rp=None))
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
+def test_a_message_with_no_return_path_is_refused_by_the_from_derivation_itself():
     with pytest.raises(fx.EffectRefused):
         fx.inbound_from(f"From: {FROM}\r\nSubject: s\r\n\r\nb\r\n".encode())
 
 
-@pytest.mark.parametrize("rp", [
+#: every raw message the ack must never answer: one refusal, one assertion, whatever the reason the sender is unsafe
+#: to answer (a Reply-To or auto-reply/list marker, a null or unparseable or absent Return-Path, a Return-Path that
+#: is not exactly one valid mailbox). Each group keeps its own id prefix, so a failure names the case.
+_AUTO_REPLY_EXTRAS = [
+    "Reply-To: other@client.example.com\r\n",
+    "Reply-To: heather@client.example.com, other@client.example.com\r\n",
+    "Reply-To: a@x.example\r\nReply-To: heather@client.example.com\r\n",
+    "Auto-Submitted: auto-replied\r\n", "Auto-Submitted: auto-generated\r\n",
+    "Precedence: bulk\r\n", "Precedence: list\r\n", "Precedence: junk\r\n", "Precedence: auto_reply\r\n",
+    "List-Id: <x.example>\r\n", "List-Unsubscribe: <mailto:u@x.example>\r\n", "List-Post: NO\r\n",
+    "X-Autoreply: yes\r\n", "X-Autorespond: yes\r\n", "X-Auto-Response-Suppress: All\r\n",
+    "Return-Path: <>\r\n", "Content-Type: multipart/report; boundary=x\r\n",
+    "From: heather@client.example.com\r\n",                                    # a second From
+]
+_NULL_RETURN_PATH_EXTRAS = [
+    "Return-Path: <> (bounce)\r\n", "Return-Path: (mailer) <>\r\n", "Return-Path: <<>>\r\n", "Return-Path: \r\n",
+    "Return-Path: <a@>\r\n", "Return-Path: <@client.example.com>\r\n", "Return-Path: <\"\"@client.example.com>\r\n",
+    "Return-Path: <a@b.example>, <c@d.example>\r\n",
+    "Return-Path: <heather@client.example.com>\r\nReturn-Path: <>\r\n",
+]
+_INVALID_MAILBOX_RETURN_PATHS = [
     b"<foo@-relay.example>", b"<foo@relay-.example>", b"<foo@relay..example>", b"<foo@.relay.example>",
     b"<foo@relay.example.>", b"<fo\x00o@relay.example>", b"<foo@relay.exa\x00mple>", b"<fo\x7fo@relay.example>",
     b"<foo@relay.example>\x00", b"<.foo@relay.example>", b"<foo.@relay.example>", b"<fo..o@relay.example>",
@@ -786,10 +768,21 @@ def test_a_message_with_no_return_path_is_never_answered(world):
     b"<foo@relay.example> (via relay)", b"foo@relay.example", b"<foo@relay.example>x", b"<f\xc3\xa9@relay.example>",
     b"<foo@r\xc3\xa9lay.example>", b"<foo@relay.example>\r\n <bar@x.example>", b"<foo@\trelay.example>",
     b"<" + b"a" * 65 + b"@relay.example>", b"<foo@" + b"a" * 64 + b".example>",
-])
-def test_a_return_path_that_is_not_one_valid_mailbox_is_refused(world, rp):
+]
+_UNANSWERABLE_RAWS = (
+    [pytest.param(raw_mail(extra=e, rp=None if e.startswith("Return-Path") else f"<{FROM}>"),
+                  id=f"{e.split(':', 1)[0].lower()}-{i}") for i, e in enumerate(_AUTO_REPLY_EXTRAS)]
+    + [pytest.param(raw_mail(extra=e, rp=None), id=f"null-return-path-{i}") for i, e in enumerate(_NULL_RETURN_PATH_EXTRAS)]
+    + [pytest.param(raw_mail(rp=None), id="no-return-path")]
+    + [pytest.param(raw_mail(rp=f"<{FROM}> "), id="return-path-trailing-space")]
+    + [pytest.param(b"Return-Path: " + rp + b"\r\n" + raw_mail(rp=None), id=f"invalid-mailbox-{rp!r}")
+       for rp in _INVALID_MAILBOX_RETURN_PATHS]
+)
+
+
+@pytest.mark.parametrize("raw", _UNANSWERABLE_RAWS)
+def test_a_message_that_names_no_one_answerable_sender_is_never_answered(world, raw):
     g = signed(world)
-    raw = b"Return-Path: " + rp + b"\r\n" + raw_mail(rp=None)
     rig = Rig(world, raw)
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
@@ -1052,14 +1045,6 @@ def test_a_reverse_path_is_bounded_by_its_rfc_length_before_any_pattern():
 def test_a_return_path_with_a_space_around_it_is_not_the_whole_field(value):
     assert not fx._return_path_ok(value)
     assert fx._return_path_ok(value.strip())
-
-
-def test_a_return_path_with_a_trailing_space_refuses_the_ack(world):
-    g = signed(world)
-    rig = Rig(world, raw_mail(rp=f"<{FROM}> "))
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
 
 
 @pytest.mark.parametrize("raw", [

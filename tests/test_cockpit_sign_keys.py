@@ -105,7 +105,10 @@ def test_one_error_word_table_answers_for_the_cockpit(qdir: Path, monkeypatch) -
         word = sign.error_word(status)
         assert word == {409: "conflict-x", 422: "sign_refused", 403: "sign_refused"}.get(status, word)
         pin = "https://phone.example:8443"
+        logged: "list[tuple[str, Any]]" = []        # the refusal logger the handler calls for a 503
         fake = SimpleNamespace(server=SimpleNamespace(signer=SimpleNamespace(challenge=refuse, page_origin=pin),
-                                                      signer_page_origin=pin))
+                                                      signer_page_origin=pin),
+                               _refused=lambda gate, route=None, ms=None: logged.append((gate, route)))
         body, code = web_server._Handler._sign_post(fake, "np-sign-0001", "challenge", {})  # type: ignore[arg-type]
         assert (code, body["error"]) == (status, word)
+        assert logged == ([("sign:" + word, "sign")] if status == 503 else []), logged   # only a 503 is a refusal worth a log line

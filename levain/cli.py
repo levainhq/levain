@@ -1630,7 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "The hands-uid chat. Takes the entity's session locks, stops anything the entity's user left running, "
             "rewrites both MCP launch files from the live registry (`levain hands mcp prepare`), and only then starts "
-            "the vendor as the entity's user (Claude with --strict-mcp-config). Any refusal starts nothing; there "
+            "the vendor as the entity's user (Claude with --strict-mcp-config and a --settings value that stops the plugin and account-skill syncs). Any refusal starts nothing; there "
             "is no fallback to files an earlier prepare wrote. Revoking a server the chat carries ends "
             "the chat and the command exits 77. The authority log is re-read every 5 s, each read bounded to 5 s; a "
             "log that cannot be read for 30 s ends the chat the same way (a read that succeeds starts the 30 s "

@@ -14,7 +14,7 @@ hands vendor chat, and it keeps this order:
    registry, so a server revoked since the last prepare is absent from both.
 4. only when that returned, and a re-read of the authority log still holds every entry the files carry (a revoke is
    a log append that takes no hands lock, :func:`~levain.firing.hands_mcp_login.launch_still_live`): the vendor, from :func:`~levain.firing.hands_mcp_login.claude_chat_argv` (which passes
-   ``--strict-mcp-config``) or :func:`~levain.firing.hands_mcp_login.codex_chat_argv`.
+   ``--strict-mcp-config`` and a ``--settings`` value that stops the plugin and account-skill syncs) or :func:`~levain.firing.hands_mcp_login.codex_chat_argv`.
 
 A refusal or a failure at any step before the start (a lock, the stop, the prepare, the spawn itself) starts nothing,
 releases both locks and reports. There is no fallback to the files an earlier prepare left: a launch on those is the
@@ -138,18 +138,9 @@ def host_refusal() -> str | None:
 
 
 def vendor_missing(vendor: str) -> str | None:
-    """Why ``vendor`` cannot start as the hands account, or None (leg 6 fix, L2 MED 4): the hands prefix runs it as
-    a bare name under ``env -i PATH=``:data:`~levain.firing.confinement.HANDS_PATH`, so one installed only in the
-    operator's home (the Claude native installer's ``~/.local/bin``) ended the launch in a bare ``env: claude: No
-    such file or directory`` after the locks, the sweep and the prepare. Looked up as the operator, on that PATH and
-    nothing else: a binary the operator cannot see there the hands account cannot either."""
-    import shutil
-    from levain.firing import confinement
-    if shutil.which(vendor, path=confinement.HANDS_PATH) is not None:
-        return None
-    return (f"{vendor} is not on the hands account's PATH ({confinement.HANDS_PATH}); install {vendor} where the "
-            "hands account can run it, under /usr/local/bin or /opt/homebrew/bin (the VM harness's stage-vendors "
-            "puts claude and codex there)")
+    """Why ``vendor`` cannot start as the hands account, or None: :func:`levain.firing.hands_login.vendor_missing`,
+    which the login shares (levain#139); this name stays the chat's own patch point."""
+    return hl.vendor_missing(vendor)
 
 
 def project_layer(workspace: Path, vendor: str) -> Path | None:
@@ -200,7 +191,20 @@ def project_layer(workspace: Path, vendor: str) -> Path | None:
 #: list`` but was not started by a ``-p`` or a TUI chat even with no flag on this host, so what strict does to it is
 #: unmeasured; a user agent's ``mcpServers`` start only when that agent runs, which needs a model (unmeasured). The
 #: unmeasured ones are refused, not left to strict. A plain claude run makes ``plugins/store`` only, so that is not one.
+#:
+#: ``plugins/marketplaces`` is what Claude Code's official-marketplace autoinstall writes. The chat's environment now asks
+#: Claude Code not to run that autoinstall (:data:`levain.firing.confinement.HANDS_NO_MARKETPLACE_AUTOINSTALL`), so this
+#: refusal is the second line, not the first; a home an earlier build's chat already wrote still holds the tree, is still
+#: refused by name, and needs the operator to remove it.
+#: That home also holds ``plugins/known_marketplaces.json`` and autoinstall state in ``.claude.json``; the variable does
+#: not remove an already-registered marketplace, and whether a start re-creates ``plugins/marketplaces`` from
+#: ``known_marketplaces.json`` is NOT measured. Why the refusal for ``plugins/marketplaces`` names the file beside it, and
+#: why the acceptance on such a home needs its own run: a poisoned home, the tree removed, the new chat run twice, the tree
+#: checked; then the same again also removing ``known_marketplaces.json``.
 CLAUDE_USER_LAYER = ("agents", "plugins/installed_plugins.json", "plugins/marketplaces")
+#: Appended to the refusal only when the refused path ends in ``plugins/marketplaces`` (see the comment above).
+MARKETPLACES_REMOVE_CLAUSE = (" and `plugins/known_marketplaces.json` beside it (whether leaving that file "
+                              "brings the tree back is not measured)")
 _CLAUDE_SETTINGS_KEYS = ("enabledPlugins", "extraKnownMarketplaces", "mcpServers")
 
 
@@ -772,7 +776,8 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             if user is not None:
                 raise HandsChatRefused(f"the hands account's Claude config home holds a user-level agent, plugin or "
                                        f"plugin setting ({user}), which can bring MCP servers the registry does not "
-                                       "hold; remove it")
+                                       "hold; remove it" + (MARKETPLACES_REMOVE_CLAUSE
+                                                            if user.endswith("plugins/marketplaces") else ""))
             argv = chat_argv(hands, vendor)
             moved = hml.launch_still_live(res)          # L3 r3 G5: a revoke takes no hands lock; the last read
             if moved is not None:

@@ -2,6 +2,7 @@
 Two cases use real time and a real faulthandler timer: the stop/start race and the interpreter-holding thread."""
 from __future__ import annotations
 
+import errno
 import faulthandler
 import os
 import stat
@@ -98,18 +99,42 @@ def test_the_dump_file_is_written_before_the_line_is_printed(tmp_path, monkeypat
     assert seen[0][1][0] in seen[0][0]
 
 
-def test_the_dump_names_a_thread_blocked_in_a_known_function(tmp_path):
-    entered, release = threading.Event(), threading.Event()
+def test_the_new_dump_is_never_trimmed_by_its_own_call_even_when_a_backwards_clock_sorts_it_oldest(tmp_path,
+                                                                                                   monkeypatch):
+    for i in range(KEEP_DUMPS):
+        (tmp_path / f"stall-2099010{i % 10}T000000000000Z-{i:06d}.txt").write_text(f"old {i}")
+    monkeypatch.setattr(stall_watch, "datetime", _FixedStamp(2001))       # the clock stepped back: sorts before all 20
+    watch = StallWatch(tmp_path)
+    path = watch._write_dump(1.5)
+    assert path.exists()
+    assert path in watch.dumps() and len(watch.dumps()) == KEEP_DUMPS
+
+
+def test_the_dump_names_a_thread_blocked_in_a_known_function(tmp_path, monkeypatch):
+    # The fallback dump keeps threads in name order up to MAX_THREADS (that cap has its own test). Threads left alive by
+    # other tests in the same process, and extra ones started here, sort ahead of "probe-worker" and would push it out
+    # of the listing, so the cap is lifted past the live thread count for this case.
+    entered, release, crowd_release = threading.Event(), threading.Event(), threading.Event()
+    crowd = [threading.Thread(target=crowd_release.wait, args=(30,), name=f"Thread-crowd-{i}", daemon=True)
+             for i in range(stall_watch.MAX_THREADS + 6)]
     worker = threading.Thread(target=blocked_in_stall_probe_helper, args=(entered, release), name="probe-worker",
                               daemon=True)
+    for thread in crowd:
+        thread.start()
     worker.start()
     try:
         assert entered.wait(10)
+        monkeypatch.setattr(stall_watch, "MAX_THREADS", len(sys._current_frames()) + 64)
         watch = drive(tmp_path, [LATE_S + 1.0])
     finally:
         release.set()
+        crowd_release.set()
         worker.join(10)
+        for thread in crowd:
+            thread.join(10)
     text = watch.dumps()[0].read_text()
+    assert "--- fallback stacks" in text
+    assert "--- thread probe-worker" in text
     assert "blocked_in_stall_probe_helper" in text
     assert "probe-worker" in text
 
@@ -331,6 +356,326 @@ def test_a_scratch_file_of_a_dead_pid_is_removed_and_one_of_a_live_pid_is_not(tm
     finally:
         live_child.kill()
         live_child.wait()
+
+
+# ---- a killed process's live capture is kept, not deleted -------------------------------------------------------
+
+STACK_TEXT = b"Thread 0x00000001 (most recent call first):\n  File \"bridge.py\", line 9 in held_the_interpreter\n"
+
+
+def killed_dumps(directory) -> list:
+    return sorted(p for p in directory.iterdir() if p.name.startswith("stall-") and "killed" in p.name)
+
+
+def test_a_dead_pids_scratch_with_stacks_becomes_a_kept_dump_named_for_the_pid_and_killed(tmp_path):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        kept = killed_dumps(tmp_path)
+        assert len(kept) == 1
+        assert str(pid) in kept[0].name and "killed" in kept[0].name
+        assert kept[0] in watch.dumps()
+        assert STACK_TEXT.decode() in kept[0].read_text()
+        assert mode_of(kept[0]) == 0o600
+        assert not dead.exists()
+    finally:
+        watch._close_live()
+
+
+def test_an_empty_scratch_of_a_dead_pid_is_removed_and_makes_no_dump(tmp_path):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(b"")
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert not dead.exists()
+        assert watch.dumps() == []
+    finally:
+        watch._close_live()
+
+
+def test_a_live_pids_scratch_is_never_touched_and_makes_no_dump(tmp_path):
+    live_child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        alive = tmp_path / stall_watch.scratch_name(live_child.pid)
+        alive.write_bytes(STACK_TEXT)
+        watch = StallWatch(tmp_path)
+        watch._prepare()
+        try:
+            assert alive.read_bytes() == STACK_TEXT
+            assert watch.dumps() == []
+        finally:
+            watch._close_live()
+    finally:
+        live_child.kill()
+        live_child.wait()
+
+
+class _FixedStamp:
+    """A stand-in for the module's datetime whose clock reads one fixed instant."""
+
+    def __init__(self, year: int) -> None:
+        from datetime import datetime, timezone
+        self._at = datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    def now(self, tz=None):
+        return self._at
+
+
+def test_a_kept_dump_counts_inside_keep_dumps_and_the_oldest_goes_first_never_the_new_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(stall_watch, "datetime", _FixedStamp(2001))       # earlier than every name below
+    for i in range(KEEP_DUMPS):
+        (tmp_path / f"stall-2099010{i % 10}T000000000000Z-{i:06d}.txt").write_text(f"old {i}")
+    before = sorted(p.name for p in tmp_path.iterdir())
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        files = watch.dumps()
+        assert len(files) == KEEP_DUMPS
+        kept = killed_dumps(tmp_path)
+        assert len(kept) == 1 and kept[0] in files               # the new one survives although it sorts oldest
+        gone = set(before) - {p.name for p in files}
+        assert gone == {before[0]}                               # the oldest of the others went
+    finally:
+        watch._close_live()
+
+
+def test_a_kept_dump_body_is_inside_the_byte_budget(tmp_path):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(b"x" * 500_000)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        text = kept.read_text()
+        assert f"[dump cut at {stall_watch.MAX_DUMP_BYTES} bytes]" in text
+        assert text.count("x") == stall_watch.MAX_DUMP_BYTES
+    finally:
+        watch._close_live()
+
+
+def test_a_kept_dump_never_overwrites_one_of_the_same_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(stall_watch, "datetime", _FixedStamp(2030))       # every name below shares one stamp
+    pid = _gone_pid()
+    for round_ in range(3):
+        (tmp_path / stall_watch.scratch_name(pid)).write_text(f"stacks of round {round_}\n")
+        watch = StallWatch(tmp_path)         # a new watch starts its sequence over, so its first name repeats
+        watch._prepare()
+        watch._close_live()
+    kept = killed_dumps(tmp_path)
+    assert len({p.name for p in kept}) == 3
+    assert sorted(p.read_text().split("stacks of round")[1].strip() for p in kept) == ["0", "1", "2"]
+
+
+def test_a_dump_that_cannot_be_written_leaves_the_dead_scratch_in_place_and_does_not_raise(tmp_path, monkeypatch,
+                                                                                         capsys):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+
+    def no_space(self, path):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(StallWatch, "_open_new_dump", no_space)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert dead.read_bytes() == STACK_TEXT
+        assert "not written" in capsys.readouterr().err
+    finally:
+        watch._close_live()
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads any file")
+def test_a_scratch_that_cannot_be_read_does_not_crash_prepare_and_is_left_in_place_and_named(tmp_path, capsys):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    dead.chmod(0)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert watch._scratch is not None             # the watch still has its own live capture
+        assert dead.exists()                          # fail closed: not deleted unread
+        assert watch.dumps() == []
+        said = capsys.readouterr().err
+        assert f"{pid}" in said and "not written" in said
+    finally:
+        dead.chmod(0o600)
+        watch._close_live()
+
+
+def _open_failing_for(monkeypatch, target, err: int) -> None:
+    """Make os.open raise OSError(err) for ``target`` only; every other open is the real one."""
+    real_open = os.open
+
+    def fake_open(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(target):
+            raise OSError(err, os.strerror(err))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+
+@pytest.mark.parametrize("err", [errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EINTR, errno.EIO,
+                                 errno.EACCES, errno.EPERM, errno.ENXIO])
+def test_an_open_that_fails_for_a_reason_about_the_process_leaves_the_dead_scratch_and_says_so(tmp_path, monkeypatch,
+                                                                                               capsys, err):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    _open_failing_for(monkeypatch, dead, err)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert dead.read_bytes() == STACK_TEXT         # kept for the next start, not deleted unread
+        assert killed_dumps(tmp_path) == []
+        said = capsys.readouterr().err
+        assert f"{pid}" in said and "not written" in said and os.strerror(err) in said
+    finally:
+        watch._close_live()
+
+
+@pytest.mark.parametrize("err", [errno.ENOENT, errno.ELOOP, errno.EMLINK])
+def test_an_open_that_says_gone_or_a_refused_symlink_still_deletes_the_dead_scratch(tmp_path, monkeypatch, err):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    _open_failing_for(monkeypatch, dead, err)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert not dead.exists()
+        assert killed_dumps(tmp_path) == []
+    finally:
+        watch._close_live()
+
+
+def test_a_symlink_scratch_is_refused_and_the_link_is_deleted_not_its_target(tmp_path):
+    target = tmp_path / "elsewhere.txt"
+    target.write_bytes(STACK_TEXT)
+    stalls = tmp_path / "stalls"
+    stalls.mkdir()
+    link = stalls / stall_watch.scratch_name(_gone_pid())
+    link.symlink_to(target)
+    watch = StallWatch(stalls)
+    watch._prepare()
+    try:
+        assert not link.is_symlink() and not link.exists()
+        assert target.read_bytes() == STACK_TEXT      # never followed, never touched
+        assert killed_dumps(stalls) == []
+    finally:
+        watch._close_live()
+
+
+def test_an_unforeseen_error_while_keeping_leaves_the_dead_scratch_and_says_so(tmp_path, monkeypatch, capsys):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+
+    def odd_open(self, path):
+        raise ValueError("odd dump name")
+
+    monkeypatch.setattr(StallWatch, "_open_new_dump", odd_open)     # not an OSError: only the outer net catches it
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert dead.read_bytes() == STACK_TEXT
+        assert killed_dumps(tmp_path) == []
+        said = capsys.readouterr().err
+        assert f"{pid}" in said and "not written" in said and "ValueError" in said
+    finally:
+        watch._close_live()
+
+
+def test_a_write_that_fails_midway_removes_the_partial_dump_and_keeps_the_scratch(tmp_path, monkeypatch, capsys):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    seen = []
+
+    def fail_after_create(fd, handle, budget, banner):
+        seen.append(len(killed_dumps(tmp_path)))      # the dump file already exists when the copy starts
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(stall_watch, "_copy_fd", fail_after_create)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        assert seen == [1]
+        assert killed_dumps(tmp_path) == []           # the partial one is gone
+        assert dead.read_bytes() == STACK_TEXT
+        assert "not written" in capsys.readouterr().err
+    finally:
+        watch._close_live()
+
+
+def test_a_failing_trim_after_a_written_dump_still_removes_the_scratch_and_says_nothing(tmp_path, monkeypatch, capsys):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+
+    def broken_trim(self, keep=None):
+        raise RuntimeError("degraded directory")
+
+    monkeypatch.setattr(StallWatch, "_trim_dumps", broken_trim)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        assert STACK_TEXT.decode() in kept.read_text()
+        assert not dead.exists()
+        assert "not written" not in capsys.readouterr().err
+    finally:
+        watch._close_live()
+
+
+def test_a_scratch_cut_mid_character_keeps_a_replacement_character_at_the_end_of_the_dump(tmp_path):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT + b"\xc3")             # the last write of a killed process ended inside a character
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        assert kept.read_text().endswith(STACK_TEXT.decode() + "\ufffd")
+    finally:
+        watch._close_live()
+
+
+def test_a_later_dumps_trim_can_delete_a_kept_dump_once_keep_dumps_newer_ones_exist(tmp_path):
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        for i in range(KEEP_DUMPS - 1):
+            (tmp_path / f"stall-2099010{i % 10}T000000000000Z-{i:06d}.txt").write_text(f"newer {i}")
+        assert kept.exists() and len(watch.dumps()) == KEEP_DUMPS     # full, the kept one still inside
+        watch._write_dump(1.5)                                         # the 21st: the trim has no protected dump
+        assert not kept.exists()
+        assert len(watch.dumps()) == KEEP_DUMPS
+    finally:
+        watch._close_live()
+
+
+def test_the_kept_dump_header_names_the_pid_and_the_scratch_size_and_claims_no_cause(tmp_path):
+    pid = _gone_pid()
+    dead = tmp_path / stall_watch.scratch_name(pid)
+    dead.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
+    watch._prepare()
+    try:
+        (kept,) = killed_dumps(tmp_path)
+        header = kept.read_text().splitlines()[0]
+        assert header.startswith(f"cockpit stall: process {pid} ended without stopping its watch; ")
+        assert f"size {len(STACK_TEXT)} bytes" in header
+        assert header.endswith("a late-wake report may or may not have been written from them")
+        assert "no late-wake report was written" not in header
+        assert f"killed-pid{pid}-" in kept.name
+    finally:
+        watch._close_live()
 
 
 # ---- a directory that is not ours to trust ------------------------------------------------------------------------

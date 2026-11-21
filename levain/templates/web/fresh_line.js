@@ -15,7 +15,8 @@
  * On a phone-width screen the age is written in its short form (STRINGS.ageShort) so its number survives beside the state words.
  *
  * Speech. The state words sit alone in the role="status" span; the age and the "updating" cue sit in a sibling span outside it, so a
- * ticking age is never announced. The words are written only when the state changes. A worse state, and any entry into "down" (whatever
+ * ticking age is never announced. The words are written only when the state changes, or when the same state names other words (a
+ * different panel is the stale one, a different count), which is then spoken too. A worse state, and any entry into "down" (whatever
  * state it comes from), is held HOLD_MS before it is written (a stream reconnect flap does not speak); a hold pending when the tab hides
  * is dropped and judged afresh when it is seen. A recovery to live is spoken only if the worse state was; the first connecting-to-live
  * is silent. */
@@ -38,6 +39,7 @@
     justNow: "just now",
     ageUpdatedNow: "updated just now",
     agePanelNow: "read just now",
+    agePanelNever: "never read",
     ageShort: "{age}",
     justNowShort: "<5s",
     updating: "updating",
@@ -114,8 +116,9 @@
       var kind = h.status === "error" || neverRead ? "error" : (h.status === "stale" || faulted[id] === true ? "stale" : "");
       var stale = kind !== "";
       var asOf = toMs(h.as_of), onServer = true;
-      // a panel the page could not read has aged from the page's own last read of it, on the page's clock, not from the server's
-      if (faulted[id]) { asOf = (held[id] && held[id].at) || boot.lastWholeAt || asOf; onServer = false; }
+      // a panel the page could not read has aged from the page's own last SUCCESSFUL read of it, on the page's clock, not from the server's;
+      // one never read has no age (the line says so), never the failed attempt's
+      if (faulted[id]) { asOf = (held[id] && held[id].at) || null; onServer = false; }
       return { id: id, title: stale ? (titleOf(id) || id) : id, kind: kind, asOfMs: asOf || null, onServerClock: onServer, stale: stale, pending: false };
     });
     var read;
@@ -174,6 +177,7 @@
       if (short) ageText = fresh ? STRINGS.justNowShort : fill(STRINGS.ageShort, { age: a });
       else ageText = key === "stale" ? (fresh ? STRINGS.agePanelNow : fill(STRINGS.agePanel, { age: a })) : (fresh ? STRINGS.ageUpdatedNow : fill(STRINGS.ageUpdated, { age: a }));
     }
+    else if (key === "stale" && stale[0].kind === "error") ageText = STRINGS.agePanelNever;   // an unavailable panel with no read time was never read
     // the first read says "connecting" already; the cue is for a re-read of a board that is up
     var updating = key !== "connecting" && !!(f.read.inflightAt && now - f.read.inflightAt >= UPDATING_MS);
     if (updating) age = STRINGS.updating; else age = ageText;

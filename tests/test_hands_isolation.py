@@ -1298,3 +1298,57 @@ def test_a_setup_whose_record_cannot_be_synced_is_a_clean_failure_not_a_tracebac
     monkeypatch.setattr(hands, "record_hands", lambda *a, **kw: (_ for _ in ()).throw(HandsSetupError("could not be synced")))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     assert "could not be synced" in capsys.readouterr().out
+
+
+def test_the_foreign_gitdir_probe_fixture_does_not_inherit_a_private_umask(tmp_path: Path) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    os.chmod(scratch, 0o700)  # not mkdir(mode=): that one is masked by the ambient umask
+    repo = scratch / "r"
+    env = {"PATH": hands.SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    old = os.umask(0o077)
+    try:
+        assert hands._make_gitcheck_repo(scratch, repo, env)
+    finally:
+        os.umask(old)
+    other_can_enter_and_read = stat.S_IROTH | stat.S_IXOTH
+    for path in (scratch, repo, repo / ".git"):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode & other_can_enter_and_read == other_can_enter_and_read, f"{path.name} is {oct(mode)}: another user cannot read and enter it"
+    # what the operator's git must READ inside .git: HEAD, refs/, objects/ and what is nested in them
+    git_dir = repo / ".git"
+    for path in (git_dir / "HEAD", git_dir / "refs", git_dir / "objects", git_dir / "refs" / "heads", git_dir / "objects" / "pack"):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        need = stat.S_IROTH | (stat.S_IXOTH if path.is_dir() else 0)
+        assert mode & need == need, f".git/{path.relative_to(git_dir)} is {oct(mode)}: another user cannot read it"
+    for root, dirs, files in os.walk(git_dir):
+        for name in files:
+            assert stat.S_IMODE(os.lstat(os.path.join(root, name)).st_mode) == 0o644, os.path.join(root, name)
+        for name in dirs:
+            assert stat.S_IMODE(os.lstat(os.path.join(root, name)).st_mode) == 0o755, os.path.join(root, name)
+
+
+def test_the_gitcheck_repo_helper_widens_only_what_it_is_told_and_not_through_a_symlink(tmp_path: Path) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    other = tmp_path / "other"  # the repo's parent here, which the helper was not told about
+    other.mkdir()
+    os.chmod(scratch, 0o700)
+    os.chmod(other, 0o700)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    os.chmod(outside, 0o600)
+    template = tmp_path / "template"
+    template.mkdir()
+    os.symlink(outside, template / "link")
+    env = {"PATH": hands.SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_TEMPLATE_DIR": str(template)}
+    old = os.umask(0o077)
+    try:
+        assert hands._make_gitcheck_repo(scratch, other / "r", env)
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(other.stat().st_mode) == 0o700
+    assert stat.S_IMODE(scratch.stat().st_mode) == 0o755
+    assert (other / "r" / ".git" / "link").is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o600

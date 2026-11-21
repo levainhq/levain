@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import shutil
 import threading
 import time
@@ -83,8 +84,13 @@ def _release(gate, held: list) -> None:
     held.clear()
 
 
+_AT = re.compile(r" at=\S+$")
+
+
 def _refusal_lines(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.name == LOG and r.getMessage().startswith("refused 503")]
+    """The refusal lines logged, each without its closing ` at=<time>` stamp (its own test reads the stamp)."""
+    return [_AT.sub("", r.getMessage()) for r in caplog.records
+            if r.name == LOG and r.getMessage().startswith("refused 503")]
 
 
 # --- 1. the mechanism: the page's own reads are not starved by a page-load burst --------------------------------------
@@ -197,6 +203,19 @@ def test_the_instrument_logs_one_line_per_route_and_gate_per_second_and_counts_t
         assert _refusal_lines(caplog)[2:] == ["refused 503 route=band gate=page_waiters_full n=1",
                                               "refused 503 route=board gate=page_wait n=1"]
     assert st.snapshot()["band"]["refused_503"] == 52 and st.snapshot()["board"]["refused_503"] == 1
+
+
+def test_the_refusal_line_ends_with_the_time_it_was_logged(caplog) -> None:
+    from datetime import datetime, timezone
+
+    st = web_server._RouteStats(clock=_Clock())
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        st.record_refusal("band", "page_wait")
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("refused 503"))
+    stamp = _AT.search(line)
+    assert stamp is not None, line
+    at = datetime.fromisoformat(stamp.group(0).removeprefix(" at="))
+    assert at.tzinfo is not None and abs((datetime.now(timezone.utc) - at).total_seconds()) < 60, line
 
 
 def test_the_refusal_line_carries_no_raw_path_query_or_token(caplog) -> None:

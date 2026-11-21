@@ -22,10 +22,40 @@ from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
 from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
+from tests._waits import scaled
 
 TRAY = "document.querySelector('[data-ck-panel=tray]')"
 INPUT = f"{TRAY}.querySelector('.list-intake-input')"
 RECEIPT = f"{TRAY}.querySelector('[data-list-receipt]')"
+
+# What a test waits for instead of a fixed sleep. A board draw replaces the whole focus view (its body, its chips) and the card's control,
+# so a step that takes hold of one of them must start from the settled board (BOARD_SETTLED); the dialog is at rest once nothing in it is
+# still animating, and gone once its overlay is out of the page.
+_MODAL_AT_REST = {"until": "(() => { const m = document.getElementById('levain-modal'); "
+                           "return !!m && !m.getAnimations({subtree: true}).some(a => a.playState !== 'finished') && 1; })()"}
+_MODAL_GONE = {"until": "!document.getElementById('levain-modal') && 1"}
+
+# The in-page half of a chip sweep. A draw while a sweep runs replaces the focus view's body and every chip in it, so the sweep never keeps
+# a node across a step: it finds the body and each chip again at the moment it needs them (`mb()`, `chip()`), and a tap waits for the
+# page to redraw the chips it was made on (`tap`: the tapped chip has left the page, the row having been rebuilt) before anything is read.
+# `until` throws with what it waited for, so a wait that never comes true fails the drive with its own words.
+_SWEEP_KIT = """
+  const mb = () => document.querySelector('#levain-modal .modal-body');
+  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
+  const shown = () => { const m = mb(); return m ? [...m.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length : 0; };
+  const chip = (kind, v) => { const m = mb(); return m && m.querySelector('.list-' + kind + '-chip[data-' + kind + '="' + v + '"]'); };
+  const pressed = (kind) => { const m = mb(); return m && m.querySelector('.list-' + kind + '-chip[aria-pressed="true"]'); };
+  const until = async (test, what) => {
+    const t0 = Date.now();
+    while (!test()) { if (Date.now() - t0 > __MS__) throw new Error('never came true: ' + what); await new Promise(r => setTimeout(r, 15)); }
+  };
+  const tap = async (kind, v) => {
+    const c = chip(kind, v); if (!c) return null;
+    const n = num(c); c.click();
+    await until(() => !c.isConnected, 'the ' + kind + ' chip "' + v + '" redrawn after its tap');
+    return {n};
+  };
+""".replace("__MS__", str(int(scaled(15) * 1000)))
 
 
 def _reload() -> list[dict[str, Any]]:
@@ -361,7 +391,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             # rebuild the List the way the page does on a refresh: the tab coming back
             *[{"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"} for _ in range(6)],
-            {"eval": "new Promise(r => setTimeout(() => r(1), 1500))"},
+            BOARD_SETTLED,        # the six rebuilds have been read and drawn
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             {"eval": f"JSON.stringify({{ph: {ph}}})"},
             {"emulate": {"w": 1000, "h": 844, "dpr": 1}},
@@ -426,9 +456,7 @@ def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Pat
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
-            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
-            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},       # the dialog's fade settles before anything is read or shot
+            *_open_focus(),       # from the settled board, with the dialog's fade over before anything is read or shot
             {"eval": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); mb.scrollTop = Math.floor((mb.scrollHeight - mb.clientHeight) / 2); return 1; })()"},
             {"eval": _BAR_PROBE},
             {"shot": str(shots / "listpanel_141_after.png")},
@@ -516,14 +544,14 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 0 && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            BOARD_SETTLED,
             {"eval": _CARD_PROBE},
             {"eval": f"{TRAY}.querySelector('[data-list-more]') ? ({TRAY}.querySelector('[data-list-more]').click(), 1) : 0"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            _MODAL_AT_REST,
             {"eval": _FOCUS_PROBE},
             {"eval": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"band\"]').click(); 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            {"until": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"band\"][aria-pressed=\"true\"]') && 1"},
             {"eval": _BAND_CHIP_PROBE},
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
@@ -597,15 +625,14 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            BOARD_SETTLED,
             {"eval": _CTL_PROBE},
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
-            # the close hands the focus to the control: this waits for that hand-back (up to 10 s, not a fixed 400 ms) and no more. The
-            # later loss of the focus was never a slow hand-back: the draw below is what moved it, and the next steps make that draw
-            {"eval": "document.querySelector('#levain-modal .modal-close').click(); "
-                     f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 10000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            # a board draw may land between the click and this read and replace the control: its successor takes the focus when it is drawn, so the read is a bounded poll that ends at the first success
+            {"eval": f"new Promise(r => {{ const t0 = Date.now(); const tick = () => (({focus_is_control}) || Date.now() - t0 > 5000) ? r(1) : setTimeout(tick, 50); tick(); }})"},
             # a draw that follows the close (a fold from a search, a resize or a late row; a whole-board redraw from a fresh read) draws the
             # card's control again: the focus must ride along. A board redraw arrives on its own some 300 ms after the close on a loaded
             # box, so the test asks for each instead of hoping to meet one; unchanged input still folds the card
@@ -618,11 +645,11 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
             # true, or what holds the focus instead (the next failure then says where it went, not only that it left)
             {"eval": f"(({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing'))"},
         ])
-    wide = json.loads(out["values"][-8])
+    wide = json.loads(out["values"][-9])
     assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
     assert wide["label"] and "desk owes 2" in wide["label"] and "open the full list" in wide["label"], wide
     assert wide["tags"] == [True], wide                                            # the carried row is tagged desk-owed, as the footer tags it
-    heads = json.loads(out["values"][-5])
+    heads = json.loads(out["values"][-6])
     assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
     assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
     assert out["values"][-3] is True, out["values"]                                # the search fold replaced the control (not a wait that timed out)
@@ -641,7 +668,7 @@ def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives
             {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            BOARD_SETTLED,
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "document.querySelectorAll('[data-ck-panel=tray] .more-foot').forEach(n => n.remove()); 1"},
@@ -654,6 +681,35 @@ def test_listpanel_closing_the_full_list_while_the_cards_control_is_absent_gives
 
 
 @needs_browser
+def test_listpanel_a_board_redraw_after_the_full_list_closed_keeps_focus_on_the_cards_control(tmp_path: Path, monkeypatch: Any) -> None:
+    # the view has closed and given the focus back; the board is then drawn again (a poll does this) and replaces the control that holds it
+    src = _carried_install(tmp_path, monkeypatch)
+    ctl = "document.querySelector('[data-ck-panel=tray] [data-list-more]')"
+    focus_is_control = f"document.activeElement && document.activeElement === {ctl}"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            # the close hands the focus to the control (waited for, bounded), which is then kept to show the redraw replaced it; the successor is looked for on a timer
+            # (a hidden tab pauses animation frames), so the read is made as soon as the page gives it the focus and the deadline is checked on every tick and is past the ask's window
+            {"eval": "(() => { document.querySelector('#levain-modal .modal-close').click(); "
+                     f"const wait = (done, ms) => new Promise(r => {{ const t0 = Date.now(); const tick = () => (done() || Date.now() - t0 > ms) ? r(1) : setTimeout(tick, 16); tick(); }}); "
+                     f"return wait(() => {focus_is_control}, 5000).then(() => {{ "
+                     f"const old = {ctl}; const heldBefore = !!old && document.activeElement === old; window.LevainDashboard.redraw(); const replaced = !!old && !old.isConnected; "
+                     f"return wait(() => {focus_is_control}, 3500).then(() => JSON.stringify({{heldBefore, replaced, successor: {ctl} !== old, "
+                     f"focus: ({focus_is_control}) ? true : 'focus is on ' + (document.activeElement ? document.activeElement.tagName + '.' + document.activeElement.className : 'nothing') + ' ctl=' + !!{ctl}}})); }}); }})()"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got["heldBefore"] is True, got      # the control held the focus when the redraw ran
+    assert got["replaced"] is True and got["successor"] is True, got      # the redraw took that control out and drew another
+    assert got["focus"] is True, got
+
+
+@needs_browser
 def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_and_a_search_finds_them_in_the_full_list(tmp_path: Path, monkeypatch: Any) -> None:
     src = _carried_install(tmp_path, monkeypatch, all_desk=True, intentions=False)
     type_q = lambda q: (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
@@ -663,7 +719,7 @@ def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_a
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            BOARD_SETTLED,
             {"eval": _CTL_PROBE},
             {"eval": type_q("BJE")},
             {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, !!{TRAY}.querySelector('[data-list-open-matches]')]"},
@@ -696,11 +752,11 @@ def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_und
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            BOARD_SETTLED,
             {"eval": f"{TRAY}.querySelector('[data-list-more]').textContent"},
             {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            _MODAL_AT_REST,
             {"eval": _FOCUS_PROBE},
         ])
     control = next(x for x in out["values"] if isinstance(x, str) and "desk owes" in x)
@@ -760,15 +816,16 @@ def test_listpanel_141_again_the_sticky_bar_is_opaque_and_ruled_in_both_themes_s
         {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
         *_reload(),
         {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
-        {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
-        {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
-        {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+        *_open_focus(),
     ]
     for theme in ("light", "dark"):
         steps += [
             {"eval": f"document.documentElement.dataset.theme = '{theme}'; 1"},
             {"eval": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); mb.scrollTop = 0; mb.scrollTop = 260; return 1; })()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
+            # the scroll has landed where it was put (the body's own limit when that is nearer) and the theme's transitions are over
+            {"until": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); "
+                      "return Math.abs(mb.scrollTop - Math.min(260, mb.scrollHeight - mb.clientHeight)) < 1 && 1; })()"},
+            _MODAL_AT_REST,
             {"eval": _BAR_LAYERS},
             {"shot": str(shots / f"{theme}.png")},
         ]
@@ -809,10 +866,12 @@ def _chip(kind: str, value: str) -> str:
     return f"{_FOCUS}.querySelector('.list-{kind}-chip[data-{kind}=\"{value}\"]')"
 
 
-def _open_focus() -> list[dict[str, Any]]:
-    return [{"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+def _open_focus(settled: bool = True) -> list[dict[str, Any]]:
+    """The focus view opened from a settled board (`settled=False` when the caller's last step already left it so), then at rest."""
+    return [*([BOARD_SETTLED] if settled else []),
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
             {"until": f"{_FOCUS} && {_FOCUS}.querySelector('.sp-results .row') && 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"}]            # the dialog's fade settles
+            _MODAL_AT_REST]
 
 
 @needs_browser
@@ -840,7 +899,8 @@ def test_the_list_is_time_first_with_a_type_tag_on_every_row_and_the_type_chips_
             {"eval": f"{_chip('time', 'later')}.click(); {_chip('surface', '')}.click(); {_chip('time', 'done')}.click(); 1"},
             {"eval": f"JSON.stringify({{done: {rows_of}}})"},
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"until": "window.innerWidth === 390 && 1"},
+            _MODAL_AT_REST,
             {"shot": str(shots / "focus_time_first_390.png")},
         ])
     vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
@@ -947,23 +1007,21 @@ def test_a_ringing_repeating_reminders_band_row_draws_its_repeat_line_as_text(tm
 # --- the first fix round (levain 7, 1109-26): chips that add up, a stale type choice, two labelled rows --------------------------
 
 _CHIP_SWEEP = f"""(async () => {{
-  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
-  const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
+  {_SWEEP_KIT}
   const out = [];
   for (const t of ['', 'now', 'later', 'someday', 'done']) {{
-    const on = mb.querySelector('.list-time-chip[aria-pressed="true"]');
-    const want = t ? mb.querySelector('.list-time-chip[data-time="' + t + '"]') : null;
-    if (t && !want) continue;
-    if (on && on !== want) on.click();
-    if (want && want.getAttribute('aria-pressed') !== 'true') want.click();
-    await sleep(80);
-    const chips = [...mb.querySelectorAll('.list-surface-chip')];
-    const all = chips.find((c) => c.dataset.surface === '');
+    const on = pressed('time');
+    if (t && !chip('time', t)) continue;
+    if (on && on.dataset.time !== t) await tap('time', on.dataset.time);
+    const want = t ? chip('time', t) : null;
+    if (want && want.getAttribute('aria-pressed') !== 'true') await tap('time', t);
+    const timeCount = want ? num(chip('time', t)) : null;
+    const kinds = [...mb().querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface);
+    const all = num(chip('surface', ''));
     const per = [];
-    for (const c of chips.filter((x) => x.dataset.surface !== '')) {{ c.click(); await sleep(60); per.push([c.dataset.surface, num(c), shown()]); }}
-    all.click(); await sleep(60);
-    out.push({{t, timeCount: want ? num(want) : null, all: num(all), shownAll: shown(), per}});
+    for (const k of kinds.filter((x) => x !== '')) {{ const r = await tap('surface', k); if (r) per.push([k, r.n, shown()]); }}
+    await tap('surface', '');
+    out.push({{t, timeCount, all, shownAll: shown(), per}});
   }}
   return JSON.stringify({{sweep: out}});
 }})()"""
@@ -999,23 +1057,18 @@ def test_the_type_chips_add_up_to_all_in_every_time_state_and_each_count_is_the_
 
 
 _TIME_UNDER_SURFACE = f"""(async () => {{
-  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
-  const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
+  {_SWEEP_KIT}
   const out = [];
-  for (const k of [...mb.querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
-    const surf = mb.querySelector('.list-surface-chip[data-surface="' + k + '"]'); if (!surf) continue;
-    surf.click(); await sleep(80);
+  for (const k of [...mb().querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
+    if (!await tap('surface', k)) continue;
     for (const t of ['now', 'later', 'someday', 'done']) {{
-      const chip = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
-      if (!chip) continue;
-      const n = num(chip); chip.click(); await sleep(80);
-      out.push([k, t, n, shown()]);
-      const again = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
-      if (again) again.click(); await sleep(60);
+      const r = await tap('time', t);
+      if (!r) continue;
+      out.push([k, t, r.n, shown()]);
+      await tap('time', t);
     }}
-    const on = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (on) {{ on.click(); await sleep(60); }}
-    const allChip = mb.querySelector('.list-surface-chip[data-surface=""]'); if (allChip) {{ allChip.click(); await sleep(60); }}
+    const on = pressed('time'); if (on) await tap('time', on.dataset.time);
+    await tap('surface', '');
   }}
   return JSON.stringify(out);
 }})()"""
@@ -1045,43 +1098,46 @@ def test_with_a_type_chip_chosen_each_time_chip_is_the_rows_its_tap_draws(tmp_pa
 
 
 _EVERY_STATE_SWEEP = f"""(async () => {{
-  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
-  const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
-  const sel = mb.querySelector('select.tray-dump-type');
-  const views = sel ? [...sel.options].map((o) => o.value) : [''];
-  const out = []; const set = async (v) => {{ if (!sel) return; sel.value = v; sel.dispatchEvent(new Event('change', {{bubbles: true}})); await sleep(80); }};
-  const clearTime = async () => {{ const on = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (on) {{ on.click(); await sleep(60); }} }};
-  const clearSurface = async () => {{ const a = mb.querySelector('.list-surface-chip[data-surface=""]'); if (a) {{ a.click(); await sleep(60); }} }};
+  {_SWEEP_KIT}
+  const sel = () => {{ const m = mb(); return m && m.querySelector('select.tray-dump-type'); }};
+  const views = sel() ? [...sel().options].map((o) => o.value) : [''];
+  const kinds = (kind) => [...mb().querySelectorAll('.list-' + kind + '-chip')].map((c) => c.dataset[kind]);
+  const out = [];
+  // a chosen view redraws the chips for it: the chip row the change found has left the page
+  const set = async (v) => {{
+    const s = sel(); if (!s) return;
+    const c = chip('surface', ''); s.value = v; s.dispatchEvent(new Event('change', {{bubbles: true}}));
+    if (c) await until(() => !c.isConnected, 'the chips redrawn for the view "' + v + '"');
+  }};
+  const clearTime = async () => {{ const on = pressed('time'); if (on) await tap('time', on.dataset.time); }};
+  const clearSurface = async () => tap('surface', '');
   for (const v of views) {{
     await set(v);
     for (const t of ['', 'now', 'later', 'someday', 'done']) {{
       await clearTime(); await clearSurface();
-      if (t) {{ const w = mb.querySelector('.list-time-chip[data-time="' + t + '"]'); if (!w) continue; w.click(); await sleep(80); }}
-      for (const c of [...mb.querySelectorAll('.list-surface-chip')]) {{
-        const k = c.dataset.surface; const n = num(c); c.click(); await sleep(70);
-        out.push({{view: v, time: t, surface: k, n, shown: shown()}});
+      if (t) {{ if (!await tap('time', t)) continue; }}
+      for (const k of kinds('surface')) {{
+        const r = await tap('surface', k); if (!r) continue;
+        out.push({{view: v, time: t, surface: k, n: r.n, shown: shown()}});
       }}
       await clearSurface();
     }}
     await clearTime();
-    for (const sk of [...mb.querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
+    for (const sk of kinds('surface').filter((x) => x)) {{
       await clearTime(); await clearSurface();
-      const sc = mb.querySelector('.list-surface-chip[data-surface="' + sk + '"]'); if (!sc) continue;
-      sc.click(); await sleep(70);
-      for (const tk of [...mb.querySelectorAll('.list-time-chip')].map((c) => c.dataset.time)) {{
-        const tc = mb.querySelector('.list-time-chip[data-time="' + tk + '"]'); if (!tc) continue;
-        const n = num(tc); tc.click(); await sleep(70);
-        out.push({{view: v, time: tk, surface: sk, n, shown: shown(), under: true}});
-        const back = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (back) {{ back.click(); await sleep(60); }}
+      if (!await tap('surface', sk)) continue;
+      for (const tk of kinds('time')) {{
+        const r = await tap('time', tk); if (!r) continue;
+        out.push({{view: v, time: tk, surface: sk, n: r.n, shown: shown(), under: true}});
+        const back = pressed('time'); if (back) await tap('time', back.dataset.time);
       }}
       await clearTime(); await clearSurface();
     }}
     await clearTime();
-    for (const c of [...mb.querySelectorAll('.list-time-chip')]) {{
-      const k = c.dataset.time; const n = num(c); c.click(); await sleep(70);
-      out.push({{view: v, time: k, surface: '*', n, shown: shown()}});
-      const again = mb.querySelector('.list-time-chip[data-time="' + k + '"]'); if (again) again.click(); await sleep(60);
+    for (const k of kinds('time')) {{
+      const r = await tap('time', k); if (!r) continue;
+      out.push({{view: v, time: k, surface: '*', n: r.n, shown: shown()}});
+      if (chip('time', k)) await tap('time', k);
     }}
   }}
   return JSON.stringify({{views, out}});
@@ -1115,14 +1171,14 @@ def test_every_chip_in_every_state_is_the_rows_its_tap_draws_in_a_named_view_too
 
 
 _KEYBOARD_FOCUS = f"""(async () => {{
-  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  {_SWEEP_KIT}
   const out = [];
-  const same = (a) => !!a && a.dataset && (a.dataset.surface !== undefined ? '[data-surface="' + a.dataset.surface + '"]' : '[data-time="' + a.dataset.time + '"]');
   for (const sel of ['.list-surface-chip[data-surface="band"]', '.list-time-chip[data-time="now"]', '.list-surface-chip[data-surface=""]']) {{
-    const c = mb.querySelector(sel); if (!c) {{ out.push([sel, 'absent']); continue; }}
-    c.focus(); c.click(); await sleep(100);
+    const c = mb().querySelector(sel); if (!c) {{ out.push([sel, 'absent']); continue; }}
+    c.focus(); c.click();
+    await until(() => !c.isConnected, 'the chips redrawn after the tap on ' + sel);
     const a = document.activeElement;
-    out.push([sel, a && a.matches ? a.matches(sel) : false, !!(a && mb.contains(a)), a === c]);
+    out.push([sel, a && a.matches ? a.matches(sel) : false, !!(a && mb().contains(a)), a === c]);
   }}
   return JSON.stringify(out);
 }})()"""
@@ -1193,7 +1249,8 @@ def test_the_two_chip_rows_are_labelled_when_and_type_at_390_and_1280(tmp_path: 
             {"eval": f"JSON.stringify({{labels: {labels}}})"},
             {"shot": str(shots / "list_chips_1280.png")},
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"until": "window.innerWidth === 390 && 1"},
+            _MODAL_AT_REST,
             {"shot": str(shots / "list_chips_390.png")},
             {"eval": f"JSON.stringify({{narrow: {labels}, hs: document.documentElement.scrollWidth <= window.innerWidth + 1}})"},
         ])
@@ -1252,13 +1309,14 @@ def test_r5_with_a_type_chosen_on_the_card_each_footer_number_is_the_rows_its_ta
     for surface in ("band", "intentions", "talk"):
         steps += [
             {"eval": f"(() => {{ const c = {TRAY}.querySelector('.list-surface-chip[data-surface=\"{surface}\"]'); if (c) c.click(); return 1; }})()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            BOARD_SETTLED,        # the card has drawn for the type just chosen
             {"eval": _CARD_FOOT},
             {"eval": f"(() => {{ const f = {TRAY}.querySelector('[data-list-more]'); if (f) f.click(); return 1; }})()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results') && 1"},
+            _MODAL_AT_REST,
             {"eval": _FOCUS_GROUPS},
             {"eval": "(() => { const x = document.querySelector('#levain-modal .modal-close'); if (x) x.click(); return 1; })()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            _MODAL_GONE,
         ]
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
@@ -1283,12 +1341,13 @@ def test_r5_a_focused_chip_with_no_replacement_hands_focus_to_the_first_chip_of_
     _seed_time(root)
     _host_band(monkeypatch)
     probe = f"""(async () => {{
-      const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-      const c = mb.querySelector('.list-surface-chip[data-surface="band"]'); c.focus();
+      {_SWEEP_KIT}
+      const c = mb().querySelector('.list-surface-chip[data-surface="band"]'); c.focus();
       c.dataset.surface = 'gone';        // a chip whose rebuilt row has no chip of its name
-      c.click(); await sleep(120);
+      c.click();
+      await until(() => !c.isConnected, 'the chips redrawn after the tap');
       const a = document.activeElement;
-      return JSON.stringify({{inRow: !!(a && a.closest && a.closest('.list-surfaces')), first: a === mb.querySelector('.list-surfaces button'), tag: a && a.tagName}});
+      return JSON.stringify({{inRow: !!(a && a.closest && a.closest('.list-surfaces')), first: a === mb().querySelector('.list-surfaces button'), tag: a && a.tagName}});
     }})()"""
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
@@ -1313,18 +1372,19 @@ def test_r6_a_time_chosen_in_the_focus_view_leaves_the_card_footer_counting_what
                                             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
     _host_band(monkeypatch)
     close = {"eval": "(() => { const x = document.querySelector('#levain-modal .modal-close'); if (x) x.click(); return 1; })()"}
-    settle = {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}
+    settle = [_MODAL_GONE, BOARD_SETTLED]        # the view is out of the page and the card has drawn for what it left chosen
     steps: list[dict[str, Any]] = []
     for time in ("later", "someday", "done", "now"):
         steps += [
-            *_open_focus(),
+            *_open_focus(settled=time == "later"),
             {"eval": f"(() => {{ const c = {_chip('time', time)}; if (c) c.click(); return 1; }})()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 400))"},
-            close, settle,
+            # the time chip the tap drew is the pressed one (a time with no chip has nothing to tap)
+            {"until": f"(() => {{ const c = {_chip('time', time)}; return (!c || c.getAttribute('aria-pressed') === 'true') && 1; }})()"},
+            close, *settle,
             {"eval": _CARD_FOOT},                                  # what the card says after the time was chosen in the focus view
-            *_open_focus(),
+            *_open_focus(settled=False),
             {"eval": _FOCUS_GROUPS},                               # what its tap then draws
-            close, settle,
+            close, *settle,
         ]
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [

@@ -556,8 +556,12 @@ def test_a_refused_row_taken_again_by_another_order_runs_under_that_order(tmp_pa
     conn.close()
 
 
-@pytest.mark.parametrize("code", [None, True, False, "0", 0.0])
-def test_a_runner_that_returns_no_exit_code_is_unknown(world, code):
+@pytest.mark.parametrize("code", [
+    pytest.param(None, id="none"), pytest.param(True, id="true"), pytest.param(False, id="false"),
+    pytest.param("0", id="str-zero"), pytest.param(0.0, id="float-zero"),
+    pytest.param(-9, id="signal-9"), pytest.param(-15, id="signal-15"), pytest.param(-2, id="signal-2"),
+])
+def test_a_runner_that_returns_no_exit_code_or_dies_by_a_signal_is_unknown_not_failed(world, code):
     g = signed(world)
     rig = Rig(world)
     res = restart(rig, g, runner=lambda a: code)
@@ -754,14 +758,6 @@ def test_a_result_names_the_verb_alone(world):
     res = restart(rig, g)
     assert res.verb == "restart_service" and res.text == "restart_service taoserv apache2: exit 0"
     assert restart(rig, g, EVR, "php8.3-fpm", runner=lambda a: 3).verb == "restart_service"
-
-
-@pytest.mark.parametrize("code", [-9, -15, -2])
-def test_a_signal_death_is_unknown_not_failed(world, code):
-    g = signed(world)
-    rig = Rig(world)
-    assert restart(rig, g, runner=lambda a: code).text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}"
-    assert [r.status for r in rig.journal.rows()] == ["unknown"]
 
 
 @pytest.mark.parametrize("column,value", [("order_sha256", "'f'"), ("incarnation", "99"), ("per_night", "99"),

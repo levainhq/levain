@@ -1436,9 +1436,11 @@
       },
       token: storedToken, drop: dropToken,
     };
+    const readTimes = {};
     const readOne = async (id) => {
       try {
         panels[id] = await readPanelBody(panelUrl(id), io);
+        readTimes[id] = Date.now();     // when THIS panel's body resolved, not when the slowest panel's did
         // kept for a later read of this cold board only from the current read, and only while the page holds the credential it was read as
         if (onPartial && !wholeDrawn && isCurrent() && sameAs() && bootLandedAs === readAs) bootLanded[id] = panels[id];
       } catch (e) {
@@ -1463,9 +1465,17 @@
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
     // `err` marks a panel this read could not read (drawn as unavailable): a failure the stream reads again on its bounded schedule
+    // `at` is when the page last read the panel SUCCESSFULLY: now for a good body, the earlier one (or none) for a panel this read could not
+    // read, so the freshness line never ages an unavailable panel from the failed attempt
+    const heldPrev = window.LevainCockpitHeld || {};
     heldNext = Object.fromEntries(ids.map((id) => {
       const p = panels[id], unread = !!p && p.error !== undefined && p.status === undefined;
-      return [id, { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" }];
+      const rec = { etag: unread ? null : (manifest.panels[id] || {}).etag || null, err: unread ? String(p.error || "unreadable") : "" };
+      // a server error envelope (or no body) is an answer, not a read of the panel: it keeps the earlier good time too
+      const good = !!p && !unread && p.status !== "error";
+      const at = good ? readTimes[id] : (heldPrev[id] && heldPrev[id].at);
+      if (typeof at === "number" && at > 0) rec.at = at;
+      return [id, rec];
     }));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: held }, { elapsedMs: Date.now() - fetchedAt });
   }
