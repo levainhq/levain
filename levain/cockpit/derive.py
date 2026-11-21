@@ -256,7 +256,7 @@ class _Fingerprinter:
 
 
 def fingerprint(inp: Any) -> str | None:
-    """The fingerprint of one input, None when it cannot be told: ``_views`` then counts the input as the constant "?" in the panel's joined fingerprint (see ``due_reason``).
+    """The fingerprint of one input, None when it cannot be told: ``_views`` then hashes the part "?" for that input (see ``due_reason``).
 
     One-shot: a Sqlite input is opened, read and closed here. The loop keeps its own connections between polls.
     """
@@ -319,7 +319,7 @@ def due_reason(
 ) -> str | None:
     """Why a panel is due, or None. Pure: all inputs are arguments.
 
-    An input that cannot be fingerprinted is the constant "?" in ``view.fp`` (see ``_views``): it fires "input" only when it flips to or from a real fingerprint.
+    An input that cannot be fingerprinted adds the part "?" to the material ``_views`` hashes into ``view.fp``: it fires "input" only when it flips to or from a real fingerprint.
     """
     if st.busy or view.locked:
         return None
