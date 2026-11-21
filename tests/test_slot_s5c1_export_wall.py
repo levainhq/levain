@@ -58,7 +58,7 @@ def test_export_walls_render_their_capability_list(role):
         "--cap-add CAP_SETGID --cap-add CAP_SETUID --ro-bind /usr /usr --ro-bind /etc /etc --symlink usr/bin /bin "
         "--symlink usr/sbin /sbin --symlink usr/lib /lib --proc /proc --dev /dev --tmpfs /dev/shm --tmpfs /tmp "
         "--tmpfs /var/tmp --tmpfs /run --perms 0755 --dir /var --perms 0755 --dir /var/levain --perms 0755 --dir "
-        f"/var/levain/export --bind {p} {p} --chdir {p}").split())
+        f"/var/levain/export --bind {p} {p} --chdir /").split())
     sp = wall.export_launch_spec("linux", role, ids=IDS["linux"], shared=SHARED["linux"],
                                  export_class=ROLES[role][2])
     launch = wall.export_linux_launch_argv(sp, host_links=LINKS)

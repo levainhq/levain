@@ -627,7 +627,8 @@ class WallFacts:
     them), ``ipc_denied``, ``mach_allow``. Linux: ``unshare`` (the namespaces bwrap makes beside the mount one,
     in order), ``new_session``, ``caps`` (None = bwrap's own default; a tuple = ``--cap-drop ALL`` then those
     added back), ``read_only`` (ro binds beside ``/usr`` and ``/etc``), ``host_dev`` (the host's ``/dev`` bound
-    whole, the slot's; else bwrap's minimal ``--dev``)."""
+    whole, the slot's; else bwrap's minimal ``--dev``). ``target_cwd`` is the cwd the stage enters after its
+    drop (the spec's ``cwd``); None = ``chdir``. ``chdir`` is the view's own (bwrap's ``--chdir`` on Linux)."""
 
     writable: Tuple[Tuple[str, ...], ...]
     network: Tuple[str, ...] = ()
@@ -644,6 +645,7 @@ class WallFacts:
     host_dev: bool = False
     chdir: str = "/"
     keep_fds: Tuple[int, ...] = ()
+    target_cwd: Optional[str] = None
 
 
 #: s5 §5b: each export target's ONE durable writable path, relative to ``L/export/`` (its per-run image's mount
@@ -661,7 +663,10 @@ EXPORT_DEVICES = ("/dev/null", "/dev/zero", "/dev/urandom")
 EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
 #: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
 #: runs as root inside bwrap and calls ``setgroups`` / ``setgid`` / ``setuid``; with no capability at all each
-#: fails EPERM and nothing starts [reasoned from bwrap's privileged path; not run on Linux, a 5g row].
+#: fails EPERM and nothing starts [reasoned from bwrap's privileged path]. Observed on the #222 VM: the dropped
+#: child's CapEff, CapPrm, CapInh and CapAmb read empty (``RUN_222.md`` "Fidelity"). bwrap's ``--chdir`` runs after
+#: this drop [read from where the #222 failure sits, not from bwrap's source], so it is ``/``; the stage enters
+#: the mount root as the account (#226).
 #: ``drop_and_assert`` clears the inheritable set bwrap fills with them, then proves the permitted, effective,
 #: ambient and inheritable sets empty, and ``no_new_privs`` keeps a setuid program from using the bounding set
 #: left behind.
@@ -689,16 +694,16 @@ def export_wall_facts(host: str, role: str) -> WallFacts:
         raise Refused("bad-token", f"export role {role!r}")
     base = PurePosixPath(str(STORE[host])) / "export"
     writable = tuple(str(base / d) for d in _EXPORT_DIRS[role])
-    common = dict(writable=(writable,), chdir=writable[0], keep_fds=(RESULT_FD,))
+    common = dict(writable=(writable,), target_cwd=writable[0], keep_fds=(RESULT_FD,))
     if host == "darwin":
-        return WallFacts(label=f"Levain export wall profile, target {role}, principal {EXPORT_ACCOUNT[role]}.",
+        return WallFacts(chdir=writable[0], label=f"Levain export wall profile, target {role}, principal {EXPORT_ACCOUNT[role]}.",
                          read_denied=EXPORT_READ_DENIED, devices=EXPORT_DEVICES, devices_only=True,
                          network=("(deny network*)",), ipc_denied=True, mach_allow=EXPORT_MACH_ALLOW, **common)
     ro = tuple(str(p) for p in (IMPORT_TREE[host], HELPER_DIR[host])
                if PurePosixPath("/usr") not in PurePosixPath(str(p)).parents
                and PurePosixPath("/etc") not in PurePosixPath(str(p)).parents)
     return WallFacts(unshare=("net", "ipc", "pid", "uts"), new_session=True, caps=EXPORT_CAPS, read_only=ro,
-                     host_dev=False, **common)
+                     host_dev=False, chdir="/", **common)
 
 
 def _export_dir(host: str) -> PurePosixPath:
@@ -735,7 +740,7 @@ def export_launch_spec(host: str, role: str, *, ids: Mapping[str, int], shared: 
         raise Refused("spec-malformed", f"an export target's fixed argv: <= {_FRONT_ARGS} strings of <= 4 KiB")
     argv = (str(PurePosixPath(str(HELPER_DIR[host])) / EXPORT_ENTRY[role]),) + args
     profile = _export_profile(role) if host == "darwin" else None
-    spec = Spec(role, who.uid, who.gid, who.groups, EXPORT_NPROC, None, (), profile, facts.chdir, argv, False,
+    spec = Spec(role, who.uid, who.gid, who.groups, EXPORT_NPROC, None, (), profile, facts.target_cwd, argv, False,
                 facts.keep_fds)
     _check_spec(spec)
     size = len(spec.to_json())
@@ -898,6 +903,11 @@ def wall_view_args(facts: WallFacts, host_links: Mapping[str, Optional[str]]) ->
     binds = [p for group in facts.writable for p in group]
     if not binds or not all(_abs_path(p) for p in binds) or not _abs_path(facts.chdir):
         raise Refused("view-path-off-list", "a wall view needs absolute writable paths and cwd")
+    if facts.caps is not None:
+        cwd = PurePosixPath(facts.chdir)
+        if any(cwd == PurePosixPath(d) or PurePosixPath(d) in cwd.parents for d in binds):
+            raise Refused("view-path-off-list", f"a capability-dropped view's bwrap cannot enter the account's 0700 "
+                                                f"mount root {facts.chdir!r}; the stage enters it after its drop")
     args += view_ancestor_dirs(binds)
     for d in binds:
         args += ["--bind", d, d]
