@@ -777,6 +777,9 @@ def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path |
 # read 11-21), and a human running ``security -i`` as the hands user is not a path. A macOS mission hands bash or driver
 # puts the shim directory first on PATH without the check; when it is missing, ``security`` resolves to /usr/bin/security,
 # the behaviour before levain#241.
+# Bundled or attached ``-p`` forms (``-qp prompt``, ``-pprompt``) are not parsed as taking an argument: Claude never
+# sends them (binary read 11-21), and the hands account can run /usr/bin/security directly in any case, so the shim
+# routes Claude's credential to its file and guards nothing (L3 r3, codex MED / complement and gemini LOW).
 SECURITY_SHIM_NAME = "security"
 SECURITY_SHIM_TEXT = """#!/bin/sh
 # Levain: keeps Claude's login in its 0600 file. Installed by `sudo levain setup-isolation` (root-owned); never edit.
