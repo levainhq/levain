@@ -3867,6 +3867,14 @@ def _check_hands_login(install: Path) -> list[CheckResult]:
         return []
     outcomes = hands_login.read_outcomes(install)
     rows: list[CheckResult] = []
+    if hands_login.keychain_needed("claude"):
+        # levain#241: the root-installed ``security`` shim Claude's login depends on (checked, never written here).
+        problem = hands_login.security_shim_problem()
+        rows.append(CheckResult(
+            "hands security shim", problem is None,
+            "present and exact (root-owned, mode 0755)" if problem is None else problem,
+            hint=None if problem is None else f"sudo levain setup-isolation --path {shlex.quote(str(install))} "
+                                              "(a repair run installs it)"))
     for vendor in hands_login.VENDORS:
         name = f"hands login {vendor}"
         last = outcomes.get(vendor, {})

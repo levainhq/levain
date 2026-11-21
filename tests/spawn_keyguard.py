@@ -5,6 +5,9 @@ and argv, in a session report printed between ``KEYGUARD REPORT BEGIN``/``END`` 
 file named by ``LEVAIN_KEYGUARD_REPORT``, when set) and lets the spawn run (it does not stop a signing call); ``enforce`` raises ``RealKeyReached`` before anything
 starts, records it, and fails the test at teardown. ``_DEFAULT_MODE`` was flipped from warn after CI showed an empty report; it
 is the one line that sets the default.
+Every child the run starts is a SCRATCH RUN (``LEVAIN_SCRATCH_RUN=1``: set in ``os.environ`` for the run, and added to an explicit
+``env=`` that does not name it, see ``scratch_env``), so a real levain entry point a test starts cannot mark itself live and reach the
+real terminal key (levain#237). A child of such a child inherits it, unless that child hands its own environment without it.
 Shell text is re-tokenised with shlex ONLY for ``shell=True``, a shell executable (sh|bash|zsh|dash|ksh|ash, any case) with ``-c`` and
 its script, or ``eval``; a structured argv element is never shell-parsed, and a parse error in text that IS shell-parsed fails
 OPEN (allowed). The key check: an argv token that, resolved (``~`` as the PASSWD home, ``$HOME`` as the judged child's own HOME,
@@ -46,6 +49,9 @@ _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _POPEN_POS = ("bufsize", "executable", "stdin", "stdout", "stderr", "preexec_fn", "close_fds", "shell", "cwd", "env")
 _DEFAULT_MODE = "enforce"                                    # CI (run 43668900872) showed an empty report: refusals now raise
 _ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER")
+#: ``levain.home_guard.SCRATCH_ENV``, spelled here because nothing of levain loads at this module's import (a test pins
+#: the two equal). Every child the test run starts is a scratch run (levain#237 L2): see :func:`scratch_env`.
+SCRATCH_ENV = "LEVAIN_SCRATCH_RUN"
 _PROVIDER_FLAG = re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
 
 
@@ -265,8 +271,38 @@ def call_parts(n: str, bound: Mapping) -> tuple[object, object, object]:
     return file, bound.get("argv", bound.get("args")), (bound.get("env") if (n.endswith("e") or n.startswith("posix")) else None)
 
 
+def scratch_env(env):
+    """The environment a child of the test run gets: ``env`` with :data:`SCRATCH_ENV` ``=1`` added when it does not name
+    the variable at all (a copy; ``env`` itself is never changed), or ``env`` unchanged when it names it. ``None`` (the
+    child inherits ``os.environ``) stays ``None`` while ``os.environ`` names it (:func:`scrub_environ` sets it there),
+    and is otherwise a copy of ``os.environ`` with it added.
+
+    Why (levain#237 L2 HIGH): a child started with a hand-built ``env=`` carries nothing that says "test", so a real
+    levain entry point in it (``python -m levain.band_hook``, ``levain``) would call ``mark_live()``, be marked live
+    and reach the operator's real terminal key. With the marker its ``guarded_run()`` is a scratch run: ``mark_live``
+    does nothing and the real key's gate refuses, in the child and in every child of it that inherits its environment.
+    A test that runs a child as a PRODUCTION process on purpose (a test of the unmarked or the marked-live behaviour,
+    under a stand-in password-database home) names the variable itself with any other value (``"0"``), which is the
+    one way past this; it is a line a reviewer can see."""
+    if env is None:
+        if os.environ.get(SCRATCH_ENV) is not None:
+            return None
+        env = os.environ
+    items = dict(env)
+    if any((os.fsdecode(k) if isinstance(k, bytes) else k) == SCRATCH_ENV for k in items):
+        return env
+    if any(isinstance(k, bytes) for k in items):
+        items[os.fsencode(SCRATCH_ENV)] = b"1"
+    else:
+        items[SCRATCH_ENV] = "1"
+    return items
+
+
 def install():
-    """Wrap Popen, ``os.posix_spawn*``, ``os.spawn*``, ``os.exec*`` and ``os.system`` while the generator is open."""
+    """Wrap Popen, ``os.posix_spawn*``, ``os.spawn*``, ``os.exec*`` and ``os.system`` while the generator is open. Each
+    judged spawn that hands an environment gets the scratch marker (:func:`scratch_env`); one that inherits
+    (``env=None`` in Popen, ``execv``/``spawnv``/``system`` and kin) has it from ``os.environ`` (:func:`scrub_environ`),
+    and a Popen whose inherited environment lost it is handed a copy with it."""
     real_init = subprocess.Popen.__init__
     names = ("posix_spawn", "posix_spawnp", "execv", "execve", "execvp", "execvpe", "system", "spawnl", "spawnle", "spawnlp",
              "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe")
@@ -282,6 +318,13 @@ def install():
         args = args if isinstance(args, (str, bytes, os.PathLike)) else list(args)      # an iterator is read once
         b = {**dict(zip(_POPEN_POS, a)), **kw}
         check(args, b.get("executable"), b.get("env"), b.get("cwd"), bool(b.get("shell")))
+        env = scratch_env(b.get("env"))
+        if env is not b.get("env"):
+            at = _POPEN_POS.index("env")
+            if len(a) > at:
+                a = (*a[:at], env, *a[at + 1:])
+            else:
+                kw["env"] = env
         return real_init(self, args, *a, **kw)
 
     def wrap(n, real):
@@ -292,15 +335,25 @@ def install():
             if sig is None:
                 _refuse("a spawn function whose signature cannot be read", [n])
             try:
-                bound = sig.bind(*a, **kw).arguments        # judged from the REAL signature, positional or keyword
+                ba = sig.bind(*a, **kw)                     # judged from the REAL signature, positional or keyword
             except TypeError:
                 return real(*a, **kw)                       # a malformed call: the real function raises, nothing starts
+            bound = ba.arguments
             if n == "system":
                 check(bound["command"], shell=True)
+                return real(*a, **kw)
+            file, argv, env = call_parts(n, bound)
+            check(argv, file, env)
+            if env is None:                                 # an inheriting form: os.environ carries the marker
+                return real(*a, **kw)
+            marked = scratch_env(env)
+            if marked is env:
+                return real(*a, **kw)
+            if n.startswith("spawnl"):                      # spawnl*e(mode, file, *args, env): env is the last of args
+                bound["args"] = (*bound["args"][:-1], marked)
             else:
-                file, argv, env = call_parts(n, bound)
-                check(argv, file, env)
-            return real(*a, **kw)
+                bound["env"] = marked
+            return real(*ba.args, **ba.kwargs)
         return run
 
     subprocess.Popen.__init__ = popen_init
@@ -318,10 +371,12 @@ def install():
 
 
 def scrub_environ() -> dict[str, str | None]:
-    """Delete the ambient signing capability and point git at an identity-only config; returns the previous values."""
-    previous = {n: os.environ.get(n) for n in _ENV_NAMES}
+    """Delete the ambient signing capability and mark the run's process environment a scratch run (:data:`SCRATCH_ENV`
+    ``=1``, which every child that inherits it carries: :func:`scratch_env`); returns the previous values."""
+    previous = {n: os.environ.get(n) for n in (*_ENV_NAMES, SCRATCH_ENV)}
     for n in ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER"):
         os.environ.pop(n, None)
+    os.environ[SCRATCH_ENV] = "1"
     return previous
 
 
@@ -371,7 +426,9 @@ def _no_signing_spawn_in_tests():
 @pytest.fixture(autouse=True)
 def _a_refused_spawn_fails_its_test():
     """A caller that catches the refusal still fails here. Judged by index, so a refusal in a wider-scoped fixture fails the
-    first test to finish after it."""
+    first test to finish after it. Each test also starts with the scratch marker in the process environment, whatever an
+    earlier test did to it (:func:`scratch_env`)."""
+    os.environ[SCRATCH_ENV] = "1"
     yield
     fresh = _drain()
     if fresh:

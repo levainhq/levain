@@ -904,7 +904,9 @@ def test_a_provider_that_resolves_the_levain_home_in_the_child_finds_it_marked_l
     factory_dir = tmp_path / "factory"
     factory_dir.mkdir()
     (factory_dir / "home_factory.py").write_text(_HOME_FACTORY, encoding="utf-8")
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home)}     # no pytest variable, no marker, no LEVAIN_HOME
+    # no pytest variable, no marker, no LEVAIN_HOME; the child is a PRODUCTION run on purpose (the marking is what is tested), under a stand-in
+    # home: it names LEVAIN_SCRATCH_RUN itself, the one way past tests/spawn_keyguard.py's scratch-run marker (see scratch_env there)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "LEVAIN_SCRATCH_RUN": "0"}
     c = DeriveChild("home_factory:factory", syspath=[str(factory_dir)], stderr=rig.err, env=env, term_grace_s=2.0)
     rig.clients.append(c)
     ans = rig.ask(c, "home")

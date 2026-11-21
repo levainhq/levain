@@ -1,0 +1,3 @@
+# CHANGELOG.md is prose: two links that add an entry under the same heading would otherwise conflict with each other at every restack,
+# so git keeps both sides' added lines. This line names ONE file on purpose: tests/test_changelog_union_merge.py pins that no code or test path is listed.
+CHANGELOG.md merge=union
