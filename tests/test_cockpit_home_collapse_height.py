@@ -50,12 +50,14 @@ def test_a_folded_card_outranks_every_fixed_home_height_and_the_fold_hides_with_
     the browser test measures that."""
     rules = _rules()
     fixed = [i for i, (sel, decl, _at) in enumerate(rules)
-             if sel.startswith(HOME) and ".panel" in sel and "ck-collapsed" not in sel and re.search(r"(?<![-\w])height:\s*[\d.]+px\s*!important", decl)]
+             if any(s.strip().startswith(HOME) and ".panel" in s and "ck-collapsed" not in s for s in sel.split(","))
+             and re.search(r"(?<![-\w])height:\s*[\d.]+px\s*!important", decl)]
     assert fixed, "Home draws no fixed-height card, so this check would prove nothing"
     folded = [i for i, (sel, decl, _at) in enumerate(rules)
               if any(s.strip() == f"{HOME} .panel.ck-collapsed" for s in sel.split(",")) and re.search(r"(?<![-\w])height:\s*auto\s*!important", decl)]
     assert folded, "no Home rule lets a folded card size to its header (height: auto !important)"
     assert min(folded) > max(fixed), "the folded-card rule must come after every fixed Home height: equal specificity, the later wins"
+    assert all(re.search(r"(?<![-\w])min-height:\s*0\s*!important", rules[i][1]) for i in folded), "a folded card's min-height must be released with importance, or a fixed min-height keeps its box open"
     assert all(not rules[i][2] for i in folded), ("the folded-card rule sits inside an at-rule, so it does not apply at every width", [rules[i][2] for i in folded])
     hide = [decl for sel, decl, _at in rules if any(s.strip() == FOLD_HIDE for s in sel.split(","))]
     assert hide, "the fold's hide rule is gone"
@@ -77,7 +79,7 @@ MEASURE = """((CASES) => {
   const kids = (p) => [...p.children].filter((c) => !c.classList.contains('phead'));
   const shownIn = (p) => kids(p).filter((c) => getComputedStyle(c).display !== 'none').map((c) => (p.dataset.ckPanel || '?') + ' > ' + c.tagName.toLowerCase() + '.' + c.className);
   const read = (p) => ({ folded: p.classList.contains('ck-collapsed'), panel: Math.round(p.getBoundingClientRect().height), head: Math.round(head(p).getBoundingClientRect().height),
-    kids: kids(p).length, shown: shownIn(p), more: !!p.querySelector(':scope > .more-foot[data-list-more]') });
+    kids: kids(p).length, shown: shownIn(p), more: (() => { const m = p.querySelector(':scope > .more-foot[data-list-more]'); return !!m && getComputedStyle(m).display !== 'none'; })() });
   const cards = {};
   for (const c of CASES) {
     const p = document.querySelector(grid + ' .panel[data-ck-panel="' + c.card + '"]');
