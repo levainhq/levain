@@ -2763,6 +2763,9 @@
     // input-method composition is the composition's, not the box's.
     const onKey = (ev) => {
       if (ev.isComposing || ev.keyCode === 229) return;
+      // a key aimed at a control elsewhere on the page is that control's, never the box's (the body and the box itself are the box's)
+      const t = ev.target;
+      if (t && t !== document.body && t !== document.documentElement && !dlg.contains(t)) return;
       if (ev.key === "Escape") { ev.preventDefault(); close(true); }
       else if (ev.key === "ArrowDown") { ev.preventDefault(); if (items.length) select(Math.min(items.length - 1, sel + 1)); }
       else if (ev.key === "ArrowUp") { ev.preventDefault(); if (items.length) select(Math.max(0, sel - 1)); }
@@ -2774,6 +2777,12 @@
     document.addEventListener("keydown", onKey);
     // the press itself is cancelled, or the browser moves focus to the body right after it was given back
     dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) { ev.preventDefault(); close(true); } });
+    // a press on a part of the box that cannot hold focus (its padding, the empty-state line) drops focus to the body: the field takes it
+    // back, so typing still reaches it
+    dlg.addEventListener("focusout", (ev) => {
+      if (ev.relatedTarget) return;
+      Promise.resolve().then(() => { if (palette === me && document.activeElement === document.body) input.focus(); });
+    });
     refresh();
     input.focus();
   }

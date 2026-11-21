@@ -270,6 +270,18 @@ out.open = !!boxOf();
     assert out == {"moved": "palette-opt-1", "held": True, "open": False}, out
 
 
+def test_a_key_aimed_at_a_control_outside_the_box_is_not_the_boxs(tmp_path: Path) -> None:
+    out = run_node(FAKE + BOX + r"""
+const dlg = openBox(); const p = partsOf(dlg);
+const outside = node({ tag: "input" }); document.body.appendChild(outside);
+const esc = outside.fire("keydown", key("Escape")); const down = outside.fire("keydown", key("ArrowDown"));
+out.outsideOpen = !!boxOf(); out.outsidePrevented = !!((esc && esc.defaultPrevented) || (down && down.defaultPrevented));
+p.box.fire("keydown", key("Escape"));
+out.insideClosed = !boxOf();
+""", tmp_path)
+    assert out == {"outsideOpen": True, "outsidePrevented": False, "insideClosed": True}, out
+
+
 # a hand-off waits on the page's own observer and a timer: both are held by the test, and a redraw is delivered to the observers whose
 # target the changed parent is (or, for a subtree observer, sits under)
 HANDOFF = r"""
