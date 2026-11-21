@@ -85,8 +85,14 @@ _MIGRATES_FROM = "levain-cockpit/2"
 UNINITIALISED = "authority_uninitialised"
 DB_NAME = "cockpit.db"
 # the revocation revision (levain#228): a file beside the journal that every revoke REPLACES, so a process that holds a
-# verified credential in memory sees, with one stat, that some process revoked a device since it verified
+# verified credential in memory sees, with one small read, that some process revoked a device since it verified. Its
+# content is one line, a state and a random nonce: "clean <nonce>" is a revision to compare, "dirty <nonce>" is a revoke
+# that has not yet been seen to end, and no process answers from memory while it stands
 REVISION_SUFFIX = ".revrev"
+_REVISION_LINE = re.compile(r"(clean|dirty) ([0-9a-f]{32})\n")
+_REVISION_READ_MAX = 128                # more than a well-formed line: a file that fills the read is malformed
+_REVISION_CLEAN_TRIES = 3               # writes of the clean revision after a revoke commits, before it is left dirty
+_REVISION_CLEAN_PAUSE_S = 0.05          # between those writes
 PENDING_CAP = 8                       # WAITING pendings per principal generation (§3.1)
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
 FIRST_RETRY_DELAY = timedelta(seconds=5)   # decided_at + this is a never-faulted unit's due time (§4.2)
@@ -667,25 +673,31 @@ def revision_path(data_root: "Path | str") -> Path:
     return Path(data_root) / (DB_NAME + REVISION_SUFFIX)
 
 
-def revision_identity(data_root: "Path | str") -> "tuple[int, int, int, int]":
-    """The revision file's identity, ``(st_ino, st_mtime_ns, st_ctime_ns, st_size)``: one ``stat``, no sqlite. Raises
-    :class:`OSError` when the file cannot be read (missing, permission): a caller that trusts an answer only while this
-    is unchanged has no answer to trust then. A bump replaces the file, so its inode changes; a filesystem may hand the
-    freed inode of the old file to the new one, and two replaces within one timestamp tick and of one size would then
-    agree on inode, mtime and size, so ctime (set by the kernel at every inode change) is part of the identity too."""
-    st = os.stat(revision_path(data_root))
-    return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+def revision_identity(data_root: "Path | str") -> "str | None":
+    """The revocation revision of a clean revision file (no sqlite), or None when the file is dirty or malformed.
+    Raises :class:`OSError` when it cannot be read (missing, permission). None and the error alike leave a caller
+    nothing to compare, so it answers from no memory. The revision is the nonce the file holds, so a filesystem that
+    gives a replacing file the old one's inode, times and size still yields a new revision; the file's inode and ctime
+    are part of it as well, because ctime is set by the kernel on every write and cannot be set back, so a file
+    rewritten with an older content (by anything that can write the journal's directory) is a new revision too."""
+    with open(revision_path(data_root), "rb") as handle:
+        data = handle.read(_REVISION_READ_MAX)
+        st = os.fstat(handle.fileno())
+    found = _REVISION_LINE.fullmatch(data.decode("ascii", "replace"))
+    if found is None or found.group(1) != "clean":
+        return None
+    return f"{found.group(2)}:{st.st_ino}:{st.st_ctime_ns}"
 
 
-def _write_revision(data_root: Path, *, replace: bool) -> None:
-    """Write a fresh revision file beside the journal and put it in place: ``replace`` over the old one (a bump), or
-    only where none exists (a creation). Content is random bytes and the monotonic clock, nothing secret; the file takes
+def _write_revision(data_root: Path, *, dirty: bool, replace: bool) -> None:
+    """Write a fresh revision file beside the journal, its state ``dirty`` or clean and a new random nonce (nothing
+    secret), and put it in place: ``replace`` over the old one, or only where none exists (a creation). The file takes
     the journal's permissions. Raises :class:`OSError`; a file written for the move is removed when it fails."""
     target = revision_path(data_root)
     fd, tmp = tempfile.mkstemp(prefix=".revrev-", dir=data_root)
     try:
         with os.fdopen(fd, "w") as handle:
-            handle.write(f"{os.urandom(16).hex()} {time.monotonic()!r}\n")
+            handle.write(f"{'dirty' if dirty else 'clean'} {os.urandom(16).hex()}\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -699,25 +711,33 @@ def _write_revision(data_root: Path, *, replace: bool) -> None:
                 os.link(tmp, target)    # fails when the file exists: a creation never replaces a revision in use
             except FileExistsError:
                 pass
-            os.unlink(tmp)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    if not replace:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            # the link has put the file in place (or another creation did): a temporary left behind is no failure
+            _log.warning("a temporary revision file could not be removed: %s", tmp, exc_info=True)
 
 
-def bump_revision(data_root: "Path | str") -> None:
-    """Move the revocation revision: every process that compares :func:`revision_identity` sees a change. Raises
-    :class:`OSError` when the file cannot be written."""
-    _write_revision(Path(data_root), replace=True)
+def bump_revision(data_root: "Path | str", *, dirty: bool) -> None:
+    """Replace the revocation revision with a new one, ``dirty`` (no process answers from memory while it stands) or
+    clean (a nonce no process has compared before). Raises :class:`OSError` when the file cannot be written. Only a
+    holder of the journal's write lock calls it (:meth:`CockpitDB._revoking_write`, :meth:`CockpitDB.settle_revision`):
+    that lock is what keeps one revoke's write from landing between another's dirty marker and its commit."""
+    _write_revision(Path(data_root), dirty=dirty, replace=True)
 
 
 def ensure_revision(data_root: "Path | str") -> None:
-    """Create the revision file when there is none, and touch nothing when there is one. Raises :class:`OSError`."""
+    """Create a clean revision file when there is none, and touch nothing when there is one (a dirty or malformed one
+    is made clean only under the journal's write lock, :meth:`CockpitDB.settle_revision`). Raises :class:`OSError`."""
     if not revision_path(data_root).exists():
-        _write_revision(Path(data_root), replace=False)
+        _write_revision(Path(data_root), dirty=False, replace=False)
 
 
 class CockpitDB:
@@ -836,22 +856,61 @@ class CockpitDB:
 
     @contextmanager
     def _revoking_write(self) -> Iterator[sqlite3.Connection]:
-        """:meth:`write` for a transaction that sets ``revoked_at``: the revocation revision moves twice, around the
-        commit. Before it, inside the transaction and after its statements, so a bump that cannot be written rolls the
-        revoke back and the operator sees the failure (an unbumped revoke would leave other processes admitting the
-        device from memory). After it, because a lookup that ran between the first bump and the commit read the device
-        still live and stored an answer under the revision the first bump left; the second bump makes that answer stale.
-        The revoke is durable once it has committed, so a second bump that cannot be written is logged as an ERROR and
-        the revoke returns its result."""
+        """:meth:`write` for a transaction that sets ``revoked_at``: the revocation revision is written twice, around the
+        commit. First DIRTY, inside the transaction and after its statements: a marker that cannot be written rolls the
+        revoke back and the operator sees the failure, and while the marker stands no process answers from memory, so a
+        lookup that runs before the commit (and reads the device still live) stores nothing. Then, after the commit, a
+        new CLEAN revision: every answer stored before the dirty marker carries a nonce that is no longer the file's.
+
+        The revoke is durable once it has committed, so a clean write that fails is retried, then logged as an ERROR,
+        and the revoke returns its result with the marker left dirty: lookups are full (slower) until the marker is made
+        clean, never an admission from memory. A stuck marker is made clean by the next revoke's clean write or by the
+        next :meth:`settle_revision`.
+
+        Both writes are made holding the journal's write lock (the first inside the revoking transaction, the second in
+        a transaction of its own). A dirty marker is therefore only ever written by a transaction that holds the lock,
+        and any later holder that still sees it knows that transaction has committed or rolled back: writing clean then
+        can never land between another revoke's dirty marker and its commit, the window in which a reader would store
+        the still-live device under the clean nonce and outlive that revoke."""
         with self.write() as conn:
             yield conn
-            bump_revision(self.data_root)
+            bump_revision(self.data_root, dirty=True)
+        failure: "BaseException | None" = None
+        for attempt in range(_REVISION_CLEAN_TRIES):
+            if attempt:
+                time.sleep(_REVISION_CLEAN_PAUSE_S)
+            try:
+                with self.write():
+                    bump_revision(self.data_root, dirty=False)
+                return
+            except Exception as exc:  # noqa: BLE001 - the revoke has committed: any failure leaves the marker dirty
+                failure = exc
+        _log.error("revoke committed in %s but the revocation revision could not be made clean after it: it stays "
+                   "dirty, so paired credentials are looked up in full until a later revoke or settle_revision makes "
+                   "it clean", self.data_root, exc_info=failure)
+
+    def settle_revision(self) -> bool:
+        """Make the revocation revision clean where it is not (dirty, malformed, unreadable or missing), holding the
+        journal's write lock, taken without waiting: whether it is clean after. A dirty marker is written only inside
+        its revoke's transaction (:meth:`_revoking_write`), so a holder of the lock that still sees one knows that revoke
+        has committed or rolled back, and a new clean nonce lets no stored answer outlive it. While another holds the
+        lock the marker may be a revoke's in progress: it is left as it is (False). Raises :class:`OSError` when the
+        clean file cannot be written."""
+        if self._revision_is_clean():
+            return True
         try:
-            bump_revision(self.data_root)
+            with write_transaction(self._connect_nowait):
+                if not self._revision_is_clean():       # a revoke may have made it clean before the lock was taken
+                    bump_revision(self.data_root, dirty=False)
+        except (sqlite3.Error, CockpitFormatError):
+            return False                # the lock is held (or the journal cannot be opened now): left as it is
+        return True
+
+    def _revision_is_clean(self) -> bool:
+        try:
+            return revision_identity(self.data_root) is not None
         except OSError:
-            _log.error("revoke committed in %s but the revocation revision could not be moved after it: another "
-                       "process may admit a device revoked a moment ago from memory until its entry ages out",
-                       self.data_root, exc_info=True)
+            return False
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:

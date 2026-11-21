@@ -280,23 +280,73 @@ def _verify_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return calls
 
 
-def test_the_revision_file_changes_identity_on_every_bump_and_holds_nothing_secret(db: CockpitDB) -> None:
+def test_the_revision_file_holds_a_state_and_a_nonce_and_every_clean_write_is_a_new_revision(db: CockpitDB) -> None:
     _enrol(db)
     assert not firejournal.revision_path(db.data_root).exists()
     firejournal.ensure_revision(db.data_root)
     first = firejournal.revision_identity(db.data_root)
+    assert first is not None, "a creation is clean"
     firejournal.ensure_revision(db.data_root)
     assert firejournal.revision_identity(db.data_root) == first, "a creation never replaces a file in place"
     path = firejournal.revision_path(db.data_root)
     assert path.name == firejournal.DB_NAME + firejournal.REVISION_SUFFIX and path.parent == db.path.parent
     assert path.stat().st_mode & 0o777 == db.path.stat().st_mode & 0o777, "the journal's permissions"
-    assert re.fullmatch(r"[0-9a-f]{32} [0-9.]+\n", path.read_text()), "random bytes and the clock, nothing else"
+    assert re.fullmatch(r"clean [0-9a-f]{32}\n", path.read_text()), "a state and random bytes, nothing else"
     seen = [first]
     for _ in range(30):
-        firejournal.bump_revision(db.data_root)
+        firejournal.bump_revision(db.data_root, dirty=True)
+        assert re.fullmatch(r"dirty [0-9a-f]{32}\n", path.read_text())
+        assert firejournal.revision_identity(db.data_root) is None, "a dirty revision is no revision to trust"
+        firejournal.bump_revision(db.data_root, dirty=False)
         seen.append(firejournal.revision_identity(db.data_root))
-        assert seen[-1] != seen[-2], "two bumps in a row, same size, still differ"
+        assert seen[-1] is not None and seen[-1] not in seen[:-1], "every clean write is a revision never seen before"
     assert sorted(p.name for p in db.data_root.iterdir() if p.name.startswith(".revrev-")) == [], "no temporary left"
+
+
+def test_the_revision_is_the_files_content_never_its_metadata(db: CockpitDB, monkeypatch) -> None:
+    """F2: a replace whose inode, times and size all repeat the old file's (a filesystem may hand them out again) is
+    still a new revision, because the nonce the file holds is what is compared. Malformed content is no revision."""
+    firejournal.ensure_revision(db.data_root)
+    path = firejournal.revision_path(db.data_root)
+    first = firejournal.revision_identity(db.data_root)
+    first_content = path.read_text()
+    frozen = os.stat(path)
+    real_stat, real_fstat = os.stat, os.fstat
+
+    def same_metadata(p: Any, *a: Any, **kw: Any) -> Any:
+        return frozen if Path(p) == path else real_stat(p, *a, **kw)
+
+    def same_metadata_open(fd: int) -> Any:
+        st = real_fstat(fd)
+        return frozen if (st.st_dev, st.st_ino) == (frozen.st_dev, frozen.st_ino) else st
+
+    monkeypatch.setattr(os, "stat", same_metadata)
+    monkeypatch.setattr(os, "fstat", same_metadata_open)
+    path.write_text(f"clean {'0' * 32}\n")              # in place: the inode is the old one's
+    assert firejournal.revision_identity(db.data_root) not in (None, first)
+    monkeypatch.undo()
+    path.write_text(first_content)                      # the old content written back is still a new revision
+    assert firejournal.revision_identity(db.data_root) not in (None, first)
+    for junk in ("", "clean\n", f"clean {'0' * 31}\n", f"{'0' * 32} 12.5\n", f"stale {'0' * 32}\n",
+                 f"clean {'0' * 32}\n" + "x" * 200):
+        path.write_text(junk)
+        assert firejournal.revision_identity(db.data_root) is None, junk
+
+
+def test_a_revision_creation_whose_temporary_cannot_be_removed_still_reports_success(db: CockpitDB,
+                                                                                    monkeypatch) -> None:
+    """F5: once the link has put the new file in place, a temporary that cannot be removed is no failed creation."""
+    real_unlink = os.unlink
+
+    def busy(p: Any, *a: Any, **kw: Any) -> None:
+        if os.path.basename(str(p)).startswith(".revrev-"):
+            raise OSError(16, "Resource busy")
+        real_unlink(p, *a, **kw)
+
+    monkeypatch.setattr(os, "unlink", busy)
+    firejournal.ensure_revision(db.data_root)
+    monkeypatch.undo()
+    assert firejournal.revision_identity(db.data_root) is not None
 
 
 def test_every_writer_of_revoked_at_moves_the_revision_around_its_commit() -> None:
@@ -331,7 +381,7 @@ def test_every_writer_of_revoked_at_moves_the_revision_around_its_commit() -> No
 def test_a_bump_that_cannot_be_written_makes_the_revoke_fail_and_change_nothing(db: CockpitDB, monkeypatch) -> None:
     dev, tok = _enrol(db)
 
-    def disk_full(_root: Any) -> None:
+    def disk_full(*_a: Any, **_kw: Any) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(firejournal, "bump_revision", disk_full)
@@ -341,26 +391,35 @@ def test_a_bump_that_cannot_be_written_makes_the_revoke_fail_and_change_nothing(
     assert [d["revoked_at"] for d in db.list_devices()] == [None]
 
 
-def test_a_second_bump_that_cannot_be_written_logs_an_error_and_the_revoke_stands(db: CockpitDB, monkeypatch,
-                                                                                  caplog) -> None:
+def test_a_second_write_that_cannot_be_written_leaves_the_revision_dirty_and_the_revoke_stands(
+        db: CockpitDB, monkeypatch, caplog) -> None:
+    """F1: the revoke is durable once committed, and the marker its first write left stays dirty, so no process answers
+    from memory (fail closed: every lookup is full) until a later write under the journal's write lock makes it clean."""
     dev, tok = _enrol(db)
+    firejournal.ensure_revision(db.data_root)
     real = firejournal.bump_revision
     calls: list[int] = []
 
-    def second_fails(root: Any) -> None:
+    def only_the_first(*a: Any, **kw: Any) -> None:
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) > 1:
             raise OSError(28, "No space left on device")
-        real(root)
+        real(*a, **kw)
 
-    monkeypatch.setattr(firejournal, "bump_revision", second_fails)
+    monkeypatch.setattr(firejournal, "bump_revision", only_the_first)
+    monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0, raising=False)
     with caplog.at_level("ERROR", logger=firejournal.__name__):
         assert db.revoke_devices([dev], by="browser", now=NOW) == [dev]
     assert db.verify_device(tok, now=NOW) is None, "the revoke committed"
+    assert firejournal.revision_identity(db.data_root) is None, "the marker stayed dirty: no answer from memory"
+    assert len(calls) == 1 + firejournal._REVISION_CLEAN_TRIES, "the second write was retried, then given up"
     assert [r.levelname for r in caplog.records if "revocation revision" in r.getMessage()] == ["ERROR"]
+    monkeypatch.setattr(firejournal, "bump_revision", real)
+    assert db.settle_revision() is True
+    assert firejournal.revision_identity(db.data_root) is not None
 
 
-def test_http_a_lookup_between_the_first_bump_and_the_commit_is_made_stale_by_the_second_bump(src, monkeypatch) -> None:
+def test_http_a_lookup_between_the_first_write_and_the_commit_stores_nothing(src, monkeypatch) -> None:
     with _serve(src) as (port, httpd):
         dev, tok = _pair(port)
         assert _manifest(port, tok) == 200
@@ -368,12 +427,12 @@ def test_http_a_lookup_between_the_first_bump_and_the_commit_is_made_stale_by_th
         bumps: list[int] = []
         between: list[int] = []
 
-        def bump(root: Any) -> None:
-            real(root)
+        def bump(*a: Any, **kw: Any) -> None:
+            real(*a, **kw)
             bumps.append(1)
             if len(bumps) == 1:
-                # the revoke's transaction is open, its first bump has landed: this request reads the device live
-                # and stores an answer under the identity the first bump left
+                # the revoke's transaction is open and its dirty marker is in place: this request reads the device
+                # live, and stores no answer under a dirty marker
                 between.append(_manifest(port, tok))
 
         monkeypatch.setattr(firejournal, "bump_revision", bump)
@@ -382,24 +441,90 @@ def test_http_a_lookup_between_the_first_bump_and_the_commit_is_made_stale_by_th
         assert _manifest(port, tok) == 403
 
 
-def test_http_without_the_second_bump_that_answer_would_outlive_the_revoke(src, monkeypatch) -> None:
-    """The reason both bumps exist: with only the first, the entry stored between it and the commit is admitted."""
+def test_http_a_second_write_that_fails_leaves_no_answer_that_outlives_the_revoke(src, monkeypatch) -> None:
+    """F1, fail closed: a lookup between the first write and the commit reads the device live; the second write then
+    fails, every retry of it too, so the marker stays dirty and the very next request looks the token up: refused."""
     with _serve(src) as (port, httpd):
         dev, tok = _pair(port)
         real = firejournal.bump_revision
         bumps: list[int] = []
         between: list[int] = []
 
-        def first_only(root: Any) -> None:
+        def first_only(*a: Any, **kw: Any) -> None:
             bumps.append(1)
-            if len(bumps) == 1:
-                real(root)
-                between.append(_manifest(port, tok))
+            if len(bumps) > 1:
+                raise OSError(28, "No space left on device")
+            real(*a, **kw)
+            between.append(_manifest(port, tok))
 
         monkeypatch.setattr(firejournal, "bump_revision", first_only)
+        monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0, raising=False)
         httpd.broker.active_db().revoke_devices([dev], by="browser", now=datetime.now(timezone.utc))
         assert between == [200]
-        assert _manifest(port, tok) == 200, "an entry stored after the first bump carries the identity that stayed"
+        assert _manifest(port, tok) == 403, "a revoked device is refused on the very next request"
+
+
+def test_a_stuck_dirty_revision_is_made_clean_only_under_the_journals_write_lock(db: CockpitDB) -> None:
+    """A dirty marker is written inside its revoke's transaction, so whoever holds the write lock and still sees one
+    knows that revoke has committed or rolled back: making it clean then lets no lookup outlive a revoke. While a
+    transaction holds the lock the marker may be that revoke's own, and it is left dirty."""
+    _enrol(db)
+    firejournal.ensure_revision(db.data_root)
+    firejournal.bump_revision(db.data_root, dirty=True)     # a revoke that ended without its second write
+    holder = sqlite3.connect(db.path, isolation_level=None, timeout=0)
+    holder.execute("BEGIN IMMEDIATE")                         # a revoke in progress holds the write lock
+    try:
+        assert db.settle_revision() is False
+        assert firejournal.revision_identity(db.data_root) is None, "left dirty while the lock is held"
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert db.settle_revision() is True
+    assert firejournal.revision_identity(db.data_root) is not None
+    path = firejournal.revision_path(db.data_root)
+    path.write_text(f"{'0' * 32} 12.5\n")                     # malformed (an earlier build's format): settled the same way
+    assert firejournal.revision_identity(db.data_root) is None
+    assert db.settle_revision() is True
+    assert firejournal.revision_identity(db.data_root) is not None
+    clean = path.read_text()
+    assert db.settle_revision() is True and path.read_text() == clean, "a clean revision is left as it is"
+
+
+def test_every_write_of_the_revision_by_a_revoke_holds_the_journals_write_lock(db: CockpitDB, monkeypatch) -> None:
+    """Two overlapping revokes: no write of the marker can land between another revoke's dirty marker and its commit,
+    because every write, the clean one after the commit included, is made under the journal's write lock."""
+    dev, _tok = _enrol(db)
+    firejournal.ensure_revision(db.data_root)
+    real = firejournal.bump_revision
+    held: list[bool] = []
+
+    def probe(*a: Any, **kw: Any) -> None:
+        other = sqlite3.connect(db.path, isolation_level=None, timeout=0)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            held.append(False)
+        except sqlite3.OperationalError:
+            held.append(True)
+        finally:
+            other.close()
+        real(*a, **kw)
+
+    monkeypatch.setattr(firejournal, "bump_revision", probe)
+    assert db.revoke_devices([dev], by="browser", now=NOW) == [dev]
+    assert held == [True, True], held
+    assert firejournal.revision_identity(db.data_root) is not None, "the revoke ended clean"
+
+
+def test_http_a_stuck_dirty_revision_is_cleared_by_the_next_lookup_and_the_cache_resumes(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        _dev, tok = _pair(port)
+        calls = _verify_spy(monkeypatch)
+        firejournal.bump_revision(httpd.broker.data_root, dirty=True)
+        assert _manifest(port, tok) == 200 and len(calls) == 1, "dirty: a full lookup, never an entry"
+        assert firejournal.revision_identity(httpd.broker.data_root) is not None, "that lookup made it clean"
+        assert _manifest(port, tok) == 200 and len(calls) == 2, "the next lookup stores an entry under the clean one"
+        assert _manifest(port, tok) == 200 and len(calls) == 2, "and the request after it is served from it"
 
 
 def test_http_an_unreadable_revision_file_turns_the_cache_off_and_every_request_looks_up(src, monkeypatch) -> None:

@@ -207,9 +207,10 @@ _PAIR_WAIT_S = 3.0                # how long a paired request waits on a startin
 # (a flight per token hash) and, after it, a short cache of VERIFIED answers: a live device only, never a miss, a revoked
 # device or an unavailable. The key is the token's SHA-256, never the token. An entry admits exactly what a lookup made at
 # its own time admitted: it is dropped at once by a revoke through this server (``note_pair_revoked``) and by a change of
-# the revocation epoch, and by a revoke made by ANY process: the journal replaces its revocation-revision file around
-# every revoke, an entry records that file's identity as it was before its lookup, and a hit needs the identity unchanged
-# (one stat, no sqlite). A revoked device is therefore refused on the very next request. The TTL below only bounds an
+# the revocation epoch, and by a revoke made by ANY process: the journal marks its revocation-revision file dirty in the
+# revoking transaction and writes a new clean nonce after the commit; an entry records the clean nonce read before its
+# lookup, a hit needs it unchanged, and while the file is dirty or unreadable nothing is served from or stored in the
+# cache (one small read, no sqlite). A revoked device is therefore refused on the very next request. The TTL below only bounds an
 # entry's age, a defence for any change of a device's standing that is no revoke; it is not the revoke bound.
 _PAIR_VERIFIED_TTL_S = 5.0
 _PAIR_VERIFIED_MAX = 32           # entries kept; only a valid token inserts, the oldest goes first
@@ -263,9 +264,10 @@ def _journal_holds_paired_devices(data_root: Path) -> bool:
         return True
 
 
-def _pair_revision(data_root: Path) -> "tuple[int, int, int, int] | None":
-    """The identity of the journal's revocation-revision file (one ``stat``), or None when it cannot be read. None is
-    never an answer to trust: a caller that cannot compare the revision does not use a cached credential."""
+def _pair_revision(data_root: Path) -> "str | None":
+    """The journal's clean revocation revision (one small read), or None when it is dirty, malformed or unreadable.
+    None is never an answer to trust: a caller that cannot compare the revision neither uses nor stores a cached
+    credential."""
     try:
         return revision_identity(data_root)
     except OSError:
@@ -283,17 +285,19 @@ class _CredentialUnavailable(Exception):
 class _PairFlight:
     """One paired token's lookup in flight: the leader fills it and sets ``done``; every follower of the same token hash
     waits on ``done`` and takes the answer (``device``, a definite miss as None, or ``error``, the leader's refusal
-    reason) with the revocation epoch and the revision-file identity the leader read before it looked."""
+    reason) with the revocation epoch and the clean revision the leader read before it looked (None: none to compare).
+    ``seq`` numbers flights in the order they open, so a follower can tell a lookup that began after it arrived."""
 
-    __slots__ = ("done", "device", "error", "epoch", "rev", "followers")
+    __slots__ = ("done", "device", "error", "epoch", "rev", "followers", "seq")
 
-    def __init__(self) -> None:
+    def __init__(self, seq: int) -> None:
         self.done = threading.Event()
         self.device: "str | None" = None
         self.error: "str | None" = None
         self.epoch = 0
-        self.rev: "tuple[int, int, int, int] | None" = None
+        self.rev: "str | None" = None
         self.followers = 0
+        self.seq = seq
 
 
 def _pending_route(route: str) -> "tuple[str, str] | None":
@@ -2327,11 +2331,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.pair_epoch = 0
         self.pair_epoch_lock = threading.Lock()
         # the verified-credential cache and its flights (see _PAIR_VERIFIED_TTL_S): token SHA-256 -> (device id, epoch
-        # and revision-file identity read before its lookup, monotonic time of that read); one lock guards the cache,
-        # the flights and the in-flight count
+        # and clean revision read before its lookup, monotonic time of that read); one lock guards the cache, the flights,
+        # their sequence number and the in-flight count
         self.pair_verify_lock = threading.Lock()
-        self.pair_verified: "dict[str, tuple[str, int, float, tuple[int, int, int, int]]]" = {}
+        self.pair_verified: "dict[str, tuple[str, int, float, str]]" = {}
         self.pair_flights: "dict[str, _PairFlight]" = {}
+        self.pair_flight_seq = 0
         self.pair_verify_inflight = 0
         self.pair_slow_logged_at = float("-inf")        # monotonic time of the last slow-lookup warning
         self.last_seen_stamper = LastSeenStamper()      # a paired device's last_seen, written off the request thread (D15b)
@@ -2527,10 +2532,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         with self.pair_verify_lock:
             self.pair_verified.clear()
 
-    def ensure_pair_revision(self) -> None:
+    def ensure_pair_revision(self, db: Any = None) -> None:
         """Make the journal's revocation-revision file where a journal stands and the file is missing: at this server's
         start, and again wherever the journal is opened for pairing, so a journal made after the start, or a file removed
-        under a running server, does not leave the cache unusable. A file that cannot be made is logged and the
+        under a running server, does not leave the cache unusable. With the open journal ``db`` (a pairing lookup), a
+        revision left dirty by a revoke that could not finish, or malformed, is made clean under the journal's write lock
+        (``settle_revision``; a lock held now leaves it for the next lookup). A file that cannot be made is logged and the
         credential cache stays off (:func:`_pair_revision` reads None)."""
         broker = self.broker
         if broker is None:
@@ -2538,6 +2545,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         try:
             if (Path(broker.data_root) / DB_NAME).is_file():
                 ensure_revision(broker.data_root)
+                if db is not None:
+                    db.settle_revision()
         except OSError:
             _log.warning("the journal's revocation-revision file could not be made: paired credentials are looked up "
                          "in full on every request", exc_info=True)
@@ -2675,7 +2684,7 @@ class _Handler(GuardedHandler):
     _post_received_at: "str | None" = None
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
-    _pair_rev_seen: "tuple[int, int, int, int] | None" = None   # the revision-file identity read just before it, None unreadable
+    _pair_rev_seen: "str | None" = None     # the clean revision read just before it, None when there was none to compare
     _pair_looked_at = 0.0      # the monotonic time of that read
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
     _frame_headers: "tuple[str, str] | None" = None
@@ -3027,7 +3036,7 @@ class _Handler(GuardedHandler):
             # STANDBY (another process owns the ledger), ACTIVATING past the wait, DRAINING; CLOSED (the server is
             # closing) is answered the same: never a definite miss, so a page never drops a good token on it
             raise _CredentialUnavailable(state.value)
-        self.server.ensure_pair_revision()
+        self.server.ensure_pair_revision(db)
         return db
 
     def _paired_device(self, raw: str) -> "str | None":
@@ -3036,14 +3045,19 @@ class _Handler(GuardedHandler):
         ``_PAIR_VERIFY_SLOTS`` BEFORE the broker start / the lookup (a full set is the 503 of RT-1).
 
         A page's reads carry one token, so a token's answer is shared (levain#228). A live-device answer is cached,
-        keyed by the token's SHA-256, with the revocation epoch and the identity of the journal's revocation-revision
-        file as they were read before its lookup; a hit needs both unchanged, so a revoke by this server or by ANY
-        other process (the journal replaces that file around every revoke) is seen by the very next request. The
-        file is one ``stat`` per request. When it cannot be read, neither the cache nor a shared lookup is used: the
-        request takes a full lookup of its own. ``_PAIR_VERIFIED_TTL_S`` only bounds an entry's age. A request that
-        finds no entry and a lookup of the same token in flight waits for that lookup's answer instead of taking a
-        slot, and takes it only if no revoke has landed since the lookup began. Nothing unverified is cached: a miss,
-        a revoked device and an unavailable are looked up again by the next request."""
+        keyed by the token's SHA-256, with the revocation epoch and the journal's clean revocation revision as they were
+        read before its lookup; a hit needs both unchanged, so a revoke by this server or by ANY other process (the
+        journal marks the revision dirty in the revoking transaction and writes a new clean one after the commit) is
+        seen by the very next request. The revision is one small read per request. While it is dirty or unreadable
+        there is nothing to compare: no entry is used and none is stored, and every request is looked up in full,
+        still one lookup per token at a time. ``_PAIR_VERIFIED_TTL_S`` only bounds an entry's age.
+
+        A request that finds no entry and a lookup of the same token in flight waits for that lookup's answer instead
+        of taking a slot. It takes the answer when no revoke can have landed between the lookup's start and its own
+        arrival: the lookup began after it arrived, or the revision read before the lookup is still the one now. When a
+        revision was there to compare and has moved, the answer is refused as superseded (503); when there was none to
+        compare, the request waits for a lookup that begins after it arrived instead. Nothing unverified is cached: a
+        miss, a revoked device and an unavailable are looked up again by the next request."""
         srv = self.server
         if srv.broker is None:
             return None         # RU-1: no ledger, no paired tokens: skip the pass entirely
@@ -3052,37 +3066,56 @@ class _Handler(GuardedHandler):
             return None
         key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         active = srv.broker.enabled     # a broker that is not ACTIVE answers from no cache: today's path and its 503
-        epoch = srv.pair_epoch
-        rev = _pair_revision(srv.broker.data_root)      # a syscall; no lock is held across it
-        if rev is None:
-            return self._paired_seen(*self._paired_lookup(raw))
-        with srv.pair_verify_lock:
-            hit = srv.pair_verified.get(key) if active else None
-            if hit is not None:
-                if hit[1] == epoch and hit[3] == rev and time.monotonic() - hit[2] < _PAIR_VERIFIED_TTL_S:
-                    self._pair_epoch_seen = hit[1]      # RU-3: a stream of this request compares against the entry's epoch
-                    return hit[0]
-                srv.pair_verified.pop(key, None)
-            flight = srv.pair_flights.get(key)
-            leader = flight is None
-            if flight is None:
-                flight = srv.pair_flights[key] = _PairFlight()
-            elif flight.followers >= _PAIR_FOLLOWERS_MAX:
-                raise _CredentialUnavailable("paired lookup waiters full")
-            else:
-                flight.followers += 1
-        if not leader:
-            if not flight.done.wait(_PAIR_WAIT_S + _PAIR_FOLLOW_GRACE_S):
+        arrived = srv.pair_flight_seq   # read before any flight this request joins: a later flight's seq is larger
+        # Two passes at most: a flight found on the second pass opened after the first one closed, so after this
+        # request arrived, and its answer is taken (or it is this request's own lookup).
+        for _pass in range(2):
+            epoch = srv.pair_epoch
+            rev = _pair_revision(srv.broker.data_root)      # a small read; no lock is held across it
+            with srv.pair_verify_lock:
+                hit = srv.pair_verified.get(key) if active and rev is not None else None
+                if hit is not None:
+                    if hit[1] == epoch and hit[3] == rev and time.monotonic() - hit[2] < _PAIR_VERIFIED_TTL_S:
+                        self._pair_epoch_seen = hit[1]  # RU-3: a stream of this request compares against the entry's epoch
+                        return hit[0]
+                    srv.pair_verified.pop(key, None)
+                flight = srv.pair_flights.get(key)
+                leader = flight is None
+                if flight is None:
+                    srv.pair_flight_seq += 1
+                    flight = srv.pair_flights[key] = _PairFlight(srv.pair_flight_seq)
+                elif flight.followers >= _PAIR_FOLLOWERS_MAX:
+                    raise _CredentialUnavailable("paired lookup waiters full")
+                else:
+                    flight.followers += 1
+            if leader:
+                break
+            try:
+                answered = flight.done.wait(_PAIR_WAIT_S + _PAIR_FOLLOW_GRACE_S)
+            finally:
+                with srv.pair_verify_lock:
+                    flight.followers -= 1       # the cap counts the requests waiting now, never one that has left
+            if not answered:
                 raise _CredentialUnavailable("paired lookup wait timed out")
             if flight.error is not None:
                 raise _CredentialUnavailable(flight.error)
-            if flight.device is not None and (flight.epoch != srv.pair_epoch or flight.rev is None
-                                              or _pair_revision(srv.broker.data_root) != flight.rev):
+            if flight.device is None:
+                self._pair_epoch_seen = flight.epoch
+                return None                     # a definite miss refuses: sharing it never admits anything
+            if flight.epoch != srv.pair_epoch:
+                raise _CredentialUnavailable("paired lookup superseded by a revoke")     # a revoke through this server
+            now_rev = _pair_revision(srv.broker.data_root)
+            if flight.seq > arrived or (flight.rev is not None and now_rev == flight.rev):
+                self._pair_epoch_seen = flight.epoch
+                return flight.device
+            if flight.rev is not None and now_rev is not None:
                 # a revoke landed after the leader read its answer and before this request: the answer is no longer
                 # this request's (a request that joined late must not be admitted by a lookup that predates a revoke)
                 raise _CredentialUnavailable("paired lookup superseded by a revoke")
-            self._pair_epoch_seen = flight.epoch
-            return flight.device
+            # no revision to compare: whether a revoke landed between that lookup's start and this request's arrival
+            # cannot be told, so this request takes the answer of a lookup that begins after it arrived (next pass)
+        else:
+            raise _CredentialUnavailable("paired lookup superseded by a revoke")
         looked: "tuple[str | None, Any, datetime] | None" = None
         try:
             looked = self._paired_lookup(raw)
@@ -3095,7 +3128,9 @@ class _Handler(GuardedHandler):
         finally:
             with srv.pair_verify_lock:
                 if flight.error is None and looked is not None:
-                    flight.device, flight.epoch, flight.rev = looked[0], self._pair_epoch_seen, self._pair_rev_seen
+                    # a request that found no revision to compare stores nothing, even when its lookup read a clean one
+                    flight.device, flight.epoch = looked[0], self._pair_epoch_seen
+                    flight.rev = self._pair_rev_seen if rev is not None else None
                     if looked[0] is not None and flight.rev is not None:
                         srv.pair_verified.pop(key, None)
                         while len(srv.pair_verified) >= _PAIR_VERIFIED_MAX:
@@ -3135,10 +3170,11 @@ class _Handler(GuardedHandler):
             now = datetime.now(timezone.utc)
             if db is None:
                 return None, None, now
-            # The revision file's identity is read BEFORE the sqlite lookup and stored with the answer: a revoke that
-            # commits while the lookup runs replaces the file after this read, so the answer it produced is stale on
-            # arrival. Read after it, the answer could carry the post-revoke identity and outlive the revoke. The clock
-            # is taken at the same moment so an entry's age counts from when its answer was read, not when stored.
+            # The revision is read BEFORE the sqlite lookup and stored with the answer: a revoke that commits while the
+            # lookup runs writes a new clean revision after this read, so the answer it produced is stale on arrival.
+            # Read after it, the answer could carry the post-revoke revision and outlive the revoke. It is read after
+            # _pairing_db, which may have made a stuck dirty revision clean. The clock is taken at the same moment so an
+            # entry's age counts from when its answer was read, not when stored.
             self._pair_rev_seen = _pair_revision(srv.broker.data_root)
             self._pair_looked_at = time.monotonic()
             try:
@@ -3147,13 +3183,15 @@ class _Handler(GuardedHandler):
                 raise _CredentialUnavailable(f"{type(exc).__name__}") from exc
         finally:
             held_ms = (time.monotonic() - t0) * 1000
-            with srv.pair_verify_lock:
-                inflight = srv.pair_verify_inflight
-                srv.pair_verify_inflight -= 1
-                loud = held_ms >= _PAIR_SLOW_LOOKUP_MS and t0 - srv.pair_slow_logged_at >= _PAIR_SLOW_LOG_EVERY_S
-                if loud:
-                    srv.pair_slow_logged_at = t0
-            srv.pair_verify_gate.release()
+            try:
+                with srv.pair_verify_lock:
+                    inflight = srv.pair_verify_inflight
+                    srv.pair_verify_inflight -= 1
+                    loud = held_ms >= _PAIR_SLOW_LOOKUP_MS and t0 - srv.pair_slow_logged_at >= _PAIR_SLOW_LOG_EVERY_S
+                    if loud:
+                        srv.pair_slow_logged_at = t0
+            finally:
+                srv.pair_verify_gate.release()      # whatever the bookkeeping does, the slot goes back
             if held_ms >= _PAIR_SLOW_LOOKUP_MS:
                 # a flood of unknown tokens on a loaded box makes a slow lookup of each: one warning per interval,
                 # the rest are debug lines
@@ -5334,7 +5372,7 @@ class _Handler(GuardedHandler):
                 return {"error": "install_disabled", "message": f"write-disabled: {broker.disabled_reason}"}, 403
             self._refused("pair_broker")
             return {"error": "broker_unavailable", "message": f"the cockpit broker is {state.value}"}, 503
-        self.server.ensure_pair_revision()
+        self.server.ensure_pair_revision(db)
         try:
             return fn(db), 200
         except PairingError as exc:

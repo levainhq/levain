@@ -38,7 +38,7 @@ from levain.cockpit.broker import Broker, Lifecycle
 from levain.cockpit.firejournal import CockpitDB, revoke_digest
 from levain.consent.sign import SignRefused
 from levain.writes import EditError
-from tests._waits import scaled
+from tests._waits import scaled, wait_until
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve
 
@@ -462,14 +462,14 @@ def test_a_request_after_a_revoke_through_the_journal_is_not_admitted_by_a_looku
     assert _late_follower(port, tok, release, leader) in (403, 503)
 
 
-def test_a_cache_hit_costs_one_stat_of_the_revision_file_and_no_lookup(rig, monkeypatch) -> None:
+def test_a_cache_hit_costs_one_read_of_the_revision_file_and_no_lookup(rig, monkeypatch) -> None:
     port, _httpd, _dev, tok = rig
     spy = _Spy(monkeypatch)
-    stats_made: list[int] = []
+    reads_made: list[int] = []
     real = web_server.revision_identity
 
     def counted(root: Any) -> Any:
-        stats_made.append(1)
+        reads_made.append(1)
         return real(root)
 
     monkeypatch.setattr(web_server, "revision_identity", counted)
@@ -477,7 +477,96 @@ def test_a_cache_hit_costs_one_stat_of_the_revision_file_and_no_lookup(rig, monk
     for _ in range(reads):
         assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200
     assert spy.calls == 1
-    assert len(stats_made) == reads + spy.calls, "one stat per request, and the one lookup read it once more before it ran"
+    assert len(reads_made) == reads + spy.calls, "one read per request, and the one lookup read it once more before it ran"
+
+
+# --- 13. no revision to compare (dirty or unreadable): no cache, still one flight; the flight's bounds ----------------
+
+def _no_revision(monkeypatch) -> None:
+    """The revision cannot be compared (as when it is dirty or unreadable): ``_pair_revision`` reads None."""
+    def denied(_root: Any) -> Any:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(web_server, "revision_identity", denied)
+
+
+def test_a_page_burst_with_no_revision_to_compare_is_still_one_flight_and_never_refused(rig, monkeypatch, caplog) -> None:
+    port, _httpd, _dev, tok = rig
+    _no_revision(monkeypatch)
+    spy = _Spy(monkeypatch, hold=0.05)
+    caplog.set_level(logging.INFO, logger=LOG)
+    got = _page_burst(port, tok)
+    assert [g for g in got if g[0] == 503] == [], got
+    assert not [ln for ln in _refusals(caplog) if "gate=credential:" in ln], _refusals(caplog)
+    # a request that found a lookup already running waits for it, then shares one that began after it arrived
+    assert spy.calls <= 4, f"the burst's lookups were shared, not {spy.calls}"
+    assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200
+    assert spy.calls >= 2, "nothing was cached: the request after the burst looked up again"
+
+
+def test_with_no_revision_to_compare_a_request_after_a_revoke_is_not_admitted_by_a_lookup_that_began_before_it(
+        rig, monkeypatch) -> None:
+    port, httpd, device, tok = rig
+    _no_revision(monkeypatch)
+    spy = _Spy(monkeypatch)
+    release, leader, _first = _hold_leader_after_its_answer(port, tok, spy)
+    httpd.broker.active_db().revoke_devices([device], by="box", now=datetime.now(timezone.utc))     # no epoch moves here
+    assert _late_follower(port, tok, release, leader) == 403, "it waited out that lookup and took one of its own"
+
+
+def test_followers_whose_wait_timed_out_leave_the_waiter_cap(rig, monkeypatch) -> None:
+    """F3: the cap counts the requests waiting on a flight now; a follower whose wait timed out has left it."""
+    port, httpd, _dev, tok = rig
+    spy = _Spy(monkeypatch)
+    cap = 2
+    monkeypatch.setattr(web_server, "_PAIR_FOLLOWERS_MAX", cap)
+    monkeypatch.setattr(web_server, "_PAIR_WAIT_S", scaled(0.3))
+    monkeypatch.setattr(web_server, "_PAIR_FOLLOW_GRACE_S", scaled(0.3))
+    key = hashlib.sha256(tok.encode("utf-8")).hexdigest()
+    release, leader, first = _hold_leader_after_its_answer(port, tok, spy)
+    late: list[int] = []
+    t = threading.Thread(target=lambda: late.append(
+        _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0]), daemon=True)
+    try:
+        for _ in range(cap + 1):
+            st, out, _h = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)
+            assert (st, out.get("error")) == (503, "broker_unavailable"), (st, out)
+        assert httpd.pair_flights[key].followers == 0, "every follower that timed out left the count"
+        t.start()
+        wait_until(lambda: late or httpd.pair_flights[key].followers == 1, 10, what="the late request to wait")
+        assert not late, f"the late request was refused at once: {late}"
+    finally:
+        release.set()
+    leader.join(30)
+    if t.is_alive() or late:
+        t.join(30)
+    assert first == [200] and late == [200], (first, late)
+
+
+def test_a_lookup_slot_is_given_back_even_when_its_bookkeeping_raises(rig, monkeypatch) -> None:
+    """F4: the slot's release runs whatever the in-flight count's update does."""
+    port, httpd, _dev, _tok = rig
+
+    class _Breaks(int):
+        def __add__(self, _n: Any) -> "_Breaks":
+            return self
+
+        def __sub__(self, _n: Any) -> Any:
+            raise RuntimeError("the count cannot be moved")
+
+    httpd.pair_verify_inflight = _Breaks(0)
+    try:
+        # an unknown token: nothing cached answers it, so it takes a slot and a lookup
+        _call(port, "GET", "/cockpit/manifest.json", token=secrets.token_urlsafe(32), headers=PROXY)
+    except (http.client.HTTPException, OSError):
+        pass                            # the request's own answer is not what this test reads
+    finally:
+        httpd.pair_verify_inflight = 0
+    taken = [httpd.pair_verify_gate.acquire(blocking=False) for _ in range(web_server._PAIR_VERIFY_SLOTS)]
+    for ok in taken:
+        if ok:
+            httpd.pair_verify_gate.release()
+    assert all(taken), f"a slot was never given back: {taken}"
 
 
 def test_slow_lookup_warnings_are_limited_to_one_per_interval(rig, monkeypatch, caplog) -> None:
