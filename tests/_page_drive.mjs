@@ -316,9 +316,9 @@ const send = (method, params = {}) => new Promise((res, rej) => {
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
-// send() resolves a protocol error as a reply object, so a failure is read from the reply (an undefined reply is the 3 s race lost), never from a catch
-const replyFault = (r) => !r ? "no reply within 3 s" : r.error ? String(r.error.message || JSON.stringify(r.error)).slice(0, 120) : null;
-const sendBounded = async (m, params) => { try { return await Promise.race([send(m, params), sleep(3000)]); } catch (e) { return { error: { message: String(e && e.message || e) } }; } };
+// send() resolves a protocol error as a reply object, so a failure is read from the reply (an undefined reply is the bound lost), never from a catch
+const replyFault = (r) => !r ? "no reply in time" : r.error ? String(r.error.message || JSON.stringify(r.error)).slice(0, 120) : null;
+const sendBounded = async (m, params) => { try { return await Promise.race([send(m, params), sleep(scaled(3000))]); } catch (e) { return { error: { message: String(e && e.message || e) } }; } };
 let runtimeEnableFault = null;
 for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable", ...(evidence ? ["ServiceWorker.enable"] : [])]) { const r = await sendBounded(m); if (m === "Runtime.enable") runtimeEnableFault = replyFault(r); }   // console capture is best-effort: only Runtime.enable, which carries the shim's reports, is a reason to fail a drive
 // a script or stylesheet that fails to load leaves its name in window.__loadErrors (read by the timeout dump); best-effort like the domains above
