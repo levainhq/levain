@@ -155,11 +155,12 @@ def mark_live() -> None:
     """Called first thing by every levain launcher (each ``__main__`` block, the console entry): this process is a real
     levain run, so resolving the real ``~/.levain`` is expected. Sets :data:`LIVE_ENV` in the process environment;
     ``levain.launch.allowed`` refuses the name, so it crosses no exec levain makes and each entry marks itself (a
-    model levain starts must not hand it to a script it writes). A no-op in a test run, whatever calls it: the suite never takes the real home, and an
+    model levain starts must not hand it to a script it writes). A no-op in a test run or a scratch run
+    (:func:`guarded_run`), whatever calls it: the suite never takes the real home, a scratch run is not the product, and an
     in-process ``main()`` call must not leak the marker into the next test. Never raises."""
     global _MARK_FAILED
     try:
-        if not under_test_run():
+        if guarded_run() is None:
             os.environ[LIVE_ENV] = "1"
     except Exception as exc:  # noqa: BLE001 — marking must never stop a launcher, but a failed mark is recorded:
         _MARK_FAILED = f"{type(exc).__name__}: {exc}"[:200]   # one line now, and in every unmarked row after

@@ -60,6 +60,10 @@ def _recording_run(argv, *a, **kw):
 
 
 subprocess.run = _recording_run
+if mode.startswith("mark-"):        # the child's own launcher: mark_live() first thing, then the act
+    from levain.home_guard import mark_live
+    mark_live()
+    mode = mode[len("mark-"):]
 if mode == "signer":
     K.ssh_signer(Path(account) / ".levain" / "keys" / ts.KEY_LABEL)
     sys.exit(0)
@@ -108,12 +112,14 @@ class Rig:
         self.home = tmp_path / "scratch-home"
         self.home.mkdir()
 
-    def run(self, mode: str, *, live: bool = False, extra: str = ""):
+    def run(self, mode: str, *, live: bool = False, scratch: bool = False, extra: str = ""):
         env = {"PATH": f"{self.stub.parent}:/usr/bin:/bin", "HOME": str(self.home),
                "LEVAIN_HOME": str(self.home / "lh"), "PYTHONPATH": str(LEVAIN_ROOT)}
         assert "PYTEST_CURRENT_TEST" not in env
         if live:
             env[home_guard.LIVE_ENV] = "1"
+        if scratch:
+            env[home_guard.SCRATCH_ENV] = "1"
         argv = [sys.executable, str(self.script), str(self.account), str(self.marker), mode] + ([extra] if extra else [])
         return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120, cwd=str(self.tmp))
 
@@ -203,12 +209,57 @@ def test_write_sign_failure_refuses_the_real_key_dir_when_unmarked_and_writes_el
     assert Path(written).parent == other / "sign-failures" and Path(written).is_file()
 
 
-def test_write_sign_failure_in_the_real_key_dir_is_allowed_when_marked_live(tmp_path, monkeypatch):
-    real = tmp_path / "acct" / ".levain" / "keys"
-    real.mkdir(parents=True, mode=0o700)
-    monkeypatch.setattr(K, "pwd_key_dir", lambda: real)
-    monkeypatch.setenv(home_guard.LIVE_ENV, "1")
-    assert Path(_write(real / ts.KEY_LABEL)).is_file()
+def test_write_sign_failure_in_the_real_key_dir_is_allowed_to_a_child_marked_live(rig):
+    done = rig.run("sign-failure", live=True)
+    assert done.returncode == 0, done.stderr
+    assert len(list(rig.failures().glob("sigfail-*.json"))) == 1
+
+
+# --- a test run or a scratch run never reaches the real key, marked or not --------------------------------------------
+
+def test_a_scratch_run_that_calls_mark_live_is_not_marked_and_cannot_sign(rig):
+    done = rig.run("mark-sign", scratch=True)
+    assert done.returncode != 0, done.stdout
+    assert "scratch run" in done.stderr and "operator's real key" in done.stderr, done.stderr
+    assert not rig.marker.exists(), "an ssh-keygen was spawned"
+    assert not rig.failures().exists()
+
+
+def test_a_scratch_run_with_the_marker_set_directly_is_refused(rig):
+    done = rig.run("sign", live=True, scratch=True)
+    assert done.returncode != 0, done.stdout
+    assert "scratch run" in done.stderr and "operator's real key" in done.stderr, done.stderr
+    assert not rig.marker.exists() and not rig.failures().exists()
+
+
+def test_a_scratch_run_with_the_marker_set_directly_cannot_write_the_real_sign_failures_directory(rig):
+    done = rig.run("sign-failure", live=True, scratch=True)
+    assert done.returncode != 0 and "RealKeyUnmarked" in done.stderr, done.stderr
+    assert not rig.failures().exists()
+
+
+def test_a_scratch_run_with_a_key_dir_outside_the_real_one_still_signs(rig, tmp_path):
+    other = _scratch_key(tmp_path / "other-keys")
+    done = rig.run("sign-keydir", scratch=True, extra=str(other.parent))
+    assert done.returncode == 0, done.stderr
+    assert rig.marker.exists()
+
+
+def test_a_normal_child_that_calls_mark_live_signs_through_the_recorded_spawn(rig):
+    done = rig.run("mark-sign")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["signed", "None"]
+    assert rig.marker.exists() and "-Y sign" in rig.marker.read_text()
+
+
+def test_mark_live_is_a_no_op_in_a_scratch_run_and_marks_otherwise(rig, tmp_path):
+    script = tmp_path / "mark_probe.py"
+    script.write_text("import os\nfrom levain.home_guard import LIVE_ENV, mark_live\nmark_live()\nprint(os.environ.get(LIVE_ENV))\n")
+    base = {"PATH": "/usr/bin:/bin", "HOME": str(rig.home), "LEVAIN_HOME": str(rig.home / "lh"), "PYTHONPATH": str(LEVAIN_ROOT)}
+    for extra, want in (({}, "1"), ({home_guard.SCRATCH_ENV: "1"}, "None")):
+        done = subprocess.run([sys.executable, str(script)], env={**base, **extra}, capture_output=True, text=True,
+                              timeout=120, cwd=str(tmp_path))
+        assert done.returncode == 0 and done.stdout.strip() == want, (extra, done.stdout, done.stderr)
 
 
 def test_refuse_real_key_unless_live_judges_the_resolved_path(tmp_path, monkeypatch):
@@ -223,8 +274,9 @@ def test_refuse_real_key_unless_live_judges_the_resolved_path(tmp_path, monkeypa
             K.refuse_real_key_unless_live(path)
     K.refuse_real_key_unless_live(tmp_path / "elsewhere" / ts.KEY_LABEL)
     K.refuse_real_key_unless_live(real.parent / "keys-sibling" / ts.KEY_LABEL)
-    monkeypatch.setenv(home_guard.LIVE_ENV, "1")
-    K.refuse_real_key_unless_live(real / ts.KEY_LABEL)
+    monkeypatch.setenv(home_guard.LIVE_ENV, "1")        # this process is a test run: the marker does not open the key
+    with pytest.raises(K.RealKeyUnmarked, match="test run"):
+        K.refuse_real_key_unless_live(real / ts.KEY_LABEL)
 
 
 def test_the_refusal_is_a_real_key_reached_and_a_key_error():

@@ -141,29 +141,34 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
 def refuse_real_key_unless_live(path: Path | str, what: str = "the key") -> None:
     """Raise :class:`RealKeyUnmarked` when ``path`` is the operator's real key directory or lies inside it
     (:func:`pwd_key_dir`, both resolved) and this process is not marked live (:func:`levain.home_guard.live_marked`:
-    a levain launcher called ``mark_live``). Reaching the real key is an opt-in of the live product; a process that
-    did not opt in, a stray script or a bare child a test started, is refused whatever its ``$HOME`` or ``$LEVAIN_HOME``.
-    A REFUSE, never a warning: it does not read ``home_guard.UNMARKED_ACTION``. A path outside the real key directory
-    returns, marked or not. A real key directory that cannot be named (no password entry) has nothing to guard, so
-    it returns; a ``path`` that cannot be resolved is refused, since it cannot be shown to lie elsewhere."""
-    from levain.home_guard import LIVE_ENV, live_marked
+    a levain launcher called ``mark_live``), or is a test run or a scratch run (:func:`levain.home_guard.guarded_run`),
+    which never reaches it whatever :data:`~levain.home_guard.LIVE_ENV` says (a marker inherited from a parent does not
+    count). Reaching the real key is an opt-in of the live product; a process that did not opt in, a stray script or a
+    bare child a test started, is refused whatever its ``$HOME`` or ``$LEVAIN_HOME``. A REFUSE, never a warning: it
+    does not read ``home_guard.UNMARKED_ACTION``. A path outside the real key directory returns, marked or not. A real
+    key directory that cannot be named (no password entry) has nothing to guard, so it returns; a ``path`` that cannot
+    be resolved is refused, since it cannot be shown to lie elsewhere."""
+    from levain.home_guard import LIVE_ENV, guarded_run, live_marked
 
-    if live_marked():
+    guarded = guarded_run()
+    if guarded is None and live_marked():
         return
     try:
         real = pwd_key_dir().resolve()
     except (OSError, RuntimeError, KeyError):
         return
+    state = (f"this process is {guarded}, which never reaches the real key, whatever {LIVE_ENV} says" if guarded
+             else f"this process was not started by a levain launcher ({LIVE_ENV} is not 1)")
     try:
         target = Path(path).expanduser().resolve()
     except (OSError, RuntimeError) as exc:
         raise RealKeyUnmarked(f"{what} ({path}) cannot be resolved ({type(exc).__name__}: {exc}), so it cannot be shown "
-                              "not to be the operator's real key, and this process is not marked live; refused") from None
+                              f"not to be the operator's real key, and {state}; refused") from None
     if target == real or real in target.parents:
         raise RealKeyUnmarked(
-            f"refusing {what} ({target}): it is the operator's real key and this process was not started by a levain "
-            f"launcher ({LIVE_ENV} is not 1), so a signature here would be a consent nobody gave. Fix: start it "
-            "through `levain`, or call levain.home_guard.mark_live() first thing in your own launcher.")
+            f"refusing {what} ({target}): it is the operator's real key and {state}, so a signature here would be a "
+            "consent nobody gave. Fix: start it through `levain`, or call levain.home_guard.mark_live() first thing in "
+            "your own launcher (a test or scratch run cannot reach it at all).")
 
 
 @dataclass(frozen=True)
