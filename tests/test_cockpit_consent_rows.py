@@ -9,12 +9,12 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from levain.cockpit import Cockpit, ProviderSpec, Read, RowIn
 from levain.cockpit.results import Absent
 from levain.consent.listing import read_listing
 from levain.consent.queue import ConsentQueue, authority_source
-import pytest
-
 from tests._h4 import h4_home
 
 T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -279,13 +279,12 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     # ones to spoil: each answers its FIRST read with a 200 and an unreadable body. Both are triggered before either is retried, so a
     # leaked slot would saturate the two-slot queue and the third read could never run. The page encodes the id in the route
     # (the colons of a timestamp id), so the stub matches the encoded form.
-    # The page repaints the open modal whenever a view refresh or one of the modal's own side reads (grants, envelopes, dispatch)
-    # lands, and a repaint replaces every row node: a node tagged or clicked by the test is gone by then (levain#230; a CI run lost
-    # its tags between the click and the wait). So nothing here depends on a node outliving a step. The decided rows are found by the
-    # id the page puts on them (data-card), the click is the driver's act-until (safe to repeat: it only presses a details button
-    # that is enabled and whose row has no body yet), and what the stub RECORDS, which no repaint can erase, carries the proof that
-    # each id's first read was spoiled and a later one was issued. The drawn failure note is a node, so the sibling test below,
-    # which re-finds its one row on every poll, is the one that holds it.
+    # The page repaints the open modal whenever a view refresh or one of the modal's own side reads lands, and a repaint replaces
+    # every row node: a node tagged or clicked by the test is gone by then (levain#230; a CI run lost its tags between the click
+    # and the wait). So nothing here depends on a node outliving a step. The decided rows are found by the id the page puts on
+    # them (data-card), the click is the driver's act-until (safe to repeat: it only presses a details button that is enabled and
+    # whose row has no body yet), and what the stub RECORDS, which no repaint can erase, carries the proof that each id's first
+    # read was spoiled and a later one was issued. The drawn failure note is a node, so it is not asserted here.
     stub = ("(() => { const real = window.fetch.bind(window); const ids = " + json.dumps(gone) + "; const seen = new Set();"
             " const z = window.__zq = { ids: ids, log: [], before: null };"
             " window.fetch = (u, o) => { const id = ids.find(i => String(u).includes('/cockpit/consent/' + encodeURIComponent(i)));"
@@ -296,7 +295,9 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     press = ("(() => { const rs = " + decided + "; const z = window.__zq; if (rs.length !== z.ids.length) return 0;"
              " if (z.before === null) z.before = rs.map(r => !!r.querySelector('.consent-display'));"
              " rs.forEach(r => { const b = r.querySelector('.consent-details'); if (b && !b.disabled && !r.querySelector('.consent-display')) b.click(); }); return 1; })()")
-    shown = f"{decided}.length === {len(gone)} && {decided}.every(r => r.querySelector('.consent-display'))"
+    # one evaluation tests the rows AND copies their words, so no repaint can fall between the proof and the read of it
+    shown = ("(() => { const rs = " + decided + "; return rs.length === " + str(len(gone)) + " && rs.every(r => r.querySelector('.consent-display'))"
+             " && rs.map(r => r.querySelector('.consent-display').textContent); })()")
     spoiled_both = f"window.__zq.log.filter(e => e[1] === 'spoiled').length === {len(gone)}"
     steps = [
         {"until": f"{TILE} && /2/.test({TILE}.innerText)"},
@@ -307,17 +308,21 @@ def test_a_decided_row_has_a_details_button_and_a_malformed_body_releases_its_sl
     if repaint_between:
         # the repaint the page does on its own at an arbitrary moment, made certain: both first reads are spoiled, then the modal is
         # opened again (the page's own rebuild of the open modal), and the rows the test pressed are new nodes
-        steps += [{"do": press, "until": spoiled_both}, {"eval": OPEN_DECISIONS}]
-    steps += [{"do": press, "until": shown}, {"eval": "window.__zq"},
-              {"eval": f"{decided}.map(r => r.querySelector('.consent-display').textContent)"}]
+        steps += [{"do": press, "until": spoiled_both},
+                  {"eval": f"window.__zqMark = {decided}[0]; 1"},       # a row node of the old paint: the repaint below must replace it
+                  {"eval": OPEN_DECISIONS}]
+    steps += [{"do": press, "until": shown},
+              {"eval": "Object.assign({}, window.__zq, { repainted: window.__zqMark ? !window.__zqMark.isConnected : null })"}]
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
-    rec, texts = out[-2], out[-1]
-    assert rec["before"] == [False, False], rec      # before the first press neither decided row had a body
+    texts, rec = out[-2], out[-1]
+    assert rec["before"] is not None and rec["before"] == [False, False], rec      # before the first press neither decided row had a body
+    if repaint_between:
+        assert rec["repainted"] is True, rec         # the second open really replaced the rows, so this case is not vacuous
     for i in gone:
         mine = [w for (n, w) in rec["log"] if n == i]
         # the first read of each id was the spoiled one, and a later read was issued: the spoiled read released its slot
-        assert mine[0] == "spoiled" and "read" in mine[1:], rec
+        assert mine and mine[0] == "spoiled" and "read" in mine[1:], (i, rec)
     assert len(texts) == 2 and all("zq-decided-marker" in t for t in texts), out
 
 
