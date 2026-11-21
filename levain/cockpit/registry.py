@@ -604,17 +604,17 @@ register_ordering(
 
 
 def _agent_group_of(row: Any, today: Any) -> str:
-    """The agents panel's group of a row (levain#221, ruling D7): the pinned operator row and the retired rows keep their own,
-    and a live agent is in its kind's section (a ``job`` in Jobs; a ``role`` and an ``unreadable`` kind in Fleet, so a kind
-    that cannot be read is shown and never hidden in Jobs) and its state inside it."""
+    """The agents panel's group of a row (levain#221, ruling D7): the pinned operator row keeps its own, and every other
+    agent is in its kind's section (a ``job`` in Jobs; a ``role`` and an ``unreadable`` kind in Fleet, so a kind that cannot
+    be read is shown and never hidden in Jobs) and its state inside it, Retired last in each section."""
     state = str(row.facets.get("agent_group") or "unarmed")
-    if state in ("operator", "retired"):
+    if state == "operator":
         return state
     return ("jobs-" if row.facets.get("agent_kind") == "job" else "fleet-") + state
 
 
 # the agents panel (levain.cockpit.agents_panel): in the Jobs section or the Fleet section by the role's kind (_agent_group_of), and
-# by what the agent does now inside it, by name inside a group; a retired
+# by what the agent does now inside it, by title inside a group; a retired
 # agent is history beside the rest and is not a figure on the panel's count. The store's one operator agent is a pinned row
 # of its own, first (P9a-o): it is the record the registry materialises, not a registered agent, so it is not counted either
 register_ordering(
@@ -622,14 +622,16 @@ register_ordering(
              (("operator", "Agent"), ("jobs-firing", "Jobs \u00b7 Firing"), ("jobs-paused", "Jobs \u00b7 Paused"),
               ("jobs-unarmed", "Jobs \u00b7 Unarmed"), ("fleet-firing", "Fleet \u00b7 Firing"),
               ("fleet-paused", "Fleet \u00b7 Paused"), ("fleet-unarmed", "Fleet \u00b7 Unarmed"),
-              ("retired", "Retired")),
-             uncounted=frozenset({"operator", "retired"})),
+              ("jobs-retired", "Jobs \u00b7 Retired"), ("fleet-retired", "Fleet \u00b7 Retired")),
+             uncounted=frozenset({"operator", "jobs-retired", "fleet-retired"})),
     builtin=True,
 )
-# the Calls panel (levain.cockpit.calls_panel): the live spawned workers first, then the ones that are over (history, not a figure)
+# the Calls panel (levain.cockpit.calls_panel): the asked-for and running spawned workers first, then a call whose state the
+# store does not say (counted: absence is never read as finished), then the ones that are over (history, not a figure)
 register_ordering(
-    Ordering("calls.state", lambda row, today: (), lambda row, today: "live" if row.facets.get("call_state") in ("pending", "active") else "over",
-             (("live", "Running"), ("over", "Over")), uncounted=frozenset({"over"})),
+    Ordering("calls.state", lambda row, today: (),
+             lambda row, today: {"pending": "live", "active": "live", "unknown": "unknown"}.get(row.facets.get("call_state"), "over"),
+             (("live", "Asked or running"), ("unknown", "State unknown"), ("over", "Over")), uncounted=frozenset({"over"})),
     builtin=True,
 )
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable

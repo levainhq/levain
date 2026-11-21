@@ -147,8 +147,8 @@ def test_the_panel_draws_on_home_with_the_four_groups_and_the_pinned_operator_ro
     seen = _json(out, -1)
     text = seen["text"]
     groups = [r["group"] for r in seen["rows"]]
-    # the pinned row, then Fleet's state groups in order (these scratch roles are stored nowhere, so unreadable: Fleet), then Retired
-    assert groups == ["Agent", "Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Fleet \u00b7 Unarmed", "Fleet \u00b7 Unarmed", "Retired"], seen["rows"]
+    # the pinned row, then Fleet's state groups in order (these scratch roles are stored nowhere, so unreadable: Fleet), Retired last
+    assert groups == ["Agent", "Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Fleet \u00b7 Unarmed", "Fleet \u00b7 Unarmed", "Fleet \u00b7 Retired"], seen["rows"]
     assert seen["rows"][0]["body"] == "no operator agent in this store yet", seen["rows"][0]
     for name in ("w-firing", "w-paused", "w-unarmed", "w-retired"):
         assert name in text, (name, text)
@@ -194,7 +194,7 @@ def test_a_verb_round_trip_hits_the_verbspec_and_the_row_moves(width, tmp_path, 
                          _tap_row("w-paused"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_retire"), "ms": 20000},
                          {"eval": f"{verb('agent_retire')}.textContent"},
                          {"tap": verb("agent_retire"), "ms": 20000},
-                         {"until": moved("w-paused", "Retired") + " && 1", "ms": 30000}]
+                         {"until": moved("w-paused", "Fleet \u00b7 Retired") + " && 1", "ms": 30000}]
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", steps)
         after = {n: s.state(n) for n in ("unarmed", "paused", "firing")}
@@ -237,7 +237,7 @@ def test_a_job_is_drawn_in_jobs_with_its_brief_line_and_its_name_as_the_small_ad
     job = next(r for r in seen["rows"] if r["body"].startswith("Check the push queue"))
     assert job["group"] == "Jobs \u00b7 Unarmed \u00b7 w-job", job                       # the spec name beside the group, small
     assert "w-job" not in job["body"] and job["opens"], job
-    assert {r["group"] for r in seen["rows"] if r is not job} >= {"Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Retired"}, seen["rows"]
+    assert {r["group"] for r in seen["rows"] if r is not job} >= {"Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Fleet \u00b7 Retired"}, seen["rows"]
     detail = json.loads(next(v for v in values if '"verbs"' in v))
     assert detail["verbs"] == ["agent_pause", "agent_retire"], detail
     assert out["posts"] == [], out["posts"]
@@ -269,5 +269,5 @@ def test_the_calls_panel_draws_a_spawned_worker_on_home_beside_the_agents_panel(
     assert seen["w"] > 0 and "Calls" in seen["title"], seen                   # drawn on Home, titled
     assert len(seen["rows"]) == 1 and seen["rows"][0]["key"].startswith("call:"), seen
     assert seen["rows"][0]["body"].startswith("scribe · ") and "pending" in seen["rows"][0]["body"], seen
-    assert seen["rows"][0]["group"] == "Running", seen
+    assert seen["rows"][0]["group"] == "Asked or running", seen
     assert out["posts"] == [], out["posts"]

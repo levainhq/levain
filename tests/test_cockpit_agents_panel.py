@@ -98,7 +98,7 @@ def world(tmp_path) -> World:
 
 
 GROUP_IDS = ["operator", "jobs-firing", "jobs-paused", "jobs-unarmed", "fleet-firing", "fleet-paused", "fleet-unarmed",
-             "retired"]
+             "jobs-retired", "fleet-retired"]
 
 
 def _groups(panel: dict) -> dict[str, list[str]]:
@@ -115,9 +115,9 @@ def test_rows_group_firing_paused_unarmed_retired_and_an_unreadable_log_is_never
     got = _groups(panel)
     assert got["operator"] == ["operator-agent:none"]                                     # a store with no record, uncounted
     assert got["fleet-firing"] == [world.rid("firing")] and got["fleet-paused"] == [world.rid("paused")]   # the rig's roles are Fleet
-    assert got["retired"] == [world.rid("retired")]
+    assert got["fleet-retired"] == [world.rid("retired")]
     assert set(got["fleet-unarmed"]) == {world.rid("unarmed"), "agent:" + world.rig.agent}     # the launch rig's agent too
-    assert panel["count"] == 4 and next(g for g in panel["groups"] if g["id"] == "retired").get("uncounted")
+    assert panel["count"] == 4 and all(next(g for g in panel["groups"] if g["id"] == r).get("uncounted") for r in ("jobs-retired", "fleet-retired"))
     bodies = {r["id"]: r["body"] for r in panel["rows"]}
     assert "armed · link until " in bodies[world.rid("firing")]
     assert "no signed link covers this spec" in bodies[world.rid("unarmed")]
@@ -499,7 +499,7 @@ def test_the_dream_attached_draws_the_operator_agents_row_with_its_role_and_the_
     assert next(g for g in panel["groups"] if g["id"] == "operator").get("uncounted")
     assert panel["count"] == 5 and panel["rows"][0]["id"] == row["id"]       # the four, plus the dream: the record is no agent
     got = _groups(panel)
-    assert got["fleet-firing"] == [world.rid("firing")] and got["retired"] == [world.rid("retired")]
+    assert got["fleet-firing"] == [world.rid("firing")] and got["fleet-retired"] == [world.rid("retired")]
     # the dream is also an ordinary agent row, and read_one answers the operator row by its id
     assert "agent:" + dream in {r["id"] for r in panel["rows"]}
     assert world.ck.read_one(AGENTS_ID, row["id"]).value["id"] == row["id"]
@@ -1221,10 +1221,11 @@ def test_jobs_and_fleet_are_sections_by_kind_and_an_unreadable_kind_is_fleet_nev
     assert by_id["agent:" + job] == "jobs-unarmed"                       # no link is signed for it: Unarmed, inside Jobs
     assert by_id["agent:" + role] == "fleet-unarmed"
     assert by_id["agent:" + bad] == "fleet-unarmed"                      # an unreadable kind is shown in Fleet
-    assert by_id[world.rid("retired")] == "retired" and by_id["operator-agent:none"] == "operator"
+    assert by_id[world.rid("retired")] == "fleet-retired" and by_id["operator-agent:none"] == "operator"   # retired is last inside its section
     titles = {g["id"]: g["title"] for g in panel["groups"]}
     assert titles["jobs-firing"] == "Jobs · Firing" and titles["fleet-paused"] == "Fleet · Paused"
-    assert panel["count"] == len([r for r in panel["rows"] if r["group"] not in ("operator", "retired")])   # the retired and the pinned row are no figure
+    assert titles["jobs-retired"] == "Jobs · Retired"
+    assert panel["count"] == len([r for r in panel["rows"] if r["group"] not in ("operator", "jobs-retired", "fleet-retired")])   # the retired and the pinned row are no figure
 
 
 def test_a_job_row_leads_with_its_role_briefs_first_line_and_carries_its_spec_name_as_the_address_label(world):

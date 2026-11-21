@@ -8,8 +8,10 @@ named would read absence as health, so they are a later row that first names a s
 
 The panel only draws what the launch and its events say; it decides nothing and offers no verb. The store is opened
 ``mode=ro`` and never created. A store that cannot be read is this panel's fault, said in words, never "no calls"; a
-launch whose record cannot be read is a row that says so, never a hidden one. The newest :data:`CALLS_SHOWN` calls are
-listed (a note says when there are older ones).
+launch whose record cannot be read is a row that says so, never a hidden one. A desk store that lacks a table the panel
+reads (``launches``, ``launch_events``) is a fault, never "no calls", except one made before ``role_ref`` existed, which
+cannot hold a spawned worker. At most :data:`CALLS_SHOWN` calls are listed, the live ones first (a note says when there are
+more).
 """
 from __future__ import annotations
 
@@ -30,9 +32,10 @@ CALL_FACETS = frozenset({"call_state"})
 CALLS_SHOWN = 40
 _LIVE = ("pending", "active")
 
-_SQL = ("SELECT l.launch_id, l.threads, l.at, l.role_ref, "
-        "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) "
-        "FROM launches l WHERE l.role = 'worker' AND l.role_ref IS NOT NULL ORDER BY l.gseq DESC LIMIT ?")
+_SQL = ("SELECT launch_id, threads, at, role_ref, kind FROM (SELECT l.launch_id, l.threads, l.at, l.role_ref, l.gseq, "
+        "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) AS kind "
+        "FROM launches l WHERE l.role = 'worker' AND l.role_ref IS NOT NULL) "
+        "ORDER BY CASE WHEN kind IN ('pending', 'active') THEN 0 ELSE 1 END, gseq DESC LIMIT ?")
 
 
 def _one_line(text: object, limit: int = 300) -> str:
@@ -65,7 +68,7 @@ def _row(launch_id: str, threads: str, at: str, role_ref: str, kind: str | None)
     shown = name or "unreadable spawn record"
     thread = _one_line(threads.strip("[]").replace('"', ""), 80)
     tail = f" · record unreadable: {why}" if why else ""
-    body = _one_line(f"{shown} · {thread} · {state} · since {at}", 300 - len(tail)) + tail
+    body = _one_line(f"{shown} · {thread} · {state} · asked {at}", 300 - len(tail)) + tail
     return RowIn(id=CALL_ROW_PREFIX + launch_id, title=_one_line(shown, 120), body=body,
                  facets={"call_state": state},
                  stored={"launch_id": launch_id, "role": name, "threads": threads, "at": at, "state": state,
@@ -80,17 +83,17 @@ def read_calls(directory: Path | None) -> tuple[tuple[RowIn, ...], str | None] |
     if conn is None:
         return None
     try:
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'launches'").fetchone() is None:
-            return (), None
-        has_events = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'launch_events'").fetchone() is not None
-        if not has_events:
-            return (), "the desk store holds no launch events: no call's state can be read"
+        have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "launches" not in have or "launch_events" not in have:
+            raise sqlite3.DatabaseError("the desk store holds no launches or no launch events table")
+        if "role_ref" not in {r[1] for r in conn.execute("PRAGMA table_info(launches)")}:
+            return (), None            # made before spawned workers existed: it cannot hold one
         got = conn.execute(_SQL, (CALLS_SHOWN + 1,)).fetchall()
     finally:
         conn.close()
     older = len(got) > CALLS_SHOWN
     rows = tuple(_row(*r) for r in got[:CALLS_SHOWN])
-    return rows, (f"Showing the newest {CALLS_SHOWN} calls; older ones are in the desk's record." if older else None)
+    return rows, (f"Showing {CALLS_SHOWN} calls, the live ones first; the rest are in the desk's record." if older else None)
 
 
 def calls_discoverer(dispatch_dir: Callable[[], Any] | None) -> Callable[[ReadContext], list[ProviderSpec]]:
@@ -108,7 +111,8 @@ def calls_discoverer(dispatch_dir: Callable[[], Any] | None) -> Callable[[ReadCo
 
         def calls_read(ctx: ReadContext) -> Result:
             try:
-                got = read_calls(Path(dispatch_dir()) if dispatch_dir() is not None else None)
+                where = dispatch_dir()
+                got = read_calls(Path(where) if where is not None else None)
             except Exception as exc:  # noqa: BLE001 - an unreadable store is this panel's fault, never "no calls"
                 return Fault(f"the desk store cannot be read: {type(exc).__name__}: {_one_line(exc)}")
             if got is None:

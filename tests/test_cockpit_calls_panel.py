@@ -48,7 +48,7 @@ def test_a_spawned_worker_is_a_call_and_a_seat_launch_is_not(desk, registry, tmp
     assert note is None and [r.id for r in rows] == ["call:" + ln.launch_id]
     assert "call:" + seat.launch_id not in {r.id for r in rows}
     assert rows[0].facets == {"call_state": "pending"} and rows[0].title == "scribe"
-    assert rows[0].body.startswith("scribe · ") and " · pending · since " in rows[0].body
+    assert rows[0].body.startswith("scribe · ") and " · pending · asked " in rows[0].body
 
 
 def test_the_panel_groups_the_live_calls_first_and_an_over_call_is_not_a_figure(desk, registry, tmp_path):  # noqa: F811
@@ -68,7 +68,7 @@ def test_the_panel_groups_the_live_calls_first_and_an_over_call_is_not_a_figure(
     panel = ck.panel(CALLS_ID)
     groups = {r["id"]: r["group"] for r in panel["rows"]}
     assert groups == {"call:" + a.launch_id: "over", "call:" + b.launch_id: "live"}
-    assert [g["id"] for g in panel["groups"]] == ["live", "over"] and panel["count"] == 1
+    assert [g["id"] for g in panel["groups"]] == ["live", "unknown", "over"] and panel["count"] == 1
 
 
 def test_no_desk_store_draws_no_panel_and_an_unreadable_one_is_a_fault_never_no_calls(desk, registry, tmp_path):  # noqa: F811
@@ -108,3 +108,51 @@ def test_the_panel_id_is_the_one_the_machine_zones_styling_and_section_head_name
     root = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web"
     assert f'[data-ck-panel="{CALLS_ID}"]' in (root / "dashboard_places.js").read_text()
     assert f'[data-ck-panel="{CALLS_ID}"]' in (root / "dashboard.css").read_text()
+
+
+def test_a_store_that_lacks_a_table_is_a_fault_never_no_calls_and_one_from_before_role_ref_holds_none(tmp_path):
+    from levain.cockpit.calls_panel import _SQL  # noqa: F401  (the query is the one under test)
+
+    for ddl in ("CREATE TABLE unrelated (x)", "CREATE TABLE launches (launch_id TEXT, role TEXT)"):   # none; launches without events
+        path = tmp_path / "bad" / "dispatch.db"
+        path.parent.mkdir(exist_ok=True)
+        path.unlink(missing_ok=True)
+        c = sqlite3.connect(path)
+        c.execute(ddl)
+        c.commit()
+        c.close()
+        with pytest.raises(sqlite3.DatabaseError, match="no launches or no launch events"):
+            read_calls(path.parent)
+        ck = _cockpit(path.parent)
+        assert "cannot be read" in str(ck.panel(CALLS_ID)), ddl
+    path.unlink()
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE launches (launch_id TEXT, role TEXT)")
+    c.execute("CREATE TABLE launch_events (launch_id TEXT)")                     # a store made before spawned workers existed
+    c.commit()
+    c.close()
+    assert read_calls(path.parent) == ((), None)
+
+
+def test_a_call_with_no_events_is_state_unknown_and_counted_and_a_live_call_is_never_cut_by_the_window(desk, registry, tmp_path, monkeypatch):  # noqa: F811
+    from levain.cockpit import calls_panel
+
+    store, token = desk
+    old = _spawn(store, token, registry, tmp_path, "old")
+    conn = sqlite3.connect(store.path)
+    try:
+        conn.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, 2, "
+                     "(SELECT MAX(gseq) + 1 FROM launch_events), 'failed', 'test', '2026-11-20T00:00:00Z')", (old.launch_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    live = _spawn(store, token, registry, tmp_path, "live")
+    monkeypatch.setattr(calls_panel, "CALLS_SHOWN", 1)
+    rows, note = calls_panel.read_calls(store.path.parent)
+    assert [r.id for r in rows] == ["call:" + live.launch_id] and note                  # the live one, whichever is newer
+    row = calls_panel._row("l-x", '["t"]', "2026-11-20T00:00:00Z", "garbage", None)       # no event at all
+    assert row.facets == {"call_state": "unknown"}
+    from levain.cockpit.registry import ORDERINGS
+
+    group = ORDERINGS["calls.state"].group
+    assert group(row, None) == "unknown" and "unknown" not in ORDERINGS["calls.state"].uncounted
