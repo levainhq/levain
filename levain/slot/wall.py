@@ -628,7 +628,8 @@ class WallFacts:
     in order), ``new_session``, ``caps`` (None = bwrap's own default; a tuple = ``--cap-drop ALL`` then those
     added back), ``read_only`` (ro binds beside ``/usr`` and ``/etc``), ``host_dev`` (the host's ``/dev`` bound
     whole, the slot's; else bwrap's minimal ``--dev``). ``target_cwd`` is the cwd the stage enters after its
-    drop (the spec's ``cwd``); None = ``chdir``. ``chdir`` is the view's own (bwrap's ``--chdir`` on Linux)."""
+    drop (the spec's ``cwd``; an export spec with none is refused by ``_check_spec``). ``chdir`` is the view's own
+    (bwrap's ``--chdir`` on Linux)."""
 
     writable: Tuple[Tuple[str, ...], ...]
     network: Tuple[str, ...] = ()
@@ -664,7 +665,7 @@ EXPORT_MACH_ALLOW = ("com.apple.system.opendirectoryd.libinfo",)
 #: s5 §5b: ``--cap-drop ALL`` with only the two capabilities the stage spends on its drop added back. The stage
 #: runs as root inside bwrap and calls ``setgroups`` / ``setgid`` / ``setuid``; with no capability at all each
 #: fails EPERM and nothing starts [reasoned from bwrap's privileged path]. Observed on the #222 VM: the dropped
-#: child's CapEff, CapPrm, CapInh and CapAmb read empty (``RUN_222.md`` "Fidelity"). bwrap's ``--chdir`` runs after
+#: child's CapEff, CapPrm, CapInh and CapAmb read empty (levain#222). bwrap's ``--chdir`` runs after
 #: this drop [read from where the #222 failure sits, not from bwrap's source], so it is ``/``; the stage enters
 #: the mount root as the account (#226).
 #: ``drop_and_assert`` clears the inheritable set bwrap fills with them, then proves the permitted, effective,
@@ -681,7 +682,7 @@ _EXPORT_SCOPE = {"importer": "export.scope", "verifier": "verify.scope"}
 
 def export_wall_facts(host: str, role: str) -> WallFacts:
     """The importer's or the verifier's wall (s5 §5b capability list): the one writable path ``L/export/.work``
-    (``.verify``), the cwd there, fd 4 kept (the bounded result pipe). macOS: ``(allow default)`` reads less the
+    (``.verify``), the stage's cwd after its drop, fd 4 kept (the bounded result pipe). macOS: ``(allow default)`` reads less the
     three user-data subpaths, :data:`EXPORT_DEVICES` the only devices, all network and IPC denied, Mach
     denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
     dropped (:data:`EXPORT_CAPS`), ro ``/usr`` ``/etc`` (+ the import tree and helper dir where ``/usr`` does not
@@ -696,7 +697,8 @@ def export_wall_facts(host: str, role: str) -> WallFacts:
     writable = tuple(str(base / d) for d in _EXPORT_DIRS[role])
     common = dict(writable=(writable,), target_cwd=writable[0], keep_fds=(RESULT_FD,))
     if host == "darwin":
-        return WallFacts(chdir=writable[0], label=f"Levain export wall profile, target {role}, principal {EXPORT_ACCOUNT[role]}.",
+        return WallFacts(chdir=writable[0],
+                         label=f"Levain export wall profile, target {role}, principal {EXPORT_ACCOUNT[role]}.",
                          read_denied=EXPORT_READ_DENIED, devices=EXPORT_DEVICES, devices_only=True,
                          network=("(deny network*)",), ipc_denied=True, mach_allow=EXPORT_MACH_ALLOW, **common)
     ro = tuple(str(p) for p in (IMPORT_TREE[host], HELPER_DIR[host])
@@ -875,7 +877,8 @@ def wall_view_args(facts: WallFacts, host_links: Mapping[str, Optional[str]]) ->
     ``--new-session``, the capability flags, ro ``/usr`` ``/etc`` and the ``read_only`` binds, the host's
     ``/bin /sbin /lib /lib64`` links into ``/usr`` (any other link = ``view-path-off-list``), a fresh ``/proc``,
     ``/dev`` (the host's bound whole, or bwrap's minimal one) with a fresh ``/dev/shm``, tmpfs ``/tmp /var/tmp
-    /run``, the writable binds' ancestors (:func:`view_ancestor_dirs`), the rw binds, ``--chdir``."""
+    /run``, the writable binds' ancestors (:func:`view_ancestor_dirs`), the rw binds, ``--chdir``. A capability-dropped view (``caps`` set) whose ``chdir`` is a writable bind or below
+    one is ``view-path-off-list``: bwrap, holding no capability, cannot enter the account's mount root (#226)."""
     # --die-with-parent: bwrap's sandbox (every process of it, the target included) is SIGKILLed when bwrap or
     # its parent, the helper, dies, so a helper that dies or kills bwrap never leaves a vendor running past it.
     # It also bounds the forwarder: it lives until the helper exits, no longer until END [not run: a 2g row].
@@ -906,8 +909,8 @@ def wall_view_args(facts: WallFacts, host_links: Mapping[str, Optional[str]]) ->
     if facts.caps is not None:
         cwd = PurePosixPath(facts.chdir)
         if any(cwd == PurePosixPath(d) or PurePosixPath(d) in cwd.parents for d in binds):
-            raise Refused("view-path-off-list", f"a capability-dropped view's bwrap cannot enter the account's 0700 "
-                                                f"mount root {facts.chdir!r}; the stage enters it after its drop")
+            raise Refused("view-path-off-list", f"a capability-dropped view's bwrap, holding no capability, cannot enter "
+                                                f"the account's writable mount root {facts.chdir!r}; the stage enters it after its drop")
     args += view_ancestor_dirs(binds)
     for d in binds:
         args += ["--bind", d, d]
