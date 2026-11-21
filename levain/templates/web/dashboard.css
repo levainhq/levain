@@ -1142,7 +1142,8 @@
   .pk { font: var(--fw-bold) var(--fs-micro)/var(--lh-prose) var(--round); text-transform: none; letter-spacing: 0; color: var(--meta); width: 56px; flex: none; }
   .pl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pw { margin-left: auto; font-size: var(--fs-meta); color: var(--meta); white-space: nowrap; }
-  .pl-none { color: var(--meta); cursor: default; }
+  .pl-none { color: var(--meta); cursor: default; font-size: var(--fs-body); padding: var(--sp-4) var(--sp-6); }
+  .palette-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 /* the freshness line (levain#159, fresh_line.js): the dot, the state words, then the age beside them. The words and the age are
    two spans so that only the words are in the live region (the age ticks and is never spoken). Where the line is short of room
