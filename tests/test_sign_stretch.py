@@ -92,3 +92,10 @@ def test_missing_key_dir_is_no_data_exit_zero(tmp_path, capsys):
     assert "clean_run=?" in out
     assert "source sign-failures: no data" in out
     assert not (tmp_path / "absent").exists()
+
+
+def test_no_ledger_named_means_signs_unknown_never_a_guessed_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("NEEDS_PHILL_STATEMENTS", raising=False)
+    assert ss.default_ledger() is None
+    result = ss.tally(tmp_path / "keys", None, 3)
+    assert "not given" in result["sources"]["ledger"]

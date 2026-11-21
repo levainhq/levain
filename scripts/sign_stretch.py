@@ -43,12 +43,10 @@ def default_key_dir() -> Path:
     return pwd_key_dir()
 
 
-def default_ledger() -> Path:
+def default_ledger() -> Path | None:
+    """The statement ledger only when named (``NEEDS_PHILL_STATEMENTS``); levain never assumes where another tool keeps it."""
     env = os.environ.get("NEEDS_PHILL_STATEMENTS")
-    if env:
-        return Path(env)
-    import pwd
-    return Path(pwd.getpwuid(os.getuid()).pw_dir) / "Briefcase" / "flow" / "state" / "needs_phill_statements.jsonl"
+    return Path(env) if env else None
 
 
 def _read_text(path: Path) -> str | None:
@@ -147,7 +145,7 @@ def read_ledger(path: Path) -> tuple[list[float], str | None]:
     return out, None
 
 
-def tally(key_dir: Path, ledger: Path, days: int, until: datetime.date | None = None) -> dict:
+def tally(key_dir: Path, ledger: Path | None, days: int, until: datetime.date | None = None) -> dict:
     events: list[tuple[float, str]] = []          # (time, 'signed' | 'empty' | other name)
     sources: dict[str, str] = {}
     fails, n_attempts, skipped = read_sigfails(key_dir)
@@ -158,7 +156,8 @@ def tally(key_dir: Path, ledger: Path, days: int, until: datetime.date | None = 
     sources["sign-log"] = f"{len(log)} lines" if has_log else "no data"
     events += log
     signs_known = True
-    sign_times, why = read_ledger(ledger)
+    sign_times, why = read_ledger(ledger) if ledger is not None else \
+        ([], "not given: pass --ledger or set NEEDS_PHILL_STATEMENTS")
     if why is None:
         sources["ledger"] = f"{len(sign_times)} signed statements in {ledger}"
         events += [(t, "signed") for t in sign_times]
@@ -205,7 +204,7 @@ def render(result: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--key-dir", type=Path, default=None, help="default: the real key dir from the password database")
-    ap.add_argument("--ledger", type=Path, default=None, help="the statement ledger (default: flow's)")
+    ap.add_argument("--ledger", type=Path, default=None, help="the statement ledger (default: $NEEDS_PHILL_STATEMENTS; none when unset)")
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--until", type=datetime.date.fromisoformat, default=None, help="last day shown (default: today)")
     ap.add_argument("--json", action="store_true")
@@ -214,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--days must be at least 1")
     key_dir = args.key_dir if args.key_dir is not None else default_key_dir()
     ledger = args.ledger if args.ledger is not None else default_ledger()
-    result = tally(Path(key_dir), Path(ledger), args.days, args.until)
+    result = tally(Path(key_dir), Path(ledger) if ledger is not None else None, args.days, args.until)
     print(json.dumps(result, indent=1) if args.json else render(result))
     return 0
 
