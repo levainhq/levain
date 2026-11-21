@@ -1,10 +1,8 @@
 """The cockpit snapshot store: one sqlite file the derive worker writes and the serve reads.
 
-The worker derives each panel and publishes the result here; the serve (and any other reader, in any language) answers
-from the stored snapshot instead of deriving on the request path. The file is `snapshots.db` in the cockpit data root,
-WAL mode, one writer and many read-only readers. This module and the symbols docs/cockpit_snapshot_contract.md points at
-are the contract; that document holds the reasons behind the design (single writer, the gen rule, the modes), not the
-field rules. Stdlib only.
+The worker derives each panel and publishes the result here; the serve answers from the stored snapshot instead of
+deriving on the request path. This module and the symbols docs/cockpit_snapshot_contract.md points at are the contract;
+that document holds the reasons behind the design and points back here for the facts. Stdlib only.
 """
 
 from __future__ import annotations

@@ -1,133 +1,120 @@
 # Cockpit snapshot contract
 
 The cockpit's derive worker computes each panel and stores the result in one sqlite file. The serve, the change
-stream, and any other reader answer from that file instead of deriving on the request path.
+stream and any other reader answer from that file instead of deriving on the request path.
 
 This document holds the reasons behind the store's design and points at the code that holds the facts. It is not a
-spec a reader can be built from: the layout, the encodings and the freshness rules are stated by the code, and a
-second statement of them here would drift from it. Read the symbols named below.
+spec a reader can be built from. A sentence here about what the code does would be a second statement of it, free to
+drift, so the sentences below are reasons, sqlite's own behaviour, or names of the symbols to read.
 
-Convention for this file: a backticked word is either a code symbol (looked up in `levain/cockpit/snapshots.py`,
-`levain/cockpit/snapshot_host.py`, `levain/cockpit/engine.py` or `levain/cockpit/derive.py`, as Class.method where
-it is a method) or a repo path, and nothing else is backticked. `tests/test_cockpit_snapshot_contract_doc.py` fails when one of them stops
-existing.
+Convention for this file: a backticked word is a code symbol or a repo path, and nothing else is backticked. A symbol is
+looked up in the module whose path is named in the same paragraph or list item (`levain/cockpit/snapshots.py` when none
+is named), as Class.method where it is a method. `tests/test_cockpit_snapshot_contract_doc.py` fails when one of them
+stops being defined there.
 
 ## Where the code is
 
-- The store, its writer and its reader: `levain/cockpit/snapshots.py` (`SnapshotWriter`, `SnapshotReader`).
-- The file name and the lock file's suffix: `DB_FILENAME` and `LOCK_SUFFIX`. The file sits in the cockpit's data root
-  and is a file of its own, so the cockpit's other databases never share its checkpoints or locks. The files sqlite and
-  the writer lock keep beside it belong with it.
-- The tables and columns: `_SCHEMA` (the statement a writer runs) and `_PANEL_COLS`; a row as Python sees it is
-  `PanelSnap`.
-- The statuses a panel row can carry, and which ones keep the stored body: `KNOWN_STATUSES`, `KEEP_BODY_STATUSES`,
-  `NO_BODY_SHA`.
-- The body's encoding on the way in: `encode_body` (canonical bytes, so equal content is equal bytes and an equal
-  hash). The body's field list and schema, and how a body becomes a snapshot: `BODY_VERSION`, `BODY_FIELDS` and
-  `decode_snap` in `levain/cockpit/snapshot_host.py`, with `body_for` and `encode_snap` for the other direction.
-- The host's pseudo-rows, ids that are never a panel's: `PSEUDO_PREFIX`, `DISCOVER_ID` and `ENTITY_ID` in
-  `levain/cockpit/snapshot_host.py`.
-- The derived freshness fields (as_of, valid_until, stale, the worker's health): `Cockpit._attached_snap`,
-  `Cockpit._fresh_of` and `Cockpit._worker_health` in `levain/cockpit/engine.py`, with the thresholds they read
-  (`WORKER_LIVE_FACTOR`, `WORKER_DOWN_AFTER_S`, `STALE_CADENCE_FACTOR`).
+- The store, its writer and its reader, in `levain/cockpit/snapshots.py`: `SnapshotWriter`, `SnapshotReader`, and the
+  errors they raise, `WriterLocked`, `ContractMismatch` and `SnapshotReadError`.
+- The file name and the lock file's suffix: `DB_FILENAME` and `LOCK_SUFFIX`. The file is one of its own so that the
+  cockpit's other databases do not share its checkpoints or locks.
+- The tables and columns: `_SCHEMA` and `_PANEL_COLS`. A stored row becomes a `PanelSnap` in `_snap`, which is also where
+  a status the code does not know is dealt with.
+- The statuses and the body rule that goes with them: `KNOWN_STATUSES`, `KEEP_BODY_STATUSES`, `NO_BODY_SHA`.
+- The body's encoding on the way in: `encode_body`.
+- The body's field list and schema, and how a body becomes a snapshot and back, in `levain/cockpit/snapshot_host.py`:
+  `BODY_VERSION`, `BODY_FIELDS`, `decode_snap`, `body_for` and `encode_snap`. The host's pseudo-rows: `PSEUDO_PREFIX`,
+  `DISCOVER_ID` and `ENTITY_ID`.
+- The freshness fields a reader derives (as_of, valid_until, stale, the worker's health), in `levain/cockpit/engine.py`:
+  `Cockpit._attached_snap`, `Cockpit._fresh_of` and `Cockpit._worker_health`, with the constants beside them
+  (`HEARTBEAT_CADENCE_S`, `WORKER_LIVE_FACTOR`, `WORKER_DOWN_AFTER_S`, `STALE_CADENCE_FACTOR`); what the engine announces
+  a change on is `_ChangeProbe.change_seq`.
+- The contract string: `CONTRACT_NAME`, `CONTRACT_MAJOR`, `CONTRACT` and the comparison `_check_contract`; what the
+  writer reads before it changes anything is `_preflight`; what it does with tables that differ from the schema is
+  `SnapshotWriter._rebuild_if_drifted`.
+- What moves a panel's gen and the file's change counter: `SnapshotWriter.publish` and `SnapshotWriter.drop`. What the
+  writer does for a stream row and a heartbeat: `SnapshotWriter.set_stream` and `SnapshotWriter.heartbeat`.
 
-The reader's code is the contract for the body schema, the pseudo-rows, as_of and stale. A prose copy of them here
-would be a second source that the code can leave behind without a failing test.
+The code is the contract for all of these. A prose copy of them here would be a second source that the code can leave
+behind without a failing test.
 
 ## Single writer
 
-Exactly one writer (the derive worker), any number of read-only readers. `SnapshotWriter` takes an exclusive,
-non-blocking lock on the lock file (`DB_FILENAME` plus `LOCK_SUFFIX`) before it opens the database, and a second writer
-that cannot take it raises `WriterLocked`. The lock exists because a restarted worker can overlap with the one it
-replaces, so it is a guard and not a convention. A second writer implementation would also have to reproduce the body
-encoding of `encode_body` byte for byte, which is another reason the contract names one writer.
+Exactly one writer (the derive worker) and any number of read-only readers. The design guards the file against a second
+writer with a lock (`SnapshotWriter`, `LOCK_SUFFIX`, `WriterLocked`) because a restarted worker can overlap the one it
+replaces, so the single writer is a guard and not a convention. The design has one encoder (`encode_body`) for a related
+reason: a body hash that is compared across publishes means something only if one function made every body.
 
 ## Mode
 
-- The writer puts the file in WAL mode and refuses when sqlite does not answer that it did. Readers never set a journal
-  mode. The writer relaxes durability on purpose: a power loss may drop the last publishes, and the next derive
-  rewrites them. `JOURNAL_SIZE_LIMIT` keeps the wal file from growing without bound.
-- A reader that needs several rows at one moment reads them inside one read transaction, so they come from the same
-  commit: `SnapshotReader.read_manifest` is that read.
-- Readers open the file read-only (`_uri` builds the URI) and never as immutable: on a live WAL database an immutable
-  open reads stale or torn data. A read-only connection to a WAL database still needs write access to the directory,
-  because sqlite maps its shared-memory file there.
-- A reader keeps one connection per thread and checks it against the file on disk now and then
-  (`READER_REVALIDATE_S`): the file can be deleted and recreated under a live reader (a contract-major bump, a manual
-  reset), and a connection to the old file would read it forever.
+- The file is meant to be a WAL-mode database so that one writer and many readers do not block each other. It is a
+  cache of derivable data, so durability is not a goal of the file.
+- In WAL mode a read transaction sees one commit, so a reader that needs several rows consistent with each other reads
+  them inside one (`SnapshotReader.read_manifest`).
+- sqlite's immutable open assumes the file cannot change, so on a database that is being written it can return stale or
+  inconsistent data, so a reader of live content must not use it (the reader's URI is `_uri`).
+- Since sqlite 3.22.0 a read-only connection can open a WAL-mode database if its shared-memory and log files already
+  exist, or can be created, or the database is opened immutable.
+- A sqlite connection follows the file it opened, not the path. If the file is deleted and recreated under a live reader
+  (a manual reset, say), a connection kept open would read the old file forever; `READER_REVALIDATE_S` is the reader's
+  answer to that.
+- The write-ahead log's size limit is `JOURNAL_SIZE_LIMIT`; its comment says when it applies.
 
 ### Change signals
 
-Two cheap signals, different questions.
-
-- "The file changed" is sqlite's per-connection data_version. It moves whenever another connection commits anything,
-  heartbeats included, so on a live worker it moves on an idle store. Its values mean nothing across connections, and
-  a reopened connection can repeat the old number, so `SnapshotReader.data_version` folds the reopen count in and
-  returns an opaque token to be compared for equality only. In a language whose database pool hands out different
-  connections, a reader must pin one connection for the probe.
-- "A panel changed" is the meta key publish_seq. It does not move on heartbeats, stream rows or a republish of
-  unchanged content; `SnapshotWriter.publish` and `SnapshotWriter.drop` are what move it. A reader that sees
-  data_version change reads publish_seq, and reads panels only when that moved.
+Two questions, two signals. Whether the file changed: sqlite's per-connection data_version changes when another
+connection commits anything, and its values mean nothing across connections (`SnapshotReader.data_version`). Whether a
+panel changed: the writer's change counter in the file (`SnapshotWriter.publish`, `SnapshotWriter.drop`). They answer
+different questions.
 
 ## Contract string
 
-The meta row named contract holds the layout's name and its major version, built from `CONTRACT_NAME`,
-`CONTRACT_MAJOR` and `CONTRACT`; `_check_contract` is the comparison. The string carries a major only. On a different
-name or major both the writer and the reader raise `ContractMismatch` rather than guess at a layout they do not know.
-Additive changes never change the major, so a reader ignores columns and meta keys it does not know.
+The layout is named and carries a major version in the file. The intent is that code which does not know the layout
+refuses it rather than guesses at it (`ContractMismatch`, `_check_contract`), and that a refusal costs the file nothing
+(`_preflight`; the sqlite caveat is under Known edges). The policy is that an additive change, a column or a meta key,
+does not change the major and a change that is not additive does.
 
-A writer never migrates a file in place. It reads the contract row with `_preflight`, on a connection that writes
-nothing and before it sets any pragma or writes any table, so a refusal leaves the file exactly as it found it. A file
-with other tables and no contract row is refused as well. A file with no contract row and no tables of its own is empty
-to a reader: no panels, no meta, not a mismatch.
-
-The file is a cache of derivable data. A writer that opens a file of its own major whose tables differ from `_SCHEMA`
-drops all of ours and recreates them in one transaction (`SnapshotWriter._rebuild_if_drifted`, which says so on
-stderr), rather than failing its publishes.
+The file is a cache of derivable data, so the design prefers recreating it to failing a publish;
+`SnapshotWriter._rebuild_if_drifted` is where that choice is made.
 
 ## Tables, in words
 
-What each table is for; the columns and their types are `_SCHEMA`.
+What each table is for; the columns, their types and what a writer puts in them are `_SCHEMA` and
+`SnapshotWriter.publish`.
 
-- meta holds the file's own facts: the contract, which worker opened the file and when, the worker's last heartbeat,
-  and publish_seq. A worker that opens the file removes its predecessor's heartbeat, so a worker is not live until its
-  own first one.
-- panel has one row per panel, updated in place on every publish. derived_at moves on every publish, even with the same
-  content. write_gen is the read-your-writes marker and never decreases: an error or timeout publish carries the one it
-  was derived for, so a reader waiting on a write is answered by that row and its status. A status a reader does not
-  know is read as partial (`PanelSnap` and `KNOWN_STATUSES`). An error or timeout keeps the previous body, so the panel
-  shows its last good content under that status, and a panel whose first publish is an error has no body at all; its
-  status and error say why.
-- stream has one row per input-watch stream, the worker's report on how well it sees changes. It is written only when
-  it changes (`SnapshotWriter.set_stream`).
+- meta holds the file's own facts, not a panel's content.
+- panel holds a panel's latest result and its bookkeeping. write_gen is the read-your-writes marker: it is how a reader
+  that has just made a write learns that the panel was derived for it.
+- stream holds the worker's report on how well it sees changes (`SnapshotWriter.set_stream`).
 
 ## The gen rule
 
-On each publish the writer compares the new body's hash and the new status with the stored ones. If both match, the
-generation (gen) is kept and only the timing and bookkeeping columns take new values; if either differs, gen goes up by
-one and so does publish_seq; a panel with no stored row starts at 1. The exact comparison is `SnapshotWriter.publish`.
+The generation (gen) exists so that re-deriving an unchanged panel does not look like a change to a reader. What counts
+as a change, what a panel with no stored row starts at, and what a dropped panel does to the counters are
+`SnapshotWriter.publish` and `SnapshotWriter.drop`. What a reader caches decoded bodies on is
+`SnapshotReader.decoded`.
 
-So a changed gen is the one reliable signal that a panel's content or status changed: a reader announces a change to
-its own clients exactly when gen moves, and re-deriving an unchanged panel never produces a false change. gen is unique
-only within one file lifetime, because a recreated file starts again, so a reader that caches decoded bodies keys them
-by panel id, gen and body hash (`SnapshotReader.decoded`).
+Do not treat gen as the whole change signal: what the engine announces on and what it caches on are
+`_ChangeProbe.change_seq` and `Cockpit._attached_snap`, in `levain/cockpit/engine.py`.
 
 ## Freshness
 
-The store holds timestamps and the reader turns them into freshness; the derivation is in the engine symbols listed
-under "Where the code is". The intent that outlives their detail: a stale panel is still served, with its age, and a
-dead worker makes panels stale and never errors; a cold reader answers from whatever the file already holds. Only an
-absent file or table reads as "the worker has not run": a locked, busy or unreadable database is an error the reader
-reports (`SnapshotReadError`).
+A stale panel is better served with its age than withheld, and a reader that starts before the worker has should answer
+from what the file already holds rather than wait for it. An unreadable store is not the same thing as a worker that has
+not run, and the two are meant to be told apart (`SnapshotReadError`).
+
+What the code does in each case is `Cockpit._attached_snap`, `Cockpit._fresh_of` and `Cockpit._worker_health`, in
+`levain/cockpit/engine.py`.
 
 ## Known edges
 
-- The limits of the input fingerprints (what a watched directory or a git repository does and does not show, and how
-  long an index lock holds a panel) belong with `Dir`, `GitRefs` and `LOCK_HOLD_MAX_S` in `levain/cockpit/derive.py`,
-  which is where they are decided.
-- The preflight is a read-only open that writes nothing to the contract, but a read-only open of a WAL database can
-  still create sqlite's shared-memory file, and it opens as immutable when no log file exists. That is safe only against
-  cooperating writers; the writer lock is taken before the preflight, which excludes the ones this code starts, and a
-  foreign process writing the path is outside this contract.
-- A foreign file at the snapshot path whose only tables are ours, with a matching meta schema, is adopted, because
-  nothing but the worker writes that path.
+- The limits of the input fingerprints are written next to the code, in `levain/cockpit/derive.py`: what a watched
+  directory and a git repository do and do not show are the docstrings of `Dir` and `GitRefs`, how long an index lock
+  holds a panel is `LOCK_HOLD_MAX_S`, and what a derive that never returns costs is `DERIVE_TIMEOUT_S`. The size limits
+  are `DIR_ENTRIES_MAX` and `GIT_REFS_MAX`.
+- The preflight (`_preflight`) is meant to read the contract without writing. sqlite can create its shared-memory file
+  even on a read-only open of a WAL-mode database, when none exists yet, and an immutable open is safe only if nothing
+  writes the file meanwhile. A lock file binds only the processes that take it, so a foreign process writing the
+  snapshot path is outside this contract.
+- The design assumes nothing but the worker writes the snapshot path; what the code does with a foreign file there is
+  `_preflight`, `_check_contract` and `SnapshotWriter._rebuild_if_drifted`.
