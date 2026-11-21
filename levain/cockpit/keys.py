@@ -1005,6 +1005,14 @@ _VERIFY_RESERVE_S = 1.0
 _SIGN_FAILURE_KEEP = 200
 _SIGN_FAILURE_DIR = "sign-failures"
 _SIGN_FAILURE_PREFIX = "sigfail-"
+# levain#191: the LocalAuthentication codes that mean the person (or the system, or the app) cancelled the sheet:
+# LAError.userCancel -2, systemCancel -4, appCancel -9. Any other presence_denied (authenticationFailed -1,
+# biometryNotAvailable -6 e.g. a closed lid, biometryNotEnrolled -7, biometryLockout -8, ...) is a signer error.
+_LA_DOMAIN = "com.apple.LocalAuthentication"
+_LA_CANCEL_CODES = (-2, -4, -9)
+_LA_NAMES = {-1: "authenticationFailed", -2: "userCancel", -3: "userFallback", -4: "systemCancel",
+             -5: "passcodeNotSet", -6: "biometryNotAvailable", -7: "biometryNotEnrolled", -8: "biometryLockout",
+             -9: "appCancel", -10: "invalidContext", -1004: "notInteractive"}
 
 
 @dataclass(frozen=True)
@@ -1142,7 +1150,11 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
     (:func:`levain.consent.se_signer.sign_log_record`), and a failure other than the person cancelling also writes the
     evidence file the old path writes (``<key dir>/sign-failures``, ``signer: levain-sign``, the helper's code and
     attempts; the message's hash, never the message). A failure raises :class:`KeyError_` in the words
-    ``terminal_sign``'s classifier reads (``Touch ID was cancelled``, ``TimeoutExpired``)."""
+    ``terminal_sign``'s classifier reads (``Touch ID was cancelled``, ``TimeoutExpired``). "Cancelled" is said ONLY for
+    a LocalAuthentication userCancel / systemCancel / appCancel (:data:`_LA_CANCEL_CODES`); any other presence
+    refusal (lockout, not enrolled, not available, failed) is a signer error naming its LAError code, with evidence.
+    The helper is given what is left of ``bound`` less two verify reserves, its presence wall less again
+    (:func:`levain.consent.se_signer.sign_once`); when less than a second is left nothing is run."""
     from levain.consent import se_signer as _se
     key_dir = key_path.parent
     sig_type = "sk-ecdsa-sha2-nistp256@openssh.com"
@@ -1172,9 +1184,14 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
         except _se.SeSignerError as exc:
             record("helper-missing", exc.code or "build")
             raise KeyError_(f"the Secure Enclave helper is not available ({exc}), so nothing was signed") from None
+        # an exhausted deadline is never extended: under a second left for the helper and nothing is run
+        helper_budget = deadline - time.monotonic() - _VERIFY_RESERVE_S * 2
+        if helper_budget < 1.0:
+            record("no-time", "deadline")
+            raise KeyError_(f"no time left to sign with {fp} ({max(helper_budget, 0.0):.1f}s of the {bound:g}s bound "
+                            "after the verify reserve), so nothing was signed")
         try:
-            out = _se.sign_once(key_path, message, namespace=namespace, helper=built,
-                                timeout=max(bound - _VERIFY_RESERVE_S * 2, 1.0))
+            out = _se.sign_once(key_path, message, namespace=namespace, helper=built, timeout=helper_budget)
         except _se.SeSignerError as exc:
             seen["attempts"] = exc.payload.get("attempts")
             seen["evaluated"] = exc.payload.get("evaluated")
@@ -1186,10 +1203,19 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
                 evidence(f"the helper did not answer in time ({code})", code)
                 raise KeyError_(f"the Secure Enclave helper timed out (TimeoutExpired): Touch ID was not touched in "
                                 f"time for {fp} ({ran:.1f}s of {bound:g}s), so nothing was signed") from None
-            if code == "presence_denied" or (code == "sign_failed" and "cancel" in str(exc).lower()):
+            la_domain, la_code = exc.payload.get("error_domain"), exc.payload.get("error_code")
+            la_code = la_code if isinstance(la_code, int) and not isinstance(la_code, bool) else None
+            if code in ("presence_denied", "sign_failed") and la_domain == _LA_DOMAIN and la_code in _LA_CANCEL_CODES:
                 record("cancelled", code)
-                raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
-                                f"(the Secure Enclave helper ran {ran:.1f}s), so nothing was signed") from None
+                raise KeyError_(f"Touch ID was cancelled ({_LA_NAMES[la_code]} {la_code}): no signature was made "
+                                f"with {fp} (the Secure Enclave helper ran {ran:.1f}s), so nothing was signed") from None
+            if code == "presence_denied":
+                name = _LA_NAMES.get(la_code, "unknown") if la_domain == _LA_DOMAIN else "not a LocalAuthentication error"
+                said = f"{la_domain} {la_code}" if la_code is not None else f"{la_domain or 'no error domain'}, no code"
+                record("presence-failed", f"{code} {la_code if la_code is not None else '?'}")
+                evidence(f"presence refused: LAError {la_code} ({name}); {said}", f"{code}:{la_code}")
+                raise KeyError_(f"Touch ID could not run for {fp}: LocalAuthentication error {la_code} ({name}; "
+                                f"{said}), so nothing was signed") from None
             if code == "key_load":
                 record("key-not-here", code)
                 evidence("the key blob does not load on this Mac", code)
@@ -1215,8 +1241,7 @@ def _levain_sign_signer(key_path: Path, public_key: str, fp: str, namespace: str
         if not isinstance(signature, str) or not signature.strip():
             record("no-signature", "empty")
             evidence("the helper answered with no signature", "empty")
-            raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp} "
-                            f"(the Secure Enclave helper answered with none), so nothing was signed")
+            raise KeyError_(f"the Secure Enclave helper answered with no signature for {fp}, so nothing was signed")
         try:
             verified = _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
                                                   namespace=namespace, ssh_keygen=ssh_keygen,

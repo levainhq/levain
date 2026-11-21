@@ -429,3 +429,29 @@ def test_a_whole_next_key_without_its_meta_file_is_half_a_key(rig):
     Path(str(key) + ".meta.json").unlink()
     rep = rig.run()
     assert rep.state == "stopped" and "half there" in rep.text
+
+
+# levain#191 review round 2 (serot-fix2, F8): a failure before the first journal write is a refusal, nothing started
+
+
+def test_a_data_root_that_raises_is_a_refusal_not_a_stop(rig, monkeypatch):
+    def boom(path, data_root):
+        raise RuntimeError("the install config is unreadable")
+    monkeypatch.setattr(tr, "resolve_data_root", boom)
+    rep = rig.run()
+    assert rep.state == "refused" and rep.code == tr.EXIT_REFUSED and "nothing was started" in rep.text
+    assert "steps above are done" not in rep.text and rig.made == 0 and not (rig.d / tr.JOURNAL).exists()
+
+
+def test_a_fresh_start_check_that_raises_is_a_refusal_not_a_stop(rig, monkeypatch):
+    def boom(path):
+        raise OSError("sidecar unreadable")
+    monkeypatch.setattr(tr, "read_sidecar", boom)
+    rep = rig.run()
+    assert rep.state == "refused" and rep.code == tr.EXIT_REFUSED and "nothing was started" in rep.text
+    assert "steps above are done" not in rep.text and rig.made == 0 and not (rig.d / tr.JOURNAL).exists()
+
+
+def test_the_ctk_step_docstring_says_an_exception_stops_the_run():
+    doc = tr._step_ctk.__doc__ or ""
+    assert "never fatal" not in doc and "stops the run" in doc and "resumable" in doc

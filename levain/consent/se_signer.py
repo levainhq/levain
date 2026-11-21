@@ -14,9 +14,11 @@ Every subprocess is an argv list with a bounded timeout and the message on stdin
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import secrets
 import subprocess
 import tempfile
 import time
@@ -24,12 +26,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 SWIFTC = "/usr/bin/swiftc"
+DEFAULT_SWIFTC = "/usr/bin/swiftc"   # always there (the xcode-select stub): a toolchain is probed, never assumed from it
+XCODE_SELECT = "/usr/bin/xcode-select"
+TOOLCHAIN_PROBE_TIMEOUT = 10.0
 SSH_KEYGEN = "/usr/bin/ssh-keygen"
 SOURCE = Path(__file__).resolve().parent.parent / "native" / "levain_sign.swift"
 APPLICATION = "ssh:"
 BUILD_TIMEOUT = 300.0
 CREATE_TIMEOUT = 30.0
-SIGN_TIMEOUT = 120.0   # a presence sheet waits on a person; outlasts the helper's PRESENCE_WALL_SECONDS (pinned by a test)
+SIGN_TIMEOUT = 120.0   # a presence sheet waits on a person; the helper's wall is this less WALL_MARGIN_S (it clamps to its ceiling)
+# held back from a sign's subprocess timeout for the helper's own presence wall (``--wall-ms``), so the helper's
+# presence_timeout answer always comes before Python kills it mid-sheet; the wall never goes below 1 s
+WALL_MARGIN_S = 2.0
+WALL_FLOOR_S = 1.0
 VERIFY_TIMEOUT = 15.0
 BUILD_COMMAND = "levain doctor --fix"
 # an explicit child environment (tests/test_launch.py): the tool paths and the home the helper and swiftc need, nothing else
@@ -58,31 +67,80 @@ def helper_path(dest_dir: Path) -> Path:
     return Path(dest_dir) / f"levain-sign-{_digest()}"
 
 
+def toolchain_present() -> bool:
+    """True when the Command Line Tools (or Xcode) are installed: ``xcode-select -p`` exits 0 within
+    :data:`TOOLCHAIN_PROBE_TIMEOUT` and the directory it prints exists. ``/usr/bin/swiftc`` alone proves nothing: it is
+    the xcode-select stub, present on every Mac, and running it without a toolchain opens the install dialog."""
+    try:
+        cp = subprocess.run([XCODE_SELECT, "-p"], capture_output=True, text=True, timeout=TOOLCHAIN_PROBE_TIMEOUT,
+                            check=False, env=dict(_CHILD_ENV))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    where = (cp.stdout or "").strip()
+    return cp.returncode == 0 and bool(where) and os.path.isdir(where)
+
+
+def compiler_problem(swiftc: str | Path | None = None) -> str | None:
+    """Why the compiler cannot be used, or None. The default ``/usr/bin/swiftc`` is judged by :func:`toolchain_present`
+    (never by its existence); any other path (a test's) by whether it exists."""
+    compiler = str(swiftc if swiftc is not None else SWIFTC)
+    if compiler == DEFAULT_SWIFTC:
+        if not toolchain_present():
+            return ("the Command Line Tools are not installed (`xcode-select -p` finds none); "
+                    "`xcode-select --install` adds them")
+        return None
+    if not Path(compiler).exists():
+        return f"{compiler} is missing (xcode-select --install adds it)"
+    return None
+
+
 def build_helper(dest_dir: Path, *, defines: tuple[str, ...] = (), name_suffix: str = "") -> Path:
     """Compile the Swift helper into ``dest_dir`` (rebuilt when the source hash changes); return the binary path.
     ``defines`` are ``-D`` flags with a ``name_suffix`` so a variant never shares a cache name (the test-only
-    force-presence-flag build, which no product code passes)."""
+    force-presence-flag build, which no product code passes). swiftc is never run without a toolchain
+    (:func:`compiler_problem`). Each call compiles into its own temporary file (``O_EXCL``), removed unless it was put
+    in place."""
     dest_dir = Path(dest_dir)
-    if not Path(SWIFTC).exists():
-        raise SeSignerError(f"{SWIFTC} is missing: install the Command Line Tools (xcode-select --install)")
     binary = helper_path(dest_dir).with_name(helper_path(dest_dir).name + name_suffix)
     if binary.is_file() and os.access(binary, os.X_OK):
         return binary
-    tmp = dest_dir / f".levain-sign-{binary.name}.{os.getpid()}.tmp"
+    why = compiler_problem()
+    if why is not None:
+        raise SeSignerError(f"the Secure Enclave helper cannot be built: {why}", "no_toolchain")
+    tmp: Path | None = None
+    replaced = False
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        cmd = [SWIFTC, "-O", *[a for d in defines for a in ("-D", d)], str(SOURCE), "-o", str(tmp)]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=BUILD_TIMEOUT, check=False,
-                              env=dict(_CHILD_ENV))
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SeSignerError(f"swiftc did not run: {exc}") from None
-    if proc.returncode != 0:
-        tmp.unlink(missing_ok=True)
-        raise SeSignerError(f"swiftc failed ({proc.returncode}): {proc.stderr.strip()[:2000]}")
-    try:
-        os.replace(tmp, binary)
-    except OSError as exc:
-        raise SeSignerError(f"the built helper could not be put in place ({type(exc).__name__})") from None
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for _ in range(8):
+                cand = dest_dir / f".levain-sign-{binary.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+                try:
+                    os.close(os.open(cand, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600))
+                except FileExistsError:
+                    continue
+                tmp = cand
+                break
+            if tmp is None:
+                raise SeSignerError("no unique temporary file for the build could be made")
+            cmd = [SWIFTC, "-O", *[a for d in defines for a in ("-D", d)], str(SOURCE), "-o", str(tmp)]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=BUILD_TIMEOUT, check=False,
+                                  env=dict(_CHILD_ENV))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SeSignerError(f"swiftc did not run: {exc}") from None
+        if proc.returncode != 0:
+            raise SeSignerError(f"swiftc failed ({proc.returncode}): {proc.stderr.strip()[:2000]}")
+        try:
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, binary)
+            replaced = True
+        except OSError as exc:
+            raise SeSignerError(f"the built helper could not be put in place ({type(exc).__name__})") from None
+    finally:
+        if tmp is not None and not replaced:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     return binary
 
 
@@ -90,7 +148,12 @@ def default_cache_dir() -> Path:
     """The per-user directory the compiled helper lives in (R7): ``~/Library/Caches/levain/native`` from the password
     database, never ``$HOME``. Holds only binaries named by their source hash; it is not the key directory."""
     import pwd
-    return Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library" / "Caches" / "levain" / "native"
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        raise SeSignerError(f"uid {os.getuid()} has no password entry, so the helper cache directory cannot be named",
+                            "no_home") from None
+    return Path(home) / "Library" / "Caches" / "levain" / "native"
 
 
 def ensure_helper(cache_dir: Path | None = None) -> Path:
@@ -181,9 +244,12 @@ def sign_once(blob_path: Path, message: bytes, *, namespace: str, helper: Path,
     ``.meta.json``): the helper's whole JSON answer, which holds the armored ``signature`` and ``attempts``,
     ``evaluations`` (at most 1), ``counter``. The signature is NOT checked here (see :func:`se_signer`). Raises
     :class:`SeSignerError`; its ``payload`` is the helper's error JSON when it gave one. Never retried here: the
-    helper's silent same-context retries (named transient codes only) are the only ones."""
+    helper's silent same-context retries (named transient codes only) are the only ones. The helper's presence wall
+    (``--wall-ms``) is ``timeout`` less :data:`WALL_MARGIN_S` (never under :data:`WALL_FLOOR_S`), so its own
+    ``presence_timeout`` answer comes before this side's kill."""
+    wall_ms = int(max(timeout - WALL_MARGIN_S, WALL_FLOOR_S) * 1000)
     args = ["sign", "--key", str(blob_path), "--application", application, "--namespace", namespace,
-            "--reason", reason]
+            "--reason", reason, "--wall-ms", str(wall_ms)]
     return _run(helper, args, stdin=message, timeout=timeout)
 
 
@@ -246,45 +312,81 @@ def se_signer(blob_path: Path, *, namespace: str, helper: Path, pub_path: Path |
 # R4: the sign log, the field proof of how the helper path behaves
 
 SIGN_LOG = "sign-log.jsonl"
+SIGN_LOG_LOCK = "sign-log.lock"
 SIGN_LOG_KEEP = 500
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
 
 
 def append_sign_log(key_dir: Path, record: dict) -> str | None:
     """Append one JSON line to ``<key_dir>/sign-log.jsonl`` (0600, tightened when an older file is looser) and prune
-    it to its newest :data:`SIGN_LOG_KEEP` lines. ``record`` holds no message and no signature bytes: the caller builds
-    it from the fields in :func:`sign_log_record`. A diagnostic: it never raises, it returns why it could not write
-    (or None)."""
+    it to its newest :data:`SIGN_LOG_KEEP` lines, both under an exclusive ``flock`` on ``<key_dir>/sign-log.lock``
+    (0600, a stable file never replaced, opened without following a link), so two signers at once lose no line.
+    ``record`` holds no message and no signature bytes: the caller builds it from the fields in
+    :func:`sign_log_record`. A diagnostic: it never raises, it returns why it could not write (or None)."""
     path = Path(key_dir) / SIGN_LOG
     try:
-        line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        line = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        lfd = os.open(Path(key_dir) / SIGN_LOG_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.fchmod(fd, 0o600)
-            os.write(fd, line.encode("utf-8"))
+            os.fchmod(lfd, 0o600)
+            fcntl.flock(lfd, fcntl.LOCK_EX)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                _write_all(fd, line)
+            finally:
+                os.close(fd)
+            _prune_sign_log(path)
         finally:
-            os.close(fd)
-        _prune_sign_log(path)
+            os.close(lfd)          # releases the lock
     except OSError as exc:
         return f"sign log not written ({type(exc).__name__}: {exc.strerror or exc})"
     return None
 
 
 def _prune_sign_log(path: Path) -> None:
+    """Called with the sign-log lock held. Reads the log without following a link, writes the newest
+    :data:`SIGN_LOG_KEEP` lines to a unique temporary file (``O_EXCL``, 0600) and renames it over the log; the
+    temporary file is removed if the rename fails."""
+    tmp: Path | None = None
     try:
-        if path.stat().st_size < SIGN_LOG_KEEP * 40:     # fewer bytes than SIGN_LOG_KEEP shortest lines: nothing to prune
-            return
-        lines = path.read_bytes().splitlines(keepends=True)
-        if len(lines) <= SIGN_LOG_KEEP:
-            return
-        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            os.write(fd, b"".join(lines[-SIGN_LOG_KEEP:]))
+            size = os.fstat(fd).st_size
+            if size < SIGN_LOG_KEEP * 40:     # fewer bytes than SIGN_LOG_KEEP shortest lines: nothing to prune
+                return
+            chunks = []
+            while True:
+                b = os.read(fd, 1 << 16)
+                if not b:
+                    break
+                chunks.append(b)
         finally:
             os.close(fd)
+        lines = b"".join(chunks).splitlines(keepends=True)
+        if len(lines) <= SIGN_LOG_KEEP:
+            return
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+        wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            _write_all(wfd, b"".join(lines[-SIGN_LOG_KEEP:]))
+        finally:
+            os.close(wfd)
         os.replace(tmp, path)
+        tmp = None
     except OSError:
         pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _int_or_none(v: Any) -> int | None:

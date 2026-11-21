@@ -252,7 +252,10 @@ def test_the_swift_helper_evaluates_once_and_then_forbids_interaction():
     ev, off, load = sign.index("evaluateAccessControl("), sign.index("interactionNotAllowed = true"), sign.index("loadKey(")
     assert ev < off < load                                  # no key use, and so no sign, before the context is closed
     assert sign.count("c.invalidate()") == 1 and "presence_timeout" in sign
-    assert "sem.wait(timeout: .now() + .seconds(PRESENCE_WALL_SECONDS)) == .timedOut" in sign   # the wall, invalidated on expiry
+    assert "sem.wait(timeout: .now() + .milliseconds(wallMs)) == .timedOut" in sign   # the caller's wall, invalidated on expiry
+    # the wall is the caller's --wall-ms (required on sign), clamped to 1 s .. PRESENCE_WALL_SECONDS, which stays the ceiling
+    assert 'Int(need("--wall-ms"))' in sign
+    assert "let wallMs = min(max(wallAsked, 1000), PRESENCE_WALL_SECONDS * 1000)" in sign
     assert re.search(r"^let PRESENCE_WALL_SECONDS = 60\b", src, re.M) is not None
     assert "evaluations += 1" in sign and sign.count("evaluations += 1") == 1
     # no loop around the evaluate
@@ -286,3 +289,30 @@ def test_the_python_side_never_passes_presence_to_a_sign():
     assert "--presence" not in inspect.getsource(ses.sign_once)
     assert "presence" not in inspect.signature(ses.sign_once).parameters
     assert "presence" not in inspect.signature(ses.se_signer).parameters
+
+
+def test_every_fail_after_the_evaluate_carries_evaluated_and_evaluations():
+    # levain#191 F7: key_load, counter, sign_failed and sign_unverified all come after the evaluate; fail() merges the
+    # context the sign sets right after it, so each of them says whether presence was evaluated
+    src = ses.SOURCE.read_text()
+    fail_fn = src[src.index("func fail("):src.index("// ---- SSH wire encoding")]
+    assert "for (k, v) in failContext { o[k] = v }" in fail_fn
+    assert src.index("var failContext") < src.index("func fail(")
+    sign = _sign_case(src)
+    ctx = sign.index('failContext = ["evaluated": evaluations > 0, "evaluations": evaluations]')
+    assert sign.index("interactionNotAllowed = true") < ctx < sign.index("loadKey(")
+    for code in ('"sign_failed"', '"sign_unverified"'):
+        assert ctx < sign.index(code)
+    assert ctx < sign.index("nextCounter(keyPath)")
+
+
+def test_the_swift_create_never_unlinks_a_meta_file_it_did_not_create():
+    # levain#191 F6: an open that fails (EEXIST) touches nothing; only a meta this call created and could not fill goes
+    src = ses.SOURCE.read_text()
+    wm = src[src.index("func writeMeta("):src.index("func readPresence(")]
+    assert "if fd < 0 { return false }" in wm and "O_EXCL" in wm and "O_NOFOLLOW" in wm
+    assert wm.count("unlink(") == 1 and "if n != d.count + 1 { unlink(metaPath(blob)); return false }" in wm
+    create = src[src.index('case "create":'):src.index('case "pubkey":')]
+    assert "unlink(metaPath(out))" not in create
+    assert 'if lstat(metaPath(out), &mst) == 0 { fail("exists"' in create
+    assert create.index("lstat(metaPath(out)") < create.index("SecureEnclave.P256.Signing.PrivateKey(accessControl:")

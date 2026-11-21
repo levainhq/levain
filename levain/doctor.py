@@ -107,36 +107,46 @@ def _emit(r: CheckResult) -> None:
         print(f"      → {r.hint}")
 
 
-def build_signing_helper() -> str:
+def build_signing_helper() -> tuple[bool, str]:
     """The one build point for the Secure Enclave helper outside a sign (``levain doctor --fix``; ``terminal-key
     create`` / ``rotate`` build it themselves). Compiles it into the per-user cache when it is not there for this
-    source (a compile takes up to a few minutes), and says what it did; a Mac without swiftc is a plain sentence."""
+    source (a compile takes up to a few minutes, said before it starts), and returns ``(ok, what it did)``; ``ok`` is
+    False only when the helper is NOT built (a Mac without the Command Line Tools is a plain sentence)."""
     import sys
 
     from levain.consent import se_signer
 
     if sys.platform != "darwin":
-        return "signing helper: not a Mac, nothing to build"
+        return True, "signing helper: not a Mac, nothing to build"
     try:
         se_signer.require_helper()
-        return "signing helper: already built"
+        return True, "signing helper: already built"
     except se_signer.SeSignerError:
         pass
+    print("building the signing helper (a compile can take minutes)…", flush=True)
     try:
         built = se_signer.ensure_helper()
     except se_signer.SeSignerError as exc:
-        return f"signing helper: NOT built ({exc})"
-    return f"signing helper: built ({built})"
+        return False, f"signing helper: NOT built ({exc})"
+    return True, f"signing helper: built ({built})"
 
 
 def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False, fix: bool = False) -> int:
+    """The doctor's checks. With ``fix`` the signing helper is built first; a helper that is NOT built makes the exit
+    :data:`EXIT_BROKEN` even when every check passes."""
     # one `claude --version` per run, however many rows ask for the version
     from levain.consent.canary import versions_read_once
 
+    helper_ok = True
     if fix:
-        print(build_signing_helper() + "\n")
+        helper_ok, said = build_signing_helper()
+        print(said + "\n")
     with versions_read_once():
-        return _run_doctor(path, invoke=invoke, repin_hooks=repin_hooks)
+        rc = _run_doctor(path, invoke=invoke, repin_hooks=repin_hooks)
+    if not helper_ok:
+        print(f"The signing helper was NOT built (see above), so doctor exits {EXIT_BROKEN}.")
+        return EXIT_BROKEN
+    return rc
 
 
 def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:

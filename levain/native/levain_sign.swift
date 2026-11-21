@@ -2,7 +2,9 @@
 // (PROTOCOL.u2f + PROTOCOL.sshsig). levain#191 / #153. All output is JSON on stdout.
 //   create --out <blob> [--presence]     also writes <blob>.meta.json (format, presence, created): whether the key is
 //                                        presence-gated is read from that file at every sign, never from a flag
-//   sign   --key <blob> --application ssh: --namespace <ns> --reason <text>   (message on stdin)
+//   sign   --key <blob> --application ssh: --namespace <ns> --reason <text> --wall-ms <n>   (message on stdin)
+//                                        --wall-ms: how long the one presence sheet may wait for a touch, clamped to
+//                                        1000 .. PRESENCE_WALL_SECONDS * 1000; the caller passes less than its own kill
 //   pubkey --key <blob> --application ssh:
 //   status --key <blob>      (zero UI: is the key presence-gated on this Mac?)
 // A presence key's access control is .biometryAny + .privateKeyUsage (no device-password fallback). A sign evaluates it
@@ -14,12 +16,16 @@ import Security
 
 let keyType = "sk-ecdsa-sha2-nistp256@openssh.com"
 
+// fields every later fail() carries (a sign sets "evaluated" / "evaluations" here once its evaluate is done)
+var failContext: [String: Any] = [:]
+
 func emit(_ obj: [String: Any]) {
     let d = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     FileHandle.standardOutput.write(d); FileHandle.standardOutput.write(Data("\n".utf8))
 }
 func fail(_ code: String, _ msg: String, _ extra: [String: Any] = [:]) -> Never {
     var o: [String: Any] = ["ok": false, "code": code, "error": msg]
+    for (k, v) in failContext { o[k] = v }
     for (k, v) in extra { o[k] = v }
     emit(o); exit(1)
 }
@@ -51,15 +57,18 @@ func makeAccessControl(presence: Bool) -> SecAccessControl {
 // ---- <blob>.meta.json: written at create; the helper reads whether the key is presence-gated from it ----
 let metaFormat = "levain-sign-key/1"
 func metaPath(_ blob: String) -> String { blob + ".meta.json" }
+// Never unlinks a meta file it did not create: an open that fails (EEXIST included) touches nothing; only a meta this
+// call created and then could not fill is removed.
 func writeMeta(_ blob: String, presence: Bool) -> Bool {
     let body: [String: Any] = ["format": metaFormat, "presence": presence,
                                "created": ISO8601DateFormatter().string(from: Date())]
     guard let d = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else { return false }
-    let fd = open(metaPath(blob), O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    let fd = open(metaPath(blob), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
     if fd < 0 { return false }
     let n = (d + Data("\n".utf8)).withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     close(fd)
-    return n == d.count + 1
+    if n != d.count + 1 { unlink(metaPath(blob)); return false }
+    return true
 }
 func readPresence(_ blob: String) -> Bool {
     guard let d = FileManager.default.contents(atPath: metaPath(blob)) else {
@@ -111,7 +120,7 @@ func loadKey(_ path: String, context: LAContext?) -> SecureEnclave.P256.Signing.
     } catch { fail("key_load", "\(error)") }
 }
 
-let PRESENCE_WALL_SECONDS = 60      // how long one presence sheet waits for a touch
+let PRESENCE_WALL_SECONDS = 60      // the CEILING on how long one presence sheet waits for a touch (sign's --wall-ms is clamped to it)
 let SIGN_MAX_ATTEMPTS = 3          // the first sign plus the transient-code retries
 
 // ---- counter sidecar: <blob>.counter, 0600, a decimal uint32, incremented per sign under an exclusive flock ----
@@ -146,6 +155,8 @@ case "create":
     let out = need("--out")
     let presence = flag("--presence")
     if FileManager.default.fileExists(atPath: out) { fail("exists", "refusing to overwrite \(out)") }
+    var mst = stat()
+    if lstat(metaPath(out), &mst) == 0 { fail("exists", "refusing to overwrite \(metaPath(out))") }
     let ac = makeAccessControl(presence: presence)
     do {
         let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: ac)
@@ -155,7 +166,7 @@ case "create":
         let n = blob.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
         close(fd)
         if n != blob.count { unlink(out); fail("write", "short write") }
-        if !writeMeta(out, presence: presence) { unlink(out); unlink(metaPath(out)); fail("write", "cannot write \(metaPath(out))") }
+        if !writeMeta(out, presence: presence) { unlink(out); fail("write", "cannot write \(metaPath(out)): errno \(errno)") }
         emit(["ok": true, "public_key": b64(key.publicKey.x963Representation), "presence": presence, "blob": out])
     } catch { fail("create", "\(error)", errorExtra(error)) }
 
@@ -168,10 +179,13 @@ case "pubkey":
 case "sign":
     let keyPath = need("--key"), app = need("--application"), ns = need("--namespace"), reason = need("--reason")
     if ns.isEmpty { fail("usage", "empty namespace") }
+    // the caller's budget for the sheet, in ms; PRESENCE_WALL_SECONDS stays the ceiling, 1 s the floor
+    guard let wallAsked = Int(need("--wall-ms")) else { fail("usage", "--wall-ms takes a whole number of milliseconds") }
+    let wallMs = min(max(wallAsked, 1000), PRESENCE_WALL_SECONDS * 1000)
     let presence = readPresence(keyPath)             // from <blob>.meta.json, never from a flag
     let message = FileHandle.standardInput.readDataToEndOfFile()
 
-    // ONE evaluate per sign (counted in "evaluations"), with a PRESENCE_WALL_SECONDS wall; afterwards the context allows no interaction,
+    // ONE evaluate per sign (counted in "evaluations"), with a wallMs wall (at most PRESENCE_WALL_SECONDS); afterwards the context allows no interaction,
     // so nothing later in this sign, a retry included, can show a sheet: it fails instead.
     var ctx: LAContext? = nil
     var evaluations = 0
@@ -182,9 +196,10 @@ case "sign":
         var ok = false; var err: Error? = nil
         evaluations += 1
         c.evaluateAccessControl(ac, operation: .useKeySign, localizedReason: reason) { r, e in ok = r; err = e; sem.signal() }
-        if sem.wait(timeout: .now() + .seconds(PRESENCE_WALL_SECONDS)) == .timedOut {
+        if sem.wait(timeout: .now() + .milliseconds(wallMs)) == .timedOut {
             c.invalidate()
-            fail("presence_timeout", "not touched in time (\(PRESENCE_WALL_SECONDS) s)", ["evaluations": evaluations, "evaluated": false])
+            fail("presence_timeout", "not touched in time (\(Double(wallMs) / 1000) s)",
+                 ["evaluations": evaluations, "evaluated": false, "wall_ms": wallMs])
         }
         if !ok {
             var extra: [String: Any] = ["evaluations": evaluations, "evaluated": false]
@@ -194,6 +209,8 @@ case "sign":
         c.interactionNotAllowed = true
         ctx = c
     }
+    // from here on every fail() (key_load, counter, sign_failed, sign_unverified) says whether presence was evaluated
+    failContext = ["evaluated": evaluations > 0, "evaluations": evaluations]
     let key = loadKey(keyPath, context: ctx)
     let x963 = key.publicKey.x963Representation
     let pubBlob = openSSHPubBlob(x963, application: app)

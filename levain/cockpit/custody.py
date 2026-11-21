@@ -49,7 +49,8 @@ from typing import Any
 
 from levain.authority import CUSTODIES, LAPTOP, UNSTATED, custody_problem
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
-from levain.cockpit.keys import KeyError_, normalise_public_key, refuse_real_key_in_tests
+from levain.cockpit.keys import (KeyError_, normalise_public_key, refuse_real_key_dir_unless_live,
+                                 refuse_real_key_in_tests)
 from levain.launch import child_env
 
 __all__ = ["APPLE_PROVIDER", "BIOUTIL", "LEVAIN_SIGN", "SIGNER_FORMAT", "create_levain_sign", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar",
@@ -667,20 +668,33 @@ def create_levain_sign(key_dir: Path | None = None, label: str | None = None, *,
     OpenSSH private key), ``<label>.pub`` the ``sk-ecdsa ... ssh:`` line, ``<label>.levain-key.json`` the sidecar.
     ``presence`` (the default, and the only value the product uses) adds the user-presence access control: a Touch ID
     sheet at each sign; ``False`` is for tests, which must show no sheet. ``helper`` is the compiled binary (default
-    the per-user cache build). Any failure removes the files this call made."""
+    the per-user cache build). Any failure removes the files this call made.
+
+    First, the real-key gate ``terminal_sign.create`` applies (``refuse_real_key_in_tests`` and
+    ``refuse_real_key_dir_unless_live`` on the key directory, named or default). Refused, with nothing made, when the
+    key's ``.meta.json`` or ``.counter`` is already there (a leftover the helper must never adopt or delete)."""
     from levain.consent import se_signer
+    gate = Path(key_dir).expanduser() if key_dir is not None else default_key_dir()
+    refuse_real_key_in_tests(gate, "the key directory")
+    gate = refuse_real_key_dir_unless_live(gate, "the key directory")
     if (platform or sys.platform) != "darwin":
         raise KeyError_("the Secure Enclave helper is macOS only; on this machine use --custody passphrase")
     label = _check_label(label or f"levain-{(stamp or _stamp)()}")
-    d = _key_dir(key_dir)
+    d = _key_dir(gate)
     key, pub = _destinations(d, label)
+    meta = key.with_name(key.name + ".meta.json")   # the helper's record of whether the key is presence-gated
+    leftovers = [str(p) for p in (meta, key.with_name(key.name + ".counter")) if os.path.lexists(p)]
+    if leftovers:
+        raise KeyError_(f"{' and '.join(leftovers)} already {'exist' if len(leftovers) > 1 else 'exists'} (left "
+                        "from an earlier key); remove them or choose another --label")
     made: list[Path] = []
     kept = False
     try:
         built = helper if helper is not None else se_signer.ensure_helper()
-        se_signer.create_key(key, presence=presence, helper=built)
+        # listed BEFORE the helper runs, so any failure from here on removes whatever of them it left (neither existed)
         made.append(key)
-        made.append(key.with_name(key.name + ".meta.json"))   # the helper's record of whether the key is presence-gated
+        made.append(meta)
+        se_signer.create_key(key, presence=presence, helper=built)
         normal = normalise_public_key(se_signer.public_key_line(key, helper=built))
         _write_new(pub, f"{normal} {label}\n".encode("ascii"), 0o644)
         made.append(pub)

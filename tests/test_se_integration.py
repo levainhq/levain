@@ -55,11 +55,15 @@ if sub == "status":
 if sub != "sign":
     out({"ok": False, "code": "usage", "error": "stub"}, 1)
 msg = sys.stdin.buffer.read()
+if not (opt("--wall-ms") or "").isdigit():
+    out({"ok": False, "code": "usage", "error": "missing --wall-ms"}, 1)
 if side(key, ".sleep"): time.sleep(float(side(key, ".sleep")))
 if side(key, ".replay"):
     sys.stdout.write(side(key, ".replay") + "\n"); sys.exit(0)
 if side(key, ".fail"):
-    out({"ok": False, "code": side(key, ".fail"), "error": "stub refusal", "attempts": 3, "evaluated": False}, 1)
+    o = {"ok": False, "code": side(key, ".fail"), "error": "stub refusal", "attempts": 3, "evaluated": False}
+    o.update(json.loads(side(key, ".fail-extra") or "{}"))
+    out(o, 1)
 priv = serialization.load_pem_private_key(open(key, "rb").read(), None)
 pt = priv.public_key().public_numbers()
 x963 = b"\x04" + pt.x.to_bytes(32, "big") + pt.y.to_bytes(32, "big")
@@ -105,6 +109,7 @@ def _empty_sig() -> str:
 
 NS = ts.NAMESPACE
 APPLE = custody.APPLE_PROVIDER
+LA_CANCEL = {"error_domain": "com.apple.LocalAuthentication", "error_code": -2}      # LAError.userCancel
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -308,6 +313,7 @@ def test_the_pub_path_signs_the_same_blob(tmp_path, stub_helper):
 def test_one_sheet_per_sign_no_python_retry(tmp_path, stub_helper):
     key = _soft_key(_keydir(tmp_path))
     _set(key, ".fail", "presence_denied")
+    _set(key, ".fail-extra", json.dumps(LA_CANCEL))
     _fp, sign = _signer(key, stub_helper)
     with pytest.raises(KeyError_) as ei:
         sign(b"m")
@@ -319,7 +325,7 @@ def test_one_sheet_per_sign_no_python_retry(tmp_path, stub_helper):
 def test_helper_failures_keep_the_classifier_working(tmp_path, stub_helper):
     d = _keydir(tmp_path)
     key = _soft_key(d)
-    _fp, sign = _signer(key, stub_helper, timeout=3.0)
+    _fp, sign = _signer(key, stub_helper, timeout=4.0)     # about 2 s for the helper after the two verify reserves
     _set(key, ".sleep", "6")
     with pytest.raises(KeyError_) as ei:
         sign(b"m")
@@ -685,13 +691,14 @@ def test_the_build_point_builds_once_and_says_so(tmp_path, monkeypatch):
     monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: (_ for _ in ()).throw(ses.SeSignerError("no")))
     monkeypatch.setattr(ses, "ensure_helper", lambda cache_dir=None: built.append(1) or tmp_path / "h")
     monkeypatch.setattr(sys, "platform", "darwin")
-    assert doctor.build_signing_helper() == f"signing helper: built ({tmp_path / 'h'})" and built == [1]
+    assert doctor.build_signing_helper() == (True, f"signing helper: built ({tmp_path / 'h'})") and built == [1]
     monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: tmp_path / "h")
-    assert doctor.build_signing_helper() == "signing helper: already built" and built == [1]
+    assert doctor.build_signing_helper() == (True, "signing helper: already built") and built == [1]
     monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: (_ for _ in ()).throw(ses.SeSignerError("no")))
     monkeypatch.setattr(ses, "ensure_helper", lambda cache_dir=None: (_ for _ in ()).throw(
         ses.SeSignerError("missing swiftc (xcode-select --install)")))
-    assert "NOT built" in doctor.build_signing_helper()
+    ok, said = doctor.build_signing_helper()
+    assert ok is False and "NOT built" in said
 
 
 def test_doctor_has_a_fix_flag_that_reaches_the_build():
@@ -750,6 +757,7 @@ def test_a_failed_helper_sign_writes_the_sign_failures_record_with_the_helper_fi
     Path(str(key) + ".fail").unlink()
     before = len(_evidence(d))
     _set(key, ".fail", "presence_denied")
+    _set(key, ".fail-extra", json.dumps(LA_CANCEL))
     with pytest.raises(KeyError_):
         sign(b"m")
     assert len(_evidence(d)) == before
@@ -763,3 +771,246 @@ def test_the_signer_refuses_an_answer_that_reports_two_presence_evaluations(tmp_
     with pytest.raises(KeyError_, match="evaluated presence"):
         sign(b"m")
     assert _log(d)[-1]["outcome"] == "unverified" and _log(d)[-1]["code"] == "too-many-evaluations"
+
+
+# ---------------------------------------------------------------------------------------------------
+# levain#191 review round 2 (serot-fix2): the wall follows the budget, cancel is only a cancel, the toolchain probe,
+# the locked sign log, doctor --fix's exit, create's leftovers and cleanup, the cache dir with no passwd entry
+
+LA = "com.apple.LocalAuthentication"
+
+
+def test_a_sign_with_no_time_left_is_refused_before_the_helper_runs(tmp_path, stub_helper):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _fp, sign = _signer(key, stub_helper, timeout=2.5)          # 2.5 s less two 1 s verify reserves: under a second
+    with pytest.raises(KeyError_, match="no time left to sign") as ei:
+        sign(b"m")
+    assert _stub_log(key) == [] and "nothing was signed" in str(ei.value)
+    assert _log(d)[-1]["outcome"] == "no-time"
+
+
+def test_the_helper_is_always_given_a_wall_ms(tmp_path, stub_helper):
+    key = _soft_key(_keydir(tmp_path))
+    _fp, sign = _signer(key, stub_helper)
+    sign(b"m")
+    (call,) = _stub_log(key)
+    words = call.split()
+    assert int(words[words.index("--wall-ms") + 1]) > 0
+
+
+@pytest.mark.parametrize("extra,kind,code", [
+    (LA_CANCEL, "cancelled", -2),
+    ({"error_domain": LA, "error_code": -4}, "cancelled", -4),
+    ({"error_domain": LA, "error_code": -9}, "cancelled", -9),
+    ({"error_domain": LA, "error_code": -8}, "signer-error", -8),         # biometryLockout
+    ({"error_domain": LA, "error_code": -6}, "signer-error", -6),         # biometryNotAvailable (a closed lid)
+    ({"error_domain": LA, "error_code": -7}, "signer-error", -7),         # biometryNotEnrolled
+    ({"error_domain": "NSOSStatusErrorDomain", "error_code": -2}, "signer-error", -2),   # -2, but not LocalAuthentication
+    ({}, "signer-error", None),                                          # no domain, no code
+])
+def test_presence_denied_is_a_cancel_only_for_the_three_la_cancel_codes(tmp_path, stub_helper, extra, kind, code):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _set(key, ".fail", "presence_denied")
+    _set(key, ".fail-extra", json.dumps(extra))
+    _fp, sign = _signer(key, stub_helper)
+    with pytest.raises(KeyError_) as ei:
+        sign(b"m")
+    said = str(ei.value)
+    assert ts._classify(ei.value)[0] == kind and "nothing was signed" in said
+    row = _log(d)[-1]
+    if kind == "cancelled":
+        assert row["outcome"] == "cancelled" and _evidence(d) == []
+    else:
+        assert row["outcome"] == "presence-failed" and "cancel" not in said.lower()
+        (rec,) = _evidence(d)
+        assert rec["signer"] == "levain-sign" and rec["helper_code"].startswith("presence_denied")
+        if code is not None:
+            assert f"error {code} (" in said and str(code) in row["code"] and str(code) in rec["helper_code"]
+
+
+def test_an_ok_answer_with_no_signature_is_a_signer_error_not_a_cancel(tmp_path, stub_helper):
+    d = _keydir(tmp_path)
+    key = _soft_key(d)
+    _set(key, ".replay", json.dumps({"ok": True, "attempts": 1, "evaluated": True, "evaluations": 1}))
+    fp, sign = _signer(key, stub_helper)
+    with pytest.raises(KeyError_) as ei:
+        sign(b"m")
+    assert str(ei.value) == f"the Secure Enclave helper answered with no signature for {fp}, so nothing was signed"
+    assert ts._classify(ei.value)[0] == "signer-error"
+    assert len(_evidence(d)) == 1 and _log(d)[-1]["outcome"] == "no-signature"
+
+
+def test_the_default_swiftc_is_never_run_without_a_toolchain(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake(cmd, **kw):
+        calls.append(list(cmd))
+        if cmd[0] == ses.XCODE_SELECT:
+            return subprocess.CompletedProcess(cmd, 2, stdout="", stderr="xcode-select: error: no developer tools")
+        raise AssertionError(f"ran {cmd}")
+    monkeypatch.setattr(ses.subprocess, "run", fake)
+    monkeypatch.setattr(ses, "SWIFTC", ses.DEFAULT_SWIFTC)
+    assert ses.toolchain_present() is False
+    with pytest.raises(ses.SeSignerError, match="xcode-select --install") as ei:
+        ses.build_helper(tmp_path / "cache")
+    assert ei.value.code == "no_toolchain"
+    assert calls and all(c[0] == ses.XCODE_SELECT and c[1:] == ["-p"] for c in calls)     # never swiftc
+    creator, why = ts.default_creator(platform="darwin", machine="arm64")
+    assert creator is custody.create_touch_id and "xcode-select --install" in why and "\n" not in why
+
+
+def test_toolchain_present_needs_exit_0_and_a_directory_that_exists(tmp_path, monkeypatch):
+    answer: dict = {}
+
+    def fake(cmd, **kw):
+        assert cmd == [ses.XCODE_SELECT, "-p"] and kw["timeout"] == ses.TOOLCHAIN_PROBE_TIMEOUT
+        if answer.get("raise"):
+            raise answer["raise"]
+        return subprocess.CompletedProcess(cmd, answer["rc"], stdout=answer["out"], stderr="")
+    monkeypatch.setattr(ses.subprocess, "run", fake)
+    answer.update(rc=0, out=f"{tmp_path}\n")
+    assert ses.toolchain_present() is True
+    answer.update(rc=0, out=f"{tmp_path / 'gone'}\n")
+    assert ses.toolchain_present() is False
+    answer.update(rc=0, out="")
+    assert ses.toolchain_present() is False
+    answer.update(rc=2, out=f"{tmp_path}\n")
+    assert ses.toolchain_present() is False
+    answer.update({"raise": subprocess.TimeoutExpired("xcode-select", 10)})
+    assert ses.toolchain_present() is False
+    # with the toolchain there, default_creator takes the helper
+    answer.clear()
+    answer.update(rc=0, out=f"{tmp_path}\n")
+    monkeypatch.setattr(ses, "SWIFTC", ses.DEFAULT_SWIFTC)
+    assert ts.default_creator(platform="darwin", machine="arm64") == (custody.create_levain_sign, None)
+
+
+def test_each_build_compiles_into_its_own_tmp_and_a_failed_one_leaves_none(tmp_path, monkeypatch):
+    swiftc = tmp_path / "swiftc"
+    swiftc.write_text("")
+    monkeypatch.setattr(ses, "SWIFTC", str(swiftc))
+    outs: list[str] = []
+
+    def fake(cmd, **kw):
+        outs.append(cmd[cmd.index("-o") + 1])
+        assert Path(outs[-1]).exists()                      # made O_EXCL before swiftc runs
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: stub")
+    monkeypatch.setattr(ses.subprocess, "run", fake)
+    cache = tmp_path / "cache"
+    for _ in range(2):
+        with pytest.raises(ses.SeSignerError, match="swiftc failed"):
+            ses.build_helper(cache)
+    assert len(set(outs)) == 2 and list(cache.iterdir()) == []
+
+
+def test_two_signers_at_once_lose_no_sign_log_line(tmp_path):
+    import threading
+    d = _keydir(tmp_path)
+    n = 300
+    errors: list[str] = []
+
+    def run(t: int) -> None:
+        for i in range(n):
+            why = ses.append_sign_log(d, ses.sign_log_record(outcome=f"t{t}-{i}", attempts=1, evaluated=True,
+                                                             elapsed_s=0.1, code="ok"))
+            if why is not None:
+                errors.append(why)
+    threads = [threading.Thread(target=run, args=(t,)) for t in (0, 1)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert errors == []
+    rows = [r["outcome"] for r in _log(d)]
+    assert len(rows) == ses.SIGN_LOG_KEEP and len(set(rows)) == len(rows)
+    for t in (0, 1):
+        mine = [int(o.split("-")[1]) for o in rows if o.startswith(f"t{t}-")]
+        assert mine == list(range(n - len(mine), n))      # the newest of what that signer wrote, in order, no gap
+    assert stat.S_IMODE(os.lstat(d / ses.SIGN_LOG_LOCK).st_mode) == 0o600
+    assert not [p for p in d.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_doctor_fix_with_the_helper_not_built_exits_broken_even_when_the_checks_pass(tmp_path, monkeypatch, capsys):
+    from levain import doctor
+    monkeypatch.setattr(doctor, "_run_doctor", lambda path, invoke=False, repin_hooks=False: doctor.EXIT_HEALTHY)
+    monkeypatch.setattr(doctor, "build_signing_helper", lambda: (False, "signing helper: NOT built (stub)"))
+    assert doctor.run_doctor(tmp_path, fix=True) == doctor.EXIT_BROKEN
+    assert "NOT built" in capsys.readouterr().out
+    monkeypatch.setattr(doctor, "build_signing_helper", lambda: (True, "signing helper: already built"))
+    assert doctor.run_doctor(tmp_path, fix=True) == doctor.EXIT_HEALTHY
+    assert doctor.run_doctor(tmp_path) == doctor.EXIT_HEALTHY          # no --fix: the helper is not consulted
+
+
+def test_doctor_fix_says_a_compile_can_take_minutes_before_it_builds(tmp_path, monkeypatch, capsys):
+    from levain import doctor
+    order: list[str] = []
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ses, "require_helper", lambda cache_dir=None: (_ for _ in ()).throw(ses.SeSignerError("no")))
+
+    def build(cache_dir=None):
+        order.append("built:" + capsys.readouterr().out)
+        return tmp_path / "h"
+    monkeypatch.setattr(ses, "ensure_helper", build)
+    assert doctor.build_signing_helper()[0] is True
+    assert order == ["built:building the signing helper (a compile can take minutes)…\n"]
+
+
+def test_a_leftover_meta_or_counter_refuses_the_create_and_survives(tmp_path):
+    d = _keydir(tmp_path)
+    for suffix in (".meta.json", ".counter"):
+        left = d / ("levain-terminal" + suffix)
+        left.write_text("leftover")
+        with pytest.raises(KeyError_, match=suffix.replace(".", r"\.")):
+            custody.create_levain_sign(d, "levain-terminal", helper=tmp_path / "never-run", platform="darwin")
+        assert left.read_text() == "leftover" and not (d / "levain-terminal").exists()
+        left.unlink()
+
+
+FAILING_CREATE = r'''
+import json, sys
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+open(out, "w").write("blob")
+open(out + ".meta.json", "w").write("{}")
+sys.stdout.write(json.dumps({"ok": False, "code": "write", "error": "stub: failed after writing both"}) + "\n")
+sys.exit(1)
+'''
+
+
+def test_a_create_key_failure_leaves_no_key_and_no_meta(tmp_path):
+    d = _keydir(tmp_path)
+    helper = tmp_path / "failing-helper"
+    helper.write_text(f"#!{sys.executable}\n" + FAILING_CREATE)
+    helper.chmod(0o755)
+    with pytest.raises(KeyError_, match="could not make the key"):
+        custody.create_levain_sign(d, "levain-terminal", helper=helper, platform="darwin")
+    assert sorted(p.name for p in d.iterdir()) == []
+
+
+def test_create_levain_sign_applies_the_real_key_gate_first(tmp_path, monkeypatch):
+    def refuse(path, what="the key directory"):
+        raise ckeys.RealKeyUnmarked("stub: the real key directory")
+    monkeypatch.setattr(custody, "refuse_real_key_dir_unless_live", refuse)
+    with pytest.raises(ckeys.RealKeyUnmarked):
+        custody.create_levain_sign(_keydir(tmp_path), "levain-terminal", helper=tmp_path / "never-run",
+                                   platform="darwin")
+
+
+def test_default_creator_off_a_mac_points_at_the_passphrase_key():
+    creator, why = ts.default_creator(platform="linux", machine="x86_64")
+    assert why == "terminal-key create is macOS only; use `levain cockpit key create --custody passphrase`"
+
+
+def test_the_helper_cache_dir_with_no_passwd_entry_is_a_signer_error(monkeypatch):
+    import pwd
+
+    def nobody(uid):
+        raise KeyError(f"getpwuid(): uid not found: {uid}")
+    monkeypatch.setattr(pwd, "getpwuid", nobody)
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses.default_cache_dir()
+    assert ei.value.code == "no_home"
+    with pytest.raises(ses.SeSignerError):
+        ses.require_helper()

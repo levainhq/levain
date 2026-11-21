@@ -11,7 +11,15 @@ It is RESUMABLE. ``<keydir>/rotate.json`` (0600) records each completed step, an
 (or the disk), never the journal alone, so a re-run after any interruption finishes the rest and never enrols or
 revokes twice. It is the operator's act at the laptop: refused inside any agent session, exactly as ``create`` is, and
 under the same real-key gate (``keys.refuse_real_key_dir_unless_live``). It never raises: a refusal, a stop and a
-Ctrl-C are a report.
+Ctrl-C are a report. Anything that fails before the first journal write (the session check, the key directory, the
+data root, the fresh-start checks) is a refusal, exit 2, "nothing was started"; only after it is a run "stopped".
+
+Known edges (levain#191, nothing built for them): a resumed rotate adopts an existing enrolment of the new key and an
+existing revocation of the old one without checking which key signed them (it needs another authorised key to act
+between two steps of the operator's own rotation); no lock keeps two rotates from running at once in one key
+directory; the helper key's ``.counter`` sidecar restarts when it is corrupt (``ssh-keygen -Y verify`` does not judge
+the counter); a T2 Intel Mac takes the CTK path (``terminal_sign.default_creator``); helper binaries built from an
+older source stay in the cache.
 """
 
 from __future__ import annotations
@@ -187,7 +195,7 @@ def rotate(key_dir: Path | None = None, *, data_root: Path | None = None, path: 
 
 def _stopped(log: list[str], why: str, refused: bool) -> RotateReport:
     if refused:
-        return RotateReport("refused", f"refused: {why} (nothing was changed)", EXIT_REFUSED, log)
+        return RotateReport("refused", f"refused: {why} (nothing was started, nothing was changed)", EXIT_REFUSED, log)
     lines = [*log, f"stopped: {why}",
              "Nothing is lost: the steps above are done and recorded. Run `levain band terminal-key rotate` again "
              "to finish; it continues from the last step and never enrols or revokes twice."]
@@ -218,14 +226,24 @@ def _rotate(key_dir: Path | None, data_root: Path | None, path: Path | None, cre
         raise
     except Exception as exc:  # noqa: BLE001 - a directory that cannot be read is a refusal
         raise _Stop(f"the key directory cannot be read: {_plain(exc)}", refused=True) from None
-    root = resolve_data_root(path, data_root)
+    try:
+        root = resolve_data_root(path, data_root)
+    except _Stop:
+        raise
+    except Exception as exc:  # noqa: BLE001 - before the first journal write every failure is a refusal
+        raise _Stop(f"the authority's data root cannot be found: {_plain(exc)}", refused=True) from None
     sign_for: SignerFactory = signer_factory or (lambda p: _keys.ssh_signer(p))
     make: Callable[..., Any] = creator or _default_creator
 
     if journal is not None and not journal.get("complete"):
         log.append(f"resuming the rotation recorded in {_journal_path(d)}")
     else:
-        journal = _begin(d, root, clock, log)
+        try:
+            journal = _begin(d, root, clock, log)
+        except _Stop as stop:
+            raise _Stop(str(stop), refused=True) from None       # _begin changes nothing until its journal lands
+        except Exception as exc:  # noqa: BLE001 - before the first journal write every failure is a refusal
+            raise _Stop(f"the rotation could not start: {_plain(exc)}", refused=True) from None
         if journal is None:
             return RotateReport("noop", NOOP_TEXT, EXIT_OK, [NOOP_TEXT])
 
@@ -250,7 +268,8 @@ def _default_creator(key_dir: Path, label: str) -> Any:
 
 def _begin(d: Path, root: Path, clock: Callable[[], datetime], log: list[str]) -> dict[str, Any] | None:
     """The journal of a fresh rotation, or None when the key already signs through the helper. Refuses (nothing made)
-    when there is no terminal key, or the authority does not hold it enrolled and active."""
+    when there is no terminal key, or the authority does not hold it enrolled and active. Its one write is the
+    journal, last (an atomic rename), so the caller treats ANY failure in here as a refusal: nothing was started."""
     key = ts.find_key(d)
     if key is None:
         raise _Stop("there is no terminal key to rotate; make one with `levain band terminal-key create`",
@@ -440,7 +459,9 @@ def _step_move(d: Path, journal: dict[str, Any], log: list[str]) -> None:
 
 def _step_ctk(d: Path, journal: dict[str, Any], delete: Callable[[str, Path | str], str | None],
               sc_auth: Path | str, log: list[str]) -> None:
-    """Delete the old key's CTK identity (no touch). A failure is reported and recorded, never fatal."""
+    """Delete the old key's CTK identity (no touch). A failure the deleter REPORTS (it returns a reason) is recorded
+    in the journal and the log and the rotation still completes. An EXCEPTION from the deleter is not caught here: it
+    stops the run before the step is recorded, and the next run (resumable) tries the delete again."""
     steps = journal["steps"]
     if steps.get("ctk_deleted") is not None:
         return

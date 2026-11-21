@@ -167,9 +167,20 @@ def test_a_presence_flag_on_the_command_line_of_a_sign_is_ignored(tmp_path, help
     """The old CLI took ``--presence`` on sign; the helper now reads the key's meta. A no-presence key stays flags 0x00,
     evaluations 0, whatever the command line says (so no sheet can be asked for by a caller's argument)."""
     out = ses._run(helper, ["sign", "--key", str(key), "--application", "ssh:", "--namespace", NS, "--reason", "r",
-                            "--presence"], stdin=b"m", timeout=30)
+                            "--wall-ms", "5000", "--presence"], stdin=b"m", timeout=30)
     assert out["flags"] == 0 and out["evaluations"] == 0 and out["evaluated"] is False and out["presence"] is False
     assert _parse(out["signature"])[0] == 0x00
+
+
+@pytest.mark.parametrize("wall", [None, "soon", ""])
+def test_the_real_helper_refuses_a_sign_without_a_whole_number_wall_ms(tmp_path, helper, key, wall):
+    """levain#191 F1: --wall-ms is required on sign (no-presence key: no sheet either way)."""
+    args = ["sign", "--key", str(key), "--application", "ssh:", "--namespace", NS, "--reason", "r"]
+    if wall is not None:
+        args += ["--wall-ms", wall]
+    with pytest.raises(ses.SeSignerError) as ei:
+        ses._run(helper, args, stdin=b"m", timeout=30)
+    assert ei.value.code == "usage" and "--wall-ms" in str(ei.value)
 
 
 def test_the_helper_says_how_many_presence_evaluations_it_made(tmp_path, helper, key):
@@ -219,10 +230,40 @@ def test_require_helper_finds_what_ensure_helper_built(tmp_path, helper):
     assert ses.require_helper(cache) == built and ses.helper_path(cache) == built
 
 
-def test_sign_timeout_outlasts_the_helpers_presence_wall():
-    # The Python bound on a sign must outlast the helper's own wait for a touch, or a slow touch is killed mid-sheet.
-    import re
-    src = (Path(ses.__file__).resolve().parent.parent / "native" / "levain_sign.swift").read_text()
-    m = re.search(r"^let PRESENCE_WALL_SECONDS = (\d+)\b", src, re.M)
-    assert m is not None
-    assert ses.SIGN_TIMEOUT > int(m.group(1))
+def test_sign_once_passes_a_presence_wall_below_its_own_subprocess_timeout(tmp_path, monkeypatch):
+    # levain#191 F1: the helper's own presence_timeout must fire before Python kills it mid-sheet
+    seen: dict = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"], seen["timeout"] = list(cmd), kw["timeout"]
+        return subprocess.CompletedProcess(cmd, 0, stdout=b'{"ok": true, "signature": "x"}', stderr=b"")
+    monkeypatch.setattr(ses.subprocess, "run", fake)
+    for timeout in (ses.SIGN_TIMEOUT, 18.0, 5.0, 3.5):
+        ses.sign_once(tmp_path / "k", b"m", namespace=NS, helper=tmp_path / "h", timeout=timeout)
+        wall_ms = int(seen["cmd"][seen["cmd"].index("--wall-ms") + 1])
+        assert seen["timeout"] == timeout
+        assert wall_ms == int((timeout - ses.WALL_MARGIN_S) * 1000) and wall_ms / 1000 < timeout
+    ses.sign_once(tmp_path / "k", b"m", namespace=NS, helper=tmp_path / "h", timeout=2.5)
+    assert int(seen["cmd"][seen["cmd"].index("--wall-ms") + 1]) == int(ses.WALL_FLOOR_S * 1000)     # the floor
+
+
+def test_the_terminal_sign_bound_gives_the_levain_sign_helper_a_wall_inside_its_timeout(tmp_path, monkeypatch):
+    # levain#191 F1, through keys' levain-sign signer at the terminal sign's own bound (20 s): the helper is given
+    # bound less two verify reserves, and its wall is under that
+    from levain.cockpit import keys as ckeys
+    from levain.consent import terminal_sign as ts
+    seen: dict = {}
+
+    def fake_run(helper, args, *, stdin=b"", timeout):
+        seen["args"], seen["timeout"] = list(args), timeout
+        raise ses.SeSignerError("stub refusal", "stub")
+    monkeypatch.setattr(ses, "_run", fake_run)
+    d = tmp_path / "keys"
+    d.mkdir(mode=0o700)
+    sign = ckeys._levain_sign_signer(d / "k", "sk-ecdsa-sha2-nistp256@openssh.com AAAA", "SHA256:x", NS,
+                                     ts.SIGN_BOUND_S, SSH_KEYGEN, tmp_path / "h")
+    with pytest.raises(ckeys.KeyError_):
+        sign(b"m")
+    wall = int(seen["args"][seen["args"].index("--wall-ms") + 1]) / 1000
+    assert seen["timeout"] <= ts.SIGN_BOUND_S - 2 * ckeys._VERIFY_RESERVE_S
+    assert wall < seen["timeout"] and wall <= seen["timeout"] - ses.WALL_MARGIN_S + 0.001

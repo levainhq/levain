@@ -561,19 +561,21 @@ def enroll_command(public_path: Path | str) -> str:
 def default_creator(*, platform: str | None = None, swiftc: Path | str | None = None,
                     machine: str | None = None) -> tuple[Callable[..., Any], str | None]:
     """``(creator, why)`` for ``terminal-key create`` when none is injected (levain#191 R6): the levain-sign helper
-    (``custody.create_levain_sign``, a presence-gated Secure Enclave key) on a Mac with ``/usr/bin/swiftc`` and a Secure
+    (``custody.create_levain_sign``, a presence-gated Secure Enclave key) on a Mac with a Swift toolchain and a Secure
     Enclave (Apple silicon: ``arm64``), else the Apple CTK path (``custody.create_touch_id``) with ``why`` saying in one
-    line why the helper was not used. ``why`` is None when the helper is used."""
+    line why the helper was not used. ``why`` is None when the helper is used. The default ``/usr/bin/swiftc`` is the
+    xcode-select stub on every Mac, so the toolchain is probed (``se_signer.toolchain_present``: ``xcode-select -p``);
+    an injected ``swiftc`` (a test's) is judged by whether it exists."""
     import platform as _platform
     from levain.cockpit.custody import create_levain_sign, create_touch_id
     from levain.consent import se_signer as _se
     plat = platform or sys.platform
     if plat != "darwin":
-        return create_touch_id, "the levain-sign helper is macOS only, so this key came from the Apple CTK path"
-    compiler = Path(swiftc if swiftc is not None else _se.SWIFTC)
-    if not compiler.exists():
-        return create_touch_id, (f"{compiler} is missing (xcode-select --install adds it), so this key came "
-                                          "from the Apple CTK path, not the levain-sign helper")
+        return create_touch_id, ("terminal-key create is macOS only; use "
+                                 "`levain cockpit key create --custody passphrase`")
+    problem = _se.compiler_problem(swiftc)
+    if problem is not None:
+        return create_touch_id, (f"{problem}, so this key came from the Apple CTK path, not the levain-sign helper")
     if (machine or _platform.machine()) != "arm64":
         return create_touch_id, ("no Secure Enclave found for the levain-sign helper (not Apple silicon), so "
                                           "this key came from the Apple CTK path")
