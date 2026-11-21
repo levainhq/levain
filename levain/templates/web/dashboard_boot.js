@@ -11,10 +11,13 @@
 // else asks for it again, so the page would stay dead until a person reloaded it. This runs first, before the boot below, and does not
 // wait for anything: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and when that
 // lands the page goes on. When it does not, the page reloads ONCE: the marker is written to sessionStorage BEFORE the reload, so a second
-// failure finds it and stops. A healthy boot clears the marker, so a later incident may heal again. Storage that cannot be read or written
-// never reloads (no marker could be kept, so a loop could not be ruled out). Nothing is shown: the one trace is a console line.
+// failure finds it and stops. The marker is the time it was written, and one older than MARK_TTL_MS counts as absent. A healthy boot clears
+// the marker, so a later incident may heal again. Storage that cannot be read or written never reloads (no marker could be kept, so a loop
+// could not be ruled out). Nothing is shown: the one trace is a console line.
 (function () {
-  const KEY = "levain_cockpit_view_reload", WAIT_MS = 4000;
+  // MARK_TTL_MS: a reload loop repeats within seconds, so a marker only has to outlive that; one left by a dead load long ago must not
+  // suppress a later recovery for the rest of the tab's session
+  const KEY = "levain_cockpit_view_reload", WAIT_MS = 4000, MARK_TTL_MS = 60000;
   function clearMark() { try { window.sessionStorage.removeItem(KEY); } catch (_) { /* no storage: nothing was kept */ } }
   try {
     if (window.LevainCockpitView) { clearMark(); return; }
@@ -30,8 +33,8 @@
         if (window.LevainCockpitView) { clearMark(); return; }
         let mayReload = false;
         try {
-          const ss = window.sessionStorage;
-          if (ss.getItem(KEY) === null) { ss.setItem(KEY, "1"); mayReload = ss.getItem(KEY) === "1"; }
+          const ss = window.sessionStorage, now = Date.now(), held = ss.getItem(KEY);
+          if (held === null || !(now - Number(held) <= MARK_TTL_MS)) { const stamp = String(now); ss.setItem(KEY, stamp); mayReload = ss.getItem(KEY) === stamp; }
         } catch (_) { mayReload = false; }
         if (mayReload) { window.location.reload(); return; }
         console.error("levain: cockpit_view.js did not load, and the page has already reloaded once (or cannot remember that it did)");
