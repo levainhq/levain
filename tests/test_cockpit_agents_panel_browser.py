@@ -105,8 +105,7 @@ def _row(name: str) -> str:
 
 
 def _tap_row(name: str) -> list[dict]:
-    """Open one row's detail. Every tap in this file is a `landed_tap`: the board and the open detail repaint on a change, and a bare
-    press on a node a repaint replaces between its two halves makes no click (see `landed_tap`), so the page was left as it was."""
+    """Open one row's detail with a `landed_tap`: a bare press on a node a repaint replaces between its two halves makes no click."""
     return landed_tap(f"{_row(name)}.querySelector('.ext-meta')", before=f"{_row(name)}.scrollIntoView({{block: 'center'}})", ms=20000)
 
 
