@@ -758,25 +758,25 @@ def test_a_send_that_throws_leaves_the_keep_and_agenda_forms_with_a_fixed_line_a
                          "cls: " + row + ".querySelector('.verb-form .edit-msg').className, "
                          "go: !" + row + ".querySelector('.verb-form .verb-confirm').disabled, "
                          "cancel: !" + row + ".querySelector('.verb-form .verb-cancel').disabled})")
-    wait = {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {seed} && {band_row} && 1"},
+            BOARD_SETTLED,                # a fresh install's first hello may draw the board again, which would replace the rows and the form the steps hold
             {"eval": "window.LevainCockpitTransport.rowVerb = () => Promise.reject(new TypeError('Failed to fetch')); 1"},
             # the Keep
             {"eval": f"{seed}.querySelector('.verb-more').click(); {seed}.querySelector('[data-verb=intention_keep]').click(); 1"},
             {"until": f"{seed}.querySelector('.verb-form .verb-confirm') && 1"},
             _confirm(seed),
-            wait,
+            _failed(seed),                # the rejected send has been answered: the form's message reads the refusal
             {"eval": state(seed)},
             # the agenda
             {"eval": f"{band_row}.querySelector('[data-verb=band_agenda]').click(); 1"},
             {"until": f"{_day_input(band_row)} && 1"},
             _pick(band_row, past),
             _confirm(band_row),
-            wait,
+            _failed(band_row),
             {"eval": state(band_row)},
         ])
     got = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"msg"')]
