@@ -42,7 +42,8 @@ ABSENT = "absent"
 # Prefix of the fingerprint of a repo whose index.lock is older than LOCK_HOLD_MAX_S (the lock is ignored, named).
 STALE_LOCK = "stale-lock"
 # A live index.lock holds a GitRefs panel at most this long (seconds); past it the panel derives anyway, and the
-# "inputs" stream's detail names the lock's path (see GitRefs for the rest of what that input does and does not see).
+# "inputs" stream's detail names the lock's path unless the fingerprint is None (see GitRefs for the rest of what that
+# input does and does not see).
 LOCK_HOLD_MAX_S = 180.0
 # A derive running longer than this publishes status "timeout" (PanelPlan.timeout_s overrides, seconds). Nothing here
 # interrupts the derive call: its thread (one of DERIVE_THREADS) stays in it until it returns. While the panel is still

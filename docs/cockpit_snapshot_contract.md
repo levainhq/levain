@@ -4,7 +4,8 @@ This document is about the cockpit's snapshot store, one sqlite file, in `levain
 
 It holds the reasons behind the store's design, facts about sqlite itself with their qualifiers, and pointers to the
 symbols to read. It is not a spec a reader can be built from. A sentence here about what the code does would be a second
-statement of it, free to drift, so a pointer names a symbol and says nothing about what that symbol does.
+statement of it, free to drift, so a pointer names a symbol and at most its role; how the symbol behaves is read in the
+symbol.
 
 Convention for this file: a backticked word is a code symbol or a repo path, and nothing else is backticked.
 `tests/test_cockpit_snapshot_contract_doc.py` checks that each backticked symbol is defined in the module whose path is
@@ -77,8 +78,7 @@ What each table is for; the columns, their types and what a writer puts in them 
 `SnapshotWriter.publish`.
 
 - meta holds the file's own facts, not a panel's content.
-- panel holds a panel's latest result and its bookkeeping. write_gen is the read-your-writes marker: it is how a reader
-  that has just made a write learns that the panel was derived for it.
+- panel holds a panel's latest result and its bookkeeping. write_gen is the read-your-writes marker.
 - stream holds the worker's report on how well it sees changes (`SnapshotWriter.set_stream`).
 
 ## The gen rule
