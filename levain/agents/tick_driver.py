@@ -873,7 +873,7 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
                 # (revoked or expired since the pick) states nothing, the same fail-closed answer as any other cause
                 grant = _auth.grants_in_force(state).get(picked)
                 figure = (_session_exposure(grant, signed.get("stop_at")) if grant is not None
-                          else "the link is not in force (it was stopped or has expired since it was picked)")
+                          else "the link is not in force (it left the in-force view after it was picked)")
                 if isinstance(figure, str):
                     notes.append(f"{oid} was not launched: its exposure cannot be stated from link {picked}: {figure}; "
                                  f"{retry}")
