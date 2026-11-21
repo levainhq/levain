@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -19,10 +23,11 @@ from levain.cockpit.firejournal import revoke_digest
 
 from levain import web_server
 from levain.cockpit.broker import Broker, Lifecycle
-from levain.cockpit.firejournal import PAIRED_PREFIX
+from levain.cockpit import firejournal
+from levain.cockpit.firejournal import PAIRED_PREFIX, CockpitDB, revision_identity
 from levain.dashboard import SubstrateSource
 from levain.web_server import make_server
-from tests._waits import scaled
+from tests._waits import scaled, wait_until
 from tests.test_cockpit_k2a import _install
 
 T = "pairing-browser-token"
@@ -381,7 +386,9 @@ def test_ru3_a_revoke_during_a_steady_event_flow_ends_the_stream_before_its_next
 
 def test_rt2_a_revoke_made_by_another_process_ends_the_stream_within_one_heartbeat(src) -> None:
     """RT-2 as amended by RU-3: a revoke that moves no in-process epoch (the box-side CLI writes the journal
-    directly) is still seen: a paired stream re-checks at every heartbeat pass."""
+    directly) is still seen. Since levain#231 this one ends through the journal's revocation revision, which the
+    revoke (``revoke_devices``) moves, on the stream's next pass, not through the heartbeat re-check; the heartbeat
+    path is pinned by ``test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat`` (a raw UPDATE)."""
     from datetime import datetime, timezone
 
     from levain.cockpit.firejournal import CockpitDB
@@ -396,6 +403,506 @@ def test_rt2_a_revoke_made_by_another_process_ends_the_stream_within_one_heartbe
         pump.join(5)
         s.close()
         assert "at" in done and done["at"] - t0 < 0.4 + 0.6, done
+
+
+# --- levain#231: a paired stream sees another process's revoke on its next pass ---------------------------------------
+# Every test here but the heartbeat-backstop one sets ``stream_heartbeat_s = 30.0``, so the heartbeat re-check cannot
+# be what ends the stream: the bounds below are the revision read on each pass, not the heartbeat. Every end bound goes
+# through ``scaled`` (``_ends_within``), so a loaded runner stretches it.
+
+def _revoke_journal(httpd: Any, ids: "list[str] | None") -> None:
+    """A revoke written straight to the journal (no epoch of this server moves), as the box-side CLI writes it."""
+    CockpitDB(httpd.broker.data_root).revoke_devices(ids, by="box", now=datetime.now(timezone.utc))
+
+
+def _stream_up(httpd: Any, port: int, tok: str) -> tuple[socket.socket, list[tuple[float, bytes]], threading.Thread, dict]:
+    s, chunks, pump, done = _open_stream(port, tok)
+    w = httpd.stream_watcher
+    deadline = time.monotonic() + 5
+    while w.stream_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert w.stream_count == 1, "the stream did not open"
+    return s, chunks, pump, done
+
+
+def _flow(httpd: Any) -> tuple[threading.Event, threading.Thread]:
+    """Events published faster than any check cadence, until the returned event is set."""
+    w = httpd.stream_watcher
+    stop = threading.Event()
+
+    def publish() -> None:
+        while not stop.is_set():
+            with w._lock:
+                w._publish_locked("panel-changed", {"id": "tray", "etag": str(time.monotonic())})
+            time.sleep(0.02)
+
+    pub = threading.Thread(target=publish, daemon=True)
+    pub.start()
+    return stop, pub
+
+
+def _ends_within(pump: threading.Thread, done: dict, t0: float, bound: float) -> None:
+    pump.join(5)
+    assert "at" in done, "the stream did not end"
+    assert done["at"] - t0 < scaled(bound), done["at"] - t0
+
+
+@contextmanager
+def _revokes_seen_clean_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A revoke made inside this block is read by a stream's revision pass either before it or after its clean write,
+    never between the revoke's dirty marker and its clean one (a pass in that window reads None and would add a check
+    a test counting checks cannot tell apart)."""
+    gate = threading.Lock()
+    held = [False]      # whether a dirty write took the gate; set and cleared only by the revoking thread
+    real_bump = firejournal.bump_revision
+    real_read = web_server._pair_revision
+
+    def release() -> None:
+        if held[0]:
+            held[0] = False
+            gate.release()
+
+    def bump(root: Any, *, dirty: bool) -> None:
+        if dirty and not held[0]:
+            gate.acquire()
+            held[0] = True
+        try:
+            real_bump(root, dirty=dirty)
+        except BaseException:
+            if dirty:
+                release()       # the dirty write failed: no clean write follows, so nothing else will release
+            raise
+        finally:
+            if not dirty:
+                release()       # a clean write, however it ended, closes the window a dirty write opened (if any)
+
+    def read(root: Any) -> "str | None":
+        with gate:
+            return real_read(root)
+
+    with monkeypatch.context() as m:
+        m.setattr(firejournal, "bump_revision", bump)
+        m.setattr(web_server, "_pair_revision", read)
+        try:
+            yield
+        finally:
+            release()       # a dirty write whose commit failed made no clean write: the gate is let go at the end
+
+
+def _spy_device_live(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    real = CockpitDB.device_live
+
+    def spy(self: Any, device_id: str) -> bool:
+        calls.append(device_id)
+        return real(self, device_id)
+
+    monkeypatch.setattr(CockpitDB, "device_live", spy)
+    return calls
+
+
+def test_231_a_revoke_by_the_terminal_cli_ends_an_open_stream_on_its_next_pass(src) -> None:
+    """The box-side ``levain cockpit pair --revoke`` writes the journal directly, so no epoch of this server moves."""
+    from levain.cli import main
+
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            assert main(["cockpit", "pair", "--data-root", str(httpd.broker.data_root), "--revoke", device]) == 0
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_by_another_os_process_ends_an_open_stream_on_its_next_pass(src) -> None:
+    repo_root = str(Path(__file__).resolve().parents[1])
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            subprocess.run([sys.executable, "-m", "levain", "cockpit", "pair", "--data-root",
+                            str(httpd.broker.data_root), "--revoke", device],
+                           check=True, timeout=60, env={**os.environ, "PYTHONPATH": repo_root},
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_whose_clean_write_fails_still_ends_the_open_stream(src, monkeypatch) -> None:
+    """The revoke commits and its marker stays dirty (the clean write cannot be made): a stream that cannot compare
+    the revision checks its device instead."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            real = firejournal.bump_revision
+            calls: list[int] = []
+
+            def only_the_first(*a: Any, **kw: Any) -> None:
+                calls.append(1)
+                if len(calls) > 1:
+                    raise OSError(28, "No space left on device")
+                real(*a, **kw)
+
+            monkeypatch.setattr(firejournal, "bump_revision", only_the_first)
+            monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0)
+            _revoke_journal(httpd, [device])
+            t0 = time.monotonic()
+            assert revision_identity(httpd.broker.data_root) is None, "the marker stayed dirty"
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            s.close()
+
+
+def test_231_an_unreadable_revision_neither_ends_a_good_stream_nor_hides_a_revoke(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, chunks, pump, done = _stream_up(httpd, port, tok)
+        stop, pub = _flow(httpd)
+        try:
+            def denied(_root: Any) -> Any:
+                raise PermissionError(13, "Permission denied")
+
+            calls = _spy_device_live(monkeypatch)
+            monkeypatch.setattr(web_server, "revision_identity", denied)
+            before = len(_ids(chunks))
+            time.sleep(1.5)
+            assert "at" not in done, "a revision that cannot be read ended a good stream"
+            assert len(_ids(chunks)) > before, "the stream still got frames"
+            assert len(calls) > 1.5 / 0.5 + 2, f"an uncomparable revision checks on every pass, not {len(calls)} times"
+            _revoke_journal(httpd, [device])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_check_that_passed_on_a_dirty_marker_lets_no_frame_through_after_the_revoke_commits(
+        src, monkeypatch) -> None:
+    """L3 r1 codex HIGH: a revoke made by another process while the stream's check passes on the revoke's own dirty
+    marker (the check runs between the dirty write and the commit, so it still sees the device live), and the revoke's
+    clean write then fails, so the marker stays dirty. A pass that cannot compare the revision runs the device check
+    every time, so no frame passes on the strength of that earlier check: at most the one frame already past its
+    check when the revoke commits is written, and the stream ends."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        s, chunks, pump, done = _stream_up(httpd, port, tok)
+        w = httpd.stream_watcher
+        armed, checked = threading.Event(), threading.Event()
+        real_live = CockpitDB.device_live
+
+        def live(self: Any, device_id: str) -> bool:
+            out = real_live(self, device_id)
+            if armed.is_set() and device_id == device:
+                checked.set()
+            return out
+
+        real_bump = firejournal.bump_revision
+        committed: dict = {}
+
+        def dirty_waits_for_a_check_then_clean_fails(root: Any, *, dirty: bool) -> None:
+            if dirty:
+                real_bump(root, dirty=True)
+                armed.set()
+                assert checked.wait(scaled(5)), "the stream ran a check on the dirty marker before the commit"
+                return
+            if "seq" not in committed:      # the first clean write runs after the commit
+                with w._lock:
+                    committed["seq"] = w._seq
+                committed["at"] = time.monotonic()
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(CockpitDB, "device_live", live)
+        monkeypatch.setattr(firejournal, "bump_revision", dirty_waits_for_a_check_then_clean_fails)
+        monkeypatch.setattr(firejournal, "_REVISION_CLEAN_PAUSE_S", 0.0)
+        stop, pub = _flow(httpd)
+        try:
+            time.sleep(0.4)
+            assert len(_ids(chunks)) > 3, "the flow is steady before the revoke"
+            _revoke_journal(httpd, [device])
+            assert revision_identity(httpd.broker.data_root) is None, "the marker stayed dirty"
+            _ends_within(pump, done, committed["at"], 0.5 + 0.6)
+            after = [i for i in _ids(chunks) if i > committed["seq"]]
+            assert len(after) <= 1, f"frames published after the revoke committed were written: {after}"
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_broker_that_raises_on_a_recheck_ends_the_stream_cleanly(src, monkeypatch) -> None:
+    """L3 r1 deepseek MED: the journal handle is taken inside the check's guard, so a broker that raises when a pass
+    must run the device check ends the stream (a check that cannot run), never an unhandled exception in the
+    stream's handler thread."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, _chunks, pump, done = _stream_up(httpd, port, tok_a)
+        errors: list[BaseException] = []
+        real_handle_error = httpd.handle_error
+
+        def recorded(request: Any, client_address: Any) -> None:
+            errors.append(sys.exc_info()[1])
+            real_handle_error(request, client_address)
+
+        monkeypatch.setattr(httpd, "handle_error", recorded)
+        raised: list[int] = []
+
+        def broken() -> Any:
+            raised.append(1)
+            raise RuntimeError("the broker cannot hand out its journal")
+
+        try:
+            monkeypatch.setattr(httpd.broker, "active_db", broken)
+            _revoke_journal(httpd, [b])      # another device's revoke moves the revision: the next pass checks
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 0.5 + 0.6)
+            assert raised, "the recheck asked the broker for its journal"
+            assert errors == [], f"the stream's handler thread died with an unhandled exception: {errors!r}"
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat(src) -> None:
+    """The backstop (design E1): a revoke that bypasses the journal's write path (a raw UPDATE of ``revoked_at``, a
+    hand edit, another tool) moves neither the epoch nor the revision, so only the heartbeat re-check can see it. This
+    is the one test that ends a stream that way: the revision identity is asserted unmoved, so the end cannot be the
+    revision path (``test_rt2_`` and ``test_g2_`` revoke through ``revoke_devices``, which moves it).
+
+    Red-first does not apply: it passes on the code as written. It was shown able to fail by running it with the
+    heartbeat at 30 s (the stream then outlives the bound)."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 0.4
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            before =revision_identity(httpd.broker.data_root)
+            assert before is not None, "a clean revision to compare"
+            time.sleep(0.6)         # a pass or two on the open stream first
+            assert "at" not in done, "the stream is open before the revoke"
+            conn = sqlite3.connect(httpd.broker.data_root / "cockpit.db", isolation_level=None, timeout=5)
+            try:
+                conn.execute("UPDATE paired_devices SET revoked_at = ? WHERE id = ?",
+                             (datetime.now(timezone.utc).isoformat(), device))
+            finally:
+                conn.close()
+            t0 = time.monotonic()
+            assert revision_identity(httpd.broker.data_root) == before, "no revision moved: the revision path cannot end it"
+            _ends_within(pump, done, t0, 0.4 + 0.6)
+            assert revision_identity(httpd.broker.data_root) == before, "still unmoved when the stream ended"
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_landing_between_the_credential_check_and_the_stream_is_seen_by_the_first_check(
+        src, monkeypatch) -> None:
+    """The baseline is the revision read BEFORE the lookup that admitted the request: a revoke committing after
+    ``verify_device`` returned moves it, so the first check (before the hello frame) sees the device gone."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        armed = threading.Event()
+        real = CockpitDB.verify_device
+
+        def verify_then_revoke(self: Any, *a: Any, **kw: Any) -> Any:
+            out = real(self, *a, **kw)
+            if armed.is_set():
+                armed.clear()
+                _revoke_journal(httpd, [device])
+            return out
+
+        monkeypatch.setattr(CockpitDB, "verify_device", verify_then_revoke)
+        armed.set()
+        s, chunks, pump, done = _open_stream(port, tok)
+        try:
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the revoke landed between the credential check and the stream"
+            assert b"event: hello" not in b"".join(c for _t, c in chunks), "no hello frame was written"
+        finally:
+            s.close()
+
+
+def test_231_a_revoke_landing_between_a_cache_hit_and_the_stream_is_seen_by_the_first_check(src, monkeypatch) -> None:
+    """The hit path of the credential check: the stream is ADMITTED from the cache (no journal lookup ran for it) and
+    its baseline is the revision that hit was compared with, so a revoke landing after that compare read is seen by
+    the first check. The two admission asserts below are what tell this apart from a 403 refusal of a request that
+    missed the cache and met the revoke in its own lookup (which also ends without a hello frame)."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        device, tok = _pair(port)
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200   # primes the cache
+        assert httpd.pair_verified, "the cache is primed"
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def counted_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", counted_verify)
+        armed = threading.Event()
+        real = web_server._pair_revision
+
+        def read_then_revoke(root: Any) -> "str | None":
+            value = real(root)
+            if armed.is_set():
+                armed.clear()
+                _revoke_journal(httpd, [device])
+            return value
+
+        monkeypatch.setattr(web_server, "_pair_revision", read_then_revoke)
+        armed.set()
+        s, chunks, pump, done = _open_stream(port, tok)
+        try:
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the revoke landed after the hit's revision read"
+            assert b"event: hello" not in b"".join(c for _t, c in chunks), "no hello frame was written"
+            assert lookups == [], "admitted from the cache: no journal lookup ran for this request"
+            head = b"".join(c for _t, c in chunks)
+            assert head.startswith(b"HTTP/1.1 200") or head.startswith(b"HTTP/1.0 200"), head[:80]
+        finally:
+            s.close()
+
+
+def test_231_a_stream_admitted_from_the_cache_starts_with_the_hits_revision_as_its_baseline(src, monkeypatch) -> None:
+    """The hit path hands the revision it compared to the stream (``self._pair_rev_seen = rev``): on an idle stream
+    nothing moved, so its first pass and the passes after it run no device check. With the baseline left at None the
+    first pass would run one, which is what this counts. (T5b above pins the admission and the revoke; this pins the
+    assignment.)"""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _device, tok = _pair(port)
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200   # primes the cache
+        assert httpd.pair_verified, "the cache is primed"
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def counted_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", counted_verify)
+        checks = _spy_device_live(monkeypatch)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            time.sleep(1.2)         # two idle passes at least
+            assert "at" not in done, "the admitted stream is open"
+            assert lookups == [], "admitted from the cache"
+            assert checks == [], f"nothing moved, so no device check ran on any pass: {checks}"
+        finally:
+            s.close()
+
+
+def test_231_a_stream_admitted_as_a_follower_starts_with_the_leaders_revision_as_its_baseline(src, monkeypatch) -> None:
+    """The follower path (``self._pair_rev_seen = flight.rev``): a stream request that waited on another request's
+    lookup of the same token takes the revision that lookup read, so its idle passes run no device check."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _device, tok = _pair(port)
+        entered, release = threading.Event(), threading.Event()
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def held_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            if len(lookups) == 1:
+                entered.set()
+                assert release.wait(scaled(10)), "the leader's lookup was never released"
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", held_verify)
+        checks = _spy_device_live(monkeypatch)
+        socks = [_open_stream(port, tok)]                   # the leader: its lookup is held in verify_device
+        assert entered.wait(scaled(5)), "the leader's lookup began"
+        socks.append(_open_stream(port, tok))               # the follower: waits on the leader's flight
+        wait_until(lambda: any(f.followers >= 1 for f in list(httpd.pair_flights.values())), 5, what="a follower waiting")
+        release.set()
+        try:
+            wait_until(lambda: httpd.stream_watcher.stream_count == 2, 5, what="both streams open")
+            time.sleep(1.2)
+            assert len(lookups) == 1, f"one lookup served both requests: {lookups}"
+            assert checks == [], f"nothing moved, so neither stream ran a device check: {checks}"
+            assert all("at" not in done for _s, _c, _p, done in socks), "both streams stay open"
+        finally:
+            for s, _c, _p, _d in socks:
+                s.close()
+
+
+def test_231_an_unrelated_devices_revoke_by_another_process_keeps_the_stream_and_checks_once(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, chunks, pump, done = _stream_up(httpd, port, tok_a)
+        calls = _spy_device_live(monkeypatch)
+        stop, pub = _flow(httpd)
+        try:
+            time.sleep(0.2)
+            calls.clear()
+            with _revokes_seen_clean_only(monkeypatch):
+                _revoke_journal(httpd, [b])
+            before = len(_ids(chunks))
+            time.sleep(1.5)
+            assert "at" not in done, "another device's revoke ended this stream"
+            assert len(_ids(chunks)) > before, "the stream still got frames"
+            assert calls.count(a) == 1, f"one check for the one new revision, not {calls}"
+            _revoke_journal(httpd, [a])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
+
+
+def test_231_a_revoke_landing_during_the_streams_own_recheck_is_seen_by_the_next_pass(src, monkeypatch) -> None:
+    """A check reads the revision BEFORE the journal read: a revoke landing inside the check leaves a newer revision
+    than the one the check read, so the next pass sees it move. (Read after the journal, the check would hold the
+    revoke's own clean revision and hide the revoke.) What it does not pin is the order of adopting against the
+    check: a failing check ends the stream either way."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        a, tok_a = _pair(port, label="a")
+        b, _tok_b = _pair(port, label="b")
+        s, _chunks, pump, done = _stream_up(httpd, port, tok_a)
+        armed = threading.Event()
+        real = CockpitDB.device_live
+
+        def live_then_revoke(self: Any, device_id: str) -> bool:
+            out = real(self, device_id)
+            if armed.is_set() and device_id == a:
+                armed.clear()
+                _revoke_journal(httpd, [a])
+                return True
+            return out
+
+        monkeypatch.setattr(CockpitDB, "device_live", live_then_revoke)
+        stop, pub = _flow(httpd)    # a pass per frame: the two checks are not each an idle poll apart
+        try:
+            armed.set()
+            with _revokes_seen_clean_only(monkeypatch):
+                _revoke_journal(httpd, [b])
+            t0 = time.monotonic()
+            _ends_within(pump, done, t0, 1.1)
+            assert not armed.is_set(), "the stream's check ran and the revoke landed inside it"
+        finally:
+            stop.set()
+            pub.join(2)
+            s.close()
 
 
 # --- RQ-6 and the box-side CLI ---------------------------------------------------------------------------------------
@@ -607,8 +1114,10 @@ def test_g1_a_pre_auth_pair_refusal_closes_without_reading_the_body(src) -> None
 
 def test_g2_a_cross_process_revoke_during_a_steady_event_flow_ends_the_stream_within_one_heartbeat(src) -> None:
     """G2: the DB liveness re-check runs on its own deadline on EVERY pass, the data path included: events flowing
-    faster than the heartbeat no longer starve it, so a revoke written straight to the journal (no epoch bump)
-    still ends the stream within one heartbeat."""
+    faster than the heartbeat no longer starve it. Since levain#231 THIS revoke (``revoke_devices`` writes the
+    journal directly, no epoch bump, but does move the revision) ends the stream through the revision compare on its
+    next frame, well inside one heartbeat; the heartbeat re-check itself, which covers a revoke that moves no
+    revision, is pinned by ``test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat``."""
     from datetime import datetime, timezone
 
     from levain.cockpit.firejournal import CockpitDB
