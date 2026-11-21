@@ -31,6 +31,7 @@ from tests.test_dashboard import _make_levain_install
 FRESH_KEYS = ("valid_until", "stale", "pending")
 # every variable the cockpit's kernel panels read from the environment to find a store outside the install
 KERNEL_ENV = (board_store.ITEMS_ENV, board_context.ANNEAL_ENV, board_context.FLOW_ENV, desk_port.DESKCMD_ENV)
+BODY_VOLATILE = ("etag", "as_of", "valid_until", "stale", "pending", "generated_at")      # head fields that are not the body
 MIN_HEALTHY_SHARE = 0.5      # of the derived panels, the share whose ORACLE read is a read and not a failure
 
 
@@ -77,8 +78,14 @@ def pairs(tmp_path_factory, scratch_home):
             built[c.name] = rig.build_pair(c, tmp_path_factory.mktemp(c.name))
         yield built
     finally:
-        for p in built.values():
-            p.close()
+        failures: list = []
+        for p in built.values():      # every host is stopped, whichever one fails to
+            try:
+                p.close()
+            except BaseException as exc:  # noqa: BLE001 - collected, the first is raised after the rest are closed
+                failures.append(exc)
+        if failures:
+            raise failures[0]
 
 
 @pytest.fixture(scope="module")
@@ -158,6 +165,11 @@ def test_a_rule_that_is_not_a_registered_name_is_a_problem_line_not_a_crash(kind
     ({"path": "*.*"}, "literal"),
     ({"added": "21-11-2026"}, "added"),
     ({"added": "2026-2-1"}, "added"),
+    ({"added": 20261121}, "added"),
+    ({"added": None}, "added"),
+    ({"added": "2026-W47-6"}, "added"),
+    ({"added": "20261121"}, "added"),
+    ({"review_by": 20270221}, "review_by"),
     ({"review_by": "soon"}, "review_by"),
     ({"review_by": "2026-11-21"}, "later than added"),
     ({"review_by": "2026-01-01"}, "later than added"),
@@ -371,6 +383,15 @@ def test_an_etag_difference_is_explained_only_for_a_panel_the_oracle_derived(app
     assert (rig.classify([t], approved, rig.fixed_clock(), derived).unmatched == []) is ok
 
 
+def test_a_naive_clock_fails_a_clock_rule_closed():
+    from datetime import datetime
+    assert rig._iso_not_before("2999-01-01T00:00:00+00:00", rig.fixed_clock())
+    assert not rig._iso_not_before("2999-01-01T00:00:00+00:00", datetime(2026, 11, 21))
+    t = rig.Triple(("manifest", "panels", "x", "valid_until"), "extra_key_in_subject", None, "2999-01-01T00:00:00+00:00")
+    assert rig.entry_matches(next(e for e in rig.load_approved() if e["id"] == "AD-fresh-valid_until-manifest"), t,
+                             datetime(2026, 11, 21)) is False
+
+
 def test_a_rule_that_compares_with_the_clock_fails_closed_without_one(approved):
     t = rig.Triple(("manifest", "panels", "x", "valid_until"), "extra_key_in_subject", None, "2999-01-01T00:00:00+00:00")
     assert rig.classify([t], approved).unmatched == [t]
@@ -405,15 +426,18 @@ def test_the_serve_composed_panels_carry_equal_etags_on_both_sides(pairs, name):
 
 @pytest.mark.parametrize("name", IDS)
 def test_each_side_agrees_with_itself_and_distinct_panels_have_distinct_etags(pairs, name):
-    """A side's manifest etag is the etag its payload carries and a second read gives the same tag; panels of different
-    content never share one on a side (a constant tag would let a 304 hide any change)."""
+    """A side's manifest etag is the etag its payload carries and a second read gives the same tag; panels whose served
+    bodies differ never share one on a side (a constant tag would let a 304 hide any change). Panels with the same body
+    may share one: that is not asserted either way."""
     p = pairs[name]
     for ck in (p.bare, p.attached):
         manifest = ck.manifest(rig.CRED)["panels"]
         for pid in p.derived:
             assert ck.panel(pid)["etag"] == manifest[pid]["etag"] == ck.manifest(rig.CRED)["panels"][pid]["etag"], (name, pid)
+        bodies = {pid: {k: v for k, v in rig.wire(ck.panel(pid)).items() if k not in BODY_VOLATILE} for pid in manifest}
         tags = {pid: h["etag"] for pid, h in manifest.items()}
-        assert len(set(tags.values())) == len(tags), (name, sorted(t for t in tags if list(tags.values()).count(tags[t]) > 1))
+        clash = [(a, b) for a in tags for b in tags if a < b and tags[a] == tags[b] and bodies[a] != bodies[b]]
+        assert clash == [], (name, clash)
     assert any(p.bare.panel(pid)["etag"] != p.attached.panel(pid)["etag"] for pid in p.derived), name
 
 

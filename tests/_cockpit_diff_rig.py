@@ -34,7 +34,6 @@ MAX_CYCLES = 6
 HEALTHY = ("ok", "partial", "empty")      # a derive status that is a read, not a failure
 MIN_REASON = 40
 PROBE_VERSION = "#version"      # the probe's version string, beside its per-panel etags in the ``probe`` observation
-BANNED_REASONS = frozenset({"todo", "known", "tbd", "flaky", "fixme", "wip"})
 
 
 # ------------------------------------------------------------------------------------------------------------ the two cockpits
@@ -87,7 +86,9 @@ def build_pair(config: RigConfig, tmp_path: Path) -> Pair:
     on every way out that does not return the pair."""
     if config.now is None:
         config = dataclasses.replace(config, now=fixed_clock())
-    src = config.install(tmp_path)
+    install_dir = tmp_path / "install"      # a sibling of the host's directory: neither can see or collide with the other
+    install_dir.mkdir()
+    src = config.install(install_dir)
     bare, ck = _cockpit(config, src), _cockpit(config, src)
     root = tmp_path / "host"
     root.mkdir()
@@ -308,6 +309,7 @@ def self_diff(pair: Pair, side: str = "bare") -> list:
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _is_etag(old: Any, new: Any) -> bool:
@@ -326,7 +328,7 @@ def _etag_rule(t: "Triple", now: datetime | None, derived: Any = None) -> bool:
 def _iso_not_before(value: Any, now: datetime | None) -> bool:
     if value is None:
         return True
-    if not isinstance(value, str) or now is None:
+    if not isinstance(value, str) or now is None or now.tzinfo is None:      # a naive clock cannot be compared: closed
         return False
     try:
         at = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -410,9 +412,8 @@ def entry_problems(entries: Any) -> list:
         else:
             seen.add(e["id"])
         reason = e.get("reason")
-        if not isinstance(reason, str) or len(reason.strip()) < MIN_REASON \
-                or reason.strip().lower().rstrip(".") in BANNED_REASONS:
-            problems.append(f"{who}: reason is missing, empty, too short or a banned word")
+        if not isinstance(reason, str) or len(reason.strip()) < MIN_REASON:
+            problems.append(f"{who}: reason is missing, empty or shorter than {MIN_REASON} characters")
         if not isinstance(e.get("source"), str) or not e["source"].strip():
             problems.append(f"{who}: source is missing")
         if e.get("scope") not in SCOPES:
@@ -433,8 +434,11 @@ def entry_problems(entries: Any) -> list:
             problems.append(f"{who}: owner is a non-empty text")
         dates = {}
         for f in ("added", "review_by"):
-            try:
-                dates[f] = date.fromisoformat(str(e.get(f)))
+            raw = e.get(f)
+            try:      # text of exactly that form: fromisoformat alone takes other forms and, via str(), non-text
+                if not isinstance(raw, str) or not _DATE.fullmatch(raw):
+                    raise ValueError(raw)
+                dates[f] = date.fromisoformat(raw)
             except ValueError:
                 problems.append(f"{who}: {f} is a YYYY-MM-DD date")
         if len(dates) == 2 and dates["review_by"] <= dates["added"]:
