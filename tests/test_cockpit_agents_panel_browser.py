@@ -20,7 +20,7 @@ import pytest
 
 from levain.agents.role import role_hash
 from levain.agents.spec import parse_spec, register_spec, retire_agent, set_operation
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
 pytest.importorskip("cryptography")
@@ -104,8 +104,10 @@ def _row(name: str) -> str:
     return (f"({ROWS}.find(r => r.querySelector('.clause').textContent.startsWith({json.dumps(name)})) || null)")
 
 
-def _tap_row(name: str) -> dict:
-    return {"tap": f"{_row(name)}.querySelector('.ext-meta')", "before": f"{_row(name)}.scrollIntoView({{block: 'center'}})", "ms": 20000}
+def _tap_row(name: str) -> list[dict]:
+    """Open one row's detail. Every tap in this file is a `landed_tap`: the board and the open detail repaint on a change, and a bare
+    press on a node a repaint replaces between its two halves makes no click (see `landed_tap`), so the page was left as it was."""
+    return landed_tap(f"{_row(name)}.querySelector('.ext-meta')", before=f"{_row(name)}.scrollIntoView({{block: 'center'}})", ms=20000)
 
 
 DETAIL = ("(() => { const d = document.querySelector('#levain-modal [data-agent-detail]'); if (!d) return null;"
@@ -113,6 +115,7 @@ DETAIL = ("(() => { const d = document.querySelector('#levain-modal [data-agent-
           " return JSON.stringify({verbs: [...d.querySelectorAll('[data-agent-verb]')].map(b => b.dataset.agentVerb),"
           " text: d.innerText, none: !!d.querySelector('.agent-detail-none'), clipped: m.scrollWidth > m.clientWidth + 1}); })()")
 CLOSED = "(!document.getElementById('levain-modal') || null) && 1"
+CLOSE_X = "document.querySelector('#levain-modal .modal-close')"
 OPEN = {"until": READ, "ms": 30000}
 
 
@@ -156,7 +159,7 @@ def test_the_detail_offers_each_verb_only_where_the_state_allows_it_and_none_on_
     order = ("operator", "w-firing", "w-paused", "w-unarmed", "w-retired")
     for name in order:
         target = "no operator agent" if name == "operator" else name
-        steps += [_tap_row(target), {"until": DETAIL, "ms": 20000}, {"eval": DETAIL}, {"tap": "document.querySelector('#levain-modal .modal-close')", "ms": 10000}, {"until": CLOSED, "ms": 10000}]
+        steps += [*_tap_row(target), {"until": DETAIL, "ms": 20000}, {"eval": DETAIL}, *landed_tap(CLOSE_X, CLOSED, ms=10000)]
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", _shots("agents_detail_" + width, steps))
     got = {name: json.loads(v) for name, v in zip(order, [x for x in out["values"] if isinstance(x, str) and '"verbs"' in x][1::2])}   # each `until` collects too; the eval is the second
@@ -176,14 +179,12 @@ def test_a_verb_round_trip_hits_the_verbspec_and_the_row_moves(width, tmp_path, 
     verb = lambda v: f"document.querySelector('#levain-modal [data-agent-verb={v}]')"
     steps: list[dict] = [WIDTHS[width], HOME, OPEN, SETTLE,
                          # pause: one tap, no confirm; the unarmed agent moves to Paused
-                         _tap_row("w-unarmed"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_pause"), "ms": 20000},
-                         {"until": moved("w-unarmed", "Paused") + " && 1", "ms": 30000},
-                         {"tap": "document.querySelector('#levain-modal .modal-close')", "ms": 10000}, {"until": CLOSED, "ms": 10000},
+                         *_tap_row("w-unarmed"), {"until": DETAIL, "ms": 20000}, *landed_tap(verb("agent_pause"), moved("w-unarmed", "Paused") + " && 1", ms=30000),
+                         *landed_tap(CLOSE_X, CLOSED, ms=10000),
                          # retire: the first tap only asks, the second tap retires
-                         _tap_row("w-paused"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_retire"), "ms": 20000},
+                         *_tap_row("w-paused"), {"until": DETAIL, "ms": 20000}, *landed_tap(verb("agent_retire"), ms=20000),
                          {"eval": f"{verb('agent_retire')}.textContent"},
-                         {"tap": verb("agent_retire"), "ms": 20000},
-                         {"until": moved("w-paused", "Retired") + " && 1", "ms": 30000}]
+                         *landed_tap(verb("agent_retire"), moved("w-paused", "Retired") + " && 1", ms=30000)]
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", steps)
         after = {n: s.state(n) for n in ("unarmed", "paused", "firing")}
