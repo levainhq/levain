@@ -125,6 +125,23 @@ def _attempt(fn: Callable[[], Any]) -> Any:
         return _raised(exc)
 
 
+def raised_paths(value: Any, path: tuple = ()) -> list:
+    """Where in a wire-form observation a read raised (the ``{"raised": ...}`` wrapper of ``_attempt``). The same raise on
+    both sides compares equal, so a caller that means to read something asks for these and expects none."""
+    if isinstance(value, dict):
+        if set(value) == {"raised"}:
+            return [path]
+        return [p for k, v in value.items() for p in raised_paths(v, path + (k,))]
+    if isinstance(value, list):
+        return [p for i, v in enumerate(value) for p in raised_paths(v, path + (i,))]
+    return []
+
+
+def triple_raised(t: "Triple") -> bool:
+    """A difference that is a read raising on one side (or a value holding one), not a difference in what was read."""
+    return bool(raised_paths(t.old) or raised_paths(t.new))
+
+
 # ---------------------------------------------------------------------------------------------------------------- observation
 
 
