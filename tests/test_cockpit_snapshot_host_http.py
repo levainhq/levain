@@ -45,7 +45,6 @@ class Reads:
         self.provider_reads: list[str] = []
         self.deriving_threads: list[str] = []
         self.rows = [_row(1)]
-        self.slow_s = 0.0
         self._lock = threading.Lock()
 
     def spy_on(self, ck: Cockpit) -> None:
@@ -54,8 +53,6 @@ class Reads:
         def spy_read(spec, st, ctx):
             with self._lock:
                 self.provider_reads.append(spec.id)
-            if self.slow_s and spec.id != "od":
-                time.sleep(self.slow_s)     # a slow runner's panels: a wave of derives takes time
             return read_panel(spec, st, ctx)
 
         def spy_derive(pid):
@@ -163,8 +160,8 @@ def _loop_at_rest(loop: Any) -> bool:
 def _derived_and_idle(host: SnapshotHost) -> bool:
     """Every plan has a row, discovery has added the panels it will, and the loop is at rest (``_loop_at_rest``), now and
     again after a quiet interval. A host whose token is unknown re-derives on a time bucket of ``unknown_token_s``, and every
-    panel re-derives on the loop's ``backstop_s`` (a wave that moves panel etags with no store change); both are pinned
-    large here so neither turns inside a test, however slow the runner is."""
+    panel re-derives on the loop's ``backstop_s`` (a derive that touches the store moves the token, so a second wave
+    follows); both are pinned large here so neither turns inside a test."""
     host.loop._unknown_token_s = 1e9
     host.loop._backstop_s = 1e9
     plans = {p.id for p in host._plans()}
@@ -469,19 +466,23 @@ class TestStream:
     ) -> None:
         self._first_subscribe_then_a_change_to_od(tmp_path, monkeypatch)
 
-    def test_the_loops_backstop_wave_does_not_turn_inside_the_first_subscribe_test(self, tmp_path: Path, monkeypatch) -> None:
-        # levain#229: the loop re-derives EVERY panel each ``backstop_s`` (30 s by default, measured 11-20 from the derive
-        # reasons) and each wave announces a new etag for od and every other panel. The CI failure had two such waves right
-        # after the stream's adoption point, and the etag the test waited for never came. Here the backstop is 1 s and the
-        # panels are slow, so a host-at-rest wait that does not pin the backstop never sees the host at rest.
+    def test_a_host_seen_at_rest_stays_at_rest_past_the_loops_backstop(self, tmp_path: Path, monkeypatch) -> None:
+        # levain#229: with the loop's backstop at 1 s, the host the stream tests wait on is derived again every second unless
+        # ``_derived_and_idle`` pins it: a stream test then had waves of derives, and of announcements, inside its window.
         monkeypatch.setattr(snapshot_host_module, "DeriveLoop", functools.partial(DeriveLoop, backstop_s=1.0))
-        self._first_subscribe_then_a_change_to_od(tmp_path, monkeypatch, slow_s=0.2)
+        reads = Reads()
+        with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
+            assert _get(port, "/cockpit/manifest.json")[0] == 200       # builds the cockpit, attaches and starts its host
+            host = httpd._snapshot_host
+            _until(lambda: _derived_and_idle(host))
+            derived = reads.derives()
+            time.sleep(3.0)
+            assert reads.derives() == derived, "the host derived again after it was seen at rest"
 
     @staticmethod
-    def _first_subscribe_then_a_change_to_od(tmp_path: Path, monkeypatch, slow_s: float = 0.0) -> None:
+    def _first_subscribe_then_a_change_to_od(tmp_path: Path, monkeypatch) -> None:
         # the watcher builds the cockpit under its own lock on the first subscribe: attaching must not need that lock
         reads = Reads()
-        reads.slow_s = slow_s
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
             assert httpd.cockpit is None
             c, r = _open(port)
