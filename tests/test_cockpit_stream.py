@@ -147,6 +147,37 @@ class TestWatcher:
         finally:
             w.stop()
 
+    def test_a_position_too_long_to_parse_is_no_position_and_starts_nothing_it_cannot_stop(self) -> None:
+        # a digit run past the interpreter's int-string limit used to raise inside subscribe, AFTER the watcher thread
+        # had started, so no subscription existed to stop it and every such request started another
+        assert stream.parse_event_id("E:" + "9" * 5000) is None
+        w = _watcher(_Feed(a="1"))
+        sub = w.subscribe("E:" + "9" * 5000)
+        try:
+            assert sub.hello["resync"] is True
+        finally:
+            w.stop()
+
+    def test_a_subscribe_that_raises_after_starting_the_thread_stops_it(self, monkeypatch: Any) -> None:
+        w = _watcher(_Feed(a="1"))
+
+        def boom(_last: Any) -> Any:
+            raise RuntimeError("no usable position")
+
+        monkeypatch.setattr(stream, "parse_event_id", boom)
+        try:
+            w.subscribe("E:1")
+            raised = False
+        except RuntimeError:
+            raised = True
+        assert raised and not w.running
+        monkeypatch.undo()
+        again = w.subscribe(None)      # the watcher is usable afterwards
+        try:
+            assert again.hello["resync"] is False and w.running
+        finally:
+            w.stop()
+
     def test_a_watcher_that_stopped_is_a_new_epoch_so_an_old_position_resyncs(self) -> None:
         feed = _Feed(a="1")
         w = _watcher(feed)
@@ -485,14 +516,14 @@ class TestHttp:
         entered, release, seen = threading.Event(), threading.Event(), threading.Event()
         with _serving(src, cockpit=ck) as (port, httpd):
             w = httpd.stream_watcher
-            real = w._read_manifest
+            real = w._observe
 
             def held(*a: Any, **kw: Any):
                 entered.set()
                 release.wait(60)
                 return real(*a, **kw)
 
-            w._read_manifest = held       # type: ignore[method-assign]
+            w._observe = held       # type: ignore[method-assign]      # the baseline build, on the probe path and off it
             box: dict[str, Any] = {}
 
             def client() -> None:
@@ -544,10 +575,12 @@ class TestHttp:
                        for rec in caplog.records)
             # the stream's slot is released before the connection closes, so a failed subscribe leaks none
             assert httpd.stream_gate._value == stream.DEFAULT_MAX_STREAMS
+            del httpd.stream_watcher.subscribe      # the real subscribe again: a healthy stream follows the failed one
             c2 = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
             try:
                 c2.request("GET", "/cockpit/events")
-                assert c2.getresponse().status == 200      # the server still answers
+                r2 = c2.getresponse()
+                assert r2.status == 200 and "event: hello" in _read_frame(r2)
             finally:
                 c2.close()
 

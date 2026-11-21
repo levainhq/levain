@@ -5458,7 +5458,7 @@ class _Handler(GuardedHandler):
             try:
                 sub = srv.stream_watcher.subscribe(self.headers.get("Last-Event-ID"))
             except Exception as exc:  # noqa: BLE001 - the cockpit could not start: the stream ends, the client reconnects
-                _log.warning("cockpit stream: subscribe failed: %s: %s", type(exc).__name__, exc)
+                _log.warning("cockpit stream: subscribe failed: %s: %s", type(exc).__name__, exc, exc_info=True)
                 return
 
             def write(chunk: bytes) -> None:

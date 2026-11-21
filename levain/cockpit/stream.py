@@ -64,7 +64,10 @@ def parse_event_id(last_event_id: str | None) -> tuple[str, int] | None:
     epoch, _, seq = (last_event_id or "").rpartition(":")
     if not epoch or not seq.isdigit():
         return None
-    return epoch, int(seq)
+    try:
+        return epoch, int(seq)
+    except ValueError:      # a digit run past the interpreter's int-string limit is no position either
+        return None
 
 
 class Subscription:
@@ -161,25 +164,35 @@ class Watcher:
     # ---- subscribe / unsubscribe -------------------------------------------------
     def subscribe(self, last_event_id: str | None) -> Subscription:
         with self._lock:
-            if not self._subs:
-                self._start_locked()
-            pos = parse_event_id(last_event_id)
-            replay: list[tuple[int, str, dict[str, Any]]] = []
-            resync = False
-            if last_event_id and pos is None:
-                resync = True       # a position that cannot be read is no position the ring can honour
-            elif pos is not None:
-                ep, seq = pos
-                first = self._ring[0][0] if self._ring else self._seq + 1
-                if ep == self._epoch and first - 1 <= seq <= self._seq:
-                    replay = [e for e in self._ring if e[0] > seq]
-                else:
-                    resync = True
-            sub = Subscription({"epoch": self._epoch, "resync": resync}, f"{self._epoch}:{self._seq - len(replay)}")
-            for seq, event, data in replay:
-                sub.q.put_nowait((event, data, f"{self._epoch}:{seq}"))
-            self._subs.add(sub)
-            return sub
+            started = not self._subs
+            try:
+                return self._subscribe_locked(last_event_id, started)
+            except BaseException:
+                # a subscribe that fails must not leave the thread it started behind: no subscription exists to stop it
+                if started and not self._subs:
+                    self._stop_locked()
+                raise
+
+    def _subscribe_locked(self, last_event_id: str | None, started: bool) -> Subscription:
+        if started:
+            self._start_locked()
+        pos = parse_event_id(last_event_id)
+        replay: list[tuple[int, str, dict[str, Any]]] = []
+        resync = False
+        if last_event_id and pos is None:
+            resync = True       # a position that cannot be read is no position the ring can honour
+        elif pos is not None:
+            ep, seq = pos
+            first = self._ring[0][0] if self._ring else self._seq + 1
+            if ep == self._epoch and first - 1 <= seq <= self._seq:
+                replay = [e for e in self._ring if e[0] > seq]
+            else:
+                resync = True
+        sub = Subscription({"epoch": self._epoch, "resync": resync}, f"{self._epoch}:{self._seq - len(replay)}")
+        for seq, event, data in replay:
+            sub.q.put_nowait((event, data, f"{self._epoch}:{seq}"))
+        self._subs.add(sub)
+        return sub
 
     def unsubscribe(self, sub: Subscription) -> None:
         with self._lock:
