@@ -11,6 +11,17 @@
     "review_by": "2027-02-21"
   },
   {
+    "id": "AD-freshness-block",
+    "scope": "manifest",
+    "path": "freshness",
+    "kind": "extra_key_in_subject",
+    "reason": "The attached manifest carries a top-level freshness block (worker state, heartbeat age, the panels being derived, the stream state) that says whether the layer behind the page is alive; a bare cockpit has no worker and no layer to report on.",
+    "source": "levain.cockpit.engine.Cockpit._manifest_compute (the attached branch)",
+    "owner": "levain-cockpit",
+    "added": "2026-11-21",
+    "review_by": "2027-02-21"
+  },
+  {
     "id": "AD-fresh-keys-payload",
     "scope": "payload",
     "path": "*.*.valid_until|stale|pending",
