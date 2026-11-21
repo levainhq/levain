@@ -14,7 +14,6 @@ Known limits, each owned elsewhere or accepted:
 from __future__ import annotations
 
 import copy
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
