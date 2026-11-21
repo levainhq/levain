@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 
 import pytest
 
@@ -720,7 +721,7 @@ def test_loop_threads_publish_and_react_to_dirty():
 
 
 def test_per_plan_backstop():
-    loop, writer, clock, calls = make([PanelPlan("fast"), PanelPlan("heavy", heavy=True, backstop_s=300.0)], backstop_s=30.0)
+    loop, writer, clock, calls = make([PanelPlan("fast"), PanelPlan("heavy", backstop_s=300.0)], backstop_s=30.0)
     settle(loop, clock)
     clock.t += 30
     assert loop.run_once(clock.t) == ["fast"]
@@ -957,6 +958,21 @@ def test_unknown_input_detail_carries_the_failure_type(tmp_path, monkeypatch):
     loop.run_once(clock.t)
     assert "PermissionError" in writer.streams[-1]["detail"]
     monkeypatch.setattr(derive.os, "scandir", real)
+    loop.stop()
+
+
+def test_a_panel_whose_only_input_cannot_be_fingerprinted_derives_by_the_timers_and_the_backstop_only():
+    @dataclass(frozen=True)
+    class Unknown:       # a kind fingerprint() does not know
+        name: str = "x"
+
+    assert fingerprint(Unknown()) is None
+    loop, writer, clock, calls = make([PanelPlan("p", inputs=(Unknown(),))], backstop_s=1000.0)
+    ran = []
+    for t in (0, 1, 2, 3):
+        clock.t = float(t)
+        ran.append(loop.run_once(clock.t))
+    assert ran == [["p"], [], [], []]
     loop.stop()
 
 
@@ -1430,7 +1446,7 @@ def test_set_plans_keeps_the_history_of_a_changed_plan_and_derives_again_only_wh
     loop, writer, clock, calls = make([PanelPlan("a", inputs=(File(str(f)),))], backstop_s=1e9)
     settle(loop, clock)
     # cadence, flags and the timeout change; the inputs are equal: the fingerprint it derived from still holds
-    loop.set_plans([PanelPlan("a", inputs=(File(str(f)),), every_s=500.0, heavy=True, on_token=True, timeout_s=7.0)])
+    loop.set_plans([PanelPlan("a", inputs=(File(str(f)),), every_s=500.0, on_token=True, timeout_s=7.0)])
     assert loop.run_once(clock.t) == []
     assert loop._plans["a"].every_s == 500.0
     clock.t += 500

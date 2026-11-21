@@ -256,7 +256,7 @@ class _Fingerprinter:
 
 
 def fingerprint(inp: Any) -> str | None:
-    """The fingerprint of one input, None when it cannot be told (treated as "changed" by the loop).
+    """The fingerprint of one input, None when it cannot be told: the loop then derives the panel by its timers and the backstop only (see ``due_reason``).
 
     One-shot: a Sqlite input is opened, read and closed here. The loop keeps its own connections between polls.
     """
@@ -276,7 +276,6 @@ class PanelPlan:
     inputs: tuple = ()
     every_s: float | None = None
     on_token: bool = False
-    heavy: bool = False
     backstop_s: float | None = None  # this panel's backstop; None means the loop's default
     timeout_s: float | None = None  # this panel's derive deadline; None means DERIVE_TIMEOUT_S
 

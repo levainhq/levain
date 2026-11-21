@@ -17,7 +17,7 @@ import pytest
 from levain.cockpit.derive import File
 from levain.cockpit.engine import Cockpit, Read, ReadContext, RowIn
 from levain.cockpit.snapshot_host import (
-    DERIVE_THREAD_PREFIX, DISCOVER_ID, ENTITY_ID, HEAVY_PANELS, PSEUDO_PREFIX, ServerProbe, SnapshotHost,
+    DERIVE_THREAD_PREFIX, DISCOVER_ID, ENTITY_ID, PSEUDO_PREFIX, ServerProbe, SnapshotHost,
 )
 from levain.cockpit.snapshots import DB_FILENAME
 
@@ -121,22 +121,10 @@ class TestPlans:
         ck.register(_simple("slow", timeout_s=7.0))
         plans = _plan_map(make_host(ck))
         plain, timed, watched, slow = (plans[k] for k in ("plain", "timed", "watched", "slow"))
-        assert (plain.inputs, plain.every_s, plain.on_token, plain.heavy) == ((), None, True, False)
+        assert (plain.inputs, plain.every_s, plain.on_token) == ((), None, True)
         assert (timed.every_s, timed.on_token) == (5.0, False)
         assert watched.inputs == (File(str(tmp_path / "f")),) and watched.on_token is False
         assert slow.timeout_s == 7.0 and plain.timeout_s == ck.spec("plain").timeout_s
-
-    def test_the_heavy_panels_are_named_by_a_constant_ids_only(self, make_host) -> None:
-        assert HEAVY_PANELS == {"board", "topology", "sky"}
-        ck = Cockpit()
-        for pid in ("board", "topology", "other"):
-            ck.register(_simple(pid))
-        plans = _plan_map(make_host(ck))
-        assert [pid for pid in ("board", "topology", "other") if plans[pid].heavy] == ["board", "topology"]
-        # a host is told which are heavy, so a cockpit that names others is not stuck with the default
-        ck2 = Cockpit()
-        ck2.register(_simple("other"))
-        assert _plan_map(make_host(ck2, heavy={"other"}))["other"].heavy is True
 
     def test_serve_composed_panels_and_underscore_ids_have_no_plan(self, make_host) -> None:
         ck = Cockpit()

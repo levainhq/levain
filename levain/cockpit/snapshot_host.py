@@ -39,7 +39,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable
 
 from levain.cockpit.authority import LabelKey
 from levain.cockpit.derive import DeriveLoop, DeriveResult, PanelPlan
@@ -255,8 +255,6 @@ def decode_snap(status: str, body: dict[str, Any] | None, *, as_of: str | None, 
 
 # --------------------------------------------------------------------------------------------------- the host
 
-# Panels whose derive is expensive enough to be told apart from the rest (ids only; a panel absent from a cockpit is skipped).
-HEAVY_PANELS = frozenset({"board", "topology", "sky"})
 # The host's two pseudo-plans. An id with this prefix is never a panel's: ``SnapshotHost._plans`` skips any registered id that has it.
 PSEUDO_PREFIX = "_"
 DISCOVER_ID = PSEUDO_PREFIX + "discover"
@@ -290,10 +288,8 @@ class SnapshotHost:
         token_fn: "Callable[[], Any] | None" = None,
         clock: Callable[[], float] = time.time,
         poll_s: "float | None" = None,
-        heavy: Iterable[str] = HEAVY_PANELS,
     ) -> None:
         self._cockpit = cockpit
-        self._heavy = frozenset(heavy)
         self._lock = threading.Lock()
         self._started = False
         self._closed = False
@@ -353,7 +349,7 @@ class SnapshotHost:
             plans.append(PanelPlan(
                 id=pid, inputs=tuple(spec.inputs), every_s=spec.refresh_every_s,
                 on_token=(not spec.inputs and spec.refresh_every_s is None),
-                heavy=pid in self._heavy, timeout_s=spec.timeout_s, backstop_s=spec.backstop_s,
+                timeout_s=spec.timeout_s, backstop_s=spec.backstop_s,
             ))
         plans.append(PanelPlan(id=DISCOVER_ID, on_token=True))
         plans.append(PanelPlan(id=ENTITY_ID, on_token=True))
