@@ -65,7 +65,7 @@ def test_any_other_verb_passes_through_to_the_real_program(shim, tmp_path):
 
 
 @pytest.mark.parametrize("args", [("-q", "-i"), ("-v", "-q", "-i"), ("-q", "-i", "-s")])
-def test_dash_i_anywhere_in_the_arguments_is_intercepted(shim, tmp_path, args):
+def test_dash_i_among_the_leading_options_is_intercepted(shim, tmp_path, args):
     work = tmp_path / "work"
     work.mkdir()
     r = _run(shim, work, *args, stdin=b"add-generic-password -U -s s -a a -w secret\n" * 1000)
@@ -81,7 +81,48 @@ def test_an_item_verb_after_global_flags_is_intercepted(shim, tmp_path, verb, le
     assert r.returncode == 36 and r.stdout == b"" and r.stderr == b"" and list(work.iterdir()) == []
 
 
-def test_the_shim_text_has_no_logging_scans_every_argument_and_uses_absolute_paths():
+@pytest.fixture
+def stub_shim(tmp_path: Path) -> tuple[Path, Path]:
+    """The shim text with /usr/bin/security swapped for a stub that records its argv, so pass-through is observable."""
+    out = tmp_path / "argv.txt"
+    stub = tmp_path / "real-security"
+    stub.write_text(f'#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a" >> {out}; done\nexit 0\n')
+    stub.chmod(0o755)
+    d = tmp_path / "stubshimdir"
+    d.mkdir()
+    p = d / "security"
+    assert 'exec /usr/bin/security "$@"' in hands_login.SECURITY_SHIM_TEXT
+    p.write_text(hands_login.SECURITY_SHIM_TEXT.replace("/usr/bin/security", str(stub)))
+    p.chmod(0o755)
+    return p, out
+
+
+@pytest.mark.parametrize("args", [("-i",), ("-q", "-i"), ("-qi",), ("-vi",)])
+def test_a_leading_option_with_i_drains_stdin_and_exits_36(stub_shim, tmp_path, args):
+    p, out = stub_shim
+    r = _run(p, tmp_path, *args, stdin=b"add-generic-password -U -s s -a a -w secret\n" * 1000)
+    assert r.returncode == 36 and r.stdout == b"" and r.stderr == b"" and not out.exists()
+
+
+@pytest.mark.parametrize("args", [("find-generic-password", "-s", "x"), ("-q", "find-generic-password"),
+                                  ("-p", "prompt", "delete-generic-password")])
+def test_a_leading_item_verb_exits_36(stub_shim, tmp_path, args):
+    p, out = stub_shim
+    r = _run(p, tmp_path, *args)
+    assert r.returncode == 36 and not out.exists()
+
+
+@pytest.mark.parametrize("args", [("cms", "-D", "-i", "profile.mobileprovision"), ("find-certificate", "-c", "-i"),
+                                  ("-p", "prompt", "list-keychains"), ("-p", "-i", "list-keychains"),
+                                  ("list-keychains", "find-generic-password")])
+def test_everything_else_passes_through_with_the_original_arguments(stub_shim, tmp_path, args):
+    p, out = stub_shim
+    r = _run(p, tmp_path, *args)
+    assert r.returncode == 0
+    assert out.read_text().splitlines() == list(args)
+
+
+def test_the_shim_text_has_no_logging_scans_leading_options_and_uses_absolute_paths():
     t = hands_login.SECURITY_SHIM_TEXT
     assert t.startswith("#!/bin/sh\n") and 'exec /usr/bin/security "$@"' in t and 'for a in "$@"' in t
     assert ">>" not in t and "tee" not in t and "logger" not in t          # the credential on stdin is never kept
@@ -177,6 +218,51 @@ def test_a_symlink_at_any_path_component_is_refused(sys_shim, tmp_path, which):
     target.symlink_to(moved)
     p = hands_login.security_shim_problem()
     assert p and "symlink" in p and which in p
+
+
+def test_an_ancestor_owned_by_another_uid_is_refused(sys_shim, monkeypatch):
+    real_lstat = os.lstat
+    anc = sys_shim.parent.parent
+
+    class _St:
+        def __init__(self, st):
+            self._st = st
+            self.st_uid = st.st_uid + 1
+
+        def __getattr__(self, n):
+            return getattr(self._st, n)
+
+    monkeypatch.setattr(os, "lstat", lambda q, *a, **k: _St(real_lstat(q, *a, **k)) if str(q) == str(anc) else real_lstat(q, *a, **k))
+    p = hands_login.security_shim_problem()
+    assert p and str(anc) in p and "owned by uid" in p and p.endswith(hands_login.SHIM_REPAIR)
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757])
+@pytest.mark.parametrize("level", ["Levain", "Application Support", "Library", "start"])
+def test_an_ancestor_writable_by_group_or_other_is_refused(sys_shim, mode, level):
+    anc = {"Levain": sys_shim.parent, "Application Support": sys_shim.parent.parent,
+           "Library": sys_shim.parent.parent.parent, "start": sys_shim.parent.parent.parent.parent}[level]
+    anc.chmod(mode)
+    try:
+        p = hands_login.security_shim_problem()
+    finally:
+        anc.chmod(0o755)
+    assert p and str(anc) in p and "no group or other write" in p and p.endswith(hands_login.SHIM_REPAIR)
+
+
+def test_an_extra_entry_in_the_shim_directory_is_refused(sys_shim):
+    (sys_shim / "claude").write_text("x")
+    p = hands_login.security_shim_problem()
+    assert p and "holds something other than the shim (claude)" in p and "root removes it by hand" in p
+    assert p.endswith(hands_login.SHIM_REPAIR)
+
+
+def test_the_real_mac_system_directories_pass_the_ancestor_rule():
+    if sys.platform != "darwin":
+        pytest.skip("macOS system directories")
+    for q in ("/Library", "/Library/Application Support"):
+        st = os.lstat(q)
+        assert st.st_uid == 0 and (st.st_mode & 0o022) == 0
 
 
 def test_a_directory_where_the_file_goes_is_refused(sys_shim):

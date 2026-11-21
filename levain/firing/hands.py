@@ -1162,8 +1162,9 @@ def remove_hands_shim(*, except_user: str) -> tuple[bool, str]:
     d = os.path.normpath(confinement.hands_shim_dir())
     f = os.path.join(d, hands_login.SECURITY_SHIM_NAME)
     try:
-        if os.path.islink(d):
-            return False, f"{d} is a symlink; refusing to remove through it"
+        for link in (d, os.path.dirname(d), os.path.dirname(os.path.dirname(d))):
+            if os.path.islink(link):
+                return False, f"{link} is a symlink; refusing to remove through it"
         try:
             os.unlink(f)
         except FileNotFoundError:

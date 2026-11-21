@@ -753,10 +753,12 @@ def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path |
 # ``add-generic-password -U``, ``find-generic-password``, ``delete-generic-password``) and takes exit 36 and 44 as "use
 # the 0600 file". A write to a locked keychain inside a GUI login session HANGS (the Terminal -> sudo -u hands shape of
 # the real Mac), so the lock alone cannot decide where the credential goes. This shim sits first on the hands PATH
-# (macOS only, :func:`~levain.firing.confinement._hands_env`): when ANY argument is ``-i`` it drains stdin to /dev/null
-# (it carries the credential: never logged, never stored) and exits 36; when ANY argument is one of the three item verbs
-# it exits 36 (a global flag before the verb, ``-q find-generic-password``, no longer bypasses it); every other call runs
-# ``/usr/bin/security`` with the same arguments. So Claude's login, refresh, read and logout all take the file, in any
+# (macOS only, :func:`~levain.firing.confinement._hands_env`): it scans only the LEADING options, before the first
+# non-option word (``-p`` takes the next argument, which is skipped): a leading option word that contains ``i`` (``-i``,
+# ``-qi``) drains stdin to /dev/null (it carries the credential: never logged, never stored) and exits 36; the first
+# non-option word is the verb, and one of the three item verbs exits 36 (a global flag before it, ``-q
+# find-generic-password``, does not bypass it); every other call, ``security cms -D -i profile.mobileprovision`` among
+# them, runs ``/usr/bin/security`` with the original arguments. So Claude's login, refresh, read and logout all take the file, in any
 # session. Measured 11-21 with real claude 2.1.330 in the GUI shape (vmkc3): ``claude auth status`` is fast with the shim.
 # The shim covers every Claude service name by verb, which is why orphan matching (``claude_credential_services``) stays
 # the two names a login can leave. Levain's own calls use the absolute ``/usr/bin/security`` and never meet it.
@@ -767,23 +769,35 @@ def lock_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path |
 # gemini HIGH). Levain only CHECKS it (:func:`security_shim_problem`), before every Claude hands start. The shim calls
 # ``/bin/cat`` by absolute path.
 #
-# What it reaches: only the three generic-password verbs and ``-i``. On the hands account those can touch only Levain's
+# What it reaches: only the three generic-password verbs and a leading ``-i``. On the hands account those can touch only Levain's
 # sealed, locked keychain (no other keychain is on its search list, measured vmkc 11-21), so a non-Claude hands process
 # that asks for a generic password gets exit 36 too, and finds nothing it could have used. Codex is pinned to its file store.
 #
 # Known edges: ``-i`` drains stdin, which blocks on a TTY: only Claude calls ``security -i``, always with a pipe (binary
-# read 11-21), and a human running ``security -i`` as the hands user is not a path. An argument that merely equals ``-i``
-# or an item verb (a value, a name) also trips the scan; the shim errs toward the file.
+# read 11-21), and a human running ``security -i`` as the hands user is not a path. A macOS mission hands bash or driver
+# puts the shim directory first on PATH without the check; when it is missing, ``security`` resolves to /usr/bin/security,
+# the behaviour before levain#241.
 SECURITY_SHIM_NAME = "security"
 SECURITY_SHIM_TEXT = """#!/bin/sh
 # Levain: keeps Claude's login in its 0600 file. Installed by `sudo levain setup-isolation` (root-owned); never edit.
+skip=0
 for a in "$@"; do
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
   case "$a" in
-    -i)
+    -p)
+      skip=1 ;;
+    -*i*)
       /bin/cat > /dev/null
       exit 36 ;;
+    -*)
+      ;;
     find-generic-password|add-generic-password|delete-generic-password)
       exit 36 ;;
+    *)
+      break ;;
   esac
 done
 exec /usr/bin/security "$@"
@@ -801,7 +815,9 @@ SHIM_REPAIR = "run `sudo levain setup-isolation` (a repair run installs it)"
 
 def security_shim_problem() -> str | None:
     """None when Levain's ``security`` shim is installed exactly: every path component from :data:`SECURITY_SHIM_WALK_FROM`
-    down to the shim is a real directory (never a link, by ``lstat``); the shim's directory and the shim are owned by
+    down to the shim is a real directory (never a link, by ``lstat``), the start included, owned by
+    :data:`SECURITY_SHIM_OWNER_UID` with no group-write or other-write bit; the shim's directory holds nothing but the
+    shim; the shim's directory and the shim are owned by
     :data:`SECURITY_SHIM_OWNER_UID` with mode exactly 0755 (:data:`SECURITY_SHIM_MODE`, special bits included); the shim
     is a regular file whose bytes equal :data:`SECURITY_SHIM_TEXT`. Else the reason, ending with the repair. Reads only:
     Levain never writes it from here (``sudo levain setup-isolation`` does). Not gated on the platform."""
@@ -812,6 +828,7 @@ def security_shim_problem() -> str | None:
     parts = [start] + [c for c in os.path.relpath(d, start).split("/") if c and c != "."] if d != start else [start]
     cur = ""
     st: os.stat_result | None = None
+    last = len(parts) - 1
     for i, comp in enumerate(parts):
         cur = comp if i == 0 else os.path.join(cur, comp)
         try:
@@ -824,10 +841,22 @@ def security_shim_problem() -> str | None:
             return f"{cur} is a symlink, so the hands security shim is refused; {SHIM_REPAIR}"
         if not stat.S_ISDIR(st.st_mode):
             return f"{cur} is not a directory, so the hands security shim is refused; {SHIM_REPAIR}"
+        if i < last and (st.st_uid != SECURITY_SHIM_OWNER_UID or stat.S_IMODE(st.st_mode) & 0o022):
+            return (f"{cur} is owned by uid {st.st_uid} with mode {stat.S_IMODE(st.st_mode):o}; every directory above the "
+                    f"hands security shim must be owned by uid {SECURITY_SHIM_OWNER_UID} with no group or other write "
+                    f"bit; {SHIM_REPAIR}")
     assert st is not None
     if st.st_uid != SECURITY_SHIM_OWNER_UID or stat.S_IMODE(st.st_mode) != SECURITY_SHIM_MODE:
         return (f"{d} is owned by uid {st.st_uid} with mode {stat.S_IMODE(st.st_mode):o}, not uid "
                 f"{SECURITY_SHIM_OWNER_UID} with mode {SECURITY_SHIM_MODE:o}; {SHIM_REPAIR}")
+    try:
+        names = os.listdir(d)
+    except OSError as exc:
+        return f"the hands security shim directory {d} cannot be listed ({exc.strerror or exc}); {SHIM_REPAIR}"
+    extra = sorted(n for n in names if n != SECURITY_SHIM_NAME)
+    if extra:
+        return (f"{d} holds something other than the shim ({', '.join(extra)}); Levain does not remove it, root removes "
+                f"it by hand, then {SHIM_REPAIR}")
     f = os.path.join(d, SECURITY_SHIM_NAME)
     try:
         fd = os.open(f, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))

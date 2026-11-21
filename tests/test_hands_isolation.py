@@ -1640,6 +1640,8 @@ def sysdir(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(confinement, "HANDS_SHIM_SYSTEM_DIR", str(d))
     monkeypatch.setattr(hands_login, "SECURITY_SHIM_OWNER_UID", os.getuid())
     monkeypatch.setattr(hands_login, "SECURITY_SHIM_WALK_FROM", str(root))
+    for q in (root, root / "Library", root / "Library" / "Application Support"):
+        q.chmod(0o755)
     return d
 
 
@@ -1711,6 +1713,19 @@ def test_undo_removes_the_shim_only_when_no_hands_account_remains(sysdir: Path, 
     assert ok and not sysdir.exists() and not sysdir.parent.exists()    # the file and both directories
     assert "not installed" in hands_login.security_shim_problem()
     assert hands.remove_hands_shim(except_user="_levain_x")[0]          # idempotent
+
+
+@pytest.mark.parametrize("which", ["Levain", "Application Support"])
+def test_undo_refuses_a_symlinked_parent_and_removes_nothing_at_the_target(sysdir: Path, tmp_path: Path, monkeypatch, which) -> None:
+    assert hands.install_hands_shim(owner=_ME)[0]
+    monkeypatch.setattr(hands, "other_hands_accounts", lambda host, except_user: [])
+    link = sysdir.parent if which == "Levain" else sysdir.parent.parent
+    moved = tmp_path / "elsewhere"
+    link.rename(moved)
+    link.symlink_to(moved)
+    ok, why = hands.remove_hands_shim(except_user="_levain_x")
+    assert not ok and "symlink" in why
+    assert (moved / "hands-bin" / "security").exists() if which == "Levain" else (moved / "Levain" / "hands-bin" / "security").exists()
 
 
 def test_undo_keeps_a_levain_directory_that_holds_something_else(sysdir: Path, monkeypatch) -> None:
