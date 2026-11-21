@@ -21,7 +21,7 @@ from levain.consent.passkey import challenge
 from levain.desk.envelope_revoke import NAMESPACE, EnvelopeRevoke, revoke_message
 from tests._cockpit_reread import REREAD
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
-from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
+from tests.test_cockpit_flip_parity import BOARD_SETTLED, _drive, landed_tap, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_origin import _Passkey
 from tests.test_envelope_revoke import EID, EID2, _seed, _signer
@@ -106,7 +106,7 @@ def test_the_card_lists_a_scratch_envelope_and_revoke_runs_the_ceremony(world, t
         rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
         httpd.envelope_revoke = rec
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            _authenticator(pk), viewport, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            _authenticator(pk), viewport, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
             {"eval": f"{_CARD}.querySelector('.consent-head').textContent"},
             {"eval": f"{_CARD}.querySelector('.envelope-revoke').textContent"},
@@ -152,7 +152,7 @@ def test_an_empty_store_says_no_live_envelopes_and_the_grants_jump_lands_on_it(w
     signer = _signer(world, rp="localhost", origin=f"http://localhost:{port}")
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer):
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            NARROW, {"until": TILE},
+            NARROW, {"until": TILE}, BOARD_SETTLED,
             {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
             {"until": "[...document.querySelectorAll('#levain-modal .ext-grouphead')].some(h => h.textContent.trim() === 'Envelopes')"},
             {"until": _LANDED},       # the jump landed on the heading, not only drew it
@@ -200,7 +200,7 @@ def test_the_signed_text_is_on_the_screen_when_the_passkey_asks(world, tmp_path)
         rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
         httpd.envelope_revoke = rec
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            _authenticator(pk), NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
             {"eval": _WRAP_GET},
             *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')"),
@@ -235,7 +235,7 @@ def test_a_line_with_an_extra_or_altered_field_is_never_put_to_the_passkey(world
         rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint, bad=bad)
         httpd.envelope_revoke = rec
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            _authenticator(pk), NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
             {"eval": _WRAP_GET}, *steps, {"eval": "window.__envGets"}])
     said = [v for v in out["values"] if isinstance(v, str) and v.startswith("not revoked")]
@@ -252,7 +252,7 @@ def test_a_failed_envelope_read_still_draws_the_heading_and_the_jump_lands_on_it
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         httpd.envelope_revoke = _Failing(httpd.envelope_revoke, pk.key.fingerprint)
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            NARROW, {"until": TILE},
+            NARROW, {"until": TILE}, BOARD_SETTLED,
             {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
             {"until": _LANDED},
             {"eval": "document.querySelector('#levain-modal .envelope-unavailable').textContent"},
@@ -268,7 +268,7 @@ def test_under_a_minute_left_reads_less_than_a_minute(world, tmp_path) -> None:
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint, expires_in=40)
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD}"},
             {"eval": f"{_CARD}.querySelector('.consent-head').textContent"},
         ])
@@ -284,7 +284,7 @@ def test_a_revoke_said_over_a_failed_refill_is_said_once(world, tmp_path) -> Non
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint, fail_refill=True)
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            _authenticator(pk), NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
             *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')"),
             {"posts": 2},
@@ -316,7 +316,7 @@ def test_a_failed_grants_read_still_marks_its_slot_filled_so_the_jump_lands(worl
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            NARROW, {"until": TILE}, {"eval": _FAIL_GRANTS},
+            NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": _FAIL_GRANTS},
             {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
             {"until": _LANDED},
             {"eval": "document.querySelector('#levain-modal .grant-slot').dataset.filled"},
@@ -345,7 +345,7 @@ def test_a_refusal_lands_on_the_live_envelope_card_when_a_board_read_replaced_th
         rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
         httpd.envelope_revoke = rec
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
-            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            _authenticator(pk), NARROW, {"until": TILE}, BOARD_SETTLED, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_REVOKE}.title === 'revoke with your passkey'"},
             {"eval": _HOLD_GET},
             {"eval": f"window.__tapped = {_CARD}; 1"},

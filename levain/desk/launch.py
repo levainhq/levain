@@ -571,6 +571,7 @@ def _board_forms(lv: str) -> dict[str, str]:
     (tests/test_t10_briefs.py)."""
     return {
         "board state": f"{lv} board state",
+        "board open": f"{lv} board open --repo NAME",
         "board repos": f"{lv} board repos",
         "board context": f"{lv} board context NAME#N",
         "board add": f"{lv} board add --repo NAME --title \"...\" --origin \"desk N\" --done \"...\" --by desk",
@@ -620,7 +621,7 @@ def _board_modes_section(lv: str) -> list[str]:
         "signs at the laptop, they run the same line themselves with `--by operator --author-kind operator --sign` in place "
         "of `--by desk ... --source Q-ID`. `untrack` takes no `--source`: it is the operator's signed write only.",
         "",
-        f"- read: `{f['board state']}`, `{f['board repos']}`, `{f['board context']}`;",
+        f"- read: `{f['board state']}`, `{f['board open']}`, `{f['board repos']}`, `{f['board context']}`;",
         f"- an item: `{f['board add']}`, `{f['board amend']}`, `{f['board decide']}`;",
         f"- the store and a repository: `{f['board use']}`, `{f['board register']}`;",
         f"- a charter: `{f['charter init']}`, `{f['charter check']}`;",

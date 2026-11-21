@@ -3,8 +3,10 @@ only those panels' cached reads go cold. The HTTP tests drive the same snooze ``
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
 import re
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,18 @@ def _snooze_body(base: str, ids: dict[str, str], key: str = "seed", **extra) -> 
     row = next(r for r in rows if r["id"] == f"intention:{ids[key]}")
     return {"verb": "intention_surface_at", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"],
             "params": {"surface_at": "2030-01-01"}, **extra}
+
+
+def _tap_stderr(monkeypatch) -> io.StringIO:
+    """The process's stderr as one buffer that is only ever read, never drained, called from INSIDE the test body (pytest's own
+    capture re-assigns ``sys.stderr`` when the call phase starts, so a fixture's patch would be replaced). The timing line is
+    printed by the server's own thread after the response, as two writes (the text, then "\n"). Under ``capfd`` a
+    ``readouterr`` poll between them runs ``seek(0)`` on the descriptor's shared file offset, so the "\n" then lands at byte 0
+    and overwrites the first character: CI run 44780440208 read ``ockpit write ...`` (levain#195; reproduced in a plain
+    script by an L2 review lane, project_memory/1120-59_lanes/f195_l2_return.md). This reader never seeks or truncates."""
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", sink)
+    return sink
 
 
 def _scopes(ck: Cockpit) -> set:
@@ -68,19 +82,20 @@ def test_the_edits_ledger_row_carries_received_at(tmp_path: Path) -> None:
     assert datetime.fromisoformat(mine[-1]["ts"]) >= datetime.fromisoformat(mine[-1]["received_at"])
 
 
-def test_a_verb_post_prints_its_time_and_a_slow_one_warns(tmp_path: Path, capsys, caplog, monkeypatch) -> None:
+def test_a_verb_post_prints_its_time_and_a_slow_one_warns(tmp_path: Path, caplog, monkeypatch) -> None:
     import levain.web_server as ws
 
     root, src, ids = _install(tmp_path)
+    stderr_sink = _tap_stderr(monkeypatch)
     with _serve(src, write_token=TOKEN) as (base, _h):
         _post(f"{base}/cockpit/verb", _snooze_body(base, ids), TOKEN)
         # the line is written after the response: wait for the handler's own thread to get there
         for _ in range(100):
-            if "cockpit write" in capsys.readouterr().err + "":
+            if "cockpit write" in stderr_sink.getvalue():
                 break
             threading.Event().wait(0.05)
         else:
-            pytest.fail("no timing line")
+            pytest.fail(f"no timing line; stderr so far: {stderr_sink.getvalue()!r}")
         monkeypatch.setattr(ws, "_SLOW_READ_MS", -1.0)
         with caplog.at_level("WARNING"):
             _post(f"{base}/cockpit/verb", _snooze_body(base, ids, "loop"), TOKEN)
@@ -91,13 +106,13 @@ def test_a_verb_post_prints_its_time_and_a_slow_one_warns(tmp_path: Path, capsys
         assert any("slow cockpit write: verb=intention_surface_at" in r.getMessage() for r in caplog.records)
 
 
-def test_the_timing_line_shape(tmp_path: Path, capfd) -> None:
+def test_the_timing_line_shape(tmp_path: Path, monkeypatch) -> None:
     root, src, ids = _install(tmp_path)
+    stderr_sink = _tap_stderr(monkeypatch)
     with _serve(src, write_token=TOKEN) as (base, _h):
         _post(f"{base}/cockpit/verb", _snooze_body(base, ids), TOKEN)
-        out = ""
         for _ in range(100):
-            out += capfd.readouterr().err
+            out = stderr_sink.getvalue()
             if re.search(r"^cockpit write intention_surface_at \d+ ms$", out, re.M):
                 break
             threading.Event().wait(0.05)
