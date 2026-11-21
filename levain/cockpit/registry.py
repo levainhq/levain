@@ -167,6 +167,11 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the kind of the role an agent's current spec pins (levain.agents.role.ROLE_KINDS), or "unreadable" when that role's
     # row fails the check every read of a stored role passes (a test pins the two vocabularies together)
     "agent_kind": ("enum", _enum("job", "role", "unreadable")),
+    # a job row's spec name, the small address label its verbs need (levain#221, ruling D6, signed np-fc7af821): the row's
+    # own words lead with the role brief's first line, and the page draws the name beside the group, never as the title
+    "agent_name": ("str", _is_str),
+    # a spawned worker's state on the Calls panel (levain.cockpit.calls_panel): the latest launch event's kind
+    "call_state": ("enum", _enum("pending", "active", "failed", "expired", "ended", "unknown")),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what a Sessions row carries for the tile's busiest-seat line (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
     # THE LIST (levain.cockpit.list_panel): one view over band + board + intentions, each row labelled with its surface
@@ -596,15 +601,35 @@ register_ordering(
              (("open", "Open"), ("cleared", "Cleared")), uncounted=frozenset({"cleared"})),
     builtin=True,
 )
-# the agents panel (levain.cockpit.agents_panel): grouped by what the agent does now, by name inside a group; a retired
+
+
+def _agent_group_of(row: Any, today: Any) -> str:
+    """The agents panel's group of a row (levain#221, ruling D7): the pinned operator row and the retired rows keep their own,
+    and a live agent is in its kind's section (a ``job`` in Jobs; a ``role`` and an ``unreadable`` kind in Fleet, so a kind
+    that cannot be read is shown and never hidden in Jobs) and its state inside it."""
+    state = str(row.facets.get("agent_group") or "unarmed")
+    if state in ("operator", "retired"):
+        return state
+    return ("jobs-" if row.facets.get("agent_kind") == "job" else "fleet-") + state
+
+
+# the agents panel (levain.cockpit.agents_panel): in the Jobs section or the Fleet section by the role's kind (_agent_group_of), and
+# by what the agent does now inside it, by name inside a group; a retired
 # agent is history beside the rest and is not a figure on the panel's count. The store's one operator agent is a pinned row
 # of its own, first (P9a-o): it is the record the registry materialises, not a registered agent, so it is not counted either
 register_ordering(
-    Ordering("agents.state", lambda row, today: (row.title.lower(), row.id),
-             lambda row, today: str(row.facets.get("agent_group") or "unarmed"),
-             (("operator", "Agent"), ("firing", "Firing"), ("paused", "Paused"), ("unarmed", "Unarmed"),
+    Ordering("agents.state", lambda row, today: (row.title.lower(), row.id), _agent_group_of,
+             (("operator", "Agent"), ("jobs-firing", "Jobs \u00b7 Firing"), ("jobs-paused", "Jobs \u00b7 Paused"),
+              ("jobs-unarmed", "Jobs \u00b7 Unarmed"), ("fleet-firing", "Fleet \u00b7 Firing"),
+              ("fleet-paused", "Fleet \u00b7 Paused"), ("fleet-unarmed", "Fleet \u00b7 Unarmed"),
               ("retired", "Retired")),
              uncounted=frozenset({"operator", "retired"})),
+    builtin=True,
+)
+# the Calls panel (levain.cockpit.calls_panel): the live spawned workers first, then the ones that are over (history, not a figure)
+register_ordering(
+    Ordering("calls.state", lambda row, today: (), lambda row, today: "live" if row.facets.get("call_state") in ("pending", "active") else "over",
+             (("live", "Running"), ("over", "Over")), uncounted=frozenset({"over"})),
     builtin=True,
 )
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable

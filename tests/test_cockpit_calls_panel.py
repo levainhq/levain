@@ -1,0 +1,110 @@
+"""levain#221: the Calls panel (levain.cockpit.calls_panel), ruling D4 np-05034d15 (a): spawned workers only in 1.0.
+
+Every store is a real desk store (``CoordStore``) and every worker a real ``spawn_worker``: no hand-written launch row.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from levain.agents import instantiate as inst
+from levain.cockpit.calls_panel import CALLS_ID, calls_discoverer, read_calls
+from levain.cockpit.engine import Cockpit
+from levain.desk.store import CoordStore
+from tests.test_agents_spawn import a_thread, registry, role  # noqa: F401
+
+CLOSED = {"class": "none", "device_class": None}
+
+
+@pytest.fixture
+def desk(tmp_path):
+    store = CoordStore(tmp_path / "consent")
+    return store, store.coord_take()
+
+
+def _spawn(store, token, registry, cwd, name="scribe"):  # noqa: F811
+    _d, t = a_thread(store)
+    return inst.spawn_worker(store, token, thread_id=t.thread_id, cwd=str(cwd), inline=role(name), slots={"topic": "x"},
+                             agent_store=registry)
+
+
+def _cockpit(directory):
+    ck = Cockpit(entity=lambda ctx: {"name": "t"})
+    ck.discover(calls_discoverer(lambda: directory), retire=True)
+    ck.manifest(CLOSED)
+    return ck
+
+
+def test_a_spawned_worker_is_a_call_and_a_seat_launch_is_not(desk, registry, tmp_path):  # noqa: F811
+    # behaviour: the spawned worker (a launches row with its spawn record) is one row naming its role and state; a worker
+    # launch with no spawn record is a seat, and is not a call
+    store, token = desk
+    ln = _spawn(store, token, registry, tmp_path, "scribe")
+    _d, t = a_thread(store)
+    seat = store.launch_request(token, harness="claude", threads=[t.thread_id], cwd=str(tmp_path))
+    rows, note = read_calls(store.path.parent)
+    assert note is None and [r.id for r in rows] == ["call:" + ln.launch_id]
+    assert "call:" + seat.launch_id not in {r.id for r in rows}
+    assert rows[0].facets == {"call_state": "pending"} and rows[0].title == "scribe"
+    assert rows[0].body.startswith("scribe · ") and " · pending · since " in rows[0].body
+
+
+def test_the_panel_groups_the_live_calls_first_and_an_over_call_is_not_a_figure(desk, registry, tmp_path):  # noqa: F811
+    store, token = desk
+    a = _spawn(store, token, registry, tmp_path, "one")
+    b = _spawn(store, token, registry, tmp_path, "two")
+    conn = sqlite3.connect(store.path)
+    try:
+        conn.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, 2, "
+                     "(SELECT MAX(gseq) + 1 FROM launch_events), 'failed', 'test', '2026-11-20T00:00:00Z')", (a.launch_id,))
+        conn.commit()
+    except sqlite3.DatabaseError:
+        conn.close()
+        raise
+    conn.close()
+    ck = _cockpit(store.path.parent)
+    panel = ck.panel(CALLS_ID)
+    groups = {r["id"]: r["group"] for r in panel["rows"]}
+    assert groups == {"call:" + a.launch_id: "over", "call:" + b.launch_id: "live"}
+    assert [g["id"] for g in panel["groups"]] == ["live", "over"] and panel["count"] == 1
+
+
+def test_no_desk_store_draws_no_panel_and_an_unreadable_one_is_a_fault_never_no_calls(desk, registry, tmp_path):  # noqa: F811
+    assert read_calls(None) is None and read_calls(tmp_path / "nowhere") is None
+    assert calls_discoverer(None)(None) == [] and calls_discoverer(lambda: tmp_path / "nowhere")(None) == []
+    store, token = desk
+    _spawn(store, token, registry, tmp_path)
+    ck = _cockpit(store.path.parent)
+    store.path.write_bytes(b"not a database, and long enough to be read as one" * 40)
+    ck.manifest(CLOSED)
+    panel = ck.panel(CALLS_ID)
+    assert not panel.get("rows") and "cannot be read" in str(panel), panel
+
+
+def test_a_launch_whose_record_cannot_be_read_is_a_row_that_says_so():
+    # the store's own trigger keeps a launch append-only, so the unreadable record is shown through the row builder itself
+    from levain.cockpit.calls_panel import _row
+
+    row = _row("l-1", '["t-1"]', "2026-11-20T00:00:00Z", "garbage", "active")
+    assert row.title == "unreadable spawn record" and "record unreadable" in row.body and row.facets == {"call_state": "active"}
+
+
+def test_a_store_with_no_launches_is_an_empty_panel_and_the_newest_calls_are_shown(desk, registry, tmp_path, monkeypatch):  # noqa: F811
+    from levain.cockpit import calls_panel
+
+    store, token = desk
+    assert read_calls(store.path.parent) == ((), None)
+    monkeypatch.setattr(calls_panel, "CALLS_SHOWN", 2)             # the live-spawn cap (4) is lower than the real window
+    for _ in range(3):
+        _spawn(store, token, registry, tmp_path)
+    rows, note = calls_panel.read_calls(store.path.parent)
+    assert len(rows) == 2 and note and "2" in note
+
+
+def test_the_panel_id_is_the_one_the_machine_zones_styling_and_section_head_name():
+    # the page's Machine zone names this id in its section head ownership and its CSS order; a rename on one side only is red here
+    root = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web"
+    assert f'[data-ck-panel="{CALLS_ID}"]' in (root / "dashboard_places.js").read_text()
+    assert f'[data-ck-panel="{CALLS_ID}"]' in (root / "dashboard.css").read_text()

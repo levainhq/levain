@@ -1,0 +1,121 @@
+"""levain.cockpit.calls_panel: the Calls panel (levain#221, agent-model ruling D4 (a), signed np-05034d15).
+
+A READ-ONLY list over the desk's ``dispatch.db``: one row per SPAWNED WORKER, the summoned role ``levain coord spawn``
+asks for (:func:`levain.agents.instantiate.spawn_worker`). A spawned worker is a ``launches`` row whose ``role`` is
+``worker`` and whose ``role_ref`` holds its spawn record; a launch with no ``role_ref`` is a seat, not a call, and is not
+here. In 1.0 this is all Calls is: raw model calls have no ledger a panel could read, and a panel over a store nobody has
+named would read absence as health, so they are a later row that first names a source (D4).
+
+The panel only draws what the launch and its events say; it decides nothing and offers no verb. The store is opened
+``mode=ro`` and never created. A store that cannot be read is this panel's fault, said in words, never "no calls"; a
+launch whose record cannot be read is a row that says so, never a hidden one. The newest :data:`CALLS_SHOWN` calls are
+listed (a note says when there are older ones).
+"""
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from levain.cockpit.engine import ProviderSpec, ReadContext
+from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
+
+__all__ = ["CALLS_ID", "CALLS_ORDER", "CALL_ROW_PREFIX", "CALLS_SHOWN", "calls_discoverer", "read_calls"]
+
+CALLS_ID = "agent_calls"          # the id the Machine zone's styling and section head already name
+CALL_ROW_PREFIX = "call:"
+CALLS_ORDER = "calls.state"
+CALL_FACETS = frozenset({"call_state"})
+CALLS_SHOWN = 40
+_LIVE = ("pending", "active")
+
+_SQL = ("SELECT l.launch_id, l.threads, l.at, l.role_ref, "
+        "(SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) "
+        "FROM launches l WHERE l.role = 'worker' AND l.role_ref IS NOT NULL ORDER BY l.gseq DESC LIMIT ?")
+
+
+def _one_line(text: object, limit: int = 300) -> str:
+    line = " ".join(str(text or "").split())
+    return line if len(line) <= limit else line[:limit - 1].rstrip() + "…"
+
+
+def _open(directory: Path) -> sqlite3.Connection | None:
+    path = Path(directory) / "dispatch.db"
+    if not path.is_file():
+        return None
+    return sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=2.0, isolation_level=None)
+
+
+def _role_name(role_ref: str) -> tuple[str, str]:
+    """``(role name, "")`` of a launch's spawn record, or ``("", why)`` when the record cannot be read."""
+    from levain.desk.lease import LeaseRefused, spawn_record
+
+    try:
+        rec = spawn_record(role_ref)
+        name = rec["role"]["name"]
+    except (LeaseRefused, KeyError, TypeError) as exc:
+        return "", _one_line(exc, 100) if isinstance(exc, LeaseRefused) else f"the spawn record has no role name ({type(exc).__name__})"
+    return str(name), ""
+
+
+def _row(launch_id: str, threads: str, at: str, role_ref: str, kind: str | None) -> RowIn:
+    state = kind if kind else "unknown"
+    name, why = _role_name(role_ref)
+    shown = name or "unreadable spawn record"
+    thread = _one_line(threads.strip("[]").replace('"', ""), 80)
+    tail = f" · record unreadable: {why}" if why else ""
+    body = _one_line(f"{shown} · {thread} · {state} · since {at}", 300 - len(tail)) + tail
+    return RowIn(id=CALL_ROW_PREFIX + launch_id, title=_one_line(shown, 120), body=body,
+                 facets={"call_state": state},
+                 stored={"launch_id": launch_id, "role": name, "threads": threads, "at": at, "state": state,
+                         "unreadable": why})
+
+
+def read_calls(directory: Path | None) -> tuple[tuple[RowIn, ...], str | None] | None:
+    """The spawned-worker rows and a note, or None when there is no desk store to read. Writes nothing."""
+    if directory is None:
+        return None
+    conn = _open(Path(directory))
+    if conn is None:
+        return None
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'launches'").fetchone() is None:
+            return (), None
+        has_events = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'launch_events'").fetchone() is not None
+        if not has_events:
+            return (), "the desk store holds no launch events: no call's state can be read"
+        got = conn.execute(_SQL, (CALLS_SHOWN + 1,)).fetchall()
+    finally:
+        conn.close()
+    older = len(got) > CALLS_SHOWN
+    rows = tuple(_row(*r) for r in got[:CALLS_SHOWN])
+    return rows, (f"Showing the newest {CALLS_SHOWN} calls; older ones are in the desk's record." if older else None)
+
+
+def calls_discoverer(dispatch_dir: Callable[[], Any] | None) -> Callable[[ReadContext], list[ProviderSpec]]:
+    """The Calls panel for the install NOW (register with ``cockpit.discover(calls_discoverer(fn), retire=True)``):
+    none while there is no desk directory or no ``dispatch.db`` in it, so an install with no desk draws no empty card."""
+    def discover(ctx: ReadContext) -> list[ProviderSpec]:
+        if dispatch_dir is None:
+            return []
+        try:
+            directory = dispatch_dir()
+            if directory is None or not (Path(directory) / "dispatch.db").is_file():
+                return []
+        except Exception:  # noqa: BLE001 - a directory that cannot be named draws no panel
+            return []
+
+        def calls_read(ctx: ReadContext) -> Result:
+            try:
+                got = read_calls(Path(dispatch_dir()) if dispatch_dir() is not None else None)
+            except Exception as exc:  # noqa: BLE001 - an unreadable store is this panel's fault, never "no calls"
+                return Fault(f"the desk store cannot be read: {type(exc).__name__}: {_one_line(exc)}")
+            if got is None:
+                return Absent("the desk store is gone")
+            return Read(rows=got[0], note=got[1])
+
+        return [ProviderSpec(CALLS_ID, "list", "Calls", "feed", calls_read, region="operate", rank=32,
+                             order=CALLS_ORDER, version_fields=("*",), size="medium", span=1,
+                             empty="No spawned worker yet.", facets=CALL_FACETS)]
+    return discover

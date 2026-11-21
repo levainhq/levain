@@ -335,7 +335,9 @@
         // a count list's own rows (not the Decisions or Sessions rows, which draw typed cards) are plain provider words: they are drawn as
         // markdown, and the kind its title leads with ("contradiction: ...") leads the meta line, since the body drawn is the words alone
         const mdRow = panel.face === "count" && head.id !== "decisions" && head.id !== "sessions";
-        const meta = [mdRow ? rowKind(r) : "", typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
+        // a Jobs row's spec name is its small address label (levain#221, ruling D6): beside the group, never the row's title
+        const addr = head.id === "agents" && (r.facets || {}).agent_kind === "job" && typeof (r.facets || {}).agent_name === "string" ? r.facets.agent_name : "";
+        const meta = [mdRow ? rowKind(r) : "", typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, addr, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
         if (mdRow) line.md = true;

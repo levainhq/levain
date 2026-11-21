@@ -48,7 +48,7 @@ class Scratch:
     """One agent per group, laid out the way the served install reads them. The log's clock is moved to the real
     clock first, because the served page judges a link's expiry at the real time."""
 
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, job: bool = False) -> None:
         (tmp_path / "rig").mkdir()
         rig = Rig(tmp_path / "rig")
         rig.world.clock.now = datetime.now(timezone.utc) - timedelta(minutes=10)
@@ -58,6 +58,16 @@ class Scratch:
             self.ids[name], hashes[name], *_ = register_spec(rig.store, _spec("w-" + name), "America/New_York")
         rig.world.link({"op": "create_grant", "grant": link_record(
             rig.world, 1, agent=self.ids["firing"], store=rig.sid, spec_hash=hashes["firing"], binding_id=BINDING)})
+        if job:     # one agent pinning a STORED job role (the rest pin roles no row holds, which read as the unreadable kind: Fleet)
+            from levain.agents.role import add_role
+
+            jrole = copy.deepcopy(ROLES["notify-role"])
+            jrole.update(name="job-role", kind="job", brief={"template": "Check the push queue and say what is stuck\nmore", "slots": {}})
+            add_role(rig.store, jrole)
+            d = copy.deepcopy(SPECS["job_push_check"])
+            d["name"] = "w-job"
+            d["role"] = {"name": "job-role", "role_hash": role_hash(jrole)}
+            self.ids["job"] = register_spec(rig.store, parse_spec(d), "America/New_York")[0]
         set_operation(rig.store, self.ids["paused"], "paused")
         retire_agent(rig.store, self.ids["retired"])
         self.rig_agent = rig.agent
@@ -137,7 +147,8 @@ def test_the_panel_draws_on_home_with_the_four_groups_and_the_pinned_operator_ro
     seen = _json(out, -1)
     text = seen["text"]
     groups = [r["group"] for r in seen["rows"]]
-    assert groups == ["Agent", "Firing", "Paused", "Unarmed", "Unarmed", "Retired"], seen["rows"]    # the pinned row, then the four groups in order
+    # the pinned row, then Fleet's state groups in order (these scratch roles are stored nowhere, so unreadable: Fleet), then Retired
+    assert groups == ["Agent", "Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Fleet \u00b7 Unarmed", "Fleet \u00b7 Unarmed", "Retired"], seen["rows"]
     assert seen["rows"][0]["body"] == "no operator agent in this store yet", seen["rows"][0]
     for name in ("w-firing", "w-paused", "w-unarmed", "w-retired"):
         assert name in text, (name, text)
@@ -177,7 +188,7 @@ def test_a_verb_round_trip_hits_the_verbspec_and_the_row_moves(width, tmp_path, 
     steps: list[dict] = [WIDTHS[width], HOME, OPEN, SETTLE,
                          # pause: one tap, no confirm; the unarmed agent moves to Paused
                          _tap_row("w-unarmed"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_pause"), "ms": 20000},
-                         {"until": moved("w-unarmed", "Paused") + " && 1", "ms": 30000},
+                         {"until": moved("w-unarmed", "Fleet \u00b7 Paused") + " && 1", "ms": 30000},
                          {"tap": "document.querySelector('#levain-modal .modal-close')", "ms": 10000}, {"until": CLOSED, "ms": 10000},
                          # retire: the first tap only asks, the second tap retires
                          _tap_row("w-paused"), {"until": DETAIL, "ms": 20000}, {"tap": verb("agent_retire"), "ms": 20000},
@@ -209,3 +220,54 @@ def test_the_cleared_or_not_cell_reflects_the_agent_review_cards_cleared_and_not
     assert "cards: 1 open, 0 cleared" in bodies["w-paused"], bodies      # keyed by the agent's name too
     for quiet in ("w-unarmed", "w-retired"):
         assert "cards:" not in bodies[quiet], bodies                      # no card, nothing said (not "0 open")
+
+
+@pytest.mark.parametrize("width", sorted(WIDTHS))
+def test_a_job_is_drawn_in_jobs_with_its_brief_line_and_its_name_as_the_small_address_label(width, tmp_path, monkeypatch) -> None:
+    # levain#221 (rulings D6 np-fc7af821 (a), D7 np-d74d51e6 (a)): the row is in the Jobs section, its words lead with the role
+    # brief's first line and its spec name is beside the group; Fleet keeps the rest; the job row's detail still offers its verbs
+    s = Scratch(tmp_path, monkeypatch, job=True)
+    steps = [WIDTHS[width], HOME, OPEN, SETTLE, {"eval": READ},
+             {"tap": f"{_row('Check the push queue')}.querySelector('.ext-meta')", "before": f"{_row('Check the push queue')}.scrollIntoView({{block: 'center'}})", "ms": 20000},
+             {"until": DETAIL, "ms": 20000}, {"eval": DETAIL}]
+    with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token={TOK}", _shots("agents_jobs_" + width, steps))
+    values = [x for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    seen = json.loads(next(v for v in values if '"rows"' in v))
+    job = next(r for r in seen["rows"] if r["body"].startswith("Check the push queue"))
+    assert job["group"] == "Jobs \u00b7 Unarmed \u00b7 w-job", job                       # the spec name beside the group, small
+    assert "w-job" not in job["body"] and job["opens"], job
+    assert {r["group"] for r in seen["rows"] if r is not job} >= {"Fleet \u00b7 Firing", "Fleet \u00b7 Paused", "Retired"}, seen["rows"]
+    detail = json.loads(next(v for v in values if '"verbs"' in v))
+    assert detail["verbs"] == ["agent_pause", "agent_retire"], detail
+    assert out["posts"] == [], out["posts"]
+
+
+@pytest.mark.parametrize("width", sorted(WIDTHS))
+def test_the_calls_panel_draws_a_spawned_worker_on_home_beside_the_agents_panel(width, tmp_path, monkeypatch) -> None:
+    # levain#221 (ruling D4 np-05034d15 (a)): Calls = spawned workers; the desk store the served page reads holds a real spawn
+    from levain.agents import instantiate as inst
+    from levain.agents.store import open_agent_store
+    from levain.desk.store import CoordStore
+    from tests.test_agents_spawn import a_thread, role as spawn_role
+
+    s = Scratch(tmp_path, monkeypatch)
+    home = tmp_path / "levain_home"
+    (home / "consent").mkdir(mode=0o700, exist_ok=True)
+    desk = CoordStore(home / "consent")
+    _d, t = a_thread(desk)
+    inst.spawn_worker(desk, desk.coord_take(), thread_id=t.thread_id, cwd=str(tmp_path), inline=spawn_role("scribe"),
+                      slots={"topic": "x"}, agent_store=open_agent_store(tmp_path / "ag"))
+    calls = "document.querySelector('[data-ck-panel=\"agent_calls\"]')"
+    read = ("(() => { const p = " + calls + "; if (!p) return null; const rows = [...p.querySelectorAll('.row[data-keep-key]')].map(x => ({"
+            "key: x.dataset.keepKey, group: x.querySelector('.ext-meta').textContent.trim(), body: x.querySelector('.clause').textContent.trim()}));"
+            " if (!rows.length) return null; const r = p.getBoundingClientRect(); return JSON.stringify({rows, w: Math.round(r.width), title: p.innerText}); })()")
+    steps = [WIDTHS[width], HOME, {"until": read, "ms": 30000}, SETTLE, {"eval": read}]
+    with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token={TOK}", _shots("calls_" + width, steps))
+    seen = json.loads(next(v for v in reversed(out["values"]) if isinstance(v, str) and '"rows"' in v))
+    assert seen["w"] > 0 and "Calls" in seen["title"], seen                   # drawn on Home, titled
+    assert len(seen["rows"]) == 1 and seen["rows"][0]["key"].startswith("call:"), seen
+    assert seen["rows"][0]["body"].startswith("scribe · ") and "pending" in seen["rows"][0]["body"], seen
+    assert seen["rows"][0]["group"] == "Running", seen
+    assert out["posts"] == [], out["posts"]

@@ -7,7 +7,8 @@ kernel verb (:data:`AGENT_VERBS`, defined in :mod:`levain.cockpit.verbs`) whose 
 in :mod:`levain.agents` (``set_operation``, ``retire_agent``, ``renew_agent_link``, the revoke's bar steps); the panel
 never calls one.
 
-A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``agents.state``), after the pinned row:
+A row is one agent, ``agent:<agent_id>``, in a section by its role's kind (Jobs or Fleet, see ``agent_kind`` below) and in one
+of the groups below inside it (the ordering ``agents.state``), after the pinned row:
 
 - **Agent** (``operator``, K2b / P9a-o): the store's ONE operator agent, a row of its own over
   :func:`levain.agents.operator.materialise`, drawn first and not counted: ``operator-agent:<oa-id>``, or the fixed
@@ -35,7 +36,11 @@ Every row also carries ``agent_kind``: the kind (``job`` or ``role``) of the rol
 stored role through :mod:`levain.agents.role`'s own check, on the same snapshot as the spec. A role that cannot be read
 (its row is gone, is not text, does not parse, does not hash to its key, or is not the canonical text) is
 ``unreadable``, the row says so in its body, and it is never read as a kind or as no kind. The panel only labels: the
-split of rows into Jobs and Fleet is the view's (P9b), and the group above is unchanged by the kind.
+state group above is unchanged by the kind, and the panel is drawn in sections by it (ruling D7, levain#221): a ``job``
+is in Jobs, a ``role`` and an ``unreadable`` kind in Fleet, each with the state groups inside it (the ordering
+``agents.state``). A job row's title is its role brief's first line (ruling D6) and its spec name is the small address label
+the page draws beside the group (the facet ``agent_name``): the verbs need an address, and a spec name is a label, never
+the identity (that is the ``agent_id``).
 
 The "cleared or not" column: a row also says how many of its review cards (the desk's ``agent`` feed, P8a) are
 open and how many are cleared, read from the review queue of the dispatch directory the wiring names. A card belongs to
@@ -69,7 +74,7 @@ AGENT_ROW_PREFIX = "agent:"
 AGENT_ORDER = "agents.state"
 OPERATOR_ROW_PREFIX = "operator-agent:"     # the pinned row of the store's one operator agent (not an ``agent:`` row)
 OPERATOR_GROUP = "operator"
-AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store", "agent_kind"})
+AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store", "agent_kind", "agent_name"})
 UNREADABLE_KIND = "unreadable"
 # the verbs an agent row offers (levain.cockpit.verbs registers them); `run now` has no owner yet and is not here
 AGENT_VERBS = ("agent_pause", "agent_resume", "agent_renew", "agent_revoke", "agent_retire")
@@ -120,7 +125,8 @@ def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | 
     one ``levain agents`` opens (this levain home's); the authority log is the ``cockpit/`` directory under the source's
     write-scope ledger root, else the install's own ``.levain/cockpit`` when that directory exists, else None. The wiring
     carries no signing key: a cockpit draws, pauses, resumes and retires, and a renew is refused until a laptop-presence key is
-    wired. An install whose home has no agent store draws no panel (:func:`agents_discoverer`)."""
+    wired. An install whose home has no agent store draws no panel (:func:`agents_discoverer`). The Calls panel
+    (:mod:`levain.cockpit.calls_panel`) is registered here too, over the desk directory ``dispatch_dir`` names."""
     scope = getattr(source, "write_scope", None)
     root = getattr(source, "install_root", None)
     if scope is not None:
@@ -132,6 +138,9 @@ def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | 
     wiring = AgentsWiring(store_dir=None, cockpit_root=cockpit_root, clock=clock, dispatch_dir=dispatch_dir)
     cockpit.agents_wiring = wiring
     cockpit.discover(agents_discoverer(cockpit), retire=True)
+    from levain.cockpit.calls_panel import calls_discoverer      # the Calls panel (ruling D7): its own provider, over the desk store
+
+    cockpit.discover(calls_discoverer(dispatch_dir), retire=True)
     return wiring
 
 
@@ -236,24 +245,26 @@ def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any]
         False
 
 
-def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, str]]) -> tuple[str, str]:
-    """``(kind, why)`` of the role a spec pins: the kind of the stored role (``why`` empty), or
+def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, str, str]]) -> tuple[str, str, str]:
+    """``(kind, why, brief line)`` of the role a spec pins: the kind of the stored role (``why`` empty), or
     :data:`UNREADABLE_KIND` and the reason. The row passes the check every other read of a stored role passes
     (:func:`levain.agents.role._check_row`, on this read's own connection; the spec and role reads are separate
     statements, not one snapshot, which holds because ``agent_roles`` is append-only, so a hash resolves to one row
     whenever it is read): a row that is gone, is not text, does not parse, does not hash to its key or is not the canonical text
-    is "unreadable", never an absent kind and never a default one. ``seen`` holds the answers of this read."""
+    is "unreadable", never an absent kind and never a default one. The brief line is the first non-empty line of the role's
+    brief template (empty when the role is unreadable). ``seen`` holds the answers of this read."""
     if role_hash not in seen:
         row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (role_hash,)).fetchone()
         if row is None:
-            seen[role_hash] = (UNREADABLE_KIND, "no role row has the hash its spec pins")
+            seen[role_hash] = (UNREADABLE_KIND, "no role row has the hash its spec pins", "")
         else:
             try:
                 role = _check_stored_role(row[0], role_hash, row[1], row[2])
-                seen[role_hash] = (role.get("kind", DEFAULT_KIND), "")   # the canonical text omits the default
+                first = next((ln.strip() for ln in str(role["brief"]["template"]).splitlines() if ln.strip()), "")
+                seen[role_hash] = (role.get("kind", DEFAULT_KIND), "", first)   # the canonical text omits the default
             except Exception as exc:  # noqa: BLE001 - a role row that cannot be read is never a kind, nor one row's fault
                 seen[role_hash] = (UNREADABLE_KIND, _one_line(exc, 100) if isinstance(exc, RoleError)
-                                   else f"the role row could not be checked ({type(exc).__name__})")
+                                   else f"the role row could not be checked ({type(exc).__name__})", "")
     return seen[role_hash]
 
 
@@ -314,13 +325,15 @@ def _cards_of(agent: dict[str, Any], index) -> tuple[int, int]:
 
 
 def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,
-         kind: tuple[str, str], cards: tuple[int, int] = (0, 0), revoked: bool = False) -> RowIn:
+         kind: tuple[str, str, str], cards: tuple[int, int] = (0, 0), revoked: bool = False) -> RowIn:
     streak = f" · {agent['failure_streak']} failed in a row" if agent["failure_streak"] else ""
     until = f" · link until {expiry}" if expiry and group != "retired" else ""
     role = f" · role unreadable: {kind[1]}" if kind[0] == UNREADABLE_KIND else ""
     held = f" · cards: {cards[0]} open, {cards[1]} cleared" if cards[0] or cards[1] else ""
     # the card counts and the unreadable-role words come last and are never the part a long line cuts
-    body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}",
+    # a job's words lead with its role brief's first line, its spec name being the small address label the page draws (D6)
+    lead = (kind[2] or agent["name"]) if kind[0] == "job" else agent["name"]
+    body = _one_line(f"{lead} · v{agent['current_version']} · {words}{streak}{until}",
                      300 - len(role) - len(held)) + held + role
     stored = {"agent_id": agent["agent_id"], "name": agent["name"], "version": agent["current_version"],
               "spec_hash": agent["spec_hash"], "registration": agent["registration"],
@@ -328,9 +341,9 @@ def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, 
               "words": words, "link": link, "expires_at": expiry, "store_id": store_id, "kind": kind[0],
               "cards_open": cards[0], "cards_cleared": cards[1], "revoked": revoked}
     # agent_version and agent_store are what a verb's write checks the agent against, inside its own transaction
-    return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(agent["name"], 120), body=body,
+    return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(lead, 120), body=body,
                  facets={"agent_group": group, "agent_link": link, "agent_version": agent["current_version"],
-                         "agent_store": store_id, "agent_kind": kind[0]}, stored=stored)
+                         "agent_store": store_id, "agent_kind": kind[0], "agent_name": agent["name"]}, stored=stored)
 
 
 def _operator_row(conn: sqlite3.Connection, install_dir: Path) -> RowIn:
@@ -392,7 +405,7 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
         if store_id_row is None:
             raise StoreFormatError("the agent store holds no store id")
         store_id = str(store_id_row[0])
-        kinds: dict[str, tuple[str, str]] = {}
+        kinds: dict[str, tuple[str, str, str]] = {}
         found = [dict(zip(("agent_id", "name", "current_version", "registration", "operation", "failure_streak",
                            "spec_hash", "role_hash"), r))
                  for r in (conn.execute(_AGENT_SQL + " ORDER BY a.name, a.created_at") if only is None else

@@ -97,6 +97,10 @@ def world(tmp_path) -> World:
     return World(tmp_path)
 
 
+GROUP_IDS = ["operator", "jobs-firing", "jobs-paused", "jobs-unarmed", "fleet-firing", "fleet-paused", "fleet-unarmed",
+             "retired"]
+
+
 def _groups(panel: dict) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for r in panel["rows"]:
@@ -107,12 +111,12 @@ def _groups(panel: dict) -> dict[str, list[str]]:
 def test_rows_group_firing_paused_unarmed_retired_and_an_unreadable_log_is_never_health(world, tmp_path):
     # behaviour: one agent per group lands in its group, in the group order, and only the retired one is uncounted
     panel = world.panel()
-    assert [g["id"] for g in panel["groups"]] == ["operator", "firing", "paused", "unarmed", "retired"]   # P9a-o's pinned group first
+    assert [g["id"] for g in panel["groups"]] == GROUP_IDS   # P9a-o's pinned group first, then Jobs and Fleet (levain#221)
     got = _groups(panel)
     assert got["operator"] == ["operator-agent:none"]                                     # a store with no record, uncounted
-    assert got["firing"] == [world.rid("firing")] and got["paused"] == [world.rid("paused")]
+    assert got["fleet-firing"] == [world.rid("firing")] and got["fleet-paused"] == [world.rid("paused")]   # the rig's roles are Fleet
     assert got["retired"] == [world.rid("retired")]
-    assert set(got["unarmed"]) == {world.rid("unarmed"), "agent:" + world.rig.agent}     # the launch rig's agent too
+    assert set(got["fleet-unarmed"]) == {world.rid("unarmed"), "agent:" + world.rig.agent}     # the launch rig's agent too
     assert panel["count"] == 4 and next(g for g in panel["groups"] if g["id"] == "retired").get("uncounted")
     bodies = {r["id"]: r["body"] for r in panel["rows"]}
     assert "armed · link until " in bodies[world.rid("firing")]
@@ -126,7 +130,7 @@ def test_rows_group_firing_paused_unarmed_retired_and_an_unreadable_log_is_never
     (tmp_path / "blind").mkdir()
     blind = World(tmp_path / "blind", cockpit_root=False)
     panel = blind.panel()
-    assert "firing" not in _groups(panel) and "Arming is unknown" in panel["note"]
+    assert "fleet-firing" not in _groups(panel) and "Arming is unknown" in panel["note"]
     assert "arming unknown" in {r["id"]: r["body"] for r in panel["rows"]}[blind.rid("firing")]
 
 
@@ -347,10 +351,10 @@ def test_a_pause_wins_over_an_unreadable_log_and_one_bad_judgement_is_one_row(tm
     monkeypatch.setattr(AgentAuthority, "peek", lambda self, *a, **k: (_ for _ in ()).throw(KeyError("spec_hash")))
     panel = seeing.panel()
     bodies = {r["id"]: r for r in panel["rows"]}
-    assert "firing" not in _groups(panel)
+    assert "fleet-firing" not in _groups(panel)
     assert "arming unknown" in bodies[seeing.rid("firing")]["body"]
     assert bodies[seeing.rid("firing")]["facets"]["agent_link"] == ""
-    assert bodies[seeing.rid("paused")]["group"] == "paused"
+    assert bodies[seeing.rid("paused")]["group"] == "fleet-paused"
 
 
 # --- P9a-k: the kind facet. Each case was first run as a script against this rig ($CLAUDE_JOB_DIR/tmp/p9ak/run.py) ---
@@ -491,11 +495,11 @@ def test_the_dream_attached_draws_the_operator_agents_row_with_its_role_and_the_
     assert "dream" in row["body"] and "active" in row["body"] and "no install facts" in row["body"]
     assert "not attached" not in row["body"]
     assert row["body"].startswith("Operator agent oa-") and "roles: dream v1 as role dream v1 (active)" in row["body"]
-    assert [g["id"] for g in panel["groups"]] == ["operator", "firing", "paused", "unarmed", "retired"]
+    assert [g["id"] for g in panel["groups"]] == GROUP_IDS
     assert next(g for g in panel["groups"] if g["id"] == "operator").get("uncounted")
     assert panel["count"] == 5 and panel["rows"][0]["id"] == row["id"]       # the four, plus the dream: the record is no agent
     got = _groups(panel)
-    assert got["firing"] == [world.rid("firing")] and got["retired"] == [world.rid("retired")]
+    assert got["fleet-firing"] == [world.rid("firing")] and got["retired"] == [world.rid("retired")]
     # the dream is also an ordinary agent row, and read_one answers the operator row by its id
     assert "agent:" + dream in {r["id"] for r in panel["rows"]}
     assert world.ck.read_one(AGENTS_ID, row["id"]).value["id"] == row["id"]
@@ -553,7 +557,7 @@ def test_a_corrupt_attached_role_row_is_an_unreadable_operator_row_and_the_rest_
     ops = _operator_rows(panel)
     assert len(ops) == 1 and ops[0]["id"] == "operator-agent:unreadable" and ops[0]["group"] == "operator"
     assert ops[0]["body"].startswith("unreadable: ") and "dream" in ops[0]["body"]
-    assert _groups(panel)["firing"] == [world.rid("firing")] and "agent:" + dream in {r["id"] for r in panel["rows"]}
+    assert _groups(panel)["fleet-firing"] == [world.rid("firing")] and "agent:" + dream in {r["id"] for r in panel["rows"]}
     assert world.ck.read_one(AGENTS_ID, ops[0]["id"]).value["body"] == ops[0]["body"]
     assert _snapshot(world) == before
 
@@ -1201,3 +1205,40 @@ def test_a_bar_close_that_raises_after_a_landed_revoke_is_landed_and_barred_neve
     monkeypatch.setattr(bars, "_r3", broken)
     out = world.post("agent_revoke", "firing", confirm=True)
     assert out["state"] == "landed" and out["barred"] == verbs_mod.REVOKE_LANDED_STILL_BARRED
+
+
+def test_jobs_and_fleet_are_sections_by_kind_and_an_unreadable_kind_is_fleet_never_hidden_in_jobs(world):
+    # behaviour (levain#221, ruling D7 np-d74d51e6 (a)): one provider, the sections drawn from the agent_kind facet: a job is
+    # in Jobs, a role and an unreadable kind are in Fleet, the retired ones keep their own group, and the state groups
+    # are inside each section (the ordering's group ids are the contract the page's headings read)
+    job = _kind_agent(world, "sjob", _kind_role("sjob-role", "job"))
+    role = _kind_agent(world, "srole", _kind_role("srole-role"))
+    bad_role = _kind_role("sbad-role", "job")
+    bad = _kind_agent(world, "sbad", bad_role)
+    _damage(world, bad_role, "row_gone")
+    panel = world.panel()
+    by_id = {r["id"]: r["group"] for r in panel["rows"]}
+    assert by_id["agent:" + job] == "jobs-unarmed"                       # no link is signed for it: Unarmed, inside Jobs
+    assert by_id["agent:" + role] == "fleet-unarmed"
+    assert by_id["agent:" + bad] == "fleet-unarmed"                      # an unreadable kind is shown in Fleet
+    assert by_id[world.rid("retired")] == "retired" and by_id["operator-agent:none"] == "operator"
+    titles = {g["id"]: g["title"] for g in panel["groups"]}
+    assert titles["jobs-firing"] == "Jobs · Firing" and titles["fleet-paused"] == "Fleet · Paused"
+    assert panel["count"] == len([r for r in panel["rows"] if r["group"] not in ("operator", "retired")])   # the retired and the pinned row are no figure
+
+
+def test_a_job_row_leads_with_its_role_briefs_first_line_and_carries_its_spec_name_as_the_address_label(world):
+    # behaviour (ruling D6 np-fc7af821 (a), a partial departure from "gets no name"): a job's title and the lead of its
+    # words are the role brief's first line, its spec name is the facet `agent_name` the page draws as a small label; the
+    # verbs still address it by the row id (the agent id), and a role's row keeps its name as its title
+    role = _kind_role("ljob-role", "job")
+    role["brief"] = {"template": "\n  Check the push queue and say what is stuck\nsecond line\n", "slots": {}}
+    job = _kind_agent(world, "ljob", role)
+    plain = _kind_agent(world, "lplain", _kind_role("lplain-role"))
+    rows = {r["id"]: r for r in world.panel()["rows"]}
+    jrow = rows["agent:" + job]
+    assert jrow["title"] == "Check the push queue and say what is stuck"
+    assert jrow["body"].startswith("Check the push queue and say what is stuck · v1")
+    assert "w-ljob" not in jrow["body"] and jrow["facets"]["agent_name"] == "w-ljob"
+    assert rows["agent:" + plain]["title"] == "w-lplain" and rows["agent:" + plain]["body"].startswith("w-lplain · v1")
+    assert rows["agent:" + plain]["facets"]["agent_name"] == "w-lplain"
