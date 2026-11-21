@@ -749,6 +749,12 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
     if missing is not None:
         raise HandsChatRefused(f"{missing}; no chat was started")
     try:
+        # levain#241: Claude on macOS runs only with the root-installed ``security`` shim in place (a refresh lands in
+        # the file); a miss is this chat's own refusal, before anything is locked or swept.
+        hl.check_security_shim(vendor)
+    except hl.HandsLoginError as exc:
+        raise HandsChatRefused(f"{exc}; no chat was started") from None
+    try:
         sigs = _Signals()
     except ValueError as exc:   # not the main thread: no handler, so no orderly stop; refuse rather than run without
         raise HandsChatRefused(f"the stop signals cannot be handled here ({exc}); no chat was started") from None

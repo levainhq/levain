@@ -117,7 +117,7 @@ def test_the_hands_argv_puts_sudo_outside_the_sandbox_with_a_clean_environment(t
     at = argv.index(confinement.SANDBOX_EXEC)
     assert argv[at + 1] == "-p" and argv[at + 3:] == ["/bin/bash", "--noprofile", "--norc"]
     env_args = argv[6:at]
-    assert f"HOME={_NOBODY.pw_dir}" in env_args and f"PATH={HANDS_PATH}" in env_args
+    assert f"HOME={_NOBODY.pw_dir}" in env_args and f"PATH={confinement._hands_env(hands)['PATH']}" in env_args
     assert not any("do-not-leak" in a for a in argv)
     assert not any(str(Path.home()) in d for d in HANDS_PATH.split(":"))
     assert sh._cwd == hands.workspace and sh._carried_env["HOME"] == _NOBODY.pw_dir

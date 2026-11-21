@@ -322,3 +322,51 @@ def test_a_corrupted_log_is_a_clean_refusal_through_register_and_revoke(ck, caps
     assert main(argv(ck, verb, *rest)) == 1
     err = capsys.readouterr().err
     assert f"{verb} refused:" in err and "Traceback" not in err
+
+
+# --- levain#241: the MCP sign-in locks the sealed keychain and checks the security shim before the vendor runs ---------
+# (the sign-in rig is the one of tests/test_hands_mcp_verbs.py; only its fixture and helper are borrowed)
+from tests.test_hands_login import _sec_calls  # noqa: E402
+from tests.test_hands_mcp_verbs import rig, signin  # noqa: E402,F401
+
+
+def test_every_mcp_signin_locks_the_sealed_keychain_before_the_vendor_adds_anything(rig):
+    # the keychain is already there at the second sign-in, so the only `lock-keychain` it can see is the sign-in's own
+    # call: deleting that call from hands_mcp_login.signin fails this test
+    rig.register()
+    assert signin(rig) == 0
+    rig.seclog.unlink()
+    rig.register("notion")
+    assert signin(rig, "notion") == 0
+    assert [c for c in _sec_calls(rig) if c.startswith("lock-keychain")] != []
+
+
+def test_an_mcp_signin_whose_lock_fails_refuses_before_any_add_or_login(rig, capsys):
+    rig.register()
+    rig.knobs["SEC_LOCK_FAIL"] = "denied"
+    assert signin(rig) == 1
+    out = capsys.readouterr().out
+    assert "could not lock" in out and "the sign-in was not started" in out
+    assert rig.mutating() == [] and not rig.cred.exists() and "linear" not in hml.read_record(rig.entity)
+
+
+def test_an_mcp_signin_and_remove_check_the_root_installed_shim_before_any_claude_run(rig, capsys):
+    from levain.firing import hands_login as hl
+    rig.register()
+    assert signin(rig) == 0                                     # the shim is in place: the sign-in runs
+    shim = rig.shim_dir / hl.SECURITY_SHIM_NAME
+    shim.write_text("#!/bin/sh\nexit 0\n")                       # tampered: neither verb runs claude
+    rig.log.write_text("")
+    rig.register("notion")
+    assert signin(rig, "notion") == 1
+    out = capsys.readouterr().out
+    assert "the sign-in was not started" in out and "sudo levain setup-isolation" in out
+    assert rig.calls() == [] and rig.mutating() == [] and "notion" not in hml.read_record(rig.entity)
+    assert hml.cmd_remove(rig.entity, "linear") == 1
+    out = capsys.readouterr().out
+    assert "sudo levain setup-isolation" in out and "nothing was changed" in out
+    assert rig.calls() == [] and "linear" in hml.read_record(rig.entity)
+    shim.unlink()                                               # missing: the same
+    assert signin(rig, "notion") == 1 and rig.calls() == []
+    # nothing wrote the shim: the hands home has no shim directory of any name
+    assert not (rig.hands_home / ".levain-bin").exists() and not shim.exists()

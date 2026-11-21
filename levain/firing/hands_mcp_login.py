@@ -348,6 +348,7 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
     try:
         with hl.hands_lock(entity_dir, "an MCP sign-in"):
             try:
+                hl.check_security_shim(VENDOR)      # levain#241: before ANY claude run (root-installed; checked, never written)
                 hl.ensure_config_home(hands, VENDOR, entity_dir=entity_dir)
                 held = vendor_servers(hands, entity_dir, held=True)
             except hl.HandsLoginError as exc:
@@ -365,9 +366,12 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
             # add/login mutation.
             try:
                 if hl.keychain_needed(VENDOR):
+                    # levain#241: the security shim (checked above, before the vendor runs) and the lock keep the token's
+                    # save in the 0600 file; a failed lock refuses before anything is added.
                     note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
                     if note:
                         (emit or hl._write_out)(note)
+                    hl.lock_hands_keychain(hands, VENDOR, entity_dir=entity_dir)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
             if name not in held:
@@ -430,6 +434,10 @@ def remove(hands: HandsIdentity, name: str, entity_dir: Path | str) -> tuple[str
     try:
         with hl.hands_lock(entity_dir, "an MCP remove"):
             ours = read_record(entity_dir).get(name)
+            try:
+                hl.check_security_shim(VENDOR)      # levain#241: before ANY claude run, the logout and remove included
+            except hl.HandsLoginError as exc:
+                raise HandsMcpRefused(f"{exc}; nothing was changed") from None
             try:
                 held = vendor_servers(hands, entity_dir, held=True)
             except hl.HandsLoginError as exc:
