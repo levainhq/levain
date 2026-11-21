@@ -110,11 +110,13 @@ class Dg:
         self.seen["line"] = p.request.split(b"\r\n")[0].decode()
         self.seen["auth"] = p.header("Authorization")
         self.seen["request"] = p.request
-        # One long timeout, never a short one retried: read_frame consumes a frame's header before it reads the payload, so a timeout
-        # that fired between the two would be swallowed by a retry and every later frame would be read from the wrong offset.
-        p.conn.settimeout(30)
+        # One long timeout per read, never a short one retried: read_frame consumes a frame's header before it reads the payload, so a
+        # timeout that fired between the two would be swallowed by a retry and every later frame would be read from the wrong offset.
+        # The handler as a whole keeps its absolute deadline, so a client that keeps sending cannot hold the fake provider open.
         said = False
-        while True:
+        deadline = time.monotonic() + 30
+        while (left := deadline - time.monotonic()) > 0:
+            p.conn.settimeout(left)
             try:
                 fin, op, masked, data, key = p.read_frame()
             except (TimeoutError, OSError, EOFError):
@@ -158,7 +160,11 @@ class HoldsFirstPartial:
 
     def send_audio(self, pcm: bytes) -> None:
         self._inner.send_audio(pcm)
-        self._sent = True
+        if pcm:                  # an empty frame carries no audio for the provider to answer, so it never arms the hold
+            self._sent = True
+
+    def __getattr__(self, name):   # anything else the session asks of a stream is the real stream's
+        return getattr(self._inner, name)
 
     def poll(self):
         if not self._sent or self._held:
