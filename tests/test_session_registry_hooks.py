@@ -38,11 +38,17 @@ def _install(root: Path, tree: Path) -> Path:
     return hooks
 
 
+def _child_env(root: Path) -> dict:
+    """The hand-built environment of a hook child. `LEVAIN_HOME` is the per-test scratch home the autouse
+    `_isolate_levain_home` fixture (tests/conftest.py) sets in this process, so the child resolves its consent
+    directory under a scratch home and never falls back to `~/.levain`."""
+    return {"PATH": "/usr/bin:/bin", "HOME": str(root), "LEVAIN_HOME": os.environ["LEVAIN_HOME"]}
+
+
 def _run(root: Path, script: str, payload: dict):
     return subprocess.run(
         [sys.executable, str(root / "activation" / "hooks" / script)], input=json.dumps(payload),
-        capture_output=True, text=True, cwd=root, timeout=60,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+        capture_output=True, text=True, cwd=root, timeout=60, env=_child_env(root))
 
 
 def _record(root: Path, agent: str, sid: str) -> dict:
@@ -233,8 +239,7 @@ def test_stop_and_post_tool_use_are_silent_whatever_goes_wrong(agent_root, scrip
         for stdin in ("not json at all", "", "[1, 2]", '{"session_id": 5, "tool_name": 7}'):
             proc = subprocess.run(
                 [sys.executable, str(root / "activation" / "hooks" / script)], input=stdin,
-                capture_output=True, text=True, cwd=root, timeout=60,
-                env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+                capture_output=True, text=True, cwd=root, timeout=60, env=_child_env(root))
             assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
     finally:
         sdir.chmod(0o700)
@@ -324,8 +329,7 @@ def test_concurrent_appends_across_the_rotation_lose_no_event(agent_root, tmp_pa
             sent.append(tag)
             pr = subprocess.Popen(
                 [sys.executable, "-c", _GATED, str(gate), str(script)], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=root,
-                env={"PATH": "/usr/bin:/bin", "HOME": str(root)})
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=root, env=_child_env(root))
             pr.stdin.write(json.dumps({"session_id": "s1", "cwd": "/w", "tool_name": "Task",
                                        "tool_input": {"file_path": tag}}))
             pr.stdin.close()
