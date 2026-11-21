@@ -6,6 +6,7 @@ version, a normalisation per non-JSON value, fresh containers on every decode). 
 and the last tests read the engine's own panels through a real refresh."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import gc
@@ -126,25 +127,47 @@ def _big_snap(n: int) -> _Snap:
     return _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
 
 
-def _round_trip(s: _Snap) -> tuple[float, _Snap]:
-    """One timed encode -> store bytes -> decode. The collector is off while the clock runs: its full collections walk
-    every live object, so their cost follows the size of the whole heap, not the codec's algorithm, and they land on
-    some runs and not others."""
-    gc.collect()
-    gc.disable()
+@contextlib.contextmanager
+def _collector_off():
+    """Timed windows run with the collector off: its full collections walk every live object, so their cost follows the
+    size of the whole heap, not the codec's algorithm, and they land on some runs and not others. One collection runs
+    first so the window starts from a clean heap; the state the caller had is restored, never forced on."""
+    was_enabled = gc.isenabled()
     try:
-        t0 = time.perf_counter()
-        status, body = sh.encode_snap(s)
-        raw = snapshots.encode_body(body)
-        back = sh.decode_snap(status, json.loads(raw), as_of=s.as_of)
-        return time.perf_counter() - t0, back
+        gc.collect()
+        gc.disable()
+        yield
     finally:
-        gc.enable()
+        if was_enabled:
+            gc.enable()
+
+
+def _round_trip(s: _Snap) -> tuple[float, _Snap]:
+    t0 = time.perf_counter()
+    status, body = sh.encode_snap(s)
+    raw = snapshots.encode_body(body)
+    back = sh.decode_snap(status, json.loads(raw), as_of=s.as_of)
+    return time.perf_counter() - t0, back
 
 
 _SMALL_ROWS, _BIG_ROWS = 250, 5000  # the step between the two timed sizes
 _PAIRS = 5  # small and big attempts, interleaved; odd so the median is one measured pair
 _GROWTH_ALLOWANCE = 3  # the equal-work time ratio may reach this multiple of 1
+
+
+def test_the_timed_window_hands_the_collector_back_as_it_found_it() -> None:
+    was = gc.isenabled()
+    try:
+        gc.enable()
+        with _collector_off():
+            assert not gc.isenabled()
+        assert gc.isenabled()
+        gc.disable()
+        with _collector_off():
+            assert not gc.isenabled()
+        assert not gc.isenabled()       # a caller that had it off is not turned back on
+    finally:
+        gc.enable() if was else gc.disable()
 
 
 def test_a_large_rows_list_round_trips_in_linear_time() -> None:
@@ -154,11 +177,12 @@ def test_a_large_rows_list_round_trips_in_linear_time() -> None:
     round trip against enough small ones to carry the same total rows (_BIG_ROWS / _SMALL_ROWS of them). For a linear
     codec the two take about the same time (ratio near 1); a size-quadratic encode or decode makes the big one cost
     about the size ratio times more. Two things kept earlier forms of this test flaky and are held fixed here: the
-    garbage collector is disabled inside each timed run (see _round_trip), because its heap-wide collections made the
+    garbage collector is disabled inside each timed window (see _collector_off), because its heap-wide collections made the
     ratio bimodal, and the small side is the sum of many runs, so one millisecond-scale small run cannot swing it. The
     _PAIRS attempts alternate and the MEDIAN ratio is gated at _GROWTH_ALLOWANCE. It misses a constant-factor
     slowdown and a mild superlinear cost that stays under the bound. The big round trip must also decode back to the
     same change-detection text as the original."""
+    assert _BIG_ROWS % _SMALL_ROWS == 0, "the small side must carry exactly the big side's rows"
     small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
     reps = _BIG_ROWS // _SMALL_ROWS
     _round_trip(small)  # warm-up, untimed, at both sizes
@@ -166,8 +190,10 @@ def test_a_large_rows_list_round_trips_in_linear_time() -> None:
     ratios: list[float] = []
     last_back: _Snap | None = None
     for _ in range(_PAIRS):
-        small_took = sum(_round_trip(small)[0] for _ in range(reps))
-        big_took, last_back = _round_trip(big)
+        with _collector_off():
+            small_took = sum(_round_trip(small)[0] for _ in range(reps))
+        with _collector_off():
+            big_took, last_back = _round_trip(big)
         ratios.append(big_took / small_took)
     assert statistics.median(ratios) < _GROWTH_ALLOWANCE, (ratios, _GROWTH_ALLOWANCE)
     assert last_back is not None and _frags(last_back) == _frags(big)
