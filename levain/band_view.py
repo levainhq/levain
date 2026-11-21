@@ -3907,6 +3907,9 @@ def run_band_terminal_key(args: argparse.Namespace) -> int:
     act at the laptop, so it is refused inside any agent session; ``status`` only reads."""
     from levain.consent import terminal_sign as ts
 
+    if args.tk_verb == "rotate":
+        from levain.consent import terminal_rotate
+        return terminal_rotate.run(args)
     if args.tk_verb == "status":
         rep = ts.status()
         print(rep.text, file=sys.stderr if rep.state == "warning" else sys.stdout)
@@ -4067,3 +4070,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     for name, text in (("create", "Make the Secure Enclave key (Touch ID) and print the lines to commit."),
                        ("status", "Read-only: is a terminal key enrolled, and is its identity biometric-protected.")):
         tsub.add_parser(name, help=text).set_defaults(func=run_band_terminal_key, tk_verb=name)
+    rot = tsub.add_parser("rotate", help="Once: move the terminal key onto Levain's helper (new key enrolled by the "
+                                         "old, old key revoked by the new; resumable).")
+    rot.add_argument("--path", type=Path, default=Path.cwd(),
+                     help="Install directory (default: cwd); the authority is its ledger's cockpit/.")
+    rot.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                     help="The cockpit data root itself (as `levain cockpit enroll --data-root`).")
+    rot.set_defaults(func=run_band_terminal_key, tk_verb="rotate")
