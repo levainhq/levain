@@ -62,6 +62,7 @@ from typing import Any, Protocol, runtime_checkable
 from levain.agents import accounting, controller as _ctl, role as _role
 from levain.agents.accounting import ActionExposure, StopResult, Usage
 from levain.agents.store import AgentStore
+from levain.slot.runtime_grammar import REPORT_CAP as _REPORT_CAP
 from levain.agents.supervise import STOP_DEADLINE_S as _STOP_DEADLINE_S   # the reaper's stop deadline, reused
 
 __all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "Workspace",
@@ -327,7 +328,7 @@ def _recall_block(recall: Any) -> str:
 
 
 REPORT_FILE = ".levain-report.md"     # the brief's name for the file runtime_grammar's REPORT_REL names
-REPORT_CAP_KIB = 32                    # the brief's figure for runtime_grammar's REPORT_CAP, in KiB
+REPORT_CAP_KIB = _REPORT_CAP // 1024   # runtime_grammar's REPORT_CAP, in KiB
 
 
 def render_brief(role: Mapping[str, Any], values: Mapping[str, Any], recall: Any = None, *, occurrence_id: str,

@@ -281,7 +281,7 @@ def _episode_hooks(store: AgentStore, install: SessionInstall, agent_id: str, ro
 REPORT_MISSING, REPORT_OVERSIZE, REPORT_MALFORMED, CARD_NOT_FILED = (
     "report_missing", "report_oversize", "report_malformed", "card_not_filed")
 _SUMMARY_MAX = 300
-_BODY_MAX = 8000          # the review store's bound on one item's canonical body (its ``_insert``), counted in characters
+_BODY_MAX = 8000          # a test pins this against the review store's own bound on a body
 
 
 def _collapse(text: str) -> str:

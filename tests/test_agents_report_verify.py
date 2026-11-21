@@ -197,3 +197,7 @@ def test_the_brief_tail_names_the_report_file_cap_and_data_status():
     text = S.render_brief(role, {}, occurrence_id="occ-1", session_key="s-0123456789abcdef")
     assert "`.levain-report.md`" in text and "32 KiB" in text and "as data" in text and "ends failed" in text
     assert text.index("This is occurrence") < text.index(".levain-report.md")
+
+
+def test_the_card_body_bound_is_the_review_stores():
+    assert W._BODY_MAX == 2 * review._TEXT_MAX
