@@ -136,7 +136,7 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
     values = doc.get("values", {})
     if not isinstance(values, dict):
         raise InstallRefused(f"{path}: values is not an object")
-    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="dir")
+    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="none")   # existence: at write
     return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path), coord)
 
 
@@ -182,6 +182,9 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
         doc["workspaces"] = {a: dict(e) for a, e in workspaces.items()}
     text = json.dumps(doc, sort_keys=True)
     _parse_install(json.loads(text), d / INSTALL_FILE)     # the round trip: what a read will see, before any write
+    if coord_dir is not None and not Path(doc["coord_dir"]).is_dir():
+        # checked here and not at read: a coord dir that has since vanished must not make the whole install unreadable
+        raise InstallRefused(f"{d / INSTALL_FILE}: coord_dir {doc['coord_dir']!r} is not a directory")
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".session_install.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

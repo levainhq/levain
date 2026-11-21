@@ -209,10 +209,20 @@ def test_the_install_round_trips_a_coord_dir_and_refuses_a_relative_one(rig):
     assert W.read_install(rig.store.directory).coord_dir == _coord(rig) and path.exists()
     with pytest.raises(W.InstallRefused):
         W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir="relative/coord")
-    with pytest.raises(W.InstallRefused):           # an absolute path that is no directory
+    before = path.read_bytes()
+    with pytest.raises(W.InstallRefused, match="not a directory"):    # a write refuses an absolute path that is no directory
         W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir=_coord(rig) / "missing")
+    assert path.read_bytes() == before
     W.write_install(rig.store.directory, cockpit_root=rig.world.root)
     assert W.read_install(rig.store.directory).coord_dir is None
+
+
+def test_an_install_naming_a_vanished_coord_dir_still_reads(rig):
+    coord = _coord(rig)
+    W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher="stub", coord_dir=coord)
+    coord.rmdir()
+    install = W.read_install(rig.store.directory)
+    assert install.coord_dir == coord and install.launcher == "stub" and install.cockpit_root == rig.world.root
 
 
 def test_the_brief_tail_names_the_report_file_cap_and_data_status():

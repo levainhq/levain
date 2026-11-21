@@ -71,6 +71,7 @@ def _fire_once(rig, monkeypatch, tmp_path, vendor_code):
     W.register_launcher("vendor", lambda store: launcher)
     from anneal_memory import Store
     Store(tmp_path / "episodes.db", audit=False).close()
+    (tmp_path / "coord").mkdir(mode=0o700, exist_ok=True)      # a write checks it exists; the store insists on 0700
     W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher="vendor",
                     episodic_path=tmp_path / "episodes.db", coord_dir=tmp_path / "coord")
     monkeypatch.setattr(delivery, "process_identity",
