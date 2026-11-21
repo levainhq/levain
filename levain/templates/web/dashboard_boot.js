@@ -7,6 +7,45 @@
 // — only the delivery differs. Kept in its own served file (not inline) so the
 // page's CSP can be `script-src 'self'` with no inline-script exception.
 
+// ONE-SHOT GUARD for a missing cockpit_view.js. A script answered with an error leaves `window.LevainCockpitView` undefined, and nothing
+// else asks for it again, so the page would stay dead until a person reloaded it. This runs first, before the boot below, and does not
+// wait for anything: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and when that
+// lands the page goes on. When it does not, the page reloads ONCE: the marker is written to sessionStorage BEFORE the reload, so a second
+// failure finds it and stops. A healthy boot clears the marker, so a later incident may heal again. Storage that cannot be read or written
+// never reloads (no marker could be kept, so a loop could not be ruled out). Nothing is shown: the one trace is a console line.
+(function () {
+  const KEY = "levain_cockpit_view_reload", WAIT_MS = 4000;
+  function clearMark() { try { window.sessionStorage.removeItem(KEY); } catch (_) { /* no storage: nothing was kept */ } }
+  try {
+    if (window.LevainCockpitView) { clearMark(); return; }
+    const tag = document.querySelector('script[src^="/cockpit_view.js"]');
+    const src = tag && typeof tag.getAttribute === "function" ? tag.getAttribute("src") : null;
+    if (!src || !document.head) return;     // a page that never named the script has nothing to wait for
+    let decided = false, timer = 0;
+    const decide = function () {
+      if (decided) return;
+      decided = true;
+      clearTimeout(timer);
+      try {
+        if (window.LevainCockpitView) { clearMark(); return; }
+        let mayReload = false;
+        try {
+          const ss = window.sessionStorage;
+          if (ss.getItem(KEY) === null) { ss.setItem(KEY, "1"); mayReload = ss.getItem(KEY) === "1"; }
+        } catch (_) { mayReload = false; }
+        if (mayReload) { window.location.reload(); return; }
+        console.error("levain: cockpit_view.js did not load, and the page has already reloaded once (or cannot remember that it did)");
+      } catch (_) { /* the guard never throws into the page */ }
+    };
+    const el = document.createElement("script");
+    el.onload = decide;
+    el.onerror = decide;
+    el.src = src;
+    timer = setTimeout(decide, WAIT_MS);
+    document.head.appendChild(el);
+  } catch (_) { /* the guard never throws into the page */ }
+})();
+
 (function () {
   "use strict";
   const storeEl = document.getElementById("store");
