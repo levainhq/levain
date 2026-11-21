@@ -241,6 +241,17 @@ try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMo
 // The dialog decline's retry decision (tests/_dialog_decline.mjs): same tolerance, a copy without the sibling declines once and never retries.
 let declineMod = null;
 try { declineMod = await import("./_dialog_decline.mjs"); } catch { declineMod = null; }
+// A dialog that could not be declined leaves the page frozen behind it: the drive fails at once, by name, with the same dump a timed-out step leaves.
+// It adds nothing once the drive is ending or an earlier failure has taken the exit. dumpAtFailure is set once shotOnTimeout exists (a dialog
+// can fail before that, and then the drive just fails by name).
+let stepAt = -1; let dumpAtFailure = null; let frozenReported = false;
+const failFrozen = async (message) => {
+  if (exiting || frozenReported) return;
+  frozenReported = true;
+  console.error(message);
+  try { if (dumpAtFailure) await dumpAtFailure(stepAt); } catch {}
+  done(1);
+};
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (evidence) evidence.onMessage(d);
@@ -268,12 +279,18 @@ ws.addEventListener("message", (m) => {
   if (d.method === "Page.javascriptDialogOpening") {
     if (declineMod) {
       // A decline refused only because the page target is not attached yet is sent again after a pause, within a bound (tests/_dialog_decline.mjs):
-      // an open dialog freezes the page and nothing else would close it. Each send is recorded by the evidence under its own command id, and
-      // the reply is read through the same pending map as every other command; it is never awaited inside this listener.
+      // an open dialog freezes the page and nothing else would close it. Each send is recorded by the evidence under the command id it took
+      // (handed out by `send` as it takes it), each is bounded so an unanswered one ends the loop, and the reply is read through the same
+      // pending map as every other command; it is never awaited inside this listener. A decline that gives up fails the drive by name.
       declineMod.declineDialog({
-        send: (method, params) => { if (evidence) evidence.dialogReplySent(id + 1); return send(method, params); },   // send takes the next id synchronously: the evidence record matches the reply to this command by it
+        send: declineMod.boundedSend((method, params) => send(method, params, (i) => { if (evidence) evidence.dialogReplySent(i); }), sleep, scaled(3000)),
         now: Date.now, sleep, boundMs: scaled(5000), pauseMs: 200,
-      }).then((out) => { if (!out.declined) trail.push(`dialog decline not done (${out.why}) after ${out.sends} sends: ${out.last.slice(0, 80)}`); }).catch(() => {});
+      }).then((out) => {
+        if (out.declined) return;
+        if (!declineMod.leavesPageFrozen(out)) { trail.push(`dialog decline ended after ${out.sends} sends: ${out.last.slice(0, 80)}`); return; }   // the dialog was already closed: nothing is frozen
+        trail.push(`dialog decline not done (${out.why}) after ${out.sends} sends: ${out.last.slice(0, 80)}`);
+        return failFrozen("page-drive: " + declineMod.frozenMessage(out));
+      }).catch(() => {});
     } else {
       const i = ++id; if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
       ws.send(JSON.stringify({ id: i, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
@@ -283,9 +300,10 @@ ws.addEventListener("message", (m) => {
 });
 ws.addEventListener("close", () => failPending(pend, "the page connection closed"));
 ws.addEventListener("error", () => failPending(pend, "the page connection failed"));
-const send = (method, params = {}) => new Promise((res, rej) => {
+// onId, when given, is called with the command's id as it is taken, ahead of the write: a caller that must record the id learns the real one
+const send = (method, params = {}, onId) => new Promise((res, rej) => {
   if (ws.readyState !== 1) return rej(new Error("the page connection is not open"));
-  const i = ++id; pend.set(i, { res, rej });
+  const i = ++id; if (onId) onId(i); pend.set(i, { res, rej });
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
@@ -454,6 +472,7 @@ const shotOnTimeout = async (n) => {
   try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact, block); } catch {}
   await timeoutBlock(shotPath, artifact);
 };
+dumpAtFailure = shotOnTimeout;
 const shotOnTimeoutInner = async (n, setPath, artifact, block = "") => {
   try {
     // the txt is written even when the screenshot is not (a wedged page answers neither): the text and state probes then say so themselves
@@ -530,6 +549,7 @@ const awaitWorkerSettled = async () => {
 };
 const RELOADS_PAGE = /\blocation\.reload\b/;
 for (const s of steps) {
+  stepAt = steps.indexOf(s);
   if (!s.partial && !boardWaitGaveUp && !SETUP_STEPS.some((k) => s[k] !== undefined)) await waitForWholeBoard();
   const waitMs = scaled(s.ms || 20000);
   const deadline = Date.now() + waitMs;

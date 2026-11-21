@@ -8,6 +8,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { declineDialog, boundedSend, leavesPageFrozen, frozenMessage } from "./_dialog_decline.mjs";
 
 const [chromePath, url] = process.argv.slice(2);
 const flags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
@@ -45,13 +46,18 @@ async function targets() {
 async function attach(wsUrl) {
   const ws = new WebSocket(wsUrl); await new Promise((r) => ws.addEventListener("open", r));
   let id = 0; const pend = new Map();
+  const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
   ws.addEventListener("message", (m) => {
     const d = JSON.parse(m.data);
-    // a prompt (the write-token ask) is declined, as an operator with no token would: it must not block the page
-    if (d.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: ++id, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+    // a prompt (the write-token ask) is declined, as an operator with no token would: it must not block the page. The decline is the driver's
+    // (tests/_dialog_decline.mjs): refused as not attached it is sent again within a bound, and one that gives up fails this rig by name.
+    if (d.method === "Page.javascriptDialogOpening") {
+      declineDialog({ send: boundedSend(send, sleep, 3000), now: Date.now, sleep, boundMs: 5000, pauseMs: 200 })
+        .then((out) => { if (leavesPageFrozen(out)) throw new Error(frozenMessage(out)); });   // a rejection here ends the rig through its unhandledRejection handler
+    }
     if (d.id && pend.has(d.id)) { pend.get(d.id)(d); pend.delete(d.id); }
   });
-  return (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+  return send;
 }
 async function evalIn(send, expr) {
   const r = await Promise.race([send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }),
