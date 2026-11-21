@@ -167,7 +167,10 @@ def test_the_timed_window_hands_the_collector_back_as_it_found_it() -> None:
             assert not gc.isenabled()
         assert not gc.isenabled()       # a caller that had it off is not turned back on
     finally:
-        gc.enable() if was else gc.disable()
+        if was:
+            gc.enable()
+        else:
+            gc.disable()
 
 
 def test_a_large_rows_list_round_trips_in_linear_time() -> None:
