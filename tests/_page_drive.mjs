@@ -486,8 +486,8 @@ for (const s of steps) {
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) await initFails("init: the reload was refused: " + JSON.stringify(reloaded.error));
     // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document.
-    // Every probe is raced against the time left (never the 60 s evaluate default: a reload that never committed answered nothing, and the
-    // wait then ran to ~66 s, not to this bound), and a reload that has committed nothing by the middle of the bound is sent ONCE more: the
+    // Every probe is raced against the time left (never the evaluate default: a reload that never committed answered nothing, and the
+    // wait then ran past this bound; CI 11-21, the l197 shard-2 log), and a reload that has committed nothing by the middle of the bound is sent ONCE more: the
     // measured hang is a reload whose navigation never commits (NAV TRAIL ends at frameStartedLoading, no frameNavigated, every evaluate
     // unanswered), which the worker wait above does not always prevent. A reload that was only slow costs one more load, inside the same bound.
     let resent = false;

@@ -42,8 +42,8 @@ def _seed(value: str) -> list:
 
 
 # a reload whose fresh page never drew: CI (levain#236, shard 0) kept a page whose scripts and styles had not loaded ("Cannot read properties of
-# undefined (reading 'fromManifest')", the board never drawn a .pbody) and waited out the whole 40 s on it. A load that is fine draws in ~2 s, so
-# a page still not fresh after 8 s (16 s at the CI scale) is reloaded ONCE and waited on for the usual bound; a fresh page is left alone.
+# undefined (reading 'fromManifest')", the board never drawn a .pbody) and waited out the whole bound on it. A load that is fine draws well inside
+# the 8000 ms first wait below, so a page still not fresh by then is reloaded ONCE and waited on for the usual bound; a fresh page is left alone.
 RETRY_IF_STALE = "(() => { if (" + FRESH + ") return 'fresh'; window.__old = 1; location.reload(); return 'reloaded'; })()"
 
 
