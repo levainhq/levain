@@ -219,6 +219,26 @@ def test_the_diff_reads_dicts_by_key_and_lists_by_position():
     assert [t.kind for t in rig.diff({"a": [1]}, {"a": [1, 2]})] == ["value"]
 
 
+def test_a_read_that_raised_on_one_side_is_one_difference_not_one_per_key():
+    raised = {"raised": "E: e"}
+    for old, new in (({"rows": [1], "status": "ok"}, raised), (raised, {"rows": [1], "status": "ok"})):
+        got = rig.diff({"payload": old}, {"payload": new})
+        assert [(t.dotted(), t.kind) for t in got] == [("payload", "value")], got
+        assert rig.triple_raised(got[0])
+    assert rig.diff({"payload": raised}, {"payload": dict(raised)}) == []      # the same raise on both sides stays equal: other tests assert none
+    assert [t.dotted() for t in rig.diff({"a": raised, "b": 1}, {"a": {"x": 1}, "b": 2})] == ["a", "b"]
+
+
+def test_a_triple_whose_path_holds_an_index_has_no_panel_and_no_crash():
+    assert rig.Triple(("freshness", 0), "value", 1, 2).panel == "-"
+    assert rig.Triple(("payload", "x", "full"), "value", 1, 2).panel == "x"
+
+
+def test_two_bodies_that_differ_only_in_json_type_are_different_bodies():
+    assert not rig.same_body({"x": True}, {"x": 1}) and not rig.same_body({"x": 0}, {"x": False})
+    assert rig.same_body({"a": 1, "b": [1, 2]}, {"b": [1, 2], "a": 1})
+
+
 # ------------------------------------------------------------------------------------------------------------- the corpus
 
 
@@ -356,6 +376,10 @@ _BLOCK = {"worker": "live", "heartbeat_age_s": 0.5, "deriving": [], "stream": {"
     (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream="up"), False),
     (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={}), False),
     (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={"state": 1}), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={"state": ""}), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, stream={"state": "  "}), False),
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s=10 ** 1000), True),      # a number too large for a float is not a crash
+    (("manifest", "freshness"), "extra_key_in_subject", dict(_BLOCK, heartbeat_age_s=float("inf")), False),
     (("manifest", "freshness"), "extra_key_in_subject", None, False),
     # a freshness key whose value DIFFERS (both sides had it) is a value triple, never explained by an extra-key entry
     (("manifest", "panels", "x", "stale"), "value", False, False),
@@ -436,7 +460,7 @@ def test_each_side_agrees_with_itself_and_distinct_panels_have_distinct_etags(pa
             assert ck.panel(pid)["etag"] == manifest[pid]["etag"] == ck.manifest(rig.CRED)["panels"][pid]["etag"], (name, pid)
         bodies = {pid: {k: v for k, v in rig.wire(ck.panel(pid)).items() if k not in BODY_VOLATILE} for pid in manifest}
         tags = {pid: h["etag"] for pid, h in manifest.items()}
-        clash = [(a, b) for a in tags for b in tags if a < b and tags[a] == tags[b] and bodies[a] != bodies[b]]
+        clash = [(a, b) for a in tags for b in tags if a < b and tags[a] == tags[b] and not rig.same_body(bodies[a], bodies[b])]
         assert clash == [], (name, clash)
     assert any(p.bare.panel(pid)["etag"] != p.attached.panel(pid)["etag"] for pid in p.derived), name
 
