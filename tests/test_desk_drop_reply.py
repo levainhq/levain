@@ -439,10 +439,11 @@ def test_the_frozen_block_leaves_out_the_drop_it_answers_but_names_the_others(qd
 def test_the_stored_block_carries_the_unreplied_lines_the_stop_check_verifies(qdir) -> None:
     from levain import band_view
 
-    store, _box = _clocked(qdir, datetime.now(timezone.utc) - timedelta(minutes=30))
+    when = datetime.now(timezone.utc) - timedelta(minutes=30)      # one instant: the drop is stamped with it and the line expects it
+    store, _box = _clocked(qdir, when)
     d = _drop(store)
     block = work_delta.read_block(qdir, "v", 5.0)
-    line = f"drop {d} ({_stamp(datetime.now(timezone.utc) - timedelta(minutes=30))[11:16]}, phone): no reply yet"
+    line = f"drop {d} ({_stamp(when)[11:16]}, phone): no reply yet"
     assert line in block.text
     view = band_view.View(0, (), None)
     assert band_view._reprint_check(view, block.text, block.text) == ([], False)
