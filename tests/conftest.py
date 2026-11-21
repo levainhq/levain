@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -529,6 +530,49 @@ def invariant_node_ids():
     """The whole-tree invariant tests, one `file::Class::function` per line (see the header of that file)."""
     lines = _INVARIANT_LIST.read_text(encoding="utf-8").splitlines()
     return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+
+
+def invariant_modules():
+    """The repo-relative test files that hold a listed invariant test."""
+    return {i.split("::", 1)[0] for i in invariant_node_ids()}
+
+
+def skipped_by_the_invariant_tier(path, markexpr):
+    """True for a test module the bare `-m invariant` run need not import. Only the listed ids carry the marker, so
+    a module holding none of them contributes nothing to that tier, and importing every module of the tree to find
+    that out is what made the tier's collection outgrow the conductor's cap (levain-signing 3, 11-21: the collect
+    of all test modules, measured at 768 of them in 560 s under load). Any other marker expression, and any path
+    named explicitly on the command line (pytest never offers those to this hook), collects as before."""
+    if (markexpr or "").strip() != "invariant":
+        return False
+    path = Path(path)
+    if not (path.name.startswith("test_") and path.suffix == ".py"):
+        return False
+    try:
+        rel = path.resolve().relative_to(Path(__file__).resolve().parent.parent).as_posix()
+    except ValueError:
+        return False
+    return rel not in invariant_modules()
+
+
+def pytest_ignore_collect(collection_path, config):
+    if skipped_by_the_invariant_tier(collection_path, config.getoption("markexpr", default="")):
+        return True
+    return None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pycollect_makeitem(collector, name, obj):
+    """In the bare invariant tier a test function that is not listed is never built: building each one computes its
+    fixture closure, which is where that tier's collection spent its time (a listed module holds many unlisted tests).
+    Classes and everything else collect as before, and a parametrized listed test is kept whole by its base id."""
+    if (collector.config.getoption("markexpr", default="") or "").strip() != "invariant":
+        return None
+    if not (inspect.isfunction(obj) and name.startswith("test")):
+        return None
+    if collector.nodeid.split("::", 1)[0] not in invariant_modules():
+        return None
+    return None if f"{collector.nodeid}::{name}" in invariant_node_ids() else []
 
 
 def pytest_collection_modifyitems(config, items):

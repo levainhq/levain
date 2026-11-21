@@ -35,3 +35,23 @@ def test_no_header_claims_a_pre_push_hook_runs_the_tier():
         text = (ROOT / rel).read_text(encoding="utf-8")
         assert "scripts/hooks/pre-push" not in text, rel
         assert "is the pre-push tier" not in text, rel
+
+
+def test_the_bare_invariant_run_selects_exactly_the_listed_tests_without_importing_the_rest_of_the_tree():
+    """The conductor's pin runs `pytest -m invariant --collect-only` with no files; it must find the same set the
+    explicit-files run does, from the modules that hold the listed tests alone."""
+    listed = {ln.strip() for ln in (ROOT / "tests" / "ci" / "invariant_tests.txt").read_text().splitlines()
+              if ln.strip() and not ln.startswith("#")}
+    assert _collect("-m", "invariant") == listed
+
+
+def test_the_invariant_tier_skips_only_test_modules_that_hold_no_listed_test():
+    from tests.conftest import invariant_modules, skipped_by_the_invariant_tier as skip
+    held = sorted(invariant_modules())[0]
+    assert not skip(ROOT / held, "invariant")                      # a module with a listed test is collected
+    assert skip(ROOT / "tests" / "test_ci_invariant_marker.py", "invariant") is (
+        "tests/test_ci_invariant_marker.py" not in invariant_modules())
+    other = next(p for p in sorted((ROOT / "tests").glob("test_*.py")) if p.relative_to(ROOT).as_posix() not in invariant_modules())
+    assert skip(other, "invariant")                                # a module with none is not imported
+    assert not skip(other, "not invariant") and not skip(other, "") and not skip(other, "invariant or slow")
+    assert not skip(ROOT / "tests" / "conftest.py", "invariant")   # only test modules are ever skipped
