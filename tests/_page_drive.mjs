@@ -228,7 +228,7 @@ if (!ws) {
   pageWsUrl = pageTarget.webSocketDebuggerUrl; ourTargetId = pageTarget.id;   // the id of the page THIS drive drives: a popup the page opened is a page target too
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
-let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10)
+let id = 0; let navStarts = 0; let mainCommits = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10)
 const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEventAt / navTrail: what the page last said and when, for the timeout block (a page that stops answering is told apart from one that never loaded)
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
@@ -244,6 +244,7 @@ ws.addEventListener("message", (m) => {
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
   if (d.method === "Page.frameStartedLoading" || d.method === "Page.frameRequestedNavigation" || d.method === "Page.frameNavigated") navStarts++;
+  if (d.method === "Page.frameNavigated" && !(d.params && d.params.frame && d.params.frame.parentId)) mainCommits++;   // the top frame took a new document (a child frame has a parentId)
   if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
   // the page's own telemetry, never an operator POST: the SW-open landing report (POST /webpush/landed, sw_open.js 1106-53) and the
   // ring-trace report (POST /webpush/trace, sw_open.js reportTrace: 2.5 s after load once the worker has written ring entries, so
@@ -483,14 +484,28 @@ for (const s of steps) {
     }
     await awaitWorkerSettled();
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
+    const commitsBefore = mainCommits;      // read before the send: a commit event can arrive ahead of the reply
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) await initFails("init: the reload was refused: " + JSON.stringify(reloaded.error));
-    // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document
-    for (const end = Date.now() + scaled(15000);;) {
-      if (await evaluate("document.readyState === 'complete' && window.__driveOldDocument === undefined") === true) break;
-      if (Date.now() >= end) await initFails("init: the reload did not complete");
-      await sleep(100);
-    }
+    // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document.
+    // The wait itself is tests/_reload_wait.mjs (its decisions are run against stub pages by tests/test_reload_wait.py). Every probe is
+    // raced against the time left (never the evaluate default timeout: a reload that never committed answers nothing, and that default then
+    // outlasts this bound). A reload that has NOT COMMITTED by the middle of the bound (no main-frame commit event, and no probe answered by
+    // a document without the old mark) is sent ONCE more; a load that committed is only waited for, however slow: a second reload would throw
+    // away a load that was going to finish. Loaded on demand, so a copy of this file made without its sibling still runs every other step.
+    const { waitForReloadedDocument, NEW_DOCUMENT_PROBE } = await import("./_reload_wait.mjs");
+    const waited = await waitForReloadedDocument({
+      probe: (ms) => evaluateOutcome(NEW_DOCUMENT_PROBE, ms),
+      committed: () => mainCommits > commitsBefore,
+      resend: async () => {
+        const r = await sendWithin(3000, "Page.reload", {});
+        if (r.timedOut) return { ok: false, why: "no answer to the second Page.reload" };
+        if (r.error) return { ok: false, why: "refused: " + JSON.stringify(r.error) };
+        return { ok: true };
+      },
+      now: () => Date.now(), sleep, boundMs: scaled(15000), resendAfterMs: scaled(7000),
+    });
+    if (!waited.ok) await initFails(waited.why);
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     if (s.emulate.safe) await send("Emulation.setSafeAreaInsetsOverride", { insets: s.emulate.safe });   // the iPhone notch / status bar / home indicator
