@@ -683,9 +683,8 @@ _EXPORT_SCOPE = {"importer": "export.scope", "verifier": "verify.scope"}
 def export_wall_facts(host: str, role: str) -> WallFacts:
     """The importer's or the verifier's wall (s5 §5b capability list): the one writable path ``L/export/.work``
     (``.verify``), the stage's cwd after its drop, fd 4 kept (the bounded result pipe). macOS: ``(allow default)``
-    reads less the
-    three user-data subpaths, :data:`EXPORT_DEVICES` the only devices, all network and IPC denied, Mach
-    denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
+    reads less the three user-data subpaths, :data:`EXPORT_DEVICES` the only devices, all network and IPC denied,
+    Mach denied but for the allow-list. Linux: fresh net, IPC, PID and UTS namespaces, a new session, capabilities
     dropped (:data:`EXPORT_CAPS`), ro ``/usr`` ``/etc`` (+ the import tree and helper dir where ``/usr`` does not
     hold them), bwrap's minimal ``/dev``, nothing of the operator's and no socket dir."""
     from levain.slot.layout import HELPER_DIR, IMPORT_TREE, STORE
@@ -878,8 +877,9 @@ def wall_view_args(facts: WallFacts, host_links: Mapping[str, Optional[str]]) ->
     ``--new-session``, the capability flags, ro ``/usr`` ``/etc`` and the ``read_only`` binds, the host's
     ``/bin /sbin /lib /lib64`` links into ``/usr`` (any other link = ``view-path-off-list``), a fresh ``/proc``,
     ``/dev`` (the host's bound whole, or bwrap's minimal one) with a fresh ``/dev/shm``, tmpfs ``/tmp /var/tmp
-    /run``, the writable binds' ancestors (:func:`view_ancestor_dirs`), the rw binds, ``--chdir``. A capability-dropped view (``caps`` set) whose ``chdir`` is a writable bind or
-    below one is ``view-path-off-list``: bwrap, holding no capability, cannot enter the account's mount root (#226)."""
+    /run``, the writable binds' ancestors (:func:`view_ancestor_dirs`), the rw binds, ``--chdir``.
+    A capability-dropped view (``caps`` set) whose ``chdir`` is a writable bind or below one is
+    ``view-path-off-list``: bwrap, holding no capability, cannot enter the account's mount root (#226)."""
     # --die-with-parent: bwrap's sandbox (every process of it, the target included) is SIGKILLed when bwrap or
     # its parent, the helper, dies, so a helper that dies or kills bwrap never leaves a vendor running past it.
     # It also bounds the forwarder: it lives until the helper exits, no longer until END [not run: a 2g row].
