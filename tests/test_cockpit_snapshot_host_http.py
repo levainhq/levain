@@ -164,6 +164,7 @@ def _derived_and_idle(host: SnapshotHost) -> bool:
     follows); both are pinned large here so neither turns inside a test."""
     host.loop._unknown_token_s = 1e9
     host.loop._backstop_s = 1e9
+    assert all(p.backstop_s is None for p in host.loop._plans.values()), "a panel with its own backstop bypasses the pin"
     plans = {p.id for p in host._plans()}
     if not _every_plan_has_a_row(host) or not _loop_at_rest(host.loop):
         return False
@@ -474,6 +475,9 @@ class TestStream:
         with _default_server(tmp_path, monkeypatch, "1", reads) as (port, httpd):
             assert _get(port, "/cockpit/manifest.json")[0] == 200       # builds the cockpit, attaches and starts its host
             host = httpd._snapshot_host
+            _until(lambda: _derived_and_idle(host))     # pins the backstop; a poll that had already found a panel due may still run it
+            assert host.loop._poll_s * 3 <= 3.0, "the window below must hold more than one poll"
+            time.sleep(host.loop._poll_s * 2)
             _until(lambda: _derived_and_idle(host))
             derived = reads.derives()
             time.sleep(3.0)
