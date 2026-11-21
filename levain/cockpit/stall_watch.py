@@ -241,10 +241,10 @@ class StallWatch:
         self._remove_dead_scratches()
 
     def _remove_dead_scratches(self) -> None:
-        """Delete the scratch files in the directory that belong to a process that no longer exists. A non-empty
-        readable regular file is first kept as a dump (see :meth:`_keep_dead_scratch`); one that is empty, not a regular
-        file or gone is deleted unkept; one that could not be kept, an unreadable one included, stays in place and is named
-        on stderr."""
+        """Delete the scratch files in the directory that belong to a process that no longer exists, or to this watch's own
+        pid (an earlier version's leftover: this version writes none). A non-empty readable regular file is first kept
+        as a dump (see :meth:`_keep_dead_scratch`); one that is empty, not a regular file or gone is deleted unkept; one
+        that could not be kept, an unreadable one included, stays in place and is named on stderr."""
         try:
             names = [p.name for p in self._dir.iterdir()]
         except OSError:
@@ -366,6 +366,7 @@ class StallWatch:
             return False             # anything unforeseen: the scratch stays, the line above is the signal
         finally:
             os.close(fd)
+
 
 def _copy_fd(fd: int, handle, budget: "_Budget", banner: str) -> bool:
     """Copy a file's contents into the dump under ``banner``. False (nothing written) when the file is empty.

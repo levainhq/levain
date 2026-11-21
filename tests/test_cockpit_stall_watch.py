@@ -71,7 +71,7 @@ def test_no_dump_and_no_stack_walk_below_the_threshold(tmp_path, capsys, monkeyp
     watch = drive(tmp_path, [0.0, 0.01, LATE_S - 0.01, 0.0])
     assert walked == []
     assert watch.dumps() == []
-    assert list(tmp_path.iterdir()) == []            # the scratch file is gone once the loop has ended
+    assert list(tmp_path.iterdir()) == []            # a quiet run leaves no scratch file and no dump
     assert capsys.readouterr().err == ""
 
 
@@ -299,7 +299,7 @@ def test_the_directory_is_made_by_the_watch_thread_not_by_the_caller(tmp_path, u
     finally:
         gate.set()
         watch.stop()
-    assert not stalls.exists() or not any(stalls.iterdir())      # the scratch is removed on stop
+    assert not stalls.exists() or not any(stalls.iterdir())      # a watch that saw no stall leaves no file behind
 
 
 # ---- the scratch file is per process ---------------------------------------------------------------------------
@@ -849,7 +849,7 @@ def test_a_late_wake_still_writes_the_stacks_taken_after_the_wake_and_leaves_no_
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(stall_watch.SCRATCH_PREFIX)] == []
 
 
-def test_the_module_imports_faulthandler_nowhere(tmp_path):
+def test_the_module_imports_faulthandler_nowhere():
     """The pin the recorder test cannot give: a ``from faulthandler import dump_traceback_later`` taken at import time
     would escape a patch of the module's attributes. No import of faulthandler, anywhere in the module, in any form."""
     import ast
@@ -862,17 +862,19 @@ def test_the_module_imports_faulthandler_nowhere(tmp_path):
 
 
 def test_the_pid_a_watch_is_given_names_the_scratch_file_it_treats_as_its_own_leftover(tmp_path):
-    """``pid=`` stands for a second process: a leftover under THAT pid is kept as a dump, and one under another live pid is not."""
-    mine = os.getpid() + 100_000_000                     # a pid no running process has
-    (tmp_path / stall_watch.scratch_name(mine)).write_bytes(STACK_TEXT)
+    """``pid=`` stands for a second process. The pid given is a LIVE one, so only the ``pid=`` wiring can make its file a
+    leftover: this process's own file (also live) is left alone, as is every other live process's."""
     live_child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
     try:
-        alive = tmp_path / stall_watch.scratch_name(live_child.pid)
-        alive.write_bytes(b"a running process's file")
-        StallWatch(tmp_path, pid=mine)._prepare()
-        assert alive.read_bytes() == b"a running process's file"
+        given = tmp_path / stall_watch.scratch_name(live_child.pid)
+        given.write_bytes(STACK_TEXT)
+        this_one = tmp_path / stall_watch.scratch_name(os.getpid())
+        this_one.write_bytes(b"this test process's own file")
+        StallWatch(tmp_path, pid=live_child.pid)._prepare()
         kept = killed_dumps(tmp_path)
-        assert len(kept) == 1 and str(mine) in kept[0].name
+        assert len(kept) == 1 and str(live_child.pid) in kept[0].name
+        assert not given.exists()
+        assert this_one.read_bytes() == b"this test process's own file"
     finally:
         live_child.kill()
         live_child.wait()
@@ -939,5 +941,3 @@ def test_stop_and_start_in_a_tight_loop_leave_at_most_one_live_watcher(tmp_path)
     finally:
         watch.stop()
     assert watch_threads() == []
-
-
