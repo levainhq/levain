@@ -69,7 +69,8 @@ def check_staged(dest: Path, canonical: bytes) -> None:
 
 def archive_argv(git: str, repo: Path, rev: str, out: Path) -> list[str]:
     """The ``git archive`` command that tars ``rev``'s :data:`ARCHIVE_PATHS` for the guest."""
-    return [git, "-C", str(repo), "archive", "--format=tar.gz", "-o", str(out), rev, *ARCHIVE_PATHS]
+    # ``-C`` changes git's directory before it opens ``-o``, so a relative ``out`` would land inside ``repo``: absolute it
+    return [git, "-C", str(repo), "archive", "--format=tar.gz", "-o", str(Path(out).resolve()), rev, *ARCHIVE_PATHS]
 
 
 def vendor_link_argvs(vendor_bin: str = VENDOR_BIN, hands_bin: str = HANDS_BIN) -> list[list[str]]:

@@ -121,9 +121,15 @@ def test_archive_carries_pyproject_beside_the_tree(tmp_path):
     # revert: ARCHIVE_PATHS back to ("levain",) (doctor then cannot read the anneal range on a vend)
     out = tmp_path / "lv.tgz"
     subprocess.run(rig_stage.archive_argv("git", REPO, "HEAD", out), check=True, timeout=120)
-    names = subprocess.run(["tar", "-tzf", str(out)], capture_output=True, text=True, check=True).stdout.split()
+    names = subprocess.run(["tar", "-tzf", str(out)], capture_output=True, text=True, check=True).stdout.splitlines()
     assert "pyproject.toml" in names and any(n.startswith("levain/") for n in names)
     assert rig_stage.archive_argv("git", REPO, "HEAD", out)[-2:] == ["levain", "pyproject.toml"]
+
+
+def test_archive_out_is_absolute_so_git_c_cannot_move_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    argv = rig_stage.archive_argv("git", REPO, "HEAD", Path("rel") / "lv.tgz")
+    assert Path(argv[argv.index("-o") + 1]) == (tmp_path / "rel" / "lv.tgz").resolve()
 
 
 def test_vendor_links_are_symlinks_into_the_vendor_prefix(tmp_path):
