@@ -1,13 +1,14 @@
 """The snapshot contract doc points at code; every pointer must still land where the doc says it does.
 
-docs/cockpit_snapshot_contract.md backticks only code symbols and repo paths (its own convention paragraph says so). A
-symbol must be DEFINED in the module whose path is named in the same paragraph or list item of the doc (snapshots.py when
-none is named): a class, a function or a module-level assignment in that module's own source, so an imported module or
-an imported name (`os`, `Any`, `Path`), a dunder, and an attribute a class only inherits all fail. ``Class.method`` must
-be a function in that class's own ``__dict__``. A path must be an existing file.
+docs/cockpit_snapshot_contract.md backticks only code symbols and repo paths (its own convention paragraph says so). Each
+backticked symbol must be DEFINED in the module whose path is named in the same paragraph or list item of the doc
+(snapshots.py when none is named): a class, a function or a module-level assignment in that module's own source, so an
+imported module or an imported name (`os`, `Any`, `Path`), a dunder, and an attribute a class only inherits all fail.
+``Class.method`` must be a function in that class's own ``__dict__``. A path must be an existing file. That is all that
+is checked: a symbol resolves by the module its own unit names, not by any other module.
 
-A true name in a false sentence is not something a test can catch; the doc's remedy is to state no behaviour, and the
-phrase list below only pins the sentences the reviewers proved false.
+The phrase list below catches the exact phrases review proved false coming back, not a paraphrase of them; a true name
+inside a false sentence is not catchable by any test.
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ DELETED_FALSE_CLAIMS = (
     ("with a matching meta schema", "adoption of a foreign file applies no such guard"),
     ("never errors", "an unreadable store, a panel with no row and an error row all read as an error"),
     ("exactly as it found it", "a read-only preflight can still create sqlite's shared-memory file"),
+    ("costs the file nothing", "the same refusal claim reworded: a read-only preflight can still create sqlite's -shm file"),
 )
 
 

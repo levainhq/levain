@@ -1,39 +1,34 @@
 # Cockpit snapshot contract
 
-The cockpit's derive worker computes each panel and stores the result in one sqlite file. The serve, the change
-stream and any other reader answer from that file instead of deriving on the request path.
+This document is about the cockpit's snapshot store, one sqlite file, in `levain/cockpit/snapshots.py`.
 
-This document holds the reasons behind the store's design and points at the code that holds the facts. It is not a
-spec a reader can be built from. A sentence here about what the code does would be a second statement of it, free to
-drift, so the sentences below are reasons, sqlite's own behaviour, or names of the symbols to read.
+It holds the reasons behind the store's design, facts about sqlite itself with their qualifiers, and pointers to the
+symbols to read. It is not a spec a reader can be built from. A sentence here about what the code does would be a second
+statement of it, free to drift, so a pointer names a symbol and says nothing about what that symbol does.
 
-Convention for this file: a backticked word is a code symbol or a repo path, and nothing else is backticked. A symbol is
-looked up in the module whose path is named in the same paragraph or list item (`levain/cockpit/snapshots.py` when none
-is named), as Class.method where it is a method. `tests/test_cockpit_snapshot_contract_doc.py` fails when one of them
-stops being defined there.
+Convention for this file: a backticked word is a code symbol or a repo path, and nothing else is backticked.
+`tests/test_cockpit_snapshot_contract_doc.py` checks that each backticked symbol is defined in the module whose path is
+named in the same paragraph or list item (`levain/cockpit/snapshots.py` when none is named), as Class.method where it is
+a method, and that each backticked path is an existing file. It checks nothing else.
 
 ## Where the code is
 
 - The store, its writer and its reader, in `levain/cockpit/snapshots.py`: `SnapshotWriter`, `SnapshotReader`, and the
-  errors they raise, `WriterLocked`, `ContractMismatch` and `SnapshotReadError`.
+  errors `WriterLocked`, `ContractMismatch` and `SnapshotReadError`.
 - The file name and the lock file's suffix: `DB_FILENAME` and `LOCK_SUFFIX`. The file is one of its own so that the
   cockpit's other databases do not share its checkpoints or locks.
-- The tables and columns: `_SCHEMA` and `_PANEL_COLS`. A stored row becomes a `PanelSnap` in `_snap`, which is also where
-  a status the code does not know is dealt with.
-- The statuses and the body rule that goes with them: `KNOWN_STATUSES`, `KEEP_BODY_STATUSES`, `NO_BODY_SHA`.
-- The body's encoding on the way in: `encode_body`.
-- The body's field list and schema, and how a body becomes a snapshot and back, in `levain/cockpit/snapshot_host.py`:
-  `BODY_VERSION`, `BODY_FIELDS`, `decode_snap`, `body_for` and `encode_snap`. The host's pseudo-rows: `PSEUDO_PREFIX`,
-  `DISCOVER_ID` and `ENTITY_ID`.
-- The freshness fields a reader derives (as_of, valid_until, stale, the worker's health), in `levain/cockpit/engine.py`:
-  `Cockpit._attached_snap`, `Cockpit._fresh_of` and `Cockpit._worker_health`, with the constants beside them
-  (`HEARTBEAT_CADENCE_S`, `WORKER_LIVE_FACTOR`, `WORKER_DOWN_AFTER_S`, `STALE_CADENCE_FACTOR`); what the engine announces
-  a change on is `_ChangeProbe.change_seq`.
-- The contract string: `CONTRACT_NAME`, `CONTRACT_MAJOR`, `CONTRACT` and the comparison `_check_contract`; what the
-  writer reads before it changes anything is `_preflight`; what it does with tables that differ from the schema is
+- The tables and columns: `_SCHEMA` and `_PANEL_COLS`. The stored row's type and its constructor: `PanelSnap` and `_snap`.
+- The statuses and the body rule: `KNOWN_STATUSES`, `KEEP_BODY_STATUSES`, `NO_BODY_SHA`.
+- The body's encoding: `encode_body`.
+- In `levain/cockpit/snapshot_host.py`: `BODY_VERSION`, `BODY_FIELDS`, `decode_snap`, `body_for`, `encode_snap`,
+  `PSEUDO_PREFIX`, `DISCOVER_ID` and `ENTITY_ID`.
+- In `levain/cockpit/engine.py`: `Cockpit._attached_snap`, `Cockpit._fresh_of`, `Cockpit._worker_health` and
+  `_ChangeProbe.change_seq`, with the constants beside them (`HEARTBEAT_CADENCE_S`, `WORKER_LIVE_FACTOR`,
+  `WORKER_DOWN_AFTER_S`, `STALE_CADENCE_FACTOR`).
+- The contract string: `CONTRACT_NAME`, `CONTRACT_MAJOR`, `CONTRACT`, `_check_contract`, `_preflight` and
   `SnapshotWriter._rebuild_if_drifted`.
-- What moves a panel's gen and the file's change counter: `SnapshotWriter.publish` and `SnapshotWriter.drop`. What the
-  writer does for a stream row and a heartbeat: `SnapshotWriter.set_stream` and `SnapshotWriter.heartbeat`.
+- The writer's entry points: `SnapshotWriter.publish`, `SnapshotWriter.drop`, `SnapshotWriter.set_stream` and
+  `SnapshotWriter.heartbeat`.
 
 The code is the contract for all of these. A prose copy of them here would be a second source that the code can leave
 behind without a failing test.
@@ -49,33 +44,32 @@ reason: a body hash that is compared across publishes means something only if on
 
 - The file is meant to be a WAL-mode database so that one writer and many readers do not block each other. It is a
   cache of derivable data, so durability is not a goal of the file.
-- In WAL mode a read transaction sees one commit, so a reader that needs several rows consistent with each other reads
-  them inside one (`SnapshotReader.read_manifest`).
+- In WAL mode a read transaction sees one commit, so a reader that needs several rows consistent with each other has to
+  read them inside one (see `SnapshotReader.read_manifest`).
 - sqlite's immutable open assumes the file cannot change, so on a database that is being written it can return stale or
-  inconsistent data, so a reader of live content must not use it (the reader's URI is `_uri`).
+  inconsistent data, so a reader of live content must not use it (see `_uri`).
 - Since sqlite 3.22.0 a read-only connection can open a WAL-mode database if its shared-memory and log files already
   exist, or can be created, or the database is opened immutable.
 - A sqlite connection follows the file it opened, not the path. If the file is deleted and recreated under a live reader
-  (a manual reset, say), a connection kept open would read the old file forever; `READER_REVALIDATE_S` is the reader's
-  answer to that.
+  (a manual reset, say), a connection kept open would read the old file forever (see `READER_REVALIDATE_S`).
 - The write-ahead log's size limit is `JOURNAL_SIZE_LIMIT`; its comment says when it applies.
 
 ### Change signals
 
-Two questions, two signals. Whether the file changed: sqlite's per-connection data_version changes when another
-connection commits anything, and its values mean nothing across connections (`SnapshotReader.data_version`). Whether a
-panel changed: the writer's change counter in the file (`SnapshotWriter.publish`, `SnapshotWriter.drop`). They answer
-different questions.
+A reader needs a cheap way to ask whether the file changed and a way to ask whether a panel changed, and the file offers
+more than one signal. sqlite's per-connection data_version changes when another connection commits anything, and its
+values mean nothing across connections (`SnapshotReader.data_version`). The other signals to read are
+`SnapshotWriter.publish` and `SnapshotWriter.drop`.
+
+The engine's own signal to read is `_ChangeProbe.change_seq`, in `levain/cockpit/engine.py`.
 
 ## Contract string
 
-The layout is named and carries a major version in the file. The intent is that code which does not know the layout
-refuses it rather than guesses at it (`ContractMismatch`, `_check_contract`), and that a refusal costs the file nothing
-(`_preflight`; the sqlite caveat is under Known edges). The policy is that an additive change, a column or a meta key,
-does not change the major and a change that is not additive does.
+The layout is named and carries a major version (`CONTRACT_MAJOR`). The intent is that code which does not know the
+layout refuses it rather than guesses at it (`ContractMismatch`, `_check_contract`, `_preflight`); the sqlite caveat
+about `_preflight` is under Known edges.
 
-The file is a cache of derivable data, so the design prefers recreating it to failing a publish;
-`SnapshotWriter._rebuild_if_drifted` is where that choice is made.
+The file is a cache of derivable data, so a mismatch is meant to be survivable (`SnapshotWriter._rebuild_if_drifted`).
 
 ## Tables, in words
 
@@ -108,13 +102,11 @@ What the code does in each case is `Cockpit._attached_snap`, `Cockpit._fresh_of`
 
 ## Known edges
 
-- The limits of the input fingerprints are written next to the code, in `levain/cockpit/derive.py`: what a watched
-  directory and a git repository do and do not show are the docstrings of `Dir` and `GitRefs`, how long an index lock
-  holds a panel is `LOCK_HOLD_MAX_S`, and what a derive that never returns costs is `DERIVE_TIMEOUT_S`. The size limits
-  are `DIR_ENTRIES_MAX` and `GIT_REFS_MAX`.
+- The limits of the input fingerprints are written next to the code, in `levain/cockpit/derive.py`: the docstrings of
+  `Dir` and `GitRefs`, and the comments on `LOCK_HOLD_MAX_S`, `DERIVE_TIMEOUT_S`, `DIR_ENTRIES_MAX` and `GIT_REFS_MAX`.
 - The preflight (`_preflight`) is meant to read the contract without writing. sqlite can create its shared-memory file
   even on a read-only open of a WAL-mode database, when none exists yet, and an immutable open is safe only if nothing
   writes the file meanwhile. A lock file binds only the processes that take it, so a foreign process writing the
   snapshot path is outside this contract.
-- The design assumes nothing but the worker writes the snapshot path; what the code does with a foreign file there is
-  `_preflight`, `_check_contract` and `SnapshotWriter._rebuild_if_drifted`.
+- The design assumes nothing but the worker writes the snapshot path; see `_preflight`, `_check_contract` and
+  `SnapshotWriter._rebuild_if_drifted`.

@@ -120,7 +120,7 @@ class PanelSnap:
     status: str
     error: str | None
     body_sha: str
-    body: bytes | None  # None: no good body was ever stored (see the contract)
+    body: bytes | None  # None: no good body was ever stored (`KEEP_BODY_STATUSES`, `SnapshotWriter.publish`)
 
 
 def _snap(row: tuple) -> PanelSnap:

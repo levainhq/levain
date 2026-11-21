@@ -45,8 +45,8 @@ STALE_LOCK = "stale-lock"
 # "inputs" stream's detail names the lock's path (see GitRefs for the rest of what that input does and does not see).
 LOCK_HOLD_MAX_S = 180.0
 # A derive running longer than this publishes status "timeout" (PanelPlan.timeout_s overrides, seconds). Nothing here
-# interrupts the derive call: its thread stays in it until it returns, so a provider that never returns pins that
-# thread for the loop's life, the panel stays busy, and the "inputs" stream's detail lists "<id>: derive timeout".
+# interrupts the derive call: its thread (one of DERIVE_THREADS) stays in it until it returns. While the panel is still
+# planned, the "inputs" stream's detail lists "<id>: derive timeout" (`_publish_timeouts`, `_evaluate`).
 DERIVE_TIMEOUT_S = 120.0
 
 _UNSET = object()
@@ -87,8 +87,7 @@ class GitRefs:
     directory, of packed-refs in the common directory, and of each loose file under the common directory's refs/
     (`_refs_walk`, symlinks not followed; more than GIT_REFS_MAX of them and the fingerprint is None).
 
-    A held index.lock in the git directory answers LOCKED while it is younger than LOCK_HOLD_MAX_S; older, the
-    fingerprint carries the STALE_LOCK prefix and the panel derives.
+    A held index.lock in the git directory is read in `_Fingerprinter._git` (see LOCKED, STALE_LOCK, LOCK_HOLD_MAX_S).
 
     What it does not see: the working tree (file edits), a linked worktree's own refs/ (only the common directory's is
     walked), and the reftable ref backend (only packed-refs and loose refs are read).
