@@ -204,7 +204,15 @@ jobs:
     # cancelled at the cap at 96% with no failure), so it was split into shards. A hang still ends at this cap.
     timeout-minutes: 45
     strategy:
-      fail-fast: false
+      # A land/** run stops its other shards at the first red one (11-20, Phill np-358c7b13 (a), cut 3 of the CI economy
+      # report); every other ref keeps `false`, so a branch, PR, main, tag or nightly run still shows every red shard.
+      # Native key on purpose, measured on a scratch run of a stub (11-20, run 44836014010 on scratch/cut3-probe-2, deleted):
+      # the failing shard stays `failure` and its siblings end `cancelled` within ~15 s, a shard still queued is cancelled with
+      # no steps, and the job-level `always() && !cancelled()` guard above does not stop the cancel. A workflow-wide cancel
+      # from a failing step (`gh run cancel`, run 44835699478) was measured too and rejected: it turned the failing job
+      # itself `cancelled`, so the land waiter (it reads each job's conclusion) would lose which job was red. The matrix is
+      # the only scope the key has: the run's other jobs still run to their end.
+      fail-fast: ${{ startsWith(github.ref, 'refs/heads/land/') }}
       matrix:
         # main, land/** and every other event run both Pythons. A workflow_dispatch on any other branch (a seat branch; a tag dispatch runs both) runs
         # 3.12 only: the landing candidate on land/** and main still run the full set.
@@ -448,7 +456,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
-      fail-fast: false
+      # fail-fast on land/** only, as in the `test` job above (same 11-20 measurement); every other ref keeps `false`
+      fail-fast: ${{ startsWith(github.ref, 'refs/heads/land/') }}
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
