@@ -442,8 +442,11 @@ class TerminalKey:
 
 
 def _real_key_dir() -> Path:
-    """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
-    return _keys.pwd_key_dir()
+    """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``. Only a
+    process marked live gets it (``keys.refuse_real_key_unless_live``); any other raises ``RealKeyUnmarked`` here."""
+    real = _keys.pwd_key_dir()
+    _keys.refuse_real_key_unless_live(real, "the real key directory")
+    return real
 
 
 def _own_regular_file(path: Path) -> bool:
@@ -686,6 +689,7 @@ def default_signer_factory(key_path: Path, timeout: float | None = None) -> tupl
     """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
     Calling the ``Signer`` it returns raises the Touch ID prompt."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    _keys.refuse_real_key_unless_live(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
@@ -693,6 +697,7 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
     """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
     other door to the real key."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    _keys.refuse_real_key_unless_live(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 
@@ -999,6 +1004,7 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
         if key is None:
             return SignOutcome("unsigned", "no-key", "no terminal key with a touch-id sidecar")
         _keys.refuse_real_key_in_tests(key.path, "the signing key")
+        _keys.refuse_real_key_unless_live(key.path, "the signing key")
         factory = signer_factory or default_signer_factory
         fp, signer = factory(key.path, bound_s)
         signature = signer(bytes(message))

@@ -73,6 +73,11 @@ class RealKeyReached(KeyError_, AssertionError):
     ``signer-error``) that is also an ``AssertionError``, so a test that expects either kind of refusal sees one."""
 
 
+class RealKeyUnmarked(RealKeyReached):
+    """A process no levain launcher marked live reached the operator's real key. Raised before anything is spawned or
+    written; ``str()`` names the fix. A ``RealKeyReached``, so a caller that handles that one handles this."""
+
+
 #: Further scratch roots (``os.pathsep``-separated) a test run names for keys beyond the temp root, set by the suite's
 #: conftest only: a trust-anchor directory must live under the account home, where a world-writable temp root cannot
 #: hold it. A root that holds the account's own home vouches for nothing (:func:`levain.home_guard.vouched_scratch`).
@@ -131,6 +136,34 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
                              "a test may only use a key it made there, never the operator's (a Touch ID sheet would "
                              "open on the live laptop); pass a temp key_dir and a fake signer")
     return target
+
+
+def refuse_real_key_unless_live(path: Path | str, what: str = "the key") -> None:
+    """Raise :class:`RealKeyUnmarked` when ``path`` is the operator's real key directory or lies inside it
+    (:func:`pwd_key_dir`, both resolved) and this process is not marked live (:func:`levain.home_guard.live_marked`:
+    a levain launcher called ``mark_live``). Reaching the real key is an opt-in of the live product; a process that
+    did not opt in, a stray script or a bare child a test started, is refused whatever its ``$HOME`` or ``$LEVAIN_HOME``.
+    A REFUSE, never a warning: it does not read ``home_guard.UNMARKED_ACTION``. A path outside the real key directory
+    returns, marked or not. A real key directory that cannot be named (no password entry) has nothing to guard, so
+    it returns; a ``path`` that cannot be resolved is refused, since it cannot be shown to lie elsewhere."""
+    from levain.home_guard import LIVE_ENV, live_marked
+
+    if live_marked():
+        return
+    try:
+        real = pwd_key_dir().resolve()
+    except (OSError, RuntimeError, KeyError):
+        return
+    try:
+        target = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise RealKeyUnmarked(f"{what} ({path}) cannot be resolved ({type(exc).__name__}: {exc}), so it cannot be shown "
+                              "not to be the operator's real key, and this process is not marked live; refused") from None
+    if target == real or real in target.parents:
+        raise RealKeyUnmarked(
+            f"refusing {what} ({target}): it is the operator's real key and this process was not started by a levain "
+            f"launcher ({LIVE_ENV} is not 1), so a signature here would be a consent nobody gave. Fix: start it "
+            "through `levain`, or call levain.home_guard.mark_live() first thing in your own launcher.")
 
 
 @dataclass(frozen=True)
@@ -931,7 +964,9 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
     with the armored signature lets ``check-novalidate`` be re-run once that message is in hand). The hash is not a
     secret: whoever can read this file and can guess the message (a short answer, a known template) can confirm the
     guess offline. Returns the path, or ``evidence not written (why)``: a diagnostic never fails a sign and never
-    replaces the refusal's own text."""
+    replaces the refusal's own text. The one raise is :class:`RealKeyUnmarked`, for a directory inside the real key
+    directory when this process is not marked live (:func:`refuse_real_key_unless_live`), before anything is made."""
+    refuse_real_key_unless_live(Path(key_path).parent / _SIGN_FAILURE_DIR, "the sign-failures directory")
     dfd = None
     try:
         directory = Path(key_path).parent / _SIGN_FAILURE_DIR
@@ -1023,6 +1058,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     the answer is empty (:data:`_SK_EMPTY_ATTEMPTS` attempts in all; ``sign`` below says which)."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
+    refuse_real_key_unless_live(key_path, "the signing key")
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     sidecar = read_sidecar(key_path)
