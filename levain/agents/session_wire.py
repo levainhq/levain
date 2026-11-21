@@ -352,6 +352,8 @@ def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, age
 
     def verify(end: Any) -> str | None:
         if end.state != "done":
+            if base.verify is not None:      # the process-wide hook still sees a failed end, as it did before this verifier
+                base.verify(end)
             return None
         for judge in (base.verify, win):
             verdict = None if judge is None else judge(end)
@@ -386,7 +388,7 @@ def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, age
             return REPORT_MALFORMED
         if not data or "\0" in text:
             return REPORT_MALFORMED
-        if unshowable.first_hidden(text, allow="\n\t", selectors=False) is not None:
+        if unshowable.first_hidden(text, allow="\n\r\t", selectors=False) is not None:
             return REPORT_MALFORMED         # attacker-chosen text that reaches operator surfaces
         if install.coord_dir is None:
             return CARD_NOT_FILED

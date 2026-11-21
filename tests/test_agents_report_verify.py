@@ -225,3 +225,19 @@ def test_the_brief_tail_names_the_report_file_cap_and_data_status():
 
 def test_the_card_body_bound_is_the_review_stores():
     assert W._BODY_MAX == 2 * review._TEXT_MAX
+
+
+def test_a_crlf_report_still_files_a_card(rig, monkeypatch):
+    text = "# Done\r\nsecond line\r\n"
+    _oid, _code, row = _night(rig, monkeypatch, report=text.encode())
+    assert row["state"] == "done" and [c.body["report"] for c in _cards(rig)] == [text]
+
+
+def test_the_process_wide_verify_still_sees_a_failed_end(rig, monkeypatch):
+    seen = []
+    monkeypatch.setattr(supervise, "HOOKS", supervise.Hooks(verify=lambda end: seen.append(end.state)))
+    oid, _code, _row = _night(rig, monkeypatch, report=b"fine")
+    seen.clear()
+    verify = W.fire_factory(rig.store, oid, rig.row(oid)["launch_epoch"], clock=rig.now)["sup"]._hooks.verify
+    assert verify(supervise.End(oid, "failed", "x", Usage(0, None, None, "stub"))) is None
+    assert seen == ["failed"]

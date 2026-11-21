@@ -1075,7 +1075,7 @@ class RealLauncher:
         if rec.get("auth", "passthrough") != self.auth:
             raise LauncherRefused("report-auth-mismatch", "launched under the other auth")
         session = rec.get("session")
-        if rec["state"] != "ended" or type(session) is not str or not session:
+        if rec.get("state") != "ended" or type(session) is not str or not session:
             raise LauncherRefused("report-end-unproven", "the run is not proven ended")
         reader = getattr(self.runtime, "read_report", None)
         if reader is None:
