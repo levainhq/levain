@@ -267,7 +267,7 @@ def test_doctor_row_states(rig, monkeypatch):
 
     monkeypatch.setattr(hands_login, "credential_state", as_hands)
     rows = _rows(rig.entity)
-    assert set(rows) == {"hands login claude", "hands login codex"}
+    assert set(rows) == {"hands login claude", "hands login codex", "hands security shim"}   # levain#241: the shim row
     r = rows["hands login claude"]
     assert r.ok and r.neutral and "no credential file" in r.detail and "last: none recorded" in r.detail
     hands_login.cmd_hands_login(rig.entity, "claude")
@@ -307,3 +307,39 @@ def test_doctor_row_exception_is_a_warning(rig, monkeypatch):
     monkeypatch.setattr(hands_login, "credential_state", boom)
     r = _rows(rig.entity)["hands login claude"]
     assert r.warn and "not determinable" in r.detail
+
+
+# --- levain#241 (L3 r1): the second orphan look, and the doctor's shim row -------------------------------------------
+
+def test_a_second_keychain_look_that_fails_after_the_vendor_logout_is_reported_unchecked_not_a_hard_error(rig, monkeypatch):
+    """The first look finds an item; the look made after the vendor logout and the file removal raises: it is the
+    advisory 'unconfirmed' (the keychain is not guessed at), never an escape from the middle of the logout."""
+    hands_login.cmd_hands_login(rig.entity, "claude")
+    looks = []
+
+    def look(hands, vendor, *, entity_dir):
+        looks.append(1)
+        if len(looks) == 1:
+            return "Claude Code-credentials-deadbeef"
+        raise hands_login.HandsLoginError("The user canceled the operation.")
+
+    monkeypatch.setattr(hands_login, "keychain_orphan", look)
+    removed = []
+    monkeypatch.setattr(hands_login, "remove_hands_keychain", lambda *a, **k: removed.append(1))
+    with pytest.raises(hands_login.HandsLoginError,
+                       match=r"signed out \(logged-out\).*could not be confirmed.*The user canceled"):
+        hands_login.run_logout(rig.h, "claude", rig.entity)
+    assert len(looks) == 2 and removed == []
+    assert any("auth logout" in c for c in rig.calls())                       # the vendor logout ran first
+    assert not (rig.hands_home / ".claude" / ".credentials.json").exists()    # and the file went
+
+
+def test_doctor_shim_row_is_ok_when_exact_and_names_the_repair_when_not(rig):
+    r = _rows(rig.entity)["hands security shim"]
+    assert r.ok and "present and exact" in r.detail and not r.warn
+    (rig.shim_dir / "security").write_text("#!/bin/sh\nexit 0\n")
+    r = _rows(rig.entity)["hands security shim"]
+    assert not r.ok and "not the shim Levain installs" in r.detail and "sudo levain setup-isolation" in r.hint
+    (rig.shim_dir / "security").unlink()
+    r = _rows(rig.entity)["hands security shim"]
+    assert not r.ok and "not installed" in r.detail and "sudo levain setup-isolation" in r.hint
