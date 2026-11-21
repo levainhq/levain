@@ -42,16 +42,20 @@ RETIRED_IDS_PATH: Mapping[str, Path] = {   # CONTRACT §1.1
 VERIFIER_ACCOUNT = "_levain_verify"
 VERIFIER_GROUP = "levain-verify"
 
+#: The singletons and the shared groups an install, setup journal or record made BEFORE levain#223 holds. Every
+#: KNOWN name after these is one an older install lacks: an older setup journal resumes without it and repair may make
+#: it (``install_helper._journal_names_what_setup_makes``, ``install_helper._REPAIR_MAKES`` derive from these two).
+ORIGINAL_SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch")
+ORIGINAL_SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
+                          "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin")
+
 #: EVERY singleton name Levain recognises, whether or not a host's setup makes it. A new one goes LAST, so no
 #: singleton's id moves. What a host MAKES is :func:`provisioned_singletons`.
-KNOWN_SINGLETONS = ("_levain_keys", "_levain_export", "_levain_control", "_levain_qbroker", "_levain_dispatch",
-                    VERIFIER_ACCOUNT)
+KNOWN_SINGLETONS = (*ORIGINAL_SINGLETONS, VERIFIER_ACCOUNT)
 
 #: Every shared-group name Levain recognises. Allocation takes the provisioned ones in this order, top-down from the
 #: shared range: a new group goes LAST, so no group's id moves.
-KNOWN_SHARED_GROUPS = ("levain-slots", "levain-gwfronts", "levain-control", "levain-wake", "levain-lineage",
-                       "levain-export", "levain-dispatch-export", "levain-queue", "levain-keysadmin",
-                       VERIFIER_GROUP)   # CONTRACT §1.2
+KNOWN_SHARED_GROUPS = (*ORIGINAL_SHARED_GROUPS, VERIFIER_GROUP)   # CONTRACT §1.2
 
 #: Names only some hosts make: the host is the key.
 _HOST_ONLY: Mapping[str, tuple[str, ...]] = {VERIFIER_ACCOUNT: ("linux",), VERIFIER_GROUP: ("linux",)}
@@ -222,7 +226,9 @@ def allocate(host: HostOS, *, egress: Iterable[SlotId], verifier: Iterable[SlotI
     that come back at their recorded id (§20); ``keep`` / ``keep_shared``: accounts / shared groups an
     interrupted setup already made, kept at the id they hold (§23). Neither takes a fresh id; each
     must sit in its own class's range. ``singletons`` makes every singleton of ``host`` (:func:`provisioned_singletons`);
-    ``only_singletons`` makes just those named instead (repair's bounded creation)."""
+    ``only_singletons`` makes just those named instead (repair's bounded creation); the two together refuse."""
+    if singletons and only_singletons is not None:
+        raise Refused("internal", "allocate: singletons and only_singletons are exclusive")
     egress, verifier = tuple(egress), tuple(verifier)
     revive, keep, keep_shared = dict(revive or {}), dict(keep or {}), dict(keep_shared or {})
     r = RANGES[host]

@@ -61,8 +61,8 @@ from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Gro
                                   vendor_home_steps)
 from levain.slot.grammar import (EGRESS_RESERVE, MIN_SETUP_SLOTS, KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
                                  InstallCommand, check_roots, parse_install_argv)
-from levain.slot.ids import (KNOWN_SHARED_GROUPS, KNOWN_SINGLETONS, RANGES, RETIRED_IDS_PATH, SLOT_NAME_RE,
-                             VERIFIER_ACCOUNT, VERIFIER_GROUP, Allocation, SlotClass, SlotId, allocate,
+from levain.slot.ids import (KNOWN_SHARED_GROUPS, KNOWN_SINGLETONS, ORIGINAL_SHARED_GROUPS, ORIGINAL_SINGLETONS,
+                             RANGES, RETIRED_IDS_PATH, SLOT_NAME_RE, Allocation, SlotClass, SlotId, allocate,
                              check_capacity, choose_indices, in_own_range, is_levain_account, loopback_alias,
                              provisioned_shared_groups, provisioned_singletons, read_retired_ids, retired_ids_text,
                              spent_indices)
@@ -582,12 +582,14 @@ def _journal_presence(facts: HostFacts) -> tuple[dict[str, int], list[str]]:
 
 
 def _journal_names_what_setup_makes(host: HostOS, journal: Intent) -> bool:
-    """Whether a setup journal names what this host's setup makes. The verifier's account and group are the two names
-    a setup journal written before levain#223 lacks (a Linux host provisions them now): either shape is whole, and the
-    resume makes the missing pair fresh. Every other singleton and shared group must be named."""
-    singletons = set(provisioned_singletons(host)) - {VERIFIER_ACCOUNT}
+    """Whether a setup journal names what this host's setup makes. A provisioned name outside ``ORIGINAL_SINGLETONS``
+    / ``ORIGINAL_SHARED_GROUPS`` (levain#223: the verifier's account and group, on a host that provisions them) is one
+    a setup journal written before it lacks: the journal is whole with or without it, and the resume makes it fresh.
+    Every original singleton and shared group this host provisions must be named, and no group it does not provision."""
+    singletons = set(provisioned_singletons(host)) & set(ORIGINAL_SINGLETONS)
     groups = set(provisioned_shared_groups(host))
-    return singletons <= set(journal.accounts) and set(journal.groups) in (groups, groups - {VERIFIER_GROUP})
+    return (singletons <= set(journal.accounts)
+            and groups & set(ORIGINAL_SHARED_GROUPS) <= set(journal.groups) <= groups)
 
 
 def _journal_slots(intent: Intent) -> dict[SlotClass, tuple[SlotId, ...]]:
@@ -1530,8 +1532,9 @@ def _repair_journal(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts,
 
 
 #: The singletons repair may CREATE, because an install made before this code provisioned them lacks them (levain#223:
-#: the verifier's account, on a host that provisions it). Every other singleton missing still refuses ``account-missing``.
-_REPAIR_MAKES = frozenset({VERIFIER_ACCOUNT})
+#: every KNOWN singleton outside ``ORIGINAL_SINGLETONS``; :func:`_repair_creates` keeps the ones the host provisions).
+#: An original singleton missing still refuses ``account-missing``.
+_REPAIR_MAKES = frozenset(KNOWN_SINGLETONS) - frozenset(ORIGINAL_SINGLETONS)
 
 
 def _repair_creates(host: HostOS, facts: HostFacts, rf: RepairFacts, journaled: Mapping[str, int]) -> dict[str, int]:
@@ -1559,7 +1562,9 @@ def _check_rendered_accounts(host: HostOS, rf: RepairFacts, slots: Sequence[Slot
     """R2 entry (1022+20 Linux VM, `userdel _levain_s7`): desired holds only the LIVE accounts, so a recorded one that
     is gone is removed at R7 while R8 still renders its slot's rows for it. §2.4: repair never creates or removes a
     slot, so it can neither re-create the account nor drop the slot. Every account the rendered plan names (the
-    singletons, every in-service slot's pair) must be live, else refused before any act."""
+    singletons, every in-service slot's pair) must be live, else refused before any act, but for ``creating``: the
+    singletons this repair makes (:func:`_repair_creates`, levain#223), which may be absent. Every LIVE one, a
+    ``creating`` one included, must have its same-named group at its id."""
     missing = [n for n in (*provisioned_singletons(host), *(n for s in slots for n in s.accounts))
                if n not in rf.accounts and n not in creating]
     if missing:
@@ -1568,8 +1573,10 @@ def _check_rendered_accounts(host: HostOS, rf: RepairFacts, slots: Sequence[Slot
                                          "setup")
     # L3 r1 (codex): R8 renders `chown <owner>:<account>` against each account's same-named primary group, so a
     # group deleted (or moved, or relabelled on macOS) by hand while its user stays is the same gap; refused here.
+    # Only an absent ``creating`` account is passed over (its group is planned with it); every name reaching here
+    # that is not live is one of those, as the check above refused the rest.
     ungrouped = [n for n in (*provisioned_singletons(host), *(n for s in slots for n in s.accounts))
-                 if n not in creating and rf.account_groups.get(n) != rf.accounts[n]]
+                 if n in rf.accounts and rf.account_groups.get(n) != rf.accounts[n]]
     if ungrouped:
         raise Refused("group-missing", f"{', '.join(ungrouped)}: no Levain group of that name at the account's id, "
                                        "and repair never creates one (it never creates or removes a slot). Run undo, "
@@ -1677,7 +1684,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     Order: the journal (a finished repair journal, ``txn == record.completed_txn``, is removed first and a fresh
     ``txn`` minted; an unfinished one is resumed at its ``txn``, gids and write-ahead ``managed``); the stage (R2-R3);
     the gids and write-ahead ``managed`` journaled (R4b); every affected service STOPPED (R5); new shared groups (R6);
-    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10); sudoers (R11); units and
+    the missing memberships (R7); rows and confinement (R8); THE FLIP (R9); entries (R10), then the singletons repair
+    makes (levain#223, :func:`_repair_creates`: journaled write-ahead, then each one's group, user and lock, all after
+    the flip and the entry scripts, so no older generation's code reads a journal naming one); sudoers (R11); units and
     every start (R12); GC (R13); ``install-shape`` (R14, the completion commit); the journal removed (R15).
 
     The removal path (R1b): ``remove = (record.managed ∪ journal.managed ∪ desired) − desired``, each record through
@@ -1768,8 +1777,15 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     first = Intent("repair", operator, jaccts, jgroups, run_txn, journal.generation if journal else None,
                    tuple(journal.managed) if journal else ())
     staged = replace(first, generation=target)
-    # R4b is write-ahead for the accounts this run makes (R6 below), as for the groups: journaled before the first act.
-    final = replace(staged, accounts={**jaccts, **creates}, groups=dict(alloc.shared), managed=_shape_of(reconcile))
+    # levain#223 (L1 HIGH-1 / L2 H1): an account this run makes that no journal names yet is journaled and made only
+    # in R10, after the flip and the entry scripts, so that no code older than this generation's ever reads a journal
+    # naming it or meets it live. R4b's write-ahead record therefore leaves out the records it adds; R10's names them.
+    late = {n: u for n, u in creates.items() if n not in jaccts}
+    early = desired_managed(host, accounts={n: u for n, u in ids_now.items() if n not in late}, shared=alloc.shared,
+                            operator=operator, services=[s.name for s in services], slots=slots,
+                            apparmor=restricted) if late else desired
+    ahead = replace(staged, groups=dict(alloc.shared), managed=_shape_of(previous | journaled | early))
+    final = replace(ahead, accounts={**jaccts, **creates}, managed=_shape_of(reconcile))
     noted: dict[str, int] = {}
     carried = dict(shape.started_after) if shape is not None else {}
     keep = {target} | ({shape.generation} if shape is not None else set())
@@ -1803,11 +1819,10 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
                                                    fault=(lambda pt: fault("R2", pt)) if fault else None))
         steps += F("R3", [_journal_step(host, f"journal the generation {target} (same txn)", staged)])  # R3
     steps += F("R4b", [_journal_step(host, "journal the shared-group gids and the write-ahead managed set (same "
-                                           "txn)", final)])                                       # R4b
+                                           "txn)", ahead)])                                       # R4b
     steps += F("R5", [*_stop_steps(host, stop, noted, clock, live=live),                          # R5
                       *removals("R5")])             # R1b: recorded units stopped by name, then sudoers (grants first)
-    # R6: the shared groups, then the singletons repair makes (levain#223), before R7's memberships and R8's rows.
-    steps += F("R6", [*shared_group_steps(host, missing_groups), *account_steps(host, making)])   # R6
+    steps += F("R6", shared_group_steps(host, missing_groups))                                    # R6
     steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
@@ -1819,7 +1834,13 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     if rf.current != target:
         steps += F("R9", [root_tree.flip_step(host, target,                                       # R9
                                               fault=(lambda pt: fault("R9", pt)) if fault else None)])
+    # levain#223: the singletons repair makes (``late`` above), journaled write-ahead and then made, after the flip
+    # (R9) and the entry scripts just before them. Nothing earlier in this plan may need them live: R7's memberships
+    # and R8's rows must name none of them.
+    made_late = [_journal_step(host, "journal the singletons this repair makes, write-ahead (same txn)", final)
+                 ] if late else []
     steps += F("R10", [*root_tree.entry_steps(host),                                              # R10
+                       *made_late, *account_steps(host, making),
                        *removals("R10"),            # R1b: entries after the flip (their sudoers rule went at R5)
                        # the vendor CLIs re-copied, so a vendor updated since the last repair reaches the slot;
                        # a failed copy does not stop R11/R12: the report step after them fails the run (ruling V6)

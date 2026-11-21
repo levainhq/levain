@@ -176,7 +176,8 @@ def vendor_home_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
     (:func:`vendor_runs_as`) gets the home :func:`account_steps` gives a fresh one, then the directory cache is
     flushed once and each such account's cfprefsd is ended, so the next session resolves the new home. Every step is
     idempotent: an account already pointed is pointed again. It changes one attribute of accounts repair has already
-    proved live (``install_helper._check_rendered_accounts``); repair still creates and removes none. Linux: none."""
+    proved live (``install_helper._check_rendered_accounts``); repair creates and removes no slot account. Linux:
+    none."""
     if vendor_home(host) is None:
         return []
     names = [n for s in slots for n in s.accounts if vendor_runs_as(n)]
