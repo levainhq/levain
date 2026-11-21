@@ -609,8 +609,10 @@ def run_init(args: Any) -> int:
 
 
 def register(subparsers: Any) -> None:
-    # Hidden, as ``levain board`` is (no ``help=``: ``levain --help`` and the README's "All commands" table leave it out).
-    charter = subparsers.add_parser("charter", description="The repository charter: purpose, criteria, constraints, plan.")
+    # Public, as ``levain board`` is: a ``help=`` here and a row in the README's "All commands" table, kept together.
+    charter = subparsers.add_parser(
+        "charter", help="A repository's CHARTER.md: write its skeleton, check its shape.",
+        description="The repository charter: purpose, criteria, constraints, plan.")
     sub = charter.add_subparsers(dest="charter_cmd", required=True)
     p = sub.add_parser(
         "check", help="Check a repository's CHARTER.md (warn mode: exits 0; 2 on another repository's name, an unreadable registry, or a bad command line).",

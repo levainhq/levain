@@ -623,6 +623,8 @@ Every verb `levain --help` lists, each with the one line it gives. `levain <verb
 | `levain team` | Share one project's decisions across a team of engineers (git ledger + edit-time hook). |
 | `levain ping` | Web push to paired phones: keys, a test ping, the notification record, presence. |
 | `levain notify` | Notify tokens: the credential a service posts a notice at your phone with. |
+| `levain board` | The work board: what is open, in flight and done, and which repositories are tracked (see "Projects: tracked and untracked"). |
+| `levain charter` | A repository's CHARTER.md: write its skeleton, check its shape. |
 
 More on `levain hands`: `levain hands launch claude|codex` (macOS) starts a chat AS that user with only the registered MCP servers, on a terminal of its own that levain relays (never yours); revoking a server it carries ends it (exit 77). `levain hands mcp register <name> --url ...` and `levain hands mcp revoke <id or name>` sign a hands MCP entry in and out; the cockpit's Grants tab and the phone list each entry by name, and the phone's passkey can revoke it.
 
