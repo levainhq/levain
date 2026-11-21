@@ -973,6 +973,8 @@ def test_a_panel_whose_only_input_cannot_be_fingerprinted_derives_by_the_timers_
         clock.t = float(t)
         ran.append(loop.run_once(clock.t))
     assert ran == [["p"], [], [], []]
+    clock.t = 1001.0     # past the backstop: the timers still derive it
+    assert loop.run_once(clock.t) == ["p"]
     loop.stop()
 
 
