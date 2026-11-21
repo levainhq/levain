@@ -127,6 +127,11 @@ def _attempt(fn: Callable[[], Any]) -> Any:
         return _raised(exc)
 
 
+def same_body(a: Any, b: Any) -> bool:
+    """Two served bodies as JSON: ``true`` and ``1`` are different bodies, which Python's own equality does not say."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def raised_paths(value: Any, path: tuple = ()) -> list:
     """Where in a wire-form observation a read raised (the ``{"raised": ...}`` wrapper of ``_attempt``). The same raise on
     both sides compares equal, so a caller that means to read something asks for these and expects none."""
@@ -228,7 +233,7 @@ class Triple:
     def panel(self) -> str:
         """The panel id a path is about, or ``-`` for a path about the whole manifest."""
         p = self.path
-        if p[0] in ("derive", "payload", "freshness", "probe") and len(p) > 1 and not p[1].startswith("#"):
+        if p[0] in ("derive", "payload", "freshness", "probe") and len(p) > 1 and isinstance(p[1], str) and not p[1].startswith("#"):
             return p[1]
         if p[0] == "manifest" and len(p) > 2 and p[1] == "panels":
             return p[2]
@@ -240,8 +245,11 @@ class Triple:
 
 def diff(old: Any, new: Any, path: tuple = ()) -> list:
     """Every difference between two wire-form values as triples. Dicts are compared by key (never by order), lists by
-    position and length (order is semantic), scalars by value."""
+    position and length (order is semantic), scalars by value. A read that raised (the wrapper of ``_attempt``) is one value:
+    a raise on one side and a payload on the other is one difference holding the raise, never one per key of the payload."""
     if isinstance(old, dict) and isinstance(new, dict):
+        if (set(old) == {"raised"} or set(new) == {"raised"}) and old != new:
+            return [Triple(path, "value", old, new)]
         out = []
         for k in sorted(set(old) | set(new), key=str):
             if k not in new:
@@ -286,10 +294,7 @@ def compare(pair: Pair) -> list:
         heads = subject["manifest"].get("panels") if isinstance(subject["manifest"], dict) else None
         mine = {pid: {"etag": h.get("etag") if isinstance(h, dict) else None}
                 for pid, h in (heads if isinstance(heads, dict) else {}).items()}
-        if isinstance(probe, dict) and set(probe) == {"raised"}:
-            out.append(Triple(("probe",), "value", mine, probe))      # one triple holding the raise, not its keys
-        else:
-            out.extend(diff({"probe": mine}, {"probe": probe}))
+        out.extend(diff({"probe": mine}, {"probe": probe}))
     return out
 
 
@@ -347,8 +352,8 @@ def _fresh_block_at_rest(value: Any) -> bool:
         return False
     age, stream = value["heartbeat_age_s"], value["stream"]
     return (value["worker"] == "live" and value["deriving"] == []
-            and isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age >= 0
-            and isinstance(stream, dict) and isinstance(stream.get("state"), str))
+            and isinstance(age, (int, float)) and not isinstance(age, bool) and (isinstance(age, int) or math.isfinite(age)) and age >= 0
+            and isinstance(stream, dict) and isinstance(stream.get("state"), str) and bool(stream["state"].strip()))
 
 
 def _fresh_at_rest(t: "Triple", now: datetime | None, derived: Any = None) -> bool:
