@@ -49,7 +49,7 @@ async function attach(wsUrl) {
   const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
   ws.addEventListener("message", (m) => {
     const d = JSON.parse(m.data);
-    // a prompt (the write-token ask) is declined, as an operator with no token would: it must not block the page. The decline is the driver's
+    // a prompt (the write-token ask) is declined, as an operator with no token would: it must not block the page. The decline is the page driver's shared module
     // (tests/_dialog_decline.mjs): refused as not attached it is sent again within a bound, and one that gives up fails this rig by name.
     if (d.method === "Page.javascriptDialogOpening") {
       declineDialog({ send: boundedSend(send, sleep, 3000), now: Date.now, sleep, boundMs: 5000, pauseMs: 200 })
