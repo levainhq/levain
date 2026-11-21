@@ -965,6 +965,7 @@ def test_a_vendor_only_the_hands_uid_can_see_still_launches(rig, monkeypatch, tm
     empty.mkdir()
     monkeypatch.setattr(confinement, "HANDS_PATH", str(empty))
     monkeypatch.setattr(hc, "vendor_missing", _REAL_VENDOR_MISSING)
+    monkeypatch.setattr(hc.hl, "vendor_missing", _REAL_HL_VENDOR_MISSING)       # hc's lookup delegates here; the shared rig stubs it
     assert _REAL_VENDOR_MISSING("claude") is not None
     monkeypatch.setattr(hands_login, "vendor_probe", lambda hands, v, **kw: True)
     rig.register("alpha", callback_port=49601)
