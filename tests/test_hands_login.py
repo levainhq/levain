@@ -214,7 +214,8 @@ def test_login_argv_runs_as_hands_with_pinned_home_and_fixed_path(monkeypatch, s
     assert assigned[var] == f"/Users/levain-hands/{sub}"
     assert assigned["HOME"] == "/Users/levain-hands"
     assert assigned["PATH"] == HANDS_PATH
-    assert set(assigned) == {"HOME", "PATH", "LANG", "TERM", "USER", "LOGNAME", "ENABLE_CLAUDEAI_MCP_SERVERS", var}
+    assert set(assigned) == {"HOME", "PATH", "LANG", "TERM", "USER", "LOGNAME", "ENABLE_CLAUDEAI_MCP_SERVERS",
+                         "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", var}
     assert argv[-len(hands_login._VENDOR[vendor]["login"]):] == list(hands_login._VENDOR[vendor]["login"])
     # one login command each, never the operator's home
     assert "--device-auth" in argv if vendor == "codex" else argv[-3:] == ["claude", "auth", "login"]
