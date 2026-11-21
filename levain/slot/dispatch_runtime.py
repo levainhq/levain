@@ -20,7 +20,8 @@ frame has no reserved ``ticket`` key), so ``control_client.py`` is untouched. Th
 Finding D (``probe`` is not a dispatch verb): V13 does not bind a dispatch session at launch, by two independent
 refusals in code: ``runtime_grammar.DISPATCH_FORBIDDEN`` lists ``probe`` ("forbidden to dispatch until a dispatch
 session launches"), and ``probe.PROBE_KINDS`` is ``("interactive", "login")``, so a ``dispatch`` kind session answers
-``not-probeable:kind``. So the order has no probe, and ``sudoers.DISPATCH_VERBS`` needs no change. What this leaves open
+``not-probeable:kind``. So the order was built without a probe, and ``probe`` was left out of ``sudoers.DISPATCH_VERBS`` (that tuple is the
+list to read). What this leaves open
 is a policy question, not a code one: a dispatch session has no launch-time firewall tripwire (the interactive
 supervisor does), so the wall's only check is the VM's.
 

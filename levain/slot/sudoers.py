@@ -26,8 +26,8 @@ INSTALL_SUDOERS = _SUDOERS_DIR / "levain-install"
 #: this file): :func:`dropin_state` reads a recorded drop-in as Levain's only when its first line starts with it.
 HEADER = "# Written by the Levain install helper"
 
-#: CONTRACT §5.1: the runtime verbs ``_levain_dispatch`` may call (every verb but adopt-open,
-#: discard, restore, confirm-identity).
+#: CONTRACT §5.1: the runtime verbs ``_levain_dispatch`` may call. The verbs it may NOT call are
+#: ``runtime_grammar.DISPATCH_FORBIDDEN``; this tuple is the list the sudoers drop-in is built from.
 DISPATCH_VERBS = ("prepare", "render", "start", "resume", "teardown", "adopt-verify", "read-report", "status")
 
 

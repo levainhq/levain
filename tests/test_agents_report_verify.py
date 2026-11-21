@@ -17,7 +17,7 @@ from levain.agents.accounting import Usage
 from levain.contracts.canon import canonical
 from levain.desk import review
 from levain.desk.store import CoordStore, StoreAbsent
-from tests.test_agents_session_launch import Stub, rig  # noqa: F401
+from tests.test_agents_session_launch import EXP, Stub, rig  # noqa: F401
 from tests.test_agents_session_wire import _AcceptAll, _coord, _install, _session_occurrence
 from tests.test_agents_session_wire_fire import _clock, _fire, _wired  # noqa: F401
 
@@ -31,8 +31,8 @@ def _accept(monkeypatch):
     monkeypatch.setattr(gauges, "_CHECKS", _AcceptAll())
 
 
-def _night(rig, monkeypatch, *, report, coord=True, **stub_kw):
-    oid = _session_occurrence(rig)
+def _night(rig, monkeypatch, *, report, coord=True, billing="api_key", **stub_kw):
+    oid = _session_occurrence(rig, billing=billing)
     stub = Stub(**stub_kw)
     stub.report_bytes = report
     W.register_launcher("stub", lambda store: stub)
@@ -81,7 +81,17 @@ def test_the_card_carries_root_usage_and_the_caps_apart_from_the_report(rig, mon
     u = card.body["usage"]
     assert (u["actions"], u["tunnel_bytes"], u["seconds"], u["basis"]) == (11, 222, 33, "stub:basis")
     assert card.body["report"] == liar.decode()             # the report is data, left apart from the usage
-    assert set(u["caps"]) <= {"actions", "tunnel_bytes", "seconds"} and all(type(v) is int for v in u["caps"].values())
+    assert u["caps"] == {}                  # an api_key reservation has no subscription caps
+
+
+def test_a_subscription_night_card_carries_the_exact_reserved_caps(rig, monkeypatch):
+    used = Usage(0, None, None, "stub:basis", actions=11, tunnel_bytes=222, seconds=33)
+    _oid, _code, row = _night(rig, monkeypatch, report=b"fine", billing="subscription", auth="passthrough",
+                               used=used)
+    assert row["state"] == "done", row["reason"]
+    (card,) = _cards(rig)
+    assert card.body["usage"]["caps"] == {"actions": EXP.actions, "tunnel_bytes": EXP.tunnel_bytes,
+                                          "seconds": EXP.seconds}
 
 
 def test_an_unread_figure_stays_null_in_the_card(rig, monkeypatch):
@@ -109,6 +119,8 @@ def test_a_long_report_is_cut_to_fit_with_a_visible_marker(rig, monkeypatch):
     (b"", "report_malformed"),
     (b"abc\x00def", "report_malformed"),
     (b"\xff\xfe bad utf8", "report_malformed"),
+    (b"ok \x1b]0;title\x07\x1b[2J rest\nmore", "report_malformed"),                   # an escape sequence in the first line
+    ("ok ‮gnirts\nmore".encode(), "report_malformed"),                           # a bidi override in the first line
 ])
 def test_a_bad_report_turns_done_into_failed_and_files_nothing(rig, monkeypatch, report, reason):
     _oid, _code, row = _night(rig, monkeypatch, report=report)
@@ -121,8 +133,15 @@ def test_a_report_of_exactly_the_cap_is_accepted(rig, monkeypatch):
     assert row["state"] == "done" and len(_cards(rig)) == 1
 
 
+def test_a_multi_line_report_with_tabs_and_newlines_still_files_a_card(rig, monkeypatch):
+    text = "# Done\n\n\tindented\tcolumns\nlast line\n"
+    _oid, _code, row = _night(rig, monkeypatch, report=text.encode())
+    assert row["state"] == "done" and [c.body["report"] for c in _cards(rig)] == [text]
+
+
 @pytest.mark.parametrize("name,reason", [("report-oversize", "report_oversize"), ("report-malformed", "report_malformed"),
-                                         ("report-unreadable", "report_missing")])
+                                         ("report-unreadable", "report_unreadable"),
+                                         ("session-busy", "report_unreadable")])
 def test_a_launcher_refusal_maps_to_its_reason(rig, monkeypatch, name, reason):
     from levain.agents.session_launcher import LauncherRefused
     _oid, _code, row = _night(rig, monkeypatch, report=LauncherRefused(name, "x"))
@@ -152,6 +171,9 @@ def test_a_non_done_end_files_nothing(rig, monkeypatch):
     for state in ("failed", "cancelled", "launched"):
         assert verify(supervise.End(other, state, "x", Usage(0, None, None, "stub"))) is None
     assert len(_cards(rig)) == n
+    # the real occurrence's own failed end files nothing after the night's one card
+    assert verify(supervise.End(oid, "failed", "x", Usage(0, None, None, "stub"))) is None
+    assert len(_cards(rig)) == n == 1
 
 
 def test_the_win_verifiers_reason_wins_and_no_card_is_filed(rig, monkeypatch):
@@ -177,7 +199,7 @@ def test_a_supervisor_not_built_by_session_wire_still_ends_done_with_no_report_a
     monkeypatch.setattr(W, "_report_hooks", lambda *a, **k: None)
     _oid, _code, row = _night(rig, monkeypatch, report=None)
     assert (row["state"], row["reason"]) == ("done", "completed")
-    assert not (_coord(rig) / "dispatch.db").exists() or _cards(rig) == []
+    assert _cards(rig) == []
 
 
 # ---- the install ------------------------------------------------------------------------------------------------------
@@ -187,6 +209,8 @@ def test_the_install_round_trips_a_coord_dir_and_refuses_a_relative_one(rig):
     assert W.read_install(rig.store.directory).coord_dir == _coord(rig) and path.exists()
     with pytest.raises(W.InstallRefused):
         W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir="relative/coord")
+    with pytest.raises(W.InstallRefused):           # an absolute path that is no directory
+        W.write_install(rig.store.directory, cockpit_root=rig.world.root, coord_dir=_coord(rig) / "missing")
     W.write_install(rig.store.directory, cockpit_root=rig.world.root)
     assert W.read_install(rig.store.directory).coord_dir is None
 

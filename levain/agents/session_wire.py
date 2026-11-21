@@ -136,7 +136,7 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
     values = doc.get("values", {})
     if not isinstance(values, dict):
         raise InstallRefused(f"{path}: values is not an object")
-    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="none")
+    coord = None if doc.get("coord_dir") is None else _abs(doc, "coord_dir", path, kind="dir")
     return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path), coord)
 
 
@@ -278,8 +278,8 @@ def _episode_hooks(store: AgentStore, install: SessionInstall, agent_id: str, ro
 
 # -- the report channel (levain#225): no card, no ``done`` ----------------------------------------------------------------
 
-REPORT_MISSING, REPORT_OVERSIZE, REPORT_MALFORMED, CARD_NOT_FILED = (
-    "report_missing", "report_oversize", "report_malformed", "card_not_filed")
+REPORT_MISSING, REPORT_OVERSIZE, REPORT_MALFORMED, CARD_NOT_FILED, REPORT_UNREADABLE = (
+    "report_missing", "report_oversize", "report_malformed", "card_not_filed", "report_unreadable")
 _SUMMARY_MAX = 300
 _BODY_MAX = 8000          # a test pins this against the review store's own bound on a body
 
@@ -291,7 +291,10 @@ def _collapse(text: str) -> str:
 def report_card_body(agent_id: str, occurrence_id: str, data: bytes, text: str, usage: Mapping[str, Any]) -> dict[str, Any]:
     """The card body for one report: canonical-JSON-able, whole under :data:`_BODY_MAX` characters. The report text is the
     only part cut to fit (a visible ``[cut at N of M bytes]`` marker closes a cut text); every other key is bounded
-    by construction. ``usage`` is root-authored and rides beside the report, never inside it."""
+    by construction. ``usage`` is root-authored and rides beside the report, never inside it.
+
+    Trust per key: ``summary`` and ``report`` are UNTRUSTED (both derive from the report text); ``kind``, ``agent``,
+    ``occurrence``, ``sha256``, ``bytes`` and ``usage`` are root-authored. A renderer treats ``summary`` like ``report``."""
     from levain.contracts.canon import canonical
     first = next((ln for ln in text.splitlines() if ln.strip()), "")
     body: dict[str, Any] = {"kind": "session-report", "agent": agent_id, "occurrence": occurrence_id,
@@ -326,7 +329,8 @@ def _usage_of(store: AgentStore, end: Any) -> dict[str, Any]:
                                " WHERE occurrence_id = ?", (end.occurrence_id,)).fetchone()
         caps = {} if row is None else {k: v for k, v in zip(("actions", "tunnel_bytes", "seconds"), row)
                                        if type(v) is int}
-    except Exception:  # noqa: BLE001 - the caps are context; a store that will not answer leaves them out
+    except Exception as exc:  # noqa: BLE001 - the caps are context; a store that will not answer leaves them out
+        _log.warning("session report caps for %s were not read: %s", end.occurrence_id, type(exc).__name__)
         caps = {}
     out["caps"] = caps
     return out
@@ -340,6 +344,7 @@ def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, age
     first reason winning; then the report read through the launcher; then the card. Each miss is a reason that turns the ``done``
     into ``failed``. The report is UNTRUSTED DATA: it is checked for size and text only, never obeyed."""
     from levain.agents import gauges, supervise
+    from levain import unshowable
     from levain.slot.runtime_grammar import REPORT_CAP
     base = supervise.HOOKS
     win = gauges.win_verifier(store, clock=clock)
@@ -362,8 +367,13 @@ def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, age
             data = reader(row[0])
         except Exception as exc:  # noqa: BLE001 - a refusal names its reason; any other fault is no report
             name = getattr(exc, "name", "")
-            return REPORT_OVERSIZE if name == "report-oversize" else REPORT_MALFORMED if name == "report-malformed" \
-                else REPORT_MISSING
+            if name == "report-oversize":
+                return REPORT_OVERSIZE
+            if name == "report-malformed":
+                return REPORT_MALFORMED
+            _log.warning("session report for %s was not read: %s", end.occurrence_id,
+                         name if isinstance(name, str) and name else type(exc).__name__)
+            return REPORT_UNREADABLE
         if data is None:
             return REPORT_MISSING
         if type(data) is not bytes:
@@ -376,6 +386,8 @@ def _report_hooks(store: AgentStore, install: SessionInstall, launcher: Any, age
             return REPORT_MALFORMED
         if not data or "\0" in text:
             return REPORT_MALFORMED
+        if unshowable.first_hidden(text, allow="\n\t", selectors=False) is not None:
+            return REPORT_MALFORMED         # attacker-chosen text that reaches operator surfaces
         if install.coord_dir is None:
             return CARD_NOT_FILED
         try:

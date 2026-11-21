@@ -7,7 +7,8 @@
 non-zero exit, raised before the next act: nothing after the refusing check acts.
 
 Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open``, ``adopt-verify``, ``discard`` and
-``restore`` (session 5's) and ``read-allow`` (row 165: one fixed file of the operator's own retained clone);
+``restore`` (session 5's) ``read-allow`` (row 165: one fixed file of the operator's own retained clone) and ``read-report`` (levain#225: the
+session's report file, read as untrusted data for the dispatch caller);
 ``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`, ``probe`` (V13) to :mod:`levain.slot.probe`. Every other verb (derive: ``VERBS`` less
 ``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (``_levain_dispatch``) ``prepare`` takes its slot by
 §3.5 Pool's point-of-use rules and writes ``ATTACH``'s ``ticket_facts`` into alloc before it returns (S1 3c-7).
@@ -4208,10 +4209,11 @@ def _allow_record(obj: object) -> Optional[Tuple[int, str]]:
 
 
 def _allow_dir(store_fd: int, session: str, path: Tuple[str, ...] = ALLOW_PATH,
-               refusal: str = "allow-unreadable") -> Optional[int]:
+               refusal: str = "allow-unreadable", refuse_any_error: bool = False) -> Optional[int]:
     """An fd on ``retained/<session>/<path>`` (by default ``tree/repo/.claude``) reached one component at a time, none
     followed; ``None`` when a component is absent. A component that is a link or not a directory is ``refusal``: the
-    walk is of slot-written names, so nothing on it is trusted and nothing is written."""
+    walk is of slot-written names, so nothing on it is trusted and nothing is written. Any other OS error at a
+    component propagates, unless ``refuse_any_error`` makes it ``refusal`` too (only ``read-report`` asks)."""
     cur = os.dup(store_fd)
     try:
         for part in ("retained", session, *path):
@@ -4224,6 +4226,8 @@ def _allow_dir(store_fd: int, session: str, path: Tuple[str, ...] = ALLOW_PATH,
             except OSError as e:
                 if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
                     raise Refused(refusal, f"{part} is not a directory") from None
+                if refuse_any_error:
+                    raise Refused(refusal, f"{part} cannot be opened") from None
                 raise
             prev, cur = cur, nxt      # ``cur`` names the open fd before ``prev`` closes: a failing close leaks none
             os.close(prev)
@@ -4364,7 +4368,7 @@ def _read_report_locked(ctx: Ctx, a: R.Alloc, SV) -> Dict[str, object]:
     if not SV.retained_whole(facts, sv):
         raise Refused("not-retained:absent", a.session)
     root = ctx.seams.chowned_uid(0)
-    dfd = _allow_dir(ctx.store.fd, a.session, REPORT_PATH, "report-unreadable")
+    dfd = _allow_dir(ctx.store.fd, a.session, REPORT_PATH, "report-unreadable", refuse_any_error=True)
     if dfd is None:
         return {"present": False}
     try:

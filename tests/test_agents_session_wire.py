@@ -43,7 +43,9 @@ def _fire(rig, oid, monkeypatch):
 
 def _coord(rig):
     """The review store directory a report card is filed into (beside the agent store, never inside it)."""
-    return rig.store.directory.parent / "coord"
+    d = rig.store.directory.parent / "coord"
+    d.mkdir(mode=0o700, exist_ok=True)  # an install names a directory that exists; the store insists on 0700
+    return d
 
 
 def _install(rig, **kw):

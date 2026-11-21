@@ -81,8 +81,8 @@ CALLERS = (OPERATOR, DISPATCH)
 #: §5.1 the ``_levain_dispatch`` rule: every verb except these. ``adopt-verify`` is NOT excepted (c7.10 fix1
 #: F2, head 1022+20 Q1): dispatch's consumer verifies a dispatch-class session's artifact; the verb layer splits the
 #: caller check by class (``runtime_helper.verify_caller``).
-#: DECISION (V13 rev 2 §1): ``probe`` is forbidden to dispatch until a dispatch session launches (2f), so
-#: ``sudoers.DISPATCH_VERBS`` stays as installed and no sudoers re-install is needed for the new verb.
+#: DECISION (V13 rev 2 §1): ``probe`` was made forbidden to dispatch until a dispatch session launches (2f). The verbs
+#: dispatch may call are ``sudoers.DISPATCH_VERBS``; a verb added to it takes a sudoers re-install on a host.
 DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity", "probe", "read-allow",
                                 "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list",
                                 "egress-grants-all"})

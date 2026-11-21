@@ -246,6 +246,18 @@ def test_a_discard_racing_the_read_cannot_move_the_tree_under_it(world, monkeypa
     assert world.where() == before and before[1] == ["retained"]
 
 
+def test_an_unmapped_os_error_at_a_directory_component_is_report_unreadable(world, monkeypatch):
+    put(world)
+    real_open = os.open
+
+    def deny(path, flags, *a, **k):
+        if path == "repo" and k.get("dir_fd") is not None:
+            raise PermissionError(13, "denied")
+        return real_open(path, flags, *a, **k)
+    monkeypatch.setattr(os, "open", deny)
+    refused(world, "report-unreadable")
+
+
 def test_read_allow_still_walks_its_own_directory_and_names(world):
     d = repo_dir(world) / ".claude"
     d.mkdir()
