@@ -34,8 +34,9 @@ alone fills the stop budget. Nothing new is stored.
 
 A sleeping laptop coalesces missed launchd ticks, so leases lapse during sleep. The first tick on wake runs lapse
 recovery (``takeover``, through ``controller.take_over_unclaimed``) only for a launched row no fire ever claimed (no
-``pid``, no ``session_key``); a lapsed row whose fire claimed it is not renewed (``heartbeat`` refuses a lapsed lease)
-and is left to that fire's own end. That is designed behaviour, not an alarm.
+``pid``, no ``session_key``) and for a launched SESSION row whose fire claimed it but opened no session
+(:func:`_recover_keyless_session_rows`); any other lapsed row whose fire claimed it is not renewed (``heartbeat`` refuses
+a lapsed lease) and is left to that fire's own end. That is designed behaviour, not an alarm.
 
 What the tick wires (and what it does not): the ``executor_of`` router (:func:`executor_of_factory`: ``session`` rows to
 :class:`levain.agents.session.RowSessionExecutor`, ``dream`` rows to the dream's own executor, anything else None, which
@@ -54,8 +55,9 @@ by ``controller.take_over_unclaimed``, whose docstring states that rule. Before 
 THE SESSION AGENTS' LAUNCH (levain#219): after the dream's, the scheduled slots of agents whose signed spec pins a
 ``session`` role are launched the same way (:func:`_launch_session_slots`), each charged its link's whole signed per-run
 figure up front, and only when the install names a usable launcher; a row that cannot launch is left ``admitted``, so the
-signed link stays the only consent and a later tick may retry it. A launched session row no fire claimed is not spawned
-again here.
+signed link stays the only consent and a later tick may retry it. A row the launch admitted under another link than the
+one its figure was read from is ended before any fire starts. A launched session row no fire claimed is not spawned
+again here; it is ended by ``controller.take_over_unclaimed`` once its launch lease lapses.
 
 THE NIGHT'S NOTICES (D1-N): after the claims, a store whose install names a dream runs
 ``levain.dream.agent.tick_notices``: the did-not-consolidate card for each closed window (one per window and class,
@@ -100,9 +102,10 @@ TICK_NOTICE_RESERVE_S = 120
 #: session launcher to END it, so it was not renewed and its lease lapses to takeover (an install that names none, or
 #: whose launcher cannot be built); 5 a night notice failed, raised, or was skipped for time (the tick itself ran;
 #: the stderr line says which); 6 a claimed dream or session slot could not be launched (its launch raised or answered
-#: ``unclassified``; for a session slot also: no usable launcher, or an exposure that cannot be stated; a full cap is a
-#: normal wait and is not this), or a launched one could not have its fire
-#: spawned, or one no fire claimed was ended by takeover (D1-Q: an admitted row is retried until its grace; a launched
+#: ``unclassified``; for a session slot also: no usable launcher, an exposure that cannot be stated, a spec or role
+#: that cannot be read, or a launch under another link than the one read, ended unrun; a full cap is a
+#: normal wait and is not this), or a launched one could not have its fire spawned, or one no fire claimed (or a
+#: session one whose fire opened no session) was ended by takeover (D1-Q: an admitted row is retried until its grace; a launched
 #: row with no fire has its fire spawned again until its launch lease lapses, then is ended stopped/crash_recovered;
 #: the stderr line says which); 70 the watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_NOTICES, EXIT_HARD_TIMEOUT = (
@@ -664,29 +667,108 @@ class _UnstatedExposure:
         return StopResult(True, "nothing was started")
 
 
-def _session_exposure(grant: Mapping[str, Any], stop_at: Any) -> tuple[int, Any] | None:
+def _session_exposure(grant: Mapping[str, Any], stop_at: Any) -> tuple[int, Any] | str:
     """``(max_exposure_usd_micros, action_exposure)`` a session run states at its launch: the admitting link's WHOLE
     signed per-run figure, charged up front as a hard ceiling (np-fe3e2ebd (a)). An ``api_key`` link: its
     ``budget_run_usd_micros`` dollars. A ``subscription`` link: no dollars, its ``budget_run_calls`` tool calls, its
-    ``budget_run_tunnel_bytes`` and the signed spec's ``stop_at`` seconds. None when the figure cannot be stated (an
-    unknown billing, a non-positive figure, no ``stop_at``): the caller then launches nothing."""
+    ``budget_run_tunnel_bytes`` and the signed spec's ``stop_at`` seconds. When the figure cannot be stated the answer
+    is a STRING naming which of the causes it was (terms that cannot be read, no usable ``stop_at``, an api_key figure
+    of 0 (np-a7c2a08c (a)) or not a whole number, subscription caps that are not, an unknown billing): the caller then
+    launches nothing and says that string."""
     from levain import authority as _auth
     from levain.agents.accounting import ActionExposure
 
-    if type(stop_at) is not int or stop_at <= 0:
-        return None
     try:
         billing, calls, tunnel = _auth.agent_link_terms(grant)
-    except Exception:  # noqa: BLE001 - a grant whose terms cannot be read states nothing
-        return None
+    except Exception as exc:  # noqa: BLE001 - a grant whose terms cannot be read states nothing
+        return f"the link's billing terms cannot be read ({type(exc).__name__})"
+    if type(stop_at) is not int or stop_at <= 0:
+        return "the signed spec's stop_at is not a positive whole number of seconds"
     if billing == "api_key":
         dollars = grant.get("budget_run_usd_micros")
-        return (dollars, None) if type(dollars) is int and dollars > 0 else None
+        if type(dollars) is not int:
+            return "the api_key link's budget_run_usd_micros is not a whole number"
+        if dollars <= 0:
+            return (f"the api_key link signs a per-run figure (budget_run_usd_micros) of {dollars}, and a session run "
+                    "with no dollars to spend is not launched (np-a7c2a08c (a)); sign a link with a figure above 0")
+        return dollars, None
     if billing == "subscription":
         if type(calls) is not int or calls <= 0 or type(tunnel) is not int or tunnel <= 0:
-            return None
+            return "the subscription link's budget_run_calls or budget_run_tunnel_bytes is not a positive whole number"
         return 0, ActionExposure(calls, "tool_calls", stop_at, tunnel)
-    return None
+    return f"the link's billing {billing!r} is neither api_key nor subscription"
+
+
+def _nothing_ran() -> Any:
+    """The usage of a launched row whose fire was never spawned: zero on every axis, read from the fact that nothing was
+    started, so its reservation is settled on that actual and debits nothing."""
+    from levain.agents.accounting import Usage
+    return Usage(0, 0, 0, "session:never_spawned", actions=0, tunnel_bytes=0, seconds=0)
+
+
+#: the reason a session row is ended with when its launch admitted another link than the one its exposure was read from
+LINK_MOVED = "link_moved"
+
+
+def _end_link_moved(st: AgentStore, oid: str, res: Any, picked: str | None, clock: Callable[[], datetime],
+                    notes: list[str]) -> None:
+    """End a row the launch admitted under another link than ``picked`` before any fire is spawned for it: ``stopped`` /
+    :data:`LINK_MOVED` through ``controller.settle_terminal`` at the launch's epoch, its reservation settled on
+    :func:`_nothing_ran`."""
+    moved = (f"{oid} was launched under link {res.link_id}, not link {picked} its exposure was read from, so no fire "
+             "was started")
+    try:
+        with st.write() as conn:
+            ended = _ctl.settle_terminal(conn, oid, res.launch_epoch, "stopped", LINK_MOVED, _nothing_ran(), clock())
+    except Exception as exc:  # noqa: BLE001 - named; the row has no fire, so its launch lease lapses to takeover
+        notes.append(f"{moved}; ending it raised {type(exc).__name__}: {exc}, so it is launched with nothing running "
+                     "and is ended stopped/crash_recovered once its launch lease lapses")
+        return
+    notes.append(f"{moved}: it was ended stopped/{LINK_MOVED}, its slot freed and its reservation settled on the zero it "
+                 "spent" if ended.ended else
+                 f"{moved}; it had already left launched, so nothing was ended here")
+
+
+def _recover_keyless_session_rows(st: AgentStore, clock: Callable[[], datetime], notes: list[str], seen: dict) -> None:
+    """Lapse recovery for a ``launched`` SESSION row whose fire CLAIMED it (its ``pid``) but opened no session (no
+    ``session_key``), for example a fire whose run could not be built. ``controller.take_over_unclaimed`` reads only
+    rows no fire claimed, and this tick's reaper renews no session row without a key, so without this such a row held
+    its slot and its reservation and every later slot of its agent was filed ``skipped-overlap``.
+
+    Once its lease has lapsed it is ended through ``controller.takeover`` (``stopped`` / ``crash_recovered``, the epoch
+    raised, the slot freed, the reservation settled as unread), as ``take_over_unclaimed`` ends an unclaimed row. Only
+    rows whose signed spec pins a ``session`` role are read (a dream row has no session key, and its claimed fire owns
+    it). The row is read again under the write lock, so one that recorded a key since the first read is left alone. Each
+    row ended here is named and the tick exits :data:`EXIT_LAUNCH`; one that raises is named and costs no other."""
+    try:
+        with st.read() as conn:
+            rows = conn.execute(
+                "SELECT occurrence_id, key FROM agent_occurrences WHERE state = 'launched' AND pid IS NOT NULL"
+                " AND session_key IS NULL ORDER BY launched_at, occurrence_id").fetchall()
+    except Exception as exc:  # noqa: BLE001 - named; the next tick reads them again
+        notes.append(f"the claimed session rows with no session key could not be read ({type(exc).__name__}: {exc}); "
+                     "the next tick tries again")
+        seen["launch"] = "raised"
+        return
+    for oid, key in rows:
+        try:
+            if _ctl._pinned_executor(st, oid)[1] != "session":
+                continue
+            with st.write() as conn:
+                _ctl._write_lock(conn)
+                keyless = conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                                       " AND session_key IS NULL", (oid,)).fetchone() is not None
+                ended = keyless and _ctl.takeover(conn, oid, clock())
+        except Exception as exc:  # noqa: BLE001 - one row's failure is named and never costs the others
+            notes.append(f"{oid} ({key}) is a launched session row its fire claimed with no session opened; ending it "
+                         f"raised {type(exc).__name__}: {exc}; the next tick tries again")
+            seen["launch"] = "raised"
+            continue
+        if ended:
+            notes.append(f"{oid} ({key}) was launched as a session run and its fire claimed it, but no session was "
+                         "opened before its launch lease lapsed: it was ended stopped/crash_recovered (takeover), its "
+                         "slot freed and its reservation settled as unread")
+            seen["launch"] = "recovered"
 
 
 def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime],
@@ -702,16 +784,25 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
       stop it by). Without one nothing is launched and the rows are left ``admitted`` (np-4c157a8f (a)): no reservation
       or slot is taken for a run whose fire could only refuse.
     * the EXPOSURE (:func:`_session_exposure`, np-fe3e2ebd (a)): read from the link ``controller._pick_link`` picks, the
-      function the launch picks with, over a fresh replay, so the figure is the admitting link's. A row whose figure
-      cannot be stated, or whose link cannot be read, is left ``admitted``. A pick that REFUSES (revoked, expired, no
-      link) is handed to the launch with an executor that states nothing, so the row ends with the launch's own refusal
-      and can never be reserved against.
+      function the launch picks with, over a fresh replay. A row whose figure cannot be stated, or whose link cannot be
+      read, is left ``admitted``. A pick that REFUSES (revoked, expired, no link) is handed to the launch with an
+      executor that states nothing, so the row ends with the launch's own refusal and can never be reserved against.
+    * ONE link: the launch replays the authority again and picks again, so a link signed or revoked between the two
+      replays can make it admit another link than the one the figure was read from. A row launched so (``link_id`` is
+      not the picked link) is never run: no fire is spawned and the row is ended at once, ``stopped`` /
+      :data:`LINK_MOVED`, its reservation settled on the zero it spent and its slot freed (a stop that is not a failed
+      run). KNOWN EDGE: the same move can instead make the launch refuse, and the launch writes that refusal: a
+      smaller per-run figure on the new link refuses the stated one ``run_budget``, and a link that turns live after
+      the tick's own pick refused finds the stating-nothing executor and refuses it ``no_exposure``. Those rows end
+      ``skipped-budget``, never launched (fail-closed), and are not retried.
 
     Selected by the role the row's own SIGNED spec pins (``controller._pinned_executor``), never by name, so the dream's
-    rows are :func:`_launch_dream_slots`'s alone. Outcomes are named as that step names them: ``no-slot`` and
-    ``unclassified`` leave the row ``admitted``; ``launched`` spawns the fire; every other answer was written by the
-    launch. The launch is a compare-and-set on ``state = 'admitted'``, which is why a row is launched at most once however
-    many ticks see it. One row's exception is named and does not cost the others."""
+    rows are :func:`_launch_dream_slots`'s alone; a row whose spec or role cannot be read is named and makes the tick
+    exit :data:`EXIT_LAUNCH`. Outcomes are named as that step names them: ``no-slot`` and ``unclassified`` leave the row
+    ``admitted``; ``launched`` spawns the fire; every other answer was written by the launch. The launch is a
+    compare-and-set on ``state = 'admitted'``, which is why a row is launched at most once however many ticks see it.
+    Each row is classified, picked and launched in its own guard and at its own clock reading: one row's failure is named
+    and does not cost the others."""
     from levain.agents import schedule as _sched
     from levain.agents import session as _session
     from levain.agents import session_wire as _wire
@@ -719,18 +810,29 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
 
     try:
         with st.read() as conn:
-            rows = conn.execute(
+            admitted = conn.execute(
                 "SELECT occurrence_id, agent_id, kind, key, window_key, spec_hash, binding_id FROM agent_occurrences"
                 " WHERE kind = 'scheduled' AND state = 'admitted' ORDER BY admitted_at, occurrence_id").fetchall()
-        rows = [r for r in rows if _ctl._pinned_executor(st, r[0])[1] == "session"]
     except Exception as exc:  # noqa: BLE001 - named; the next tick reads them again
         notes.append(f"the session agents' admitted slots could not be read, so nothing was launched "
                      f"({type(exc).__name__}: {exc}); the next tick tries again")
         seen["launch"] = "raised"
         return
+    retry = "it stays admitted and is retried next tick until its grace is gone"
+    rows = []
+    for row in admitted:
+        try:
+            _name, executor_kind, why = _ctl._pinned_executor(st, row[0])
+        except Exception as exc:  # noqa: BLE001 - one row that cannot be classified never costs the others
+            executor_kind, why = None, f"{type(exc).__name__}: {exc}"
+        if executor_kind == "session":
+            rows.append(row)
+        elif executor_kind is None:
+            notes.append(f"{row[0]} is admitted but its signed spec or pinned role cannot be read ({why}), so it was not "
+                         f"launched; {retry}")
+            seen["launch"] = "unreadable"
     if not rows:
         return
-    retry = "it stays admitted and is retried next tick until its grace is gone"
     try:
         launcher = _wire.resolve_launcher(st, _wire.read_install(st.directory))
         if isinstance(launcher, _session.UnwiredLauncher):
@@ -743,9 +845,9 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
                      "grace is gone, then end never_launched. Name a registered launcher in the install file.")
         seen["launch"] = "no_launcher"
         return
-    now = clock()
     for oid, agent_id, kind, key, window_key, spec_hash, binding_id in rows:
         try:
+            now = clock()               # per row: an earlier row's launch may have taken long
             signed = _spec.occurrence_spec(st, oid)
             trigger = signed["trigger"]
             lo, hi = _sched.window_span(trigger, trigger["zone"], window_key)
@@ -767,9 +869,9 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
                 executor: Any = _UnstatedExposure()
             else:
                 figure = _session_exposure(state.policy.grants[picked], signed.get("stop_at"))
-                if figure is None:
-                    notes.append(f"{oid} was not launched: the per-run figure of link {picked} (with the spec's "
-                                 f"stop_at) cannot be stated as its exposure; {retry}")
+                if isinstance(figure, str):
+                    notes.append(f"{oid} was not launched: its exposure cannot be stated from link {picked}: {figure}; "
+                                 f"{retry}")
                     seen["launch"] = "exposure"
                     continue
                 executor = _session.SessionExecutor(launcher, max_exposure_usd_micros=figure[0],
@@ -782,7 +884,9 @@ def _launch_session_slots(st: AgentStore, auth: Any, clock: Callable[[], datetim
             continue
         if res.outcome == _ctl.LAUNCHED:
             if res.link_id != picked:
-                notes.append(f"{oid} launched under link {res.link_id}, its exposure read from link {picked}")
+                _end_link_moved(st, oid, res, picked, clock, notes)
+                seen["launch"] = "link_moved"
+                continue
             try:
                 spawn(st.directory, oid)
             except Exception as exc:  # noqa: BLE001 - a launched row with no fire lapses to takeover
@@ -886,12 +990,15 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
                              f"renewal-gap bound allows ({WORST_RENEW_GAP_S}s against the {_ctl.LEASE_S}s lease): a "
                              "lease the previous tick renewed may have lapsed")
             try:
-                return sup.reap(executor_of, attention=attention, resolve=resolve)
+                reaped = sup.reap(executor_of, attention=attention, resolve=resolve)
             finally:                # named on the graceful bound too
                 if unstoppable:
                     why = dict(executor_of.no_launcher).get(unstoppable[0], "no executor could be built for it")
                     notes.append(f"{len(unstoppable)} launched row(s) have no executor that could stop them ({why}; "
                                  f"first: {unstoppable[0]}): they were not renewed, and their leases lapse to takeover")
+            # after the renewals, before the claims: a claimed keyless session row whose lease lapsed frees its slot
+            _recover_keyless_session_rows(st, clock, notes, seen)
+            return reaped
 
         if refusal is not None:
             # the install names no usable cockpit: renew the rows this process could stop and stop what the store

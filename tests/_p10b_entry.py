@@ -15,7 +15,8 @@ names, ``P10B_STUB_DIR``: a directory the stub launcher keeps its records and it
 
 The stub's vendor is a tiny python program behind the real ``GatedChild`` gate, so the exit status a run reads is a real
 process's. Controls (files in ``P10B_STUB_DIR``, written by the case): ``hold`` (the vendor waits while it exists), ``exit``
-(its exit status), ``usage`` (``unreadable``: the launcher answers no usage). Records: ``calls`` (the number of spawns),
+(its exit status), ``usage`` (``unreadable``: the launcher answers no usage), ``subscription`` (the launcher also serves the
+subscription route's auth). Records: ``calls`` (the number of spawns),
 ``launch-<n>.json`` (what the launcher was asked to start) and ``gate-<n>.pid``.
 """
 from __future__ import annotations
@@ -52,6 +53,8 @@ class StubLauncher:
         self.dir = Path(directory)
         self.route = S.S1_DISPATCH
         self.auth = "brokered"
+        if (self.dir / "subscription").exists():     # the control a subscription case writes: serve that route too
+            self.auths = frozenset({"brokered", S.AUTH_FOR_BILLING["subscription"]})
 
     def spawn(self, launch):
         from levain.agents import controller as ctl

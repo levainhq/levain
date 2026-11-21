@@ -76,6 +76,11 @@ class Session(Install):
 
     # ------------------------------------------------------------------------------------------------- the CLI
     def env(self, now: str | None = None, spawn_gate: bool = False, kill: str | None = None) -> dict[str, str]:
+        """The environment of a process this rig starts. ``spawn_gate`` is off by default here and on by default in
+        :meth:`cli` because the two serve different processes: ``env()`` with no arguments is the FIRE's own environment
+        (:meth:`fire`, and a case's own ``spawn_fire(env=s.env())``), and a fire must run its body, never record a spawn
+        in its place; a CLI process must not start a fire the product's way (it could not reach the stub), so its spawn
+        is recorded for the case to fire itself."""
         env = super().env(now, spawn_gate, kill)
         env["P10B_STUB_DIR"] = str(self.stubdir)
         return env
@@ -237,6 +242,9 @@ class Session(Install):
 
     def usage_unreadable(self) -> None:
         (self.stubdir / "usage").write_text("unreadable", encoding="utf-8")
+
+    def serve_subscription(self) -> None:
+        (self.stubdir / "subscription").write_text("", encoding="utf-8")
 
     def started(self) -> int:
         try:

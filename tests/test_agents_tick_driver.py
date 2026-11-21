@@ -657,8 +657,9 @@ def test_the_default_store_is_compared_resolved_on_both_sides(rig, tmp_path, mon
 
 def test_a_session_launch_states_the_link_s_whole_per_run_figure_or_nothing():
     """The figure is the admitting link's whole signed per-run figure: dollars on an api_key link, the action caps and the
-    spec's stop_at seconds on a subscription one. Anything it cannot state from (no stop_at, a zero or non-int figure, an
-    unknown billing, a grant whose terms cannot be read) is None, and the tick then launches nothing."""
+    spec's stop_at seconds on a subscription one. Anything it cannot state from is a string naming which cause it was (no
+    stop_at, a zero or non-int figure, caps that are not positive, an unknown billing, a grant whose terms cannot be
+    read), and the tick then launches nothing and says that string."""
     from levain.agents.accounting import ActionExposure
 
     api = {"budget_run_usd_micros": 20_000_000}
@@ -666,10 +667,11 @@ def test_a_session_launch_states_the_link_s_whole_per_run_figure_or_nothing():
     assert T._session_exposure(api, 3600) == (20_000_000, None)
     assert T._session_exposure(sub, 3600) == (0, ActionExposure(40, "tool_calls", 3600, 9000))
     for stop_at in (None, 0, -1, 3600.0, True, "3600"):
-        assert T._session_exposure(api, stop_at) is None and T._session_exposure(sub, stop_at) is None
-    assert T._session_exposure({"budget_run_usd_micros": 0}, 3600) is None
-    assert T._session_exposure({"budget_run_usd_micros": 1.5}, 3600) is None
-    assert T._session_exposure({**sub, "budget_run_calls": 0}, 3600) is None
-    assert T._session_exposure({**sub, "budget_run_tunnel_bytes": 0}, 3600) is None
-    assert T._session_exposure({**sub, "billing": "other"}, 3600) is None
-    assert T._session_exposure({"billing": "subscription"}, 3600) is None      # its caps cannot be read
+        for grant in (api, sub):
+            assert "stop_at is not a positive whole number" in T._session_exposure(grant, stop_at)
+    assert "a per-run figure (budget_run_usd_micros) of 0" in T._session_exposure({"budget_run_usd_micros": 0}, 3600)
+    assert "is not a whole number" in T._session_exposure({"budget_run_usd_micros": 1.5}, 3600)
+    for over in ({"budget_run_calls": 0}, {"budget_run_tunnel_bytes": 0}):
+        assert "is not a positive whole number" in T._session_exposure({**sub, **over}, 3600)
+    assert "billing 'other' is neither" in T._session_exposure({**sub, "billing": "other"}, 3600)
+    assert "terms cannot be read (KeyError)" in T._session_exposure({"billing": "subscription"}, 3600)
