@@ -138,37 +138,101 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
     return target
 
 
-def refuse_real_key_unless_live(path: Path | str, what: str = "the key") -> None:
+#: The key files in the real key directory whose hard link elsewhere is still the real key
+#: (``levain.consent.terminal_sign.KEY_LABEL``, spelled here because terminal_sign imports this module; a test pins it).
+_REAL_KEY_FILES = ("levain-terminal",)
+
+
+def _is_real_key_dir_by_identity(target: Path, real: Path) -> bool:
+    """True when ``target`` (resolved) is the real key directory or lies inside it by device and inode, whatever its
+    spelling: every EXISTING one of ``target`` and its ancestors, up to the root, is compared with the real directory
+    (a path not made yet, the evidence directory, is judged by the ancestors that exist), and a regular file with more
+    than one link is compared with the real key files (a hard link of the key). A stat that fails other than "not
+    there" is True (fail closed). A real directory that does not exist has no identity to alias."""
+    try:
+        real_st = os.stat(real)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    for a in (target, *target.parents):
+        try:
+            st = os.stat(a)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return True
+        if os.path.samestat(st, real_st):
+            return True
+    try:
+        st = os.stat(target)
+    except OSError:
+        return False
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        for name in _REAL_KEY_FILES:
+            try:
+                if os.path.samestat(st, os.stat(real / name)):
+                    return True
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return True
+    return False
+
+
+def refuse_real_key_unless_live(path: Path | str, what: str = "the key") -> Path:
     """Raise :class:`RealKeyUnmarked` when ``path`` is the operator's real key directory or lies inside it
-    (:func:`pwd_key_dir`, both resolved) and this process is not marked live (:func:`levain.home_guard.live_marked`:
-    a levain launcher called ``mark_live``), or is a test run or a scratch run (:func:`levain.home_guard.guarded_run`),
-    which never reaches it whatever :data:`~levain.home_guard.LIVE_ENV` says (a marker inherited from a parent does not
-    count). Reaching the real key is an opt-in of the live product; a process that did not opt in, a stray script or a
-    bare child a test started, is refused whatever its ``$HOME`` or ``$LEVAIN_HOME``. A REFUSE, never a warning: it
-    does not read ``home_guard.UNMARKED_ACTION``. A path outside the real key directory returns, marked or not. A real
-    key directory that cannot be named (no password entry) has nothing to guard, so it returns; a ``path`` that cannot
-    be resolved is refused, since it cannot be shown to lie elsewhere."""
-    from levain.home_guard import LIVE_ENV, guarded_run, live_marked
+    (:func:`pwd_key_dir`) and this process did not mark itself live (:func:`levain.home_guard.live_marked_here`:
+    ``LEVAIN_LIVE=1`` AND ``LEVAIN_LIVE_PID`` equal to this process's pid, which ``mark_live`` sets), or is a test run
+    or a scratch run (:func:`levain.home_guard.guarded_run`), which never reaches it whatever the markers say. A child
+    that inherited a marked parent's environment (a spawn without ``env=``, a fork) has another pid, so it is refused
+    until its own entry calls ``mark_live``. Reaching the real key is an opt-in of the live product; a process that did
+    not opt in, a stray script or a bare child a test started, is refused whatever its ``$HOME`` or ``$LEVAIN_HOME``.
+    A REFUSE, never a warning: it does not read ``home_guard.UNMARKED_ACTION``.
+
+    "Inside it" is judged by spelling (both resolved) AND by identity (:func:`_is_real_key_dir_by_identity`: device and
+    inode of the path and of each existing ancestor, and a hard link of the key file), so a case-different spelling on
+    a case-insensitive volume or a ``/System/Volumes/Data`` firmlink spelling is refused too. A COPY of the key is a
+    different file and is out of scope: it holds the same handle and sidecar, and the provider's own policy, not this
+    gate, owns it. A path outside the real key directory returns, marked or not. Fail closed: a real key directory that
+    cannot be named (no password entry), or a ``path`` that cannot be resolved, is refused to a process that is not
+    marked here, since neither can be shown to lie elsewhere.
+
+    It stops a STRAY process, not a hostile one: a process that sets both markers itself, or calls ``mark_live``,
+    passes; the Touch ID sheet, not this gate, is the consent.
+
+    Returns the resolved path it judged, which a caller uses for every later act (the ``ssh-keygen`` spawn included),
+    so a link retargeted after the check is not followed again; a marked process whose path will not resolve gets it
+    with ``~`` expanded."""
+    from levain.home_guard import LIVE_ENV, LIVE_PID_ENV, guarded_run, live_marked_here
 
     guarded = guarded_run()
-    if guarded is None and live_marked():
-        return
+    if guarded is None and live_marked_here():
+        try:
+            return Path(path).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return Path(path).expanduser()
+    state = (f"this process is {guarded}, which never reaches the real key, whatever {LIVE_ENV} says" if guarded
+             else f"this process did not mark itself live ({LIVE_ENV}=1 with {LIVE_PID_ENV} its own pid; a marker "
+                  "inherited from a parent does not count)")
     try:
         real = pwd_key_dir().resolve()
-    except (OSError, RuntimeError, KeyError):
-        return
-    state = (f"this process is {guarded}, which never reaches the real key, whatever {LIVE_ENV} says" if guarded
-             else f"this process was not started by a levain launcher ({LIVE_ENV} is not 1)")
+    except (OSError, RuntimeError, KeyError) as exc:
+        raise RealKeyUnmarked(f"{what} ({path}): the operator's real key directory cannot be named "
+                              f"({type(exc).__name__}: {exc}), so {what} cannot be shown to lie elsewhere, and {state}; "
+                              "refused") from None
     try:
         target = Path(path).expanduser().resolve()
     except (OSError, RuntimeError) as exc:
         raise RealKeyUnmarked(f"{what} ({path}) cannot be resolved ({type(exc).__name__}: {exc}), so it cannot be shown "
                               f"not to be the operator's real key, and {state}; refused") from None
-    if target == real or real in target.parents:
+    if target == real or real in target.parents or _is_real_key_dir_by_identity(target, real):
         raise RealKeyUnmarked(
-            f"refusing {what} ({target}): it is the operator's real key and {state}, so a signature here would be a "
-            "consent nobody gave. Fix: start it through `levain`, or call levain.home_guard.mark_live() first thing in "
-            "your own launcher (a test or scratch run cannot reach it at all).")
+            f"refusing {what} ({target}): it is the operator's real key directory ({real}) or inside it, and {state}. "
+            "Only a process that marked itself live reaches that directory at all, to read it or to sign with it. "
+            "Fix: start it through `levain`, or call levain.home_guard.mark_live() first thing in your own launcher "
+            "(a test or scratch run cannot reach it at all).")
+    return target
 
 
 @dataclass(frozen=True)
@@ -970,7 +1034,8 @@ def _write_sign_failure(key_path: Path, *, fp: str, message: bytes, signature: s
     secret: whoever can read this file and can guess the message (a short answer, a known template) can confirm the
     guess offline. Returns the path, or ``evidence not written (why)``: a diagnostic never fails a sign and never
     replaces the refusal's own text. The one raise is :class:`RealKeyUnmarked`, for a directory inside the real key
-    directory when this process is not marked live (:func:`refuse_real_key_unless_live`), before anything is made."""
+    directory when this process did not mark itself live, or is a test or scratch run (:func:`refuse_real_key_unless_live`),
+    before anything is made."""
     refuse_real_key_unless_live(Path(key_path).parent / _SIGN_FAILURE_DIR, "the sign-failures directory")
     dfd = None
     try:
@@ -1060,10 +1125,14 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
 
     A security-key answer that does not verify leaves an evidence file (:func:`_write_sign_failure`, under
     ``<key dir>/sign-failures``) and may be asked for again, once: at once (:data:`_SK_RETRIES`), or after a wait when
-    the answer is empty (:data:`_SK_EMPTY_ATTEMPTS` attempts in all; ``sign`` below says which)."""
+    the answer is empty (:data:`_SK_EMPTY_ATTEMPTS` attempts in all; ``sign`` below says which).
+
+    Before anything is read or spawned it raises :class:`RealKeyUnmarked` (:func:`refuse_real_key_unless_live`) for
+    the operator's real key in a process that did not mark itself live, or in a test or scratch run; from then on it
+    uses the resolved path that gate judged."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
-    key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
-    refuse_real_key_unless_live(key_path, "the signing key")
+    key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")
+    key_path = refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     sidecar = read_sidecar(key_path)

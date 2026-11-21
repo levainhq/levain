@@ -349,3 +349,94 @@ def test_the_terminal_summary_prints_the_block_and_writes_the_file(tmp_path, mon
     G.pytest_terminal_summary(Rep())
     # an empty report still prints (CI must tell "empty" from "missing"); the file says empty
     assert lines == ["KEYGUARD REPORT BEGIN", "KEYGUARD REPORT: 0 denied spawns", "KEYGUARD REPORT END"] and out.read_text() == ""
+
+
+# --- every child of the test run is a scratch run (levain#237 L2 HIGH) ------------------------------------------------
+
+def test_the_scratch_name_is_home_guards_and_the_run_carries_it():
+    from levain import home_guard
+
+    assert G.SCRATCH_ENV == home_guard.SCRATCH_ENV
+    assert os.environ.get(G.SCRATCH_ENV) == "1"
+
+
+def test_scratch_env_adds_the_marker_to_an_env_that_does_not_name_it(monkeypatch):
+    given = {"PATH": "/bin"}
+    got = G.scratch_env(given)
+    assert got == {"PATH": "/bin", G.SCRATCH_ENV: "1"} and given == {"PATH": "/bin"}       # a copy: the caller's dict untouched
+    named = {"PATH": "/bin", G.SCRATCH_ENV: "0"}
+    assert G.scratch_env(named) is named                                                  # a test that names it decides
+    assert G.scratch_env({b"PATH": b"/bin"}) == {b"PATH": b"/bin", G.SCRATCH_ENV.encode(): b"1"}
+    assert G.scratch_env({b"PATH": b"/bin", G.SCRATCH_ENV.encode(): b"0"})[G.SCRATCH_ENV.encode()] == b"0"
+    assert G.scratch_env(None) is None                                                    # inherits os.environ, which has it
+    monkeypatch.delenv(G.SCRATCH_ENV)
+    inherited = G.scratch_env(None)
+    assert inherited[G.SCRATCH_ENV] == "1" and inherited.get("PATH") == os.environ.get("PATH")
+
+
+@pytest.fixture
+def env_recorder(monkeypatch):
+    seen: list = []
+
+    def rec(self, args, *a, **kw):
+        seen.append(({**dict(zip(G._POPEN_POS, a)), **kw}).get("env"))
+    monkeypatch.setattr(subprocess.Popen, "__init__", rec)
+    gen = G.install()
+    next(gen)
+    try:
+        yield seen
+    finally:
+        gen.close()
+
+
+def test_every_popen_child_gets_the_marker_by_keyword_position_or_inheritance(env_recorder, monkeypatch):
+    subprocess.Popen(["true"], env={"A": "b"})
+    subprocess.Popen(["true"], -1, None, None, None, None, None, True, False, None, {"A": "b"})   # env by position (11th)
+    subprocess.Popen(["true"], env={"A": "b", G.SCRATCH_ENV: "0"})
+    subprocess.Popen(["true"])
+    monkeypatch.delenv(G.SCRATCH_ENV)
+    subprocess.Popen(["true"])
+    first, positional, named, inherit, lost = env_recorder
+    assert first == {"A": "b", G.SCRATCH_ENV: "1"} and positional == first
+    assert named == {"A": "b", G.SCRATCH_ENV: "0"}
+    assert inherit is None                                     # os.environ carries it
+    assert lost[G.SCRATCH_ENV] == "1"                          # an inherited environment that lost it is handed a copy with it
+
+
+def test_every_wrapped_os_spawn_with_an_env_gets_the_marker(monkeypatch, tmp_path):
+    names = [n for n in ("posix_spawn", "posix_spawnp", "execve", "execvpe", "spawnle", "spawnlpe", "spawnve", "spawnvpe")
+             if hasattr(os, n)]
+    got: dict = {}
+    for n in names:
+        sig = G.real_signature(getattr(os, n), n)
+
+        def rec(*a, _n=n, **k):
+            got[_n] = (a, k)
+        rec.__signature__ = sig
+        monkeypatch.setattr(os, n, rec)
+    gen = G.install()
+    next(gen)
+    try:
+        for n in names:
+            argv = ["true"]
+            if n.startswith("spawnl"):
+                getattr(os, n)(os.P_NOWAIT, "/usr/bin/true", *argv, {"A": "b"})
+            elif n.startswith("spawn"):
+                getattr(os, n)(os.P_NOWAIT, "/usr/bin/true", argv, {"A": "b"})
+            else:
+                getattr(os, n)("/usr/bin/true", argv, {"A": "b"})
+    finally:
+        gen.close()
+    for n in names:
+        a, k = got[n]
+        env = a[-1] if n.startswith("spawnl") else ({**dict(zip(("path", "argv", "env"), a)), **k}.get("env")
+                                                      if not n.startswith("spawn") else a[3])
+        assert env == {"A": "b", G.SCRATCH_ENV: "1"}, (n, a, k)
+
+
+def test_a_real_child_with_a_hand_built_env_is_a_scratch_run_unless_it_names_the_marker(tmp_path):
+    probe = [sys.executable, "-I", "-c", "import os; print(os.environ.get('LEVAIN_SCRATCH_RUN'))"]
+    assert subprocess.run(probe, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                          timeout=60).stdout.strip() == "1"
+    assert subprocess.run(probe, env={"PATH": "/usr/bin:/bin", G.SCRATCH_ENV: "0"}, capture_output=True, text=True,
+                          timeout=60).stdout.strip() == "0"

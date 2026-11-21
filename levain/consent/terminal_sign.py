@@ -443,7 +443,11 @@ class TerminalKey:
 
 def _real_key_dir() -> Path:
     """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``. Only a
-    process marked live gets it (``keys.refuse_real_key_unless_live``); any other raises ``RealKeyUnmarked`` here."""
+    process that marked itself live, and is not a test or scratch run, gets it (``keys.refuse_real_key_unless_live``);
+    any other raises ``RealKeyUnmarked`` here. That includes the READ-only callers (``find_key``, ``status``,
+    ``_create``), on purpose: no unmarked read-only caller was found in levain or in flow's scripts (levain#237 L1 Q4),
+    so such a process gets a refusal (``status`` a warning row, ``sign`` an unsigned ``signer-error``) rather than a
+    look at the real key directory."""
     real = _keys.pwd_key_dir()
     _keys.refuse_real_key_unless_live(real, "the real key directory")
     return real
@@ -468,7 +472,9 @@ def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     there is none with a ``touch-id`` sidecar. Read-only: nothing is created. A directory open to other users or
     owned by someone else, a key, ``.pub`` or sidecar that is a link or not this user's regular file, or a sidecar
     that is there but malformed, raises ``KeyError_``. ``key_dir`` is for tests; the default is the real home's,
-    whatever the environment says."""
+    whatever the environment says, and only a process that marked itself live gets it: any other (and a test or
+    scratch run) raises ``keys.RealKeyUnmarked``, a ``KeyError_``, before the directory is looked at
+    (:func:`_real_key_dir`)."""
     d = Path(key_dir) if key_dir is not None else _real_key_dir()
     _keys.refuse_real_key_in_tests(d, "the key directory")
     try:
@@ -687,9 +693,10 @@ SignerFactory = Callable[[Path, float], tuple[str, Signer]]    # (key path, the 
 
 def default_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
-    Calling the ``Signer`` it returns raises the Touch ID prompt."""
+    Calling the ``Signer`` it returns raises the Touch ID prompt. Raises ``keys.RealKeyUnmarked`` for the real key in
+    a process that did not mark itself live (``keys.refuse_real_key_unless_live``) and signs the path that gate judged."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
-    _keys.refuse_real_key_unless_live(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
@@ -697,7 +704,7 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
     """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
     other door to the real key."""
     key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
-    _keys.refuse_real_key_unless_live(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_unless_live(key_path, "the signing key")     # the judged path, from here on
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 
@@ -1004,9 +1011,9 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
         if key is None:
             return SignOutcome("unsigned", "no-key", "no terminal key with a touch-id sidecar")
         _keys.refuse_real_key_in_tests(key.path, "the signing key")
-        _keys.refuse_real_key_unless_live(key.path, "the signing key")
+        judged = _keys.refuse_real_key_unless_live(key.path, "the signing key")    # the factory signs the path judged
         factory = signer_factory or default_signer_factory
-        fp, signer = factory(key.path, bound_s)
+        fp, signer = factory(judged, bound_s)
         signature = signer(bytes(message))
     except KeyError_ as exc:
         reason, detail = _classify(exc)

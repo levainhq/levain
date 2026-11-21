@@ -30,8 +30,8 @@ def _spawn(tmp_path: Path, script: str, *, test_run: bool, scratch_marker: bool 
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(fake_home), "PYTHONPATH": str(REPO)}
     if test_run:
         env["PYTEST_CURRENT_TEST"] = "tests/test_x.py::test_y (call)"
-    if scratch_marker:
-        env[home_guard.SCRATCH_ENV] = "1"
+    # named either way: without it the keyguard marks every child a scratch run (tests/spawn_keyguard.py scratch_env)
+    env[home_guard.SCRATCH_ENV] = "1" if scratch_marker else "0"
     if levain_home is not None:
         env["LEVAIN_HOME"] = levain_home
     done = subprocess.run([sys.executable, str(path)], env=env, capture_output=True, text=True, timeout=60,
