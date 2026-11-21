@@ -33,6 +33,7 @@ KINDS = ("extra_key_in_subject", "missing_key_in_subject", "value_rule", "extra_
 MAX_CYCLES = 6
 HEALTHY = ("ok", "partial", "empty")      # a derive status that is a read, not a failure
 MIN_REASON = 40
+PROBE_VERSION = "#version"      # the probe's version string, beside its per-panel etags in the ``probe`` observation
 BANNED_REASONS = frozenset({"todo", "known", "tbd", "flaky", "fixme", "wip"})
 
 
@@ -193,12 +194,18 @@ def observe_request(ck: Any, derived: list, oracle_rows: dict | None = None) -> 
             rows_asked[pid] = rid
             per[f"row:{rid}"] = _attempt(lambda pid=pid, rid=rid: ck.panel(pid, row=rid))
         payload[pid] = per
-    probe = ck.change_probe()
     out = {"manifest": manifest, "payload": payload, "freshness": _attempt(ck.freshness),
            "_rows_asked": rows_asked,
            "_panel_order": list(panels) if isinstance(panels, dict) else None}
+    try:
+        probe = ck.change_probe()
+    except Exception as exc:  # noqa: BLE001 - a probe that raises is a triple, not a crash of every dependent test
+        probe, out["probe"] = None, _raised(exc)
     if probe is not None:
-        out["probe"] = _attempt(lambda: {pid: {"etag": tag} for pid, tag in probe.snapshot()[0].items()})
+        def read_probe() -> dict:
+            etags, version = probe.snapshot()
+            return {**{pid: {"etag": tag} for pid, tag in etags.items()}, PROBE_VERSION: version}
+        out["probe"] = _attempt(read_probe)
     return out
 
 
@@ -220,7 +227,7 @@ class Triple:
     def panel(self) -> str:
         """The panel id a path is about, or ``-`` for a path about the whole manifest."""
         p = self.path
-        if p[0] in ("derive", "payload", "freshness", "probe") and len(p) > 1:
+        if p[0] in ("derive", "payload", "freshness", "probe") and len(p) > 1 and not p[1].startswith("#"):
             return p[1]
         if p[0] == "manifest" and len(p) > 2 and p[1] == "panels":
             return p[2]
@@ -264,14 +271,24 @@ def compare(pair: Pair) -> list:
     subject = observe_request(pair.attached, pair.derived, oracle["_rows_asked"])
     order = Triple(("manifest", "panels", "#order"), "value", oracle.pop("_panel_order"), subject.pop("_panel_order"))
     oracle.pop("_rows_asked"), subject.pop("_rows_asked")
-    # the probe is the subject's own surface (a bare cockpit has none): its etags are held against the subject's own manifest etags (the oracle's differ by design)
+    # the probe is the subject's own surface (a bare cockpit has none): its etags are held against the subject's own manifest
+    # etags (the oracle's differ by design), and its version has no oracle, so it is held to be text here (that it is
+    # stable across reads is ``self_diff``'s; that it moves with the state is DIFF-2's, levain#245)
     probe = subject.pop("probe", None)
     out.extend(diff(oracle, subject))
     if order.old != order.new:
         out.append(order)
     if probe is not None:
-        mine = {pid: {"etag": (h or {}).get("etag")} for pid, h in (subject["manifest"].get("panels") or {}).items()}
-        out.extend(diff({"probe": mine}, {"probe": probe}))
+        version = probe.pop(PROBE_VERSION, None) if isinstance(probe, dict) else None
+        if isinstance(probe, dict) and set(probe) != {"raised"} and not (isinstance(version, str) and version):
+            out.append(Triple(("probe", PROBE_VERSION), "value", "non-empty text", version))
+        heads = subject["manifest"].get("panels") if isinstance(subject["manifest"], dict) else None
+        mine = {pid: {"etag": h.get("etag") if isinstance(h, dict) else None}
+                for pid, h in (heads if isinstance(heads, dict) else {}).items()}
+        if isinstance(probe, dict) and set(probe) == {"raised"}:
+            out.append(Triple(("probe",), "value", mine, probe))      # one triple holding the raise, not its keys
+        else:
+            out.extend(diff({"probe": mine}, {"probe": probe}))
     return out
 
 

@@ -9,6 +9,8 @@ Known limits, each owned elsewhere or accepted:
   * The value rule proves "fresh at rest" only. Mutating a row and republishing, to show an etag moves with content (the
     metamorphic half of the etag question), and convergence belong to DIFF-2 (levain#245); this file holds only that
     distinct panels carry distinct etags and that the serve-composed panels, the control, carry equal ones.
+  * The probe's version is held to be text and stable across two reads of one state; that it MOVES when the state does
+    (an entity, the panel set, a discovery error) is a mutation test, DIFF-2's (levain#245).
   * The k2a install dates its seeds with a fixed calendar date while the clock is the real date, so a date band in that
     corpus can move with the day the suite runs. Both sides read the same install in one run, so it cannot split them."""
 from __future__ import annotations
@@ -561,3 +563,56 @@ def test_canary_a_catch_all_entry_is_rejected_in_every_scope(scope, kind):
     assert any("literal" in p for p in rig.entry_problems([entry]))
     t = rig.Triple((scope, "x", "surprise"), kind, None, 1)
     assert rig.classify([t], [entry]).unmatched == []
+
+
+class _Probe:
+    """A stand-in for the subject's change probe: ``snapshot`` returns what it is given or raises."""
+
+    def __init__(self, real, snapshot):
+        self._real, self.snapshot = real, snapshot
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_canary_a_probe_that_raises_or_reports_a_bad_or_moving_version_is_seen(fresh, approved):
+    """One pair serves every probe fault below (each is a patch of the subject's ``change_probe``, put back in turn)."""
+    ck = fresh.attached
+    real_change_probe = ck.change_probe
+    real = real_change_probe()
+
+    def boom():
+        raise RuntimeError("probe down")
+
+    def unmatched_probe(patched):
+        ck.change_probe = patched
+        return [t for t in _unmatched_on(fresh, approved) if t.scope == "probe"]
+
+    # a raise is a triple, not a crash of the comparison
+    got = unmatched_probe(lambda: _Probe(real, boom))
+    assert any(rig.triple_raised(t) for t in got)
+    got = unmatched_probe(boom)
+    assert any(rig.triple_raised(t) for t in got)
+    # a version that is not text is the one triple at its own path
+    for version in (None, "", 5, ["v"]):
+        got = unmatched_probe(lambda version=version: _Probe(real, lambda: (real.snapshot()[0], version)))
+        assert [t.dotted() for t in got] == ["probe.#version"], version
+    # a version that differs between two reads of one state is seen by the side's own double read
+    calls = []
+
+    def moving():
+        calls.append(1)
+        return real.snapshot()[0], f"v{len(calls)}"
+
+    ck.change_probe = lambda: _Probe(real, moving)
+    assert [t.dotted() for t in rig.self_diff(fresh, "attached")] == ["probe.#version"]
+    ck.change_probe = real_change_probe
+    assert [t for t in _unmatched_on(fresh, approved) if t.scope == "probe"] == []
+
+
+def test_the_probe_reports_its_etags_and_a_stable_version(pairs):
+    for name, p in pairs.items():
+        probe = p.attached.change_probe()
+        (etags, version), (again, version2) = probe.snapshot(), probe.snapshot()
+        assert etags and etags == again, name
+        assert isinstance(version, str) and version and version == version2, (name, version, version2)
