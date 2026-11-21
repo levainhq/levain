@@ -28,35 +28,6 @@ test("dialogs: when each opened and closed, and what Chrome answered to the repl
   assert.match(text, /\+900ms alert "second" closed never; handleJavaScriptDialog sent \+900ms, reply error No dialog is showing after 5ms/);
 });
 
-const WRITE_TOKEN = "Write token (printed when this server started: on its startup line, or in the daemon's log):";   // the real prompt's text
-const NOT_ATTACHED = { code: -32000, message: "Not attached to an active page" };
-
-test("dialogs: a decline sent again shows the first refusal, the number of sends and the final outcome, on the real prompt text", () => {
-  const r = rig();
-  r.feed(826, { method: "Page.javascriptDialogOpening", params: { type: "prompt", message: WRITE_TOKEN } });
-  r.ev.dialogReplySent(7);
-  r.feed(830, { id: 7, error: NOT_ATTACHED });
-  r.ev.dialogReplySent(8);
-  r.feed(1034, { id: 8, error: NOT_ATTACHED });
-  r.ev.dialogReplySent(9);
-  r.feed(1240, { id: 9, result: {} });
-  r.feed(1241, { method: "Page.javascriptDialogClosed", params: { result: false, userInput: "" } });
-  const text = renderEvidence(r.ev);
-  assert.match(text, /\+826ms prompt "Write token \(printed when this server s~" closed \+1241ms accepted=false; handleJavaScriptDialog sent \+826ms, reply ok after 206ms; sent 3 times, first reply error Not attached to an active page after 4ms\n/);
-});
-
-test("dialogs: a decline given up at the bound keeps the count and the first refusal on the real prompt text, unclipped", () => {
-  const r = rig();
-  r.feed(826, { method: "Page.javascriptDialogOpening", params: { type: "prompt", message: WRITE_TOKEN } });
-  for (let n = 0; n < 25; n++) {
-    r.at(826 + n * 200); r.ev.dialogReplySent(100 + n);
-    r.feed(826 + n * 200 + 4, { id: 100 + n, error: NOT_ATTACHED });
-  }
-  const line = renderEvidence(r.ev).split("\n").find((l) => l.includes("handleJavaScriptDialog sent"));
-  assert.match(line, /sent 25 times, first reply error Not attached to an active page after 4ms$/);
-  assert.doesNotMatch(line, /~$/);
-});
-
 test("requests: a script that failed to load is in the ring with its errorText, beside the document and the stylesheet", () => {
   const r = rig();
   r.feed(10, req("1", "Document", "http://127.0.0.1:5000/"));

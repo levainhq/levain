@@ -9,8 +9,6 @@ export const FAILED_MAX = 20;       // failed loads kept in a ring the ordinary 
 export const SW_EVENT_MAX = 12;     // service-worker status events kept (newest)
 export const TARGET_MAX = 12;       // targets listed
 export const LINE_MAX = 130;        // one ring or target line
-export const DIALOG_LINE_MAX = 260; // one dialog line: its message is quoted short so the retry suffix (the count and the first reply) stays in view
-export const DIALOG_MESSAGE_SHOWN = 40; // characters of the dialog's message quoted in that line
 export const EVIDENCE_MAX = 16000;  // the whole block
 export const SHELL_LINES_MAX = 60;  // the shell-cache section, lines
 export const SHELL_CHARS_MAX = 4500; // the shell-cache section, characters
@@ -90,7 +88,7 @@ export function createEvidence({ now = Date.now, t0 = now() } = {}) {
       const p = d.params || {};
       switch (d.method) {
         case "Page.javascriptDialogOpening":
-          dialogs.push({ type: String(p.type), message: clip(p.message, 60), opened: rel(), closed: null, accepted: null, sent: null, reply: null, tries: 1, firstReply: null });
+          dialogs.push({ type: String(p.type), message: clip(p.message, 60), opened: rel(), closed: null, accepted: null, sent: null, reply: null });
           if (dialogs.length > DIALOG_MAX) dialogs.shift();
           break;
         case "Page.javascriptDialogClosed": {
@@ -130,14 +128,11 @@ export function createEvidence({ now = Date.now, t0 = now() } = {}) {
       }
     } catch { /* a malformed event is never a reason to lose the others */ }
   };
-  // the driver sent Page.handleJavaScriptDialog as command `id`, for the newest dialog on record
+  // the driver sent Page.handleJavaScriptDialog as command `id` for the dialog that opened last
   const dialogReplySent = (id) => {
     const dialog = dialogs[dialogs.length - 1];
     if (!dialog) return;
-    // a decline sent again keeps the first send's time and the first reply, so the record shows both the first refusal and the final outcome
-    if (dialog.sent === null) dialog.sent = rel();
-    else { dialog.tries++; if (dialog.firstReply === null) dialog.firstReply = dialog.reply; }
-    replyOf.set(id, { dialog, sent: now() });
+    dialog.sent = rel(); replyOf.set(id, { dialog, sent: now() });
     if (replyOf.size > DIALOG_MAX * 2) replyOf.delete(replyOf.keys().next().value);
   };
   const resendFired = () => { resends++; return resends; };
@@ -155,7 +150,7 @@ const ringLine = (e) => clip(`${e.at} ${e.type} ${e.url} `
 export function renderEvidence(ev, extra = {}) {
   const out = ["--- drive evidence ---", `resend fired: ${ev.resends()}`];
   out.push(`DIALOGS (${ev.dialogs.length}, newest kept):`);
-  for (const d of ev.dialogs) out.push(clip(`  ${d.opened} ${d.type} "${clip(d.message, DIALOG_MESSAGE_SHOWN)}" closed ${d.closed ?? "never"}${d.accepted === null ? "" : ` accepted=${d.accepted}`}; handleJavaScriptDialog sent ${d.sent ?? "never"}, reply ${d.reply ?? "none"}${d.tries > 1 ? `; sent ${d.tries} times, first reply ${d.firstReply ?? "none"}` : ""}`, DIALOG_LINE_MAX));
+  for (const d of ev.dialogs) out.push(clip(`  ${d.opened} ${d.type} "${d.message}" closed ${d.closed ?? "never"}${d.accepted === null ? "" : ` accepted=${d.accepted}`}; handleJavaScriptDialog sent ${d.sent ?? "never"}, reply ${d.reply ?? "none"}`, 200));
   out.push(`FAILED LOADS (${ev.failed.size} kept, newest ${FAILED_MAX}; a status of 400 and up counts):`);
   for (const e of ev.failed.values()) out.push("  " + ringLine(e));
   const ordinary = [...ev.ring.entries()].filter(([rid]) => !ev.failed.has(rid)).map(([, e]) => e);
