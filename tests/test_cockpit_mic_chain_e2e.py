@@ -110,15 +110,14 @@ class Dg:
         self.seen["line"] = p.request.split(b"\r\n")[0].decode()
         self.seen["auth"] = p.header("Authorization")
         self.seen["request"] = p.request
-        p.conn.settimeout(0.05)
+        # One long timeout, never a short one retried: read_frame consumes a frame's header before it reads the payload, so a timeout
+        # that fired between the two would be swallowed by a retry and every later frame would be read from the wrong offset.
+        p.conn.settimeout(30)
         said = False
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
+        while True:
             try:
                 fin, op, masked, data, key = p.read_frame()
-            except (TimeoutError, OSError):
-                continue
-            except EOFError:
+            except (TimeoutError, OSError, EOFError):
                 break
             if op == 2:
                 self.audio.append(data)
@@ -147,6 +146,35 @@ class Dg:
         self.eof.set()
 
 
+class HoldsFirstPartial:
+    """A provider stream whose first poll after audio waits, up to ``wait`` seconds, until the stream's reader has folded in the
+    provider's first words. The session polls at once after every send and the page is shown words only in a chunk's answer, so
+    without the hold a chunk answered before the fake provider replied carries nothing, and the test has no later chunk to carry
+    the words. The bound makes a provider that never replies fail the step instead of hanging the chunk request."""
+
+    def __init__(self, inner, wait: float = 5.0) -> None:
+        self._inner, self._wait = inner, wait
+        self._sent = self._held = False
+
+    def send_audio(self, pcm: bytes) -> None:
+        self._inner.send_audio(pcm)
+        self._sent = True
+
+    def poll(self):
+        if not self._sent or self._held:
+            return self._inner.poll()
+        self._held = True
+        end = time.monotonic() + self._wait
+        while True:
+            up = self._inner.poll()
+            if up.partial or up.final or up.failed or time.monotonic() >= end:
+                return up
+            time.sleep(0.005)
+
+    def close(self) -> str:
+        return self._inner.close()
+
+
 def pcm_stats(blob: bytes) -> dict:
     n = len(blob) // 2
     s = struct.unpack("<%dh" % n, blob[: 2 * n])
@@ -154,9 +182,10 @@ def pcm_stats(blob: bytes) -> dict:
     return {"samples": n, "peak": max(abs(x) for x in s) if s else 0, "crossings": crossings}
 
 
-def chain(tmp_path, rig, steps, script, *, premium_stt=True, key=True, before=None):  # before(rig, httpd): runs with the server up
+def chain(tmp_path, rig, steps, script, *, premium_stt=True, key=True, before=None, hold_partial=False):  # before(rig, httpd): runs with the server up
     """The real server over the keyed rig with the real Deepgram adapter pointed at the fake provider; the page driven through
-    ``steps``. Returns (values, dg, httpd-after-shutdown, the fake provider server)."""
+    ``steps``. ``hold_partial`` wraps the adapter in :class:`HoldsFirstPartial`. Returns (values, dg, httpd-after-shutdown, the fake
+    provider server)."""
     dg = Dg()
     srv = Server(getattr(dg, script))
     if key:
@@ -164,8 +193,11 @@ def chain(tmp_path, rig, steps, script, *, premium_stt=True, key=True, before=No
     base = f"ws://127.0.0.1:{srv.port}/v1/listen"
     try:
         with served(rig, premium_stt=premium_stt) as (port, httpd):
-            httpd.voice_stream_factory = lambda secret: deepgram_stream.DeepgramStream(
-                secret, base_url=base, connect_opts={"insecure_for_test": True, "allowed_hosts": None}, close_drain=3.0)
+            def make(secret):
+                real = deepgram_stream.DeepgramStream(
+                    secret, base_url=base, connect_opts={"insecure_for_test": True, "allowed_hosts": None}, close_drain=3.0)
+                return HoldsFirstPartial(real) if hold_partial else real
+            httpd.voice_stream_factory = make
             if before:
                 before(rig, httpd)
             out = _drive(tmp_path, f"http://127.0.0.1:{port}/", [{"init": INIT % BROWSER}, *HEAD, _to_room(), *steps])
@@ -202,7 +234,7 @@ def test_the_happy_path_end_to_end(tmp_path, rig) -> None:
         {"eval": MIC + ".click(); 1"},
         {"until": TA + ".value === 'the final words' && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 30000},
         {"eval": SETTLE},
-    ], "happy", before=None)
+    ], "happy", before=None, hold_partial=True)
     mid, end = snap(vals[-4]), snap(vals[-1])
     posts = [(n["url"].split("?")[0], n["status"]) for n in end["net"] if n["method"] == "POST" and "/voice/" in n["url"]]
     assert posts[0] == ("/cockpit/voice/stream/open", 200), posts
