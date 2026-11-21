@@ -101,8 +101,8 @@ def say(line: str) -> None:
 class StallWatch:
     """Watch for stalls. ``start()`` and ``stop()`` are idempotent; ``dumps()`` lists the dump files.
 
-    ``pid`` is the process whose scratch file this watch never treats as a dead process's (it defaults to this
-    process's); a test passes another to stand for a second process.
+    ``pid`` is this watch's process (it defaults to this process's): a scratch file left under that pid is an earlier
+    version's, and is kept or removed like a dead process's; a test passes another to stand for a second process.
 
     ``clock`` is the monotonic clock the lateness and the dump gap are read from. ``sleep`` takes a number of seconds;
     left None it is the running thread's own stop event's wait, so ``stop()`` ends that thread at once instead of after
@@ -216,8 +216,8 @@ class StallWatch:
         once. One owned by this user is set to :data:`DIR_MODE`. Scratch files of processes that are gone (an earlier
         version wrote them) are kept as dumps when each is a non-empty readable regular file, then removed; one that is
         empty, not a regular file or gone is removed unkept, and one that could not be kept (an unreadable one included)
-        stays for the next start, named on stderr. One of a live process is never touched. A failure leaves the watch
-        running; a dump then fails with its own stderr line."""
+        stays for the next start, named on stderr. One of a live process other than this one is never touched. A failure
+        leaves the watch running; a dump then fails with its own stderr line."""
         self._dumps_off = False
         try:
             os.mkdir(self._dir, DIR_MODE)    # one level: a missing root is not made
@@ -250,7 +250,9 @@ class StallWatch:
             return
         for name in names:
             pid = _scratch_pid(name)
-            if pid is None or pid == self._pid or not _pid_is_gone(pid):
+            # this process's own name is a leftover too: this version never writes a scratch file, so one under this pid is an
+            # earlier version's, from a process that died and whose pid was reused
+            if pid is None or (pid != self._pid and not _pid_is_gone(pid)):
                 continue
             try:
                 if not self._keep_dead_scratch(self._dir / name, pid):

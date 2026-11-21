@@ -1,9 +1,8 @@
 """The cockpit stall watchdog: a fake clock and a fake sleep drive the loop with no real time, so each case is exact.
-Two cases use real time and a real faulthandler timer: the stop/start race and the interpreter-holding thread."""
+A few cases use real time: the stop/start race and the lifecycle ones."""
 from __future__ import annotations
 
 import errno
-import faulthandler
 import os
 import stat
 import subprocess
@@ -635,15 +634,44 @@ def test_an_existing_stalls_directory_this_user_owns_is_set_to_0700(tmp_path, um
 
 
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="this platform has no O_NOFOLLOW")
-def test_a_symlink_planted_at_this_processs_scratch_name_is_left_alone(tmp_path):
+def test_a_symlink_planted_at_this_processs_scratch_name_is_deleted_and_its_target_is_not_followed(tmp_path):
     stalls = tmp_path / "stalls"
     stalls.mkdir()
     target = tmp_path / "victim"
     target.write_text("keep me")
-    watch = StallWatch(stalls)
-    (stalls / stall_watch.scratch_name(os.getpid())).symlink_to(target)
+    link = stalls / stall_watch.scratch_name(os.getpid())
+    link.symlink_to(target)
+    StallWatch(stalls)._prepare()
+    assert target.read_text() == "keep me"                # never followed, never written
+    assert not link.is_symlink() and not link.exists()    # a leftover under this process's pid is cleared like a dead one's
+    assert killed_dumps(stalls) == []
+
+
+def test_a_scratch_file_left_under_this_processs_own_pid_by_an_earlier_version_is_kept_as_a_dump(tmp_path):
+    """A pid is reused after a process died in a stall under the earlier version: its leftover scratch has this pid."""
+    own = tmp_path / stall_watch.scratch_name(os.getpid())
+    own.write_bytes(STACK_TEXT)
+    watch = StallWatch(tmp_path)
     watch._prepare()
-    assert target.read_text() == "keep me"
+    kept = killed_dumps(tmp_path)
+    assert len(kept) == 1 and str(os.getpid()) in kept[0].name and "killed" in kept[0].name
+    assert STACK_TEXT.decode() in kept[0].read_text()
+    assert not own.exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(stall_watch.SCRATCH_PREFIX)]
+
+
+def test_a_dead_scratch_is_read_at_most_the_cap_plus_one_byte(tmp_path, monkeypatch):
+    """The bound on the one reader left of an earlier version's scratch file: an oversized leftover is never read whole."""
+    monkeypatch.setattr(stall_watch, "MAX_DUMP_BYTES", 1000)
+    dead = tmp_path / stall_watch.scratch_name(_gone_pid())
+    dead.write_bytes(b"x" * 500_000)
+    read = []
+    real = os.pread
+    monkeypatch.setattr(stall_watch.os, "pread", lambda fd, n, off: (read.append(n), real(fd, n, off))[1])
+    StallWatch(tmp_path)._prepare()
+    assert sum(read) == 1001
+    kept = killed_dumps(tmp_path)
+    assert len(kept) == 1 and kept[0].read_text().count("[dump cut at 1000 bytes]") == 1
 
 
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="this platform has no O_NOFOLLOW")
@@ -808,7 +836,6 @@ def test_the_watch_never_arms_or_cancels_faulthandlers_timed_dump(tmp_path, monk
     monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", recorder.cancel_dump_traceback_later)
     watch = drive(tmp_path, [0.0, LATE_S + 0.5, 0.0])
     assert recorder.calls == []
-    assert not hasattr(stall_watch, "faulthandler")
     watch.stop()
     assert recorder.calls == []
 
