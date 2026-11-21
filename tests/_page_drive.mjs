@@ -62,7 +62,8 @@
 // launching a Chrome of its own: each launch costs macOS keychain calls that no flag removes. A call that passes
 // LEVAIN_DRIVE_CHROME_FLAGS (flags only a new process can take) ignores the port and spawns, exactly as without it.
 // LEVAIN_DRIVE_LAUNCH_LOG: a file that gets one "spawn" line per Chrome this driver launches (a count for a measurement).
-// A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
+// alert / confirm / prompt are answered by an in-page shim that records them (what a declined dialog returns to the page); any other dialog is declined once by CDP,
+// and a decline Chrome refuses fails the drive by name. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { accessSync, appendFileSync, constants, mkdtempSync, readdirSync, statSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
@@ -238,6 +239,28 @@ const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEvent
 // Loaded here, once, and tolerated absent: a copy of this file made without its sibling still drives, and just dumps without the block.
 let evidence = null; let evidenceMod = null;
 try { evidenceMod = await import("./_drive_evidence.mjs"); evidence = evidenceMod.createEvidence({ now: Date.now, t0: T0 }); } catch { evidence = null; }
+// The page must never sit behind a native alert / confirm / prompt: Chrome can refuse the CDP decline of one that opened while a reload was in
+// flight, and a retry of the same command changes nothing. So the page is given a shim that answers them itself, exactly as a declined dialog would
+// (alert undefined, confirm false, prompt null) and reports each by one console.debug line that starts with a marker no page prints. The shim
+// is a constant of this file, not a sibling's, because the driver is sometimes copied alone and must still drive.
+const DIALOG_MARK = "\u0001levain-dialog ";
+const DIALOG_SHIM = `(() => {
+  const note = (type, message) => { try { console.debug("\\u0001levain-dialog " + type + ": " + String(message)); } catch (e) {} };
+  window.alert = function alert(message) { note("alert", message); return undefined; };
+  window.confirm = function confirm(message) { note("confirm", message); return false; };
+  window.prompt = function prompt(message) { note("prompt", message); return null; };
+})();`;
+// A dialog the shim cannot catch (a beforeunload one) is declined once over CDP. If Chrome refuses that, the page is frozen behind the dialog:
+// the drive fails by name. frozenFailure is taken before anything is awaited so that the exit at the end of the drive, which may be running
+// at this very moment, already sees it and exits 1.
+let frozenFailure = false; let stepAt = -1; let dumpAtFailure = null; const declineIds = new Set();
+const failFrozen = async (message) => {
+  if (frozenFailure) return;
+  frozenFailure = true;
+  console.error(message);
+  try { if (dumpAtFailure) await dumpAtFailure(Math.max(stepAt, 0)); } catch {}   // before the first step the dump is of step 0
+  done(1);
+};
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (evidence) evidence.onMessage(d);
@@ -245,7 +268,13 @@ ws.addEventListener("message", (m) => {
   if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${Date.now() - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
   if (d.method === "Inspector.targetCrashed") consoleLog.push("PAGE CRASHED: Inspector.targetCrashed (the renderer died)");
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
-  if (d.method === "Runtime.consoleAPICalled") consoleLog.push(`console.${d.params.type}: ` + (d.params.args || []).map((a) => String(a.value !== undefined ? a.value : (a.description || a.type))).join(" ").slice(0, 300));
+  const first = d.method === "Runtime.consoleAPICalled" && d.params.args && d.params.args[0] ? d.params.args[0].value : undefined;
+  if (typeof first === "string" && first.startsWith(DIALOG_MARK)) {
+    // the shim's report of a dialog it answered: listed as a native dialog is, and not part of the page's console output
+    const text = first.slice(DIALOG_MARK.length); const colon = text.indexOf(": ");
+    dialogs.push(text);
+    trail.push(`dialog declined (shim): ${colon < 0 ? text : text.slice(0, colon)} ${colon < 0 ? "" : text.slice(colon + 2, colon + 2 + 80)}`);
+  } else if (d.method === "Runtime.consoleAPICalled") consoleLog.push(`console.${d.params.type}: ` + (d.params.args || []).map((a) => String(a.value !== undefined ? a.value : (a.description || a.type))).join(" ").slice(0, 300));
   if (d.method === "Runtime.exceptionThrown") consoleLog.push("page error: " + String(d.params.exceptionDetails?.exception?.description || d.params.exceptionDetails?.text).slice(0, 300));
   if (d.method === "Log.entryAdded") consoleLog.push(`log.${d.params.entry.level}: ${String(d.params.entry.text).slice(0, 300)}`);
   if (consoleLog.length > 200) consoleLog.shift();
@@ -263,8 +292,11 @@ ws.addEventListener("message", (m) => {
   }
   // a prompt (the write-token ask) is declined, as an operator who has no token would
   if (d.method === "Page.javascriptDialogOpening") {
-    const i = ++id; if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
+    const i = ++id; declineIds.add(i); if (evidence) evidence.dialogReplySent(i);   // the evidence record matches the reply to this command by its id
     ws.send(JSON.stringify({ id: i, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
+  }
+  if (d.id && declineIds.delete(d.id) && d.error && !/No dialog is showing/.test(String(d.error.message))) {
+    failFrozen(`page-drive: a JavaScript dialog could not be declined (${String(d.error.message || JSON.stringify(d.error)).slice(0, 120)}): the page is frozen behind it`);
   }
   if (d.id && pend.has(d.id)) { const e = pend.get(d.id); pend.delete(d.id); e.res(d); }
 });
@@ -279,6 +311,7 @@ await send("Page.enable"); await send("Network.enable");
 for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable", ...(evidence ? ["ServiceWorker.enable"] : [])]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
 // a script or stylesheet that fails to load leaves its name in window.__loadErrors (read by the timeout dump); best-effort like the domains above
 if (evidence) { try { await Promise.race([send("Page.addScriptToEvaluateOnNewDocument", { source: evidenceMod.LOAD_ERRORS_SCRIPT }), sleep(3000)]); } catch {} }
+try { await Promise.race([send("Page.addScriptToEvaluateOnNewDocument", { source: DIALOG_SHIM }), sleep(3000)]); } catch {}   // not gated on `evidence`: a copy without the sibling still needs it
 await send("Page.navigate", { url });
 const values = [], repressed = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
@@ -441,6 +474,7 @@ const shotOnTimeout = async (n) => {
   try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact, block); } catch {}
   await timeoutBlock(shotPath, artifact);
 };
+dumpAtFailure = shotOnTimeout;
 const shotOnTimeoutInner = async (n, setPath, artifact, block = "") => {
   try {
     // the txt is written even when the screenshot is not (a wedged page answers neither): the text and state probes then say so themselves
@@ -517,6 +551,7 @@ const awaitWorkerSettled = async () => {
 };
 const RELOADS_PAGE = /\blocation\.reload\b/;
 for (const s of steps) {
+  stepAt = steps.indexOf(s);
   if (!s.partial && !boardWaitGaveUp && !SETUP_STEPS.some((k) => s[k] !== undefined)) await waitForWholeBoard();
   const waitMs = scaled(s.ms || 20000);
   const deadline = Date.now() + waitMs;
@@ -827,4 +862,4 @@ for (const s of steps) {
   }
 }
 process.stdout.write(JSON.stringify({ values, posts, dialogs, repressed }));
-ws.close(); done(0);
+ws.close(); done(frozenFailure ? 1 : 0);
