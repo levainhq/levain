@@ -315,10 +315,11 @@ def run(
     ``allowed(recheck)`` (PAIR RU-3) is asked on EVERY loop pass, before any frame (data or heartbeat) is
     written, and the stream ends the moment it answers False: a revoked paired device's open stream writes at most
     the one frame already past its check when the revoke commits (G3: no lock is held around the write).
-    ``recheck`` is True on any pass, the data path included, once ``heartbeat_s`` has passed since the last full
-    check (G2: its own deadline, so an event flow faster than the heartbeat cannot starve the DB liveness re-check
-    that sees a revoke made by another process); the cheap check (the in-process epoch and the journal's revocation
-    revision, levain#231) runs otherwise. It is asked before the
+    ``recheck`` is True on any pass, the data path included, once ``heartbeat_s`` has passed since the last
+    heartbeat re-check (G2: its own deadline, so an event flow faster than the heartbeat cannot starve the DB
+    liveness re-check, which is the backstop for a revoke that moves no revision); otherwise the callback compares
+    the in-process epoch and the journal's revocation revision (levain#231) and runs the device check itself only
+    when either moved or the revision cannot be compared. It is asked before the
     hello frame too (F8), so "before any frame" holds for the first one."""
     if allowed is not None and not allowed(False):
         return

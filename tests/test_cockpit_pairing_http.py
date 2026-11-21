@@ -27,7 +27,7 @@ from levain.cockpit import firejournal
 from levain.cockpit.firejournal import PAIRED_PREFIX, CockpitDB, revision_identity
 from levain.dashboard import SubstrateSource
 from levain.web_server import make_server
-from tests._waits import scaled
+from tests._waits import scaled, wait_until
 from tests.test_cockpit_k2a import _install
 
 T = "pairing-browser-token"
@@ -386,7 +386,9 @@ def test_ru3_a_revoke_during_a_steady_event_flow_ends_the_stream_before_its_next
 
 def test_rt2_a_revoke_made_by_another_process_ends_the_stream_within_one_heartbeat(src) -> None:
     """RT-2 as amended by RU-3: a revoke that moves no in-process epoch (the box-side CLI writes the journal
-    directly) is still seen: a paired stream re-checks at every heartbeat pass."""
+    directly) is still seen. Since levain#231 this one ends through the journal's revocation revision, which the
+    revoke (``revoke_devices``) moves, on the stream's next pass, not through the heartbeat re-check; the heartbeat
+    path is pinned by ``test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat`` (a raw UPDATE)."""
     from datetime import datetime, timezone
 
     from levain.cockpit.firejournal import CockpitDB
@@ -404,8 +406,9 @@ def test_rt2_a_revoke_made_by_another_process_ends_the_stream_within_one_heartbe
 
 
 # --- levain#231: a paired stream sees another process's revoke on its next pass ---------------------------------------
-# Every test here sets ``stream_heartbeat_s = 30.0``, so the heartbeat re-check cannot be what ends the stream: the
-# bounds below are the revision read on each pass, not the heartbeat.
+# Every test here but the heartbeat-backstop one sets ``stream_heartbeat_s = 30.0``, so the heartbeat re-check cannot
+# be what ends the stream: the bounds below are the revision read on each pass, not the heartbeat. Every end bound goes
+# through ``scaled`` (``_ends_within``), so a loaded runner stretches it.
 
 def _revoke_journal(httpd: Any, ids: "list[str] | None") -> None:
     """A revoke written straight to the journal (no epoch of this server moves), as the box-side CLI writes it."""
@@ -441,7 +444,7 @@ def _flow(httpd: Any) -> tuple[threading.Event, threading.Thread]:
 def _ends_within(pump: threading.Thread, done: dict, t0: float, bound: float) -> None:
     pump.join(5)
     assert "at" in done, "the stream did not end"
-    assert done["at"] - t0 < bound, done["at"] - t0
+    assert done["at"] - t0 < scaled(bound), done["at"] - t0
 
 
 @contextmanager
@@ -460,10 +463,11 @@ def _revokes_seen_clean_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
             real_bump(root, dirty=dirty)
         except BaseException:
             if dirty:
-                gate.release()
+                gate.release()      # the dirty write failed: no clean write follows, so nothing else will release
             raise
-        if not dirty:
-            gate.release()
+        finally:
+            if not dirty:
+                gate.release()      # the clean write, however it ended, closes the window the dirty write opened
 
     def read(root: Any) -> "str | None":
         with gate:
@@ -573,6 +577,37 @@ def test_231_an_unreadable_revision_neither_ends_a_good_stream_nor_hides_a_revok
             s.close()
 
 
+def test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat(src) -> None:
+    """The backstop (design E1): a revoke that bypasses the journal's write path (a raw UPDATE of ``revoked_at``, a
+    hand edit, another tool) moves neither the epoch nor the revision, so only the heartbeat re-check can see it. This
+    is the one test that ends a stream that way: the revision identity is asserted unmoved, so the end cannot be the
+    revision path (``test_rt2_`` and ``test_g2_`` revoke through ``revoke_devices``, which moves it).
+
+    Red-first does not apply: it passes on the code as written. It was shown able to fail by running it with the
+    heartbeat at 30 s (the stream then outlives the bound)."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 0.4
+        device, tok = _pair(port)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            before =revision_identity(httpd.broker.data_root)
+            assert before is not None, "a clean revision to compare"
+            time.sleep(0.6)         # a pass or two on the open stream first
+            assert "at" not in done, "the stream is open before the revoke"
+            conn = sqlite3.connect(httpd.broker.data_root / "cockpit.db", isolation_level=None, timeout=5)
+            try:
+                conn.execute("UPDATE paired_devices SET revoked_at = ? WHERE id = ?",
+                             (datetime.now(timezone.utc).isoformat(), device))
+            finally:
+                conn.close()
+            t0 = time.monotonic()
+            assert revision_identity(httpd.broker.data_root) == before, "no revision moved: the revision path cannot end it"
+            _ends_within(pump, done, t0, 0.4 + 0.6)
+            assert revision_identity(httpd.broker.data_root) == before, "still unmoved when the stream ended"
+        finally:
+            s.close()
+
+
 def test_231_a_revoke_landing_between_the_credential_check_and_the_stream_is_seen_by_the_first_check(
         src, monkeypatch) -> None:
     """The baseline is the revision read BEFORE the lookup that admitted the request: a revoke committing after
@@ -603,11 +638,23 @@ def test_231_a_revoke_landing_between_the_credential_check_and_the_stream_is_see
 
 
 def test_231_a_revoke_landing_between_a_cache_hit_and_the_stream_is_seen_by_the_first_check(src, monkeypatch) -> None:
-    """The hit path of the credential check: the stream's baseline is the revision that hit was compared with."""
+    """The hit path of the credential check: the stream is ADMITTED from the cache (no journal lookup ran for it) and
+    its baseline is the revision that hit was compared with, so a revoke landing after that compare read is seen by
+    the first check. The two admission asserts below are what tell this apart from a 403 refusal of a request that
+    missed the cache and met the revoke in its own lookup (which also ends without a hello frame)."""
     with _serve(src) as (port, httpd):
         httpd.stream_heartbeat_s = 30.0
         device, tok = _pair(port)
         assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200   # primes the cache
+        assert httpd.pair_verified, "the cache is primed"
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def counted_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", counted_verify)
         armed = threading.Event()
         real = web_server._pair_revision
 
@@ -626,8 +673,75 @@ def test_231_a_revoke_landing_between_a_cache_hit_and_the_stream_is_seen_by_the_
             _ends_within(pump, done, t0, 1.1)
             assert not armed.is_set(), "the revoke landed after the hit's revision read"
             assert b"event: hello" not in b"".join(c for _t, c in chunks), "no hello frame was written"
+            assert lookups == [], "admitted from the cache: no journal lookup ran for this request"
+            head = b"".join(c for _t, c in chunks)
+            assert head.startswith(b"HTTP/1.1 200") or head.startswith(b"HTTP/1.0 200"), head[:80]
         finally:
             s.close()
+
+
+def test_231_a_stream_admitted_from_the_cache_starts_with_the_hits_revision_as_its_baseline(src, monkeypatch) -> None:
+    """The hit path hands the revision it compared to the stream (``self._pair_rev_seen = rev``): on an idle stream
+    nothing moved, so its first pass and the passes after it run no device check. With the baseline left at None the
+    first pass would run one, which is what this counts. (T5b above pins the admission and the revoke; this pins the
+    assignment.)"""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _device, tok = _pair(port)
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200   # primes the cache
+        assert httpd.pair_verified, "the cache is primed"
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def counted_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", counted_verify)
+        checks = _spy_device_live(monkeypatch)
+        s, _chunks, pump, done = _stream_up(httpd, port, tok)
+        try:
+            time.sleep(1.2)         # two idle passes at least
+            assert "at" not in done, "the admitted stream is open"
+            assert lookups == [], "admitted from the cache"
+            assert checks == [], f"nothing moved, so no device check ran on any pass: {checks}"
+        finally:
+            s.close()
+
+
+def test_231_a_stream_admitted_as_a_follower_starts_with_the_leaders_revision_as_its_baseline(src, monkeypatch) -> None:
+    """The follower path (``self._pair_rev_seen = flight.rev``): a stream request that waited on another request's
+    lookup of the same token takes the revision that lookup read, so its idle passes run no device check."""
+    with _serve(src) as (port, httpd):
+        httpd.stream_heartbeat_s = 30.0
+        _device, tok = _pair(port)
+        entered, release = threading.Event(), threading.Event()
+        lookups: list[str] = []
+        real_verify = CockpitDB.verify_device
+
+        def held_verify(self: Any, token: str, **kw: Any) -> Any:
+            lookups.append(token)
+            if len(lookups) == 1:
+                entered.set()
+                assert release.wait(scaled(10)), "the leader's lookup was never released"
+            return real_verify(self, token, **kw)
+
+        monkeypatch.setattr(CockpitDB, "verify_device", held_verify)
+        checks = _spy_device_live(monkeypatch)
+        socks = [_open_stream(port, tok)]                   # the leader: its lookup is held in verify_device
+        assert entered.wait(scaled(5)), "the leader's lookup began"
+        socks.append(_open_stream(port, tok))               # the follower: waits on the leader's flight
+        wait_until(lambda: any(f.followers >= 1 for f in list(httpd.pair_flights.values())), 5, what="a follower waiting")
+        release.set()
+        try:
+            wait_until(lambda: httpd.stream_watcher.stream_count == 2, 5, what="both streams open")
+            time.sleep(1.2)
+            assert len(lookups) == 1, f"one lookup served both requests: {lookups}"
+            assert checks == [], f"nothing moved, so neither stream ran a device check: {checks}"
+            assert all("at" not in done for _s, _c, _p, done in socks), "both streams stay open"
+        finally:
+            for s, _c, _p, _d in socks:
+                s.close()
 
 
 def test_231_an_unrelated_devices_revoke_by_another_process_keeps_the_stream_and_checks_once(src, monkeypatch) -> None:
@@ -658,8 +772,10 @@ def test_231_an_unrelated_devices_revoke_by_another_process_keeps_the_stream_and
 
 
 def test_231_a_revoke_landing_during_the_streams_own_recheck_is_seen_by_the_next_pass(src, monkeypatch) -> None:
-    """A check reads the revision BEFORE the journal and adopts it only when the check passed: a revoke landing
-    inside the check leaves a newer revision than the one adopted."""
+    """A check reads the revision BEFORE the journal read: a revoke landing inside the check leaves a newer revision
+    than the one the check read, so the next pass sees it move. (Read after the journal, the check would hold the
+    revoke's own clean revision and hide the revoke.) What it does not pin is the order of adopting against the
+    check: a failing check ends the stream either way."""
     with _serve(src) as (port, httpd):
         httpd.stream_heartbeat_s = 30.0
         a, tok_a = _pair(port, label="a")
@@ -900,8 +1016,10 @@ def test_g1_a_pre_auth_pair_refusal_closes_without_reading_the_body(src) -> None
 
 def test_g2_a_cross_process_revoke_during_a_steady_event_flow_ends_the_stream_within_one_heartbeat(src) -> None:
     """G2: the DB liveness re-check runs on its own deadline on EVERY pass, the data path included: events flowing
-    faster than the heartbeat no longer starve it, so a revoke written straight to the journal (no epoch bump)
-    still ends the stream within one heartbeat."""
+    faster than the heartbeat no longer starve it. Since levain#231 THIS revoke (``revoke_devices`` writes the
+    journal directly, no epoch bump, but does move the revision) ends the stream through the revision compare on its
+    next frame, well inside one heartbeat; the heartbeat re-check itself, which covers a revoke that moves no
+    revision, is pinned by ``test_231_a_revoke_that_moves_no_revision_ends_the_stream_at_the_heartbeat``."""
     from datetime import datetime, timezone
 
     from levain.cockpit.firejournal import CockpitDB

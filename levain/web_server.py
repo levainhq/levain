@@ -2326,7 +2326,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 slow_s=self.stream_watcher.watch_s))
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3), as it
-        # does the journal's revocation revision, which a revoke by any process moves (levain#231)
+        # does the journal's revocation revision, which a revoke through the journal's own write path moves, from any
+        # process (levain#231); a revoke that bypasses that path moves neither, and the heartbeat re-check sees it
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
         self.pair_claim_gate = threading.BoundedSemaphore(_PAIR_CLAIM_SLOTS)
         self.receipt_gate = threading.BoundedSemaphore(_RECEIPT_SLOTS)
@@ -2686,8 +2687,9 @@ class _Handler(GuardedHandler):
     _post_received_at: "str | None" = None
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
-    # the clean revision read just before it, None when there was none to compare; also the baseline a stream of this
-    # request compares against (levain#231)
+    # the clean revision this request's admission was compared with (read before its own lookup, or at the top of the
+    # pass for a cache hit, or the leader's read for a follower), None when there was none to compare; also the baseline
+    # a stream of this request compares against (levain#231)
     _pair_rev_seen: "str | None" = None
     _pair_looked_at = 0.0      # the monotonic time of that read
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
@@ -5297,10 +5299,11 @@ class _Handler(GuardedHandler):
         device check, so a revoke made by another process (``levain cockpit pair --revoke``) is seen on the next
         pass; a revision that cannot be compared (dirty, malformed or unreadable) is never adopted and never ends
         the stream by itself: it re-runs the device check, at most once per ``_STREAM_UNCOMPARED_RECHECK_S``.
-        The baseline is the revision read before the lookup that admitted this request (``_pair_rev_seen``), never
-        one read here, after the credential check. In every check the epoch is read, then the revision, then the
+        The baseline is the revision read before the lookup that admitted this request (``_pair_rev_seen``), taken
+        here as it stands, not read again after the credential check; when that is None the first pass runs the device
+        check and adopts the revision read just before it. In every check the epoch is read, then the revision, then the
         device; the revision is adopted only when the device check passed. The heartbeat re-check stays: every pass
-        once a heartbeat interval has passed since the last full check runs the device check, the data path
+        once a heartbeat interval has passed since the last heartbeat re-check runs the device check, the data path
         included (G2), which covers a revoke that moves no revision. Only the device check answering False, or not
         running, ends the stream. At most the one frame already past its check when the revoke commits is written
         (G3). Any other principal: None (a surface token is never revoked from the panel)."""
