@@ -299,8 +299,11 @@ def _is_etag(old: Any, new: Any) -> bool:
     return isinstance(old, str) and isinstance(new, str) and bool(_HEX64.fullmatch(old)) and bool(_HEX64.fullmatch(new))
 
 
-def _etag_rule(t: "Triple", now: datetime | None) -> bool:
-    return _is_etag(t.old, t.new)
+def _etag_rule(t: "Triple", now: datetime | None, derived: Any = None) -> bool:
+    """The etag of a panel the oracle derived (``derived``: its ids) or of the manifest as a whole. A serve-composed panel
+    is read the same way by both cockpits, so for it an etag that differs is never explained; with no set given, no
+    panel's is."""
+    return _is_etag(t.old, t.new) and (t.panel == "-" or (derived is not None and t.panel in derived))
 
 
 def _iso_not_before(value: Any, now: datetime | None) -> bool:
@@ -329,10 +332,12 @@ def _fresh_block_at_rest(value: Any) -> bool:
             and isinstance(stream, dict) and isinstance(stream.get("state"), str))
 
 
-def _fresh_at_rest(t: "Triple", now: datetime | None) -> bool:
+def _fresh_at_rest(t: "Triple", now: datetime | None, derived: Any = None) -> bool:
     """The value of a freshness key the subject adds, for a corpus read at rest (every row derived at the run's clock, the
     worker alive, nothing in flight): a panel is not stale and not pending, its bound is absent or not before the clock, and
-    the layer behind the page reports a live worker with nothing deriving."""
+    the layer behind the page reports a live worker with nothing deriving. A ``valid_until`` of None is accepted for every
+    panel: it is None by design for a panel whose provider declares no bound (``_stamp_fresh`` copies the row's, which has
+    one only when the provider set it, and ``_stamp_unrowed`` sets none), and the corpora declare none."""
     key, value = t.path[-1], t.new
     if key in ("stale", "pending"):
         return value is False
@@ -436,13 +441,13 @@ def glob_match(pattern: str, path: tuple) -> bool:
     return go(0, 0)
 
 
-def entry_matches(entry: dict, t: Triple, now: datetime | None = None) -> bool:
+def entry_matches(entry: dict, t: Triple, now: datetime | None = None, derived: Any = None) -> bool:
     if entry["scope"] != t.scope or not glob_match(entry["path"], t.path[1:]):
         return False
     if entry["kind"] == "value_rule":
-        return t.kind == "value" and bool(RULES[entry["rule"]](t, now))
+        return t.kind == "value" and bool(RULES[entry["rule"]](t, now, derived))
     if entry["kind"] == "extra_key_with_rule":
-        return t.kind == "extra_key_in_subject" and bool(RULES[entry["rule"]](t, now))
+        return t.kind == "extra_key_in_subject" and bool(RULES[entry["rule"]](t, now, derived))
     return entry["kind"] == t.kind
 
 
@@ -452,11 +457,12 @@ class Verdict:
     matched: dict = field(default_factory=dict)      # entry id -> how many triples it explained
 
 
-def classify(triples: list, entries: list, now: datetime | None = None) -> Verdict:
-    """``now`` is the run's clock, for the rules that compare a value with it."""
+def classify(triples: list, entries: list, now: datetime | None = None, derived: Any = None) -> Verdict:
+    """``now`` is the run's clock and ``derived`` the ids of the panels the oracle derived (``Pair.derived``), for the rules
+    that compare a value with the clock or are about those panels only."""
     v = Verdict()
     for t in triples:
-        hit = next((e for e in entries if entry_matches(e, t, now)), None)
+        hit = next((e for e in entries if entry_matches(e, t, now, derived)), None)
         if hit is None:
             v.unmatched.append(t)
         else:

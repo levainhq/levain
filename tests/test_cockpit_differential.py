@@ -90,7 +90,7 @@ def approved():
 
 
 def _verdict(pairs, triples, approved, name):
-    return rig.classify(triples[name], approved, pairs[name].config.now)
+    return rig.classify(triples[name], approved, pairs[name].config.now, pairs[name].derived)
 
 
 # ------------------------------------------------------------------------------------------------------- the approved list
@@ -285,14 +285,23 @@ def test_no_approved_entry_is_dead(pairs, triples, approved):
 @pytest.mark.parametrize("name", IDS)
 def test_the_subject_carries_each_freshness_key_and_says_fresh_at_rest(pairs, name):
     """Presence and value of what the entries only allow: every panel head the manifest lists (row-backed and
-    serve-composed alike) and every panel's own payload has the three keys; the row-backed ones are fresh at rest."""
+    serve-composed alike) and every panel's own payload, in the full and the compact profile and by row where it has
+    rows, has the three keys and reads fresh at rest. The entries are only for what a side adds, so a profile that lost a
+    key on both sides would show no difference: presence is held here."""
     p = pairs[name]
     ck, now = p.attached, p.config.now
     manifest = ck.manifest(rig.CRED)
     assert set(ck.panel_ids) <= set(manifest["panels"])
     fresh_map = ck.freshness()
+    row_of = {pid: rows[0]["id"] for pid in p.derived if (rows := ck.panel(pid).get("rows"))}
+    assert row_of, name
+    reads = {"manifest": lambda pid: manifest["panels"][pid], "payload": lambda pid: ck.panel(pid),
+             "compact": lambda pid: ck.panel(pid, profile="compact")}
     for pid in ck.panel_ids:
-        for where, head in (("manifest", manifest["panels"][pid]), ("payload", ck.panel(pid))):
+        heads = [(where, read(pid)) for where, read in reads.items()]
+        if pid in row_of:
+            heads.append(("row", ck.panel(pid, row=row_of[pid])))
+        for where, head in heads:
             for key in FRESH_KEYS:
                 assert key in head, (name, pid, where, key)
             assert head["stale"] is False and head["pending"] is False, (name, pid, where)
@@ -343,6 +352,23 @@ def test_the_value_rule_accepts_fresh_at_rest_and_rejects_anything_else(approved
     assert (rig.classify([t], approved, now).unmatched == []) is ok
 
 
+@pytest.mark.parametrize("path,derived,ok", [
+    (("manifest", "panels", "d", "etag"), {"d"}, True),
+    (("manifest", "panels", "c", "etag"), {"d"}, False),
+    (("payload", "d", "full", "etag"), {"d"}, True),
+    (("payload", "c", "full", "etag"), {"d"}, False),
+    (("payload", "c", "compact", "etag"), {"d"}, False),
+    (("payload", "c", "row:1", "etag"), {"d"}, False),
+    (("payload", "d", "row:1", "etag"), {"d"}, True),
+    (("payload", "d", "compact", "etag"), None, False),
+    (("manifest", "etag"), None, True),
+    (("manifest", "etag"), {"d"}, True),
+])
+def test_an_etag_difference_is_explained_only_for_a_panel_the_oracle_derived(approved, path, derived, ok):
+    t = rig.Triple(path, "value", "a" * 64, "b" * 64)
+    assert (rig.classify([t], approved, rig.fixed_clock(), derived).unmatched == []) is ok
+
+
 def test_a_rule_that_compares_with_the_clock_fails_closed_without_one(approved):
     t = rig.Triple(("manifest", "panels", "x", "valid_until"), "extra_key_in_subject", None, "2999-01-01T00:00:00+00:00")
     assert rig.classify([t], approved).unmatched == [t]
@@ -360,14 +386,19 @@ def test_an_etag_is_a_lowercase_sha256_hex_and_nothing_else(value):
 @pytest.mark.parametrize("name", IDS)
 def test_the_serve_composed_panels_carry_equal_etags_on_both_sides(pairs, name):
     """The control: a panel composed at request time is read the same way by both cockpits, so the etag entries do not
-    explain a difference for it; it must be none."""
+    explain a difference for it; it must be none, in the manifest and in the full, compact and by-row payloads."""
     p = pairs[name]
     composed = [pid for pid in p.attached.panel_ids if p.attached.serve_composed(pid)]
     assert composed
     mb, ma = p.bare.manifest(rig.CRED)["panels"], p.attached.manifest(rig.CRED)["panels"]
     for pid in composed:
         assert mb[pid]["etag"] == ma[pid]["etag"], (name, pid, "manifest")
-        assert p.bare.panel(pid)["etag"] == p.attached.panel(pid)["etag"], (name, pid, "payload")
+        assert p.bare.panel(pid)["etag"] == p.attached.panel(pid)["etag"], (name, pid, "full")
+        assert p.bare.panel(pid, profile="compact")["etag"] == p.attached.panel(pid, profile="compact")["etag"], (name, pid, "compact")
+        rows = p.bare.panel(pid).get("rows")
+        if rows:      # no serve-composed panel of these corpora has rows; the read is made for one that does
+            rid = rows[0]["id"]
+            assert p.bare.panel(pid, row=rid)["etag"] == p.attached.panel(pid, row=rid)["etag"], (name, pid, "row")
 
 
 @pytest.mark.parametrize("name", IDS)
@@ -412,7 +443,7 @@ def _break_decode(monkeypatch, mutate):
 
 
 def _unmatched_on(pair, approved):
-    return rig.classify(rig.compare(pair), approved, pair.config.now).unmatched
+    return rig.classify(rig.compare(pair), approved, pair.config.now, pair.derived).unmatched
 
 
 def _request_layer_sees(unmatched):
