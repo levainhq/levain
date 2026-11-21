@@ -5440,14 +5440,10 @@ class _Handler(GuardedHandler):
             return
         sub = None
         try:
-            try:
-                sub = srv.stream_watcher.subscribe(self.headers.get("Last-Event-ID"))
-            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
-                raise
-            except Exception as exc:  # noqa: BLE001 - the cockpit could not start: an answer, not a dead connection
-                self._send(json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
-                           "application/json; charset=utf-8", status=500)
-                return
+            # The status line goes out before the subscribe: the first subscriber's subscribe builds the baseline
+            # manifest, which is as slow as the cockpit's slowest panel read, and a client waiting on its status line
+            # must not wait on that. The refusals that can still be answered with a status (the credential, the stream
+            # cap) are all settled above.
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", cockpit_stream.CONTENT_TYPE)
@@ -5456,6 +5452,11 @@ class _Handler(GuardedHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.flush()
+            try:
+                sub = srv.stream_watcher.subscribe(self.headers.get("Last-Event-ID"))
+            except Exception as exc:  # noqa: BLE001 - the cockpit could not start: the stream ends, the client reconnects
+                _log.warning("cockpit stream: subscribe failed: %s: %s", type(exc).__name__, exc)
+                return
 
             def write(chunk: bytes) -> None:
                 self.wfile.write(chunk)

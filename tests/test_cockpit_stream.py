@@ -477,6 +477,49 @@ class TestHttp:
             finally:
                 c.close()
 
+    def test_the_status_line_does_not_wait_on_the_first_manifest_read(self, tmp_path: Path) -> None:
+        # the first stream's subscribe builds the baseline manifest; a build that is slow (a loaded box) must not hold
+        # the status line. The build is held here, and released only after the status line has been seen.
+        _root, src = _install(tmp_path)
+        ck, _ = _cockpit(src, [_row(1)])
+        entered, release, seen = threading.Event(), threading.Event(), threading.Event()
+        with _serving(src, cockpit=ck) as (port, httpd):
+            w = httpd.stream_watcher
+            real = w._read_manifest
+
+            def held(*a: Any, **kw: Any):
+                entered.set()
+                release.wait(60)
+                return real(*a, **kw)
+
+            w._read_manifest = held       # type: ignore[method-assign]
+            box: dict[str, Any] = {}
+
+            def client() -> None:
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+                box["conn"] = c
+                try:
+                    c.request("GET", "/cockpit/events")
+                    r = box["resp"] = c.getresponse()
+                    box["status"] = r.status
+                    seen.set()
+                    box["hello"] = _read_frame(r)
+                except OSError as exc:
+                    box["error"] = exc
+
+            t = threading.Thread(target=client, daemon=True)
+            t.start()
+            try:
+                assert entered.wait(30), "the server never began the baseline read"
+                assert seen.wait(20), "the status line waited on the manifest read"
+                assert box["status"] == 200
+            finally:
+                release.set()
+                t.join(timeout=30)
+                if "conn" in box:
+                    box["conn"].close()
+            assert "error" not in box and "event: hello" in box["hello"]
+
     def test_a_store_change_on_an_on_demand_panel_nobody_reads_is_exactly_one_panel_changed(self, tmp_path: Path) -> None:
         _root, src = _install(tmp_path)
         ck, state = _cockpit(src, [_row(1)])
