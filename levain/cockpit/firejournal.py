@@ -28,9 +28,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import sqlite3
+import stat
+import tempfile
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,9 +66,12 @@ from levain.intention_legacy import (
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
     "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows", "DeviceRevoked",
-    "OFFER_TTL", "OFFERS_LIVE", "PAIRED_PREFIX", "PairingError",
+    "OFFER_TTL", "OFFERS_LIVE", "PAIRED_PREFIX", "PairingError", "REVISION_SUFFIX", "bump_revision", "ensure_revision",
+    "revision_identity", "revision_path",
     "EditRow", "EditsPage", "EffectRow", "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict",
     "IssueResult", "JournalCorruptError", "LabelRow", "OpView", "Outcome", "OUTCOME_WINDOW",
     "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT", "UNINITIALISED", "authority_fence",
@@ -77,7 +84,10 @@ _MIGRATES_FROM = "levain-cockpit/2"
 # set by the migration until `levain cockpit ledger init` re-enrols the keys: every signed act refuses
 UNINITIALISED = "authority_uninitialised"
 DB_NAME = "cockpit.db"
-PENDING_CAP = 8                        # WAITING pendings per principal generation (§3.1)
+# the revocation revision (levain#228): a file beside the journal that every revoke REPLACES, so a process that holds a
+# verified credential in memory sees, with one stat, that some process revoked a device since it verified
+REVISION_SUFFIX = ".revrev"
+PENDING_CAP = 8                       # WAITING pendings per principal generation (§3.1)
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
 FIRST_RETRY_DELAY = timedelta(seconds=5)   # decided_at + this is a never-faulted unit's due time (§4.2)
 _MAX_BACKOFF = 120
@@ -652,6 +662,64 @@ def _request_shape(record: Mapping[str, Any]) -> bytes:
 
 # ---------------------------------------------------------------------------------------------------
 
+def revision_path(data_root: "Path | str") -> Path:
+    """The revocation-revision file of the journal in ``data_root``: beside ``cockpit.db``, same directory."""
+    return Path(data_root) / (DB_NAME + REVISION_SUFFIX)
+
+
+def revision_identity(data_root: "Path | str") -> "tuple[int, int, int, int]":
+    """The revision file's identity, ``(st_ino, st_mtime_ns, st_ctime_ns, st_size)``: one ``stat``, no sqlite. Raises
+    :class:`OSError` when the file cannot be read (missing, permission): a caller that trusts an answer only while this
+    is unchanged has no answer to trust then. A bump replaces the file, so its inode changes; a filesystem may hand the
+    freed inode of the old file to the new one, and two replaces within one timestamp tick and of one size would then
+    agree on inode, mtime and size, so ctime (set by the kernel at every inode change) is part of the identity too."""
+    st = os.stat(revision_path(data_root))
+    return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
+def _write_revision(data_root: Path, *, replace: bool) -> None:
+    """Write a fresh revision file beside the journal and put it in place: ``replace`` over the old one (a bump), or
+    only where none exists (a creation). Content is random bytes and the monotonic clock, nothing secret; the file takes
+    the journal's permissions. Raises :class:`OSError`; a file written for the move is removed when it fails."""
+    target = revision_path(data_root)
+    fd, tmp = tempfile.mkstemp(prefix=".revrev-", dir=data_root)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(f"{os.urandom(16).hex()} {time.monotonic()!r}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(data_root / DB_NAME).st_mode))
+        except OSError:
+            pass                    # no journal file to copy from: the file stays as mkstemp made it (owner only)
+        if replace:
+            os.replace(tmp, target)
+        else:
+            try:
+                os.link(tmp, target)    # fails when the file exists: a creation never replaces a revision in use
+            except FileExistsError:
+                pass
+            os.unlink(tmp)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def bump_revision(data_root: "Path | str") -> None:
+    """Move the revocation revision: every process that compares :func:`revision_identity` sees a change. Raises
+    :class:`OSError` when the file cannot be written."""
+    _write_revision(Path(data_root), replace=True)
+
+
+def ensure_revision(data_root: "Path | str") -> None:
+    """Create the revision file when there is none, and touch nothing when there is one. Raises :class:`OSError`."""
+    if not revision_path(data_root).exists():
+        _write_revision(Path(data_root), replace=False)
+
+
 class CockpitDB:
     """``cockpit.db`` in ``data_root``. Every operation opens its own connection, except :meth:`verify_device`, which
     reads through a connection held per thread that nothing else is ever handed (:attr:`_cred`); every write is one
@@ -765,6 +833,25 @@ class CockpitDB:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def _revoking_write(self) -> Iterator[sqlite3.Connection]:
+        """:meth:`write` for a transaction that sets ``revoked_at``: the revocation revision moves twice, around the
+        commit. Before it, inside the transaction and after its statements, so a bump that cannot be written rolls the
+        revoke back and the operator sees the failure (an unbumped revoke would leave other processes admitting the
+        device from memory). After it, because a lookup that ran between the first bump and the commit read the device
+        still live and stored an answer under the revision the first bump left; the second bump makes that answer stale.
+        The revoke is durable once it has committed, so a second bump that cannot be written is logged as an ERROR and
+        the revoke returns its result."""
+        with self.write() as conn:
+            yield conn
+            bump_revision(self.data_root)
+        try:
+            bump_revision(self.data_root)
+        except OSError:
+            _log.error("revoke committed in %s but the revocation revision could not be moved after it: another "
+                       "process may admit a device revoked a moment ago from memory until its entry ages out",
+                       self.data_root, exc_info=True)
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
@@ -1302,7 +1389,7 @@ class CockpitDB:
         for d in roots or ():
             if not isinstance(d, str) or _DEVICE_ID.fullmatch(d) is None:
                 raise PairingError(f"not a device id: {d!r}")
-        with self.write() as conn:
+        with self._revoking_write() as conn:
             # G6: every id is validated before _expire, so a refusal writes nothing
             if roots is None:
                 roots = [r[0] for r in conn.execute("SELECT id FROM paired_devices ORDER BY rowid")]
@@ -1364,7 +1451,7 @@ class CockpitDB:
         if not isinstance(expect_digest, str) or _DIGEST.fullmatch(expect_digest) is None:
             raise PairingError("expect_digest is the 64-hex digest revoke-preview named")
         stamp = utc_stamp(now)
-        with self.write() as conn:
+        with self._revoking_write() as conn:
             row = conn.execute("SELECT paired_by FROM paired_devices WHERE id = ?", (device_id,)).fetchone()
             if row is None:
                 raise PairingError(f"no such device: {device_id}")

@@ -9,7 +9,8 @@ The contract these tests pin:
 * a token's concurrent lookups are ONE (a flight per token hash), and a live-device answer is cached briefly, keyed by
   the token's hash; nothing unverified is ever cached;
 * an unauthenticated caller still costs at most ``_PAIR_VERIFY_SLOTS`` lookups in flight, refused at once when full;
-* a revoke through the server is seen by the next request; a revoke by another process within the TTL;
+* a revoke through the server, or by any other process, is seen by the next request (the journal's revocation-revision
+  file; the TTL only bounds an entry's age);
 * the refusal line carries its time, a slow lookup is logged with the lookups in flight, and the 503s a verb and a sign
   answer are logged like every other.
 """
@@ -21,6 +22,8 @@ import logging
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -383,3 +386,106 @@ def test_the_instruments_stamp_a_refusal_name_a_slow_lookup_and_log_the_verb_and
     httpd.signer = SimpleNamespace(answer=sign_busy)
     assert _call(port, "POST", "/cockpit/sign/some-request/answer", {}, token=T)[0] == 503
     assert [ln for ln in _refusals(caplog) if ln.startswith("refused 503 route=sign gate=sign:")], _refusals(caplog)
+
+
+# --- 12. a revoke by ANY process is seen by the very next request (the revocation-revision file) -----------------------
+
+_REVOKE_IN_ANOTHER_PROCESS = (
+    "import sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from levain.cli import main\n"
+    "sys.exit(main(['cockpit', 'pair', '--data-root', sys.argv[2], '--revoke', sys.argv[3]]))\n")
+
+
+def test_a_second_process_that_revokes_is_refused_on_the_very_next_request(rig, monkeypatch) -> None:
+    port, httpd, device, tok = rig
+    spy = _Spy(monkeypatch)
+    keep = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    for _ in range(3):
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY, conn=keep)[0] == 200
+    assert spy.calls == 1, "warm: the reads after the first were served from the verified entry"
+    done = subprocess.run([sys.executable, "-I", "-c", _REVOKE_IN_ANOTHER_PROCESS, str(Path(__file__).resolve().parents[1]),
+                           str(httpd.broker.data_root), device], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0 and f"revoked 1 paired device(s): {device}" in done.stdout, (done.stdout, done.stderr)
+    assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY, conn=keep)[0] == 403
+    keep.close()
+
+
+def _hold_leader_after_its_answer(port: int, tok: str, spy: "_Spy") -> "tuple[threading.Event, threading.Thread, list[int]]":
+    """A leader whose lookup has its (live) answer and waits: (release, its thread, its status once it answers)."""
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_first(n: int) -> None:
+        if n == 1:
+            entered.set()
+            assert release.wait(30)
+
+    spy.after = hold_first
+    first: list[int] = []
+    t = threading.Thread(target=lambda: first.append(
+        _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0]), daemon=True)
+    t.start()
+    assert entered.wait(30)
+    return release, t, first
+
+
+def _late_follower(port: int, tok: str, release: threading.Event, leader: threading.Thread) -> int:
+    """A request sent now, after a revoke has returned: it parks on the leader's flight, then the leader is released."""
+    out: list[int] = []
+    t = threading.Thread(target=lambda: out.append(
+        _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0]), daemon=True)
+    t.start()
+    time.sleep(0.5)                     # parked on the flight
+    release.set()
+    leader.join(30)
+    t.join(30)
+    assert out, "the follower never answered"
+    return out[0]
+
+
+def test_a_request_after_a_revoke_through_the_server_is_not_admitted_by_a_lookup_that_began_before_it(
+        rig, monkeypatch) -> None:
+    port, _httpd, device, tok = rig
+    spy = _Spy(monkeypatch)
+    release, leader, _first = _hold_leader_after_its_answer(port, tok, spy)
+    body = {"id": device, "expect_digest": revoke_digest([device], "family"), "mode": "family"}
+    assert _call(port, "POST", "/cockpit/pair/revoke", body, token=T)[0] == 200      # the revoke has returned
+    assert _late_follower(port, tok, release, leader) in (403, 503)
+
+
+def test_a_request_after_a_revoke_through_the_journal_is_not_admitted_by_a_lookup_that_began_before_it(
+        rig, monkeypatch) -> None:
+    port, httpd, device, tok = rig
+    spy = _Spy(monkeypatch)
+    release, leader, _first = _hold_leader_after_its_answer(port, tok, spy)
+    httpd.broker.active_db().revoke_devices([device], by="box", now=datetime.now(timezone.utc))     # no epoch moves here
+    assert _late_follower(port, tok, release, leader) in (403, 503)
+
+
+def test_a_cache_hit_costs_one_stat_of_the_revision_file_and_no_lookup(rig, monkeypatch) -> None:
+    port, _httpd, _dev, tok = rig
+    spy = _Spy(monkeypatch)
+    stats_made: list[int] = []
+    real = web_server.revision_identity
+
+    def counted(root: Any) -> Any:
+        stats_made.append(1)
+        return real(root)
+
+    monkeypatch.setattr(web_server, "revision_identity", counted)
+    reads = 12
+    for _ in range(reads):
+        assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 200
+    assert spy.calls == 1
+    assert len(stats_made) == reads + spy.calls, "one stat per request, and the one lookup read it once more before it ran"
+
+
+def test_slow_lookup_warnings_are_limited_to_one_per_interval(rig, monkeypatch, caplog) -> None:
+    port, _httpd, _dev, _tok = rig
+    monkeypatch.setattr(web_server, "_PAIR_SLOW_LOG_EVERY_S", 3600.0, raising=False)
+    _Spy(monkeypatch, hold=web_server._PAIR_SLOW_LOOKUP_MS / 1000 + 0.05)
+    caplog.set_level(logging.DEBUG, logger=LOG)
+    for _ in range(3):
+        assert _call(port, "GET", "/cockpit/manifest.json", token=secrets.token_urlsafe(32), headers=PROXY)[0] == 403
+    slow = [r for r in caplog.records if r.getMessage().startswith("paired lookup slow ms=")]
+    assert [r.levelno for r in slow] == [logging.WARNING, logging.DEBUG, logging.DEBUG], [r.levelname for r in slow]

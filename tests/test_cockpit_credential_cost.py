@@ -4,10 +4,12 @@ and the security invariant that a faster path must keep: a revoked device is ref
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import gc
 import http.client
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +23,7 @@ from typing import Any
 import pytest
 
 import levain
+from levain import web_server
 from levain.cockpit import firejournal
 from levain.cockpit.firejournal import CockpitDB
 from tests.test_cockpit_k2a import _install
@@ -258,6 +261,183 @@ def test_http_a_re_enrolled_device(src) -> None:
         assert _manifest(port, tok2, conn) == 200
         assert _manifest(port, tok1, conn) == 403
         conn.close()
+
+
+# --- the revocation revision (levain#228): a revoke by ANY process is seen by the very next request ---------------------
+# The server keeps a verified credential in memory so a page's reads share one lookup. Every revoke replaces a file beside
+# the journal; an entry records that file's identity as it was before its lookup, and a hit needs it unchanged.
+
+def _verify_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every ``verify_device`` call made while installed: its token (a list that grows)."""
+    calls: list[str] = []
+    real = CockpitDB.verify_device
+
+    def spy(self: CockpitDB, token: str, *, now: datetime) -> "str | None":
+        calls.append(token)
+        return real(self, token, now=now)
+
+    monkeypatch.setattr(CockpitDB, "verify_device", spy)
+    return calls
+
+
+def test_the_revision_file_changes_identity_on_every_bump_and_holds_nothing_secret(db: CockpitDB) -> None:
+    _enrol(db)
+    assert not firejournal.revision_path(db.data_root).exists()
+    firejournal.ensure_revision(db.data_root)
+    first = firejournal.revision_identity(db.data_root)
+    firejournal.ensure_revision(db.data_root)
+    assert firejournal.revision_identity(db.data_root) == first, "a creation never replaces a file in place"
+    path = firejournal.revision_path(db.data_root)
+    assert path.name == firejournal.DB_NAME + firejournal.REVISION_SUFFIX and path.parent == db.path.parent
+    assert path.stat().st_mode & 0o777 == db.path.stat().st_mode & 0o777, "the journal's permissions"
+    assert re.fullmatch(r"[0-9a-f]{32} [0-9.]+\n", path.read_text()), "random bytes and the clock, nothing else"
+    seen = [first]
+    for _ in range(30):
+        firejournal.bump_revision(db.data_root)
+        seen.append(firejournal.revision_identity(db.data_root))
+        assert seen[-1] != seen[-2], "two bumps in a row, same size, still differ"
+    assert sorted(p.name for p in db.data_root.iterdir() if p.name.startswith(".revrev-")) == [], "no temporary left"
+
+
+def test_every_writer_of_revoked_at_moves_the_revision_around_its_commit() -> None:
+    """``revoked_at`` is set in one statement, in ``_revoke_members``; every caller of that helper opens its transaction
+    with ``_revoking_write``, the one that bumps the revision before and after the commit. A new writer fails here."""
+    tree_root = CHECKOUT / "levain"
+    writer = re.compile(r"UPDATE\s+paired_devices\s+SET\s+[^\"']*?\brevoked_at\s*=|REPLACE\s+INTO\s+paired_devices", re.I)
+    hits = sorted(p.relative_to(tree_root).as_posix() for p in tree_root.rglob("*.py") if writer.search(p.read_text()))
+    assert hits == ["cockpit/firejournal.py"], hits
+    source = (tree_root / "cockpit" / "firejournal.py").read_text()
+    tree = ast.parse(source)
+    members = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_revoke_members")
+    assert len(writer.findall(ast.get_source_segment(source, members))) == 1
+    assert len(writer.findall(source)) == 1, "no other statement of the journal sets revoked_at"
+    callers: list[str] = []
+
+    def walk(node: ast.AST, inside: bool, fn: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn = node.name
+        if isinstance(node, ast.With):
+            inside = inside or any(isinstance(i.context_expr, ast.Call)
+                                   and getattr(i.context_expr.func, "attr", "") == "_revoking_write" for i in node.items)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_revoke_members":
+            callers.append(f"{fn}:{inside}")
+        for child in ast.iter_child_nodes(node):
+            walk(child, inside, fn)
+
+    walk(tree, False, "")
+    assert sorted(callers) == ["revoke_confirmed:True", "revoke_confirmed:True", "revoke_devices:True"], callers
+
+
+def test_a_bump_that_cannot_be_written_makes_the_revoke_fail_and_change_nothing(db: CockpitDB, monkeypatch) -> None:
+    dev, tok = _enrol(db)
+
+    def disk_full(_root: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(firejournal, "bump_revision", disk_full)
+    with pytest.raises(OSError):
+        db.revoke_devices([dev], by="browser", now=NOW)
+    assert db.verify_device(tok, now=NOW) == dev, "the revoke was rolled back: the operator retries it"
+    assert [d["revoked_at"] for d in db.list_devices()] == [None]
+
+
+def test_a_second_bump_that_cannot_be_written_logs_an_error_and_the_revoke_stands(db: CockpitDB, monkeypatch,
+                                                                                  caplog) -> None:
+    dev, tok = _enrol(db)
+    real = firejournal.bump_revision
+    calls: list[int] = []
+
+    def second_fails(root: Any) -> None:
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        real(root)
+
+    monkeypatch.setattr(firejournal, "bump_revision", second_fails)
+    with caplog.at_level("ERROR", logger=firejournal.__name__):
+        assert db.revoke_devices([dev], by="browser", now=NOW) == [dev]
+    assert db.verify_device(tok, now=NOW) is None, "the revoke committed"
+    assert [r.levelname for r in caplog.records if "revocation revision" in r.getMessage()] == ["ERROR"]
+
+
+def test_http_a_lookup_between_the_first_bump_and_the_commit_is_made_stale_by_the_second_bump(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        dev, tok = _pair(port)
+        assert _manifest(port, tok) == 200
+        real = firejournal.bump_revision
+        bumps: list[int] = []
+        between: list[int] = []
+
+        def bump(root: Any) -> None:
+            real(root)
+            bumps.append(1)
+            if len(bumps) == 1:
+                # the revoke's transaction is open, its first bump has landed: this request reads the device live
+                # and stores an answer under the identity the first bump left
+                between.append(_manifest(port, tok))
+
+        monkeypatch.setattr(firejournal, "bump_revision", bump)
+        httpd.broker.active_db().revoke_devices([dev], by="browser", now=datetime.now(timezone.utc))
+        assert between == [200] and len(bumps) == 2
+        assert _manifest(port, tok) == 403
+
+
+def test_http_without_the_second_bump_that_answer_would_outlive_the_revoke(src, monkeypatch) -> None:
+    """The reason both bumps exist: with only the first, the entry stored between it and the commit is admitted."""
+    with _serve(src) as (port, httpd):
+        dev, tok = _pair(port)
+        real = firejournal.bump_revision
+        bumps: list[int] = []
+        between: list[int] = []
+
+        def first_only(root: Any) -> None:
+            bumps.append(1)
+            if len(bumps) == 1:
+                real(root)
+                between.append(_manifest(port, tok))
+
+        monkeypatch.setattr(firejournal, "bump_revision", first_only)
+        httpd.broker.active_db().revoke_devices([dev], by="browser", now=datetime.now(timezone.utc))
+        assert between == [200]
+        assert _manifest(port, tok) == 200, "an entry stored after the first bump carries the identity that stayed"
+
+
+def test_http_an_unreadable_revision_file_turns_the_cache_off_and_every_request_looks_up(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        dev, tok = _pair(port)
+        calls = _verify_spy(monkeypatch)
+        assert [_manifest(port, tok) for _ in range(3)] == [200] * 3
+        assert len(calls) == 1, "warm: served from the entry"
+
+        def denied(_root: Any) -> Any:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(web_server, "revision_identity", denied)
+        assert [_manifest(port, tok) for _ in range(3)] == [200] * 3
+        assert len(calls) == 4, "each request took the full lookup: no admission from the cache"
+        httpd.broker.active_db().revoke_devices([dev], by="browser", now=datetime.now(timezone.utc))
+        assert _manifest(port, tok) == 403, "and a revoked device is refused by the full path"
+
+
+def test_http_a_missing_revision_file_is_made_again_and_the_cache_resumes(src, monkeypatch) -> None:
+    with _serve(src) as (port, httpd):
+        _dev, tok = _pair(port)
+        calls = _verify_spy(monkeypatch)
+        assert _manifest(port, tok) == 200 and len(calls) == 1
+        firejournal.revision_path(httpd.broker.data_root).unlink()
+        assert _manifest(port, tok) == 200 and len(calls) == 2, "no file: a full lookup, never the entry"
+        assert firejournal.revision_path(httpd.broker.data_root).exists()
+        assert _manifest(port, tok) == 200 and len(calls) == 3, "the next lookup stores an entry under the new file"
+        assert _manifest(port, tok) == 200 and len(calls) == 3, "and the request after it is served from it"
+
+
+def test_http_a_server_started_over_a_journal_without_the_file_makes_it(src) -> None:
+    with _serve(src) as (port, httpd):
+        _pair(port)
+        root = httpd.broker.data_root
+    firejournal.revision_path(root).unlink()
+    with _serve(src) as (_port, httpd):
+        assert firejournal.revision_path(httpd.broker.data_root).exists(), "made at start, before any request"
 
 
 # --- the last_seen stamp leaves the request thread (D15b) ---------------------------------------------------------------
