@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import codecs
 import fcntl
+import hashlib
 import json
 import os
 import platform
@@ -624,7 +625,12 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
 # uid: the login went to the file and the keychain stayed empty; levain#140's VM run measures the hands uid).
 # So the hands account gets one such keychain, as itself, before a Claude login: a random password that Levain never
 # stores or prints, nothing ever unlocks it, it holds nothing. The login stays where V1 put it: the 0600 file.
-# UNMEASURED on a fresh install (levain#140): the file read with the keychain locked, and no GUI keychain dialog.
+# MEASURED on the VM 11-21 (project_memory/1121-10_lanes/vm_phase_c1_return.md and vm_phase_c2a_return.md): ``security
+# create-keychain`` leaves the new keychain UNLOCKED in the creating session, and a login made then writes its item into
+# it (``Claude Code-credentials-<suffix>``) instead of falling back to the file, so the first login read "not signed
+# in". On the keychain once it was locked, the next login fell back to the 0600 file and read signed in. So the keychain
+# is locked right after it is made and again, with the lock confirmed, before every Claude login: the design intent
+# ("nothing ever unlocks it") is only true if the keychain starts locked (levain#241).
 # Every read and set here is the ``-d user`` form (``security default-keychain -d user`` measured 11-18 on macOS:
 # exit 0, prints the default; the "illegal option -d" claim of an L3 seat was measured false).
 SECURITY = "/usr/bin/security"
@@ -724,6 +730,69 @@ def _search_list(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> l
     return [ln.strip().strip('"') for ln in r.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
 
 
+def _lock_keychain(hands: HandsIdentity, vendor: str, ours: str, entity_dir: Path | str) -> None:
+    r = _security(hands, vendor, "lock-keychain", ours, entity_dir=entity_dir)
+    if r.returncode != 0:
+        raise HandsLoginError(f"could not lock {ours} as {hands.user}: {_brief(_text(r)) or f'exit {r.returncode}'}")
+
+
+#: ``security``'s answer to a read of a locked keychain's settings, run with LC_ALL=C (the VM measurement of 11-21,
+#: vm_phase_c2a_return.md): exit 36 (errSecInteractionNotAllowed) and this text. Both are required, never the code alone.
+_LOCKED_RC = 36
+_LOCKED_TEXT = "User interaction is not allowed"
+
+
+def lock_and_confirm_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
+    """Under the caller's hands lock, as the hands user: lock Levain's sealed keychain (idempotent) and confirm it is
+    locked (``show-keychain-info`` fails with errSecInteractionNotAllowed on a locked keychain and succeeds on an
+    unlocked one). Anything but that answer raises: an unconfirmed lock is a refusal before the vendor login runs.
+    Never unlocks, never reads an item."""
+    ours = keychain_path(hands)
+    _lock_keychain(hands, vendor, ours, entity_dir)
+    r = _security(hands, vendor, "show-keychain-info", ours, entity_dir=entity_dir)
+    if r.returncode == _LOCKED_RC and _LOCKED_TEXT in _text(r):
+        return
+    raise HandsLoginError("the hands keychain could not be confirmed locked "
+                          f"({'it answered as unlocked' if r.returncode == 0 else _brief(_text(r)) or f'exit {r.returncode}'})")
+
+
+def claude_credential_services(hands: HandsIdentity) -> tuple[str, str]:
+    """The two keychain service names a Claude login can leave: ``(suffixed, unsuffixed)``. The suffix is the first 8
+    hex digits of sha256 of the config home Claude was pointed at (``CLAUDE_CONFIG_DIR``; measured 11-21, ``45e49ffa``
+    for ``/Users/_levain_leg6entity_872b7e/.claude``); older clients wrote the bare name."""
+    base = "Claude Code-credentials"
+    return f"{base}-{hashlib.sha256(config_home(hands, 'claude').encode()).hexdigest()[:8]}", base
+
+
+def keychain_orphan(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> str | None:
+    """The service name of a Claude item sitting in Levain's sealed keychain, or None (also None when the keychain file
+    is not there, or the vendor keeps nothing in it). Attributes only (``find-generic-password -s <name> <keychain>``,
+    never ``-w`` or ``-g``), which answers on a locked keychain. Found: exit 0; absent: exit 44 (errSecItemNotFound).
+    Any other answer raises: an unreadable state is never taken for an empty one."""
+    if not keychain_needed(vendor):
+        return None
+    ours = keychain_path(hands)
+    if _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True) is None:
+        return None
+    for name in claude_credential_services(hands):
+        r = _security(hands, vendor, "find-generic-password", "-s", name, ours, entity_dir=entity_dir)
+        if r.returncode == 0:
+            return name
+        if r.returncode != 44:
+            raise HandsLoginError(f"could not look for {name!r} in {ours}: {_brief(_text(r)) or f'exit {r.returncode}'}")
+    return None
+
+
+def remove_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
+    """Delete Levain's sealed keychain as the hands user (its password was never kept, so no item in it can be removed
+    singly) and confirm the file is gone. The next login makes it again, locked."""
+    ours = keychain_path(hands)
+    r = _security(hands, vendor, "delete-keychain", ours, entity_dir=entity_dir)
+    if r.returncode != 0 or _lstat(hands, vendor, ours, entity_dir=entity_dir, held=True) is not None:
+        raise HandsLoginError(f"the hands keychain {ours} is still there after `delete-keychain` "
+                              f"({_brief(_text(r)) or f'exit {r.returncode}'})")
+
+
 def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> str:
     """Under the caller's hands lock, as the hands user: the hands account's default keychain is Levain's sealed one,
     its file exists, and the search list holds it. Returns ``"made"`` (the keychain was created), ``"repaired"`` (it
@@ -759,6 +828,7 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
         if r.returncode != 0:
             raise HandsLoginError(f"could not make {ours} as {hands.user}: {_brief(_text(r))}")
         made = True
+        _lock_keychain(hands, vendor, ours, entity_dir)      # create-keychain leaves the new one unlocked (levain#241)
     elif not st[0].startswith("regular") or st[1] != hands.uid:
         raise HandsLoginError(f"{ours} is a {st[0]} of {st[2]}, not a keychain file of {hands.user}; remove it by hand")
     if current is None:
@@ -791,6 +861,9 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
 KEYCHAIN_MADE_NOTE = ("Made the hands account's own keychain ({path}). It holds nothing and Levain did not store its "
                       "password. It is there so that Claude keeps this login in its 0600 file in the hands home; that "
                       "was measured as the operator's account, not yet as the hands account (levain#140).")
+KEYCHAIN_ORPHAN_NOTE = ("The hands account's own keychain ({path}) holds a Claude item ({name!r}) from an earlier login. "
+                        "It stays locked, so this login is kept in the 0600 file; `levain hands logout {vendor}` "
+                        "removes the keychain.")
 KEYCHAIN_REPAIRED_NOTE = ("Set the hands account's own keychain ({path}) as its default and in its search list again; "
                           "an earlier run had stopped before it finished.")
 
@@ -935,6 +1008,12 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
                 note = keychain_note(ensure_hands_keychain(hands, vendor, entity_dir=entity_dir), hands)
                 if note:
                     say(note)
+                # Every Claude login, whatever ensure said: a keychain that is not confirmed locked takes the vendor's
+                # write and the login then reads "not signed in" (levain#241).
+                lock_and_confirm_hands_keychain(hands, vendor, entity_dir=entity_dir)
+                orphan = keychain_orphan(hands, vendor, entity_dir=entity_dir)
+                if orphan:
+                    say(KEYCHAIN_ORPHAN_NOTE.format(path=keychain_path(hands), name=orphan, vendor=vendor) + "\n")
         except HandsRefused:
             raise
         except HandsLoginError as exc:
@@ -1122,16 +1201,23 @@ def record_outcome(entity_dir: Path | str, vendor: str, outcome: str) -> None:
 def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str:
     """End the hands user's login for ``vendor``, all under the hands lock (a live session or a login refuses): read
     the state; stop every process of the hands user; run the vendor's logout as it; remove that one credential file
-    as the hands user if it is still there; then ask the vendor again. Returns ``nothing`` (confirmed signed out and
-    no file: nothing run), ``logged-out`` or ``file-removed`` only when the vendor then says signed out and the file
-    is gone. Raises :class:`HandsRefused` when nothing was changed (the state could not be read, the lock is held,
+    as the hands user if it is still there; delete the sealed keychain if it holds a Claude item (levain#241); then ask
+    the vendor again. Returns ``nothing`` (confirmed signed out, no file, no Claude item in the sealed keychain: nothing
+    run), else ``logged-out`` or ``file-removed`` (alone when only the vendor or the file changed) and, when the sealed
+    keychain was deleted, ``keychain-removed`` (alone when it was all that was left, else joined with ``+``), only when
+    the vendor then says signed out and the file and the item are gone. Raises :class:`HandsRefused` when nothing was changed (the state could not be read, the lock is held,
     processes were left) and :class:`HandsLoginError` when the logout ran but could not be confirmed."""
     _check_vendor(vendor)
     with hands_lock(entity_dir, "logout"):
         st = run_status(hands, vendor, entity_dir=entity_dir, held=True)
         if st.state == UNKNOWN:
             raise HandsRefused(f"cannot tell whether hands {vendor} is signed in, so nothing was changed: {st.error}")
-        if st.state == OUT and st.credential is None:
+        try:
+            orphan = keychain_orphan(hands, vendor, entity_dir=entity_dir)
+        except HandsLoginError as exc:
+            raise HandsRefused(f"cannot tell whether the hands keychain holds a {vendor} login, so nothing was changed: "
+                               f"{exc}") from None
+        if st.state == OUT and st.credential is None and orphan is None:
             return "nothing"
         left = hands_live.sweep_hands_user(hands.user, uid=hands.uid)
         if left:
@@ -1140,6 +1226,7 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
                                  what=f"{vendor} logout")
         said = _brief(_text(r)) or f"exit {r.returncode}"
         how = "logged-out"
+        pure_orphan = st.state == OUT and st.credential is None
         if credential_state(hands, vendor, entity_dir=entity_dir, held=True) is not None:
             r2 = run_as_hands_bounded(hands, remove_argv(hands, vendor), entity_dir=entity_dir, held=True,
                                       what=f"rm {credential_path(hands, vendor)}")
@@ -1147,6 +1234,9 @@ def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str
                 raise HandsLoginError(f"the credential file {credential_path(hands, vendor)} is still there "
                                       f"({_brief(_text(r2)) or said})")
             how = "file-removed"
+        if orphan is not None and keychain_orphan(hands, vendor, entity_dir=entity_dir) is not None:
+            remove_hands_keychain(hands, vendor, entity_dir=entity_dir)
+            how = "keychain-removed" if pure_orphan else f"{how}+keychain-removed"
         after = run_status(hands, vendor, entity_dir=entity_dir, held=True)
         if after.state != OUT or after.credential is not None:
             why = after.error if after.state == UNKNOWN else f"it says {after.state}{': ' + after.account if after.account else ''}"

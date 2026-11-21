@@ -43,7 +43,13 @@ case "$1 $2" in
     if [ -n "$SHIM_HANG" ]; then sleep 8 & echo $! > "$SHIM_PIDS"; wait; fi
     umask 077
     mkdir -p "$CLAUDE_CONFIG_DIR"
-    if [ -n "$SHIM_KEYSTORE" ]; then echo k > "$SHIM_KEYSTORE"; else echo '{"claudeAiOauth":{}}' > "$CRED"; fi
+    KC="$HOME/Library/Keychains/levain-hands.keychain-db"
+    if [ -f "$KC" ]; then cat "$KC" > "$HOME/.fake-login-kcstate"; fi
+    if [ -n "$SHIM_KEYSTORE" ]; then echo k > "$SHIM_KEYSTORE"
+    elif [ -f "$KC" ] && grep -q unlocked "$KC"; then
+      # levain#241, measured on the VM: a keychain that is unlocked at the write TAKES the item and no file is kept
+      echo "Claude Code-credentials-$(printf %s "$CLAUDE_CONFIG_DIR" | shasum -a 256 | cut -c1-8)" >> "$HOME/.fake-security-items"
+    else echo '{"claudeAiOauth":{}}' > "$CRED"; fi
     exit 0;;
   "auth logout")
     if [ -n "$SHIM_LOGOUT_HANG" ]; then sleep 8 & echo $! > "$SHIM_PIDS"; wait; fi
@@ -95,6 +101,13 @@ exit 2
 #: default"), SEC_SET_NOOP (setting the default is accepted but changes nothing), SEC_SET_FAIL (setting the default
 #: fails), SEC_LIST_FAIL (setting the search list fails), SEC_CREATE_FAIL (create-keychain fails, echoing its
 #: arguments, the password included), SEC_CREATE_HANG (create-keychain hangs, its sleeper's pid in SHIM_PIDS).
+#: levain#241: a made keychain is UNLOCKED (its file says so; lock-keychain rewrites it), as the real one is measured to
+#: be; show-keychain-info answers rc 36 "User interaction is not allowed" only on a locked one. Knobs: SEC_LOCK_FAIL
+#: (lock-keychain fails), SEC_LOCK_NOOP (it is accepted and the keychain stays unlocked), SEC_LOCKED_TEXT (the words a
+#: locked keychain's info answers with), SEC_FIND_FAIL (find-generic-password fails with that text, rc 1),
+#: SEC_DELETE_NOOP (delete-keychain is accepted and the file stays). The items are the lines of .fake-security-items;
+#: find-generic-password answers only the attributes-only form ``-s <name> <keychain>`` and the rig exits 97 on any
+#: other (a ``-w`` or ``-g`` is the product reading a secret).
 SECURITY_SHIM = """#!/bin/sh
 echo "$HOME|$LC_ALL|$*" >> "$SHIM_SECLOG"
 D="$HOME/.fake-security-default"
@@ -119,7 +132,26 @@ case "$1" in
     if [ -n "$SEC_CREATE_HANG" ]; then sleep 8 & echo $! > "$SHIM_PIDS"; wait; fi
     if [ -n "$SEC_CREATE_FAIL" ]; then echo "security: SecKeychainCreate $*: $SEC_CREATE_FAIL" >&2; exit 1; fi
     if [ -e "$4" ]; then echo "security: SecKeychainCreate $4: A keychain with the same name already exists." >&2; exit 48; fi
-    umask 077; echo "fake keychain" > "$4"; exit 0;;
+    umask 077; echo "fake keychain unlocked" > "$4"; exit 0;;
+  lock-keychain)
+    [ "$#" = 2 ] || { echo "rig: lock-keychain takes exactly the keychain path" >&2; exit 97; }
+    if [ -n "$SEC_LOCK_FAIL" ]; then echo "security: SecKeychainLock: $SEC_LOCK_FAIL" >&2; exit 1; fi
+    [ -f "$2" ] || { echo "security: SecKeychainLock: The specified keychain could not be found." >&2; exit 1; }
+    [ -n "$SEC_LOCK_NOOP" ] || echo "fake keychain locked" > "$2"; exit 0;;
+  show-keychain-info)
+    [ "$#" = 2 ] || { echo "rig: show-keychain-info takes exactly the keychain path" >&2; exit 97; }
+    [ -f "$2" ] || { echo "security: SecKeychainCopySettings: The specified keychain could not be found." >&2; exit 1; }
+    if grep -q "fake keychain locked" "$2"; then echo "security: SecKeychainCopySettings $2: ${SEC_LOCKED_TEXT:-User interaction is not allowed.}" >&2; exit 36; fi
+    echo "Keychain \"$2\" no-timeout" >&2; exit 0;;
+  find-generic-password)
+    [ "$#" = 4 ] && [ "$2" = "-s" ] || { echo "rig: find-generic-password is the attributes-only -s <name> <keychain> form" >&2; exit 97; }
+    if [ -n "$SEC_FIND_FAIL" ]; then echo "security: SecKeychainSearchCopyNext: $SEC_FIND_FAIL" >&2; exit 1; fi
+    if [ -f "$HOME/.fake-security-items" ] && grep -qxF "$3" "$HOME/.fake-security-items"; then echo 'keychain: "'"$4"'"'; exit 0; fi
+    echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44;;
+  delete-keychain)
+    [ "$#" = 2 ] || { echo "rig: delete-keychain takes exactly the keychain path" >&2; exit 97; }
+    [ -f "$2" ] || { echo "security: SecKeychainDelete: The specified keychain could not be found." >&2; exit 1; }
+    [ -n "$SEC_DELETE_NOOP" ] || { rm -f "$2" "$HOME/.fake-security-items"; }; exit 0;;
 esac
 exit 2
 """
@@ -674,6 +706,11 @@ def _kc(r: Rig) -> Path:
     return r.hands_home / "Library" / "Keychains" / hands_login.HANDS_KEYCHAIN
 
 
+def _FIND_CALLS(r: Rig) -> list[str]:
+    """The attributes-only look for a Claude item that follows every confirmed lock: the suffixed name, then the bare one."""
+    return [f"find-generic-password -s {n} {_kc(r)}" for n in hands_login.claude_credential_services(r.h)]
+
+
 def test_keychain_needed_is_claude_on_macos_only(monkeypatch):
     monkeypatch.setattr(hands_login, "keychain_needed", _REAL_KEYCHAIN_NEEDED)
     for system, vendor, want in (("Darwin", "claude", True), ("Darwin", "codex", False),
@@ -682,9 +719,11 @@ def test_keychain_needed_is_claude_on_macos_only(monkeypatch):
         assert hands_login.keychain_needed(vendor) is want
 
 
-#: Every ``security`` verb the product may run; anything else (unlock-keychain, lock-keychain, find-generic-password,
-#: delete-keychain, set-keychain-settings ...) failing this set is a change of the custody design, not a refactor.
-_ALLOWED_VERBS = {"default-keychain", "list-keychains", "create-keychain"}
+#: Every ``security`` verb the product may run; anything else (unlock-keychain, set-keychain-settings,
+#: dump-keychain ...) failing this set is a change of the custody design, not a refactor. levain#241 added exactly
+#: lock-keychain, show-keychain-info, find-generic-password (attributes only) and delete-keychain.
+_ALLOWED_VERBS = {"default-keychain", "list-keychains", "create-keychain", "lock-keychain", "show-keychain-info",
+                  "find-generic-password", "delete-keychain"}
 
 
 def test_the_rig_never_runs_the_real_program_and_the_product_never_unlocks(rig):
@@ -714,8 +753,10 @@ def test_claude_login_first_makes_the_hands_keychain_then_the_login_lands_in_the
     assert res.returncode == 0 and st.logged_in
     kc = _kc(rig)
     calls = _sec_calls(rig)
-    assert calls == ["default-keychain -d user", calls[1], f"default-keychain -d user -s {kc}", "list-keychains -d user",
-                     f"list-keychains -d user -s {kc}", "list-keychains -d user", "default-keychain -d user"]
+    assert calls == ["default-keychain -d user", calls[1], f"lock-keychain {kc}", f"default-keychain -d user -s {kc}",
+                     "list-keychains -d user", f"list-keychains -d user -s {kc}", "list-keychains -d user",
+                     "default-keychain -d user", f"lock-keychain {kc}", f"show-keychain-info {kc}",
+                     *_FIND_CALLS(rig)]
     create = calls[1].split(" ")
     assert create[0] == "create-keychain" and create[1] == "-p" and len(create[2]) >= 40 and create[3] == str(kc)
     # the keychain is the hands account's, inside its home, in a 700 directory; the password is kept nowhere
@@ -745,7 +786,9 @@ def test_a_second_login_finds_the_keychain_and_makes_nothing(rig):
     said: list[str] = []
     res, st = _login(rig, "claude", emit=said.append)
     assert res.returncode == 0 and st.logged_in
-    assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user"]
+    kc = _kc(rig)
+    assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"lock-keychain {kc}",
+                               f"show-keychain-info {kc}", *_FIND_CALLS(rig)]
     assert not any("Made the hands account" in s or "again" in s for s in said)
 
 
@@ -796,7 +839,7 @@ def test_a_keychain_file_left_by_an_earlier_run_is_reused_not_recreated(rig):
     res, st = _login(rig, "claude")
     assert res.returncode == 0 and st.logged_in
     assert "create-keychain" not in " ".join(_sec_calls(rig))
-    assert kc.read_text() == "earlier"
+    assert kc.read_text() != "fake keychain unlocked\n"            # reused, and locked before the vendor ran (levain#241)
 
 
 def test_a_keychain_path_that_is_not_a_file_is_refused(rig):
@@ -910,7 +953,8 @@ def test_a_failed_search_list_refuses_then_the_next_login_finishes_it(rig):
     res, st = _login(rig, "claude", emit=said.append)
     assert res.returncode == 0 and st.logged_in
     assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"list-keychains -d user -s {_kc(rig)}",
-                               "list-keychains -d user", "default-keychain -d user"]
+                               "list-keychains -d user", "default-keychain -d user", f"lock-keychain {_kc(rig)}",
+                               f"show-keychain-info {_kc(rig)}", *_FIND_CALLS(rig)]
     assert (rig.hands_home / ".fake-security-list").read_text().strip() == str(_kc(rig))
     assert any(hands_login.KEYCHAIN_REPAIRED_NOTE.format(path=_kc(rig)) in s for s in said)
 
@@ -981,7 +1025,9 @@ def test_our_keychain_spelled_another_way_is_still_ours(rig):
     rig.seclog.unlink()
     res, st = _login(rig, "claude")
     assert res.returncode == 0 and st.logged_in
-    assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user"]
+    kc = hands_login.keychain_path(rig.h)
+    assert _sec_calls(rig) == ["default-keychain -d user", "list-keychains -d user", f"lock-keychain {kc}",
+                               f"show-keychain-info {kc}", *_FIND_CALLS(rig)]
     assert hands_login.keychain_path(rig.h) == str(_kc(rig))
 
 
@@ -1048,3 +1094,202 @@ def test_a_symlinked_keychains_directory_is_refused(rig, tmp_path):
     with pytest.raises(hands_login.HandsRefused, match="not a directory"):
         _login(rig, "claude")
     assert list(elsewhere.iterdir()) == [] and rig.calls() == []
+
+
+# --- levain#241: the sealed keychain is locked before any vendor login; an item an earlier login left is removed by logout --
+
+def _items(r: Rig) -> list[str]:
+    p = r.hands_home / ".fake-security-items"
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def _orphan(r: Rig, name: str | None = None) -> str:
+    """The state an earlier (pre-fix) login left: a locked sealed keychain holding a Claude item, no credential file."""
+    _login(r, "claude")
+    (r.hands_home / ".claude" / ".credentials.json").unlink()
+    name = name or hands_login.claude_credential_services(r.h)[0]
+    (r.hands_home / ".fake-security-items").write_text(name + "\n")
+    r.seclog.unlink()
+    r.log.unlink()
+    return name
+
+
+def test_the_item_suffix_is_the_sha256_of_the_config_home_measured_on_the_vm():
+    h = HandsIdentity("_levain_leg6entity_872b7e", 501, "/Users/_levain_leg6entity_872b7e", Path("/ws"))
+    assert hands_login.config_home(h, "claude") == "/Users/_levain_leg6entity_872b7e/.claude"
+    assert hands_login.claude_credential_services(h) == ("Claude Code-credentials-45e49ffa", "Claude Code-credentials")
+
+
+def test_a_keychain_that_takes_a_write_while_unlocked_is_locked_before_the_vendor_login_runs(rig):
+    # the VM sequence (vm_phase_c1_return.md): create leaves it unlocked, the vendor then writes its item into it and no
+    # file is kept, so the login read "not signed in". The rig's vendor does exactly that when the keychain is unlocked.
+    res, st = _login(rig, "claude")
+    assert (rig.hands_home / ".fake-login-kcstate").read_text() == "fake keychain locked\n"
+    assert _items(rig) == [] and (rig.hands_home / ".claude" / ".credentials.json").is_file()
+    assert res.returncode == 0 and st.logged_in
+    calls = _sec_calls(rig)
+    assert calls.index(f"show-keychain-info {_kc(rig)}") > calls.index(f"lock-keychain {_kc(rig)}")
+
+
+def test_the_rig_models_the_failure_the_vm_measured(rig):
+    # the control: with the lock turned into a no-op the vendor's write lands in the keychain and the login reads signed out
+    rig.knobs["SEC_LOCK_NOOP"] = "1"
+    hands_login.ensure_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+    res = hands_login._run_login(rig.h, "claude", rig.entity, lambda s: None, 30)
+    assert res.returncode == 0 and len(_items(rig)) == 1 and _items(rig)[0].startswith("Claude Code-credentials-")
+    assert not hands_login.run_status(rig.h, "claude", entity_dir=rig.entity).logged_in
+
+
+@pytest.mark.parametrize("knob,value,match", [
+    ("SEC_LOCK_NOOP", "1", "could not be confirmed locked.*unlocked"),
+    ("SEC_LOCK_FAIL", "denied", "could not lock .*denied"),
+    ("SEC_LOCKED_TEXT", "Some other failure.", "could not be confirmed locked.*Some other failure"),
+])
+def test_a_lock_that_is_not_confirmed_refuses_before_the_vendor_runs(rig, knob, value, match):
+    rig.knobs[knob] = value
+    with pytest.raises(hands_login.HandsRefused, match=f"{match}.*the login was not started"):
+        _login(rig, "claude")
+    assert rig.calls() == [] and not (rig.hands_home / ".claude" / ".credentials.json").exists()
+    with pytest.raises(hands_login.HandsRefused, match="the login was not started"):
+        _login(rig, "claude")
+
+
+def test_rc_36_alone_does_not_confirm_a_lock_and_the_text_alone_does_not_either(rig, monkeypatch):
+    hands_login.ensure_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+    real = hands_login._security
+
+    def fake(rc, err):
+        def run(hands, vendor, *args, **kw):
+            if args[0] == "show-keychain-info":
+                return hands_login.subprocess.CompletedProcess(args, rc, b"", err)
+            return real(hands, vendor, *args, **kw)
+        return run
+    for rc, err in ((36, b"security: something else\n"), (1, b"security: User interaction is not allowed.\n")):
+        monkeypatch.setattr(hands_login, "_security", fake(rc, err))
+        with pytest.raises(HandsLoginError, match="could not be confirmed locked"):
+            hands_login.lock_and_confirm_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+    monkeypatch.setattr(hands_login, "_security", fake(36, b"security: x: User interaction is not allowed.\n"))
+    hands_login.lock_and_confirm_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+
+
+def test_a_failed_lock_after_create_refuses(rig):
+    rig.knobs["SEC_LOCK_FAIL"] = "denied"
+    with pytest.raises(HandsLoginError, match="could not lock"):
+        hands_login.ensure_hands_keychain(rig.h, "claude", entity_dir=rig.entity)
+
+
+def test_a_made_keychain_is_locked_the_moment_it_exists(rig):
+    assert hands_login.ensure_hands_keychain(rig.h, "claude", entity_dir=rig.entity) == "made"
+    assert _kc(rig).read_text() == "fake keychain locked\n"
+    calls = _sec_calls(rig)
+    assert calls[[c.split(" ")[0] for c in calls].index("lock-keychain") - 1].startswith("create-keychain")
+
+
+def test_logout_with_an_orphan_item_and_no_file_deletes_the_sealed_keychain(rig, capsys):
+    _orphan(rig)
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "keychain-removed"
+    assert not _kc(rig).exists() and _items(rig) == []
+    assert any(c.startswith(f"delete-keychain {_kc(rig)}") for c in _sec_calls(rig))
+    assert "logout" in " ".join(rig.calls())                           # the vendor's own logout ran first
+    capsys.readouterr()
+    assert hands_login.cmd_hands_logout(rig.entity, "claude") == 0      # the second logout has nothing left
+    assert "nothing signed in" in capsys.readouterr().out
+
+
+def test_the_cli_logout_reports_the_new_outcome_word_and_records_it(rig, capsys):
+    _orphan(rig)
+    assert hands_login.cmd_hands_logout(rig.entity, "claude") == 0
+    assert "hands claude: signed out (keychain-removed)" in capsys.readouterr().out
+    assert hands_login.read_outcomes(rig.entity)["claude"]["outcome"] == "keychain-removed"
+
+
+def test_the_older_unsuffixed_item_name_is_an_orphan_too(rig):
+    _orphan(rig, "Claude Code-credentials")
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "keychain-removed"
+
+
+def test_an_item_of_another_name_is_not_ours_to_remove(rig):
+    _orphan(rig, "Some Other App")
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "nothing"
+    assert _kc(rig).exists()
+
+
+def test_a_signed_in_file_and_an_orphan_both_go(rig):
+    _login(rig, "claude")
+    (rig.hands_home / ".fake-security-items").write_text(hands_login.claude_credential_services(rig.h)[0] + "\n")
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "logged-out+keychain-removed"
+    assert not _kc(rig).exists() and not (rig.hands_home / ".claude" / ".credentials.json").exists()
+
+
+def test_logout_with_nothing_anywhere_still_runs_nothing(rig):
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "nothing"
+    assert rig.calls() == [] or all("auth status" in c for c in rig.calls())
+    assert not any(c.startswith("delete-keychain") for c in _sec_calls(rig))
+    # a sealed keychain that holds no item is not touched either
+    _login(rig, "claude")
+    hands_login.run_logout(rig.h, "claude", rig.entity)
+    _login(rig, "claude")
+    (rig.hands_home / ".claude" / ".credentials.json").unlink()
+    rig.log.unlink()
+    assert hands_login.run_logout(rig.h, "claude", rig.entity) == "nothing"
+    assert _kc(rig).exists() and not any(c.startswith("delete-keychain") for c in _sec_calls(rig))
+    assert not any("auth logout" in c for c in rig.calls())
+
+
+def test_a_codex_logout_never_looks_in_the_keychain(rig):
+    assert hands_login.run_logout(rig.h, "codex", rig.entity) == "nothing"
+    assert _sec_calls(rig) == []
+
+
+def test_a_keychain_that_will_not_delete_is_an_error_not_a_success(rig):
+    _orphan(rig)
+    rig.knobs["SEC_DELETE_NOOP"] = "1"
+    with pytest.raises(HandsLoginError, match="still there after `delete-keychain`"):
+        hands_login.run_logout(rig.h, "claude", rig.entity)
+    assert _kc(rig).exists()
+
+
+def test_a_keychain_look_that_cannot_be_read_refuses_the_logout_with_nothing_changed(rig):
+    _orphan(rig)
+    rig.knobs["SEC_FIND_FAIL"] = "The user canceled the operation."
+    with pytest.raises(hands_login.HandsRefused, match="nothing was changed"):
+        hands_login.run_logout(rig.h, "claude", rig.entity)
+    assert not any("auth logout" in c for c in rig.calls()) and _kc(rig).exists()   # only the read-only status ran
+
+
+def test_a_login_with_an_orphan_is_not_refused_keeps_the_file_and_names_the_logout(rig):
+    name = _orphan(rig)
+    said: list[str] = []
+    res, st = _login(rig, "claude", emit=said.append)
+    assert res.returncode == 0 and st.logged_in
+    assert (rig.hands_home / ".claude" / ".credentials.json").is_file() and _items(rig) == [name]
+    joined = "".join(said)
+    assert name in joined and "levain hands logout claude" in joined
+    assert joined.index(name) < joined.index("Open https://claude.ai")
+    said.clear()
+    _login(rig, "claude", emit=said.append)
+    assert name in "".join(said)                                       # it stays named until logout removes it
+
+
+def test_a_login_without_an_orphan_says_nothing_of_one(rig):
+    said: list[str] = []
+    _login(rig, "claude", emit=said.append)
+    assert "earlier login" not in "".join(said)
+
+
+def test_the_product_only_ever_asks_for_attributes_and_the_rig_refuses_a_secret_read(rig):
+    import subprocess
+    _orphan(rig)
+    hands_login.run_logout(rig.h, "claude", rig.entity)
+    _login(rig, "claude")
+    finds = [c for c in _sec_calls(rig) if c.startswith("find-generic-password")]
+    names = hands_login.claude_credential_services(rig.h)
+    assert finds and all(any(f == f"find-generic-password -s {n} {_kc(rig)}" for n in names) for f in finds)
+    assert {c.split(" ")[0] for c in _sec_calls(rig)} <= _ALLOWED_VERBS
+    sh = str(rig.bindir / "security")
+    env = {"HOME": str(rig.hands_home), "SHIM_SECLOG": str(rig.seclog), "PATH": "/usr/bin:/bin"}
+    for extra in (["-w"], ["-g"], ["-w", "-g"]):
+        r = subprocess.run([sh, "find-generic-password", "-s", "x", *extra, str(_kc(rig))], env=env, capture_output=True)
+        assert r.returncode == 97, extra
+    for verb in ("unlock-keychain", "dump-keychain", "export", "set-keychain-settings"):
+        assert subprocess.run([sh, verb, str(_kc(rig))], env=env, capture_output=True).returncode == 2
