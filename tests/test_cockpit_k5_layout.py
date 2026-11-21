@@ -9,7 +9,7 @@ import pytest
 from pathlib import Path
 
 from tests._cockpit_reread import REREAD_SETTLED
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, _pushes_value, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
 KEY = "levain_cockpit_layout_v1"
@@ -42,15 +42,23 @@ def _seed(value: str) -> list:
 
 
 # a reload whose fresh page never drew: CI (levain#236, shard 0) kept a page whose scripts and styles had not loaded ("Cannot read properties of
-# undefined (reading 'fromManifest')", the board never drawn a .pbody) and waited out the whole bound on it. A load that is fine draws well inside
-# the 8000 ms first wait below, so a page still not fresh by then is reloaded ONCE and waited on for the usual bound; a fresh page is left alone.
-RETRY_IF_STALE = "(() => { if (" + FRESH + ") return 'fresh'; window.__old = 1; location.reload(); return 'reloaded'; })()"
+# undefined (reading 'fromManifest')", the board never drawn a .pbody) and waited out the whole bound on it. The retry is for a page that is
+# BROKEN, never for one that is only slow: it reloads when the old document is still the page (the reload never committed) or when the new
+# document has finished loading without the cockpit script (`window.LevainCockpitView`, set by cockpit_view.js). A document that is still
+# loading, or that has the script and has not drawn yet, is left alone and waited on, so a healthy slow page does not pay a second load.
+# The stored value is written again before the reload, so the retry starts from the same storage as the first attempt.
+def _reload_if_broken(value: str) -> str:
+    return ("(() => { try { const oldDoc = !!window.__old; const noScript = !oldDoc && document.readyState === 'complete' && !window.LevainCockpitView;"
+            " if (!oldDoc && !noScript) return 'left alone';"
+            f" localStorage.setItem('{KEY}', {value}); {RELOAD}; return 'reloaded'; }} catch (e) {{ return 'threw'; }} }})()")
 
 
 def _seed_once_more(value: str) -> list:
-    """`_seed`, with the one bounded reload for a fresh page that never drew: five steps, the first three as `_seed`'s read."""
-    return [{"eval": f"localStorage.setItem('{KEY}', {value}); {RELOAD}"}, {"until": FRESH, "ms": 8000, "may_timeout": True},
-            {"eval": RETRY_IF_STALE}, {"until": FRESH}, SETTLE]
+    """`_seed`, with one bounded reload for a fresh page that is broken. The first wait and the retry step carry `partial` so their own deadlines
+    govern (the driver's whole-board gate, run first, would spend a bound of its own on a page whose board can never be whole). The retry step
+    runs its action once (`every` is past its deadline), then polls for the fresh page for the usual bound."""
+    return [{"eval": f"localStorage.setItem('{KEY}', {value}); {RELOAD}"}, {"until": FRESH, "ms": 8000, "may_timeout": True, "partial": True},
+            {"do": _reload_if_broken(value), "until": FRESH, "every": 600000, "partial": True}, SETTLE]
 
 
 @needs_browser
@@ -74,10 +82,12 @@ def test_garbage_in_storage_is_ignored_and_the_board_draws_the_kernel_order(tmp_
             "JSON.stringify({v: 1, zones: {operate: {order: 'now'}}, collapsed: 5})",
             "JSON.stringify({v: 1, zones: {operate: {order: [1, null, {}]}}, collapsed: [3]})"]
     steps: list = []
-    per = len(_seed_once_more("0")) + 2                 # one junk's values: the seed's, then the stacks, then the collapsed/controls read
+    # one junk's entries: what its seed steps collect (counted by the driver's own rule, `_pushes_value`, not assumed), then the stacks, then the collapsed/controls read
+    per = sum(_pushes_value(s) for s in _seed_once_more("0")) + 2
     for j in junk:
         steps += _seed_once_more(j) + [{"eval": STACKS}, {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('.ck-lay-btn').length > 0]"}]
     out = _run(tmp_path, steps)
+    assert len(out) == per * len(junk), f"the driver collected {len(out)} entries for {len(junk)} junk values of {per} each: the stride is wrong"
     for i in range(len(junk)):
         stacks, (collapsed, has_controls) = out[i * per + per - 2], out[i * per + per - 1]
         assert stacks["left"] == ["tray"] and stacks["right"] == [], (junk[i], stacks)
