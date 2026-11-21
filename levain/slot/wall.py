@@ -173,7 +173,7 @@ VERIFIER_UNPROVISIONED = (
     "repo")
 VERIFIER_MISSING = (
     "_levain_verify: adopt runs its confined verifier as this managed account, and it is missing from this install, "
-    "so adopt's verify step (the one that precedes any take) cannot run. `{repair}` creates it. --verifier-slots "
+    "so adopt's verify step (the one that precedes any take) cannot run. `{repair}` creates it, or names what already holds that name. --verifier-slots "
     "makes the verifier session accounts (_levain_v<n>, _levain_c<n>), not this one. Nothing was taken into your "
     "repo")
 
