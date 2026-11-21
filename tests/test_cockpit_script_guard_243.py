@@ -3,10 +3,10 @@
 These cases prove the guard's mechanism: when the page's script for the view is answered with an error, the guard asks for it again once,
 else reloads the page once with a marker bounding it. They do NOT prove the cause reported in levain#243: the rig has no service
 worker, and the injected 503 is a server answer, not the network failure that issue's worker hypothesis names. What the guard does:
-- re-requests the script once, from the very `src` the page named it by, and goes on when that lands;
+- re-requests the script once, from the very `src` the page named it by, and goes on when that lands (the heal case waits for the board to be drawn, so it is red if a late script leaves the page undrawn);
 - else reloads the page once, a marker in sessionStorage written first, so a second failure cannot reload again;
 - clears the marker when the global is there at boot (a healthy boot), so a later incident may heal again.
-The storage cases (storage that throws, a marker of a given age) are in test_cockpit_script_guard_243_node.py.
+The storage cases (storage that throws), the marker's age and the guard's own timer are in test_cockpit_script_guard_243_node.py.
 
 The server here is the real one with its handler wrapped: a GET for the script is answered 503 for the first N requests the PAGE makes
 for it, and every other request is the real server's. A request counts as the page's by `Sec-Fetch-Dest` (`script` for a script
@@ -32,6 +32,10 @@ ALWAYS = 10**6
 _DEFINED = "typeof window.LevainCockpitView === 'object' && document.readyState === 'complete' && 1"
 _STATE = ("JSON.stringify({ nav: (performance.getEntriesByType('navigation')[0] || {}).type, marker: sessionStorage.getItem('" + KEY + "'),"
           " view: typeof window.LevainCockpitView })")
+# the same facts, and whether the boot drew its whole board (dashboard_boot.js's LevainBootFacts, which the boot's own freshness line reads)
+_STATE_DRAWN = ("JSON.stringify({ nav: (performance.getEntriesByType('navigation')[0] || {}).type, marker: sessionStorage.getItem('" + KEY + "'),"
+                " view: typeof window.LevainCockpitView, drawn: !!(window.LevainBootFacts && window.LevainBootFacts().wholeDrawn),"
+                " whole: document.documentElement.hasAttribute('data-board-whole') })")
 # a step is `partial`: the driver does not wait for a whole board first, and a page whose script never loaded draws none
 _WAIT_DEFINED = {"until": _DEFINED, "ms": 30000, "partial": True}
 # the second document after a reload (its navigation type), the marker still there, and the injected script's own failure seen
@@ -75,9 +79,12 @@ def _scenario(tmp_path: Path, fail_first: int, steps: list[dict[str, Any]]) -> t
 
 
 def test_a_failed_script_is_asked_for_again_once_and_the_page_goes_on_without_a_reload(tmp_path: Path) -> None:
-    out, counts = _scenario(tmp_path, 1, [_WAIT_DEFINED, {"eval": _STATE, "partial": True}])
+    """Red if a late cockpit_view.js leaves the page undrawn: the boot's first read can run before the re-request lands, and this case waits
+    for the whole board the way the other cockpit cases do (not `partial`), then asks the boot whether it drew one."""
+    out, counts = _scenario(tmp_path, 1, [{"until": _DEFINED, "ms": 30000}, {"eval": _STATE_DRAWN}])
     state = json.loads(out["values"][-1])
     assert state["view"] == "object", state
+    assert state["drawn"] is True and state["whole"] is True, state   # the page drew its board, not only defined the global
     assert counts["scripts"] == 2, counts            # the head script that failed, and the one re-request
     assert counts["docs"] == 1, counts               # no reload: the one document the drive opened
     assert state["nav"] == "navigate", state         # the document in front of the person is the one that was opened, not a reload of it
