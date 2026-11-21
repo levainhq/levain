@@ -368,6 +368,8 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
                     note = hl.keychain_note(hl.ensure_hands_keychain(hands, VENDOR, entity_dir=entity_dir), hands)
                     if note:
                         (emit or hl._write_out)(note)
+                    # levain#241: an unlocked sealed keychain takes the token's save and the sign-in then reads absent.
+                    hl.lock_and_confirm_hands_keychain(hands, VENDOR, entity_dir=entity_dir)
             except hl.HandsLoginError as exc:
                 raise HandsMcpRefused(f"{exc}; the sign-in was not started") from None
             if name not in held:

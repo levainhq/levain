@@ -859,8 +859,7 @@ def ensure_hands_keychain(hands: HandsIdentity, vendor: str, *, entity_dir: Path
 
 
 KEYCHAIN_MADE_NOTE = ("Made the hands account's own keychain ({path}). It holds nothing and Levain did not store its "
-                      "password. It is there so that Claude keeps this login in its 0600 file in the hands home; that "
-                      "was measured as the operator's account, not yet as the hands account (levain#140).")
+                      "password. It is kept locked so that Claude keeps this login in its 0600 file in the hands home.")
 KEYCHAIN_ORPHAN_NOTE = ("The hands account's own keychain ({path}) holds a Claude item ({name!r}) from an earlier login. "
                         "It stays locked, so this login is kept in the 0600 file; `levain hands logout {vendor}` "
                         "removes the keychain.")
