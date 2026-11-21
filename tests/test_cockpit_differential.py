@@ -500,10 +500,20 @@ def _request_layer_sees(unmatched):
     return {"payload", "manifest"} <= {t.scope for t in unmatched}
 
 
-def _sees_a_value_difference_at(got, field):
+def _a_vanished_rows_own_read_raises(t) -> bool:
+    """The by-row read of a row a patched decode dropped raises RowNotFound on the subject alone: that is what dropping the
+    row does, so it is the canary's own difference, never a patch that could not run."""
+    new = t.new if isinstance(t.new, dict) else {}
+    return (isinstance(t.path[-1], str) and t.path[-1].startswith("row:") and t.old is not None
+            and isinstance(new.get("raised"), str) and new["raised"].startswith("RowNotFound"))
+
+
+def _sees_a_value_difference_at(got, field, raised_ok=None):
     """The canary's difference is the one it made: no unmatched triple is a read that raised (a patch that cannot run
-    would raise on both sides' reads and look like a catch), and the field it changed is on a path."""
-    assert not [t for t in got if rig.triple_raised(t)], [rig.render(t) for t in got if rig.triple_raised(t)][:5]
+    would raise on both sides' reads and look like a catch; ``raised_ok`` names the one raise a canary's own change causes),
+    and the field it changed is on a path."""
+    bad = [t for t in got if rig.triple_raised(t) and not (raised_ok and raised_ok(t))]
+    assert not bad, [rig.render(t) for t in bad][:5]
     assert any(field in t.path for t in got), field
 
 
@@ -518,7 +528,7 @@ def test_canary_a_decode_that_drops_a_row_is_seen(fresh, pairs, approved, triple
     got = _unmatched_on(fresh, approved)
     assert ran, "the patched decode never completed"
     assert len(got) > base and _request_layer_sees(got)
-    _sees_a_value_difference_at(got, "rows")
+    _sees_a_value_difference_at(got, "rows", raised_ok=_a_vanished_rows_own_read_raises)
 
 
 def test_canary_a_decode_that_changes_a_status_is_seen(fresh, pairs, approved, triples, monkeypatch):
@@ -664,3 +674,16 @@ def test_the_probe_reports_its_etags_and_a_stable_version(pairs):
         (etags, version), (again, version2) = probe.snapshot(), probe.snapshot()
         assert etags and etags == again, name
         assert isinstance(version, str) and version and version == version2, (name, version, version2)
+
+
+def test_only_a_vanished_rows_own_read_may_raise_in_a_canary():
+    gone = rig.Triple(("payload", "x", "row:a"), "value", {"id": "x"}, {"raised": "RowNotFound: a"})
+    assert _a_vanished_rows_own_read_raises(gone)
+    for other in (rig.Triple(("payload", "x", "full"), "value", {"id": "x"}, {"raised": "RowNotFound: a"}),      # not a by-row read
+                  rig.Triple(("payload", "x", "row:a"), "value", {"id": "x"}, {"raised": "KeyError: a"}),         # another error
+                  rig.Triple(("payload", "x", "row:a"), "value", None, {"raised": "RowNotFound: a"})):            # nothing on the other side
+        assert not _a_vanished_rows_own_read_raises(other), other
+    assert _sees_a_value_difference_at([gone, rig.Triple(("derive", "x", "body", "rows"), "value", [1], [])], "rows",
+                                       raised_ok=_a_vanished_rows_own_read_raises) is None
+    with pytest.raises(AssertionError):
+        _sees_a_value_difference_at([gone, rig.Triple(("derive", "x", "body", "rows"), "value", [1], [])], "rows")
