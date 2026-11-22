@@ -38,6 +38,9 @@ DELAY = """(() => { const f = window.fetch; const seen = new Set(); let open = n
     .observe(document, { attributes: true, subtree: true, attributeFilter: ['data-board-whole'] });   // the init script runs before <html> exists
 })();"""
 RELEASE = "window.__releasePanels()"
+# DELAY, with each of the core four answered 4 s late: the shells-only window (every panel drawn as a loading shell, none landed) now lasts seconds
+DELAY_CORE_SLOW = DELAY.replace("seen.add(u); if (seen.size > 4) {", "seen.add(u); if (seen.size <= 4) { await new Promise((r) => setTimeout(r, 4000)); } else {")
+assert DELAY_CORE_SLOW != DELAY   # the replace found its anchor
 
 # the regions the draw replaces (dashboard_boot.js BOARD_REGIONS): #board holds the zones, and its siblings hold the hero, the Needs strip, the
 # notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them, and neither is the
@@ -46,9 +49,11 @@ REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-widgets", "state", "board"]
 # the board is a part: the regions are inert, a tile is drawn in the widgets region, and the signal is not there
 PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
            "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")
-# a part that carries a LANDED body: the shells alone are inert `.ck-card` tiles too (each body is aria-busy), and the page's whole draw defers for an
-# open editor only once a landed body was drawn (dashboard_boot.js `mayDrawWhole` with `partialDrawn`, set where `landedCount() > 0`): a test that opens
-# an editor must wait for this, not for PART_UP, or it can open the editor in the shells-only window, where the page draws whole over it by design
+# a part that carries a body that is no longer loading (a panel landed, or failed): the shells alone are inert `.ck-card` tiles too (each body is
+# aria-busy), so PART_UP is met by the shell draw. A test that opens an editor must wait for this instead: an editor opened before any body has
+# landed is in a window where the page draws the whole board over it (the boot load is not passive and no part has landed: `mayDrawWhole` and
+# `partialDrawn` in dashboard_boot.js). DELAY_CORE_SLOW makes that window long, so a test that waits on PART_UP fails every time, not only on a slow runner.
+# (4 s is not a wait for an outcome: it only widens the window the wrong precondition falls into, far past the driver's 100 ms poll.)
 PART_LANDED = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && "
                "!document.documentElement.hasAttribute('data-board-whole') && "
                "[...w.querySelectorAll('.ck-card')].some((c) => !c.querySelector('[aria-busy=\"true\"]')) && 1; })()")
@@ -141,7 +146,7 @@ def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_
                "setTimeout(() => { const g = window.__held; if (g.started === n && g.done === n) r(1); else tick(); }, 3000); } else setTimeout(tick, 100); }; tick(); })")
     with _boot(tmp_path) as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"init": DELAY}, DESKTOP,
+            {"init": DELAY_CORE_SLOW}, DESKTOP,
             {"until": PART_LANDED, "ms": 40000, "partial": True},
             {"eval": ADD_EDITOR, "partial": True},
             {"eval": RELEASE, "partial": True},
