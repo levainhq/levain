@@ -346,10 +346,10 @@ NO_PAGE_TEARDOWN = ("(() => { const V = window.LevainTopologyView, o = V.leaveRe
                     "V.leaveReplay = function (silent) { return silent ? undefined : o.apply(this, arguments); }; return 1; })()")
 
 
-def _host_run(tmp_path, monkeypatch, steps, tag="a"):
+def _host_run(tmp_path, monkeypatch, steps, tag="a", work_lens=False):
     (tmp_path / tag).mkdir(exist_ok=True)
     _root, src = _sessions_fixture(tmp_path / tag, monkeypatch)
-    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": NO_PAGE_TEARDOWN}, ISOLATE, {"eval": SPY}, *steps])
+    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": NO_PAGE_TEARDOWN}, ISOLATE, {"eval": SPY}, *steps], work_lens=work_lens)
 
 
 @needs_browser
@@ -401,7 +401,7 @@ def test_escape_outside_the_card_ignores_a_hidden_dialog_but_not_a_visible_one(t
 def test_switching_lens_while_replaying_leaves_replay_and_the_strip_is_live_in_the_new_lens(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-                               {"until": "document.querySelector('#ck-hlens .tv[data-lens=work]')"}, SLEEP(300), {"eval": INFO}])
+                               {"until": "document.querySelector('#ck-hlens .tv[data-lens=work]')"}, SLEEP(300), {"eval": INFO}], work_lens=True)
     got = json.loads(out[-1])
     assert got["replaying"] is False and got["paused"] is False and got["badge"] is None and got["rat"] is None, got
 
@@ -436,7 +436,7 @@ def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_
                                             {"until": "window.LevainTopologyView.replaying() && window.__resumes === 1 && !!document.querySelector('#h6 .tv-rbadge')", "diag": H_DIAG}, {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
                                             # nothing here repaints the card: the badge leaves only if production's own repaint (when the live read applies) redraws it
-                                            {"until": "!document.querySelector('#h6 .tv-rbadge')", "ms": 8000}, {"eval": H_INFO}])
+                                            {"until": "!document.querySelector('#h6 .tv-rbadge')", "ms": 8000}, {"eval": H_INFO}], work_lens=True)
     mid, done = json.loads(out[-5]), json.loads(out[-1])
     assert mid["replaying"] is True and mid["badge"] == "returning to live…" and mid["rshown"] not in (None, "live") and mid["resumes"] == 1, mid
     assert done["replaying"] is False and done["badge"] is None, done

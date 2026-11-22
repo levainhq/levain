@@ -104,7 +104,7 @@ def test_the_real_page_says_no_number_of_what_waits_on_him_beside_the_band_that_
         for lens in ("work", "agents"):
             out = _run(tmp_path, src, [{"eval": f"document.querySelector('#ck-hlens [data-tv={lens}]').click(); 1"},
                                        {"until": "document.querySelectorAll('#ck-needs .needs-row').length >= 1 && 1", "ms": 30000},
-                                       {"eval": probe}], first=first)
+                                       {"eval": probe}], first=first, work_lens=True)
             got = json.loads(out[-1])
             assert got["strip"] >= 1, (name, lens, got)                                      # the band has the row
             assert got["hdr"] and not [f for f in got["hdr"] if "waiting" in f.lower()], (name, lens, got["hdr"])

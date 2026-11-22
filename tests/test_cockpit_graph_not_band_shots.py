@@ -30,4 +30,4 @@ def test_the_graph_header_shots(tmp_path, monkeypatch, width):
     _run(tmp_path, src, [{"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
                          {"until": "document.querySelectorAll('#ck-needs .needs-row').length >= 1 && 1", "ms": 30000},
                          {"eval": "new Promise(r => setTimeout(r, 600))"},
-                         {"shot": str(out_dir / f"{TAG}_work_page_{width}.png"), "full": True}], first=first)
+                         {"shot": str(out_dir / f"{TAG}_work_page_{width}.png"), "full": True}], first=first, work_lens=True)

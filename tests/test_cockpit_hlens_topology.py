@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from tests.test_cockpit_f12b_topology_view import MID, TV, _intention, _run, _value
+from tests.test_cockpit_f12b_topology_view import GRAPH_OPEN, MID, TV, _intention, _run, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_k7_build import _sessions_fixture
 
@@ -27,7 +27,7 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_header_lens_in_eithe
         # drawn with the lens in force (a lens that is not the pressed one means the test would be grading the other lens)
         steps = [{"eval": "localStorage.setItem('levain_cockpit_header_lens', '%s'); window.__pre148 = 1; setTimeout(() => location.reload(), 0); 1" % lens},
                  {"until": "!window.__pre148 && " + LINE}, {"eval": probe}]       # the reloaded document has no __pre148: no fixed sleep across the reload
-        out = _run(tmp_path, src, steps, first=MID, until=LINE)
+        out = _run(tmp_path, src, steps, first=MID, until=LINE, work_lens=True)
         got = json.loads(out[-1])
         assert got["pressed"] == [lens], (lens, got)
         assert any("Topology unavailable: " in t and "the session records are gone" in t for t in got["line"]), (lens, got)
@@ -60,6 +60,24 @@ def test_a_renderer_that_throws_leaves_the_header_lens_its_switch_and_one_line_n
                                {"until": TV + ".querySelector('.tv-task')"},
                                {"eval": "window.LevainTopologyView.render = () => { throw new Error('boom'); }; document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"},
                                {"until": LINE}, {"eval": probe},
-                               {"eval": "window.LevainTopologyView.render = window.__orig; 1"}])
+                               {"eval": "window.LevainTopologyView.render = window.__orig; 1"}], work_lens=True)
     got = json.loads(out[-2])
     assert got["tv"] is False and got["switch"] >= 1 and "topology could not be drawn" in got["text"], got
+
+
+@needs_browser
+def test_with_no_opt_in_the_header_has_no_work_button_and_a_stored_work_opens_on_the_agents_graph(tmp_path, monkeypatch):
+    """Red if the Work lens shows by default (np-021ab5aa): no page opt-in, so the switch must hold no [data-tv=work] button, and a browser whose
+    stored lens is `work` (chosen before the cut) must draw the Agents graph with Agents pressed, not a Work lens and not a blank header."""
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _intention(root)
+    drawn = TV + " && " + TV + ".querySelector('svg.tv-graph')"
+    probe = ("JSON.stringify({lens: %s.dataset.lens, work_btn: !!document.querySelector('#ck-hlens [data-tv=work]'), "
+             "buttons: [...document.querySelectorAll('#ck-hlens [data-tv]')].map(b => b.dataset.tv), "
+             "pressed: [...document.querySelectorAll('#ck-hlens [data-tv][aria-pressed=true]')].map(b => b.dataset.tv)})") % TV
+    steps = [{"eval": "localStorage.setItem('levain_cockpit_header_lens', 'work'); window.__pre = 1; setTimeout(() => location.reload(), 0); 1"},
+             {"until": "!window.__pre && " + GRAPH_OPEN}, {"until": drawn}, {"eval": probe}]      # the reloaded document has no __pre: the paint graded is the one drawn with `work` stored
+    out = _run(tmp_path, src, steps, first=MID)
+    got = json.loads(out[-1])
+    assert got["work_btn"] is False and "work" not in got["buttons"], got
+    assert got["lens"] == "agents" and got["pressed"] == ["agents"], got

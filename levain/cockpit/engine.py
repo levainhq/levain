@@ -901,6 +901,9 @@ class Cockpit:
         self._hero_yields: set[str] = set()     # hero panels a later hero panel of their kind replaces (yield_hero)
         self._board_yields: set[str] = set()    # the kernel's own board panel, which a provider's board replaces (attach_board)
         self._board_read: Callable[[], Any] | None = None    # the kernel's own board's reader: it returns when no board is left
+        self._hidden: frozenset[str] = frozenset()   # ids left off the home (hide_panels): never registered, so no path brings one back
+        self._hide_called = False                    # hide_panels is called once
+        self._started = False                        # start() has been called: hide_panels is no longer legal
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -1198,6 +1201,8 @@ class Cockpit:
         discovered later replaces it instead of standing beside it."""
         if BOARD_DEFAULT_ID in self._specs or any(o.kind == "board" for o in self._specs.values()):
             return      # a board is already drawn, or an embedder's panel holds the id: the built-in never blocks an embedder
+        if BOARD_DEFAULT_ID in self._hidden:
+            return      # registering it would be a no-op: no yield state is left for a panel that is not there
         self._register_locked(ProviderSpec(
             id=BOARD_DEFAULT_ID, kind="board", title="Work board", priority="feed", region="operate",
             read=lambda ctx: Read(value=read())))
@@ -1221,6 +1226,37 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"panel {sid} is owned by a discoverer; it goes when the discoverer stops returning it")
             self._drop_panel_locked(sid)
+
+    def hide_panels(self, ids: Any) -> None:
+        """Leave these panel ids off the home: one that is registered is unregistered, and one that is registered or
+        discovered later is skipped. The provider code is untouched. It is called once, while the cockpit is built, and before
+        :meth:`start` (a second call, or one after start, raises); not calling it is what leaves every
+        panel on the home. A hidden id is not an error to be absent, and an id no panel here carries is accepted. The decisions
+        panel (the Needs-you band reads it) and the reserved ids are refused. Unlike :meth:`unregister` it removes a
+        discovered panel and does not bring the kernel's own board back: a hidden board id stays gone."""
+        if isinstance(ids, (str, bytes, bytearray, memoryview)):
+            raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
+        try:
+            ids = tuple(ids)     # read once: a generator would otherwise be spent by the check below
+        except TypeError:
+            raise CockpitRegistrationError("hide_panels takes a collection of panel id strings") from None
+        if not all(type(i) is str for i in ids):
+            raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
+        hidden = frozenset(ids)
+        refused = sorted(hidden & {DECISIONS_ID, *RETIRED_PANEL_IDS})
+        if refused:
+            raise CockpitRegistrationError(f"panel {refused[0]!r} is the band's feed or reserved: it cannot be hidden")
+        with self._lock:
+            if self._hide_called:
+                raise CockpitRegistrationError("hide_panels is called once, while the cockpit is built")
+            if self._started:
+                raise CockpitRegistrationError("hide_panels is called before the cockpit starts")
+            self._hide_called = True
+            self._hidden = hidden
+            for sid in [i for i in self._specs if i in hidden]:
+                self._unregister_locked(sid)
+            if self._discovered:
+                self._discovered = {k: v for k, v in self._discovered.items() if k not in hidden}
 
     def _restore_board_locked(self) -> None:
         """The kernel's own board comes back when the last board-kind panel has gone (a discoverer stopped returning it), so a
@@ -1339,6 +1375,8 @@ class Cockpit:
 
     def _register_locked(self, spec: ProviderSpec) -> None:
         sid = spec.id
+        if sid in self._hidden:
+            return      # also what keeps the kernel's own board (attach, restore) from coming back under a hidden id
         if sid == DECISIONS_ID and spec is not self._dec.spec and self._is_composed(sid):
             if self._dec.source is not None:
                 raise CockpitRegistrationError("panel 'decisions' composes an attached decision source")
@@ -1491,6 +1529,8 @@ class Cockpit:
         """Take the first read of every refresher panel, then start its refresher thread. An attached cockpit starts none:
         its host derives every panel, so a refresher thread here would run a provider the request side must not."""
         with self._life:
+            with self._lock:
+                self._started = True
             if self._reader is not None:
                 return
             for pid in [p for p, r in self._refreshers.items() if not r.thread.is_alive()]:
@@ -2848,8 +2888,11 @@ class Cockpit:
             # the id exactly str before it is hashed: a str subclass can carry its own __hash__ (None, or
             # one that hangs). A discoverer is the embedding server's own code; its other fields are not
             # re-typed here
-            ids = Counter(s.id for s in res.value if type(s.id) is str)   # a bad id is an errors entry below
-            for spec in res.value:
+            # a hidden id is dropped before anything records it: registering it is a no-op, so the loops below would
+            # otherwise record an owner for a panel that has no spec
+            found = [s for s in res.value if type(s.id) is not str or s.id not in self._hidden] if self._hidden else res.value
+            ids = Counter(s.id for s in found if type(s.id) is str)   # a bad id is an errors entry below
+            for spec in found:
                 if type(spec.id) is not str:
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
                     continue
@@ -2872,7 +2915,8 @@ class Cockpit:
                             if spec.refresh_every_s is not None:
                                 raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
                             self._register_locked(spec)
-                            self._discovered = {**self._discovered, spec.id: i}
+                            if spec.id in self._specs:      # a skipped (hidden) registration leaves no owner behind
+                                self._discovered = {**self._discovered, spec.id: i}
                         except Exception as exc:  # noqa: BLE001 - a bad spec is an errors entry, never a 500
                             errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
                     elif self._discovered.get(spec.id) != i or have.title != spec.title:

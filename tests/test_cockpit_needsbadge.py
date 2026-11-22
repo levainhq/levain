@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from tests.test_cockpit_f12b_topology_view import NARROW, TV, _paint, _value
+from tests.test_cockpit_f12b_topology_view import NARROW, TV, WORK_LENS_ON, _paint, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_seatmsg import CHIPS, PRESSED, PRIME, _run, _tap
 
@@ -202,7 +202,7 @@ def test_a_badge_tap_runs_the_real_open_path_and_lights_the_row_that_carries_the
     rows = ("(() => { let h = document.getElementById('ck-needs'); if (!h) { h = document.createElement('div'); h.id = 'ck-needs'; document.body.appendChild(h); } h.hidden = false; "
             "h.replaceChildren(...['np:np-zzzz9999', 'np:np-aaaa1111', 'np-aaaa1111'].map(id => { const d = document.createElement('div'); d.className = 'needs-row'; d.dataset.needsId = id; d.style.height = '10px'; return d; })); return 1; })()")
     lit = "JSON.stringify([...document.querySelectorAll('#ck-needs .needs-lit')].map(n => n.dataset.needsId))"
-    out = _run(tmp_path, src, [{"eval": patch}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"}, {"until": TV + ".dataset.lens == 'work'"}, *PRIME, {"until": BADGE % "hub" + " && " + BADGE % "hub" + ".getAttribute('role') == 'button'"}, {"eval": rows},
+    out = _run(tmp_path, src, [{"init": WORK_LENS_ON}, {"eval": patch}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"}, {"until": TV + ".dataset.lens == 'work'"}, *PRIME, {"until": BADGE % "hub" + " && " + BADGE % "hub" + ".getAttribute('role') == 'button'"}, {"eval": rows},
                                {"eval": "%s.dispatchEvent(new MouseEvent('click', {bubbles: true})); 1" % (BADGE % "hub")}, {"eval": lit}])
     assert json.loads(out[-1]) == ["np:np-aaaa1111"], out       # the row carrying the card id is lit; the decoy and the bare row id are not
 
