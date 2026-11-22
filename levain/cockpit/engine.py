@@ -1230,7 +1230,7 @@ class Cockpit:
     def hide_panels(self, ids: Any) -> None:
         """Leave these panel ids off the home: one that is registered is unregistered, and one that is registered or
         discovered later is skipped. The provider code is untouched. It is called once, while the cockpit is built, and before
-        any refresher has started (a second call, or one after :meth:`start`, raises); not calling it is what leaves every
+        :meth:`start` (a second call, or one after start, raises); not calling it is what leaves every
         panel on the home. A hidden id is not an error to be absent, and an id no panel here carries is accepted. The decisions
         panel (the Needs-you band reads it) and the reserved ids are refused. Unlike :meth:`unregister` it removes a
         discovered panel and does not bring the kernel's own board back: a hidden board id stays gone."""
@@ -1249,7 +1249,7 @@ class Cockpit:
         with self._lock:
             if self._hide_called:
                 raise CockpitRegistrationError("hide_panels is called once, while the cockpit is built")
-            if self._started or self._refreshers:
+            if self._started:
                 raise CockpitRegistrationError("hide_panels is called before the cockpit starts")
             self._hide_called = True
             self._hidden = hidden

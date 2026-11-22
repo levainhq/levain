@@ -233,3 +233,12 @@ def test_a_byte_buffer_is_not_a_collection_of_panel_ids(bad) -> None:
     with pytest.raises(CockpitRegistrationError):
         ck.hide_panels(bad)
     ck.hide_panels(())     # the refused call did not spend the one call
+
+
+def test_a_registered_refresher_panel_does_not_stop_a_hide_before_start() -> None:
+    """Red with a guard that reads the registry of refresher panels instead of whether start() ran: a cockpit that has registered
+    a refresher panel and not started would refuse the hide the home's builder makes."""
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="r", kind="metric-grid", title="R", priority="feed", region="operate", read=_V, refresh_every_s=60.0))
+    ck.hide_panels({"r"})
+    assert "r" not in ck.panel_ids
