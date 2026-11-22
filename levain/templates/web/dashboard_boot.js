@@ -7,6 +7,57 @@
 // — only the delivery differs. Kept in its own served file (not inline) so the
 // page's CSP can be `script-src 'self'` with no inline-script exception.
 
+// ONE-SHOT GUARD for a missing cockpit_view.js. A script answered with an error leaves `window.LevainCockpitView` undefined, and
+// nothing else asks for it again, so the page would stay dead until a person reloaded it. This runs first, before the boot below, and
+// does not block the boot: it asks once more for the script (the very `src` the page named it by, so the same URL and version), and
+// when that lands the page goes on. When it does not, the page reloads ONCE: the marker is written to sessionStorage BEFORE the reload,
+// so a second failure finds it and stops. The marker is the time it was written, and it holds only while its age is a finite span, not
+// negative, and no longer than MARK_TTL_MS: an older one, a future one (a clock set back) and a non-time all count as absent, so none
+// can silence the guard for good. A healthy boot, and a late re-request that lands after the guard has decided without reloading, clear
+// the marker, so a later incident may heal again, but a late one never clears the marker of a reload already issued (the old document
+// lives on until the new one commits, and a loop would follow). Storage that cannot be read or written never reloads (no marker could
+// be kept, so a loop could not be ruled out). Nothing is shown; a console line is written when it gives up.
+(function () {
+  // MARK_TTL_MS: a reload loop repeats within seconds, so a marker only has to outlive that; one left by a dead load long ago must not
+  // suppress a later recovery for the rest of the tab's session
+  const KEY = "levain_cockpit_view_reload", WAIT_MS = 4000, MARK_TTL_MS = 60000;
+  function clearMark() { try { window.sessionStorage.removeItem(KEY); } catch (_) { /* no storage: nothing was kept */ } }
+  try {
+    if (window.LevainCockpitView) { clearMark(); return; }
+    const tag = document.querySelector('script[src^="/cockpit_view.js"]');
+    const src = tag && typeof tag.getAttribute === "function" ? tag.getAttribute("src") : null;
+    if (!src || !document.head) return;     // a page that never named the script has nothing to wait for
+    // `reloading`: set just before the reload is issued. The old document lives on until the new one commits, so a re-request's late
+    // load would otherwise erase the marker the reload relies on, and a script slow on every load would reload for ever.
+    let decided = false, reloading = false, timer = 0;
+    const decide = function () {
+      if (decided) return;
+      decided = true;
+      clearTimeout(timer);
+      try {
+        if (window.LevainCockpitView) { clearMark(); return; }
+        let mayReload = false;
+        try {
+          const ss = window.sessionStorage, now = Date.now(), held = ss.getItem(KEY), age = now - Number(held);
+          // a future or non-numeric stamp must not hold the reload back for as long as it lasts, so only a finite, non-negative age is fresh
+          const fresh = held !== null && Number.isFinite(age) && age >= 0 && age <= MARK_TTL_MS;
+          if (!fresh) { const stamp = String(now); ss.setItem(KEY, stamp); mayReload = ss.getItem(KEY) === stamp; }
+        } catch (_) { mayReload = false; }
+        if (mayReload) { reloading = true; window.location.reload(); return; }
+        console.error("levain: cockpit_view.js did not load (a reload was already tried, or the page cannot remember one)");
+      } catch (_) { /* the guard never throws into the page */ }
+    };
+    const el = document.createElement("script");
+    // a re-request that lands after the decision (the timer ran first, or a fresh marker held the reload back) still ends the incident,
+    // unless a reload was already issued (see `reloading`)
+    el.onload = function () { if (window.LevainCockpitView && !reloading) clearMark(); decide(); };
+    el.onerror = decide;
+    el.src = src;
+    timer = setTimeout(decide, WAIT_MS);
+    document.head.appendChild(el);
+  } catch (_) { /* the guard never throws into the page */ }
+})();
+
 (function () {
   "use strict";
   const storeEl = document.getElementById("store");
