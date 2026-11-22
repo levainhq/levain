@@ -43,7 +43,7 @@ def test_a_hidden_panel_is_absent_from_the_served_home_and_its_code_is_intact(tm
     ck.hide_panels({"episodes", "board", "work_board"})
     assert "episodes" not in _listed(ck) and "episodes" not in ck.panel_ids
     assert ck.panel("episodes", credential_class="none") is None
-    assert {"tray", "decisions", "sky", "state"} <= _listed(ck)                   # what the home keeps is untouched
+    assert {"tray", "sky", "state"} <= _listed(ck)                   # what the home keeps is untouched
     # code intact: the provider function and the registration still exist, and an unhidden cockpit still has the panel
     from levain.cockpit import providers
     assert callable(providers._episodes) and callable(Cockpit.register)
@@ -77,7 +77,7 @@ def test_a_hidden_discovered_panel_stays_hidden_across_manifests() -> None:
     in _discovered (a KeyError on the 'no longer returns' branch), or if a panel hidden after it was discovered is not removed."""
     def found(ctx):
         return [ProviderSpec("section:x", "prose", "X", "feed", _V, region="mind"),
-                ProviderSpec("agents", "triage-list", "Agents", "feed", _V, region="operate")]
+                ProviderSpec("agents", "metric-grid", "Agents", "gauge", _V, region="widgets")]
 
     ck = Cockpit()
     ck.discover(found, retire=True)

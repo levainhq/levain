@@ -901,6 +901,7 @@ class Cockpit:
         self._hero_yields: set[str] = set()     # hero panels a later hero panel of their kind replaces (yield_hero)
         self._board_yields: set[str] = set()    # the kernel's own board panel, which a provider's board replaces (attach_board)
         self._board_read: Callable[[], Any] | None = None    # the kernel's own board's reader: it returns when no board is left
+        self._hidden: frozenset[str] = frozenset()   # ids left off the home (hide_panels): never registered, so no path brings one back
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -1222,6 +1223,25 @@ class Cockpit:
                     f"panel {sid} is owned by a discoverer; it goes when the discoverer stops returning it")
             self._drop_panel_locked(sid)
 
+    def hide_panels(self, ids: Any) -> None:
+        """Leave these panel ids off the home: one that is registered is unregistered, and one that is registered or
+        discovered later is skipped. The provider code is untouched, and ``hide_panels(())`` (before anything registers) is the
+        reversal. A hidden id is not an error to be absent. The decisions panel (the Needs-you band reads it) and the
+        reserved ids are refused. Unlike :meth:`unregister` it removes a discovered panel and does not bring the kernel's own
+        board back: a hidden board id stays gone."""
+        if isinstance(ids, (str, bytes)) or not all(type(i) is str for i in ids):
+            raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
+        hidden = frozenset(ids)
+        refused = sorted(hidden & {DECISIONS_ID, *RETIRED_PANEL_IDS})
+        if refused:
+            raise CockpitRegistrationError(f"panel {refused[0]!r} is the band's feed or reserved: it cannot be hidden")
+        with self._lock:
+            self._hidden = hidden
+            for sid in [i for i in self._specs if i in hidden]:
+                self._unregister_locked(sid)
+            if self._discovered:
+                self._discovered = {k: v for k, v in self._discovered.items() if k not in hidden}
+
     def _restore_board_locked(self) -> None:
         """The kernel's own board comes back when the last board-kind panel has gone (a discoverer stopped returning it), so a
         cockpit that drew a board keeps drawing one; an id an embedder's panel holds is left to it."""
@@ -1339,6 +1359,8 @@ class Cockpit:
 
     def _register_locked(self, spec: ProviderSpec) -> None:
         sid = spec.id
+        if sid in self._hidden:
+            return      # also what keeps the kernel's own board (attach, restore) from coming back under a hidden id
         if sid == DECISIONS_ID and spec is not self._dec.spec and self._is_composed(sid):
             if self._dec.source is not None:
                 raise CockpitRegistrationError("panel 'decisions' composes an attached decision source")
@@ -2848,8 +2870,11 @@ class Cockpit:
             # the id exactly str before it is hashed: a str subclass can carry its own __hash__ (None, or
             # one that hangs). A discoverer is the embedding server's own code; its other fields are not
             # re-typed here
-            ids = Counter(s.id for s in res.value if type(s.id) is str)   # a bad id is an errors entry below
-            for spec in res.value:
+            # a hidden id is dropped before anything records it: registering it is a no-op, so the loops below would
+            # otherwise record an owner for a panel that has no spec
+            found = [s for s in res.value if type(s.id) is not str or s.id not in self._hidden] if self._hidden else res.value
+            ids = Counter(s.id for s in found if type(s.id) is str)   # a bad id is an errors entry below
+            for spec in found:
                 if type(spec.id) is not str:
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
                     continue

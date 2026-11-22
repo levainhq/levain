@@ -23,6 +23,8 @@
 (function (root) {
   "use strict";
 
+  // The Work lens (the work graph) is hidden from the header under np-021ab5aa; set this true to bring it back, nothing else changes.
+  const SHOW_WORK_LENS = false;
   const HEADER_KEY = "levain_cockpit_header_lens";      // the header's three-way choice: agents | events | work (a view preference, never data)
   // the order the Work lens lists its groups in (K10: what needs you, what is moving, what went quiet, the open loops, then what ended)
   const TASK_ORDER = ["waiting", "failed", "stuck", "running", "open", "done"];
@@ -57,16 +59,16 @@
   function keep(key, val) { try { root.localStorage.setItem(key, val); } catch (_) { /* no storage: the choice lasts until the page does */ } }
 
   // ---- what persists: the header lens (agents graph | event graph | work). A cold open, or a store that throws or holds anything else, is the Agents graph ----
-  const HEADER_LENSES = [["agents", "Agents graph"], ["events", "Event graph"], ["work", "Work"]];
-  // A phone-width card with no stored choice opens on Work: the graph draws at a fraction of its scale there, its text unreadable. An explicit
+  const HEADER_LENSES = [["agents", "Agents graph"], ["events", "Event graph"], ...(SHOW_WORK_LENS ? [["work", "Work"]] : [])];
+  // With the Work lens shown, a phone-width card with no stored choice opens on Work: the graph draws at a fraction of its scale there, its text unreadable. An explicit
   // pick (including "agents") is kept; the graph stays one tap away.
   const NARROW_PX = 560;
   function headerLens() {
     const v = stored(HEADER_KEY);
-    if (v === "events" || v === "work" || v === "agents") return v;
-    return typeof root.innerWidth === "number" && root.innerWidth > 0 && root.innerWidth < NARROW_PX ? "work" : "agents";
+    if (v === "events" || v === "agents" || (v === "work" && SHOW_WORK_LENS)) return v;
+    return SHOW_WORK_LENS && typeof root.innerWidth === "number" && root.innerWidth > 0 && root.innerWidth < NARROW_PX ? "work" : "agents";
   }
-  function setHeaderLens(id) { keep(HEADER_KEY, id); }
+  function setHeaderLens(id) { if (id === "work" && !SHOW_WORK_LENS) return; keep(HEADER_KEY, id); }
 
   function seg(name, items, current, onPick) {
     const g = el("span", "tv-seg");
