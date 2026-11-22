@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -16,14 +17,15 @@ SRC = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "to
 OFF = 'const SHOW_WORK_LENS = typeof root === "object" && root !== null && root.LEVAIN_SHOW_WORK_LENS === true;'
 ON = "const SHOW_WORK_LENS = true;"
 
-# argv[1]: the source text; argv[2]: [{store: {key: value} | null, width: number, set: id | null, optin: any, via: "window" | "root"}, ...]
+# argv[1]: the path of a file holding the source text (never the text itself: a whole module on the command line is past the one-argument
+# limit of a Linux runner); argv[2]: [{store: {key: value} | null, width: number, set: id | null, optin: any, via: "window" | "root"}, ...]
 # The module is handed globalThis as its ``root`` (in a page that is the window). optin (when the key is present) is the value a page's
 # init script gives window.LEVAIN_SHOW_WORK_LENS before the scripts run: via "window" (the default) the sandbox's ``window`` is the
 # sandbox itself, as in a page; via "root" the sandbox has no ``window`` at all and the value sits on the root alone;
 # via "stub" ``window`` is a separate object (a stub window the module's root is not).
 DRIVER = r"""
 const vm = require("vm");
-const [src, cases] = [process.argv[1], JSON.parse(process.argv[2])];
+const [src, cases] = [require("fs").readFileSync(process.argv[1], "utf8"), JSON.parse(process.argv[2])];
 const out = [];
 for (const c of cases) {
   const mem = Object.assign({}, c.store || {});
@@ -52,7 +54,10 @@ def _run(src: str, cases: list[dict]) -> list[dict]:
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is needed")
-    done = subprocess.run([node, "-e", DRIVER, src, json.dumps(cases)], capture_output=True, text=True, timeout=60)
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "topology_view.js"
+        source.write_text(src, encoding="utf8")
+        done = subprocess.run([node, "-e", DRIVER, str(source), json.dumps(cases)], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
