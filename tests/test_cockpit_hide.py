@@ -141,3 +141,71 @@ def test_a_generator_of_ids_hides_what_it_names(tmp_path: Path) -> None:
     ck = build_default_cockpit(src)
     ck.hide_panels(i for i in ("episodes", "edits"))
     assert "episodes" not in ck.panel_ids and "edits" not in ck.panel_ids
+
+
+def test_discovery_records_no_owner_for_a_spec_the_registration_skipped() -> None:
+    """Red with a discovery loop that records the owner after _register_locked whether or not a spec was registered: the id is in
+    _discovered with no spec, and the pass after the owner stops returning it raises KeyError. The simulation: the discoverer's
+    answer is filtered while nothing is hidden, and the hide lands (``_hidden`` is set by a wrapper round ``_register_locked``)
+    in the window between that filter and the registration, which is what a concurrent hide_panels would do."""
+    answers = [[ProviderSpec("x", "metric-grid", "X", "gauge", _V, region="widgets")]]
+    ck = Cockpit()
+    ck.discover(lambda ctx: answers[0], retire=True)
+    real = ck._register_locked
+
+    def hide_then_register(spec: ProviderSpec) -> None:
+        ck._hidden = frozenset({"x"})
+        real(spec)
+
+    ck._register_locked = hide_then_register                                      # type: ignore[method-assign]
+    ck.manifest(CRED)
+    assert "x" not in ck._specs and "x" not in ck._discovered                     # no owner without a spec
+    answers[0] = []                                                               # the owner stops returning it: the retire pass
+    ck.manifest(CRED)
+    ck.manifest(CRED)
+
+
+def test_a_hidden_kernel_board_leaves_no_yield_state() -> None:
+    """Red with an _attach_board_locked that registers (a no-op under a hidden id) and then adds the id to _board_yields: that
+    stale yield would make a real provider registered under that id later look replaceable."""
+    ck = Cockpit()
+    ck.hide_panels({BOARD_DEFAULT_ID})
+    ck.attach_server(None, lambda now: None, board=lambda: {"columns": []})
+    assert BOARD_DEFAULT_ID not in ck.panel_ids
+    assert BOARD_DEFAULT_ID not in ck._board_yields
+
+
+def test_hide_panels_is_called_once() -> None:
+    """Red with a hide_panels that replaces the hidden set on every call: a second call would silently un-hide the first call's
+    ids (a discovered panel returns while a static one stays gone). A refused call does not use up the one call."""
+    ck = Cockpit()
+    with pytest.raises(CockpitRegistrationError):
+        ck.hide_panels({DECISIONS_ID})                                            # refused: the one call is still unused
+    ck.hide_panels({"a"})
+    with pytest.raises(CockpitRegistrationError, match="called once"):
+        ck.hide_panels({"b"})
+    assert ck._hidden == frozenset({"a"})
+
+
+def test_hide_panels_is_refused_once_a_refresher_has_started() -> None:
+    """Red with a hide_panels that unregisters a panel whose refresher thread is running: the thread stays in _refreshers and a
+    later re-register would be polled by the old one. The cockpit is the smallest with one refresher panel."""
+    ck = Cockpit()
+    ck.register(ProviderSpec("r", "metric-grid", "R", "gauge", _V, region="widgets", refresh_every_s=60.0, stale_after_s=60.0))
+    ck.start()
+    try:
+        assert ck.refresher("r") is not None
+        with pytest.raises(CockpitRegistrationError, match="before the cockpit starts"):
+            ck.hide_panels({"r"})
+        assert ck._hidden == frozenset() and "r" in ck.panel_ids
+    finally:
+        ck.stop()
+
+
+@pytest.mark.parametrize("bad", [None, 3, 2.5])
+def test_hide_panels_refuses_a_non_iterable_with_the_registration_error(bad: object) -> None:
+    """Red with a hide_panels that lets the TypeError of tuple(ids) through."""
+    ck = Cockpit()
+    with pytest.raises(CockpitRegistrationError):
+        ck.hide_panels(bad)
+    assert ck._hidden == frozenset()
