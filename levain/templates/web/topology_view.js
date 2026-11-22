@@ -23,8 +23,9 @@
 (function (root) {
   "use strict";
 
-  // The Work lens (the work graph) is hidden from the header under np-021ab5aa; set this true to bring it back, nothing else changes.
-  const SHOW_WORK_LENS = false;
+  // The Work lens (the work graph) is hidden from the header under np-021ab5aa: a test or a console line sets window.LEVAIN_SHOW_WORK_LENS = true
+  // before the page scripts run to bring it back; flipping this expression to true reverts the cut.
+  const SHOW_WORK_LENS = typeof window !== "undefined" && window.LEVAIN_SHOW_WORK_LENS === true;
   const HEADER_KEY = "levain_cockpit_header_lens";      // the header's three-way choice: agents | events | work (a view preference, never data)
   // the order the Work lens lists its groups in (K10: what needs you, what is moving, what went quiet, the open loops, then what ended)
   const TASK_ORDER = ["waiting", "failed", "stuck", "running", "open", "done"];
