@@ -6,8 +6,10 @@ version, a normalisation per non-JSON value, fresh containers on every decode). 
 and the last tests read the engine's own panels through a real refresh."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
+import gc
 import hashlib
 import json
 import math
@@ -125,6 +127,21 @@ def _big_snap(n: int) -> _Snap:
     return _snap(rows=rows, label_keys={r["id"]: LabelKey("edits/x", {"id": r["id"], "n": 1}) for r in rows})
 
 
+@contextlib.contextmanager
+def _collector_off():
+    """Timed windows run with the collector off: its full collections walk every live object, so their cost follows the
+    size of the whole heap, not the codec's algorithm, and they land on some runs and not others. One collection runs
+    first so the window starts from a clean heap; the state the caller had is restored, never forced on."""
+    was_enabled = gc.isenabled()
+    try:
+        gc.collect()
+        gc.disable()
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def _round_trip(s: _Snap) -> tuple[float, _Snap]:
     t0 = time.perf_counter()
     status, body = sh.encode_snap(s)
@@ -135,34 +152,53 @@ def _round_trip(s: _Snap) -> tuple[float, _Snap]:
 
 _SMALL_ROWS, _BIG_ROWS = 250, 5000  # the step between the two timed sizes
 _PAIRS = 5  # small and big attempts, interleaved; odd so the median is one measured pair
-_GROWTH_ALLOWANCE = 3  # the time ratio may reach this multiple of the size ratio
+_GROWTH_ALLOWANCE = 3  # the equal-work time ratio may reach this multiple of 1
+
+
+def test_the_timed_window_hands_the_collector_back_as_it_found_it() -> None:
+    was = gc.isenabled()
+    try:
+        gc.enable()
+        with _collector_off():
+            assert not gc.isenabled()
+        assert gc.isenabled()
+        gc.disable()
+        with _collector_off():
+            assert not gc.isenabled()
+        assert not gc.isenabled()       # a caller that had it off is not turned back on
+    finally:
+        if was:
+            gc.enable()
+        else:
+            gc.disable()
 
 
 def test_a_large_rows_list_round_trips_in_linear_time() -> None:
-    """The round trip of a big rows list must not cost far more than its size ratio over a small one.
+    """The round trip of a big rows list must cost about what the same number of small round trips costs.
 
-    A fixed wall-clock bound measures the runner, not the code: a loaded box fails it with no codec change. So this
-    times the same round trip at a small row count and at a much larger one (_SMALL_ROWS, _BIG_ROWS), in the same test
-    on the same box. One untimed round trip of each size runs first, so the first timed runs do not pay cold-start
-    costs. The _PAIRS attempts then alternate small, big, small, big, the time ratio is taken per pair, and
-    the MEDIAN pair ratio is gated. The test fails when that median reaches _GROWTH_ALLOWANCE times the size ratio. The
-    median is robust both ways: a stall that lands on one small run (which would collapse that pair's ratio) or on one
-    big run (which would inflate it) moves one pair, and one pair cannot decide the verdict. That catches growth well past linear, such as a size-quadratic blowup
-    in the encode or the decode, whose ratio nears the square of the size ratio, provided it shows in most pairs. It
-    misses a regression that appears in fewer than half the pairs, a constant-factor slowdown, and a mild superlinear
-    one that stays under the bound. The big round trip must also decode back to the same change-detection text as the
-    original."""
+    A fixed wall-clock bound measures the runner, not the code, so this compares two timings on the same box: one big
+    round trip against enough small ones to carry the same total rows (_BIG_ROWS / _SMALL_ROWS of them). For a linear
+    codec the two take about the same time (ratio near 1); a size-quadratic encode or decode makes the big one cost
+    about the size ratio times more. Two things kept earlier forms of this test flaky and are held fixed here: the
+    garbage collector is disabled inside each timed window (see _collector_off), because its heap-wide collections made the
+    ratio bimodal, and the small side is the sum of many runs, so one millisecond-scale small run cannot swing it. The
+    _PAIRS attempts alternate and the MEDIAN ratio is gated at _GROWTH_ALLOWANCE. It misses a constant-factor
+    slowdown and a mild superlinear cost that stays under the bound. The big round trip must also decode back to the
+    same change-detection text as the original."""
+    assert _BIG_ROWS % _SMALL_ROWS == 0, "the small side must carry exactly the big side's rows"
     small, big = _big_snap(_SMALL_ROWS), _big_snap(_BIG_ROWS)
-    _round_trip(small)  # warm-up, untimed, at both sizes: the first timed big run pays no cold-start costs either
+    reps = _BIG_ROWS // _SMALL_ROWS
+    _round_trip(small)  # warm-up, untimed, at both sizes
     _round_trip(big)
     ratios: list[float] = []
     last_back: _Snap | None = None
     for _ in range(_PAIRS):
-        small_took, _discard = _round_trip(small)
-        big_took, last_back = _round_trip(big)
+        with _collector_off():
+            small_took = sum(_round_trip(small)[0] for _ in range(reps))
+        with _collector_off():
+            big_took, last_back = _round_trip(big)
         ratios.append(big_took / small_took)
-    bound = _GROWTH_ALLOWANCE * (_BIG_ROWS / _SMALL_ROWS)
-    assert statistics.median(ratios) < bound, (ratios, bound)
+    assert statistics.median(ratios) < _GROWTH_ALLOWANCE, (ratios, _GROWTH_ALLOWANCE)
     assert last_back is not None and _frags(last_back) == _frags(big)
 
 
