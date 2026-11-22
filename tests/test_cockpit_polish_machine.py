@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tests.test_cockpit_f12b_topology_view import WORK_LENS_ON
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _serve
 from tests.test_cockpit_k7_build import _sessions_fixture
@@ -59,7 +60,7 @@ def test_closed_shows_no_selector_open_stacks_row_selector_graph_and_remembers_t
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         for w in (1440, 390):
             d = tmp_path / str(w); d.mkdir(); out = _drive(d, f"{url}/#write_token=T", [
-                {"emulate": {"w": w, "h": 900, "dpr": 1}},
+                {"emulate": {"w": w, "h": 900, "dpr": 1}}, {"init": WORK_LENS_ON},
                 READY, {"until": "document.querySelector('#ck-hlens .tv-seg') && 1"}, SETTLE, SETTLE,
                 {"eval": STATE},                                                                      # 0: closed
                 {"eval": "document.querySelector('[data-ia-graph-toggle]').click(); 1"}, SETTLE,

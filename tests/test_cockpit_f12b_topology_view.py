@@ -17,6 +17,8 @@ from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 NARROW = {"emulate": {"w": 390, "h": 800, "dpr": 1, "mobile": True}}
 MID = {"emulate": {"w": 1200, "h": 900, "dpr": 1}}
 TV = "document.querySelector('#ck-hlens .tv')"
+# The Work lens is hidden from the header unless the page opts in (np-021ab5aa); a test that clicks it, or stores it as the lens, opts in with this `init` step.
+WORK_LENS_ON = "window.LEVAIN_SHOW_WORK_LENS = true;"
 # The graph is one strip on Home that opens on a click (levain#141); the lens draws inside it, so a test that reads the lens opens it first.
 # This is an `until` expression: the click is idempotent, and the value is true once the lens is drawn and the strip is open.
 GRAPH_OPEN = ("(() => { const t = document.querySelector('[data-ia-graph-toggle]'); if (t && !document.body.classList.contains('ia-graph-open')) t.click();"
@@ -66,9 +68,10 @@ def _paint(value: dict, lens: str = "work") -> str:
             "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }})); return 1; })()") % (json.dumps(value), json.dumps(lens))
 
 
-def _run(tmp_path, src, steps, first=DESKTOP, until=GRAPH_OPEN):
+def _run(tmp_path, src, steps, first=DESKTOP, until=GRAPH_OPEN, work_lens=False):
+    pre = [{"init": WORK_LENS_ON}] if work_lens else []
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        return _drive(tmp_path, f"{url}/#write_token=T", [first, {"until": until}, *steps])["values"]
+        return _drive(tmp_path, f"{url}/#write_token=T", [first, *pre, {"until": until}, *steps])["values"]
 
 
 # --- the page, through the real provider ---------------------------------------------------------------
@@ -85,7 +88,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
              "(t.querySelector('.tv-cost') || {textContent: ''}).textContent, [...t.querySelectorAll('.tv-chip')].map(c => c.textContent)]), "
              "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent)})") % ((TV,) * 5)
     out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-                               {"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": probe}])
+                               {"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": probe}], work_lens=True)
     got = json.loads(out[-1])
     assert got["lens"] == "work" and got["cols"] == 0, got                              # Work, not Agents
     assert got["pressed"] == ["Work"], got                                              # the header's switch says so
@@ -162,7 +165,7 @@ def test_a_live_work_lens_has_no_waiting_record_to_click_so_the_band_is_the_only
         {"until": TV + " && " + TV + ".querySelector('.tv-task')"},
         {"until": "document.querySelector('#ck-needs .needs-row[data-needs-id^=consent]') && 1", "ms": 30000},
         {"eval": "JSON.stringify([" + TV + ".querySelectorAll('.tv-rec').length, " + TV + ".querySelectorAll('.tv-task.waiting').length, "
-                 "document.querySelectorAll('#ck-needs .needs-row[data-needs-id^=consent]').length])"}])
+                 "document.querySelectorAll('#ck-needs .needs-row[data-needs-id^=consent]').length])"}], work_lens=True)
     recs, waiting_tasks, strip_rows = json.loads(out[-1])
     assert recs == 0 and waiting_tasks == 0, out                       # nothing on the graph ...
     assert strip_rows == 1, out                                        # ... and the one row is where it always was
@@ -630,7 +633,7 @@ def test_a_waiting_node_click_in_the_agents_lens_lights_its_card_but_does_not_ta
     src = _strip_page(tmp_path, monkeypatch, questions=0)
     ready = "document.querySelectorAll('#ck-needs .needs-row').length === 1 && document.querySelector('#ck-hlens .tv')"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": ready, "ms": 30000},
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"init": WORK_LENS_ON}, {"until": ready, "ms": 30000},
                      {"eval": PATCH_WAITING_NODE},
                      {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},      # the cold-open lens is Agents: leave it and come back so the patched render draws it
                      {"until": "document.querySelector('#ck-hlens .tv[data-lens=work]')", "ms": 30000},
