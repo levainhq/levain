@@ -209,3 +209,27 @@ def test_hide_panels_refuses_a_non_iterable_with_the_registration_error(bad: obj
     with pytest.raises(CockpitRegistrationError):
         ck.hide_panels(bad)
     assert ck._hidden == frozenset()
+
+
+def test_a_started_cockpit_with_no_refresher_refuses_hide_panels(tmp_path: Path) -> None:
+    """Red with a guard keyed on running refreshers only: a cockpit with no refresher panel keeps no refresher, so a hide after
+    start() would be accepted on a live cockpit."""
+    _root, src, _ids = _install(tmp_path)
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="x", kind="metric-grid", title="X", priority="feed", region="operate", read=_V))
+    ck.start()
+    try:
+        with pytest.raises(CockpitRegistrationError, match="before the cockpit starts"):
+            ck.hide_panels({"x"})
+    finally:
+        ck.stop()
+
+
+@pytest.mark.parametrize("bad", [bytearray(), memoryview(b""), bytearray(b"ab")])
+def test_a_byte_buffer_is_not_a_collection_of_panel_ids(bad) -> None:
+    """Red with a check that refuses only str and bytes: an empty bytearray or memoryview would be accepted as no ids and
+    consume the one allowed call."""
+    ck = Cockpit()
+    with pytest.raises(CockpitRegistrationError):
+        ck.hide_panels(bad)
+    ck.hide_panels(())     # the refused call did not spend the one call

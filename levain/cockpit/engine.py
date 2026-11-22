@@ -903,6 +903,7 @@ class Cockpit:
         self._board_read: Callable[[], Any] | None = None    # the kernel's own board's reader: it returns when no board is left
         self._hidden: frozenset[str] = frozenset()   # ids left off the home (hide_panels): never registered, so no path brings one back
         self._hide_called = False                    # hide_panels is called once
+        self._started = False                        # start() has been called: hide_panels is no longer legal
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -1233,7 +1234,7 @@ class Cockpit:
         panel on the home. A hidden id is not an error to be absent, and an id no panel here carries is accepted. The decisions
         panel (the Needs-you band reads it) and the reserved ids are refused. Unlike :meth:`unregister` it removes a
         discovered panel and does not bring the kernel's own board back: a hidden board id stays gone."""
-        if isinstance(ids, (str, bytes)):
+        if isinstance(ids, (str, bytes, bytearray, memoryview)):
             raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
         try:
             ids = tuple(ids)     # read once: a generator would otherwise be spent by the check below
@@ -1248,7 +1249,7 @@ class Cockpit:
         with self._lock:
             if self._hide_called:
                 raise CockpitRegistrationError("hide_panels is called once, while the cockpit is built")
-            if self._refreshers:
+            if self._started or self._refreshers:
                 raise CockpitRegistrationError("hide_panels is called before the cockpit starts")
             self._hide_called = True
             self._hidden = hidden
@@ -1528,6 +1529,8 @@ class Cockpit:
         """Take the first read of every refresher panel, then start its refresher thread. An attached cockpit starts none:
         its host derives every panel, so a refresher thread here would run a provider the request side must not."""
         with self._life:
+            with self._lock:
+                self._started = True
             if self._reader is not None:
                 return
             for pid in [p for p, r in self._refreshers.items() if not r.thread.is_alive()]:
