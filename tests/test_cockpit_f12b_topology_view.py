@@ -103,7 +103,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
 
 @needs_browser
 def test_a_cold_open_draws_the_header_on_the_agents_graph_lens(tmp_path, monkeypatch):
-    """K11: no stored choice -> the header's default lens is the Agents graph, with the three-way switch in its order."""
+    """K11: no stored choice -> the header's default lens is the Agents graph, with the switch in its order."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _intention(root)
     probe = ("JSON.stringify({lens: %s && %s.dataset.lens, hl: document.getElementById('ck-skycard').dataset.hlens, graph: !!%s.querySelector('svg.tv-graph'), "
@@ -112,7 +112,7 @@ def test_a_cold_open_draws_the_header_on_the_agents_graph_lens(tmp_path, monkeyp
     out = _run(tmp_path, src, [{"until": TV + " && " + TV + ".querySelector('svg.tv-graph')"}, {"eval": probe}])
     got = json.loads(out[-1])
     assert got["lens"] == "agents" and got["hl"] == "agents" and got["graph"] is True and got["stored"] is None, got
-    assert got["buttons"] == [["Agents graph", "true"], ["Event graph", "false"], ["Work", "false"]], got
+    assert got["buttons"] == [["Agents graph", "true"], ["Event graph", "false"]], got      # Work is hidden by SHOW_WORK_LENS (np-021ab5aa)
 
 
 @needs_browser
