@@ -74,6 +74,7 @@ if (c.then === "twice") { fire("onerror"); fire("onload"); }
 if (c.then === "timer") fireTimer();
 if (c.then === "timer_then_error") { fireTimer(); fire("onerror"); }
 if (c.then === "timer_then_load") { fireTimer(); globalThis.LevainCockpitView = {}; el.onload(); }
+if (c.then === "load_first") { if (c.loadHas) globalThis.LevainCockpitView = {}; el.onload(); }
 const out = { reloads: log.reloads, errors: log.errors, markerAtReload: log.markerAtReload, writes: log.writes, removes: log.removes, injected: log.injected,
   marker: Object.prototype.hasOwnProperty.call(store, KEY) ? store[KEY] : null };
 console.log(JSON.stringify(out));
@@ -84,7 +85,7 @@ process.exit(0);                      // the boot's own timers would keep node a
 def _run(tmp_path: Path, **case: Any) -> dict[str, Any]:
     drv = tmp_path / "drive.js"
     drv.write_text(_DRIVER, encoding="utf-8")
-    spec = {"now": NOW, "key": KEY, "timerMs": WAIT_MS, "marker": None, "storage": "ok", "global": "missing", "then": "error", **case}
+    spec = {"now": NOW, "key": KEY, "timerMs": WAIT_MS, "marker": None, "storage": "ok", "global": "missing", "then": "error", "loadHas": False, **case}
     run = subprocess.run([NODE, str(drv), str(WEB / "dashboard_boot.js"), json.dumps(spec)], capture_output=True, text=True, timeout=30)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout.strip().splitlines()[-1])
@@ -222,3 +223,32 @@ def test_a_write_that_throws_a_quota_error_never_reloads_and_throws_nothing_into
         out = _run(tmp_path, storage="quota", then=then)
         assert out["reloads"] == 0, out
         assert out["writes"] == [], out                          # nothing was kept, and nothing was assumed kept
+
+
+def test_a_late_load_after_the_timer_reloaded_does_not_erase_the_marker_the_reload_relies_on(tmp_path: Path) -> None:
+    """The loop: a script slower than the wait on every load. The timer decides, writes the marker and reloads; the old document lives on
+    until the new one commits, so the re-request's late load arrives with the global present. Red with an onload that clears the marker
+    unconditionally: the marker would be gone, and the reloaded document, if its script is slow again, would find none and reload again,
+    for ever. No marker held beforehand; the timer fires, then the load lands."""
+    out = _run(tmp_path, then="timer_then_load")
+    assert out["reloads"] == 1, out
+    assert out["writes"] == [str(NOW)], out
+    assert out["marker"] == str(NOW), out                        # still there for the reloaded document to find
+    assert out["removes"] == 0, out
+
+
+def test_a_load_with_the_global_before_any_decision_clears_the_marker_and_does_not_reload(tmp_path: Path) -> None:
+    """Red with an onload path that no longer clears the marker (or reloads) when it is the first thing to arrive: the guard has not
+    decided yet. A fresh marker is held; the re-request lands with the global present."""
+    out = _run(tmp_path, then="load_first", loadHas=True, marker=str(NOW - 5_000))
+    assert out["reloads"] == 0, out
+    assert out["marker"] is None, out
+    assert out["errors"] == [], out
+
+
+def test_a_load_without_the_global_before_any_decision_reloads_once(tmp_path: Path) -> None:
+    """Red with an onload that trusts a 200 (reloads would be 0): the script answered but did not define the global. It is the first
+    thing to arrive, so the guard decides then."""
+    out = _run(tmp_path, then="load_first", loadHas=False)
+    assert out["reloads"] == 1, out
+    assert out["markerAtReload"] == [str(NOW)], out
