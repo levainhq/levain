@@ -1229,7 +1229,10 @@ class Cockpit:
         reversal. A hidden id is not an error to be absent. The decisions panel (the Needs-you band reads it) and the
         reserved ids are refused. Unlike :meth:`unregister` it removes a discovered panel and does not bring the kernel's own
         board back: a hidden board id stays gone."""
-        if isinstance(ids, (str, bytes)) or not all(type(i) is str for i in ids):
+        if isinstance(ids, (str, bytes)):
+            raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
+        ids = tuple(ids)     # read once: a generator would otherwise be spent by the check below
+        if not all(type(i) is str for i in ids):
             raise CockpitRegistrationError("hide_panels takes a collection of panel id strings")
         hidden = frozenset(ids)
         refused = sorted(hidden & {DECISIONS_ID, *RETIRED_PANEL_IDS})

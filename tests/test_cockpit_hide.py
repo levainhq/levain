@@ -132,3 +132,12 @@ def test_hidden_panel_verbs_leave_the_manifest_verbs_map(tmp_path: Path) -> None
     rig.ck.hide_panels({"edits"})
     verbs = rig.ck.manifest(CRED)["verbs"]
     assert "undo" not in verbs and "episode_tombstone" in verbs
+
+
+def test_a_generator_of_ids_hides_what_it_names(tmp_path: Path) -> None:
+    """Red with a hide_panels that checks a generator and then builds its set from the spent one: nothing would be hidden and no
+    error raised."""
+    _root, src, _ids = _install(tmp_path)
+    ck = build_default_cockpit(src)
+    ck.hide_panels(i for i in ("episodes", "edits"))
+    assert "episodes" not in ck.panel_ids and "edits" not in ck.panel_ids
