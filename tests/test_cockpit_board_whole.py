@@ -46,6 +46,12 @@ REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-widgets", "state", "board"]
 # the board is a part: the regions are inert, a tile is drawn in the widgets region, and the signal is not there
 PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
            "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")
+# a part that carries a LANDED body: the shells alone are inert `.ck-card` tiles too (each body is aria-busy), and the page's whole draw defers for an
+# open editor only once a landed body was drawn (dashboard_boot.js `mayDrawWhole` with `partialDrawn`, set where `landedCount() > 0`): a test that opens
+# an editor must wait for this, not for PART_UP, or it can open the editor in the shells-only window, where the page draws whole over it by design
+PART_LANDED = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && "
+               "!document.documentElement.hasAttribute('data-board-whole') && "
+               "[...w.querySelectorAll('.ck-card')].some((c) => !c.querySelector('[aria-busy=\"true\"]')) && 1; })()")
 WHOLE_UP = "document.documentElement.hasAttribute('data-board-whole') && 1"
 # How long the tests wait for the signal after the release. It MUST stay well inside the page's watchdog (BOARD_HOLD_MS in dashboard_boot.js,
 # a minute from the first inert part): the watchdog also releases the page and sets the signal, so a wait that could outlast it would let a
@@ -136,7 +142,7 @@ def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_
     with _boot(tmp_path) as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"init": DELAY}, DESKTOP,
-            {"until": PART_UP, "ms": 40000, "partial": True},
+            {"until": PART_LANDED, "ms": 40000, "partial": True},
             {"eval": ADD_EDITOR, "partial": True},
             {"eval": RELEASE, "partial": True},
             {"eval": SETTLED, "partial": True},
