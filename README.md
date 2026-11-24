@@ -2,6 +2,8 @@
 
 # Levain
 
+> **Levain is retired.** It's no longer maintained, and this repository is archived. Thanks to everyone who tried it.
+
 **A harness for working with an AI agent as a partner: it grows its own memory and identity, pushes back on its training's worst habits, and answers to you, always.**
 
 ```
